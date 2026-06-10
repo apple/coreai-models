@@ -268,6 +268,19 @@ final class PipelineGate: Sendable {
     }
 }
 
+// MARK: - Linear Attention State Binding
+
+/// Immutable binding for a fixed-size linear attention state (conv or recurrent).
+/// Unlike KV cache, these states never grow — they hold a single rolling state buffer
+/// that is updated in-place on every encode step.
+private struct LinearAttnStateBinding {
+    let name: String
+    let buffer: MTLBuffer
+    let scalarType: NDArray.ScalarType
+    let shape: [Int]
+    let strides: [Int]
+}
+
 // MARK: - Engine Implementation
 
 private struct EngineImpl: ~Copyable {
@@ -300,6 +313,11 @@ private struct EngineImpl: ~Copyable {
 
     // KV cache — reuses CoreAIKVCache protocol from KVCache+CoreAI.swift
     var kvCache: any CoreAIKVCache
+
+    // Linear attention state bindings for hybrid models (nil for pure transformer models).
+    // States 0/1 are KV cache; states 2/3 are conv_states and recurrent_states.
+    let convBinding: LinearAttnStateBinding?
+    let recurrentBinding: LinearAttnStateBinding?
 
     // Logits — reuses GrowingLogitsBuffer from TensorStorage+CoreAI.swift
     var logits: GrowingLogitsBuffer
@@ -344,9 +362,10 @@ private struct EngineImpl: ~Copyable {
             throw InferenceRuntimeError.invalidOutputType(
                 "Expected at least 1 output, got \(descriptor.outputNames.count)")
         }
-        guard descriptor.stateNames.count == 2 else {
+        guard descriptor.stateNames.count == 2 || descriptor.stateNames.count == 4 else {
             throw InferenceRuntimeError.invalidOutputType(
-                "Expected 2 states (KV cache), got \(descriptor.stateNames.count): \(descriptor.stateNames)")
+                "Expected 2 states (transformer) or 4 states (hybrid), got \(descriptor.stateNames.count): \(descriptor.stateNames)"
+            )
         }
 
         // Extract names
@@ -415,6 +434,58 @@ private struct EngineImpl: ~Copyable {
         let resolvedSize = options.resolvedKVCacheSize(maxContextLength: config.maxContextLength)
         CLILogger.log("Created \(options.kvCacheStrategy) KV cache with size \(resolvedSize, default: "nil")")
 
+        // Allocate fixed-size buffers for linear attention states if this is a hybrid model.
+        // Hybrid models have 4 states: [key_cache, value_cache, conv_states, recurrent_states].
+        var convBindingLocal: LinearAttnStateBinding? = nil
+        var recurrentBindingLocal: LinearAttnStateBinding? = nil
+        if descriptor.stateNames.count == 4 {
+            let convName = descriptor.stateNames[2]
+            let recName = descriptor.stateNames[3]
+
+            guard case .ndArray(let convDesc) = descriptor.stateDescriptor(of: convName) else {
+                throw InferenceRuntimeError.invalidOutputType(
+                    "Cannot get conv state descriptor for '\(convName)'")
+            }
+            guard case .ndArray(let recDesc) = descriptor.stateDescriptor(of: recName) else {
+                throw InferenceRuntimeError.invalidOutputType(
+                    "Cannot get recurrent state descriptor for '\(recName)'")
+            }
+
+            let convShape = convDesc.shape
+            let convStrides = try resolvedStrides(descriptor: convDesc, shape: convShape)
+            let convByteCount = convDesc.resolvingDynamicDimensions(convShape).minimumByteCount
+            guard
+                let convBuf = device.makeBuffer(
+                    length: max(1, convByteCount), options: .storageModeShared)
+            else {
+                throw InferenceRuntimeError.bufferAllocationFailed(
+                    "conv_states (\(convByteCount) bytes)")
+            }
+            memset(convBuf.contents(), 0, convBuf.length)
+
+            let recShape = recDesc.shape
+            let recStrides = try resolvedStrides(descriptor: recDesc, shape: recShape)
+            let recByteCount = recDesc.resolvingDynamicDimensions(recShape).minimumByteCount
+            guard
+                let recBuf = device.makeBuffer(
+                    length: max(1, recByteCount), options: .storageModeShared)
+            else {
+                throw InferenceRuntimeError.bufferAllocationFailed(
+                    "recurrent_states (\(recByteCount) bytes)")
+            }
+            memset(recBuf.contents(), 0, recBuf.length)
+
+            convBindingLocal = LinearAttnStateBinding(
+                name: convName, buffer: convBuf, scalarType: convDesc.scalarType,
+                shape: convShape, strides: convStrides)
+            recurrentBindingLocal = LinearAttnStateBinding(
+                name: recName, buffer: recBuf, scalarType: recDesc.scalarType,
+                shape: recShape, strides: recStrides)
+
+            CLILogger.log(
+                "Linear attention states: '\(convName)' \(convShape), '\(recName)' \(recShape)")
+        }
+
         // Create growing logits buffer (reuses TensorStorage+CoreAI.swift)
         let logitsRef = try GrowingLogitsBuffer(
             device: device,
@@ -458,6 +529,8 @@ private struct EngineImpl: ~Copyable {
         self.inputTokensBuffer = inputTokensBuf
         self.cachePositionBuffers = (cachePosBuf0, cachePosBuf1)
         self.kvCache = kvCacheLocal
+        self.convBinding = convBindingLocal
+        self.recurrentBinding = recurrentBindingLocal
         self.logits = logitsRef
         self.cachedSampler = nil
         self.cachedSamplerTemperature = nil
@@ -571,46 +644,15 @@ private struct EngineImpl: ~Copyable {
             positionIdsName: posValue,
         ]
 
-        // Build States as AsyncMutableValue (KV cache, in-place update)
         let keyBuffer = kvCache.keyBinding.metalBuffer
         let keyShape = kvCache.keyBinding.layout.shape
         let keyStrides = kvCache.keyBinding.layout.strides
-        var keyState = unsafe InferenceFunction.AsyncMutableValue(
-            unsafeBuffer: keyBuffer,
-            byteOffset: 0,
-            scalarType: keyCacheScalarType,
-            shape: keyShape,
-            strides: keyStrides
-        )
         let valBuffer = kvCache.valueBinding.metalBuffer
         let valShape = kvCache.valueBinding.layout.shape
         let valStrides = kvCache.valueBinding.layout.strides
-        var valState = unsafe InferenceFunction.AsyncMutableValue(
-            unsafeBuffer: valBuffer,
-            byteOffset: 0,
-            scalarType: valueCacheScalarType,
-            shape: valShape,
-            strides: valStrides
-        )
-
-        var asyncStates = InferenceFunction.AsyncMutableViews()
-        asyncStates.insert(&keyState, for: keyCacheName)
-        asyncStates.insert(&valState, for: valueCacheName)
-
-        // Build Output as AsyncMutableValue (logits)
         let logitsBuffer = logits.metalBuffer
         let logitsShape = [1, queryLength, vocabSize]
         let logitsStrides = try resolvedStrides(descriptor: logitsBaseDesc, shape: logitsShape)
-        var logitsOutput = unsafe InferenceFunction.AsyncMutableValue(
-            unsafeBuffer: logitsBuffer,
-            byteOffset: 0,
-            scalarType: .float16,
-            shape: logitsShape,
-            strides: logitsStrides
-        )
-
-        var asyncOutputs = InferenceFunction.AsyncMutableViews()
-        asyncOutputs.insert(&logitsOutput, for: logitsOutputName)
 
         prepareSpan.end()
 
@@ -621,12 +663,58 @@ private struct EngineImpl: ~Copyable {
         // This commits + uses runAfterSyncPoint (no stream wait) — enables true pipelining.
         let logitsSpan = InstrumentsProfiler.beginLogitsInference(
             step: currentStep, tokens: queryLength, engine: "CoreAI-Pipelined")
-        let _ = try function.encode(
-            inputs: asyncInputs,
-            states: consume asyncStates,
-            outputViews: consume asyncOutputs,
-            to: computeStream
-        )
+        if let conv = convBinding, let rec = recurrentBinding {
+            var keyState = unsafe InferenceFunction.AsyncMutableValue(
+                unsafeBuffer: keyBuffer, byteOffset: 0,
+                scalarType: keyCacheScalarType, shape: keyShape, strides: keyStrides)
+            var valState = unsafe InferenceFunction.AsyncMutableValue(
+                unsafeBuffer: valBuffer, byteOffset: 0,
+                scalarType: valueCacheScalarType, shape: valShape, strides: valStrides)
+            var logitsOutput = unsafe InferenceFunction.AsyncMutableValue(
+                unsafeBuffer: logitsBuffer, byteOffset: 0,
+                scalarType: .float16, shape: logitsShape, strides: logitsStrides)
+            var asyncOutputs = InferenceFunction.AsyncMutableViews()
+            asyncOutputs.insert(&logitsOutput, for: logitsOutputName)
+            var convState = unsafe InferenceFunction.AsyncMutableValue(
+                unsafeBuffer: conv.buffer, byteOffset: 0,
+                scalarType: conv.scalarType, shape: conv.shape, strides: conv.strides)
+            var recState = unsafe InferenceFunction.AsyncMutableValue(
+                unsafeBuffer: rec.buffer, byteOffset: 0,
+                scalarType: rec.scalarType, shape: rec.shape, strides: rec.strides)
+            var asyncStates = InferenceFunction.AsyncMutableViews()
+            asyncStates.insert(&keyState, for: keyCacheName)
+            asyncStates.insert(&valState, for: valueCacheName)
+            asyncStates.insert(&convState, for: conv.name)
+            asyncStates.insert(&recState, for: rec.name)
+
+            let _ = try function.encode(
+                inputs: asyncInputs,
+                states: consume asyncStates,
+                outputViews: consume asyncOutputs,
+                to: computeStream
+            )
+        } else {
+            var keyState = unsafe InferenceFunction.AsyncMutableValue(
+                unsafeBuffer: keyBuffer, byteOffset: 0,
+                scalarType: keyCacheScalarType, shape: keyShape, strides: keyStrides)
+            var valState = unsafe InferenceFunction.AsyncMutableValue(
+                unsafeBuffer: valBuffer, byteOffset: 0,
+                scalarType: valueCacheScalarType, shape: valShape, strides: valStrides)
+            var logitsOutput = unsafe InferenceFunction.AsyncMutableValue(
+                unsafeBuffer: logitsBuffer, byteOffset: 0,
+                scalarType: .float16, shape: logitsShape, strides: logitsStrides)
+            var asyncOutputs = InferenceFunction.AsyncMutableViews()
+            asyncOutputs.insert(&logitsOutput, for: logitsOutputName)
+            var asyncStates = InferenceFunction.AsyncMutableViews()
+            asyncStates.insert(&keyState, for: keyCacheName)
+            asyncStates.insert(&valState, for: valueCacheName)
+            let _ = try function.encode(
+                inputs: asyncInputs,
+                states: consume asyncStates,
+                outputViews: consume asyncOutputs,
+                to: computeStream
+            )
+        }
         logitsSpan.end()
 
         // GPU sampling via Metal queue
@@ -899,9 +987,6 @@ private struct EngineImpl: ~Copyable {
         var valState = unsafe InferenceFunction.AsyncMutableValue(
             unsafeBuffer: valBuffer, byteOffset: 0,
             scalarType: valueCacheScalarType, shape: valShape, strides: valStrides)
-        var asyncStates = InferenceFunction.AsyncMutableViews()
-        asyncStates.insert(&keyState, for: keyCacheName)
-        asyncStates.insert(&valState, for: valueCacheName)
 
         let logitsShape = [1, queryLength, vocabSize]
         let logitsStrides = try resolvedStrides(descriptor: logitsBaseDesc, shape: logitsShape)
@@ -911,12 +996,37 @@ private struct EngineImpl: ~Copyable {
         var asyncOutputs = InferenceFunction.AsyncMutableViews()
         asyncOutputs.insert(&logitsOutput, for: logitsOutputName)
 
-        let _ = try function.encode(
-            inputs: asyncInputs,
-            states: consume asyncStates,
-            outputViews: consume asyncOutputs,
-            to: computeStream
-        )
+        // Two branches so that optional conv/recurrent state variables share scope
+        // with asyncStates.
+        if let conv = convBinding, let rec = recurrentBinding {
+            var convState = unsafe InferenceFunction.AsyncMutableValue(
+                unsafeBuffer: conv.buffer, byteOffset: 0,
+                scalarType: conv.scalarType, shape: conv.shape, strides: conv.strides)
+            var recState = unsafe InferenceFunction.AsyncMutableValue(
+                unsafeBuffer: rec.buffer, byteOffset: 0,
+                scalarType: rec.scalarType, shape: rec.shape, strides: rec.strides)
+            var asyncStates = InferenceFunction.AsyncMutableViews()
+            asyncStates.insert(&keyState, for: keyCacheName)
+            asyncStates.insert(&valState, for: valueCacheName)
+            asyncStates.insert(&convState, for: conv.name)
+            asyncStates.insert(&recState, for: rec.name)
+            let _ = try function.encode(
+                inputs: asyncInputs,
+                states: consume asyncStates,
+                outputViews: consume asyncOutputs,
+                to: computeStream
+            )
+        } else {
+            var asyncStates = InferenceFunction.AsyncMutableViews()
+            asyncStates.insert(&keyState, for: keyCacheName)
+            asyncStates.insert(&valState, for: valueCacheName)
+            let _ = try function.encode(
+                inputs: asyncInputs,
+                states: consume asyncStates,
+                outputViews: consume asyncOutputs,
+                to: computeStream
+            )
+        }
 
         processedTokenCount += queryLength
         step += 1
@@ -929,6 +1039,9 @@ private struct EngineImpl: ~Copyable {
         step = 0
         cachedSampler = nil
         cachedSamplerTemperature = nil
+        // Zero SSM states so the next conversation starts from a clean slate.
+        if let buf = convBinding?.buffer { memset(buf.contents(), 0, buf.length) }
+        if let buf = recurrentBinding?.buffer { memset(buf.contents(), 0, buf.length) }
         span.end()
     }
 
@@ -1003,9 +1116,6 @@ private struct EngineImpl: ~Copyable {
             var valState = unsafe InferenceFunction.AsyncMutableValue(
                 unsafeBuffer: valBuffer, byteOffset: 0,
                 scalarType: valueCacheScalarType, shape: vShape, strides: vStrides)
-            var asyncStates = InferenceFunction.AsyncMutableViews()
-            asyncStates.insert(&keyState, for: keyCacheName)
-            asyncStates.insert(&valState, for: valueCacheName)
 
             let lShape = [1, shape, vocabSize]
             let lStrides = try resolvedStrides(descriptor: logitsBaseDesc, shape: lShape)
@@ -1015,12 +1125,37 @@ private struct EngineImpl: ~Copyable {
             var asyncOutputs = InferenceFunction.AsyncMutableViews()
             asyncOutputs.insert(&logitsOutput, for: logitsOutputName)
 
-            let _ = try function.encode(
-                inputs: asyncInputs,
-                states: consume asyncStates,
-                outputViews: consume asyncOutputs,
-                to: computeStream
-            )
+            // Two branches so that optional conv/recurrent state variables share scope
+            // with asyncStates
+            if let conv = convBinding, let rec = recurrentBinding {
+                var convState = unsafe InferenceFunction.AsyncMutableValue(
+                    unsafeBuffer: conv.buffer, byteOffset: 0,
+                    scalarType: conv.scalarType, shape: conv.shape, strides: conv.strides)
+                var recState = unsafe InferenceFunction.AsyncMutableValue(
+                    unsafeBuffer: rec.buffer, byteOffset: 0,
+                    scalarType: rec.scalarType, shape: rec.shape, strides: rec.strides)
+                var asyncStates = InferenceFunction.AsyncMutableViews()
+                asyncStates.insert(&keyState, for: keyCacheName)
+                asyncStates.insert(&valState, for: valueCacheName)
+                asyncStates.insert(&convState, for: conv.name)
+                asyncStates.insert(&recState, for: rec.name)
+                let _ = try function.encode(
+                    inputs: asyncInputs,
+                    states: consume asyncStates,
+                    outputViews: consume asyncOutputs,
+                    to: computeStream
+                )
+            } else {
+                var asyncStates = InferenceFunction.AsyncMutableViews()
+                asyncStates.insert(&keyState, for: keyCacheName)
+                asyncStates.insert(&valState, for: valueCacheName)
+                let _ = try function.encode(
+                    inputs: asyncInputs,
+                    states: consume asyncStates,
+                    outputViews: consume asyncOutputs,
+                    to: computeStream
+                )
+            }
 
             // Warm up argmax kernel
             let logitsBuffer = logits.metalBuffer

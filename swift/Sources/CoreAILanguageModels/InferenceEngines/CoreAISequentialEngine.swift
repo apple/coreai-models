@@ -47,6 +47,9 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
     private let keyCacheName: String
     private let valueCacheName: String
     private let logitsName: String
+    // Linear attention state names (nil for transformer-only models)
+    private let convStatesName: String?
+    private let recurrentStatesName: String?
 
     // Descriptors for dynamic shape resolution
     private let inputIdsDescriptor: NDArrayDescriptor
@@ -56,6 +59,9 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
     // Persistent state — reused across steps
     private var keyCache: NDArray
     private var valueCache: NDArray
+    // Linear attention states for hybrid SSM/transformer models (nil for pure transformers)
+    private var convStates: NDArray?
+    private var recurrentStates: NDArray?
     private var logitsArray: NDArray
     // Pre-allocated input_ids reused across decode steps. Only reallocated when
     // batch size changes (i.e., once when transitioning from prefill to decode).
@@ -97,7 +103,7 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         }
         self.functionDescriptor = descriptor
 
-        // Validate model architecture: 2 inputs, 1+ output, 2 states
+        // Validate model architecture: 2 inputs, 1+ output, 2 or 4 states
         guard descriptor.inputNames.count == 2 else {
             throw InferenceRuntimeError.invalidInputType(
                 "Expected 2 inputs, got \(descriptor.inputNames.count): \(descriptor.inputNames)")
@@ -106,9 +112,9 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
             throw InferenceRuntimeError.invalidOutputType(
                 "Expected at least 1 output, got \(descriptor.outputNames.count): \(descriptor.outputNames)")
         }
-        guard descriptor.stateNames.count == 2 else {
+        guard descriptor.stateNames.count == 2 || descriptor.stateNames.count == 4 else {
             throw InferenceRuntimeError.invalidOutputType(
-                "Expected 2 states (KV cache), got \(descriptor.stateNames.count): "
+                "Expected 2 states (transformer) or 4 states (hybrid), got \(descriptor.stateNames.count): "
                     + "states=\(descriptor.stateNames), outputs=\(descriptor.outputNames)")
         }
 
@@ -118,6 +124,8 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         self.keyCacheName = descriptor.stateNames[0]
         self.valueCacheName = descriptor.stateNames[1]
         self.logitsName = descriptor.outputNames[0]
+        self.convStatesName = descriptor.stateNames.count == 4 ? descriptor.stateNames[2] : nil
+        self.recurrentStatesName = descriptor.stateNames.count == 4 ? descriptor.stateNames[3] : nil
 
         // Extract and validate input descriptors
         guard case .ndArray(let inputIdsDesc) = descriptor.inputDescriptor(of: inputIdsName) else {
@@ -171,6 +179,28 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         CLILogger.log(
             "KV cache: dynamic=\(isDynamic), initial=\(initialCapacity), "
                 + "key=\(keyCacheDesc.shape) → \(resolvedKeyDesc.shape)")
+
+        // Allocate fixed-size linear attention states for hybrid models.
+        // Hybrid models have 4 states: [key_cache, value_cache, conv_states, recurrent_states].
+        // These states roll in-place every step — no capacity management or growing needed.
+        if let convName = self.convStatesName, let recName = self.recurrentStatesName {
+            guard case .ndArray(let convDesc) = descriptor.stateDescriptor(of: convName) else {
+                throw InferenceRuntimeError.invalidOutputType(
+                    "Cannot get conv state descriptor for '\(convName)'")
+            }
+            guard case .ndArray(let recDesc) = descriptor.stateDescriptor(of: recName) else {
+                throw InferenceRuntimeError.invalidOutputType(
+                    "Cannot get recurrent state descriptor for '\(recName)'")
+            }
+            self.convStates = NDArray(descriptor: convDesc)
+            self.recurrentStates = NDArray(descriptor: recDesc)
+            CLILogger.log(
+                "Linear attention states: '\(convName)' \(convDesc.shape), '\(recName)' \(recDesc.shape)"
+            )
+        } else {
+            self.convStates = nil
+            self.recurrentStates = nil
+        }
 
         // Allocate initial logits (1 token — will be reallocated per batch)
         let initLogitsDesc = logitsDesc.resolvingDynamicDimensions([1, 1, config.vocabSize])
@@ -263,21 +293,38 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
             cachedLogitsBatchSize = batchSize
         }
 
-        // Build states (KV cache — persistent, inout)
-        var states = InferenceFunction.MutableViews()
-        states.insert(&keyCache, for: keyCacheName)
-        states.insert(&valueCache, for: valueCacheName)
-
         // Build output backings (logits — written in-place)
         var outputViews = InferenceFunction.MutableViews()
         outputViews.insert(&logitsArray, for: logitsName)
 
-        // Execute
-        _ = try await function.run(
-            inputs: [inputIdsName: inputIdsArray, positionIdsName: positionIds],
-            states: consume states,
-            outputViews: consume outputViews
-        )
+        // Build states and execute — two branches for hybrid vs transformer-only models.
+        // The if/else structure ensures lifetime-dependent vars (MutableViews borrows)
+        // don't escape their containing scope, mirroring the pipelined engine's pattern.
+        if let convName = convStatesName, let recName = recurrentStatesName,
+            var convArr = convStates, var recArr = recurrentStates
+        {
+            var states = InferenceFunction.MutableViews()
+            states.insert(&keyCache, for: keyCacheName)
+            states.insert(&valueCache, for: valueCacheName)
+            states.insert(&convArr, for: convName)
+            states.insert(&recArr, for: recName)
+            _ = try await function.run(
+                inputs: [inputIdsName: inputIdsArray, positionIdsName: positionIds],
+                states: consume states,
+                outputViews: consume outputViews
+            )
+            convStates = convArr
+            recurrentStates = recArr
+        } else {
+            var states = InferenceFunction.MutableViews()
+            states.insert(&keyCache, for: keyCacheName)
+            states.insert(&valueCache, for: valueCacheName)
+            _ = try await function.run(
+                inputs: [inputIdsName: inputIdsArray, positionIdsName: positionIds],
+                states: consume states,
+                outputViews: consume outputViews
+            )
+        }
 
         // Read logits from NDArray
         let totalLogits = batchSize * config.vocabSize
@@ -426,6 +473,13 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         processedTokenCount = 0
         zeroFill(&keyCache)
         zeroFill(&valueCache)
+        // Zero SSM states so the next conversation starts from a clean slate.
+        if var conv = convStates, var rec = recurrentStates {
+            zeroFill(&conv)
+            zeroFill(&rec)
+            convStates = conv
+            recurrentStates = rec
+        }
         resetSpan.end()
     }
 
