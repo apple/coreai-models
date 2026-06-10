@@ -16,6 +16,7 @@ from coreai_models.model_registry import (
     _preset_to_export_args,
     _preset_to_output_name,
     filter_presets,
+    filter_utility_models,
     lookup_preset,
     presets_for_type,
     try_lookup_preset,
@@ -168,3 +169,10 @@ def test_try_lookup_with_explicit_variant() -> None:
     result = try_lookup_preset("qwen3-0.6b", model_type="llm", variant="iOS")
     assert result is not None
     assert result.variant == "iOS"
+
+
+def test_utility_platform_filter_excludes_macos_only() -> None:
+    ios_models = filter_utility_models(platform="iOS")
+    names = [u.short_name for u in ios_models]
+    assert "depth-anything-3-small" not in names
+    assert "clip-vit-b32" in names

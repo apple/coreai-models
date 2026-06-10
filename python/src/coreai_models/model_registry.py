@@ -14,7 +14,7 @@ CLI:
     uv run coreai.model.registry --model-info clip-vit-b32 --type utility --as-export-args
 
 `--type` selects the preset table (`llm`, `diffusion`, or `utility`).
-`--platform` (`macOS` / `iOS`) is meaningful for LLM only.
+`--platform` (`macOS` / `iOS`) filters LLM variants and utility model platforms.
 """
 
 from __future__ import annotations
@@ -508,12 +508,15 @@ def filter_utility_models(
     *,
     model_type: str | None = None,
     task: str | None = None,
+    platform: str | None = None,
 ) -> list[UtilityModel]:
     out: list[UtilityModel] = []
     for u in UTILITY_PRESETS:
         if model_type is not None and u.model_type != model_type:
             continue
         if task is not None and u.task != task:
+            continue
+        if platform is not None and platform not in u.platforms:
             continue
         out.append(u)
     return out
@@ -649,7 +652,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--platform",
         choices=KNOWN_VARIANTS,
-        help="Platform filter (macOS / iOS). LLM-only; "
+        help="Platform filter (macOS / iOS). Filters LLM variants and utility model platforms; "
         "diffusion entries are excluded when --platform is set.",
     )
     parser.add_argument(
@@ -757,7 +760,7 @@ def _action_list_families(args: argparse.Namespace) -> None:
 
 
 def _action_list_utility_models(args: argparse.Namespace) -> None:
-    models = filter_utility_models(model_type=args.family, task=args.task)
+    models = filter_utility_models(model_type=args.family, task=args.task, platform=args.platform)
     if args.format == "json":
         print(json.dumps([asdict(u) for u in models], indent=2))
     elif args.format == "tsv":
@@ -801,7 +804,9 @@ def _action_list_models(args: argparse.Namespace) -> None:
         if args.type:
             print(json.dumps([asdict(p) for p in presets], indent=2))
         else:
-            util = filter_utility_models(model_type=args.family, task=args.task)
+            util = filter_utility_models(
+                model_type=args.family, task=args.task, platform=args.platform
+            )
             combined = [asdict(p) for p in presets] + [asdict(u) for u in util]
             print(json.dumps(combined, indent=2))
     elif args.format == "tsv":
@@ -816,7 +821,9 @@ def _action_list_models(args: argparse.Namespace) -> None:
             ]
             print("\t".join(cols))
         if not args.type:
-            for u in filter_utility_models(model_type=args.family, task=args.task):
+            for u in filter_utility_models(
+                model_type=args.family, task=args.task, platform=args.platform
+            ):
                 print(
                     "\t".join(
                         [
@@ -844,7 +851,7 @@ def _action_list_models(args: argparse.Namespace) -> None:
 def _print_all_tables(presets: list[ModelPreset], args: argparse.Namespace) -> None:
     llm = [p for p in presets if p.type == "llm"]
     diffusion = [p for p in presets if p.type == "diffusion"]
-    util = filter_utility_models(model_type=args.family, task=args.task)
+    util = filter_utility_models(model_type=args.family, task=args.task, platform=args.platform)
 
     if llm:
         print("=== LLM ===")
@@ -914,6 +921,9 @@ def _action_utility_model_info(args: argparse.Namespace) -> None:
     model = lookup_utility_model(args.model_info)
     if not model:
         sys.stderr.write(f"Error: no utility model {args.model_info!r}\n")
+        sys.exit(1)
+    if args.platform is not None and args.platform not in model.platforms:
+        sys.stderr.write(f"Error: model {args.model_info!r} has no --platform {args.platform!r}\n")
         sys.exit(1)
     if args.format == "export-args":
         print(" ".join(_utility_to_export_args(model)))
