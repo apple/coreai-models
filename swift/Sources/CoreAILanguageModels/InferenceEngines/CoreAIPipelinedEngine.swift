@@ -268,19 +268,6 @@ final class PipelineGate: Sendable {
     }
 }
 
-// MARK: - Linear Attention State Binding
-
-/// Immutable binding for a fixed-size linear attention state (conv or recurrent).
-/// Unlike KV cache, these states never grow — they hold a single rolling state buffer
-/// that is updated in-place on every encode step.
-private struct LinearAttnStateBinding {
-    let name: String
-    let buffer: MTLBuffer
-    let scalarType: NDArray.ScalarType
-    let shape: [Int]
-    let strides: [Int]
-}
-
 // MARK: - Engine Implementation
 
 private struct EngineImpl: ~Copyable {
