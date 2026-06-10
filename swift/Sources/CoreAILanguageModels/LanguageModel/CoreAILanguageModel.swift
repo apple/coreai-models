@@ -176,7 +176,7 @@ public struct CoreAILanguageModel: LanguageModel {
         /// gpt-oss / Harmony), a different parser is needed; this one
         /// covers the `<open>...</close>` shape.
         private static func detectThinkingMarkers(
-            using tokenizer: some Tokenizer
+            using tokenizer: any Tokenizer
         ) -> (open: String, close: String) {
             let candidates: [(open: String, close: String)] = [
                 ("<think>", "</think>"),
@@ -203,7 +203,7 @@ public struct CoreAILanguageModel: LanguageModel {
         /// matches the bare token without a trailing space — `parseToolCalls`
         /// already trims leading whitespace so optional spacing is handled.
         fileprivate static func detectToolCallMarkers(
-            using tokenizer: some Tokenizer
+            using tokenizer: any Tokenizer
         ) -> (open: String, close: String)? {
             // Standard tag-pair formats — both markers must be special tokens.
             let tagPairs: [(open: String, close: String)] = [
