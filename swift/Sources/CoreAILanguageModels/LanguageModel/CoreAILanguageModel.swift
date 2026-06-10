@@ -104,10 +104,7 @@ public struct CoreAILanguageModel: LanguageModel {
         self.modelIdentifier = modelIdentifier
         self.samplingConfig = samplingConfig
         self.vocabSize = vocabSize
-        self.supportsToolCalling =
-            tokenizer.convertTokenToId("<tool_call>") != nil
-            || tokenizer.convertTokenToId("<function_calls>") != nil
-            || tokenizer.convertTokenToId("[TOOL_CALLS]") != nil
+        self.supportsToolCalling = CoreAIExecutor.detectToolCallMarkers(tokenizer: tokenizer) != nil
         self.supportsReasoning =
             tokenizer.convertTokenToId("<think>") != nil
             || tokenizer.convertTokenToId("<|reasoning_start|>") != nil
@@ -205,7 +202,7 @@ public struct CoreAILanguageModel: LanguageModel {
         /// the JSON array is always emitted on a single line. The open marker
         /// matches the bare token without a trailing space — `parseToolCalls`
         /// already trims leading whitespace so optional spacing is handled.
-        private static func detectToolCallMarkers(
+        fileprivate static func detectToolCallMarkers(
             tokenizer: any Tokenizer
         ) -> (open: String, close: String)? {
             // Standard tag-pair formats — both markers must be special tokens.
