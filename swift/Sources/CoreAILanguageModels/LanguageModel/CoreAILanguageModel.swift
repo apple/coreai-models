@@ -45,7 +45,7 @@ public struct CoreAILanguageModel: LanguageModel {
     public var capabilities: LanguageModelCapabilities {
         var caps: [LanguageModelCapabilities.Capability] = []
         if supportsToolCalling { caps.append(.toolCalling) }
-        if supportsReasoning   { caps.append(.reasoning) }
+        if supportsReasoning { caps.append(.reasoning) }
         if engine.supportsLogits { caps.append(.guidedGeneration) }
         return LanguageModelCapabilities(capabilities: caps)
     }
@@ -210,7 +210,8 @@ public struct CoreAILanguageModel: LanguageModel {
                 ("<tool_call>", "</tool_call>"),
                 ("<function_calls>", "</function_calls>"),
             ]
-            for pair in tagPairs where tokenizer.convertTokenToId(pair.open) != nil
+            for pair in tagPairs
+            where tokenizer.convertTokenToId(pair.open) != nil
                 && tokenizer.convertTokenToId(pair.close) != nil
             {
                 return pair
@@ -577,7 +578,8 @@ public struct CoreAILanguageModel: LanguageModel {
             from entries: [Transcript.Entry],
             using tokenizer: any Tokenizer,
             tools: [Transcript.ToolDefinition] = [],
-            component: String = "CoreAIExecutor"        ) -> [Int] {
+            component: String = "CoreAIExecutor"
+        ) -> [Int] {
             var messages: [Message] = []
 
             for entry in entries {
@@ -676,26 +678,26 @@ public struct CoreAILanguageModel: LanguageModel {
 
             init(_ value: Any) {
                 switch value {
-                case let s as String:        self = .string(s)
+                case let s as String: self = .string(s)
                 case let n as NSNumber where CFGetTypeID(n) == CFBooleanGetTypeID():
                     self = .bool(n.boolValue)
                 case let n as NSNumber:
                     let d = n.doubleValue
                     self = (d == d.rounded() && !d.isInfinite) ? .int(n.intValue) : .double(d)
-                case let a as [Any]:         self = .array(a.map { JSONValue($0) })
+                case let a as [Any]: self = .array(a.map { JSONValue($0) })
                 case let o as [String: Any]: self = .object(o.mapValues { JSONValue($0) })
-                default:                     self = .null
+                default: self = .null
                 }
             }
 
             var sendable: any Sendable {
                 switch self {
                 case .string(let v): return v
-                case .int(let v):    return v
+                case .int(let v): return v
                 case .double(let v): return v
-                case .bool(let v):   return v
-                case .null:          return NSNull()
-                case .array(let v):  return v.map(\.sendable)
+                case .bool(let v): return v
+                case .null: return NSNull()
+                case .array(let v): return v.map(\.sendable)
                 case .object(let v): return v.mapValues(\.sendable)
                 }
             }
