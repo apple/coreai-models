@@ -53,47 +53,52 @@ class MockEngine: InferenceEngine, @unchecked Sendable {
         with input: [TokenId],
         samplingConfiguration: SamplingConfiguration,
         inferenceOptions: InferenceOptions
-    ) throws -> AsyncThrowingStream<InferenceOutput, Error> {
-        AsyncThrowingStream { continuation in
-            Task {
-                do {
-                    let forced = inferenceOptions.forcedContinuation
-                    let maxTokens =
-                        forced?.count
-                        ?? min(
-                            inferenceOptions.maxTokens ?? Int.max,
-                            max(0, self.config.maxContextLength - input.count)
-                        )
-                    let returnsLogits = inferenceOptions.includeLogits
+    ) throws -> InferenceStream {
+        let (stream, continuation) = InferenceStream.makeStream()
+        Task {
+            do {
+                let forced = inferenceOptions.forcedContinuation
+                let maxTokens =
+                    forced?.count
+                    ?? min(
+                        inferenceOptions.maxTokens ?? Int.max,
+                        max(0, self.config.maxContextLength - input.count)
+                    )
+                let returnsLogits = inferenceOptions.includeLogits
 
-                    for i in 0..<maxTokens {
-                        try Task.checkCancellation()
-                        let idx = self.inferenceCallCount % self.tokenSequence.count
-                        let sequenceToken = self.tokenSequence[idx]
-                        self.inferenceCallCount += 1
+                for i in 0..<maxTokens {
+                    try Task.checkCancellation()
+                    let idx = self.inferenceCallCount % self.tokenSequence.count
+                    let sequenceToken = self.tokenSequence[idx]
+                    self.inferenceCallCount += 1
 
-                        let nextToken = forced?[i] ?? sequenceToken
+                    let nextToken = forced?[i] ?? sequenceToken
 
-                        let logits: [Float16]?
-                        if returnsLogits, let vocabSize = self.vocabSize {
-                            var dist = [Float16](repeating: Float16(-10.0), count: vocabSize)
-                            let tokenIdx = Int(nextToken)
-                            if tokenIdx >= 0 && tokenIdx < vocabSize {
-                                dist[tokenIdx] = Float16(10.0)
-                            }
-                            logits = dist
-                        } else {
-                            logits = nil
+                    let logits: [Float16]?
+                    if returnsLogits, let vocabSize = self.vocabSize {
+                        var dist = [Float16](repeating: Float16(-10.0), count: vocabSize)
+                        let tokenIdx = Int(nextToken)
+                        if tokenIdx >= 0 && tokenIdx < vocabSize {
+                            dist[tokenIdx] = Float16(10.0)
                         }
-
-                        continuation.yield(InferenceOutput(tokenId: nextToken, logits: logits))
+                        logits = dist
+                    } else {
+                        logits = nil
                     }
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
+
+                    continuation.yield(InferenceOutput(tokenId: nextToken, logits: logits))
                 }
+                stream.setStopReason(.maxTokens)
+                continuation.finish()
+            } catch is CancellationError {
+                stream.setStopReason(.cancelled)
+                continuation.finish()
+            } catch {
+                stream.setStopReason(.error)
+                continuation.finish(throwing: error)
             }
         }
+        return stream
     }
 
     func reset() async throws {

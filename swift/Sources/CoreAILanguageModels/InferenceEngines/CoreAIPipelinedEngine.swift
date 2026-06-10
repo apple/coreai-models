@@ -87,7 +87,7 @@ final class CoreAIPipelinedEngine: InferenceEngine, Sendable {
         with input: [TokenId],
         samplingConfiguration: SamplingConfiguration,
         inferenceOptions: InferenceOptions
-    ) throws -> some AsyncSequence<InferenceOutput, Error> {
+    ) throws -> InferenceStream {
         if inferenceOptions.includeLogits {
             throw InferenceRuntimeError.invalidArgument(
                 "CoreAI pipelined engine does not support logits (GPU-side sampling). "
@@ -101,18 +101,14 @@ final class CoreAIPipelinedEngine: InferenceEngine, Sendable {
             )
         }
         let maxTokens = inferenceOptions.maxTokens
-        let (stream, outputContinuation) = AsyncThrowingStream<InferenceOutput, any Error>.makeStream()
+        let (inferenceStream, outputContinuation) = InferenceStream.makeStream()
         Task {
             self.acquireEngine()
             defer { self.releaseEngine() }
             do {
-                // Bridge: runCompletion yields TokenId via a TokenId continuation.
-                // We wrap each token into InferenceOutput in the yield callback.
                 let (tokenStream, tokenContinuation) =
                     AsyncThrowingStream<InferenceEngine.TokenId, any Error>.makeStream()
 
-                // Forward tokens from tokenStream → outputContinuation as InferenceOutput.
-                // This must run concurrently with runCompletion.
                 async let forwarding: Void = {
                     do {
                         for try await token in tokenStream {
@@ -131,12 +127,17 @@ final class CoreAIPipelinedEngine: InferenceEngine, Sendable {
                 )
                 tokenContinuation.finish()
                 await forwarding
+                inferenceStream.setStopReason(.maxTokens)
+                outputContinuation.finish()
+            } catch is CancellationError {
+                inferenceStream.setStopReason(.cancelled)
                 outputContinuation.finish()
             } catch {
+                inferenceStream.setStopReason(.error)
                 outputContinuation.finish(throwing: error)
             }
         }
-        return stream
+        return inferenceStream
     }
 
     /// Wait for any in-flight generate() Task to return the engine.

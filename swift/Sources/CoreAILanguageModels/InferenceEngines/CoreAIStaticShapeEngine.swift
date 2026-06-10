@@ -316,48 +316,51 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         with input: [TokenId],
         samplingConfiguration: SamplingConfiguration,
         inferenceOptions: InferenceOptions
-    ) throws -> some AsyncSequence<InferenceOutput, Error> {
-        AsyncThrowingStream { continuation in
-            Task {
-                do {
-                    let forced = inferenceOptions.forcedContinuation
-                    let maxTokens: Int
-                    if let forced {
-                        maxTokens = forced.count
-                    } else {
-                        maxTokens = min(
-                            inferenceOptions.maxTokens ?? Int.max,
-                            max(0, self.config.maxContextLength - input.count)
-                        )
-                    }
-                    let returnsLogits = inferenceOptions.includeLogits
-                    var inputTokens = input
-
-                    for i in 0..<maxTokens {
-                        try Task.checkCancellation()
-                        // When forced, we still need the forward pass (for logits + KV cache update)
-                        // but skip the sampler — the next token is predetermined.
-                        let (logits, sampledToken) = try await self.inference(
-                            inputTokens: inputTokens,
-                            samplingConfig: samplingConfiguration,
-                            returnsLogits: returnsLogits || forced != nil
-                        )
-
-                        let nextToken = forced?[i] ?? sampledToken
-
-                        continuation.yield(
-                            InferenceOutput(
-                                tokenId: nextToken,
-                                logits: returnsLogits ? logits : nil
-                            ))
-                        inputTokens.append(nextToken)
-                    }
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
+    ) throws -> InferenceStream {
+        let (stream, continuation) = InferenceStream.makeStream()
+        Task {
+            do {
+                let forced = inferenceOptions.forcedContinuation
+                let maxTokens: Int
+                if let forced {
+                    maxTokens = forced.count
+                } else {
+                    maxTokens = min(
+                        inferenceOptions.maxTokens ?? Int.max,
+                        max(0, self.config.maxContextLength - input.count)
+                    )
                 }
+                let returnsLogits = inferenceOptions.includeLogits
+                var inputTokens = input
+
+                for i in 0..<maxTokens {
+                    try Task.checkCancellation()
+                    let (logits, sampledToken) = try await self.inference(
+                        inputTokens: inputTokens,
+                        samplingConfig: samplingConfiguration,
+                        returnsLogits: returnsLogits || forced != nil
+                    )
+
+                    let nextToken = forced?[i] ?? sampledToken
+
+                    continuation.yield(
+                        InferenceOutput(
+                            tokenId: nextToken,
+                            logits: returnsLogits ? logits : nil
+                        ))
+                    inputTokens.append(nextToken)
+                }
+                stream.setStopReason(.maxTokens)
+                continuation.finish()
+            } catch is CancellationError {
+                stream.setStopReason(.cancelled)
+                continuation.finish()
+            } catch {
+                stream.setStopReason(.error)
+                continuation.finish(throwing: error)
             }
         }
+        return stream
     }
 
     // MARK: - Inference

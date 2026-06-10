@@ -338,72 +338,77 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         with input: [TokenId],
         samplingConfiguration: SamplingConfiguration,
         inferenceOptions: InferenceOptions
-    ) throws -> some AsyncSequence<InferenceOutput, Error> {
-        AsyncThrowingStream { continuation in
-            Task {
-                self.generating.withLock { $0 = true }
-                defer { self.generating.withLock { $0 = false } }
-                do {
-                    let maxTokens: Int
-                    if let forced = inferenceOptions.forcedContinuation {
-                        maxTokens = forced.count
-                    } else {
-                        maxTokens = min(
-                            inferenceOptions.maxTokens ?? Int.max,
-                            max(0, self.config.maxContextLength - input.count)
-                        )
-                    }
-                    let returnsLogits = inferenceOptions.includeLogits
-                    var inputTokens = input
-
-                    for i in 0..<maxTokens {
-                        try Task.checkCancellation()
-
-                        guard self.processedTokenCount < inputTokens.count else {
-                            throw InferenceRuntimeError.invalidState("No new tokens to process")
-                        }
-
-                        let newTokens = inputTokens[self.processedTokenCount...]
-                        let strategy = self.selectPrefillStrategy(newTokenCount: newTokens.count)
-
-                        let logitBuffer: [LogitsScalarType]
-                        switch strategy {
-                        case .chunked(let chunkSize):
-                            logitBuffer = try await self.processChunkedPrompt(
-                                tokens: newTokens, chunkSize: chunkSize)
-                        case .wholeBatch:
-                            let allLogits = try await self.processTokenBatch(newTokens)
-                            logitBuffer = lastTokenLogits(
-                                from: allLogits, vocabSize: self.config.vocabSize)
-                        case .oneAtATime:
-                            var lastLogits: [LogitsScalarType] = []
-                            for j in newTokens.indices {
-                                lastLogits = try await self.processTokenBatch(newTokens[j...j])
-                            }
-                            logitBuffer = lastLogits
-                        }
-
-                        let nextToken: Int32
-                        if let forced = inferenceOptions.forcedContinuation {
-                            nextToken = forced[i]
-                        } else {
-                            var mutableLogits = logitBuffer
-                            nextToken = samplingConfiguration.fallbackSampler(from: &mutableLogits)
-                        }
-
-                        continuation.yield(
-                            InferenceOutput(
-                                tokenId: nextToken,
-                                logits: returnsLogits ? logitBuffer : nil
-                            ))
-                        inputTokens.append(nextToken)
-                    }
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
+    ) throws -> InferenceStream {
+        let (stream, continuation) = InferenceStream.makeStream()
+        Task {
+            self.generating.withLock { $0 = true }
+            defer { self.generating.withLock { $0 = false } }
+            do {
+                let maxTokens: Int
+                if let forced = inferenceOptions.forcedContinuation {
+                    maxTokens = forced.count
+                } else {
+                    maxTokens = min(
+                        inferenceOptions.maxTokens ?? Int.max,
+                        max(0, self.config.maxContextLength - input.count)
+                    )
                 }
+                let returnsLogits = inferenceOptions.includeLogits
+                var inputTokens = input
+
+                for i in 0..<maxTokens {
+                    try Task.checkCancellation()
+
+                    guard self.processedTokenCount < inputTokens.count else {
+                        throw InferenceRuntimeError.invalidState("No new tokens to process")
+                    }
+
+                    let newTokens = inputTokens[self.processedTokenCount...]
+                    let strategy = self.selectPrefillStrategy(newTokenCount: newTokens.count)
+
+                    let logitBuffer: [LogitsScalarType]
+                    switch strategy {
+                    case .chunked(let chunkSize):
+                        logitBuffer = try await self.processChunkedPrompt(
+                            tokens: newTokens, chunkSize: chunkSize)
+                    case .wholeBatch:
+                        let allLogits = try await self.processTokenBatch(newTokens)
+                        logitBuffer = lastTokenLogits(
+                            from: allLogits, vocabSize: self.config.vocabSize)
+                    case .oneAtATime:
+                        var lastLogits: [LogitsScalarType] = []
+                        for j in newTokens.indices {
+                            lastLogits = try await self.processTokenBatch(newTokens[j...j])
+                        }
+                        logitBuffer = lastLogits
+                    }
+
+                    let nextToken: Int32
+                    if let forced = inferenceOptions.forcedContinuation {
+                        nextToken = forced[i]
+                    } else {
+                        var mutableLogits = logitBuffer
+                        nextToken = samplingConfiguration.fallbackSampler(from: &mutableLogits)
+                    }
+
+                    continuation.yield(
+                        InferenceOutput(
+                            tokenId: nextToken,
+                            logits: returnsLogits ? logitBuffer : nil
+                        ))
+                    inputTokens.append(nextToken)
+                }
+                stream.setStopReason(.maxTokens)
+                continuation.finish()
+            } catch is CancellationError {
+                stream.setStopReason(.cancelled)
+                continuation.finish()
+            } catch {
+                stream.setStopReason(.error)
+                continuation.finish(throwing: error)
             }
         }
+        return stream
     }
 
     // MARK: - Lifecycle
