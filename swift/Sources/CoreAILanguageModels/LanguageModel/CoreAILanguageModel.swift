@@ -35,16 +35,19 @@ public struct CoreAILanguageModel: LanguageModel {
     private let modelIdentifier: String
     private let samplingConfig: SamplingConfiguration
     private let vocabSize: Int?
+    private let supportsToolCalling: Bool
+    private let supportsReasoning: Bool
 
     // MARK: - Protocol Requirements
 
     public typealias Executor = CoreAIExecutor
 
     public var capabilities: LanguageModelCapabilities {
-        if engine.supportsLogits {
-            return LanguageModelCapabilities(capabilities: [.guidedGeneration])
-        }
-        return LanguageModelCapabilities(capabilities: [])
+        var caps: [LanguageModelCapabilities.Capability] = []
+        if supportsToolCalling { caps.append(.toolCalling) }
+        if supportsReasoning   { caps.append(.reasoning) }
+        if engine.supportsLogits { caps.append(.guidedGeneration) }
+        return LanguageModelCapabilities(capabilities: caps)
     }
 
     public var executorConfiguration: CoreAIExecutor.Configuration {
@@ -101,61 +104,13 @@ public struct CoreAILanguageModel: LanguageModel {
         self.modelIdentifier = modelIdentifier
         self.samplingConfig = samplingConfig
         self.vocabSize = vocabSize
-    }
-
-    // MARK: - Helper Methods
-
-    /// Converts transcript entries to tokens using the provided tokenizer.
-    /// Shared implementation used by both `CoreAILanguageModel` and `CoreAIExecutor`.
-    static func transcriptToTokens(
-        _ entries: [Transcript.Entry],
-        using tokenizer: any Tokenizer,
-        component: String = "CoreAILanguageModel"
-    ) -> [Int]? {
-        var messages: [[String: String]] = []
-
-        for entry in entries {
-            switch entry {
-            case .instructions(let instructions):
-                for segment in instructions.segments {
-                    if case .text(let text) = segment {
-                        messages.append(["role": "system", "content": text.content])
-                    }
-                }
-
-            case .prompt(let prompt):
-                for segment in prompt.segments {
-                    if case .text(let text) = segment {
-                        messages.append(["role": "user", "content": text.content])
-                    }
-                }
-
-            case .response(let response):
-                for segment in response.segments {
-                    if case .text(let text) = segment {
-                        messages.append(["role": "assistant", "content": text.content])
-                    }
-                }
-
-            default:
-                continue
-            }
-        }
-
-        if !messages.isEmpty {
-            do {
-                CLILogger.log("Applying chat template via tokenizer", component: component)
-                return try tokenizer.applyChatTemplate(messages: messages)
-            } catch {
-                CLILogger.log(
-                    "Failed to apply chat template: \(error), falling back to simple encoding",
-                    component: component)
-                let text = messages.compactMap { $0["content"] }.joined(separator: "\n")
-                return tokenizer.encode(text: text)
-            }
-        }
-
-        return nil
+        self.supportsToolCalling =
+            tokenizer.convertTokenToId("<tool_call>") != nil
+            || tokenizer.convertTokenToId("<function_calls>") != nil
+            || tokenizer.convertTokenToId("[TOOL_CALLS]") != nil
+        self.supportsReasoning =
+            tokenizer.convertTokenToId("<think>") != nil
+            || tokenizer.convertTokenToId("<|reasoning_start|>") != nil
     }
 
     // MARK: - Executor
@@ -194,8 +149,13 @@ public struct CoreAILanguageModel: LanguageModel {
         /// reasoning, the markers still default to `<think>`/`</think>` and
         /// the parser passes everything through as `.text`.
         private let thinkingMarkers: (open: String, close: String)
+        /// Open / close marker pair the model uses for tool call blocks,
+        /// discovered from the tokenizer's known token ids at init
+        /// (see `detectToolCallMarkers`). nil when the model's tokenizer
+        /// has no tool call tokens.
+        private let toolCallMarkers: (open: String, close: String)?
 
-        // MARK: - Initialization (new API)
+        // MARK: - Initialization
 
         public init(configuration: Configuration) throws {
             self.engine = configuration.engine
@@ -204,6 +164,7 @@ public struct CoreAILanguageModel: LanguageModel {
             self.samplingConfig = configuration.samplingConfig
             self.vocabSize = configuration.vocabSize
             self.thinkingMarkers = Self.detectThinkingMarkers(configuration.tokenizer)
+            self.toolCallMarkers = Self.detectToolCallMarkers(tokenizer: configuration.tokenizer)
         }
 
         /// Probes the tokenizer for known reasoning marker pairs. Each
@@ -232,6 +193,37 @@ public struct CoreAILanguageModel: LanguageModel {
                 }
             }
             return ("<think>", "</think>")
+        }
+
+        /// Probes the tokenizer for known tool call marker pairs. Each
+        /// candidate tag-pair is verified to exist as special tokens via
+        /// `convertTokenToId(_:)`. Returns nil when the model's tokenizer
+        /// has no tool call tokens at all.
+        ///
+        /// Mistral uses `[TOOL_CALLS]` as a single special token with no
+        /// paired close token; `"\n"` is used as a synthetic close because
+        /// the JSON array is always emitted on a single line. The open marker
+        /// matches the bare token without a trailing space — `parseToolCalls`
+        /// already trims leading whitespace so optional spacing is handled.
+        private static func detectToolCallMarkers(
+            tokenizer: any Tokenizer
+        ) -> (open: String, close: String)? {
+            // Standard tag-pair formats — both markers must be special tokens.
+            let tagPairs: [(open: String, close: String)] = [
+                ("<tool_call>", "</tool_call>"),
+                ("<function_calls>", "</function_calls>"),
+            ]
+            for pair in tagPairs where tokenizer.convertTokenToId(pair.open) != nil
+                && tokenizer.convertTokenToId(pair.close) != nil
+            {
+                return pair
+            }
+            // Mistral: [TOOL_CALLS] is a special token but has no paired close token.
+            // Use "\n" as a synthetic close — the JSON array is always on a single line.
+            if tokenizer.convertTokenToId("[TOOL_CALLS]") != nil {
+                return (open: "[TOOL_CALLS]", close: "\n")
+            }
+            return nil
         }
 
         // MARK: - Prewarm
@@ -277,13 +269,13 @@ public struct CoreAILanguageModel: LanguageModel {
         ) async throws {
             // Tokenization span
             let tokenizationSpan = InstrumentsProfiler.beginTokenization(inputLength: 0)
-            guard
-                let promptTokens = CoreAILanguageModel.transcriptToTokens(
-                    Array(request.transcript),
-                    using: tokenizer,
-                    component: "CoreAIExecutor"
-                )
-            else {
+            let promptTokens = Self.transcriptToTokens(
+                Array(request.transcript),
+                using: tokenizer,
+                tools: request.enabledToolDefinitions,
+                component: "CoreAIExecutor"
+            )
+            guard !promptTokens.isEmpty else {
                 tokenizationSpan.end()
                 throw LanguageModelError.unsupportedTranscriptContent(
                     .init(
@@ -303,10 +295,7 @@ public struct CoreAILanguageModel: LanguageModel {
             try await engine.reset()
 
             // FoundationModels now threads entry identity itself based on event
-            // ordering — we no longer mint an entryID and pass it down. Same for
-            // metadata: updateMetadata is available on every entry type, but
-            // we don't emit any from here today (metadata flows from the
-            // upstream PromptCompletion pipeline once that lands).
+            // ordering — we no longer mint an entryID and pass it down.
 
             // Check if guided generation is requested
             if let schema = request.schema {
@@ -358,10 +347,15 @@ public struct CoreAILanguageModel: LanguageModel {
             // its own `Transcript.Reasoning` entry, not mixed into the
             // user-facing `Transcript.Response`. Markers were resolved at
             // executor init from the tokenizer's known token ids.
-            var parser = ThinkTagParser(
+            var thinkParser = ThinkTagParser(
                 open: thinkingMarkers.open,
                 close: thinkingMarkers.close
             )
+            // Routes tool call markup to .toolCalls(...) channel events.
+            // nil when the model's tokenizer has no tool call tokens.
+            var toolCallParser: ToolCallParser? = toolCallMarkers.map {
+                ToolCallParser(open: $0.open, close: $0.close)
+            }
             var generatedTokenCount: Int = 0
 
             for try await output in tokenStream {
@@ -398,8 +392,8 @@ public struct CoreAILanguageModel: LanguageModel {
                     continue
                 }
 
-                for event in parser.consume(delta) {
-                    await dispatch(event, channel: channel)
+                for event in thinkParser.consume(delta) {
+                    await dispatch(event: event, toolCallParser: &toolCallParser, channel: channel)
                 }
 
                 // Retain the last token as O(1) context for the next decode.
@@ -408,7 +402,7 @@ public struct CoreAILanguageModel: LanguageModel {
                 // new token in isolation and drops inter-word spaces.
                 // Keeping one token bounds re-decode cost to 2 tokens per step.
                 // Safe for all supported tokenizers: decode([last]) is a prefix of
-                // decode([last, next]) when addPrefixSpace=true (Mistral, Qwen)
+                // decode([last, next]) when addPrefixSpace=true (Mistral, Llama, Qwen)
                 // and for ByteLevel tokenizers (GPT-2 style) where spaces are direct bytes.
                 if let last = pendingTokens.last {
                     pendingTokens = [last]
@@ -419,11 +413,17 @@ public struct CoreAILanguageModel: LanguageModel {
                 }
             }
 
-            // Flush any buffered content the parser was holding back for a
-            // possible marker match. Without this, content right at the EOS
-            // boundary (or inside an unclosed `<think>` block) would be lost.
-            for event in parser.flush() {
-                await dispatch(event, channel: channel)
+            // Flush parsers — drains any content held back waiting for a marker.
+            // Without this, content right at the EOS boundary (or inside an
+            // unclosed block) would be lost.
+            for event in thinkParser.flush() {
+                await dispatch(event: event, toolCallParser: &toolCallParser, channel: channel)
+            }
+            if var tcp = toolCallParser {
+                for event in tcp.flush() {
+                    await dispatchToolCall(for: event, channel: channel)
+                }
+                toolCallParser = tcp
             }
 
             // Usage telemetry placeholder — awaiting Usage(input:output:) API.
@@ -435,27 +435,65 @@ public struct CoreAILanguageModel: LanguageModel {
             await Task.yield()
         }
 
-        /// Routes a parser event to the matching FoundationModels channel
-        /// event. Text becomes `.response(...).appendText`; reasoning becomes
-        /// a top-level `.reasoning(...).appendText`. Reasoning is a sibling
-        /// of response/tool-calls in the new API (not nested under response)
+        // MARK: - Event Dispatch
+
+        /// Routes a parser event to the matching FoundationModels channel event.
+        /// Text is forwarded to the tool call parser (if present) or emitted as
+        /// `.response(...).appendText`. Reasoning becomes a top-level
+        /// `.reasoning(...).appendText`. Reasoning is a sibling of
+        /// response/tool-calls in the new API (not nested under response)
         /// because at parse time we don't yet know whether the model will
         /// follow the thought block with a response or a tool call.
         ///
         /// We deliberately do not pass `entryID` — FoundationModels threads
         /// entry identity itself based on event ordering.
         private func dispatch(
-            _ event: ThinkTagParser.Event,
+            event: ThinkTagParser.Event,
+            toolCallParser: inout ToolCallParser?,
+            channel: LanguageModelExecutorGenerationChannel
+        ) async {
+            switch event {
+            case .reasoning(let text):
+                await channel.send(
+                    .reasoning(action: .appendText(text, tokenCount: 1))
+                )
+            case .text(let text):
+                if var tcp = toolCallParser {
+                    for toolEvent in tcp.consume(text) {
+                        await dispatchToolCall(for: toolEvent, channel: channel)
+                    }
+                    toolCallParser = tcp
+                } else if !text.isEmpty {
+                    await channel.send(
+                        .response(action: .appendText(text, tokenCount: 1))
+                    )
+                }
+            }
+        }
+
+        private func dispatchToolCall(
+            for event: ToolCallParser.Event,
             channel: LanguageModelExecutorGenerationChannel
         ) async {
             switch event {
             case .text(let text):
+                if !text.isEmpty {
+                    await channel.send(
+                        .response(action: .appendText(text, tokenCount: 1))
+                    )
+                }
+            case .toolCall(let id, let name, let argsJSON):
+                CLILogger.log(
+                    "ToolCallParser: dispatching tool call id=\(id) name=\(name) args=\(argsJSON)",
+                    component: "CoreAIExecutor")
                 await channel.send(
-                    .response(action: .appendText(text, tokenCount: 1))
-                )
-            case .reasoning(let text):
-                await channel.send(
-                    .reasoning(action: .appendText(text, tokenCount: 1))
+                    .toolCalls(
+                        action: .toolCall(
+                            id: id,
+                            name: name,
+                            action: .appendArguments(argsJSON, tokenCount: 1)
+                        )
+                    )
                 )
             }
         }
@@ -503,6 +541,175 @@ public struct CoreAILanguageModel: LanguageModel {
             // Yield to let the engine's tokenSequence Task finish cleanup
             // (putBackEngine, state reset, etc.) before the next respond().
             await Task.yield()
+        }
+
+        // MARK: - Transcript → Tokens
+
+        /// Tool call entry for the assistant message's `tool_calls` array.
+        private struct ToolCallEntry: Sendable {
+            let id: String
+            let name: String
+            let arguments: String
+
+            var message: [String: any Sendable] {
+                [
+                    "id": id,
+                    "type": "function",
+                    "function": ["name": name, "arguments": arguments] as [String: any Sendable],
+                ]
+            }
+        }
+
+        /// Converts transcript entries to tokens using the provided tokenizer.
+        ///
+        /// Handles all entry types including prior tool calls and tool outputs.
+        /// Tool definitions are forwarded to `applyChatTemplate` so the model
+        /// sees the available functions in the system prompt.
+        static func transcriptToTokens(
+            _ entries: [Transcript.Entry],
+            using tokenizer: any Tokenizer,
+            tools: [Transcript.ToolDefinition] = [],
+            component: String = "CoreAIExecutor"
+        ) -> [Int] {
+            var messages: [Message] = []
+
+            for entry in entries {
+                switch entry {
+                case .instructions(let instructions):
+                    let text = instructions.segments.compactMap {
+                        if case .text(let t) = $0 { return t.content }
+                        return nil
+                    }.joined(separator: "\n")
+                    if !text.isEmpty {
+                        messages.append(["role": "system", "content": text])
+                    }
+
+                case .prompt(let prompt):
+                    let text = prompt.segments.compactMap {
+                        if case .text(let t) = $0 { return t.content }
+                        return nil
+                    }.joined()
+                    if !text.isEmpty {
+                        messages.append(["role": "user", "content": text])
+                    }
+
+                case .response(let response):
+                    let text = response.segments.compactMap {
+                        if case .text(let t) = $0 { return t.content }
+                        return nil
+                    }.joined()
+                    if !text.isEmpty {
+                        messages.append(["role": "assistant", "content": text])
+                    }
+
+                case .toolCalls(let toolCalls):
+                    let calls = toolCalls.map {
+                        ToolCallEntry(id: $0.id, name: $0.toolName, arguments: $0.arguments.jsonString)
+                    }
+                    messages.append([
+                        "role": "assistant",
+                        "content": "" as any Sendable,
+                        "tool_calls": calls.map(\.message) as any Sendable,
+                    ])
+
+                case .toolOutput(let output):
+                    // Tool result turn.
+                    let content = output.segments.compactMap { segment -> String? in
+                        if case .text(let t) = segment { return t.content }
+                        return nil
+                    }.joined()
+                    messages.append([
+                        "role": "tool",
+                        "tool_call_id": output.id,
+                        "name": output.toolName,
+                        "content": content,
+                    ])
+
+                case .reasoning:
+                    // Don't echo the model's prior reasoning back into the prompt.
+                    continue
+
+                @unknown default:
+                    continue
+                }
+            }
+
+            if messages.isEmpty { return [] }
+
+            let toolSpecs: [ToolSpec]? = tools.isEmpty ? nil : tools.compactMap { makeToolSpec(from: $0) }
+
+            do {
+                CLILogger.log("Applying chat template via tokenizer", component: component)
+                return try tokenizer.applyChatTemplate(messages: messages, tools: toolSpecs)
+            } catch {
+                CLILogger.log(
+                    "Failed to apply chat template: \(error), falling back to simple encoding",
+                    component: component)
+                let text = messages.compactMap { $0["content"] as? String }.joined(separator: "\n")
+                return tokenizer.encode(text: text)
+            }
+        }
+
+        /// Converts a `ToolDefinition` into the `ToolSpec` format expected by
+        /// `applyChatTemplate`. Parameters are decoded into a typed `JSONValue`
+        /// tree — avoids passing raw `Any` through the codebase.
+        private static func makeToolSpec(from definition: Transcript.ToolDefinition) -> ToolSpec? {
+            guard
+                let schemaData = try? JSONEncoder().encode(definition.parameters),
+                let rawObj = try? JSONSerialization.jsonObject(with: schemaData),
+                let dict = rawObj as? [String: Any]
+            else {
+                CLILogger.log(
+                    "Failed to encode parameters for tool '\(definition.name)'",
+                    component: "CoreAIExecutor")
+                return nil
+            }
+            let function: [String: any Sendable] = [
+                "name": definition.name,
+                "description": definition.description,
+                "parameters": dict.mapValues { JSONValue($0).sendable },
+            ]
+            return ["type": "function", "function": function]
+        }
+
+        /// Typed, `Sendable` representation of an arbitrary JSON value.
+        ///
+        /// Bridges the `NSObject`-bridged output of `JSONSerialization` into an
+        /// explicit Swift enum so nothing untyped escapes into the rest of the code.
+        private indirect enum JSONValue: Sendable {
+            case string(String)
+            case int(Int)
+            case double(Double)
+            case bool(Bool)
+            case array([JSONValue])
+            case object([String: JSONValue])
+            case null
+
+            init(_ value: Any) {
+                switch value {
+                case let s as String:        self = .string(s)
+                case let n as NSNumber where CFGetTypeID(n) == CFBooleanGetTypeID():
+                    self = .bool(n.boolValue)
+                case let n as NSNumber:
+                    let d = n.doubleValue
+                    self = (d == d.rounded() && !d.isInfinite) ? .int(n.intValue) : .double(d)
+                case let a as [Any]:         self = .array(a.map { JSONValue($0) })
+                case let o as [String: Any]: self = .object(o.mapValues { JSONValue($0) })
+                default:                     self = .null
+                }
+            }
+
+            var sendable: any Sendable {
+                switch self {
+                case .string(let v): return v
+                case .int(let v):    return v
+                case .double(let v): return v
+                case .bool(let v):   return v
+                case .null:          return NSNull()
+                case .array(let v):  return v.map(\.sendable)
+                case .object(let v): return v.mapValues(\.sendable)
+                }
+            }
         }
 
         // MARK: - Helper Methods
