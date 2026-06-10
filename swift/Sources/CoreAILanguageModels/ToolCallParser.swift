@@ -15,11 +15,11 @@ struct ToolCallParser {
     private let openMarker: String
     private let closeMarker: String
     private var buffer: String = ""
-    private var insideToolCall: Bool = false
+    private var isInsideToolCall: Bool = false
 
-    init(open: String = "<tool_call>", close: String = "</tool_call>") {
-        self.openMarker = open
-        self.closeMarker = close
+    init(openMarker: String = "<tool_call>", closeMarker: String = "</tool_call>") {
+        self.openMarker = openMarker
+        self.closeMarker = closeMarker
     }
 
     mutating func consume(_ delta: String) -> [Event] {
@@ -40,21 +40,17 @@ struct ToolCallParser {
 
     private mutating func drain(isFinal: Bool) -> [Event] {
         var events: [Event] = []
-        while true {
-            let marker = insideToolCall ? closeMarker : openMarker
-            if let range = buffer.range(of: marker) {
-                processMarker(at: range, events: &events)
-                insideToolCall.toggle()
-            } else {
-                processRemainder(isFinal: isFinal, events: &events)
-                return events
-            }
+        while let range = buffer.range(of: isInsideToolCall ? closeMarker : openMarker) {
+            processMarker(at: range, events: &events)
+            isInsideToolCall.toggle()
         }
+        processRemainder(of: &events, isFinal: isFinal)
+        return events
     }
 
     private mutating func processMarker(at range: Range<String.Index>, events: inout [Event]) {
         let before = String(buffer[buffer.startIndex..<range.lowerBound])
-        if insideToolCall {
+        if isInsideToolCall {
             events.append(contentsOf: parseToolCalls(from: before))
         } else if !before.isEmpty {
             events.append(.text(before))
@@ -62,8 +58,8 @@ struct ToolCallParser {
         buffer = String(buffer[range.upperBound...])
     }
 
-    private mutating func processRemainder(isFinal: Bool, events: inout [Event]) {
-        if insideToolCall {
+    private mutating func processRemainder(of events: inout [Event], isFinal: Bool) {
+        if isInsideToolCall {
             guard isFinal else { return }
             // Newline-terminated formats (e.g. Mistral) have no dedicated close
             // token — the block ends at EOS. Try to parse what we have.
@@ -133,4 +129,3 @@ struct ToolCallParser {
         return buffer.endIndex
     }
 }
-

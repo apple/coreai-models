@@ -104,7 +104,7 @@ public struct CoreAILanguageModel: LanguageModel {
         self.modelIdentifier = modelIdentifier
         self.samplingConfig = samplingConfig
         self.vocabSize = vocabSize
-        self.supportsToolCalling = CoreAIExecutor.detectToolCallMarkers(tokenizer: tokenizer) != nil
+        self.supportsToolCalling = CoreAIExecutor.detectToolCallMarkers(using: tokenizer) != nil
         self.supportsReasoning =
             tokenizer.convertTokenToId("<think>") != nil
             || tokenizer.convertTokenToId("<|reasoning_start|>") != nil
@@ -160,8 +160,8 @@ public struct CoreAILanguageModel: LanguageModel {
             self.modelIdentifier = configuration.modelIdentifier
             self.samplingConfig = configuration.samplingConfig
             self.vocabSize = configuration.vocabSize
-            self.thinkingMarkers = Self.detectThinkingMarkers(configuration.tokenizer)
-            self.toolCallMarkers = Self.detectToolCallMarkers(tokenizer: configuration.tokenizer)
+            self.thinkingMarkers = Self.detectThinkingMarkers(using: configuration.tokenizer)
+            self.toolCallMarkers = Self.detectToolCallMarkers(using: configuration.tokenizer)
         }
 
         /// Probes the tokenizer for known reasoning marker pairs. Each
@@ -176,7 +176,7 @@ public struct CoreAILanguageModel: LanguageModel {
         /// gpt-oss / Harmony), a different parser is needed; this one
         /// covers the `<open>...</close>` shape.
         private static func detectThinkingMarkers(
-            _ tokenizer: any Tokenizer
+            using tokenizer: some Tokenizer
         ) -> (open: String, close: String) {
             let candidates: [(open: String, close: String)] = [
                 ("<think>", "</think>"),
@@ -203,7 +203,7 @@ public struct CoreAILanguageModel: LanguageModel {
         /// matches the bare token without a trailing space — `parseToolCalls`
         /// already trims leading whitespace so optional spacing is handled.
         fileprivate static func detectToolCallMarkers(
-            tokenizer: any Tokenizer
+            using tokenizer: some Tokenizer
         ) -> (open: String, close: String)? {
             // Standard tag-pair formats — both markers must be special tokens.
             let tagPairs: [(open: String, close: String)] = [
@@ -266,8 +266,8 @@ public struct CoreAILanguageModel: LanguageModel {
         ) async throws {
             // Tokenization span
             let tokenizationSpan = InstrumentsProfiler.beginTokenization(inputLength: 0)
-            let promptTokens = Self.transcriptToTokens(
-                Array(request.transcript),
+            let promptTokens = Self.makeTokens(
+                from: Array(request.transcript),
                 using: tokenizer,
                 tools: request.enabledToolDefinitions,
                 component: "CoreAIExecutor"
@@ -351,7 +351,7 @@ public struct CoreAILanguageModel: LanguageModel {
             // Routes tool call markup to .toolCalls(...) channel events.
             // nil when the model's tokenizer has no tool call tokens.
             var toolCallParser: ToolCallParser? = toolCallMarkers.map {
-                ToolCallParser(open: $0.open, close: $0.close)
+                ToolCallParser(openMarker: $0.open, closeMarker: $0.close)
             }
             var generatedTokenCount: Int = 0
 
@@ -542,6 +542,17 @@ public struct CoreAILanguageModel: LanguageModel {
 
         // MARK: - Transcript → Tokens
 
+        /// Extracts plain text from a segment collection, joining with `separator`.
+        private static func textContent(
+            of segments: some Collection<Transcript.Segment>,
+            separator: String = ""
+        ) -> String {
+            segments.compactMap {
+                if case .text(let t) = $0 { return t.content }
+                return nil
+            }.joined(separator: separator)
+        }
+
         /// Tool call entry for the assistant message's `tool_calls` array.
         private struct ToolCallEntry: Sendable {
             let id: String
@@ -562,42 +573,26 @@ public struct CoreAILanguageModel: LanguageModel {
         /// Handles all entry types including prior tool calls and tool outputs.
         /// Tool definitions are forwarded to `applyChatTemplate` so the model
         /// sees the available functions in the system prompt.
-        static func transcriptToTokens(
-            _ entries: [Transcript.Entry],
+        static func makeTokens(
+            from entries: [Transcript.Entry],
             using tokenizer: any Tokenizer,
             tools: [Transcript.ToolDefinition] = [],
-            component: String = "CoreAIExecutor"
-        ) -> [Int] {
+            component: String = "CoreAIExecutor"        ) -> [Int] {
             var messages: [Message] = []
 
             for entry in entries {
                 switch entry {
                 case .instructions(let instructions):
-                    let text = instructions.segments.compactMap {
-                        if case .text(let t) = $0 { return t.content }
-                        return nil
-                    }.joined(separator: "\n")
-                    if !text.isEmpty {
-                        messages.append(["role": "system", "content": text])
-                    }
+                    let text = textContent(of: instructions.segments, separator: "\n")
+                    if !text.isEmpty { messages.append(["role": "system", "content": text]) }
 
                 case .prompt(let prompt):
-                    let text = prompt.segments.compactMap {
-                        if case .text(let t) = $0 { return t.content }
-                        return nil
-                    }.joined()
-                    if !text.isEmpty {
-                        messages.append(["role": "user", "content": text])
-                    }
+                    let text = textContent(of: prompt.segments)
+                    if !text.isEmpty { messages.append(["role": "user", "content": text]) }
 
                 case .response(let response):
-                    let text = response.segments.compactMap {
-                        if case .text(let t) = $0 { return t.content }
-                        return nil
-                    }.joined()
-                    if !text.isEmpty {
-                        messages.append(["role": "assistant", "content": text])
-                    }
+                    let text = textContent(of: response.segments)
+                    if !text.isEmpty { messages.append(["role": "assistant", "content": text]) }
 
                 case .toolCalls(let toolCalls):
                     let calls = toolCalls.map {
@@ -611,10 +606,7 @@ public struct CoreAILanguageModel: LanguageModel {
 
                 case .toolOutput(let output):
                     // Tool result turn.
-                    let content = output.segments.compactMap { segment -> String? in
-                        if case .text(let t) = segment { return t.content }
-                        return nil
-                    }.joined()
+                    let content = textContent(of: output.segments)
                     messages.append([
                         "role": "tool",
                         "tool_call_id": output.id,
