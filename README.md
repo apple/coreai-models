@@ -102,11 +102,16 @@ Alternatively, register the marketplace from a local git checkout:
 codex plugin marketplace add /path/to/coreai-models
 ```
 
-Install the plugin:
+Launch Codex in your workspace:
 
 ```
-codex plugin add coreai-skills@coreai-models
+codex
 ```
+
+Install the plugin through the interactive browser: once the Codex session is
+active in your terminal, open the plugin manager by typing `/plugins`, locate the
+`coreai-models` marketplace tab (use your arrow keys or the built-in search),
+select `coreai-skills`, and choose Install.
 
 #### Gemini CLI
 
