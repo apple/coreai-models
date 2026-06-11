@@ -42,7 +42,7 @@ public struct ConstrainedDecodingStrategy: DecodingStrategy {
         samplingConfiguration: SamplingConfiguration,
         options: InferenceOptions,
         stopSequences: StopSequences
-    ) -> any AsyncSequence<GenerationResult, Error> {
+    ) -> ConstrainedDecodedSequence {
         ConstrainedDecodedSequence(
             jsonSchema: jsonSchema,
             vocabSizeOverride: vocabSizeOverride,

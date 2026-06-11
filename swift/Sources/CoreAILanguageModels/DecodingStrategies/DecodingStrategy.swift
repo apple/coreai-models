@@ -130,6 +130,8 @@ public struct StopSequences: Sendable {
 /// Decoding strategies produce text + optional enrichments (logits, token IDs)
 /// from an inference engine.
 public protocol DecodingStrategy: Sendable {
+    associatedtype ResultSequence: AsyncSequence<GenerationResult, Error>
+
     /// Stream decoded text with optional logits.
     ///
     /// - Parameters:
@@ -147,7 +149,7 @@ public protocol DecodingStrategy: Sendable {
         samplingConfiguration: SamplingConfiguration,
         options: InferenceOptions,
         stopSequences: StopSequences
-    ) -> any AsyncSequence<GenerationResult, Error>
+    ) -> ResultSequence
 }
 
 // MARK: - Decoding Strategy Factory
@@ -160,7 +162,7 @@ public struct DecodingStrategyFactory {
     ///   - parameters: Optional parameters for configuring the strategy
     /// - Returns: A configured decoding strategy instance
     public static func create(type: DecodingType, parameters: DecodingParameters = DecodingParameters())
-        -> DecodingStrategy
+        -> any DecodingStrategy
     {
         switch type {
         case .vanilla:

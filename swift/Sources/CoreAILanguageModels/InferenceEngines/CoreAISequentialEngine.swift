@@ -336,15 +336,13 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         with input: [TokenId],
         samplingConfiguration: SamplingConfiguration,
         inferenceOptions: InferenceOptions
-    ) throws -> InferenceStream {
-        InferenceStream {
-            GenerationSequence(
-                engine: self,
-                input: input,
-                samplingConfiguration: samplingConfiguration,
-                inferenceOptions: inferenceOptions
-            ).makeAsyncIterator()
-        }
+    ) throws -> GenerationSequence {
+        GenerationSequence(
+            engine: self,
+            input: input,
+            samplingConfiguration: samplingConfiguration,
+            inferenceOptions: inferenceOptions
+        )
     }
 
     // MARK: - Lifecycle
@@ -458,7 +456,7 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
 
 extension CoreAISequentialEngine {
     /// Async sequence of `InferenceOutput` produced by `generate()`.
-    public struct GenerationSequence: AsyncSequence {
+    public struct GenerationSequence: InferenceOutputSequence {
         public typealias Element = InferenceOutput
         public typealias Failure = Error
 
@@ -467,12 +465,22 @@ extension CoreAISequentialEngine {
         let samplingConfiguration: SamplingConfiguration
         let inferenceOptions: InferenceOptions
 
+        /// Shared with the iterator so the caller can read why generation ended.
+        let stopReasonStore = StopReasonStore()
+
+        public var stopReason: StopReason? { stopReasonStore.stopReason }
+
+        public func setStopReason(_ reason: StopReason) {
+            stopReasonStore.set(reason)
+        }
+
         public func makeAsyncIterator() -> Iterator {
             Iterator(
                 engine: engine,
                 input: input,
                 samplingConfiguration: samplingConfiguration,
-                inferenceOptions: inferenceOptions
+                inferenceOptions: inferenceOptions,
+                stopReasonStore: stopReasonStore
             )
         }
     }
@@ -488,6 +496,7 @@ extension CoreAISequentialEngine.GenerationSequence {
         private let returnsLogits: Bool
         private let forcedContinuation: [CoreAISequentialEngine.TokenId]?
         private let maxTokens: Int
+        private let stopReasonStore: StopReasonStore
 
         private var inputTokens: [CoreAISequentialEngine.TokenId]
         private var step: Int = 0
@@ -498,12 +507,14 @@ extension CoreAISequentialEngine.GenerationSequence {
             engine: CoreAISequentialEngine,
             input: [CoreAISequentialEngine.TokenId],
             samplingConfiguration: SamplingConfiguration,
-            inferenceOptions: InferenceOptions
+            inferenceOptions: InferenceOptions,
+            stopReasonStore: StopReasonStore
         ) {
             self.engine = engine
             self.samplingConfiguration = samplingConfiguration
             self.returnsLogits = inferenceOptions.includeLogits
             self.forcedContinuation = inferenceOptions.forcedContinuation
+            self.stopReasonStore = stopReasonStore
             self.inputTokens = input
             if let forced = inferenceOptions.forcedContinuation {
                 self.maxTokens = forced.count
@@ -530,6 +541,8 @@ extension CoreAISequentialEngine.GenerationSequence {
             }
 
             guard step < maxTokens else {
+                // Natural exhaustion. Don't clobber a reason a decoder set (e.g. `.eos`).
+                stopReasonStore.setIfUnset(.maxTokens)
                 finishAndRelease()
                 return nil
             }
@@ -574,7 +587,12 @@ extension CoreAISequentialEngine.GenerationSequence {
                     tokenId: nextToken,
                     logits: returnsLogits ? logitBuffer : nil
                 )
+            } catch is CancellationError {
+                stopReasonStore.set(.cancelled)
+                finishAndRelease()
+                throw CancellationError()
             } catch {
+                stopReasonStore.set(.error)
                 finishAndRelease()
                 throw error
             }

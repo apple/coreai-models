@@ -87,7 +87,7 @@ final class CoreAIPipelinedEngine: InferenceEngine, Sendable {
         with input: [TokenId],
         samplingConfiguration: SamplingConfiguration,
         inferenceOptions: InferenceOptions
-    ) throws -> InferenceStream {
+    ) throws -> GenerationSequence {
         if inferenceOptions.includeLogits {
             throw InferenceRuntimeError.invalidArgument(
                 "CoreAI pipelined engine does not support logits (GPU-side sampling). "
@@ -101,7 +101,9 @@ final class CoreAIPipelinedEngine: InferenceEngine, Sendable {
             )
         }
         let maxTokens = inferenceOptions.maxTokens
-        let (inferenceStream, outputContinuation) = InferenceStream.makeStream()
+        let stopReasonStore = StopReasonStore()
+        let (base, outputContinuation) =
+            AsyncThrowingStream<InferenceOutput, any Error>.makeStream()
         Task {
             self.acquireEngine()
             defer { self.releaseEngine() }
@@ -127,17 +129,17 @@ final class CoreAIPipelinedEngine: InferenceEngine, Sendable {
                 )
                 tokenContinuation.finish()
                 await forwarding
-                inferenceStream.setStopReason(.maxTokens)
+                stopReasonStore.setIfUnset(.maxTokens)
                 outputContinuation.finish()
             } catch is CancellationError {
-                inferenceStream.setStopReason(.cancelled)
+                stopReasonStore.set(.cancelled)
                 outputContinuation.finish()
             } catch {
-                inferenceStream.setStopReason(.error)
+                stopReasonStore.set(.error)
                 outputContinuation.finish(throwing: error)
             }
         }
-        return inferenceStream
+        return GenerationSequence(base: base, stopReasonStore: stopReasonStore)
     }
 
     /// Wait for any in-flight generate() Task to return the engine.
@@ -1051,5 +1053,41 @@ private struct EngineImpl: ~Copyable {
         CLILogger.log(
             "CoreAI pipelined warmup complete (\(shapesToWarm.count) shapes): \(String(format: "%.2f", warmupElapsed))ms"
         )
+    }
+}
+
+extension CoreAIPipelinedEngine {
+    /// Async sequence of `InferenceOutput` produced by `generate()`.
+    ///
+    /// Unlike the CPU engines, the pipelined engine samples on-device and drives
+    /// output from a producer `Task`, so this sequence forwards an underlying
+    /// `AsyncThrowingStream`. The producer records the `stopReason` directly.
+    public struct GenerationSequence: InferenceOutputSequence {
+        public typealias Element = InferenceOutput
+        public typealias Failure = Error
+
+        let base: AsyncThrowingStream<InferenceOutput, any Error>
+        let stopReasonStore: StopReasonStore
+
+        public var stopReason: StopReason? { stopReasonStore.stopReason }
+
+        public func setStopReason(_ reason: StopReason) {
+            stopReasonStore.set(reason)
+        }
+
+        public func makeAsyncIterator() -> Iterator {
+            Iterator(base: base.makeAsyncIterator())
+        }
+
+        public struct Iterator: AsyncIteratorProtocol {
+            public typealias Element = InferenceOutput
+            public typealias Failure = Error
+
+            var base: AsyncThrowingStream<InferenceOutput, any Error>.AsyncIterator
+
+            public mutating func next() async throws -> InferenceOutput? {
+                try await base.next()
+            }
+        }
     }
 }

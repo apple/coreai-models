@@ -83,7 +83,7 @@ public struct ConstrainedGenerator: DecodingStrategy {
         samplingConfiguration: SamplingConfiguration,
         options: InferenceOptions,
         stopSequences: StopSequences
-    ) -> any AsyncSequence<GenerationResult, Error> {
+    ) -> ConstrainedGeneratedSequence {
         ConstrainedGeneratedSequence(
             jsonSchema: jsonSchema,
             vocabSize: vocabSize,

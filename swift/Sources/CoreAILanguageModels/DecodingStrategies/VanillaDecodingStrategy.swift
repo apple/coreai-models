@@ -34,7 +34,7 @@ public struct VanillaDecodingStrategy: DecodingStrategy {
         samplingConfiguration: SamplingConfiguration,
         options: InferenceOptions,
         stopSequences: StopSequences
-    ) -> any AsyncSequence<GenerationResult, Error> {
+    ) -> VanillaDecodedSequence {
         VanillaDecodedSequence(
             input: input,
             tokenizer: tokenizer,

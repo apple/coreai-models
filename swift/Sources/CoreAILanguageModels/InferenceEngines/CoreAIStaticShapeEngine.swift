@@ -316,15 +316,13 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         with input: [TokenId],
         samplingConfiguration: SamplingConfiguration,
         inferenceOptions: InferenceOptions
-    ) throws -> InferenceStream {
-        InferenceStream {
-            GenerationSequence(
-                engine: self,
-                input: input,
-                samplingConfiguration: samplingConfiguration,
-                inferenceOptions: inferenceOptions
-            ).makeAsyncIterator()
-        }
+    ) throws -> GenerationSequence {
+        GenerationSequence(
+            engine: self,
+            input: input,
+            samplingConfiguration: samplingConfiguration,
+            inferenceOptions: inferenceOptions
+        )
     }
 
     // MARK: - Inference
@@ -553,7 +551,7 @@ extension StaticShapeEngine {
     /// Iteration is structured: state lives on the iterator and releases naturally
     /// when iteration ends or the iterator is dropped (covering early break / task
     /// cancellation).
-    public struct GenerationSequence: AsyncSequence {
+    public struct GenerationSequence: InferenceOutputSequence {
         public typealias Element = InferenceOutput
         public typealias Failure = Error
 
@@ -562,12 +560,22 @@ extension StaticShapeEngine {
         let samplingConfiguration: SamplingConfiguration
         let inferenceOptions: InferenceOptions
 
+        /// Shared with the iterator so the caller can read why generation ended.
+        let stopReasonStore = StopReasonStore()
+
+        public var stopReason: StopReason? { stopReasonStore.stopReason }
+
+        public func setStopReason(_ reason: StopReason) {
+            stopReasonStore.set(reason)
+        }
+
         public func makeAsyncIterator() -> Iterator {
             Iterator(
                 engine: engine,
                 input: input,
                 samplingConfiguration: samplingConfiguration,
-                inferenceOptions: inferenceOptions
+                inferenceOptions: inferenceOptions,
+                stopReasonStore: stopReasonStore
             )
         }
     }
@@ -583,6 +591,7 @@ extension StaticShapeEngine.GenerationSequence {
         private let returnsLogits: Bool
         private let forcedContinuation: [StaticShapeEngine.TokenId]?
         private let maxTokens: Int
+        private let stopReasonStore: StopReasonStore
 
         private var inputTokens: [StaticShapeEngine.TokenId]
         private var step: Int = 0
@@ -591,12 +600,14 @@ extension StaticShapeEngine.GenerationSequence {
             engine: StaticShapeEngine,
             input: [StaticShapeEngine.TokenId],
             samplingConfiguration: SamplingConfiguration,
-            inferenceOptions: InferenceOptions
+            inferenceOptions: InferenceOptions,
+            stopReasonStore: StopReasonStore
         ) {
             self.engine = engine
             self.samplingConfiguration = samplingConfiguration
             self.returnsLogits = inferenceOptions.includeLogits
             self.forcedContinuation = inferenceOptions.forcedContinuation
+            self.stopReasonStore = stopReasonStore
             self.inputTokens = input
             if let forced = inferenceOptions.forcedContinuation {
                 self.maxTokens = forced.count
@@ -610,26 +621,37 @@ extension StaticShapeEngine.GenerationSequence {
 
         public mutating func next() async throws -> InferenceOutput? {
             guard step < maxTokens else {
+                // Natural exhaustion. Don't clobber a reason a decoder set (e.g. `.eos`).
+                stopReasonStore.setIfUnset(.maxTokens)
                 return nil
             }
-            try Task.checkCancellation()
 
-            // When forced, we still need the forward pass (for logits + KV cache update)
-            // but skip the sampler — the next token is predetermined.
-            let (logits, sampledToken) = try await engine.inference(
-                inputTokens: inputTokens,
-                samplingConfig: samplingConfiguration,
-                returnsLogits: returnsLogits || forcedContinuation != nil
-            )
+            do {
+                try Task.checkCancellation()
 
-            let nextToken = forcedContinuation?[step] ?? sampledToken
-            inputTokens.append(nextToken)
-            step += 1
+                // When forced, we still need the forward pass (for logits + KV cache update)
+                // but skip the sampler — the next token is predetermined.
+                let (logits, sampledToken) = try await engine.inference(
+                    inputTokens: inputTokens,
+                    samplingConfig: samplingConfiguration,
+                    returnsLogits: returnsLogits || forcedContinuation != nil
+                )
 
-            return InferenceOutput(
-                tokenId: nextToken,
-                logits: returnsLogits ? logits : nil
-            )
+                let nextToken = forcedContinuation?[step] ?? sampledToken
+                inputTokens.append(nextToken)
+                step += 1
+
+                return InferenceOutput(
+                    tokenId: nextToken,
+                    logits: returnsLogits ? logits : nil
+                )
+            } catch is CancellationError {
+                stopReasonStore.set(.cancelled)
+                throw CancellationError()
+            } catch {
+                stopReasonStore.set(.error)
+                throw error
+            }
         }
     }
 }
