@@ -27,12 +27,6 @@ struct DetectionOutput: Sendable {
     /// Flat bounding-box coordinates, shape `[batch, queryCount, 4]`.
     /// Format: `[cx, cy, w, h]` normalized to [0, 1].
     let predictedBoxes: [Float]
-
-    init(logits: [Float], logitsShape: [Int], predictedBoxes: [Float]) {
-        self.logits = logits
-        self.logitsShape = logitsShape
-        self.predictedBoxes = predictedBoxes
-    }
 }
 
 /// A single detected object: bounding box, class label, and confidence score.
