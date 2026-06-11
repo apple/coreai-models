@@ -75,12 +75,12 @@ Defaults: 512 prompt tokens, 1024 generation tokens, 5 trials. Override with `-p
 
 Perplexity score on the [`WikiText-2`](https://huggingface.co/datasets/EleutherAI/wikitext_document_level) dataset computed using the [lm-evaluation-harness](https://github.com/EleutherAI/lm-evaluation-harness/blob/main/lm_eval/tasks/wikitext/README.md) with the Core AI PyTorch models.
 
-| Model                 | Compression                               | Platform | Perplexity Score | Bits Per Weight (BPW) |
-| --------------------- | ----------------------------------------- | -------- | ---------------- | --------------------- |
-| Qwen2.5 1.5B Instruct | none (`float16`)                          | macOS    | 12.21            | 16.00                 |
-| Qwen2.5 1.5B Instruct | [4-bit quantized][p-4bit]                 | macOS    | 14.79            | 4.50                  |
-| Qwen2.5 1.5B Instruct | none (`float16`)                          | iOS      | 12.21            | 16.00\*               |
-| Qwen2.5 1.5B Instruct | [4-bit palettized (group size 8)][p-4bit] | iOS      | 14.64            | 4.02\*                |
+| Model                 | Compression                               | Bits Per Weight (BPW) | Platform | Perplexity Score |
+| --------------------- | ----------------------------------------- | --------------------- | -------- | ---------------- |
+| Qwen2.5 1.5B Instruct | none (`float16`)                          | 16.00                 | macOS    | 12.21            |
+| Qwen2.5 1.5B Instruct | [4-bit quantized][p-4bit]                 | 4.50                  | macOS    | 14.79            |
+| Qwen2.5 1.5B Instruct | none (`float16`)                          | 16.00\*               | iOS      | 12.21            |
+| Qwen2.5 1.5B Instruct | [4-bit palettized (group size 8)][p-4bit] | 4.02\*                | iOS      | 14.64            |
 
 \* BPW excludes the Embedding which is quantized to INT8 per-tensor.
 

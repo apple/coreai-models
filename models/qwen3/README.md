@@ -77,16 +77,16 @@ Defaults: 512 prompt tokens, 1024 generation tokens, 5 trials. Override with `-p
 
 Perplexity score on the [`WikiText-2`](https://huggingface.co/datasets/EleutherAI/wikitext_document_level) dataset computed using the [lm-evaluation-harness](https://github.com/EleutherAI/lm-evaluation-harness/blob/main/lm_eval/tasks/wikitext/README.md) with the Core AI PyTorch models.
 
-| Model      | Compression                                          | Platform | Perplexity Score | Bits Per Weight (BPW) |
-| ---------- | ---------------------------------------------------- | -------- | ---------------- | --------------------- |
-| Qwen3 0.6B | none (`float16`)                                     | iOS      | 26.16            | 16.00\*               |
-| Qwen3 0.6B | [Mixed 4-bit/8-bit palettized][mixed-4bit-8bit-yaml] | iOS      | 30.90            | 4.88\*                |
-| Qwen3 4B   | none (`float16`)                                     | macOS    | 16.41            | 16.00                 |
-| Qwen3 4B   | [4-bit quantized][presets-info]                      | macOS    | 18.33            | 4.50                  |
-| Qwen3 4B   | none (`float16`)                                     | iOS      | 16.41            | 16.00\*               |
-| Qwen3 4B   | [Mixed 4-bit/8-bit palettized][qwen3-4b-mixed-yaml]  | iOS      | 18.80            | 4.56\*                |
-| Qwen3 8B   | none (`float16`)                                     | macOS    | 12.19            | 16.00                 |
-| Qwen3 8B   | [4-bit quantized][presets-info]                      | macOS    | 12.90            | 4.50                  |
+| Model      | Compression                                          | Bits Per Weight (BPW) | Platform | Perplexity Score |
+| ---------- | ---------------------------------------------------- | --------------------- | -------- | ---------------- |
+| Qwen3 0.6B | none (`float16`)                                     | 16.00\*               | iOS      | 26.16            |
+| Qwen3 0.6B | [Mixed 4-bit/8-bit palettized][mixed-4bit-8bit-yaml] | 4.88\*                | iOS      | 30.90            |
+| Qwen3 4B   | none (`float16`)                                     | 16.00                 | macOS    | 16.41            |
+| Qwen3 4B   | [4-bit quantized][presets-info]                      | 4.50                  | macOS    | 18.33            |
+| Qwen3 4B   | none (`float16`)                                     | 16.00\*               | iOS      | 16.41            |
+| Qwen3 4B   | [Mixed 4-bit/8-bit palettized][qwen3-4b-mixed-yaml]  | 4.56\*                | iOS      | 18.80            |
+| Qwen3 8B   | none (`float16`)                                     | 16.00                 | macOS    | 12.19            |
+| Qwen3 8B   | [4-bit quantized][presets-info]                      | 4.50                  | macOS    | 12.90            |
 
 \* BPW excludes the Embedding which is quantized to INT8 per-tensor.
 
