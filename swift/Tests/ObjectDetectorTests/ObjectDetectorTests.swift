@@ -212,4 +212,77 @@ struct ObjectDetectorTests {
         #expect(result.allSatisfy { $0.isFinite })
         #expect(abs(result[0] - 0.5) < 1e-5)
     }
+
+    // MARK: - Batch planning
+
+    @Test("planBatch: single image, dynamic dims, no overrides → parameter defaults")
+    func planBatchSingleDefault() throws {
+        let p = DetectionParameters()
+        let plan = try ObjectDetector.planBatch(
+            expectedShape: [-1, 3, -1, -1],
+            imageSizes: [CGSize(width: 728, height: 408)],
+            parameters: .default
+        )
+        #expect(plan == ObjectDetector.BatchPlan(batch: 1, height: p.inputHeight, width: p.inputWidth))
+    }
+
+    @Test("planBatch: multi-image, dynamic dims, no overrides → parameter defaults")
+    func planBatchMultiDefault() throws {
+        let p = DetectionParameters()
+        let plan = try ObjectDetector.planBatch(
+            expectedShape: [-1, 3, -1, -1],
+            imageSizes: [
+                CGSize(width: 1280, height: 720),
+                CGSize(width: 600, height: 800),
+                CGSize(width: 1024, height: 768),
+            ],
+            parameters: .default
+        )
+        #expect(plan == ObjectDetector.BatchPlan(batch: 3, height: p.inputHeight, width: p.inputWidth))
+    }
+
+    @Test("planBatch: multi-image, dynamic dims, explicit overrides win")
+    func planBatchMultiOverride() throws {
+        var params = DetectionParameters.default
+        params.inputHeight = 512
+        params.inputWidth = 512
+        let plan = try ObjectDetector.planBatch(
+            expectedShape: [-1, 3, -1, -1],
+            imageSizes: [
+                CGSize(width: 1280, height: 720),
+                CGSize(width: 600, height: 800),
+            ],
+            parameters: params
+        )
+        #expect(plan == ObjectDetector.BatchPlan(batch: 2, height: 512, width: 512))
+    }
+
+    @Test("planBatch: static spatial dims override parameter values silently")
+    func planBatchStaticSpatialIgnoresParams() throws {
+        // Static [1, 3, 800, 800] with mismatching params → planBatch uses
+        // the static dims; parameter values are silently ignored for fixed axes.
+        var params = DetectionParameters.default
+        params.inputHeight = 512
+        params.inputWidth = 512
+        let plan = try ObjectDetector.planBatch(
+            expectedShape: [1, 3, 800, 800],
+            imageSizes: [CGSize(width: 640, height: 480)],
+            parameters: params
+        )
+        #expect(plan == ObjectDetector.BatchPlan(batch: 1, height: 800, width: 800))
+    }
+
+    @Test("planBatch: static batch mismatch throws (multi-image into batch=1 model)")
+    func planBatchStaticBatchMismatchThrows() {
+        #expect(throws: DetectionRuntimeError.self) {
+            try ObjectDetector.planBatch(
+                expectedShape: [1, 3, -1, -1],
+                imageSizes: [
+                    CGSize(width: 1000, height: 1000),
+                    CGSize(width: 1000, height: 1000),
+                ],
+                parameters: .default
+            )
+        }
+    }
 }
