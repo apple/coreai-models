@@ -40,6 +40,10 @@ def _get_registry() -> dict[str, ModelEntry]:
     from coreai_models.models.macos.qwen2 import Qwen2ForCausalLM
     from coreai_models.models.macos.qwen3 import Qwen3ForCausalLM
     from coreai_models.models.macos.qwen3_moe import Qwen3MoeForCausalLM
+    from coreai_models.models.gpu.qwen3_vl import (
+        Qwen3VLForCausalLM,
+        Qwen3VLForCausalLMEmbeddings,
+    )
 
     return {
         "gemma3_text": ModelEntry(
@@ -67,6 +71,14 @@ def _get_registry() -> dict[str, ModelEntry]:
         ),
         "qwen3_moe": ModelEntry(
             macos_class=Qwen3MoeForCausalLM,
+        ),
+        # Qwen3-VL: vision-language model.
+        # macos_class = standard text decoder (input_ids, for text-only use).
+        # Use Qwen3VLForCausalLMEmbeddings for VLM export (takes inputs_embeds).
+        "qwen3_vl": ModelEntry(
+            macos_class=Qwen3VLForCausalLM,
+            hf_config_attr="text_config",
+            hf_state_dict_prefix="model.language_model.",
         ),
     }
 

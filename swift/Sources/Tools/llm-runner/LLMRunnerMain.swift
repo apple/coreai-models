@@ -56,10 +56,17 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     )
 
     @Option(
-        name: .customLong("model"),
+        name: [.customLong("model"), .customLong("model-assets")],
         help: "Path to a model bundle directory"
     )
     var model: String?
+
+    @Option(
+        name: .customLong("model-path"),
+        help:
+            "Search path for models (colon-separated). Default: ./:./exports/:~/.coreai-models/ (override with COREAI_MODEL_PATH env)"
+    )
+    var modelPath: String?
 
     @Option(help: "Input text prompt for generation (default: 'Hello, how are you?')")
     var prompt: String?
@@ -69,6 +76,12 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
 
     @Option(name: .customLong("raw-tokens"), help: "JSON file with pre-tokenized tokens: {\"tokens\": [...]}")
     var rawTokens: String?
+
+    @Option(
+        name: .customLong("image"),
+        help: "Path to an image file for VLM inference (bundle must have a 'vision' component)."
+    )
+    var imagePath: String?
 
     @Option(help: "Maximum number of tokens to generate (default: 50)")
     var maxTokens: Int = 50
@@ -196,8 +209,21 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         let verboseLevel = max(self.verboseLevel ?? 0, verbose ? 1 : 0)
         CLILogger.setLevel(to: verboseLevel)
 
-        let resolver = ModelPaths()
+        let resolver = ModelPaths(override: modelPath)
         let resolvedPath = try validateAndResolveModelPath(resolver: resolver)
+
+        // VLM dispatch: --image triggers a focused multimodal path that
+        // bypasses the text-only multi-model orchestration below.
+        if let imagePath = imagePath {
+            try await VLMDispatch.run(
+                bundlePath: resolvedPath,
+                imagePath: imagePath,
+                prompt: prompt ?? "Describe this image.",
+                maxTokens: maxTokens,
+                sampling: try parseSamplingStrategy()
+            )
+            return
+        }
 
         // Test signpost right at the start
         InstrumentsProfiler.logMemoryUsage(phase: "AppStart")
