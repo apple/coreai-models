@@ -73,18 +73,32 @@ public struct DetectionParameters: Sendable {
     /// When empty, labels default to "class_N".
     public var classLabels: [Int: String]
 
+    /// Model input height. Only consulted when the model declares a dynamic
+    /// spatial dimension; ignored for static-shape models. Defaults to 800
+    /// (matches the YOLOS export's reference input and the training-time
+    /// canvas geometry).
+    public var inputHeight: Int
+
+    /// Model input width. Only consulted when the model declares a dynamic
+    /// spatial dimension; ignored for static-shape models. Defaults to 800.
+    public var inputWidth: Int
+
     public init(
         threshold: Float = 0.3,
         maxDetections: Int = 100,
         normalizationMeans: (CGFloat, CGFloat, CGFloat) = (0.485, 0.456, 0.406),
         normalizationStds: (CGFloat, CGFloat, CGFloat) = (0.229, 0.224, 0.225),
-        classLabels: [Int: String] = ObjectDetectionLabels.coco
+        classLabels: [Int: String] = ObjectDetectionLabels.coco,
+        inputHeight: Int = 800,
+        inputWidth: Int = 800
     ) {
         self.threshold = threshold
         self.maxDetections = maxDetections
         self.normalizationMeans = normalizationMeans
         self.normalizationStds = normalizationStds
         self.classLabels = classLabels
+        self.inputHeight = inputHeight
+        self.inputWidth = inputWidth
     }
 
     public static let `default` = DetectionParameters()
