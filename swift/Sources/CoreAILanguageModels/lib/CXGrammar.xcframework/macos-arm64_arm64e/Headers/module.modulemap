@@ -1,6 +1,0 @@
-module CXGrammar {
-    header "xgrammar_c_bridge.h"
-    header "dlpack/dlpack.h"
-
-    export *
-}

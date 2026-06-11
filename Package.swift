@@ -39,6 +39,7 @@ let package = Package(
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.2.0"),
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.1.0"),
+        .package(url: "https://github.com/mlc-ai/xgrammar", branch: "main"),
     ],
     targets: [
         .target(
@@ -98,9 +99,13 @@ let package = Package(
         ),
 
         // CXGrammar C bridge
-        .binaryTarget(
+        .target(
             name: "CXGrammar",
-            path: "swift/Sources/CoreAILanguageModels/lib/CXGrammar.xcframework"
+            dependencies: [
+                .product(name: "XGrammar", package: "xgrammar"),
+            ],
+            path: "swift/Sources/lib/CXGrammar",
+            publicHeadersPath: "include"
         ),
 
         // MARK: Executable targets
@@ -229,5 +234,6 @@ let package = Package(
             ]
         ),
     ],
-    swiftLanguageModes: [.v6]
+    swiftLanguageModes: [.v6],
+    cxxLanguageStandard: .cxx17
 )
