@@ -7,9 +7,20 @@ import Synchronization
 
 /// Concrete async sequence returned by `InferenceEngine.generate()`.
 ///
-/// Wraps an `AsyncThrowingStream<InferenceOutput, any Error>` and tracks
-/// why generation ended. Reference type — the producer sets `stopReason`
-/// and the consumer reads it after iteration.
+/// Wraps a pull-based async iterator and tracks why generation ended.
+/// Reference type — the consumer reads `stopReason` after iteration, and a
+/// decoder may set it explicitly (e.g. `.eos`) before breaking out.
+///
+/// Two construction modes:
+/// - `init(_:)` wraps a pull-based iterator. Generation work runs on the
+///   consumer's task as it pulls tokens — no producer `Task`, no unstructured
+///   concurrency. This is what the CPU engines use.
+/// - `makeStream()` returns a continuation an engine can drive from a
+///   background `Task` (e.g. the GPU-pipelined engine, which samples on-device).
+///
+/// In both modes, natural exhaustion (`next()` returning nil) is recorded as
+/// `.maxTokens` unless a reason was already set, and a thrown error/cancellation
+/// is recorded as `.error`/`.cancelled`.
 public final class InferenceStream: AsyncSequence, Sendable {
     public typealias Element = InferenceOutput
 
@@ -31,11 +42,15 @@ public final class InferenceStream: AsyncSequence, Sendable {
 
     // MARK: - Init
 
-    private let base: AsyncThrowingStream<InferenceOutput, any Error>
+    private let makeBase: @Sendable () -> any AsyncIteratorProtocol<InferenceOutput, any Error>
     private let _stopReason: Mutex<StopReason?>
 
-    init(base: AsyncThrowingStream<InferenceOutput, any Error>) {
-        self.base = base
+    /// Wrap a pull-based iterator factory. The iterator drives generation lazily
+    /// on the consumer's task; no work happens until the stream is iterated.
+    init(
+        _ makeBase: @escaping @Sendable () -> any AsyncIteratorProtocol<InferenceOutput, any Error>
+    ) {
+        self.makeBase = makeBase
         self._stopReason = Mutex(nil)
     }
 
@@ -54,26 +69,35 @@ public final class InferenceStream: AsyncSequence, Sendable {
         _stopReason.withLock { $0 = reason }
     }
 
+    /// Record a reason only if none was set yet — used to mark natural
+    /// exhaustion as `.maxTokens` without clobbering a reason a decoder already
+    /// set (e.g. `.eos` before breaking out of the loop).
+    private func setStopReasonIfUnset(_ reason: StopReason) {
+        _stopReason.withLock { if $0 == nil { $0 = reason } }
+    }
+
     // MARK: - Factory
 
-    /// Create a stream + continuation pair for engines to drive.
+    /// Create a stream + continuation pair for engines that drive output from a
+    /// background `Task` (e.g. the GPU-pipelined engine).
     static func makeStream() -> (
         stream: InferenceStream,
         continuation: AsyncThrowingStream<InferenceOutput, any Error>.Continuation
     ) {
         let (base, continuation) = AsyncThrowingStream<InferenceOutput, any Error>.makeStream()
-        return (InferenceStream(base: base), continuation)
+        return (InferenceStream { base.makeAsyncIterator() }, continuation)
     }
 
     // MARK: - AsyncSequence
 
     public struct AsyncIterator: AsyncIteratorProtocol {
-        var base: AsyncThrowingStream<InferenceOutput, any Error>.AsyncIterator
+        var base: any AsyncIteratorProtocol<InferenceOutput, any Error>
         let stream: InferenceStream
 
         public mutating func next() async throws -> InferenceOutput? {
             do {
                 guard let element = try await base.next() else {
+                    stream.setStopReasonIfUnset(.maxTokens)
                     return nil
                 }
                 return element
@@ -88,6 +112,6 @@ public final class InferenceStream: AsyncSequence, Sendable {
     }
 
     public func makeAsyncIterator() -> AsyncIterator {
-        AsyncIterator(base: base.makeAsyncIterator(), stream: self)
+        AsyncIterator(base: makeBase(), stream: self)
     }
 }

@@ -147,7 +147,7 @@ public protocol DecodingStrategy: Sendable {
         samplingConfiguration: SamplingConfiguration,
         options: InferenceOptions,
         stopSequences: StopSequences
-    ) -> AsyncThrowingStream<GenerationResult, Error>
+    ) -> any AsyncSequence<GenerationResult, Error>
 }
 
 // MARK: - Decoding Strategy Factory

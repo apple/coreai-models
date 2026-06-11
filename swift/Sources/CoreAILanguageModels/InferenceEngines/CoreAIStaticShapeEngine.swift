@@ -317,50 +317,14 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         samplingConfiguration: SamplingConfiguration,
         inferenceOptions: InferenceOptions
     ) throws -> InferenceStream {
-        let (stream, continuation) = InferenceStream.makeStream()
-        Task {
-            do {
-                let forced = inferenceOptions.forcedContinuation
-                let maxTokens: Int
-                if let forced {
-                    maxTokens = forced.count
-                } else {
-                    maxTokens = min(
-                        inferenceOptions.maxTokens ?? Int.max,
-                        max(0, self.config.maxContextLength - input.count)
-                    )
-                }
-                let returnsLogits = inferenceOptions.includeLogits
-                var inputTokens = input
-
-                for i in 0..<maxTokens {
-                    try Task.checkCancellation()
-                    let (logits, sampledToken) = try await self.inference(
-                        inputTokens: inputTokens,
-                        samplingConfig: samplingConfiguration,
-                        returnsLogits: returnsLogits || forced != nil
-                    )
-
-                    let nextToken = forced?[i] ?? sampledToken
-
-                    continuation.yield(
-                        InferenceOutput(
-                            tokenId: nextToken,
-                            logits: returnsLogits ? logits : nil
-                        ))
-                    inputTokens.append(nextToken)
-                }
-                stream.setStopReason(.maxTokens)
-                continuation.finish()
-            } catch is CancellationError {
-                stream.setStopReason(.cancelled)
-                continuation.finish()
-            } catch {
-                stream.setStopReason(.error)
-                continuation.finish(throwing: error)
-            }
+        InferenceStream {
+            GenerationSequence(
+                engine: self,
+                input: input,
+                samplingConfiguration: samplingConfiguration,
+                inferenceOptions: inferenceOptions
+            ).makeAsyncIterator()
         }
-        return stream
     }
 
     // MARK: - Inference
@@ -580,5 +544,92 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
             self.functions[fnName] = try Self.requireFunction(model: model, functionName: fnName)
         }
         reset()
+    }
+}
+
+extension StaticShapeEngine {
+    /// Async sequence of `InferenceOutput` produced by `generate()`.
+    ///
+    /// Iteration is structured: state lives on the iterator and releases naturally
+    /// when iteration ends or the iterator is dropped (covering early break / task
+    /// cancellation).
+    public struct GenerationSequence: AsyncSequence {
+        public typealias Element = InferenceOutput
+        public typealias Failure = Error
+
+        let engine: StaticShapeEngine
+        let input: [TokenId]
+        let samplingConfiguration: SamplingConfiguration
+        let inferenceOptions: InferenceOptions
+
+        public func makeAsyncIterator() -> Iterator {
+            Iterator(
+                engine: engine,
+                input: input,
+                samplingConfiguration: samplingConfiguration,
+                inferenceOptions: inferenceOptions
+            )
+        }
+    }
+}
+
+extension StaticShapeEngine.GenerationSequence {
+    public struct Iterator: AsyncIteratorProtocol {
+        public typealias Element = InferenceOutput
+        public typealias Failure = Error
+
+        private let engine: StaticShapeEngine
+        private let samplingConfiguration: SamplingConfiguration
+        private let returnsLogits: Bool
+        private let forcedContinuation: [StaticShapeEngine.TokenId]?
+        private let maxTokens: Int
+
+        private var inputTokens: [StaticShapeEngine.TokenId]
+        private var step: Int = 0
+
+        init(
+            engine: StaticShapeEngine,
+            input: [StaticShapeEngine.TokenId],
+            samplingConfiguration: SamplingConfiguration,
+            inferenceOptions: InferenceOptions
+        ) {
+            self.engine = engine
+            self.samplingConfiguration = samplingConfiguration
+            self.returnsLogits = inferenceOptions.includeLogits
+            self.forcedContinuation = inferenceOptions.forcedContinuation
+            self.inputTokens = input
+            if let forced = inferenceOptions.forcedContinuation {
+                self.maxTokens = forced.count
+            } else {
+                self.maxTokens = Swift.min(
+                    inferenceOptions.maxTokens ?? Int.max,
+                    Swift.max(0, engine.config.maxContextLength - input.count)
+                )
+            }
+        }
+
+        public mutating func next() async throws -> InferenceOutput? {
+            guard step < maxTokens else {
+                return nil
+            }
+            try Task.checkCancellation()
+
+            // When forced, we still need the forward pass (for logits + KV cache update)
+            // but skip the sampler — the next token is predetermined.
+            let (logits, sampledToken) = try await engine.inference(
+                inputTokens: inputTokens,
+                samplingConfig: samplingConfiguration,
+                returnsLogits: returnsLogits || forcedContinuation != nil
+            )
+
+            let nextToken = forcedContinuation?[step] ?? sampledToken
+            inputTokens.append(nextToken)
+            step += 1
+
+            return InferenceOutput(
+                tokenId: nextToken,
+                logits: returnsLogits ? logits : nil
+            )
+        }
     }
 }
