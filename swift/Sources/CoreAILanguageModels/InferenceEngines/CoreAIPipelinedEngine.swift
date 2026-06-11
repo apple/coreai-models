@@ -631,15 +631,46 @@ private struct EngineImpl: ~Copyable {
             positionIdsName: posValue,
         ]
 
+        // Build States as AsyncMutableValue (KV cache, in-place update)
         let keyBuffer = kvCache.keyBinding.metalBuffer
         let keyShape = kvCache.keyBinding.layout.shape
         let keyStrides = kvCache.keyBinding.layout.strides
+        var keyState = unsafe InferenceFunction.AsyncMutableValue(
+            unsafeBuffer: keyBuffer,
+            byteOffset: 0,
+            scalarType: keyCacheScalarType,
+            shape: keyShape,
+            strides: keyStrides
+        )
         let valBuffer = kvCache.valueBinding.metalBuffer
         let valShape = kvCache.valueBinding.layout.shape
         let valStrides = kvCache.valueBinding.layout.strides
+        var valState = unsafe InferenceFunction.AsyncMutableValue(
+            unsafeBuffer: valBuffer,
+            byteOffset: 0,
+            scalarType: valueCacheScalarType,
+            shape: valShape,
+            strides: valStrides
+        )
+
+        var asyncStates = InferenceFunction.AsyncMutableViews()
+        asyncStates.insert(&keyState, for: keyCacheName)
+        asyncStates.insert(&valState, for: valueCacheName)
+
+        // Build Output as AsyncMutableValue (logits)
         let logitsBuffer = logits.metalBuffer
         let logitsShape = [1, queryLength, vocabSize]
         let logitsStrides = try resolvedStrides(descriptor: logitsBaseDesc, shape: logitsShape)
+        var logitsOutput = unsafe InferenceFunction.AsyncMutableValue(
+            unsafeBuffer: logitsBuffer,
+            byteOffset: 0,
+            scalarType: .float16,
+            shape: logitsShape,
+            strides: logitsStrides
+        )
+
+        var asyncOutputs = InferenceFunction.AsyncMutableViews()
+        asyncOutputs.insert(&logitsOutput, for: logitsOutputName)
 
         prepareSpan.end()
 
@@ -650,19 +681,8 @@ private struct EngineImpl: ~Copyable {
         // This commits + uses runAfterSyncPoint (no stream wait) — enables true pipelining.
         let logitsSpan = InstrumentsProfiler.beginLogitsInference(
             step: currentStep, tokens: queryLength, engine: "CoreAI-Pipelined")
-        var keyState = unsafe InferenceFunction.AsyncMutableValue(
-            unsafeBuffer: keyBuffer, byteOffset: 0,
-            scalarType: keyCacheScalarType, shape: keyShape, strides: keyStrides)
-        var valState = unsafe InferenceFunction.AsyncMutableValue(
-            unsafeBuffer: valBuffer, byteOffset: 0,
-            scalarType: valueCacheScalarType, shape: valShape, strides: valStrides)
-        var logitsOutput = unsafe InferenceFunction.AsyncMutableValue(
-            unsafeBuffer: logitsBuffer, byteOffset: 0,
-            scalarType: .float16, shape: logitsShape, strides: logitsStrides)
-        var asyncOutputs = InferenceFunction.AsyncMutableViews()
-        asyncOutputs.insert(&logitsOutput, for: logitsOutputName)
-        // Two branches so that optional conv/recurrent state variables share scope
-        // with asyncStates.
+        // Hybrid models: conv/recurrent states must share scope with asyncStates
+        // so the inout references stay live until consume.
         if let conv = convBinding, let rec = recurrentBinding {
             var convState = unsafe InferenceFunction.AsyncMutableValue(
                 unsafeBuffer: conv.buffer, byteOffset: 0,
@@ -670,9 +690,6 @@ private struct EngineImpl: ~Copyable {
             var recState = unsafe InferenceFunction.AsyncMutableValue(
                 unsafeBuffer: rec.buffer, byteOffset: 0,
                 scalarType: rec.scalarType, shape: rec.shape, strides: rec.strides)
-            var asyncStates = InferenceFunction.AsyncMutableViews()
-            asyncStates.insert(&keyState, for: keyCacheName)
-            asyncStates.insert(&valState, for: valueCacheName)
             asyncStates.insert(&convState, for: conv.name)
             asyncStates.insert(&recState, for: rec.name)
             let _ = try function.encode(
@@ -682,9 +699,6 @@ private struct EngineImpl: ~Copyable {
                 to: computeStream
             )
         } else {
-            var asyncStates = InferenceFunction.AsyncMutableViews()
-            asyncStates.insert(&keyState, for: keyCacheName)
-            asyncStates.insert(&valState, for: valueCacheName)
             let _ = try function.encode(
                 inputs: asyncInputs,
                 states: consume asyncStates,
@@ -964,6 +978,9 @@ private struct EngineImpl: ~Copyable {
         var valState = unsafe InferenceFunction.AsyncMutableValue(
             unsafeBuffer: valBuffer, byteOffset: 0,
             scalarType: valueCacheScalarType, shape: valShape, strides: valStrides)
+        var asyncStates = InferenceFunction.AsyncMutableViews()
+        asyncStates.insert(&keyState, for: keyCacheName)
+        asyncStates.insert(&valState, for: valueCacheName)
 
         let logitsShape = [1, queryLength, vocabSize]
         let logitsStrides = try resolvedStrides(descriptor: logitsBaseDesc, shape: logitsShape)
@@ -973,8 +990,8 @@ private struct EngineImpl: ~Copyable {
         var asyncOutputs = InferenceFunction.AsyncMutableViews()
         asyncOutputs.insert(&logitsOutput, for: logitsOutputName)
 
-        // Two branches so that optional conv/recurrent state variables share scope
-        // with asyncStates.
+        // Hybrid models: conv/recurrent states must share scope with asyncStates
+        // so the inout references stay live until consume.
         if let conv = convBinding, let rec = recurrentBinding {
             var convState = unsafe InferenceFunction.AsyncMutableValue(
                 unsafeBuffer: conv.buffer, byteOffset: 0,
@@ -982,9 +999,6 @@ private struct EngineImpl: ~Copyable {
             var recState = unsafe InferenceFunction.AsyncMutableValue(
                 unsafeBuffer: rec.buffer, byteOffset: 0,
                 scalarType: rec.scalarType, shape: rec.shape, strides: rec.strides)
-            var asyncStates = InferenceFunction.AsyncMutableViews()
-            asyncStates.insert(&keyState, for: keyCacheName)
-            asyncStates.insert(&valState, for: valueCacheName)
             asyncStates.insert(&convState, for: conv.name)
             asyncStates.insert(&recState, for: rec.name)
             let _ = try function.encode(
@@ -994,9 +1008,6 @@ private struct EngineImpl: ~Copyable {
                 to: computeStream
             )
         } else {
-            var asyncStates = InferenceFunction.AsyncMutableViews()
-            asyncStates.insert(&keyState, for: keyCacheName)
-            asyncStates.insert(&valState, for: valueCacheName)
             let _ = try function.encode(
                 inputs: asyncInputs,
                 states: consume asyncStates,
@@ -1093,6 +1104,9 @@ private struct EngineImpl: ~Copyable {
             var valState = unsafe InferenceFunction.AsyncMutableValue(
                 unsafeBuffer: valBuffer, byteOffset: 0,
                 scalarType: valueCacheScalarType, shape: vShape, strides: vStrides)
+            var asyncStates = InferenceFunction.AsyncMutableViews()
+            asyncStates.insert(&keyState, for: keyCacheName)
+            asyncStates.insert(&valState, for: valueCacheName)
 
             let lShape = [1, shape, vocabSize]
             let lStrides = try resolvedStrides(descriptor: logitsBaseDesc, shape: lShape)
@@ -1102,8 +1116,8 @@ private struct EngineImpl: ~Copyable {
             var asyncOutputs = InferenceFunction.AsyncMutableViews()
             asyncOutputs.insert(&logitsOutput, for: logitsOutputName)
 
-            // Two branches so that optional conv/recurrent state variables share scope
-            // with asyncStates
+            // Hybrid models: conv/recurrent states must share scope with asyncStates
+            // so the inout references stay live until consume.
             if let conv = convBinding, let rec = recurrentBinding {
                 var convState = unsafe InferenceFunction.AsyncMutableValue(
                     unsafeBuffer: conv.buffer, byteOffset: 0,
@@ -1111,9 +1125,6 @@ private struct EngineImpl: ~Copyable {
                 var recState = unsafe InferenceFunction.AsyncMutableValue(
                     unsafeBuffer: rec.buffer, byteOffset: 0,
                     scalarType: rec.scalarType, shape: rec.shape, strides: rec.strides)
-                var asyncStates = InferenceFunction.AsyncMutableViews()
-                asyncStates.insert(&keyState, for: keyCacheName)
-                asyncStates.insert(&valState, for: valueCacheName)
                 asyncStates.insert(&convState, for: conv.name)
                 asyncStates.insert(&recState, for: rec.name)
                 let _ = try function.encode(
@@ -1123,9 +1134,6 @@ private struct EngineImpl: ~Copyable {
                     to: computeStream
                 )
             } else {
-                var asyncStates = InferenceFunction.AsyncMutableViews()
-                asyncStates.insert(&keyState, for: keyCacheName)
-                asyncStates.insert(&valState, for: valueCacheName)
                 let _ = try function.encode(
                     inputs: asyncInputs,
                     states: consume asyncStates,
