@@ -12,26 +12,37 @@ concurrency:
 
 jobs:
   lint:
-    runs-on: ubuntu-latest
+    if: github.repository == 'apple/coreai-models'
+    runs-on: [self-hosted, macos, tahoe, ARM64]
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Ensure uv
+        run: |
+          command -v uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - run: uv tool install ruff
       - run: ruff check python/src/ python/tests/
       - run: ruff format --check python/src/ python/tests/
 
   swift-format:
-    runs-on: ubuntu-latest
+    if: github.repository == 'apple/coreai-models'
+    runs-on: [self-hosted, macos, tahoe, ARM64]
+    timeout-minutes: 15
+    env:
+      DEVELOPER_DIR: /Applications/Xcode-latest.app/Contents/Developer
     steps:
-      - uses: actions/checkout@v4
-      - uses: swift-actions/setup-swift@v2
-        with:
-          swift-version: "6.2"
-      - run: swift-format lint --strict --recursive swift/Sources/ swift/Tests/
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - run: swift format lint --strict --recursive swift/Sources/ swift/Tests/
 
   python-test:
-    runs-on: ubuntu-latest
+    if: github.repository == 'apple/coreai-models'
+    runs-on: [self-hosted, macos, tahoe, ARM64]
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Ensure uv
+        run: |
+          command -v uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - run: uv run pytest python/tests/test_model_units -x -q
