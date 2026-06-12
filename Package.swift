@@ -102,7 +102,7 @@ let package = Package(
         .target(
             name: "CXGrammar",
             dependencies: [
-                .product(name: "XGrammar", package: "xgrammar"),
+                .product(name: "XGrammar", package: "xgrammar")
             ],
             path: "swift/Sources/lib/CXGrammar",
             publicHeadersPath: "include"
