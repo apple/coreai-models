@@ -42,15 +42,36 @@ public struct ConstrainedDecodingStrategy: DecodingStrategy {
         samplingConfiguration: SamplingConfiguration,
         options: InferenceOptions,
         stopSequences: StopSequences
-    ) -> ConstrainedDecodedSequence {
-        ConstrainedDecodedSequence(
+    ) async throws -> ConstrainedDecodedSequence {
+        CLILogger.log(
+            "Starting constrained decoding strategy with schema",
+            component: "ConstrainedDecodingStrategy"
+        )
+
+        // Eager setup
+        let session = try Self.createSession(
             jsonSchema: jsonSchema,
             vocabSizeOverride: vocabSizeOverride,
-            input: input,
+            tokenizer: tokenizer,
+            stopSequences: stopSequences
+        )
+        let inputTokens =
+            try PromptUtils
+            .maybeApplyTokenizerChatTemplate(input, tokenizer: tokenizer)
+            .map(Int32.init)
+        let maxTokens = options.maxTokens ?? 512
+
+        try await inferenceEngine.reset()
+
+        return ConstrainedDecodedSequence(
+            prepared: ConstrainedDecodedSequence.Prepared(
+                session: consume session,
+                inputTokens: inputTokens,
+                maxTokens: maxTokens
+            ),
             tokenizer: tokenizer,
             inferenceEngine: inferenceEngine,
             samplingConfiguration: samplingConfiguration,
-            options: options,
             stopSequences: stopSequences
         )
     }
@@ -180,26 +201,39 @@ extension ConstrainedDecodingStrategy {
         public typealias Element = GenerationResult
         public typealias Failure = Error
 
-        let jsonSchema: String
-        let vocabSizeOverride: Int?
-        let input: Input
+        fileprivate let prepared: Prepared
         let tokenizer: any Tokenizer
         let inferenceEngine: any InferenceEngine
         let samplingConfiguration: SamplingConfiguration
-        let options: InferenceOptions
         let stopSequences: StopSequences
 
         public func makeAsyncIterator() -> Iterator {
             Iterator(
-                jsonSchema: jsonSchema,
-                vocabSizeOverride: vocabSizeOverride,
-                input: input,
+                prepared: prepared,
                 tokenizer: tokenizer,
                 inferenceEngine: inferenceEngine,
                 samplingConfiguration: samplingConfiguration,
-                options: options,
                 stopSequences: stopSequences
             )
+        }
+    }
+}
+
+extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
+    /// Holds the eagerly-created, move-only generation session together with the tokenized prompt and token budget.
+    fileprivate final class Prepared {
+        var session: ConstrainedGenerationSession?
+        let inputTokens: [Int32]
+        let maxTokens: Int
+
+        init(
+            session: consuming ConstrainedGenerationSession,
+            inputTokens: [Int32],
+            maxTokens: Int
+        ) {
+            self.session = consume session
+            self.inputTokens = inputTokens
+            self.maxTokens = maxTokens
         }
     }
 }
@@ -209,58 +243,41 @@ extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
         public typealias Element = GenerationResult
         public typealias Failure = Error
 
-        private let jsonSchema: String
-        private let vocabSizeOverride: Int?
-        private let input: Input
         private let tokenizer: any Tokenizer
         private let inferenceEngine: any InferenceEngine
         private let samplingConfiguration: SamplingConfiguration
-        private let options: InferenceOptions
         private let stopSequences: StopSequences
         private let constrainedOptions = InferenceOptions(maxTokens: 1, includeLogits: true)
 
+        // Generation state, seeded eagerly from the prepared setup.
         private var session: ConstrainedGenerationSession?
-        private var inputTokens: [Int32] = []
+        private var inputTokens: [Int32]
+        private let maxTokens: Int
         private var generatedTokens: [Int32] = []
         private var previousDecodedText: String = ""
         private var tokenStep: Int = 0
-        private var maxTokens: Int = 0
-        private var didSetup: Bool = false
         private var finished: Bool = false
 
-        init(
-            jsonSchema: String,
-            vocabSizeOverride: Int?,
-            input: Input,
+        fileprivate init(
+            prepared: ConstrainedDecodingStrategy.ConstrainedDecodedSequence.Prepared,
             tokenizer: any Tokenizer,
             inferenceEngine: any InferenceEngine,
             samplingConfiguration: SamplingConfiguration,
-            options: InferenceOptions,
             stopSequences: StopSequences
         ) {
-            self.jsonSchema = jsonSchema
-            self.vocabSizeOverride = vocabSizeOverride
-            self.input = input
+            // Take ownership of the move-only session prepared by `decode()`.
+            self.session = prepared.session.take()
+            self.inputTokens = prepared.inputTokens
+            self.maxTokens = prepared.maxTokens
             self.tokenizer = tokenizer
             self.inferenceEngine = inferenceEngine
             self.samplingConfiguration = samplingConfiguration
-            self.options = options
             self.stopSequences = stopSequences
         }
 
         public func next() async throws -> GenerationResult? {
             if finished {
                 return nil
-            }
-
-            if !didSetup {
-                didSetup = true
-                do {
-                    try await setUp()
-                } catch {
-                    finished = true
-                    throw error
-                }
             }
 
             while tokenStep < maxTokens {
@@ -323,27 +340,6 @@ extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
 
             finished = true
             return nil
-        }
-
-        private func setUp() async throws {
-            CLILogger.log(
-                "Starting constrained decoding strategy with schema",
-                component: "ConstrainedDecodingStrategy"
-            )
-
-            self.session = try ConstrainedDecodingStrategy.createSession(
-                jsonSchema: jsonSchema,
-                vocabSizeOverride: vocabSizeOverride,
-                tokenizer: tokenizer,
-                stopSequences: stopSequences
-            )
-            self.inputTokens =
-                try PromptUtils
-                .maybeApplyTokenizerChatTemplate(input, tokenizer: tokenizer)
-                .map(Int32.init)
-            self.maxTokens = options.maxTokens ?? 512
-
-            try await inferenceEngine.reset()
         }
     }
 }

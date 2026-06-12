@@ -146,6 +146,9 @@ public protocol DecodingStrategy: Sendable {
 
     /// Stream decoded text with optional logits.
     ///
+    /// Performs any required setup (session creation, tokenization, engine reset) eagerly before returning, so the
+    /// returned sequence is ready to iterate.
+    ///
     /// - Parameters:
     ///   - input: Input specification (raw text, prompt, or pre-tokenized)
     ///   - tokenizer: Tokenizer for encoding/decoding
@@ -161,7 +164,7 @@ public protocol DecodingStrategy: Sendable {
         samplingConfiguration: SamplingConfiguration,
         options: InferenceOptions,
         stopSequences: StopSequences
-    ) -> ResultSequence
+    ) async throws -> ResultSequence
 }
 
 // MARK: - Decoding Strategy Factory

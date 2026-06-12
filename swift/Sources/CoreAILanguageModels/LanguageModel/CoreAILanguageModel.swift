@@ -525,7 +525,7 @@ public struct CoreAILanguageModel: LanguageModel {
             let strategy = ConstrainedDecodingStrategy(jsonSchema: jsonSchema, vocabSize: vocabSize)
             let stopSequences = StopSequences(for: tokenizer)
 
-            let stream = strategy.decode(
+            let stream = try await strategy.decode(
                 from: .tokens(promptTokens),
                 tokenizer: tokenizer,
                 inferenceEngine: engine,
