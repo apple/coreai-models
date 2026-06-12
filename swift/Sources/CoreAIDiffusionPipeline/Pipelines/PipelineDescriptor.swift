@@ -105,18 +105,27 @@ public struct PipelineDescriptor: Codable, Sendable {
 
     /// Load or detect a pipeline descriptor from a model directory.
     ///
-    /// - `.auto`: reads `pipeline.json` if present, otherwise scans for known component filenames
-    /// - `.file`: reads from a specific config URL
-    /// - `.explicit`: uses the provided descriptor as-is
+    /// Priority:
+    /// 1. `metadata.json` (v0.2 schema with `kind: "diffusion"`)
+    /// 2. `pipeline.json` (deprecated — prints migration warning)
+    /// 3. Directory scan for known component filenames
     ///
     /// Fields left nil by auto-detection are filled in later during `loadComponents(from:)`
     /// by inspecting the actual model descriptors.
     public static func resolve(at url: URL, config: ConfigSource = .auto) throws -> PipelineDescriptor {
         switch config {
         case .auto:
-            let configURL = url.appendingPathComponent("pipeline.json")
-            if FileManager.default.fileExists(atPath: configURL.path) {
-                return try load(from: configURL)
+            let metadataURL = url.appendingPathComponent("metadata.json")
+            if FileManager.default.fileExists(atPath: metadataURL.path) {
+                return try loadFromMetadata(at: metadataURL)
+            }
+            let pipelineURL = url.appendingPathComponent("pipeline.json")
+            if FileManager.default.fileExists(atPath: pipelineURL.path) {
+                throw PipelineLoadError.deprecatedFormat(
+                    "This bundle uses the legacy pipeline.json format which is no longer supported.\n"
+                        + "Please re-export with `coreai.diffusion.export` to produce metadata.json.\n"
+                        + "See: https://github.com/apple/coreai-models/issues/TBD"
+                )
             }
             return detect(at: url)
         case .file(let configURL):
@@ -124,6 +133,33 @@ public struct PipelineDescriptor: Codable, Sendable {
         case .explicit(let descriptor):
             return descriptor
         }
+    }
+
+    /// Parse a metadata.json file (v0.2 schema) and extract the diffusion config.
+    public static func loadFromMetadata(at url: URL) throws -> PipelineDescriptor {
+        let data = try Data(contentsOf: url)
+        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
+
+        guard let diffusion = json["diffusion"] as? [String: Any] else {
+            throw PipelineLoadError.missingConfig("metadata.json has no 'diffusion' block")
+        }
+        guard let assets = json["assets"] as? [String: String] else {
+            throw PipelineLoadError.missingConfig("metadata.json has no 'assets' map")
+        }
+
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let diffusionData = try JSONSerialization.data(withJSONObject: diffusion)
+        var descriptor = try decoder.decode(PipelineDescriptor.self, from: diffusionData)
+
+        // Map assets to component paths
+        descriptor.components.textEncoder = assets["text_encoder"]
+        descriptor.components.textEncoder2 = assets["text_encoder_2"]
+        descriptor.components.unet = assets["transformer"] ?? assets["unet"]
+        descriptor.components.vaeDecoder = assets["vae_decoder"]
+        descriptor.components.vaeEncoder = assets["vae_encoder"]
+
+        return descriptor
     }
 
     /// Parse a pipeline.json file.
