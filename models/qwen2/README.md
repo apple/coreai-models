@@ -79,9 +79,9 @@ Perplexity score on the [`WikiText-2`](https://huggingface.co/datasets/EleutherA
 | --------------------- | ----------------------------------------- | --------------------- | -------- | ---------------- |
 | Qwen2.5 1.5B Instruct | none (`float16`)                          | 16.00                 | macOS    | 12.21            |
 | Qwen2.5 1.5B Instruct | [4-bit quantized][p-4bit]                 | 4.50                  | macOS    | 14.79            |
-| Qwen2.5 1.5B Instruct | none (`float16`)                          | 16.00\*               | iOS      | 12.21            |
-| Qwen2.5 1.5B Instruct | [4-bit palettized (group size 8)][p-4bit] | 4.02\*                | iOS      | 14.64            |
+| Qwen2.5 1.5B Instruct | none (`float16`)                          | 16.00                 | iOS      | 12.21            |
+| Qwen2.5 1.5B Instruct | [4-bit palettized (group size 8)][p-4bit] | 4.63\*                | iOS      | 14.64            |
 
-\* BPW excludes the Embedding which is quantized to INT8 per-tensor.
+\* BPW includes the Embedding which is quantized to INT8 per-tensor.
 
 [p-4bit]: ../README.md#quantization-options
