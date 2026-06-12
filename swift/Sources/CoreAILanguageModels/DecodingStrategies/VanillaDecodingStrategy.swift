@@ -100,6 +100,9 @@ extension VanillaDecodingStrategy.VanillaDecodedSequence {
         private let tokenizer: any Tokenizer
         private let stopSequences: StopSequences
 
+        // The engine sequence is retained alongside its iterator so the decoder can record *why* generation ended
+        // (e.g. a matched stop sequence) on the shared `stopReason` slot — see `InferenceOutputSequence`.
+        private var engineSequence: (any InferenceOutputSequence)?
         private var upstreamIterator: (any AsyncIteratorProtocol<InferenceOutput, Error>)?
         private var didSetup: Bool = false
         private var initialInputTokenCount: Int = 0
@@ -133,6 +136,19 @@ extension VanillaDecodingStrategy.VanillaDecodedSequence {
             self.samplingConfiguration = samplingConfiguration
             self.options = options
             self.stopSequences = stopSequences
+        }
+
+        deinit {
+            // If the consumer abandons iteration early, `next()` never reaches the span-end / metrics code. End the
+            // still-open inference span here so it isn't orphaned in Instruments, and record the token count.
+            if let span = inferenceSpan.take() {
+                span.end()
+            }
+            if !flushed {
+                let count = generatedTokenCount
+                // Metrics recording is async; fire-and-forget on the abandon path.
+                Task { await PerformanceMetrics.shared.setGeneratedTokenCount(count) }
+            }
         }
 
         public func next() async throws -> GenerationResult? {
@@ -190,11 +206,17 @@ extension VanillaDecodingStrategy.VanillaDecodedSequence {
                     recentTokens.removeFirst()
                 }
 
-                if stopSequences.matches(recentTokens: recentTokens) {
+                if let matched = stopSequences.matchedSequence(recentTokens: recentTokens) {
                     CLILogger.log("✅ Stop sequence detected at tokens: \(recentTokens)", level: 2)
                     decodingSpan.end()
                     stopped = true
+
+                    // Record why the engine stream ended before abandoning it.
+                    let matchedText = tokenizer.decode(tokens: matched.map(Int.init))
+                    engineSequence?.setStopReason(.stopSequence(matchedText))
+                    engineSequence = nil
                     upstreamIterator = nil
+
                     // Flush any buffered text and record metrics — flushTrailingText()
                     // sets `flushed`, so subsequent next() calls return nil.
                     return try await flushTrailingText()
@@ -219,6 +241,9 @@ extension VanillaDecodingStrategy.VanillaDecodedSequence {
                 CLILogger.log("✅ Generated newText: \(newText)", level: 2)
             }
 
+            // Engine stream exhausted naturally — its iterator already recorded `.maxTokens` (or `.cancelled`/`.error`
+            // if it threw above).
+            engineSequence = nil
             upstreamIterator = nil
             endInferenceSpan()
             return try await flushTrailingText()
@@ -240,6 +265,7 @@ extension VanillaDecodingStrategy.VanillaDecodedSequence {
                 samplingConfiguration: samplingConfiguration,
                 inferenceOptions: options
             )
+            engineSequence = stream
             upstreamIterator = stream.makeAsyncIterator()
         }
 

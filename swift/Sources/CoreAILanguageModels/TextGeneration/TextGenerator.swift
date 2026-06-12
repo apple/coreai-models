@@ -13,13 +13,13 @@ import Tokenizers
 public class TextGenerator {
     private let inferenceEngine: any InferenceEngine
     private let samplingConfiguration: SamplingConfiguration
-    private let decodingStrategy: DecodingStrategy
+    private let decodingStrategy: any DecodingStrategy
     private let tokenizer: any Tokenizer
 
     public init(
         inferenceEngine: any InferenceEngine,
         samplingConfiguration: SamplingConfiguration,
-        decodingStrategy: DecodingStrategy,
+        decodingStrategy: any DecodingStrategy,
         tokenizer: any Tokenizer
     ) {
         self.inferenceEngine = inferenceEngine

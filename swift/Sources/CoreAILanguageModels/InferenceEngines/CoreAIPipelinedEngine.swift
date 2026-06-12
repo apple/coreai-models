@@ -1076,17 +1076,30 @@ extension CoreAIPipelinedEngine {
         }
 
         public func makeAsyncIterator() -> Iterator {
-            Iterator(base: base.makeAsyncIterator())
+            Iterator(base: base.makeAsyncIterator(), stopReasonStore: stopReasonStore)
         }
+    }
+}
 
-        public struct Iterator: AsyncIteratorProtocol {
-            public typealias Element = InferenceOutput
-            public typealias Failure = Error
+extension CoreAIPipelinedEngine.GenerationSequence {
+    public struct Iterator: AsyncIteratorProtocol {
+        public typealias Element = InferenceOutput
+        public typealias Failure = Error
 
-            var base: AsyncThrowingStream<InferenceOutput, any Error>.AsyncIterator
+        var base: AsyncThrowingStream<InferenceOutput, any Error>.AsyncIterator
+        let stopReasonStore: StopReasonStore
 
-            public mutating func next() async throws -> InferenceOutput? {
-                try await base.next()
+        public mutating func next() async throws -> InferenceOutput? {
+            do {
+                return try await base.next()
+            } catch is CancellationError {
+                // The producer Task is independent and won't observe the
+                // consumer's cancellation, so record it from the consumer side.
+                stopReasonStore.set(.cancelled)
+                throw CancellationError()
+            } catch {
+                stopReasonStore.set(.error)
+                throw error
             }
         }
     }
