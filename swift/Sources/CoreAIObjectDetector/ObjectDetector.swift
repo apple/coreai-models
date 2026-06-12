@@ -80,17 +80,29 @@ public struct ObjectDetector {
 
     // MARK: - Inference
 
-    /// Warm up the backend (e.g. trigger Metal kernel compilation) with a dummy pass.
-    public func warmup() async throws {
+    /// Warm up the backend (e.g. trigger Metal kernel compilation) with a dummy
+    /// pass at the same `(B, H, W)` that subsequent `detect()` calls will use.
+    /// For static-shape models the arguments are ignored — `planBatch` falls
+    /// back to the descriptor's fixed dims.
+    public func warmup(imageCount: Int = 1, parameters: DetectionParameters = .default) async throws {
         guard case .ndArray(let imageDescriptor) = functionDescriptor.inputDescriptor(of: imageInputName) else {
             throw DetectionRuntimeError.invalidConfiguration(
                 "No array descriptor for image input '\(imageInputName)'"
             )
         }
-        let defaults = DetectionParameters()
-        let warmupShape = zip(imageDescriptor.shape, [1, 3, defaults.inputHeight, defaults.inputWidth])
-            .map { actual, fallback in actual >= 0 ? actual : fallback }
-        let resolved = imageDescriptor.resolvingDynamicDimensions(warmupShape)
+        let expectedShape = imageDescriptor.shape
+        guard expectedShape.count == 4 else {
+            throw DetectionRuntimeError.invalidConfiguration(
+                "Expected 4-dimensional input shape, got \(expectedShape.count)"
+            )
+        }
+        let plan = try Self.planBatch(
+            expectedShape: expectedShape,
+            imageCount: imageCount,
+            parameters: parameters
+        )
+        let resolved = imageDescriptor.resolvingDynamicDimensions(
+            [plan.batch, 3, plan.height, plan.width])
         _ = try await function.run(inputs: [imageInputName: NDArray(descriptor: resolved)])
     }
 
@@ -142,7 +154,7 @@ public struct ObjectDetector {
 
         let plan = try Self.planBatch(
             expectedShape: expectedShape,
-            imageSizes: images.map { CGSize(width: $0.width, height: $0.height) },
+            imageCount: images.count,
             parameters: parameters
         )
 
@@ -249,29 +261,28 @@ public struct ObjectDetector {
 
     /// Resolve the concrete `(B, H, W)` to bind the model with, given the
     /// model's expected shape (which may contain `-1` for dynamic dims), the
-    /// list of input image sizes, and the user's parameter overrides.
+    /// number of input images, and the user's parameter overrides.
     ///
     /// Resolution rules:
-    /// - **Batch**: always `images.count`. A static-batch model must match.
+    /// - **Batch**: always `imageCount`. A static-batch model must match.
     /// - **Spatial dims**: a dynamic `-1` dim is filled from
     ///   `parameters.inputHeight` / `inputWidth`. A static dim is taken
     ///   from the model descriptor (the parameters' values are ignored for
     ///   that axis).
     static func planBatch(
         expectedShape: [Int],
-        imageSizes: [CGSize],
+        imageCount: Int,
         parameters: DetectionParameters
     ) throws -> BatchPlan {
-        guard !imageSizes.isEmpty else {
-            throw DetectionRuntimeError.invalidConfiguration("planBatch requires at least one image")
+        guard imageCount >= 1 else {
+            throw DetectionRuntimeError.invalidConfiguration("planBatch requires imageCount >= 1")
         }
 
-        // Resolve batch from image count; verify it matches a static batch dim.
-        let targetBatch = imageSizes.count
+        // Verify image count matches a static batch dim.
         let batchExpected = expectedShape[0]
-        if batchExpected >= 0 && batchExpected != targetBatch {
+        if batchExpected >= 0 && batchExpected != imageCount {
             throw DetectionRuntimeError.invalidConfiguration(
-                "Model expects fixed batch=\(batchExpected) but caller supplied \(targetBatch) image(s)"
+                "Model expects fixed batch=\(batchExpected) but caller supplied \(imageCount) image(s)"
             )
         }
 
@@ -280,7 +291,7 @@ public struct ObjectDetector {
         let height = heightExpected < 0 ? parameters.inputHeight : heightExpected
         let width = widthExpected < 0 ? parameters.inputWidth : widthExpected
 
-        return BatchPlan(batch: targetBatch, height: height, width: width)
+        return BatchPlan(batch: imageCount, height: height, width: width)
     }
 
     // MARK: - Name Discovery
