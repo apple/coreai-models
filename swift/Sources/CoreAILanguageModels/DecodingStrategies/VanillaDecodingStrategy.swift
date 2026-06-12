@@ -34,13 +34,29 @@ public struct VanillaDecodingStrategy: DecodingStrategy {
         samplingConfiguration: SamplingConfiguration,
         options: InferenceOptions,
         stopSequences: StopSequences
-    ) -> VanillaDecodedSequence {
-        VanillaDecodedSequence(
-            input: input,
-            tokenizer: tokenizer,
-            inferenceEngine: inferenceEngine,
+    ) throws -> VanillaDecodedSequence {
+        CLILogger.log("🔄 Starting vanilla decoding generation")
+
+        // Eager setup.
+        let inputTokens =
+            try PromptUtils
+            .maybeApplyTokenizerChatTemplate(input, tokenizer: tokenizer)
+            .map(Int32.init)
+        CLILogger.log("Input tokens: \(inputTokens.prefix(10))... (showing first 10)")
+
+        let stream = try inferenceEngine.generate(
+            with: inputTokens,
             samplingConfiguration: samplingConfiguration,
-            options: options,
+            inferenceOptions: options
+        )
+
+        return VanillaDecodedSequence(
+            prepared: VanillaDecodedSequence.Prepared(
+                initialInputTokenCount: inputTokens.count,
+                engineSequence: stream,
+                upstreamIterator: stream.makeAsyncIterator()
+            ),
+            tokenizer: tokenizer,
             stopSequences: stopSequences
         )
     }
@@ -72,20 +88,31 @@ extension VanillaDecodingStrategy {
         public typealias Element = GenerationResult
         public typealias Failure = Error
 
-        let input: Input
+        /// Holds the eagerly-opened engine stream (and its single iterator) produced by `decode()`.
+        fileprivate final class Prepared {
+            let initialInputTokenCount: Int
+            var engineSequence: (any InferenceOutputSequence)?
+            var upstreamIterator: (any AsyncIteratorProtocol<InferenceOutput, Error>)?
+
+            init(
+                initialInputTokenCount: Int,
+                engineSequence: any InferenceOutputSequence,
+                upstreamIterator: any AsyncIteratorProtocol<InferenceOutput, Error>
+            ) {
+                self.initialInputTokenCount = initialInputTokenCount
+                self.engineSequence = engineSequence
+                self.upstreamIterator = upstreamIterator
+            }
+        }
+
+        fileprivate let prepared: Prepared
         let tokenizer: any Tokenizer
-        let inferenceEngine: any InferenceEngine
-        let samplingConfiguration: SamplingConfiguration
-        let options: InferenceOptions
         let stopSequences: StopSequences
 
         public func makeAsyncIterator() -> Iterator {
             Iterator(
-                input: input,
+                prepared: prepared,
                 tokenizer: tokenizer,
-                inferenceEngine: inferenceEngine,
-                samplingConfiguration: samplingConfiguration,
-                options: options,
                 stopSequences: stopSequences
             )
         }
@@ -104,8 +131,7 @@ extension VanillaDecodingStrategy.VanillaDecodedSequence {
         // (e.g. a matched stop sequence) on the shared `stopReason` slot — see `InferenceOutputSequence`.
         private var engineSequence: (any InferenceOutputSequence)?
         private var upstreamIterator: (any AsyncIteratorProtocol<InferenceOutput, Error>)?
-        private var didSetup: Bool = false
-        private var initialInputTokenCount: Int = 0
+        private let initialInputTokenCount: Int
 
         // Decoding state
         private var generatedTokenCount: Int = 0
@@ -116,26 +142,17 @@ extension VanillaDecodingStrategy.VanillaDecodedSequence {
         private var stopped: Bool = false
         private var flushed: Bool = false
 
-        // Setup inputs (used lazily on first next()).
-        private let input: Input
-        private let inferenceEngine: any InferenceEngine
-        private let samplingConfiguration: SamplingConfiguration
-        private let options: InferenceOptions
-
-        init(
-            input: Input,
+        fileprivate init(
+            prepared: VanillaDecodingStrategy.VanillaDecodedSequence.Prepared,
             tokenizer: any Tokenizer,
-            inferenceEngine: any InferenceEngine,
-            samplingConfiguration: SamplingConfiguration,
-            options: InferenceOptions,
             stopSequences: StopSequences
         ) {
-            self.input = input
             self.tokenizer = tokenizer
-            self.inferenceEngine = inferenceEngine
-            self.samplingConfiguration = samplingConfiguration
-            self.options = options
             self.stopSequences = stopSequences
+            self.initialInputTokenCount = prepared.initialInputTokenCount
+            self.engineSequence = prepared.engineSequence.take()
+            self.upstreamIterator = prepared.upstreamIterator.take()
+            self.inferenceSpan = InstrumentsProfiler.beginPrompt(tokens: prepared.initialInputTokenCount)
         }
 
         deinit {
@@ -152,16 +169,6 @@ extension VanillaDecodingStrategy.VanillaDecodedSequence {
         }
 
         public func next() async throws -> GenerationResult? {
-            if !didSetup {
-                didSetup = true
-                do {
-                    try setUpUpstream()
-                } catch {
-                    upstreamIterator = nil
-                    throw error
-                }
-            }
-
             guard !stopped, var iterator = upstreamIterator else {
                 return try await flushTrailingText()
             }
@@ -214,6 +221,9 @@ extension VanillaDecodingStrategy.VanillaDecodedSequence {
                     // Record why the engine stream ended before abandoning it.
                     let matchedText = tokenizer.decode(tokens: matched.map(Int.init))
                     engineSequence?.setStopReason(.stopSequence(matchedText))
+
+                    // Drain remaining tokens so the pipelined engine's producer Task completes.
+                    while try await iterator.next() != nil {}
                     engineSequence = nil
                     upstreamIterator = nil
 
@@ -247,26 +257,6 @@ extension VanillaDecodingStrategy.VanillaDecodedSequence {
             upstreamIterator = nil
             endInferenceSpan()
             return try await flushTrailingText()
-        }
-
-        private func setUpUpstream() throws {
-            CLILogger.log("🔄 Starting vanilla decoding generation")
-            let inputTokens =
-                try PromptUtils
-                .maybeApplyTokenizerChatTemplate(input, tokenizer: tokenizer)
-                .map(Int32.init)
-            CLILogger.log("Input tokens: \(inputTokens.prefix(10))... (showing first 10)")
-            initialInputTokenCount = inputTokens.count
-
-            inferenceSpan = InstrumentsProfiler.beginPrompt(tokens: inputTokens.count)
-
-            let stream = try inferenceEngine.generate(
-                with: inputTokens,
-                samplingConfiguration: samplingConfiguration,
-                inferenceOptions: options
-            )
-            engineSequence = stream
-            upstreamIterator = stream.makeAsyncIterator()
         }
 
         private func endInferenceSpan() {
