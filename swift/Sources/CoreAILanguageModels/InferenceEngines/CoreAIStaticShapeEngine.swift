@@ -546,11 +546,17 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     // MARK: - Lifecycle
 
     public func cancel() async throws {
-        _activeToken.withLock { $0?.cancel(); $0 = nil }
+        _activeToken.withLock {
+            $0?.cancel()
+            $0 = nil
+        }
     }
 
     public func reset() {
-        _activeToken.withLock { $0?.cancel(); $0 = nil }
+        _activeToken.withLock {
+            $0?.cancel()
+            $0 = nil
+        }
         let resetSpan = InstrumentsProfiler.beginReset(engine: "StaticShape")
         processedTokenCount = 0
         resetSpan.end()

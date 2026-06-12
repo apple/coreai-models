@@ -371,11 +371,17 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
     }
 
     public func cancel() async throws {
-        _activeToken.withLock { $0?.cancel(); $0 = nil }
+        _activeToken.withLock {
+            $0?.cancel()
+            $0 = nil
+        }
     }
 
     public func reset() {
-        _activeToken.withLock { $0?.cancel(); $0 = nil }
+        _activeToken.withLock {
+            $0?.cancel()
+            $0 = nil
+        }
         let resetSpan = InstrumentsProfiler.beginReset(engine: "CoreAIClean")
         processedTokenCount = 0
         zeroFill(&keyCache)

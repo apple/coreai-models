@@ -178,13 +178,19 @@ final class CoreAIPipelinedEngine: InferenceEngine, Sendable {
             defer { task = nil }
             return task
         }
-        _activeToken.withLock { $0?.cancel(); $0 = nil }
+        _activeToken.withLock {
+            $0?.cancel()
+            $0 = nil
+        }
         await task?.value
     }
 
     func reset() {
         drain()
-        _activeToken.withLock { $0?.cancel(); $0 = nil }
+        _activeToken.withLock {
+            $0?.cancel()
+            $0 = nil
+        }
         _generationTask.withLock { $0 = nil }
         guard tryAcquireEngine() else { return }
         defer { releaseEngine() }

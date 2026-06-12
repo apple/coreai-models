@@ -196,7 +196,10 @@ class MockEngine: InferenceEngine, @unchecked Sendable {
     }
 
     func cancel() async throws {
-        _activeToken.withLock { $0?.cancel(); $0 = nil }
+        _activeToken.withLock {
+            $0?.cancel()
+            $0 = nil
+        }
     }
 
     func reset() async throws {
