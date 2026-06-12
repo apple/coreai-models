@@ -1,5 +1,5 @@
 {
-  "originHash" : "ada7bcbc202c8eeb445ad002cc4eaf91f862ef83d27dfe4f9bd72c6d039b0729",
+  "originHash" : "2a286d1351e25ad1fe90e9af62a33aeaa646452e3532732ed2f08a2134cfd2d6",
   "pins" : [
     {
       "identity" : "eventsource",
@@ -98,6 +98,15 @@
       "state" : {
         "revision" : "eed7264ac5e4ec5dfa6165c6e5c5577364344fe4",
         "version" : "1.2.0"
+      }
+    },
+    {
+      "identity" : "xgrammar",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/mlc-ai/xgrammar",
+      "state" : {
+        "branch" : "main",
+        "revision" : "4d145cc13d878c751ebeed36af1c013074be76bc"
       }
     },
     {
