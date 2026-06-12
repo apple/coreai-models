@@ -97,7 +97,7 @@ struct ObjectDetectorCLI: AsyncParsableCommand {
 
         if warmup {
             if verbose { print("Running warmup...") }
-            try await detector.warmup()
+            try await detector.warmup(imageCount: loaded.count, parameters: params)
         }
 
         if verbose { print("Running detection on \(loaded.count) image(s)...") }
