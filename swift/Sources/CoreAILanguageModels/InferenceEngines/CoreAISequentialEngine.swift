@@ -169,8 +169,8 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         self.valueCache = NDArray(descriptor: resolvedValueDesc)
 
         CLILogger.log(
-            "KV cache: dynamic=\(isDynamic), initial=\(initialCapacity), "
-                + "key=\(keyCacheDesc.shape) → \(resolvedKeyDesc.shape)")
+            "KV cache: dynamic=\(isDynamic), initial=\(initialCapacity), key=\(keyCacheDesc.shape) → \(resolvedKeyDesc.shape)"
+        )
 
         // Allocate initial logits (1 token — will be reallocated per batch)
         let initLogitsDesc = logitsDesc.resolvingDynamicDimensions([1, 1, config.vocabSize])
@@ -196,10 +196,8 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         )
 
         CLILogger.log(
-            "CoreAI clean engine initialized — "
-                + "inputs: \(descriptor.inputNames), "
-                + "outputs: \(descriptor.outputNames), "
-                + "states: \(descriptor.stateNames)")
+            "CoreAI clean engine initialized — inputs: \(descriptor.inputNames), outputs: \(descriptor.outputNames), states: \(descriptor.stateNames)"
+        )
     }
 
     /// Convenience initializer with direct model URL.
@@ -316,8 +314,8 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
             let chunk = remainingTokens[remainingTokens.startIndex..<chunkEnd]
 
             CLILogger.log(
-                "Chunk \(chunkIndex + 1)/\(totalChunks): "
-                    + "\(chunk.count) tokens at position \(processedTokenCount)")
+                "Chunk \(chunkIndex + 1)/\(totalChunks): \(chunk.count) tokens at position \(processedTokenCount)"
+            )
 
             lastLogits = try await processTokenBatch(chunk)
             remainingTokens = remainingTokens[chunkEnd...]
@@ -338,72 +336,13 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         with input: [TokenId],
         samplingConfiguration: SamplingConfiguration,
         inferenceOptions: InferenceOptions
-    ) throws -> some AsyncSequence<InferenceOutput, Error> {
-        AsyncThrowingStream { continuation in
-            Task {
-                self.generating.withLock { $0 = true }
-                defer { self.generating.withLock { $0 = false } }
-                do {
-                    let maxTokens: Int
-                    if let forced = inferenceOptions.forcedContinuation {
-                        maxTokens = forced.count
-                    } else {
-                        maxTokens = min(
-                            inferenceOptions.maxTokens ?? Int.max,
-                            max(0, self.config.maxContextLength - input.count)
-                        )
-                    }
-                    let returnsLogits = inferenceOptions.includeLogits
-                    var inputTokens = input
-
-                    for i in 0..<maxTokens {
-                        try Task.checkCancellation()
-
-                        guard self.processedTokenCount < inputTokens.count else {
-                            throw InferenceRuntimeError.invalidState("No new tokens to process")
-                        }
-
-                        let newTokens = inputTokens[self.processedTokenCount...]
-                        let strategy = self.selectPrefillStrategy(newTokenCount: newTokens.count)
-
-                        let logitBuffer: [LogitsScalarType]
-                        switch strategy {
-                        case .chunked(let chunkSize):
-                            logitBuffer = try await self.processChunkedPrompt(
-                                tokens: newTokens, chunkSize: chunkSize)
-                        case .wholeBatch:
-                            let allLogits = try await self.processTokenBatch(newTokens)
-                            logitBuffer = lastTokenLogits(
-                                from: allLogits, vocabSize: self.config.vocabSize)
-                        case .oneAtATime:
-                            var lastLogits: [LogitsScalarType] = []
-                            for j in newTokens.indices {
-                                lastLogits = try await self.processTokenBatch(newTokens[j...j])
-                            }
-                            logitBuffer = lastLogits
-                        }
-
-                        let nextToken: Int32
-                        if let forced = inferenceOptions.forcedContinuation {
-                            nextToken = forced[i]
-                        } else {
-                            var mutableLogits = logitBuffer
-                            nextToken = samplingConfiguration.fallbackSampler(from: &mutableLogits)
-                        }
-
-                        continuation.yield(
-                            InferenceOutput(
-                                tokenId: nextToken,
-                                logits: returnsLogits ? logitBuffer : nil
-                            ))
-                        inputTokens.append(nextToken)
-                    }
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
-                }
-            }
-        }
+    ) throws -> GenerationSequence {
+        GenerationSequence(
+            engine: self,
+            input: input,
+            samplingConfiguration: samplingConfiguration,
+            inferenceOptions: inferenceOptions
+        )
     }
 
     // MARK: - Lifecycle
@@ -510,6 +449,163 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         view.withUnsafeMutablePointer { ptr, _, _ in
             for i in 0..<count {
                 ptr[i] = 0
+            }
+        }
+    }
+}
+
+extension CoreAISequentialEngine {
+    /// Async sequence of `InferenceOutput` produced by `generate()`.
+    public struct GenerationSequence: InferenceOutputSequence {
+        public typealias Element = InferenceOutput
+        public typealias Failure = Error
+
+        let engine: CoreAISequentialEngine
+        let input: [CoreAISequentialEngine.TokenId]
+        let samplingConfiguration: SamplingConfiguration
+        let inferenceOptions: InferenceOptions
+
+        /// Shared with the iterator so the caller can read why generation ended.
+        let stopReasonStore = StopReasonStore()
+
+        public var stopReason: StopReason? { stopReasonStore.stopReason }
+
+        public func setStopReason(_ reason: StopReason) {
+            stopReasonStore.set(reason)
+        }
+
+        public func makeAsyncIterator() -> Iterator {
+            Iterator(
+                engine: engine,
+                input: input,
+                samplingConfiguration: samplingConfiguration,
+                inferenceOptions: inferenceOptions,
+                stopReasonStore: stopReasonStore
+            )
+        }
+    }
+}
+
+extension CoreAISequentialEngine.GenerationSequence {
+    public final class Iterator: AsyncIteratorProtocol {
+        public typealias Element = InferenceOutput
+        public typealias Failure = Error
+
+        private let engine: CoreAISequentialEngine
+        private let samplingConfiguration: SamplingConfiguration
+        private let returnsLogits: Bool
+        private let forcedContinuation: [CoreAISequentialEngine.TokenId]?
+        private let maxTokens: Int
+        private let stopReasonStore: StopReasonStore
+
+        private var inputTokens: [CoreAISequentialEngine.TokenId]
+        private var step: Int = 0
+        private var didAcquireLock: Bool = false
+        private var finished: Bool = false
+
+        init(
+            engine: CoreAISequentialEngine,
+            input: [CoreAISequentialEngine.TokenId],
+            samplingConfiguration: SamplingConfiguration,
+            inferenceOptions: InferenceOptions,
+            stopReasonStore: StopReasonStore
+        ) {
+            self.engine = engine
+            self.samplingConfiguration = samplingConfiguration
+            self.returnsLogits = inferenceOptions.includeLogits
+            self.forcedContinuation = inferenceOptions.forcedContinuation
+            self.stopReasonStore = stopReasonStore
+            self.inputTokens = input
+            if let forced = inferenceOptions.forcedContinuation {
+                self.maxTokens = forced.count
+            } else {
+                self.maxTokens = Swift.min(
+                    inferenceOptions.maxTokens ?? Int.max,
+                    Swift.max(0, engine.config.maxContextLength - input.count)
+                )
+            }
+        }
+
+        deinit {
+            if didAcquireLock {
+                engine.generating.withLock { $0 = false }
+            }
+        }
+
+        public func next() async throws -> InferenceOutput? {
+            if finished { return nil }
+
+            if !didAcquireLock {
+                engine.generating.withLock { $0 = true }
+                didAcquireLock = true
+            }
+
+            guard step < maxTokens else {
+                // Natural exhaustion. Don't clobber a reason a decoder set (e.g. `.eos`).
+                stopReasonStore.setIfUnset(.maxTokens)
+                finishAndRelease()
+                return nil
+            }
+
+            do {
+                try Task.checkCancellation()
+
+                guard engine.processedTokenCount < inputTokens.count else {
+                    throw InferenceRuntimeError.invalidState("No new tokens to process")
+                }
+
+                let newTokens = inputTokens[engine.processedTokenCount...]
+                let strategy = engine.selectPrefillStrategy(newTokenCount: newTokens.count)
+
+                let logitBuffer: [LogitsScalarType]
+                switch strategy {
+                case .chunked(let chunkSize):
+                    logitBuffer = try await engine.processChunkedPrompt(tokens: newTokens, chunkSize: chunkSize)
+                case .wholeBatch:
+                    let allLogits = try await engine.processTokenBatch(newTokens)
+                    logitBuffer = lastTokenLogits(from: allLogits, vocabSize: engine.config.vocabSize)
+                case .oneAtATime:
+                    var lastLogits: [LogitsScalarType] = []
+                    for j in newTokens.indices {
+                        lastLogits = try await engine.processTokenBatch(newTokens[j...j])
+                    }
+                    logitBuffer = lastLogits
+                }
+
+                let nextToken: Int32
+                if let forced = forcedContinuation {
+                    nextToken = forced[step]
+                } else {
+                    var mutableLogits = logitBuffer
+                    nextToken = samplingConfiguration.fallbackSampler(from: &mutableLogits)
+                }
+
+                inputTokens.append(nextToken)
+                step += 1
+
+                return InferenceOutput(
+                    tokenId: nextToken,
+                    logits: returnsLogits ? logitBuffer : nil
+                )
+            } catch is CancellationError {
+                stopReasonStore.set(.cancelled)
+                finishAndRelease()
+                throw CancellationError()
+            } catch {
+                stopReasonStore.set(.error)
+                finishAndRelease()
+                throw error
+            }
+        }
+
+        private func finishAndRelease() {
+            guard !finished else {
+                return
+            }
+            finished = true
+            if didAcquireLock {
+                engine.generating.withLock { $0 = false }
+                didAcquireLock = false
             }
         }
     }

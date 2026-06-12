@@ -355,10 +355,14 @@ public struct CoreAILanguageModel: LanguageModel {
                 ToolCallParser(openMarker: $0.open, closeMarker: $0.close)
             }
             var generatedTokenCount: Int = 0
+            var reasoningTokenCount: Int = 0
 
             for try await output in tokenStream {
                 let token = output.tokenId
-                if let eos = eosTokenId, Int(token) == eos { break }
+                if let eos = eosTokenId, Int(token) == eos {
+                    tokenStream.setStopReason(.eos)
+                    break
+                }
 
                 pendingTokens.append(token)
                 tokenStep += 1
@@ -391,6 +395,7 @@ public struct CoreAILanguageModel: LanguageModel {
                 }
 
                 for event in thinkParser.consume(delta) {
+                    if case .reasoning = event { reasoningTokenCount += 1 }
                     await dispatch(event: event, toolCallParser: &toolCallParser, channel: channel)
                 }
 
@@ -424,9 +429,15 @@ public struct CoreAILanguageModel: LanguageModel {
                 toolCallParser = tcp
             }
 
-            // Usage telemetry placeholder — awaiting Usage(input:output:) API.
-            _ = promptTokens.count
-            _ = generatedTokenCount
+            await channel.send(
+                .response(
+                    action: .updateUsage(
+                        input: .init(totalTokenCount: promptTokens.count, cachedTokenCount: 0),
+                        output: .init(
+                            totalTokenCount: generatedTokenCount,
+                            reasoningTokenCount: reasoningTokenCount
+                        )
+                    )))
 
             // Yield to let the engine's tokenSequence Task finish cleanup
             // (putBackEngine, state reset, etc.) before the next respond().
@@ -514,7 +525,7 @@ public struct CoreAILanguageModel: LanguageModel {
             let strategy = ConstrainedDecodingStrategy(jsonSchema: jsonSchema, vocabSize: vocabSize)
             let stopSequences = StopSequences(for: tokenizer)
 
-            let stream = strategy.decode(
+            let stream = try await strategy.decode(
                 from: .tokens(promptTokens),
                 tokenizer: tokenizer,
                 inferenceEngine: engine,

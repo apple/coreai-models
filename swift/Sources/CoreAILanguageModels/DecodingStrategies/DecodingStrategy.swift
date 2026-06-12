@@ -106,12 +106,24 @@ public struct StopSequences: Sendable {
     /// - Parameter recentTokens: Buffer of recently generated tokens
     /// - Returns: true if any sequence matches the end of the buffer
     public func matches(recentTokens: [Int32]) -> Bool {
+        matchedSequence(recentTokens: recentTokens) != nil
+    }
+
+    /// Return the stop sequence whose tokens match the end of `recentTokens`.
+    ///
+    /// Same suffix-matching logic as `matches(recentTokens:)`, but returns the
+    /// matched sequence so callers can report *why* generation stopped (e.g. to
+    /// decode the sequence into a `StopReason.stopSequence` string).
+    ///
+    /// - Parameter recentTokens: Buffer of recently generated tokens
+    /// - Returns: The matched sequence, or nil if none matched.
+    public func matchedSequence(recentTokens: [Int32]) -> [Int32]? {
         for sequence in sequences {
             if recentTokens.suffix(sequence.count).elementsEqual(sequence) {
-                return true
+                return sequence
             }
         }
-        return false
+        return nil
     }
 
     /// Check if empty (no stop sequences)
@@ -130,7 +142,12 @@ public struct StopSequences: Sendable {
 /// Decoding strategies produce text + optional enrichments (logits, token IDs)
 /// from an inference engine.
 public protocol DecodingStrategy: Sendable {
+    associatedtype ResultSequence: AsyncSequence<GenerationResult, Error>
+
     /// Stream decoded text with optional logits.
+    ///
+    /// Performs any required setup (session creation, tokenization, engine reset) eagerly before returning, so the
+    /// returned sequence is ready to iterate.
     ///
     /// - Parameters:
     ///   - input: Input specification (raw text, prompt, or pre-tokenized)
@@ -147,7 +164,7 @@ public protocol DecodingStrategy: Sendable {
         samplingConfiguration: SamplingConfiguration,
         options: InferenceOptions,
         stopSequences: StopSequences
-    ) -> AsyncThrowingStream<GenerationResult, Error>
+    ) async throws -> ResultSequence
 }
 
 // MARK: - Decoding Strategy Factory
@@ -160,7 +177,7 @@ public struct DecodingStrategyFactory {
     ///   - parameters: Optional parameters for configuring the strategy
     /// - Returns: A configured decoding strategy instance
     public static func create(type: DecodingType, parameters: DecodingParameters = DecodingParameters())
-        -> DecodingStrategy
+        -> any DecodingStrategy
     {
         switch type {
         case .vanilla:

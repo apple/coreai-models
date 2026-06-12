@@ -137,7 +137,9 @@ async def _async_export_diffusion(config: DiffusionExportConfig) -> dict[str, st
         _save_tokenizer(config.hf_model_id, output_path, hf_pipe, overwrite=config.overwrite)
 
     # 4. Write pipeline.json
-    _write_metadata_json(hf_pipe, config.hf_model_id, pipeline_type, output_path, config.compression, results)
+    _write_metadata_json(
+        hf_pipe, config.hf_model_id, pipeline_type, output_path, config.compression, results
+    )
 
     # Summary
     logger.info("=== Export Summary ===")

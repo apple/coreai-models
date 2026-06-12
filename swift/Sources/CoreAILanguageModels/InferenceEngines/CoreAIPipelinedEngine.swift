@@ -87,7 +87,7 @@ final class CoreAIPipelinedEngine: InferenceEngine, Sendable {
         with input: [TokenId],
         samplingConfiguration: SamplingConfiguration,
         inferenceOptions: InferenceOptions
-    ) throws -> some AsyncSequence<InferenceOutput, Error> {
+    ) throws -> GenerationSequence {
         if inferenceOptions.includeLogits {
             throw InferenceRuntimeError.invalidArgument(
                 "CoreAI pipelined engine does not support logits (GPU-side sampling). "
@@ -101,18 +101,16 @@ final class CoreAIPipelinedEngine: InferenceEngine, Sendable {
             )
         }
         let maxTokens = inferenceOptions.maxTokens
-        let (stream, outputContinuation) = AsyncThrowingStream<InferenceOutput, any Error>.makeStream()
+        let stopReasonStore = StopReasonStore()
+        let (base, outputContinuation) =
+            AsyncThrowingStream<InferenceOutput, any Error>.makeStream()
         Task {
             self.acquireEngine()
             defer { self.releaseEngine() }
             do {
-                // Bridge: runCompletion yields TokenId via a TokenId continuation.
-                // We wrap each token into InferenceOutput in the yield callback.
                 let (tokenStream, tokenContinuation) =
                     AsyncThrowingStream<InferenceEngine.TokenId, any Error>.makeStream()
 
-                // Forward tokens from tokenStream → outputContinuation as InferenceOutput.
-                // This must run concurrently with runCompletion.
                 async let forwarding: Void = {
                     do {
                         for try await token in tokenStream {
@@ -131,12 +129,17 @@ final class CoreAIPipelinedEngine: InferenceEngine, Sendable {
                 )
                 tokenContinuation.finish()
                 await forwarding
+                stopReasonStore.setIfUnset(.maxTokens)
+                outputContinuation.finish()
+            } catch is CancellationError {
+                stopReasonStore.set(.cancelled)
                 outputContinuation.finish()
             } catch {
+                stopReasonStore.set(.error)
                 outputContinuation.finish(throwing: error)
             }
         }
-        return stream
+        return GenerationSequence(base: base, stopReasonStore: stopReasonStore)
     }
 
     /// Wait for any in-flight generate() Task to return the engine.
@@ -1050,5 +1053,54 @@ private struct EngineImpl: ~Copyable {
         CLILogger.log(
             "CoreAI pipelined warmup complete (\(shapesToWarm.count) shapes): \(String(format: "%.2f", warmupElapsed))ms"
         )
+    }
+}
+
+extension CoreAIPipelinedEngine {
+    /// Async sequence of `InferenceOutput` produced by `generate()`.
+    ///
+    /// Unlike the CPU engines, the pipelined engine samples on-device and drives
+    /// output from a producer `Task`, so this sequence forwards an underlying
+    /// `AsyncThrowingStream`. The producer records the `stopReason` directly.
+    public struct GenerationSequence: InferenceOutputSequence {
+        public typealias Element = InferenceOutput
+        public typealias Failure = Error
+
+        let base: AsyncThrowingStream<InferenceOutput, any Error>
+        let stopReasonStore: StopReasonStore
+
+        public var stopReason: StopReason? { stopReasonStore.stopReason }
+
+        public func setStopReason(_ reason: StopReason) {
+            stopReasonStore.set(reason)
+        }
+
+        public func makeAsyncIterator() -> Iterator {
+            Iterator(base: base.makeAsyncIterator(), stopReasonStore: stopReasonStore)
+        }
+    }
+}
+
+extension CoreAIPipelinedEngine.GenerationSequence {
+    public struct Iterator: AsyncIteratorProtocol {
+        public typealias Element = InferenceOutput
+        public typealias Failure = Error
+
+        var base: AsyncThrowingStream<InferenceOutput, any Error>.AsyncIterator
+        let stopReasonStore: StopReasonStore
+
+        public mutating func next() async throws -> InferenceOutput? {
+            do {
+                return try await base.next()
+            } catch is CancellationError {
+                // The producer Task is independent and won't observe the
+                // consumer's cancellation, so record it from the consumer side.
+                stopReasonStore.set(.cancelled)
+                throw CancellationError()
+            } catch {
+                stopReasonStore.set(.error)
+                throw error
+            }
+        }
     }
 }

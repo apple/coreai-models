@@ -42,91 +42,46 @@ public struct ConstrainedDecodingStrategy: DecodingStrategy {
         samplingConfiguration: SamplingConfiguration,
         options: InferenceOptions,
         stopSequences: StopSequences
-    ) -> AsyncThrowingStream<GenerationResult, Error> {
-        return AsyncThrowingStream { continuation in
-            Task {
-                do {
-                    try await runConstrainedGeneration(
-                        input: input,
-                        tokenizer: tokenizer,
-                        inferenceEngine: inferenceEngine,
-                        samplingConfiguration: samplingConfiguration,
-                        options: options,
-                        stopSequences: stopSequences,
-                        with: continuation
-                    )
-                } catch {
-                    continuation.finish(throwing: error)
-                }
-            }
-        }
-    }
+    ) async throws -> ConstrainedDecodedSequence {
+        CLILogger.log(
+            "Starting constrained decoding strategy with schema",
+            component: "ConstrainedDecodingStrategy"
+        )
 
-    // MARK: - Core constrained generation loop
-
-    private func runConstrainedGeneration(
-        input: Input,
-        tokenizer: any Tokenizer,
-        inferenceEngine: any InferenceEngine,
-        samplingConfiguration: SamplingConfiguration,
-        options: InferenceOptions,
-        stopSequences: StopSequences,
-        with continuation: AsyncThrowingStream<GenerationResult, any Error>.Continuation
-    ) async throws {
-        CLILogger.log("Starting constrained decoding strategy with schema", component: "ConstrainedDecodingStrategy")
-
-        // Setup: session, tokens, options
-        var session = try createSession(tokenizer: tokenizer, stopSequences: stopSequences)
-        var inputTokens = try PromptUtils.maybeApplyTokenizerChatTemplate(input, tokenizer: tokenizer)
+        // Eager setup
+        let session = try Self.createSession(
+            jsonSchema: jsonSchema,
+            vocabSizeOverride: vocabSizeOverride,
+            tokenizer: tokenizer,
+            stopSequences: stopSequences
+        )
+        let inputTokens =
+            try PromptUtils
+            .maybeApplyTokenizerChatTemplate(input, tokenizer: tokenizer)
             .map(Int32.init)
-        let constrainedOptions = InferenceOptions(maxTokens: 1, includeLogits: true)
         let maxTokens = options.maxTokens ?? 512
 
         try await inferenceEngine.reset()
 
-        var generatedTokens: [Int32] = []
-        var previousDecodedText: String = ""
-        var tokenStep: Int = 0
-
-        // Token-by-token generation loop
-        for _ in 0..<maxTokens {
-            if session.isTerminated { break }
-
-            // Step 1: Get logits → mask → sample → accept
-            let (bestToken, logits) = try await generateOneToken(
+        return ConstrainedDecodedSequence(
+            prepared: ConstrainedDecodedSequence.Prepared(
+                session: consume session,
                 inputTokens: inputTokens,
-                session: &session,
-                inferenceEngine: inferenceEngine,
-                samplingConfiguration: samplingConfiguration,
-                constrainedOptions: constrainedOptions
-            )
-            guard let bestToken, let logits else { break }
-
-            if stopSequences.matches(recentTokens: [bestToken]) { break }
-
-            inputTokens.append(bestToken)
-            generatedTokens.append(bestToken)
-            tokenStep += 1
-
-            // Step 2: Decode to text and yield delta
-            let delta = computeTextDelta(
-                generatedTokens: generatedTokens,
-                previousDecodedText: &previousDecodedText,
-                tokenizer: tokenizer,
-                tokenStep: tokenStep
-            )
-            continuation.yield(GenerationResult(text: delta, tokenId: bestToken, rawLogits: logits))
-
-            if session.isTerminated { break }
-        }
-
-        continuation.finish()
+                maxTokens: maxTokens
+            ),
+            tokenizer: tokenizer,
+            inferenceEngine: inferenceEngine,
+            samplingConfiguration: samplingConfiguration,
+            stopSequences: stopSequences
+        )
     }
 
     // MARK: - Private helpers
 
     /// Create a constrained generation session with stop token extraction.
-    private func createSession(
+    fileprivate static func createSession(
+        jsonSchema: String,
+        vocabSizeOverride: Int?,
         tokenizer: any Tokenizer,
         stopSequences: StopSequences
     ) throws -> ConstrainedGenerationSession {
@@ -159,7 +114,7 @@ public struct ConstrainedDecodingStrategy: DecodingStrategy {
 
     /// Run one inference step: get logits, apply mask, sample, accept.
     /// Returns `(nil, nil)` if generation should stop.
-    private func generateOneToken(
+    fileprivate static func generateOneToken(
         inputTokens: [Int32],
         session: inout ConstrainedGenerationSession,
         inferenceEngine: any InferenceEngine,
@@ -190,7 +145,7 @@ public struct ConstrainedDecodingStrategy: DecodingStrategy {
         return (bestToken, logits)
     }
 
-    private func computeTextDelta(
+    fileprivate static func computeTextDelta(
         generatedTokens: [Int32],
         previousDecodedText: inout String,
         tokenizer: any Tokenizer,
@@ -235,5 +190,156 @@ public struct ConstrainedDecodingStrategy: DecodingStrategy {
             return nil
         }
         return low
+    }
+}
+
+// MARK: - ConstrainedDecodedSequence
+
+extension ConstrainedDecodingStrategy {
+    /// Async sequence of `GenerationResult` produced by `decode()`.
+    public struct ConstrainedDecodedSequence: AsyncSequence {
+        public typealias Element = GenerationResult
+        public typealias Failure = Error
+
+        fileprivate let prepared: Prepared
+        let tokenizer: any Tokenizer
+        let inferenceEngine: any InferenceEngine
+        let samplingConfiguration: SamplingConfiguration
+        let stopSequences: StopSequences
+
+        public func makeAsyncIterator() -> Iterator {
+            Iterator(
+                prepared: prepared,
+                tokenizer: tokenizer,
+                inferenceEngine: inferenceEngine,
+                samplingConfiguration: samplingConfiguration,
+                stopSequences: stopSequences
+            )
+        }
+    }
+}
+
+extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
+    /// Holds the eagerly-created, move-only generation session together with the tokenized prompt and token budget.
+    fileprivate final class Prepared {
+        var session: ConstrainedGenerationSession?
+        let inputTokens: [Int32]
+        let maxTokens: Int
+
+        init(
+            session: consuming ConstrainedGenerationSession,
+            inputTokens: [Int32],
+            maxTokens: Int
+        ) {
+            self.session = consume session
+            self.inputTokens = inputTokens
+            self.maxTokens = maxTokens
+        }
+    }
+}
+
+extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
+    public final class Iterator: AsyncIteratorProtocol {
+        public typealias Element = GenerationResult
+        public typealias Failure = Error
+
+        private let tokenizer: any Tokenizer
+        private let inferenceEngine: any InferenceEngine
+        private let samplingConfiguration: SamplingConfiguration
+        private let stopSequences: StopSequences
+        private let constrainedOptions = InferenceOptions(maxTokens: 1, includeLogits: true)
+
+        // Generation state, seeded eagerly from the prepared setup.
+        private var session: ConstrainedGenerationSession?
+        private var inputTokens: [Int32]
+        private let maxTokens: Int
+        private var generatedTokens: [Int32] = []
+        private var previousDecodedText: String = ""
+        private var tokenStep: Int = 0
+        private var finished: Bool = false
+
+        fileprivate init(
+            prepared: ConstrainedDecodingStrategy.ConstrainedDecodedSequence.Prepared,
+            tokenizer: any Tokenizer,
+            inferenceEngine: any InferenceEngine,
+            samplingConfiguration: SamplingConfiguration,
+            stopSequences: StopSequences
+        ) {
+            // Take ownership of the move-only session prepared by `decode()`.
+            self.session = prepared.session.take()
+            self.inputTokens = prepared.inputTokens
+            self.maxTokens = prepared.maxTokens
+            self.tokenizer = tokenizer
+            self.inferenceEngine = inferenceEngine
+            self.samplingConfiguration = samplingConfiguration
+            self.stopSequences = stopSequences
+        }
+
+        public func next() async throws -> GenerationResult? {
+            if finished {
+                return nil
+            }
+
+            while tokenStep < maxTokens {
+                try Task.checkCancellation()
+
+                guard var session = self.session.take() else {
+                    finished = true
+                    return nil
+                }
+                if session.isTerminated {
+                    finished = true
+                    return nil
+                }
+
+                let result: (Int32?, [LogitsScalarType]?)
+                do {
+                    result = try await ConstrainedDecodingStrategy.generateOneToken(
+                        inputTokens: inputTokens,
+                        session: &session,
+                        inferenceEngine: inferenceEngine,
+                        samplingConfiguration: samplingConfiguration,
+                        constrainedOptions: constrainedOptions
+                    )
+                } catch {
+                    finished = true
+                    // Drop session — generation failed, no further use.
+                    throw error
+                }
+
+                let terminatedAfterAccept = session.isTerminated
+                self.session = consume session
+
+                guard let bestToken = result.0, let logits = result.1 else {
+                    finished = true
+                    return nil
+                }
+
+                if stopSequences.matches(recentTokens: [bestToken]) {
+                    finished = true
+                    return nil
+                }
+
+                inputTokens.append(bestToken)
+                generatedTokens.append(bestToken)
+                tokenStep += 1
+
+                let delta = ConstrainedDecodingStrategy.computeTextDelta(
+                    generatedTokens: generatedTokens,
+                    previousDecodedText: &previousDecodedText,
+                    tokenizer: tokenizer,
+                    tokenStep: tokenStep
+                )
+
+                if terminatedAfterAccept {
+                    finished = true
+                }
+
+                return GenerationResult(text: delta, tokenId: bestToken, rawLogits: logits)
+            }
+
+            finished = true
+            return nil
+        }
     }
 }

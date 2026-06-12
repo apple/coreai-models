@@ -622,14 +622,15 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             promptTokens: actualInputTokens, maxTokens: maxTokens)
 
         var generatedText = ""
-        for try await result in constrainedStrategy.decode(
+        let constrainedStream = try await constrainedStrategy.decode(
             from: input,
             tokenizer: tokenizer,
             inferenceEngine: inferenceEngine,
             samplingConfiguration: samplingConfiguration,
             options: InferenceOptions(maxTokens: maxTokens, includeLogits: true),
             stopSequences: stopSequences
-        ) {
+        )
+        for try await result in constrainedStream {
             generatedText += result.text
             print(result.text, terminator: "")
         }

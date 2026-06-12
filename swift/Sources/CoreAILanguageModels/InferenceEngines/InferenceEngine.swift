@@ -85,7 +85,7 @@ public enum ConfigurationError: Error, LocalizedError {
 ///
 /// KV cache is preserved between `generate()` calls. Call `reset()` to clear.
 public protocol InferenceEngine: Sendable {
-    associatedtype OutputSequence: AsyncSequence<InferenceOutput, Error>
+    associatedtype OutputSequence: InferenceOutputSequence
     typealias TokenId = Int32
 
     // MARK: - Primary API
@@ -96,7 +96,8 @@ public protocol InferenceEngine: Sendable {
     ///   - input: Token IDs (prompt, context, or continuation).
     ///   - sampling: Sampling configuration (temperature, topK, etc.).
     ///   - generation: Inference options (maxTokens, includeLogits).
-    /// - Returns: Async sequence of `InferenceOutput`.
+    /// - Returns: An `InferenceOutputSequence` — iterate for tokens, read
+    ///   `stopReason` after the loop to learn why generation ended.
     func generate(
         with input: [TokenId],
         samplingConfiguration: SamplingConfiguration,

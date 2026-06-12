@@ -157,8 +157,8 @@ struct PipelineDescriptorTests {
         #expect(descriptor.components.unet == "Transformer.aimodel")
     }
 
-    @Test("Resolve prefers pipeline.json over detection")
-    func resolvePrefersPipelineJSON() throws {
+    @Test("Resolve errors on legacy pipeline.json")
+    func resolveRejectsLegacyPipelineJSON() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("sd_resolve_\(UUID())")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -175,11 +175,10 @@ struct PipelineDescriptorTests {
             }
             """
         try json.write(to: dir.appendingPathComponent("pipeline.json"), atomically: true, encoding: .utf8)
-        try "".write(to: dir.appendingPathComponent("TextEncoder.aimodel"), atomically: true, encoding: .utf8)
 
-        let descriptor = try PipelineDescriptor.resolve(at: dir)
-        #expect(descriptor.version == "2.0")
-        #expect(descriptor.components.textEncoder == "custom_encoder.aimodel")
+        #expect(throws: PipelineLoadError.self) {
+            _ = try PipelineDescriptor.resolve(at: dir)
+        }
     }
 
     @Test("Resolve with explicit config ignores directory")
