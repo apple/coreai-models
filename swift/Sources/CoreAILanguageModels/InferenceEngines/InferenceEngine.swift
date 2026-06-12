@@ -112,6 +112,16 @@ public protocol InferenceEngine: Sendable {
     /// Run dummy inference to trigger kernel compilation.
     func warmup(queryLength: Int, sampling: SamplingConfiguration?) async throws
 
+    // MARK: - Cancellation
+
+    /// Whether the engine has an active generation in progress.
+    var isBusy: Bool { get }
+
+    /// Cancel any in-flight generation. Invalidates the current GenerationToken.
+    /// For pull-based engines, takes effect on the next `next()` call.
+    /// For push-based engines (pipelined), also cancels the background Task.
+    func cancel() async throws
+
     // MARK: - Capabilities
 
     /// Whether this engine supports per-step logits extraction.
@@ -160,6 +170,14 @@ extension InferenceEngine {
     /// Default: supportsLogits is false. Engines that can return per-step
     /// logits (sequential, static-shape) override this to true.
     public var supportsLogits: Bool { false }
+}
+
+extension InferenceEngine {
+    /// Default: engine is not busy.
+    public var isBusy: Bool { false }
+
+    /// Default: no-op cancel. Engines with active generation override this.
+    public func cancel() async throws {}
 }
 
 extension InferenceEngine {
