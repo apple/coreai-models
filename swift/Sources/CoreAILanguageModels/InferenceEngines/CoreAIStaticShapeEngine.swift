@@ -6,6 +6,7 @@
 import CoreAI
 import CoreAIShared
 import Foundation
+import Synchronization
 
 /// Static-shape inference engine using Core AI models.
 public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
@@ -46,6 +47,16 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
 
     // Number of tokens already processed in the current sequence.
     private var processedTokenCount: Int = 0
+
+    // Track in-flight generation via token
+    private let _activeToken = Mutex<GenerationToken?>(nil)
+
+    public var isBusy: Bool { _activeToken.withLock { $0 != nil } }
+
+    /// Clear the engine's active token if it matches the given token.
+    func clearTokenIfActive(_ token: GenerationToken) {
+        _activeToken.withLock { if $0 === token { $0 = nil } }
+    }
 
     // MARK: - Initialization
 
@@ -317,11 +328,14 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         samplingConfiguration: SamplingConfiguration,
         inferenceOptions: InferenceOptions
     ) throws -> GenerationSequence {
-        GenerationSequence(
+        let token = GenerationToken()
+        _activeToken.withLock { $0 = token }
+        return GenerationSequence(
             engine: self,
             input: input,
             samplingConfiguration: samplingConfiguration,
-            inferenceOptions: inferenceOptions
+            inferenceOptions: inferenceOptions,
+            generationToken: token
         )
     }
 
@@ -531,7 +545,18 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
 
     // MARK: - Lifecycle
 
+    public func cancel() async throws {
+        _activeToken.withLock {
+            $0?.cancel()
+            $0 = nil
+        }
+    }
+
     public func reset() {
+        _activeToken.withLock {
+            $0?.cancel()
+            $0 = nil
+        }
         let resetSpan = InstrumentsProfiler.beginReset(engine: "StaticShape")
         processedTokenCount = 0
         resetSpan.end()
@@ -559,6 +584,7 @@ extension StaticShapeEngine {
         let input: [TokenId]
         let samplingConfiguration: SamplingConfiguration
         let inferenceOptions: InferenceOptions
+        let generationToken: GenerationToken
 
         /// Shared with the iterator so the caller can read why generation ended.
         let stopReasonStore = StopReasonStore()
@@ -575,7 +601,8 @@ extension StaticShapeEngine {
                 input: input,
                 samplingConfiguration: samplingConfiguration,
                 inferenceOptions: inferenceOptions,
-                stopReasonStore: stopReasonStore
+                stopReasonStore: stopReasonStore,
+                generationToken: generationToken
             )
         }
     }
@@ -592,22 +619,26 @@ extension StaticShapeEngine.GenerationSequence {
         private let forcedContinuation: [StaticShapeEngine.TokenId]?
         private let maxTokens: Int
         private let stopReasonStore: StopReasonStore
+        private let generationToken: GenerationToken
 
         private var inputTokens: [StaticShapeEngine.TokenId]
         private var step: Int = 0
+        private var finished: Bool = false
 
         init(
             engine: StaticShapeEngine,
             input: [StaticShapeEngine.TokenId],
             samplingConfiguration: SamplingConfiguration,
             inferenceOptions: InferenceOptions,
-            stopReasonStore: StopReasonStore
+            stopReasonStore: StopReasonStore,
+            generationToken: GenerationToken
         ) {
             self.engine = engine
             self.samplingConfiguration = samplingConfiguration
             self.returnsLogits = inferenceOptions.includeLogits
             self.forcedContinuation = inferenceOptions.forcedContinuation
             self.stopReasonStore = stopReasonStore
+            self.generationToken = generationToken
             self.inputTokens = input
             if let forced = inferenceOptions.forcedContinuation {
                 self.maxTokens = forced.count
@@ -620,9 +651,18 @@ extension StaticShapeEngine.GenerationSequence {
         }
 
         public mutating func next() async throws -> InferenceOutput? {
+            if finished { return nil }
+
+            if generationToken.isCancelled {
+                stopReasonStore.set(.cancelled)
+                finishAndRelease()
+                return nil
+            }
+
             guard step < maxTokens else {
                 // Natural exhaustion. Don't clobber a reason a decoder set (e.g. `.eos`).
                 stopReasonStore.setIfUnset(.maxTokens)
+                finishAndRelease()
                 return nil
             }
 
@@ -637,6 +677,13 @@ extension StaticShapeEngine.GenerationSequence {
                     returnsLogits: returnsLogits || forcedContinuation != nil
                 )
 
+                // Check cancellation after inference step
+                if generationToken.isCancelled {
+                    stopReasonStore.set(.cancelled)
+                    finishAndRelease()
+                    return nil
+                }
+
                 let nextToken = forcedContinuation?[step] ?? sampledToken
                 inputTokens.append(nextToken)
                 step += 1
@@ -647,11 +694,19 @@ extension StaticShapeEngine.GenerationSequence {
                 )
             } catch is CancellationError {
                 stopReasonStore.set(.cancelled)
+                finishAndRelease()
                 throw CancellationError()
             } catch {
                 stopReasonStore.set(.error)
+                finishAndRelease()
                 throw error
             }
+        }
+
+        private mutating func finishAndRelease() {
+            guard !finished else { return }
+            finished = true
+            engine.clearTokenIfActive(generationToken)
         }
     }
 }

@@ -41,6 +41,12 @@ final class CoreAIPipelinedEngine: InferenceEngine, Sendable {
     private let engineInUse = Atomic<Bool>(false)
     let config: ModelConfig
 
+    // Generation lifecycle
+    private let _activeToken = Mutex<GenerationToken?>(nil)
+    private let _generationTask = Mutex<Task<Void, Never>?>(nil)
+
+    var isBusy: Bool { _activeToken.withLock { $0 != nil } }
+
     init(
         config: ModelConfig,
         preparedModel: PreparedModel,
@@ -104,9 +110,20 @@ final class CoreAIPipelinedEngine: InferenceEngine, Sendable {
         let stopReasonStore = StopReasonStore()
         let (base, outputContinuation) =
             AsyncThrowingStream<InferenceOutput, any Error>.makeStream()
-        Task {
+
+        let token = GenerationToken()
+        _activeToken.withLock { $0 = token }
+
+        let task = Task {
             self.acquireEngine()
-            defer { self.releaseEngine() }
+            defer {
+                self.releaseEngine()
+                // Only clear if this generation still owns both slots
+                if self._activeToken.withLock({ $0 === token }) {
+                    self._activeToken.withLock { $0 = nil }
+                    self._generationTask.withLock { $0 = nil }
+                }
+            }
             do {
                 let (tokenStream, tokenContinuation) =
                     AsyncThrowingStream<InferenceEngine.TokenId, any Error>.makeStream()
@@ -139,6 +156,7 @@ final class CoreAIPipelinedEngine: InferenceEngine, Sendable {
                 outputContinuation.finish(throwing: error)
             }
         }
+        _generationTask.withLock { $0 = task }
         return GenerationSequence(base: base, stopReasonStore: stopReasonStore)
     }
 
@@ -154,8 +172,26 @@ final class CoreAIPipelinedEngine: InferenceEngine, Sendable {
         }
     }
 
+    func cancel() async throws {
+        let task: Task<Void, Never>? = _generationTask.withLock { task in
+            task?.cancel()
+            defer { task = nil }
+            return task
+        }
+        _activeToken.withLock {
+            $0?.cancel()
+            $0 = nil
+        }
+        await task?.value
+    }
+
     func reset() {
         drain()
+        _activeToken.withLock {
+            $0?.cancel()
+            $0 = nil
+        }
+        _generationTask.withLock { $0 = nil }
         guard tryAcquireEngine() else { return }
         defer { releaseEngine() }
         engine.reset()

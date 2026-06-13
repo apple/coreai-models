@@ -71,8 +71,16 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
     // Track processed tokens for incremental inference
     private var processedTokenCount: Int = 0
 
-    // Track in-flight generation for drain (same pattern as pipelined engine)
-    private let generating = Mutex(false)
+    // Track in-flight generation via token (replaces simple bool lock)
+    private let _activeToken = Mutex<GenerationToken?>(nil)
+
+    public var isBusy: Bool { _activeToken.withLock { $0 != nil } }
+
+    /// Clear the engine's active token if it matches the given token.
+    /// Called by the iterator when generation finishes or is cancelled.
+    func clearTokenIfActive(_ token: GenerationToken) {
+        _activeToken.withLock { if $0 === token { $0 = nil } }
+    }
 
     // MARK: - Init
 
@@ -337,11 +345,14 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         samplingConfiguration: SamplingConfiguration,
         inferenceOptions: InferenceOptions
     ) throws -> GenerationSequence {
-        GenerationSequence(
+        let token = GenerationToken()
+        _activeToken.withLock { $0 = token }
+        return GenerationSequence(
             engine: self,
             input: input,
             samplingConfiguration: samplingConfiguration,
-            inferenceOptions: inferenceOptions
+            inferenceOptions: inferenceOptions,
+            generationToken: token
         )
     }
 
@@ -350,7 +361,7 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
     /// Wait for any in-flight generate() Task to finish.
     private func drain() {
         var attempts = 0
-        while generating.withLock({ $0 }) {
+        while _activeToken.withLock({ $0 != nil }) {
             attempts += 1
             if attempts > 5000 {
                 fatalError("Sequential engine drain() timeout — generation Task stuck?")
@@ -359,8 +370,18 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         }
     }
 
+    public func cancel() async throws {
+        _activeToken.withLock {
+            $0?.cancel()
+            $0 = nil
+        }
+    }
+
     public func reset() {
-        drain()
+        _activeToken.withLock {
+            $0?.cancel()
+            $0 = nil
+        }
         let resetSpan = InstrumentsProfiler.beginReset(engine: "CoreAIClean")
         processedTokenCount = 0
         zeroFill(&keyCache)
@@ -464,6 +485,7 @@ extension CoreAISequentialEngine {
         let input: [CoreAISequentialEngine.TokenId]
         let samplingConfiguration: SamplingConfiguration
         let inferenceOptions: InferenceOptions
+        let generationToken: GenerationToken
 
         /// Shared with the iterator so the caller can read why generation ended.
         let stopReasonStore = StopReasonStore()
@@ -480,7 +502,8 @@ extension CoreAISequentialEngine {
                 input: input,
                 samplingConfiguration: samplingConfiguration,
                 inferenceOptions: inferenceOptions,
-                stopReasonStore: stopReasonStore
+                stopReasonStore: stopReasonStore,
+                generationToken: generationToken
             )
         }
     }
@@ -497,10 +520,10 @@ extension CoreAISequentialEngine.GenerationSequence {
         private let forcedContinuation: [CoreAISequentialEngine.TokenId]?
         private let maxTokens: Int
         private let stopReasonStore: StopReasonStore
+        private let generationToken: GenerationToken
 
         private var inputTokens: [CoreAISequentialEngine.TokenId]
         private var step: Int = 0
-        private var didAcquireLock: Bool = false
         private var finished: Bool = false
 
         init(
@@ -508,13 +531,15 @@ extension CoreAISequentialEngine.GenerationSequence {
             input: [CoreAISequentialEngine.TokenId],
             samplingConfiguration: SamplingConfiguration,
             inferenceOptions: InferenceOptions,
-            stopReasonStore: StopReasonStore
+            stopReasonStore: StopReasonStore,
+            generationToken: GenerationToken
         ) {
             self.engine = engine
             self.samplingConfiguration = samplingConfiguration
             self.returnsLogits = inferenceOptions.includeLogits
             self.forcedContinuation = inferenceOptions.forcedContinuation
             self.stopReasonStore = stopReasonStore
+            self.generationToken = generationToken
             self.inputTokens = input
             if let forced = inferenceOptions.forcedContinuation {
                 self.maxTokens = forced.count
@@ -527,17 +552,16 @@ extension CoreAISequentialEngine.GenerationSequence {
         }
 
         deinit {
-            if didAcquireLock {
-                engine.generating.withLock { $0 = false }
-            }
+            engine.clearTokenIfActive(generationToken)
         }
 
         public func next() async throws -> InferenceOutput? {
             if finished { return nil }
 
-            if !didAcquireLock {
-                engine.generating.withLock { $0 = true }
-                didAcquireLock = true
+            if generationToken.isCancelled {
+                stopReasonStore.set(.cancelled)
+                finishAndRelease()
+                return nil
             }
 
             guard step < maxTokens else {
@@ -572,6 +596,13 @@ extension CoreAISequentialEngine.GenerationSequence {
                     logitBuffer = lastLogits
                 }
 
+                // Check cancellation after inference step
+                if generationToken.isCancelled {
+                    stopReasonStore.set(.cancelled)
+                    finishAndRelease()
+                    return nil
+                }
+
                 let nextToken: Int32
                 if let forced = forcedContinuation {
                     nextToken = forced[step]
@@ -603,10 +634,7 @@ extension CoreAISequentialEngine.GenerationSequence {
                 return
             }
             finished = true
-            if didAcquireLock {
-                engine.generating.withLock { $0 = false }
-                didAcquireLock = false
-            }
+            engine.clearTokenIfActive(generationToken)
         }
     }
 }

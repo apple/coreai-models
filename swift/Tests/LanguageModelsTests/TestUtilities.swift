@@ -4,6 +4,7 @@
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
 import Foundation
+import Synchronization
 import TestUtilities
 import Tokenizers
 
@@ -37,6 +38,16 @@ class MockEngine: InferenceEngine, @unchecked Sendable {
     /// Tracks whether reset() was called
     private(set) var resetCalled: Bool = false
 
+    // Generation lifecycle
+    private let _activeToken = Mutex<GenerationToken?>(nil)
+
+    var isBusy: Bool { _activeToken.withLock { $0 != nil } }
+
+    /// Clear the engine's active token if it matches the given token.
+    func clearTokenIfActive(_ token: GenerationToken) {
+        _activeToken.withLock { if $0 === token { $0 = nil } }
+    }
+
     init(
         tokens: [Int32] = [10, 20, 30, 40, 50],
         maxContextLength: Int = 4096,
@@ -54,10 +65,13 @@ class MockEngine: InferenceEngine, @unchecked Sendable {
         samplingConfiguration: SamplingConfiguration,
         inferenceOptions: InferenceOptions
     ) throws -> GenerationSequence {
-        GenerationSequence(
+        let token = GenerationToken()
+        _activeToken.withLock { $0 = token }
+        return GenerationSequence(
             engine: self,
             input: input,
-            inferenceOptions: inferenceOptions
+            inferenceOptions: inferenceOptions,
+            generationToken: token
         )
     }
 
@@ -68,6 +82,7 @@ class MockEngine: InferenceEngine, @unchecked Sendable {
         let engine: MockEngine
         let input: [TokenId]
         let inferenceOptions: InferenceOptions
+        let generationToken: GenerationToken
 
         let stopReasonStore = StopReasonStore()
 
@@ -82,7 +97,8 @@ class MockEngine: InferenceEngine, @unchecked Sendable {
                 engine: engine,
                 input: input,
                 inferenceOptions: inferenceOptions,
-                stopReasonStore: stopReasonStore
+                stopReasonStore: stopReasonStore,
+                generationToken: generationToken
             )
         }
 
@@ -95,19 +111,23 @@ class MockEngine: InferenceEngine, @unchecked Sendable {
             let forcedContinuation: [TokenId]?
             let maxTokens: Int
             let stopReasonStore: StopReasonStore
+            let generationToken: GenerationToken
 
             var step: Int = 0
+            var finished: Bool = false
 
             init(
                 engine: MockEngine,
                 input: [TokenId],
                 inferenceOptions: InferenceOptions,
-                stopReasonStore: StopReasonStore
+                stopReasonStore: StopReasonStore,
+                generationToken: GenerationToken
             ) {
                 self.engine = engine
                 self.returnsLogits = inferenceOptions.includeLogits
                 self.forcedContinuation = inferenceOptions.forcedContinuation
                 self.stopReasonStore = stopReasonStore
+                self.generationToken = generationToken
                 if let forced = inferenceOptions.forcedContinuation {
                     self.maxTokens = forced.count
                 } else {
@@ -119,8 +139,17 @@ class MockEngine: InferenceEngine, @unchecked Sendable {
             }
 
             mutating func next() async throws -> InferenceOutput? {
+                if finished { return nil }
+
+                if generationToken.isCancelled {
+                    stopReasonStore.set(.cancelled)
+                    finishAndRelease()
+                    return nil
+                }
+
                 guard step < maxTokens else {
                     stopReasonStore.setIfUnset(.maxTokens)
+                    finishAndRelease()
                     return nil
                 }
 
@@ -149,16 +178,32 @@ class MockEngine: InferenceEngine, @unchecked Sendable {
                     return InferenceOutput(tokenId: nextToken, logits: logits)
                 } catch is CancellationError {
                     stopReasonStore.set(.cancelled)
+                    finishAndRelease()
                     throw CancellationError()
                 } catch {
                     stopReasonStore.set(.error)
+                    finishAndRelease()
                     throw error
                 }
+            }
+
+            private mutating func finishAndRelease() {
+                guard !finished else { return }
+                finished = true
+                engine.clearTokenIfActive(generationToken)
             }
         }
     }
 
+    func cancel() async throws {
+        _activeToken.withLock {
+            $0?.cancel()
+            $0 = nil
+        }
+    }
+
     func reset() async throws {
+        try await cancel()
         resetCalled = true
         inferenceCallCount = 0
     }
