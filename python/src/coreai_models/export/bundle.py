@@ -5,6 +5,7 @@
 
 """Create model bundles from exported .aimodel files."""
 
+import importlib.metadata
 import json
 import logging
 from datetime import datetime
@@ -16,6 +17,26 @@ from transformers import AutoTokenizer
 logger = logging.getLogger(__name__)
 
 METADATA_VERSION = "0.2"
+
+_BUILD_INFO_PACKAGES = [
+    "coreai-core",
+    "coreai-torch",
+    "coreai-opt",
+    "coreai-models",
+    "torch",
+    "transformers",
+]
+
+
+def _get_build_info() -> dict[str, str]:
+    """Collect versions of key packages used during export."""
+    versions: dict[str, str] = {}
+    for pkg in _BUILD_INFO_PACKAGES:
+        try:
+            versions[pkg] = importlib.metadata.version(pkg)
+        except importlib.metadata.PackageNotFoundError:
+            pass
+    return versions
 
 
 def bundle_llm_asset(
@@ -67,6 +88,7 @@ def _write_metadata(
             "date": datetime.now().astimezone().isoformat(),
             "targets": [],
         },
+        "build_info": _get_build_info(),
     }
     metadata_path = bundle_path / "metadata.json"
     with open(metadata_path, "w") as f:
