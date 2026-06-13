@@ -37,6 +37,7 @@ public struct CoreAILanguageModel: LanguageModel {
     private let vocabSize: Int?
     private let supportsToolCalling: Bool
     private let supportsReasoning: Bool
+    private let additionalEosTokenIds: [Int32]
 
     // MARK: - Protocol Requirements
 
@@ -56,7 +57,8 @@ public struct CoreAILanguageModel: LanguageModel {
             tokenizer: tokenizer,
             modelIdentifier: modelIdentifier,
             samplingConfig: samplingConfig,
-            vocabSize: vocabSize
+            vocabSize: vocabSize,
+            additionalEosTokenIds: additionalEosTokenIds
         )
     }
 
@@ -97,13 +99,15 @@ public struct CoreAILanguageModel: LanguageModel {
         tokenizer: any Tokenizer,
         modelIdentifier: String = "coreai-model",
         samplingConfig: SamplingConfiguration = .greedy,
-        vocabSize: Int? = nil
+        vocabSize: Int? = nil,
+        additionalEosTokenIds: [Int32] = []
     ) {
         self.engine = engine
         self.tokenizer = tokenizer
         self.modelIdentifier = modelIdentifier
         self.samplingConfig = samplingConfig
         self.vocabSize = vocabSize
+        self.additionalEosTokenIds = additionalEosTokenIds
         self.supportsToolCalling = CoreAIExecutor.detectToolCallMarkers(using: tokenizer) != nil
         self.supportsReasoning =
             tokenizer.convertTokenToId("<think>") != nil
@@ -121,6 +125,7 @@ public struct CoreAILanguageModel: LanguageModel {
             fileprivate let modelIdentifier: String
             fileprivate let samplingConfig: SamplingConfiguration
             fileprivate let vocabSize: Int?
+            fileprivate let additionalEosTokenIds: [Int32]
 
             public static func == (lhs: Configuration, rhs: Configuration) -> Bool {
                 lhs.modelIdentifier == rhs.modelIdentifier
@@ -140,6 +145,9 @@ public struct CoreAILanguageModel: LanguageModel {
         private let modelIdentifier: String
         private let samplingConfig: SamplingConfiguration
         private let vocabSize: Int?
+        /// All EOS-like token IDs: the main `eosTokenId` plus any additional
+        /// stop tokens from tokenizer_config.json (e.g. Gemma's `<end_of_turn>`).
+        private let eosTokenIds: Set<Int32>
         /// Open / close marker pair the model uses for chain-of-thought
         /// blocks, discovered from the tokenizer's known token ids at init
         /// (see `detectThinkingMarkers`). For models that don't emit
@@ -162,6 +170,14 @@ public struct CoreAILanguageModel: LanguageModel {
             self.vocabSize = configuration.vocabSize
             self.thinkingMarkers = Self.detectThinkingMarkers(using: configuration.tokenizer)
             self.toolCallMarkers = Self.detectToolCallMarkers(using: configuration.tokenizer)
+
+            // Build the full set of EOS-like token IDs
+            var eos = Set<Int32>()
+            if let id = configuration.tokenizer.eosTokenId {
+                eos.insert(Int32(id))
+            }
+            eos.formUnion(configuration.additionalEosTokenIds)
+            self.eosTokenIds = eos
         }
 
         /// Probes the tokenizer for known reasoning marker pairs. Each
@@ -328,7 +344,8 @@ public struct CoreAILanguageModel: LanguageModel {
                 inferenceOptions: InferenceOptions(maxTokens: maxTokens)
             )
 
-            let eosTokenId = tokenizer.eosTokenId
+            // Use pre-computed set of all EOS-like tokens (main + additional)
+            let eosTokens = eosTokenIds
             // Incremental-decode buffer. After a clean emit, one token is
             // retained as context for the next step (see below). During a
             // multi-byte sequence that hasn't decoded cleanly yet, multiple
@@ -359,7 +376,7 @@ public struct CoreAILanguageModel: LanguageModel {
 
             for try await output in tokenStream {
                 let token = output.tokenId
-                if let eos = eosTokenId, Int(token) == eos {
+                if eosTokens.contains(token) {
                     tokenStream.setStopReason(.eos)
                     break
                 }
@@ -523,7 +540,10 @@ public struct CoreAILanguageModel: LanguageModel {
             }
 
             let strategy = ConstrainedDecodingStrategy(jsonSchema: jsonSchema, vocabSize: vocabSize)
-            let stopSequences = StopSequences(for: tokenizer)
+            let stopSequences = StopSequences(
+                for: tokenizer,
+                additionalEosTokenIds: Array(eosTokenIds)
+            )
 
             let stream = try await strategy.decode(
                 from: .tokens(promptTokens),
