@@ -81,7 +81,14 @@ private func printResults(tokens: [Int32], stepTimesMs: [Double]) async {
         print(String(format: "  min/max:  %.1f / %.1f ms", lo, hi))
     }
     print("\n── Transcription ──────────────────────────────────────────────────────")
-    if let tokenizer = try? await AutoTokenizer.from(pretrained: "openai/whisper-large-v3-turbo") {
+    // Load tokenizer from local HF cache (no network needed)
+    let cacheBase = FileManager.default.homeDirectoryForCurrentUser
+        .appending(path: ".cache/huggingface/hub/models--openai--whisper-large-v3-turbo/snapshots")
+    let snapshot = (try? FileManager.default.contentsOfDirectory(atPath: cacheBase.path))?.first
+    let tokenizerURL = snapshot.map { cacheBase.appending(path: $0) }
+
+    if let url = tokenizerURL,
+       let tokenizer = try? await AutoTokenizer.from(modelFolder: url) {
         let ids = tokens.filter { $0 < 50257 }.map { Int($0) }
         print("  \(tokenizer.decode(tokens: ids))")
     } else {
