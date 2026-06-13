@@ -137,7 +137,9 @@ async def _async_export_diffusion(config: DiffusionExportConfig) -> dict[str, st
         _save_tokenizer(config.hf_model_id, output_path, hf_pipe, overwrite=config.overwrite)
 
     # 4. Write pipeline.json
-    _write_pipeline_json(hf_pipe, config.hf_model_id, pipeline_type, output_path)
+    _write_metadata_json(
+        hf_pipe, config.hf_model_id, pipeline_type, output_path, config.compression, results
+    )
 
     # Summary
     logger.info("=== Export Summary ===")
@@ -296,33 +298,63 @@ def _save_tokenizer(model_id: str, output_path: Path, hf_pipe: Any, overwrite: b
 
 
 # ---------------------------------------------------------------------------
-# pipeline.json
+# metadata.json (v0.2 schema — aligned with LLM and segmenter bundles)
 # ---------------------------------------------------------------------------
 
+METADATA_VERSION = "0.2"
 
-def _write_pipeline_json(
-    hf_pipe: Any, model_id: str, pipeline_type: str, output_path: Path
+
+def _write_metadata_json(
+    hf_pipe: Any,
+    model_id: str,
+    pipeline_type: str,
+    output_path: Path,
+    compression: str,
+    exported_assets: dict[str, str],
 ) -> None:
-    """Write pipeline.json with model metadata for the Swift pipeline."""
+    """Write metadata.json with the v0.2 bundle schema for diffusion models."""
+    from datetime import datetime
+
     if pipeline_type == "flux2":
-        pipeline_json = _build_flux2_pipeline_json(hf_pipe, model_id)
+        diffusion_config = _build_flux2_config(hf_pipe, model_id)
     else:
-        pipeline_json = _build_sd_pipeline_json(hf_pipe, model_id, pipeline_type)
+        diffusion_config = _build_sd_config(hf_pipe, model_id, pipeline_type)
 
-    json_path = output_path / "pipeline.json"
+    # Build assets map from exported component paths
+    assets: dict[str, str] = {}
+    for name, path_str in exported_assets.items():
+        assets[name] = Path(path_str).name
+
+    metadata = {
+        "metadata_version": METADATA_VERSION,
+        "kind": "diffusion",
+        "name": output_path.name,
+        "assets": assets,
+        "diffusion": diffusion_config,
+        "source": {
+            "model_definition": "torch",
+            "hf_model_id": model_id,
+        },
+        "compression": compression if compression != "none" else None,
+        "compilation": {
+            "date": datetime.now().astimezone().isoformat(),
+            "targets": [],
+        },
+    }
+
+    json_path = output_path / "metadata.json"
     with open(json_path, "w") as f:
-        json.dump(pipeline_json, f, indent=2)
-    logger.info(f"Saved pipeline.json to {json_path}")
+        json.dump(metadata, f, indent=2)
+    logger.info(f"Saved metadata.json to {json_path}")
 
 
-def _build_flux2_pipeline_json(hf_pipe: Any, model_id: str) -> dict:
+def _build_flux2_config(hf_pipe: Any, model_id: str) -> dict:
     vae_config = hf_pipe.vae.config
     transformer_config = hf_pipe.transformer.config
 
     vae_scale_power = len(vae_config.block_out_channels) - 1
     vae_spatial_scale = 2**vae_scale_power
     default_sample_size = getattr(transformer_config, "default_sample_size", 64)
-    # FLUX.2 uses 2x2 patchification, so actual image size is doubled
     image_size = default_sample_size * vae_spatial_scale * 2
 
     scaling_factor = getattr(vae_config, "scaling_factor", 1.0)
@@ -333,7 +365,6 @@ def _build_flux2_pipeline_json(hf_pipe: Any, model_id: str) -> dict:
     rope_theta = getattr(transformer_config, "rope_theta", 2000.0)
 
     return {
-        "model_id": model_id,
         "type": "flux2",
         "prediction_type": "flow_matching",
         "encoder_scale_factor": scaling_factor,
@@ -349,7 +380,7 @@ def _build_flux2_pipeline_json(hf_pipe: Any, model_id: str) -> dict:
     }
 
 
-def _build_sd_pipeline_json(hf_pipe: Any, model_id: str, pipeline_type: str = "sd") -> dict:
+def _build_sd_config(hf_pipe: Any, model_id: str, pipeline_type: str = "sd") -> dict:
     scheduler_config = hf_pipe.scheduler.config
     vae_config = hf_pipe.vae.config
 
@@ -364,8 +395,7 @@ def _build_sd_pipeline_json(hf_pipe: Any, model_id: str, pipeline_type: str = "s
     vae_spatial_scale = 2**vae_scale_power
     image_size = denoiser_config.sample_size * vae_spatial_scale
 
-    pipeline_json: dict[str, Any] = {
-        "model_id": model_id,
+    config: dict[str, Any] = {
         "type": "stable-diffusion-3" if is_sd3 else "stable-diffusion",
         "prediction_type": "flow" if is_sd3 else prediction_type,
         "encoder_scale_factor": scaling_factor,
@@ -376,18 +406,15 @@ def _build_sd_pipeline_json(hf_pipe: Any, model_id: str, pipeline_type: str = "s
         "default_steps": 28 if is_sd3 else 50,
     }
 
-    if is_sd3:
-        # Autodetect also works for SD3 (recognizes MMDiT / text_encoder_2
-        # substrings); emitting explicit paths keeps pipeline.json self-
-        # documenting and guards against future detect() changes.
-        pipeline_json["components"] = {
-            "text_encoder": "TextEncoder.aimodel",
-            "text_encoder_2": "TextEncoder2.aimodel",
-            "unet": "MMDiT.aimodel",
-            "vae_decoder": "VAEDecoder.aimodel",
-        }
+    # Include scheduler defaults for reproducibility
+    config["scheduler"] = {
+        "training_steps": getattr(scheduler_config, "num_train_timesteps", 1000),
+        "beta_start": getattr(scheduler_config, "beta_start", 0.00085),
+        "beta_end": getattr(scheduler_config, "beta_end", 0.012),
+        "beta_schedule": getattr(scheduler_config, "beta_schedule", "scaled_linear"),
+    }
 
-    return pipeline_json
+    return config
 
 
 # ---------------------------------------------------------------------------

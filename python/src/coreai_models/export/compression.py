@@ -122,7 +122,7 @@ def quantize_pytorch_model(
         calibration_data_fn: Optional function that returns calibration data samples.
             Required when calibrate_activations is enabled.
         export_backend: Backend for the finalized quantized model.
-            Defaults to ExportBackend.MLIR if not specified.
+            Defaults to ExportBackend.CoreAI if not specified.
 
     Returns:
         Quantized model ready for the specified export backend.
@@ -135,7 +135,7 @@ def quantize_pytorch_model(
     _require_coreai_opt()
 
     if export_backend is None:
-        export_backend = ExportBackend.MLIR
+        export_backend = ExportBackend.CoreAI
 
     run_calibration = quantization_config.pop("calibrate_activations", False)
     config = QuantizerConfig.from_dict({"quantization_config": quantization_config})
@@ -240,7 +240,7 @@ def palettize_pytorch_model(
     palettizer = KMeansPalettizer(model, config)
     prepared_model = palettizer.prepare(example_inputs=example_inputs, num_workers=32)
 
-    finalized_model = palettizer.finalize(prepared_model, backend=ExportBackend.MLIR)
+    finalized_model = palettizer.finalize(prepared_model, backend=ExportBackend.CoreAI)
 
     logger.info("Palettization with coreai-opt complete")
     return finalized_model
