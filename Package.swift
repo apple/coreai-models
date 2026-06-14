@@ -155,6 +155,17 @@ let package = Package(
                 .enableUpcomingFeature("MemberImportVisibility")
             ]
         ),
+        .executableTarget(
+            name: "speech-runner",
+            dependencies: [
+                "CoreAIShared",
+                .product(name: "Transformers", package: "swift-transformers"),
+            ],
+            path: "swift/Sources/Tools/speech-runner",
+            swiftSettings: [
+                .enableUpcomingFeature("MemberImportVisibility")
+            ]
+        ),
 
         // Public LLM Benchmark CLI (based on mlx-lm benchmark)
         .executableTarget(
