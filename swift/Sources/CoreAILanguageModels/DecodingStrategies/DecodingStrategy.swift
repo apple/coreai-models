@@ -76,7 +76,13 @@ public struct StopSequences: Sendable {
     /// Initialize with tokenizer, automatically including EOS tokens
     /// - Parameter tokenizer: Tokenizer to extract EOS token from
     /// - Parameter additionalSequences: Optional additional stop sequences to include
-    public init(for tokenizer: any Tokenizer, additionalSequences: [[Int32]] = []) {
+    /// - Parameter additionalEosTokenIds: Optional additional single-token EOS IDs
+    ///   (e.g. from tokenizer_config.json's `additional_special_tokens`)
+    public init(
+        for tokenizer: any Tokenizer,
+        additionalSequences: [[Int32]] = [],
+        additionalEosTokenIds: [Int32] = []
+    ) {
         var allSequences = additionalSequences
 
         // Collect existing single-token sequences to avoid duplicates
@@ -88,6 +94,14 @@ public struct StopSequences: Sendable {
         // Add tokenizer's EOS token if available and not already present
         if let eosTokenId = tokenizer.eosTokenId {
             let token = Int32(eosTokenId)
+            if !existingTokens.contains(token) {
+                existingTokens.insert(token)
+                allSequences.append([token])
+            }
+        }
+
+        // Add additional EOS token IDs (e.g. from tokenizer_config.json)
+        for token in additionalEosTokenIds {
             if !existingTokens.contains(token) {
                 existingTokens.insert(token)
                 allSequences.append([token])

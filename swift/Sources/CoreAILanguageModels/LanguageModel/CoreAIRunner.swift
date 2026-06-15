@@ -80,12 +80,22 @@ public struct CoreAIRunner {
         let tokenizer = try await bundle.loadTokenizer()
         tokenizerLoadSpan.end()
 
+        // Read additional stop token IDs from tokenizer_config.json
+        let additionalEos: [Int32]
+        if let tokenizerDir = bundle.tokenizerPath {
+            additionalEos = LanguageConfig.additionalStopTokenIds(
+                from: tokenizerDir, tokenizer: tokenizer)
+        } else {
+            additionalEos = []
+        }
+
         return CoreAILanguageModel(
             engine: engine,
             tokenizer: tokenizer,
             modelIdentifier: bundle.name,
             samplingConfig: SamplingConfiguration.greedy,
-            vocabSize: bundle.vocabSize
+            vocabSize: bundle.vocabSize,
+            additionalEosTokenIds: additionalEos
         )
     }
 

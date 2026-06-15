@@ -361,6 +361,20 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             "Tokenizer loaded from \(bundle.hasEmbeddedTokenizer ? "embedded bundle" : "HuggingFace")",
             component: "Main")
 
+        // Read additional stop token IDs from tokenizer_config.json (e.g. <end_of_turn> for Gemma)
+        let additionalEosTokenIds: [Int32]
+        if let tokenizerDir = bundle.tokenizerPath {
+            additionalEosTokenIds = LanguageConfig.additionalStopTokenIds(
+                from: tokenizerDir, tokenizer: tokenizer)
+            if !additionalEosTokenIds.isEmpty {
+                CLILogger.log(
+                    "Found \(additionalEosTokenIds.count) additional stop token(s) from tokenizer config: \(additionalEosTokenIds)",
+                    component: "Main")
+            }
+        } else {
+            additionalEosTokenIds = []
+        }
+
         CLILogger.log("Model loaded successfully:", component: "Main")
         CLILogger.log("   Name: \(modelName)", component: "Main")
         CLILogger.log("   Source: model bundle", component: "Main")
@@ -494,7 +508,8 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
                 samplingConfiguration: samplingConfiguration,
                 maxTokens: maxTokens,
                 actualInputTokens: actualInputTokens,
-                modelVocabSize: modelVocabSize
+                modelVocabSize: modelVocabSize,
+                additionalEosTokenIds: additionalEosTokenIds
             )
         } else {
             // Generate text (timing handled by decoding strategies)
@@ -505,7 +520,8 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             // Encode stop tokens to sequences
             let stopSequences = try validateAndEncodeStopTokens(
                 stopTokens: stopTokens,
-                tokenizer: tokenizer
+                tokenizer: tokenizer,
+                additionalEosTokenIds: additionalEosTokenIds
             )
 
             // Check if logits are requested
@@ -590,7 +606,8 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         samplingConfiguration: SamplingConfiguration,
         maxTokens: Int,
         actualInputTokens: Int,
-        modelVocabSize: Int?
+        modelVocabSize: Int?,
+        additionalEosTokenIds: [Int32] = []
     ) async throws {
         let schema: String
         if FileManager.default.fileExists(atPath: schemaInput) {
@@ -603,7 +620,8 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
 
         let stopSequences = try validateAndEncodeStopTokens(
             stopTokens: stopTokens,
-            tokenizer: tokenizer
+            tokenizer: tokenizer,
+            additionalEosTokenIds: additionalEosTokenIds
         )
 
         guard let vocabSize = modelVocabSize else {
@@ -676,15 +694,19 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     /// - Parameters:
     ///   - stopTokens: Array of stop token strings from CLI
     ///   - tokenizer: Tokenizer to use for encoding
+    ///   - additionalEosTokenIds: Additional EOS token IDs from tokenizer config
     /// - Returns: StopSequences containing all valid sequences plus tokenizer EOS tokens
     func validateAndEncodeStopTokens(
         stopTokens: [String],
-        tokenizer: any Tokenizer
+        tokenizer: any Tokenizer,
+        additionalEosTokenIds: [Int32] = []
     ) throws -> StopSequences {
         var sequences: [[Int32]] = []
 
         for stopString in stopTokens {
-            let tokens = tokenizer.encode(text: stopString).map { Int32($0) }
+            // Encode without adding BOS/EOS so special token strings like
+            // "<end_of_turn>" resolve to their single token ID, not [BOS, id].
+            let tokens = tokenizer.encode(text: stopString, addSpecialTokens: false).map { Int32($0) }
 
             // Fatal error for empty encodings - user explicitly requested this stop token
             guard !tokens.isEmpty else {
@@ -710,7 +732,11 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         }
 
         // Use new initializer that automatically includes EOS tokens from tokenizer
-        return StopSequences(for: tokenizer, additionalSequences: sequences)
+        return StopSequences(
+            for: tokenizer,
+            additionalSequences: sequences,
+            additionalEosTokenIds: additionalEosTokenIds
+        )
     }
 
     // MARK: - Asset Type Label
