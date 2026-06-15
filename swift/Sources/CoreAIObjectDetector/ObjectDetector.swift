@@ -129,10 +129,9 @@ public struct ObjectDetector {
     ///    parameters. Batch is always `images.count`. Dynamic spatial dims
     ///    are filled from `parameters.inputHeight` / `inputWidth` (which
     ///    have struct-level defaults).
-    /// 2. Preprocess each image sequentially into a `[3, H, W]` Float buffer.
-    /// 3. Concatenate the per-image buffers into the `[B, 3, H, W]` input
-    ///    NDArray and run a single forward pass.
-    /// 4. Slice each batch slot from the outputs and decode independently,
+    /// 2. Allocate the `[B, 3, H, W]` input NDArray and preprocess each
+    ///    image directly into its batch slot, then run a single forward pass.
+    /// 3. Slice each batch slot from the outputs and decode independently,
     ///    returning `images.count` detection lists in input order.
     public func detect(images: [CGImage], parameters: DetectionParameters) async throws
         -> [[DetectedObject]]
@@ -158,13 +157,12 @@ public struct ObjectDetector {
             parameters: parameters
         )
 
-        // 1. Preprocess each input image (sequential).
-        let perImagePixels = try preprocessImages(images, plan: plan, parameters: parameters)
-
-        // 2. Build batched NDArray and run inference once.
+        // 1. Allocate the batched input NDArray and write each image's
+        //    preprocessed CHW pixels directly into its batch slot.
         let resolvedDescriptor = imageDescriptor.resolvingDynamicDimensions(
             [plan.batch, 3, plan.height, plan.width])
-        let imageArray = try buildInputNDArray(descriptor: resolvedDescriptor, perImagePixels: perImagePixels)
+        let imageArray = try buildInputNDArray(
+            images: images, plan: plan, descriptor: resolvedDescriptor, parameters: parameters)
 
         var outputs = try await function.run(inputs: [imageInputName: imageArray])
         guard let logitsArray = outputs.remove(logitsOutputName)?.ndArray,
@@ -186,37 +184,49 @@ public struct ObjectDetector {
 
     // MARK: - Preprocessing
 
-    /// Sequentially preprocess each image to a `[3 * H * W]` Float buffer at
-    /// the plan's target spatial dimensions.
-    private func preprocessImages(
-        _ images: [CGImage], plan: BatchPlan, parameters: DetectionParameters
-    ) throws -> [[Float]] {
+    /// Preprocess each image and write its `[3, H, W]` Float pixels directly
+    /// into the corresponding batch slot of a freshly allocated `[B, 3, H, W]`
+    /// NDArray. Avoids materializing a per-image `[Float]` array-of-arrays
+    /// or a flattened `B*3*H*W` intermediate.
+    private func buildInputNDArray(
+        images: [CGImage],
+        plan: BatchPlan,
+        descriptor: NDArrayDescriptor,
+        parameters: DetectionParameters
+    ) throws -> NDArray {
         let preprocessor = ImagePreprocessor(
             targetSize: CGSize(width: plan.width, height: plan.height),
             mean: parameters.normalizationMeans,
             std: parameters.normalizationStds,
             rescaleFactor: 1.0
         )
-        return try images.map { try preprocessor.preprocessCHW(cgImage: $0) }
-    }
-
-    /// Build the input NDArray for a `[B, 3, H, W]` resolved descriptor by
-    /// concatenating per-image CHW buffers in batch order. Each per-image
-    /// entry is `3*H*W` floats; the buffers are written contiguously to match
-    /// row-major batch-leading layout.
-    private func buildInputNDArray(
-        descriptor: NDArrayDescriptor, perImagePixels: [[Float]]
-    ) throws -> NDArray {
+        let slotCount = 3 * plan.height * plan.width
         var imageArray = NDArray(descriptor: descriptor)
-        let flat = Array(perImagePixels.joined())
+
         if descriptor.scalarType == .float16 {
             #if !((os(macOS) || targetEnvironment(macCatalyst)) && arch(x86_64))
-            fillNDArray(&imageArray, as: Float16.self, with: flat.map(Float16.init))
+            var view = imageArray.mutableView(as: Float16.self)
+            for (b, image) in images.enumerated() {
+                let chw = try preprocessor.preprocessCHW(cgImage: image)
+                view.withUnsafeMutablePointer { ptr, _, _ in
+                    let slot = ptr.advanced(by: b * slotCount)
+                    for i in 0..<slotCount { slot[i] = Float16(chw[i]) }
+                }
+            }
             #else
             fatalError("Float16 is not supported on this platform")
             #endif
         } else {
-            fillNDArray(&imageArray, as: Float.self, with: flat)
+            var view = imageArray.mutableView(as: Float.self)
+            for (b, image) in images.enumerated() {
+                let chw = try preprocessor.preprocessCHW(cgImage: image)
+                view.withUnsafeMutablePointer { ptr, _, _ in
+                    let slot = ptr.advanced(by: b * slotCount)
+                    chw.withUnsafeBufferPointer { src in
+                        slot.update(from: src.baseAddress!, count: slotCount)
+                    }
+                }
+            }
         }
         return imageArray
     }
