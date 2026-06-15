@@ -83,25 +83,17 @@ public struct ConstrainedGenerator: DecodingStrategy {
         samplingConfiguration: SamplingConfiguration,
         options: InferenceOptions,
         stopSequences: StopSequences
-    ) -> AsyncThrowingStream<GenerationResult, Error> {
-        return AsyncThrowingStream { continuation in
-            Task {
-                do {
-                    let json = try await self.generateJSONInternal(
-                        input: input,
-                        jsonSchema: self.jsonSchema,
-                        tokenizer: tokenizer,
-                        inferenceEngine: inferenceEngine,
-                        samplingConfiguration: samplingConfiguration,
-                        maxTokens: options.maxTokens ?? 200
-                    )
-                    continuation.yield(GenerationResult(text: json, tokenId: Self.invalidTokenId, rawLogits: nil))
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
-                }
-            }
-        }
+    ) -> ConstrainedGeneratedSequence {
+        ConstrainedGeneratedSequence(
+            jsonSchema: jsonSchema,
+            vocabSize: vocabSize,
+            invalidTokenId: Self.invalidTokenId,
+            input: input,
+            tokenizer: tokenizer,
+            inferenceEngine: inferenceEngine,
+            samplingConfiguration: samplingConfiguration,
+            maxTokens: options.maxTokens ?? 200
+        )
     }
 
     // MARK: - Public convenience API
@@ -112,12 +104,13 @@ public struct ConstrainedGenerator: DecodingStrategy {
         jsonSchema: String,
         maxTokens: Int = 200
     ) async throws -> String {
-        return try await generateJSONInternal(
+        return try await Self.generateJSONInternal(
             input: .prompt(prompt),
             jsonSchema: jsonSchema,
             tokenizer: self.tokenizer,
             inferenceEngine: self.engine,
             samplingConfiguration: self.samplingConfig,
+            vocabSize: self.vocabSize,
             maxTokens: maxTokens
         )
     }
@@ -134,12 +127,13 @@ public struct ConstrainedGenerator: DecodingStrategy {
 
     // MARK: - Core generation logic
 
-    private func generateJSONInternal(
+    static func generateJSONInternal(
         input: Input,
         jsonSchema: String,
         tokenizer: any Tokenizer,
         inferenceEngine: any InferenceEngine,
         samplingConfiguration: SamplingConfiguration,
+        vocabSize: Int,
         maxTokens: Int
     ) async throws -> String {
         var session = try ConstrainedGenerationSession(
@@ -166,7 +160,7 @@ public struct ConstrainedGenerator: DecodingStrategy {
     }
 
     /// Tokenize input with chat template, falling back to raw encoding.
-    private func tokenizeInput(_ input: Input, tokenizer: any Tokenizer) throws -> [Int32] {
+    private static func tokenizeInput(_ input: Input, tokenizer: any Tokenizer) throws -> [Int32] {
         do {
             return try PromptUtils.maybeApplyTokenizerChatTemplate(input, tokenizer: tokenizer)
                 .map(Int32.init)
@@ -181,7 +175,7 @@ public struct ConstrainedGenerator: DecodingStrategy {
     }
 
     /// Run the constrained generation loop: logits → mask → sample → accept.
-    private func runGenerationLoop(
+    private static func runGenerationLoop(
         session: inout ConstrainedGenerationSession,
         inputTokens: inout [Int32],
         inferenceEngine: any InferenceEngine,
@@ -226,7 +220,7 @@ public struct ConstrainedGenerator: DecodingStrategy {
     }
 
     /// Decode tokens to text and strip EOS token string.
-    private func decodeAndClean(tokens: [Int32], tokenizer: any Tokenizer) -> String {
+    private static func decodeAndClean(tokens: [Int32], tokenizer: any Tokenizer) -> String {
         let generatedText = tokenizer.decode(tokens: tokens.map(Int.init))
         let eosTokenString = tokenizer.eosTokenId.map { tokenizer.decode(tokens: [$0]) } ?? ""
         let trimmed =
@@ -234,5 +228,75 @@ public struct ConstrainedGenerator: DecodingStrategy {
             ? generatedText
             : generatedText.replacingOccurrences(of: eosTokenString, with: "")
         return trimmed.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+// MARK: - ConstrainedGeneratedSequence
+
+extension ConstrainedGenerator {
+    /// Async sequence that emits exactly one `GenerationResult` containing the complete JSON output.
+    public struct ConstrainedGeneratedSequence: AsyncSequence {
+        public typealias Element = GenerationResult
+        public typealias Failure = Error
+
+        let jsonSchema: String
+        let vocabSize: Int
+        let invalidTokenId: Int32
+        let input: Input
+        let tokenizer: any Tokenizer
+        let inferenceEngine: any InferenceEngine
+        let samplingConfiguration: SamplingConfiguration
+        let maxTokens: Int
+
+        public func makeAsyncIterator() -> Iterator {
+            Iterator(
+                jsonSchema: jsonSchema,
+                vocabSize: vocabSize,
+                invalidTokenId: invalidTokenId,
+                input: input,
+                tokenizer: tokenizer,
+                inferenceEngine: inferenceEngine,
+                samplingConfiguration: samplingConfiguration,
+                maxTokens: maxTokens
+            )
+        }
+    }
+}
+
+extension ConstrainedGenerator.ConstrainedGeneratedSequence {
+    public struct Iterator: AsyncIteratorProtocol {
+        public typealias Element = GenerationResult
+        public typealias Failure = Error
+
+        let jsonSchema: String
+        let vocabSize: Int
+        let invalidTokenId: Int32
+        let input: Input
+        let tokenizer: any Tokenizer
+        let inferenceEngine: any InferenceEngine
+        let samplingConfiguration: SamplingConfiguration
+        let maxTokens: Int
+
+        var emitted: Bool = false
+
+        public mutating func next() async throws -> GenerationResult? {
+            guard !emitted else {
+                return nil
+            }
+            emitted = true
+
+            try Task.checkCancellation()
+
+            let json = try await ConstrainedGenerator.generateJSONInternal(
+                input: input,
+                jsonSchema: jsonSchema,
+                tokenizer: tokenizer,
+                inferenceEngine: inferenceEngine,
+                samplingConfiguration: samplingConfiguration,
+                vocabSize: vocabSize,
+                maxTokens: maxTokens
+            )
+            return GenerationResult(text: json, tokenId: invalidTokenId, rawLogits: nil)
+        }
     }
 }

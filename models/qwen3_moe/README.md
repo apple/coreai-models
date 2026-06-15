@@ -51,9 +51,9 @@ Defaults: 512 prompt tokens, 1024 generation tokens, 5 trials. Override with `-p
 
 Perplexity score on the [`WikiText-2`](https://huggingface.co/datasets/EleutherAI/wikitext_document_level) dataset computed using the [lm-evaluation-harness](https://github.com/EleutherAI/lm-evaluation-harness/blob/main/lm_eval/tasks/wikitext/README.md) with the Core AI PyTorch models.
 
-| Model                        | Compression               | Platform | Perplexity Score |
-| ---------------------------- | ------------------------- | -------- | ---------------- |
-| Qwen3 Coder 30B-A3B Instruct | none (`float16`)          | macOS    | 11.06            |
-| Qwen3 Coder 30B-A3B Instruct | [4-bit quantized][p-4bit] | macOS    | 11.90            |
+| Model                        | Compression               | Bits Per Weight (BPW) | Platform | Perplexity Score |
+| ---------------------------- | ------------------------- | --------------------- | -------- | ---------------- |
+| Qwen3 Coder 30B-A3B Instruct | none (`float16`)          | 16.00                 | macOS    | 11.06            |
+| Qwen3 Coder 30B-A3B Instruct | [4-bit quantized][p-4bit] | 4.50                  | macOS    | 11.90            |
 
 [p-4bit]: ../README.md#quantization-options

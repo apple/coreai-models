@@ -7,8 +7,8 @@ import Testing
 
 @testable import CoreAILanguageModels
 
-@Suite("InferenceStream")
-struct InferenceStreamTests {
+@Suite("Generation StopReason")
+struct GenerationStopReasonTests {
     @Test("iterates all tokens and sets .maxTokens on normal completion")
     func normalCompletion() async throws {
         let engine = MockEngine(tokens: [1, 2, 3], maxContextLength: 100)

@@ -80,15 +80,30 @@ public struct ObjectDetector {
 
     // MARK: - Inference
 
-    /// Warm up the backend (e.g. trigger Metal kernel compilation) with a dummy pass.
-    public func warmup() async throws {
+    /// Warm up the backend (e.g. trigger Metal kernel compilation) with a dummy
+    /// pass at the same `(B, H, W)` that subsequent `detect()` calls will use.
+    /// For static-shape models the arguments are ignored — `planBatch` falls
+    /// back to the descriptor's fixed dims.
+    public func warmup(imageCount: Int = 1, parameters: DetectionParameters = .default) async throws {
         guard case .ndArray(let imageDescriptor) = functionDescriptor.inputDescriptor(of: imageInputName) else {
             throw DetectionRuntimeError.invalidConfiguration(
                 "No array descriptor for image input '\(imageInputName)'"
             )
         }
-        let imageArray = NDArray(descriptor: imageDescriptor)
-        _ = try await function.run(inputs: [imageInputName: imageArray])
+        let expectedShape = imageDescriptor.shape
+        guard expectedShape.count == 4 else {
+            throw DetectionRuntimeError.invalidConfiguration(
+                "Expected 4-dimensional input shape, got \(expectedShape.count)"
+            )
+        }
+        let plan = try Self.planBatch(
+            expectedShape: expectedShape,
+            imageCount: imageCount,
+            parameters: parameters
+        )
+        let resolved = imageDescriptor.resolvingDynamicDimensions(
+            [plan.batch, 3, plan.height, plan.width])
+        _ = try await function.run(inputs: [imageInputName: NDArray(descriptor: resolved)])
     }
 
     /// Detect objects in `image` using `.default` parameters.
@@ -96,43 +111,59 @@ public struct ObjectDetector {
         try await detect(image: image, parameters: .default)
     }
 
-    /// Detect objects in `image`.
+    /// Detect objects in `image` — convenience wrapper over the batched API.
     public func detect(image: CGImage, parameters: DetectionParameters) async throws -> [DetectedObject] {
-        // Build image NDArray
+        let results = try await detect(images: [image], parameters: parameters)
+        return results.first ?? []
+    }
+
+    /// Detect objects in each of `images` using `.default` parameters.
+    public func detect(images: [CGImage]) async throws -> [[DetectedObject]] {
+        try await detect(images: images, parameters: .default)
+    }
+
+    /// Detect objects across `images` in a single batched forward pass.
+    ///
+    /// Pipeline:
+    /// 1. Resolve a batch plan `(B, H, W)` from the model descriptor and
+    ///    parameters. Batch is always `images.count`. Dynamic spatial dims
+    ///    are filled from `parameters.inputHeight` / `inputWidth` (which
+    ///    have struct-level defaults).
+    /// 2. Allocate the `[B, 3, H, W]` input NDArray and preprocess each
+    ///    image directly into its batch slot, then run a single forward pass.
+    /// 3. Slice each batch slot from the outputs and decode independently,
+    ///    returning `images.count` detection lists in input order.
+    public func detect(images: [CGImage], parameters: DetectionParameters) async throws
+        -> [[DetectedObject]]
+    {
+        guard !images.isEmpty else {
+            throw DetectionRuntimeError.invalidConfiguration("detect requires at least one image")
+        }
         guard case .ndArray(let imageDescriptor) = functionDescriptor.inputDescriptor(of: imageInputName) else {
             throw DetectionRuntimeError.invalidConfiguration(
                 "No array descriptor for image input '\(imageInputName)'"
             )
         }
-
         let expectedShape = imageDescriptor.shape
         guard expectedShape.count == 4 else {
             throw DetectionRuntimeError.invalidConfiguration(
                 "Expected 4-dimensional input shape, got \(expectedShape.count)"
             )
         }
-        let height = expectedShape[2]
-        let width = expectedShape[3]
-        let floatPixels = try ImagePreprocessor(
-            targetSize: CGSize(width: width, height: height),
-            mean: parameters.normalizationMeans,
-            std: parameters.normalizationStds,
-            rescaleFactor: 1.0
-        ).preprocessCHW(cgImage: image)
 
-        var imageArray = NDArray(descriptor: imageDescriptor)
+        let plan = try Self.planBatch(
+            expectedShape: expectedShape,
+            imageCount: images.count,
+            parameters: parameters
+        )
 
-        if imageDescriptor.scalarType == .float16 {
-            #if !((os(macOS) || targetEnvironment(macCatalyst)) && arch(x86_64))
-            fillNDArray(&imageArray, as: Float16.self, with: floatPixels.map(Float16.init))
-            #else
-            fatalError("Float16 is not supported on this platform")
-            #endif
-        } else {
-            fillNDArray(&imageArray, as: Float.self, with: floatPixels)
-        }
+        // 1. Allocate the batched input NDArray and write each image's
+        //    preprocessed CHW pixels directly into its batch slot.
+        let resolvedDescriptor = imageDescriptor.resolvingDynamicDimensions(
+            [plan.batch, 3, plan.height, plan.width])
+        let imageArray = try buildInputNDArray(
+            images: images, plan: plan, descriptor: resolvedDescriptor, parameters: parameters)
 
-        // Run inference and extract outputs
         var outputs = try await function.run(inputs: [imageInputName: imageArray])
         guard let logitsArray = outputs.remove(logitsOutputName)?.ndArray,
             let boxesArray = outputs.remove(boxesOutputName)?.ndArray
@@ -142,13 +173,135 @@ public struct ObjectDetector {
             )
         }
 
-        let rawOutput = DetectionOutput(
-            logits: flattenAsFloat(logitsArray),
-            logitsShape: logitsArray.shape,
-            predictedBoxes: flattenAsFloat(boxesArray)
+        // 3. Decode each input image's batch slot.
+        return Self.decodePerImage(
+            logitsArray: logitsArray,
+            boxesArray: boxesArray,
+            images: images,
+            parameters: parameters
         )
-        let inputSize = CGSize(width: image.width, height: image.height)
-        return DetectionPostprocessor.decode(output: rawOutput, inputSize: inputSize, parameters: parameters)
+    }
+
+    // MARK: - Preprocessing
+
+    /// Preprocess each image and write its `[3, H, W]` Float pixels directly
+    /// into the corresponding batch slot of a freshly allocated `[B, 3, H, W]`
+    /// NDArray. Avoids materializing a per-image `[Float]` array-of-arrays
+    /// or a flattened `B*3*H*W` intermediate.
+    private func buildInputNDArray(
+        images: [CGImage],
+        plan: BatchPlan,
+        descriptor: NDArrayDescriptor,
+        parameters: DetectionParameters
+    ) throws -> NDArray {
+        let preprocessor = ImagePreprocessor(
+            targetSize: CGSize(width: plan.width, height: plan.height),
+            mean: parameters.normalizationMeans,
+            std: parameters.normalizationStds,
+            rescaleFactor: 1.0
+        )
+        let slotCount = 3 * plan.height * plan.width
+        var imageArray = NDArray(descriptor: descriptor)
+
+        if descriptor.scalarType == .float16 {
+            #if !((os(macOS) || targetEnvironment(macCatalyst)) && arch(x86_64))
+            var view = imageArray.mutableView(as: Float16.self)
+            for (b, image) in images.enumerated() {
+                let chw = try preprocessor.preprocessCHW(cgImage: image)
+                view.withUnsafeMutablePointer { ptr, _, _ in
+                    let slot = ptr.advanced(by: b * slotCount)
+                    for i in 0..<slotCount { slot[i] = Float16(chw[i]) }
+                }
+            }
+            #else
+            fatalError("Float16 is not supported on this platform")
+            #endif
+        } else {
+            var view = imageArray.mutableView(as: Float.self)
+            for (b, image) in images.enumerated() {
+                let chw = try preprocessor.preprocessCHW(cgImage: image)
+                view.withUnsafeMutablePointer { ptr, _, _ in
+                    let slot = ptr.advanced(by: b * slotCount)
+                    chw.withUnsafeBufferPointer { src in
+                        slot.update(from: src.baseAddress!, count: slotCount)
+                    }
+                }
+            }
+        }
+        return imageArray
+    }
+
+    // MARK: - Output decoding
+
+    private static func decodePerImage(
+        logitsArray: NDArray,
+        boxesArray: NDArray,
+        images: [CGImage],
+        parameters: DetectionParameters
+    ) -> [[DetectedObject]] {
+        let logitsShape = logitsArray.shape  // [B, Q, C]
+        let boxesShape = boxesArray.shape  // [B, Q, 4]
+        let logitsAll = flattenAsFloat(logitsArray)
+        let boxesAll = flattenAsFloat(boxesArray)
+        let perBatchLog = logitsShape.dropFirst().reduce(1, *)
+        let perBatchBox = boxesShape.dropFirst().reduce(1, *)
+        let singleBatchLogitsShape = [1] + logitsShape.dropFirst()
+
+        return images.enumerated().map { i, image in
+            let raw = DetectionOutput(
+                logits: Array(logitsAll[i * perBatchLog..<(i + 1) * perBatchLog]),
+                logitsShape: singleBatchLogitsShape,
+                predictedBoxes: Array(boxesAll[i * perBatchBox..<(i + 1) * perBatchBox])
+            )
+            return DetectionPostprocessor.decode(
+                output: raw,
+                inputSize: CGSize(width: image.width, height: image.height),
+                parameters: parameters
+            )
+        }
+    }
+
+    // MARK: - Batch planning
+
+    struct BatchPlan: Equatable {
+        let batch: Int
+        let height: Int
+        let width: Int
+    }
+
+    /// Resolve the concrete `(B, H, W)` to bind the model with, given the
+    /// model's expected shape (which may contain `-1` for dynamic dims), the
+    /// number of input images, and the user's parameter overrides.
+    ///
+    /// Resolution rules:
+    /// - **Batch**: always `imageCount`. A static-batch model must match.
+    /// - **Spatial dims**: a dynamic `-1` dim is filled from
+    ///   `parameters.inputHeight` / `inputWidth`. A static dim is taken
+    ///   from the model descriptor (the parameters' values are ignored for
+    ///   that axis).
+    static func planBatch(
+        expectedShape: [Int],
+        imageCount: Int,
+        parameters: DetectionParameters
+    ) throws -> BatchPlan {
+        guard imageCount >= 1 else {
+            throw DetectionRuntimeError.invalidConfiguration("planBatch requires imageCount >= 1")
+        }
+
+        // Verify image count matches a static batch dim.
+        let batchExpected = expectedShape[0]
+        if batchExpected >= 0 && batchExpected != imageCount {
+            throw DetectionRuntimeError.invalidConfiguration(
+                "Model expects fixed batch=\(batchExpected) but caller supplied \(imageCount) image(s)"
+            )
+        }
+
+        let heightExpected = expectedShape[2]
+        let widthExpected = expectedShape[3]
+        let height = heightExpected < 0 ? parameters.inputHeight : heightExpected
+        let width = widthExpected < 0 ? parameters.inputWidth : widthExpected
+
+        return BatchPlan(batch: imageCount, height: height, width: width)
     }
 
     // MARK: - Name Discovery

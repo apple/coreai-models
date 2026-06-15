@@ -41,6 +41,12 @@ final class CoreAIPipelinedEngine: InferenceEngine, Sendable {
     private let engineInUse = Atomic<Bool>(false)
     let config: ModelConfig
 
+    // Generation lifecycle
+    private let _activeToken = Mutex<GenerationToken?>(nil)
+    private let _generationTask = Mutex<Task<Void, Never>?>(nil)
+
+    var isBusy: Bool { _activeToken.withLock { $0 != nil } }
+
     init(
         config: ModelConfig,
         preparedModel: PreparedModel,
@@ -87,7 +93,7 @@ final class CoreAIPipelinedEngine: InferenceEngine, Sendable {
         with input: [TokenId],
         samplingConfiguration: SamplingConfiguration,
         inferenceOptions: InferenceOptions
-    ) throws -> InferenceStream {
+    ) throws -> GenerationSequence {
         if inferenceOptions.includeLogits {
             throw InferenceRuntimeError.invalidArgument(
                 "CoreAI pipelined engine does not support logits (GPU-side sampling). "
@@ -101,10 +107,23 @@ final class CoreAIPipelinedEngine: InferenceEngine, Sendable {
             )
         }
         let maxTokens = inferenceOptions.maxTokens
-        let (inferenceStream, outputContinuation) = InferenceStream.makeStream()
-        Task {
+        let stopReasonStore = StopReasonStore()
+        let (base, outputContinuation) =
+            AsyncThrowingStream<InferenceOutput, any Error>.makeStream()
+
+        let token = GenerationToken()
+        _activeToken.withLock { $0 = token }
+
+        let task = Task {
             self.acquireEngine()
-            defer { self.releaseEngine() }
+            defer {
+                self.releaseEngine()
+                // Only clear if this generation still owns both slots
+                if self._activeToken.withLock({ $0 === token }) {
+                    self._activeToken.withLock { $0 = nil }
+                    self._generationTask.withLock { $0 = nil }
+                }
+            }
             do {
                 let (tokenStream, tokenContinuation) =
                     AsyncThrowingStream<InferenceEngine.TokenId, any Error>.makeStream()
@@ -127,17 +146,18 @@ final class CoreAIPipelinedEngine: InferenceEngine, Sendable {
                 )
                 tokenContinuation.finish()
                 await forwarding
-                inferenceStream.setStopReason(.maxTokens)
+                stopReasonStore.setIfUnset(.maxTokens)
                 outputContinuation.finish()
             } catch is CancellationError {
-                inferenceStream.setStopReason(.cancelled)
+                stopReasonStore.set(.cancelled)
                 outputContinuation.finish()
             } catch {
-                inferenceStream.setStopReason(.error)
+                stopReasonStore.set(.error)
                 outputContinuation.finish(throwing: error)
             }
         }
-        return inferenceStream
+        _generationTask.withLock { $0 = task }
+        return GenerationSequence(base: base, stopReasonStore: stopReasonStore)
     }
 
     /// Wait for any in-flight generate() Task to return the engine.
@@ -152,8 +172,26 @@ final class CoreAIPipelinedEngine: InferenceEngine, Sendable {
         }
     }
 
+    func cancel() async throws {
+        let task: Task<Void, Never>? = _generationTask.withLock { task in
+            task?.cancel()
+            defer { task = nil }
+            return task
+        }
+        _activeToken.withLock {
+            $0?.cancel()
+            $0 = nil
+        }
+        await task?.value
+    }
+
     func reset() {
         drain()
+        _activeToken.withLock {
+            $0?.cancel()
+            $0 = nil
+        }
+        _generationTask.withLock { $0 = nil }
         guard tryAcquireEngine() else { return }
         defer { releaseEngine() }
         engine.reset()
@@ -1046,5 +1084,54 @@ private struct EngineImpl: ~Copyable {
         CLILogger.log(
             "CoreAI pipelined warmup complete (\(shapesToWarm.count) shapes): \(String(format: "%.2f", warmupElapsed))ms"
         )
+    }
+}
+
+extension CoreAIPipelinedEngine {
+    /// Async sequence of `InferenceOutput` produced by `generate()`.
+    ///
+    /// Unlike the CPU engines, the pipelined engine samples on-device and drives
+    /// output from a producer `Task`, so this sequence forwards an underlying
+    /// `AsyncThrowingStream`. The producer records the `stopReason` directly.
+    public struct GenerationSequence: InferenceOutputSequence {
+        public typealias Element = InferenceOutput
+        public typealias Failure = Error
+
+        let base: AsyncThrowingStream<InferenceOutput, any Error>
+        let stopReasonStore: StopReasonStore
+
+        public var stopReason: StopReason? { stopReasonStore.stopReason }
+
+        public func setStopReason(_ reason: StopReason) {
+            stopReasonStore.set(reason)
+        }
+
+        public func makeAsyncIterator() -> Iterator {
+            Iterator(base: base.makeAsyncIterator(), stopReasonStore: stopReasonStore)
+        }
+    }
+}
+
+extension CoreAIPipelinedEngine.GenerationSequence {
+    public struct Iterator: AsyncIteratorProtocol {
+        public typealias Element = InferenceOutput
+        public typealias Failure = Error
+
+        var base: AsyncThrowingStream<InferenceOutput, any Error>.AsyncIterator
+        let stopReasonStore: StopReasonStore
+
+        public mutating func next() async throws -> InferenceOutput? {
+            do {
+                return try await base.next()
+            } catch is CancellationError {
+                // The producer Task is independent and won't observe the
+                // consumer's cancellation, so record it from the consumer side.
+                stopReasonStore.set(.cancelled)
+                throw CancellationError()
+            } catch {
+                stopReasonStore.set(.error)
+                throw error
+            }
+        }
     }
 }

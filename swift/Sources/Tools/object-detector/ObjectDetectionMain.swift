@@ -22,8 +22,12 @@ struct ObjectDetectorCLI: AsyncParsableCommand {
     @Option(name: .long, help: "Path to the .aimodel directory.")
     var model: String
 
-    @Option(name: .long, help: "Path to the input image.")
-    var image: String
+    @Option(
+        name: .long,
+        help:
+            "Path to an input image. Pass --image multiple times to run detection on a batch of images (one --image per source file)."
+    )
+    var image: [String] = []
 
     @Option(name: .long, help: "Confidence threshold (0–1).")
     var threshold: Float = 0.3
@@ -31,78 +35,171 @@ struct ObjectDetectorCLI: AsyncParsableCommand {
     @Option(name: .long, help: "Maximum number of detections to return.")
     var maxDetections: Int = 100
 
+    @Option(
+        name: .long,
+        help:
+            "Override model input height (only used for dynamic models). Defaults to DetectionParameters.inputHeight if not set."
+    )
+    var inputHeight: Int?
+
+    @Option(
+        name: .long,
+        help:
+            "Override model input width (only used for dynamic models). Defaults to DetectionParameters.inputWidth if not set."
+    )
+    var inputWidth: Int?
+
     @Flag(name: .long, help: "Run a warmup pass before timed inference.")
     var warmup: Bool = false
 
-    @Option(name: .long, help: "Save output image with rendered boxes to this path.")
+    @Option(
+        name: .long,
+        help:
+            "Render detections onto the input image(s). For a single --image, this is a file path. For multiple --image inputs, this is a directory; the CLI writes <source-stem>_detections.png into it."
+    )
     var outputImage: String?
 
-    @Option(name: .long, help: "Write JSON results to this path instead of stdout.")
+    @Option(
+        name: .long,
+        help:
+            "Write JSON results to this path instead of stdout. With one --image, the JSON is an array of detections; with multiple, it's an array of {image, detections} objects."
+    )
     var outputJson: String?
 
     @Flag(name: .long, help: "Print verbose progress information.")
     var verbose: Bool = false
 
+    // MARK: - Validation
+
+    func validate() throws {
+        if image.isEmpty {
+            throw ValidationError("At least one --image must be provided.")
+        }
+    }
+
     // MARK: - Run
 
     func run() async throws {
         if verbose { print("Loading model from \(model)...") }
-        let params = DetectionParameters(threshold: threshold, maxDetections: maxDetections)
+        var params = DetectionParameters(
+            threshold: threshold,
+            maxDetections: maxDetections
+        )
+        if let h = inputHeight { params.inputHeight = h }
+        if let w = inputWidth { params.inputWidth = w }
         let detector = try await ObjectDetector(resourcesAt: model)
 
-        let cgImage = try loadCGImage(from: image)
-        if verbose { print("Loaded image: \(cgImage.width)×\(cgImage.height)") }
+        let loaded: [(path: String, image: CGImage)] = try image.map { path in
+            let cgImage = try loadCGImage(from: path)
+            if verbose { print("Loaded image \(path): \(cgImage.width)×\(cgImage.height)") }
+            return (path, cgImage)
+        }
 
         if warmup {
             if verbose { print("Running warmup...") }
-            try await detector.warmup()
+            try await detector.warmup(imageCount: loaded.count, parameters: params)
         }
 
-        if verbose { print("Running detection...") }
+        if verbose { print("Running detection on \(loaded.count) image(s)...") }
         let start = SuspendingClock().now
-        let detections = try await detector.detect(image: cgImage, parameters: params)
+        let allDetections = try await detector.detect(
+            images: loaded.map { $0.image },
+            parameters: params
+        )
         let elapsed = SuspendingClock().now - start
 
         if verbose {
-            print("Inference time: \(elapsed)")
+            print("Inference time (total): \(elapsed)")
         }
 
-        // Format results
-        let results = detections.map { d -> JSONDetection in
-            JSONDetection(
-                label: d.label,
-                labelIndex: d.labelIndex,
-                score: d.confidence,
-                box: JSONDetection.Box(
-                    x: d.boundingBox.origin.x,
-                    y: d.boundingBox.origin.y,
-                    width: d.boundingBox.size.width,
-                    height: d.boundingBox.size.height
-                )
+        // Build per-image JSON entries
+        let entries: [JSONImageResult] = zip(loaded, allDetections).map { (entry, detections) in
+            JSONImageResult(
+                image: entry.path,
+                detections: detections.map { d in
+                    JSONDetection(
+                        label: d.label,
+                        labelIndex: d.labelIndex,
+                        score: d.confidence,
+                        box: JSONDetection.Box(
+                            x: d.boundingBox.origin.x,
+                            y: d.boundingBox.origin.y,
+                            width: d.boundingBox.size.width,
+                            height: d.boundingBox.size.height
+                        )
+                    )
+                }
             )
         }
 
-        if let jsonPath = outputJson {
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-            let data = try encoder.encode(results)
-            try data.write(to: URL(fileURLWithPath: NSString(string: jsonPath).expandingTildeInPath))
-            print("Results written to \(jsonPath)")
-        } else {
-            print("\nDetections (\(detections.count)):")
-            for (i, d) in detections.enumerated() {
-                print(
-                    "  [\(i)] \(d.label) score=\(String(format: "%.3f", d.confidence))"
-                        + "  box=(\(Int(d.boundingBox.origin.x)),\(Int(d.boundingBox.origin.y)),\(Int(d.boundingBox.width))×\(Int(d.boundingBox.height)))"
-                )
+        try writeJsonOutput(entries: entries, multiImage: loaded.count > 1)
+
+        // Stdout summary (suppressed when --output-json is set, matching prior behavior)
+        if outputJson == nil {
+            for (i, entry) in entries.enumerated() {
+                if loaded.count > 1 {
+                    print("\nImage \(i + 1)/\(loaded.count): \(entry.image)")
+                }
+                print("Detections (\(entry.detections.count)):")
+                for (idx, d) in entry.detections.enumerated() {
+                    print(
+                        "  [\(idx)] \(d.label) score=\(String(format: "%.3f", d.score))"
+                            + "  box=(\(Int(d.box.x)),\(Int(d.box.y)),\(Int(d.box.width))×\(Int(d.box.height)))"
+                    )
+                }
             }
         }
 
-        // Render output image with bounding boxes
+        // Render output image(s)
         if let imagePath = outputImage {
-            let outputURL = URL(fileURLWithPath: NSString(string: imagePath).expandingTildeInPath)
-            try renderDetections(onto: cgImage, detections: detections, saveTo: outputURL)
+            try renderOutputImages(
+                imagePath: imagePath,
+                loaded: loaded,
+                allDetections: allDetections
+            )
+        }
+    }
+
+    // MARK: - Output helpers
+
+    private func writeJsonOutput(entries: [JSONImageResult], multiImage: Bool) throws {
+        guard let jsonPath = outputJson else { return }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let url = URL(fileURLWithPath: NSString(string: jsonPath).expandingTildeInPath)
+        let data: Data
+        if multiImage {
+            data = try encoder.encode(entries)
+        } else {
+            // Single-image: keep the prior schema (top-level array of detections).
+            data = try encoder.encode(entries.first?.detections ?? [])
+        }
+        try data.write(to: url)
+        print("Results written to \(jsonPath)")
+    }
+
+    private func renderOutputImages(
+        imagePath: String,
+        loaded: [(path: String, image: CGImage)],
+        allDetections: [[DetectedObject]]
+    ) throws {
+        let expanded = NSString(string: imagePath).expandingTildeInPath
+        if loaded.count == 1 {
+            let outputURL = URL(fileURLWithPath: expanded)
+            try renderDetections(onto: loaded[0].image, detections: allDetections[0], saveTo: outputURL)
             print("Output image written to \(imagePath)")
+            return
+        }
+
+        // Multi-image: treat --output-image as a directory.
+        let dirURL = URL(fileURLWithPath: expanded)
+        try FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
+        for (entry, detections) in zip(loaded, allDetections) {
+            let stem = (entry.path as NSString).lastPathComponent
+            let stemNoExt = (stem as NSString).deletingPathExtension
+            let outURL = dirURL.appendingPathComponent("\(stemNoExt)_detections.png")
+            try renderDetections(onto: entry.image, detections: detections, saveTo: outURL)
+            print("Output image written to \(outURL.path)")
         }
     }
 }
@@ -240,4 +337,9 @@ private struct JSONDetection: Codable {
     struct Box: Codable {
         let x, y, width, height: Double
     }
+}
+
+private struct JSONImageResult: Codable {
+    let image: String
+    let detections: [JSONDetection]
 }

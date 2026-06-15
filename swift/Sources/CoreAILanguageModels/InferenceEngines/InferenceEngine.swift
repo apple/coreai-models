@@ -85,6 +85,7 @@ public enum ConfigurationError: Error, LocalizedError {
 ///
 /// KV cache is preserved between `generate()` calls. Call `reset()` to clear.
 public protocol InferenceEngine: Sendable {
+    associatedtype OutputSequence: InferenceOutputSequence
     typealias TokenId = Int32
 
     // MARK: - Primary API
@@ -95,12 +96,13 @@ public protocol InferenceEngine: Sendable {
     ///   - input: Token IDs (prompt, context, or continuation).
     ///   - sampling: Sampling configuration (temperature, topK, etc.).
     ///   - generation: Inference options (maxTokens, includeLogits).
-    /// - Returns: `InferenceStream` — iterate for tokens, read `stopReason` after.
+    /// - Returns: An `InferenceOutputSequence` — iterate for tokens, read
+    ///   `stopReason` after the loop to learn why generation ended.
     func generate(
         with input: [TokenId],
         samplingConfiguration: SamplingConfiguration,
         inferenceOptions: InferenceOptions
-    ) throws -> InferenceStream
+    ) throws -> OutputSequence
 
     // MARK: - Lifecycle
 
@@ -109,6 +111,16 @@ public protocol InferenceEngine: Sendable {
 
     /// Run dummy inference to trigger kernel compilation.
     func warmup(queryLength: Int, sampling: SamplingConfiguration?) async throws
+
+    // MARK: - Cancellation
+
+    /// Whether the engine has an active generation in progress.
+    var isBusy: Bool { get }
+
+    /// Cancel any in-flight generation. Invalidates the current GenerationToken.
+    /// For pull-based engines, takes effect on the next `next()` call.
+    /// For push-based engines (pipelined), also cancels the background Task.
+    func cancel() async throws
 
     // MARK: - Capabilities
 
@@ -158,6 +170,14 @@ extension InferenceEngine {
     /// Default: supportsLogits is false. Engines that can return per-step
     /// logits (sequential, static-shape) override this to true.
     public var supportsLogits: Bool { false }
+}
+
+extension InferenceEngine {
+    /// Default: engine is not busy.
+    public var isBusy: Bool { false }
+
+    /// Default: no-op cancel. Engines with active generation override this.
+    public func cancel() async throws {}
 }
 
 extension InferenceEngine {

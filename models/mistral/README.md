@@ -69,9 +69,9 @@ Defaults: 512 prompt tokens, 1024 generation tokens, 5 trials. Override with `-p
 
 Perplexity score on the [`WikiText-2`](https://huggingface.co/datasets/EleutherAI/wikitext_document_level) dataset computed using the [lm-evaluation-harness](https://github.com/EleutherAI/lm-evaluation-harness/blob/main/lm_eval/tasks/wikitext/README.md) with the Core AI PyTorch models.
 
-| Model               | Compression                                | Platform | Perplexity Score |
-| ------------------- | ------------------------------------------ | -------- | ---------------- |
-| Mistral 7B Instruct | none (`float16`)                           | macOS    | 8.29             |
-| Mistral 7B Instruct | [4-bit quantized][p-4bit]                  | macOS    | 8.41             |
+| Model               | Compression                                | Bits Per Weight (BPW) | Platform | Perplexity Score |
+| ------------------- | ------------------------------------------ | --------------------- | -------- | ---------------- |
+| Mistral 7B Instruct | none (`float16`)                           | 16.00                 | macOS    | 8.29             |
+| Mistral 7B Instruct | [4-bit quantized][p-4bit]                  | 4.50                  | macOS    | 8.41             |
 
 [p-4bit]: ../README.md#quantization-options

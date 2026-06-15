@@ -13,13 +13,13 @@ import Tokenizers
 public class TextGenerator {
     private let inferenceEngine: any InferenceEngine
     private let samplingConfiguration: SamplingConfiguration
-    private let decodingStrategy: DecodingStrategy
+    private let decodingStrategy: any DecodingStrategy
     private let tokenizer: any Tokenizer
 
     public init(
         inferenceEngine: any InferenceEngine,
         samplingConfiguration: SamplingConfiguration,
-        decodingStrategy: DecodingStrategy,
+        decodingStrategy: any DecodingStrategy,
         tokenizer: any Tokenizer
     ) {
         self.inferenceEngine = inferenceEngine
@@ -44,7 +44,7 @@ public class TextGenerator {
         // Use provided stop sequences, or create default ones from tokenizer
         let effectiveStopSequences = stopSequences ?? StopSequences(for: tokenizer)
 
-        let tokenStream = decodingStrategy.decode(
+        let tokenStream = try await decodingStrategy.decode(
             from: input,
             tokenizer: tokenizer,
             inferenceEngine: inferenceEngine,
@@ -77,7 +77,7 @@ public class TextGenerator {
         // Use provided stop sequences, or create default ones from tokenizer
         let effectiveStopSequences = stopSequences ?? StopSequences(for: tokenizer)
 
-        let resultStream = decodingStrategy.decode(
+        let resultStream = try await decodingStrategy.decode(
             from: input,
             tokenizer: tokenizer,
             inferenceEngine: inferenceEngine,
