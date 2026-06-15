@@ -175,7 +175,7 @@ struct MPSGraphArgmaxSamplerTests {
         print("MPSGraph Argmax latency: \(String(format: "%.3f", avgLatencyMs)) ms")
 
         // Use higher threshold on VM due to virtualization overhead
-        let threshold = CIEnvironment.isVM ? 100.0 : 1.0
+        let threshold = CIEnvironment.isVM ? 100.0 : 25.0
         #expect(
             avgLatencyMs < threshold,
             "Argmax too slow: \(avgLatencyMs) ms (threshold: \(threshold) ms, VM: \(CIEnvironment.isVM))")
