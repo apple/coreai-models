@@ -170,13 +170,8 @@ final class CoreAIPipelinedEngine: InferenceEngine, Sendable {
     }
 
     func validateSamplingStrategy(_ config: SamplingConfiguration) throws {
-        guard config.temperature > 0 else { return }
-        if config.topP != nil {
-            throw InferenceRuntimeError.invalidArgument(
-                "CoreAI pipelined GPU sampler does not support topP. "
-                    + "Only greedy (temperature=0) and temperature+topK are supported."
-            )
-        }
+        // All sampling configurations are now supported by the GPU sampler:
+        // greedy, temperature, topK, topP, and minP.
     }
 
     func warmup(queryLength: Int, sampling: SamplingConfiguration?) async throws {
@@ -491,7 +486,7 @@ private struct EngineImpl: ~Copyable {
         let newSampler = try MPSGraphSamplerFactory.makeSampler(
             device: device,
             vocabSize: self.config.vocabSize,
-            temperature: temperature
+            config: config
         )
         cachedSampler = newSampler
         cachedSamplerTemperature = temperature
@@ -634,7 +629,7 @@ private struct EngineImpl: ~Copyable {
         let localGPUSampler = gpuSampler
         let outputBuffer = inputTokensBuffer
         let logitsOffset = (actualTokenCount - 1) * vocabSize * MemoryLayout<UInt16>.size
-        let samplerStrategy = gpuSampler is MPSGraphArgmaxSampler ? "GPU-argmax" : "GPU-topK"
+        let samplerStrategy = gpuSampler is MPSGraphArgmaxSampler ? "GPU-argmax" : "GPU-composite"
         let samplerTemperature = cachedSamplerTemperature ?? 0.0
 
         let sampleSpan = InstrumentsProfiler.beginSampleEncoding(
@@ -818,7 +813,7 @@ private struct EngineImpl: ~Copyable {
         // queue FIFO ordering via MTLDispatchListApply), guaranteeing every
         // continuation.yield has returned before the caller calls finish().
         // We use a bare command buffer instead of the sampler to avoid the shared
-        // MPSGraphExecutableExecutionDescriptor issue in MPSGraphTopKSampler.
+        // MPSGraphExecutableExecutionDescriptor issue in MPSGraphCompositeSampler.
         await withCheckedContinuation { (sentinelCont: CheckedContinuation<Void, Never>) in
             do {
                 let queue = pipelineQueue
