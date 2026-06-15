@@ -224,7 +224,10 @@ struct CompositeSamplerTests {
             var logits = rawLogits
             let token = CompositeSampler.sample(
                 from: &logits, config: .init(temperature: 1.0, minP: 1.0), using: &rng)
-            if token != 42 { allSame = false; break }
+            if token != 42 {
+                allSame = false
+                break
+            }
         }
         #expect(allSame, "minP=1.0 should always pick the top token")
     }
@@ -236,8 +239,8 @@ struct CompositeSamplerTests {
 
         // Spread: top 5 tokens have high logits, next 5 have medium, rest are low
         var rawLogits = [Float](repeating: -10.0, count: vocab)
-        for i in 95..<100 { rawLogits[i] = 5.0 }   // high
-        for i in 90..<95 { rawLogits[i] = 2.0 }    // medium
+        for i in 95..<100 { rawLogits[i] = 5.0 }  // high
+        for i in 90..<95 { rawLogits[i] = 2.0 }  // medium
 
         var sampledIndices = Set<Int32>()
         for _ in 0..<2_000 {

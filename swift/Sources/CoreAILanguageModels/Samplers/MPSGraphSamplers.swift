@@ -509,7 +509,9 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
     ///   - temperature: Sampling temperature
     ///   - topP: Nucleus sampling threshold (1.0 = disabled)
     ///   - minP: Minimum probability threshold (0.0 = disabled)
-    init(device: MTLDevice, vocabSize: Int, k: Int = 40, temperature: Float = 1.0, topP: Float = 1.0, minP: Float = 0.0) throws {
+    init(device: MTLDevice, vocabSize: Int, k: Int = 40, temperature: Float = 1.0, topP: Float = 1.0, minP: Float = 0.0)
+        throws
+    {
         self.device = device
         self.mpsDevice = MPSGraphDevice(mtlDevice: device)
         self.vocabSize = vocabSize
@@ -599,7 +601,8 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
 
         // Step 5: TopP filtering via exclusive cumulative sum
         // exclusive_cumsum[i] = sum of probs[0..i-1], so position 0 always has value 0
-        let exclusiveCumsum = graph.cumulativeSum(probabilities, axis: 1, exclusive: true, reverse: false, name: "excl_cumsum")
+        let exclusiveCumsum = graph.cumulativeSum(
+            probabilities, axis: 1, exclusive: true, reverse: false, name: "excl_cumsum")
         // mask: exclusive_cumsum < topP (includes all tokens before cumsum reaches topP)
         let topPMask = graph.lessThan(exclusiveCumsum, topPPlaceholder, name: "topp_mask")
 

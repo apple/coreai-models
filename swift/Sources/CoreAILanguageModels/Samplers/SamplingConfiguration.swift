@@ -110,7 +110,8 @@ public struct SamplingConfiguration: Sendable, Equatable, Hashable {
     ///   - combined: Whether to combine sampling with logit inference. Defaults to true.
     ///
     /// - Note: Call `validate()` to check for potentially suboptimal configurations.
-    public init(temperature: Double, topK: Int? = nil, topP: Double? = nil, minP: Double? = nil, combined: Bool = true) {
+    public init(temperature: Double, topK: Int? = nil, topP: Double? = nil, minP: Double? = nil, combined: Bool = true)
+    {
         precondition(temperature >= 0, "Temperature must be non-negative.")
         precondition(topK == nil || topK! > 0, "TopK must be positive if set.")
         precondition(topP == nil || (topP! > 0 && topP! <= 1), "TopP must be in (0, 1] if set.")

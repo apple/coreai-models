@@ -247,7 +247,8 @@ struct MPSGraphCompositeSamplerTests {
     func topKSamplesCorrectly() async throws {
         let device = try #require(Self.device)
         // Create sampler with temperature=1.0 (neutral)
-        let sampler = try MPSGraphCompositeSampler(device: device, vocabSize: Self.vocabSize, k: Self.k, temperature: 1.0)
+        let sampler = try MPSGraphCompositeSampler(
+            device: device, vocabSize: Self.vocabSize, k: Self.k, temperature: 1.0)
 
         let logitsBuffer = try #require(device.makeBuffer(length: Self.vocabSize * 2, options: .storageModeShared))
         let outputBuffer = try #require(device.makeBuffer(length: 4, options: .storageModeShared))
@@ -296,7 +297,8 @@ struct MPSGraphCompositeSamplerTests {
     func topKLowTemperature() async throws {
         let device = try #require(Self.device)
         // Create sampler with very low temperature (0.1) - concentrates probability
-        let sampler = try MPSGraphCompositeSampler(device: device, vocabSize: Self.vocabSize, k: Self.k, temperature: 0.1)
+        let sampler = try MPSGraphCompositeSampler(
+            device: device, vocabSize: Self.vocabSize, k: Self.k, temperature: 0.1)
 
         let logitsBuffer = try #require(device.makeBuffer(length: Self.vocabSize * 2, options: .storageModeShared))
         let outputBuffer = try #require(device.makeBuffer(length: 4, options: .storageModeShared))
@@ -342,7 +344,8 @@ struct MPSGraphCompositeSamplerTests {
     func topKHighTemperature() async throws {
         let device = try #require(Self.device)
         // Create sampler with neutral temperature (1.0)
-        let sampler = try MPSGraphCompositeSampler(device: device, vocabSize: Self.vocabSize, k: Self.k, temperature: 1.0)
+        let sampler = try MPSGraphCompositeSampler(
+            device: device, vocabSize: Self.vocabSize, k: Self.k, temperature: 1.0)
 
         let logitsBuffer = try #require(device.makeBuffer(length: Self.vocabSize * 2, options: .storageModeShared))
         let outputBuffer = try #require(device.makeBuffer(length: 4, options: .storageModeShared))
@@ -403,7 +406,8 @@ struct MPSGraphCompositeSamplerTests {
     func topKPerformance() async throws {
         let device = try #require(Self.device)
         // Create sampler with temperature=1.0
-        let sampler = try MPSGraphCompositeSampler(device: device, vocabSize: Self.vocabSize, k: Self.k, temperature: 1.0)
+        let sampler = try MPSGraphCompositeSampler(
+            device: device, vocabSize: Self.vocabSize, k: Self.k, temperature: 1.0)
 
         let logitsBuffer = try #require(device.makeBuffer(length: Self.vocabSize * 2, options: .storageModeShared))
         let outputBuffer = try #require(device.makeBuffer(length: 4, options: .storageModeShared))
@@ -457,7 +461,8 @@ struct MPSGraphCompositeSamplerTests {
     @Test("Top-K with slice (prefill scenario)")
     func topKWithSlice() async throws {
         let device = try #require(Self.device)
-        let sampler = try MPSGraphCompositeSampler(device: device, vocabSize: Self.vocabSize, k: Self.k, temperature: 1.0)
+        let sampler = try MPSGraphCompositeSampler(
+            device: device, vocabSize: Self.vocabSize, k: Self.k, temperature: 1.0)
 
         let queryLength = 128  // Typical prefill length
         let targetToken = 15000
@@ -581,7 +586,8 @@ struct MPSGraphTopPSamplerTests {
         }
 
         let result = outputBuffer.contents().assumingMemoryBound(to: Int32.self).pointee
-        #expect([500, 501, 502, 503, 504].contains(Int(result)), "topP=1.0 should sample from top tokens, got \(result)")
+        #expect(
+            [500, 501, 502, 503, 504].contains(Int(result)), "topP=1.0 should sample from top tokens, got \(result)")
         sampler.testingOnlyRandomOverride = nil
     }
 
