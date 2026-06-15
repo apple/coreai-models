@@ -620,8 +620,7 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
 
         // Step 8: Multinomial sampling via cumulative sum + random comparison
         let cumsum = graph.cumulativeSum(normalizedProbs, axis: 1, exclusive: false, reverse: false, name: "cumsum")
-        let randomBroadcast = graph.broadcast(randomPlaceholder, shape: [1, k as NSNumber], name: "random_broadcast")
-        let selectionMask = graph.greaterThanOrEqualTo(cumsum, randomBroadcast, name: "selection_mask")
+        let selectionMask = graph.greaterThanOrEqualTo(cumsum, randomPlaceholder, name: "selection_mask")
         let selectionMaskFloat = graph.cast(selectionMask, to: .float32, name: "selection_mask_float")
         let selectedIdx = graph.reductionArgMaximum(with: selectionMaskFloat, axis: 1, name: "selected_idx")
 
