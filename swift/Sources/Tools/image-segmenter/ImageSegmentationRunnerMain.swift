@@ -382,7 +382,9 @@ struct ImageSegmenterCLI: AsyncParsableCommand {
         }
         try writeImage(rendered, to: resolvedOutputPath)
         print("Output image written to \(resolvedOutputPath)")
+        #if os(macOS)
         openFile(at: resolvedOutputPath)
+        #endif
     }
 
     // MARK: - Rendering
@@ -503,6 +505,7 @@ struct ImageSegmenterCLI: AsyncParsableCommand {
         }
     }
 
+    #if os(macOS)
     private func openFile(at path: String) {
         let expanded = NSString(string: path).expandingTildeInPath
         let process = Process()
@@ -510,6 +513,7 @@ struct ImageSegmenterCLI: AsyncParsableCommand {
         process.arguments = [expanded]
         try? process.run()
     }
+    #endif
 
     // MARK: - Parity helpers (.npy reader + CGImage builder + metrics)
 
