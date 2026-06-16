@@ -69,7 +69,11 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
     private let valueCacheDescriptor: NDArrayDescriptor
 
     // Track processed tokens for incremental inference
-    private var processedTokenCount: Int = 0
+    public private(set) var processedTokenCount: Int = 0
+
+    // Token history for implicit prefix caching
+    private var history = TokenHistory()
+    public private(set) var lastPrefixHitCount: Int = 0
 
     // Track in-flight generation via token (replaces simple bool lock)
     private let _activeToken = Mutex<GenerationToken?>(nil)
@@ -345,6 +349,21 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         samplingConfiguration: SamplingConfiguration,
         inferenceOptions: InferenceOptions
     ) throws -> GenerationSequence {
+        // Implicit prefix caching: resolve before creating Iterator.
+        // Implicit prefix caching: resolve input against history.
+        if history.count > 0 {
+            let (commonPrefix, _) = history.resolve(input: input)
+            if commonPrefix < input.count && commonPrefix < history.count {
+                // Divergence: input differs from history. Full reset needed.
+                internalReset(to: 0)
+            } else if processedTokenCount >= input.count {
+                // Pure extension: all input tokens match history. Rewind for seeding.
+                let resetTo = Swift.max(0, commonPrefix - 1)
+                internalReset(to: resetTo)
+            }
+            lastPrefixHitCount = commonPrefix
+        }
+
         let token = GenerationToken()
         _activeToken.withLock { $0 = token }
         return GenerationSequence(
@@ -377,15 +396,30 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         }
     }
 
-    public func reset() {
+    public func reset(to tokenIndex: Int) async throws {
+        precondition(
+            tokenIndex >= 0 && tokenIndex <= processedTokenCount,
+            "reset(to: \(tokenIndex)) out of range [0, \(processedTokenCount)]")
         _activeToken.withLock {
             $0?.cancel()
             $0 = nil
         }
+        internalReset(to: tokenIndex)
+    }
+
+    /// Internal reset without cancelling the active generation token.
+    /// Used by the Iterator when it detects a prefix mismatch mid-generation.
+    func internalReset(to tokenIndex: Int) {
         let resetSpan = InstrumentsProfiler.beginReset(engine: "CoreAIClean")
-        processedTokenCount = 0
-        zeroFill(&keyCache)
-        zeroFill(&valueCache)
+        if tokenIndex == 0 {
+            processedTokenCount = 0
+            history.clear()
+            zeroFill(&keyCache)
+            zeroFill(&valueCache)
+        } else {
+            processedTokenCount = tokenIndex
+            history.truncate(to: tokenIndex)
+        }
         resetSpan.end()
     }
 
@@ -578,6 +612,7 @@ extension CoreAISequentialEngine.GenerationSequence {
                     throw InferenceRuntimeError.invalidState("No new tokens to process")
                 }
 
+                let oldProcessedCount = engine.processedTokenCount
                 let newTokens = inputTokens[engine.processedTokenCount...]
                 let strategy = engine.selectPrefillStrategy(newTokenCount: newTokens.count)
 
@@ -595,6 +630,10 @@ extension CoreAISequentialEngine.GenerationSequence {
                     }
                     logitBuffer = lastLogits
                 }
+
+                // Update history with newly processed tokens
+                let processedSlice = inputTokens[oldProcessedCount..<engine.processedTokenCount]
+                engine.history.append(contentsOf: processedSlice)
 
                 // Check cancellation after inference step
                 if generationToken.isCancelled {

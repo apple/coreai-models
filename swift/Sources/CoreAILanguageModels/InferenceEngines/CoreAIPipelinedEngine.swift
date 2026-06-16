@@ -38,6 +38,8 @@ final class CoreAIPipelinedEngine: InferenceEngine, Sendable {
     typealias ConfigType = ModelConfig
 
     nonisolated(unsafe) private var engine: EngineImpl
+    nonisolated(unsafe) private var history = TokenHistory()
+    nonisolated(unsafe) private(set) var lastPrefixHitCount: Int = 0
     private let engineInUse = Atomic<Bool>(false)
     let config: ModelConfig
 
@@ -46,6 +48,8 @@ final class CoreAIPipelinedEngine: InferenceEngine, Sendable {
     private let _generationTask = Mutex<Task<Void, Never>?>(nil)
 
     var isBusy: Bool { _activeToken.withLock { $0 != nil } }
+
+    var processedTokenCount: Int { engine.processedTokenCount }
 
     init(
         config: ModelConfig,
@@ -128,9 +132,42 @@ final class CoreAIPipelinedEngine: InferenceEngine, Sendable {
                 let (tokenStream, tokenContinuation) =
                     AsyncThrowingStream<InferenceEngine.TokenId, any Error>.makeStream()
 
+                // Implicit prefix caching: resolve input against history
+                var (commonPrefix, resolvedNewTokens) = self.history.resolve(input: input)
+                self.lastPrefixHitCount = commonPrefix
+
+                // Detect TRUE divergence before backup (tokens actually differ)
+                let isDivergence = commonPrefix < input.count && commonPrefix < self.history.count
+
+                // Ensure at least 1 token for prefill (seeds the decode loop).
+                // Back up by 1 if the entire input is cached.
+                if resolvedNewTokens.isEmpty && commonPrefix > 0 {
+                    commonPrefix -= 1
+                    resolvedNewTokens = input[commonPrefix...]
+                }
+
+                if isDivergence {
+                    // Tokens differ — full reset (partial rewind corrupts buffer rotation)
+                    await self.engine.computeStream.currentWorkCompleted()
+                    self.engine.reset()
+                    self.history.clear()
+                    resolvedNewTokens = input[...]
+                    commonPrefix = 0
+                } else if commonPrefix < self.engine.processedTokenCount {
+                    // Pure extension — partial rewind (buffer phase preserved)
+                    await self.engine.computeStream.currentWorkCompleted()
+                    self.engine.processedTokenCount = commonPrefix
+                    self.engine.step = commonPrefix
+                    self.history.truncate(to: commonPrefix)
+                }
+
+                let newTokens = Array(resolvedNewTokens)
+
                 async let forwarding: Void = {
                     do {
                         for try await token in tokenStream {
+                            // Track generated tokens in history
+                            self.history.append(token)
                             outputContinuation.yield(InferenceOutput(tokenId: token))
                         }
                     } catch {
@@ -138,12 +175,19 @@ final class CoreAIPipelinedEngine: InferenceEngine, Sendable {
                     }
                 }()
 
+                // Track prefill tokens BEFORE runCompletion — the forwarding loop
+                // concurrently appends generated tokens, so prefill must come first.
+                if !newTokens.isEmpty {
+                    self.history.append(contentsOf: newTokens[...])
+                }
+
                 try await self.engine.runCompletion(
-                    prompt: input,
+                    prompt: newTokens,
                     sampler: samplingConfiguration,
                     maxTokens: maxTokens,
                     yieldingTo: tokenContinuation
                 )
+
                 tokenContinuation.finish()
                 await forwarding
                 stopReasonStore.setIfUnset(.maxTokens)
@@ -185,21 +229,38 @@ final class CoreAIPipelinedEngine: InferenceEngine, Sendable {
         await task?.value
     }
 
-    func reset() {
-        // Cancel active generation BEFORE draining — otherwise drain() waits
-        // forever for a producer that will never release the engine.
-        _activeToken.withLock {
-            $0?.cancel()
-            $0 = nil
+    func reset(to tokenIndex: Int) async throws {
+        precondition(
+            tokenIndex >= 0 && tokenIndex <= processedTokenCount,
+            "reset(to: \(tokenIndex)) out of range [0, \(processedTokenCount)]")
+        if tokenIndex == 0 {
+            // Full reset: cancel + drain + clear everything
+            _activeToken.withLock {
+                $0?.cancel()
+                $0 = nil
+            }
+            _generationTask.withLock {
+                $0?.cancel()
+                $0 = nil
+            }
+            drain()
+            await engine.computeStream.currentWorkCompleted()
+            guard tryAcquireEngine() else { return }
+            defer { releaseEngine() }
+            engine.reset()
+            history.clear()
+        } else {
+            // Partial reset: wait for generation to finish naturally, then rewind counter.
+            // Do NOT cancel — cancelling corrupts the pipeline's double-buffer state.
+            // The KV cache is valid up to processedTokenCount after natural completion.
+            drain()
+            await engine.computeStream.currentWorkCompleted()
+            guard tryAcquireEngine() else { return }
+            defer { releaseEngine() }
+            engine.processedTokenCount = tokenIndex
+            engine.step = tokenIndex
+            history.truncate(to: tokenIndex)
         }
-        _generationTask.withLock {
-            $0?.cancel()
-            $0 = nil
-        }
-        drain()
-        guard tryAcquireEngine() else { return }
-        defer { releaseEngine() }
-        engine.reset()
     }
 
     func cleanup() async throws {
@@ -809,27 +870,30 @@ private struct EngineImpl: ~Copyable {
         }
 
         // Split prompt into chunks when it exceeds the chunk threshold.
-        let prefillTokens: ArraySlice<Int32>
-        if prompt.count > config.chunkThreshold {
-            prefillTokens = try await processChunkedInput(tokens: prompt)
-        } else {
-            let prefillCapacity = max(1, prompt.count)
-            if try logits.ensureCapacity(forContextLength: prefillCapacity) {
-                let fmt = ByteCountFormatter()
-                fmt.countStyle = .memory
-                CLILogger.log(
-                    "Logits buffer grew to capacity \(logits.currentCapacity) (\(fmt.string(fromByteCount: Int64(logits.currentByteCount))))"
-                )
+        // Skip prefill entirely if prompt is empty (prefix-cached continuation).
+        if !prompt.isEmpty {
+            let prefillTokens: ArraySlice<Int32>
+            if prompt.count > config.chunkThreshold {
+                prefillTokens = try await processChunkedInput(tokens: prompt)
+            } else {
+                let prefillCapacity = max(1, prompt.count)
+                if try logits.ensureCapacity(forContextLength: prefillCapacity) {
+                    let fmt = ByteCountFormatter()
+                    fmt.countStyle = .memory
+                    CLILogger.log(
+                        "Logits buffer grew to capacity \(logits.currentCapacity) (\(fmt.string(fromByteCount: Int64(logits.currentByteCount))))"
+                    )
+                }
+                prefillTokens = prompt[...]
             }
-            prefillTokens = prompt[...]
-        }
 
-        // Process prompt with sampling
-        try await _encodeNextStepGPU(
-            tokens: prefillTokens,
-            gpuSampler: gpuSampler,
-            yieldingTo: continuation
-        )
+            // Process prompt with sampling
+            try await _encodeNextStepGPU(
+                tokens: prefillTokens,
+                gpuSampler: gpuSampler,
+                yieldingTo: continuation
+            )
+        }
 
         // Generate-Grow-Continue loop
         var remainingTokens = totalMaxTokens - 1

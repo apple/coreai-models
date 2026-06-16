@@ -46,7 +46,11 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     private var valueCache: NDArray
 
     // Number of tokens already processed in the current sequence.
-    private var processedTokenCount: Int = 0
+    public private(set) var processedTokenCount: Int = 0
+
+    // Token history for implicit prefix caching
+    private var history = TokenHistory()
+    public private(set) var lastPrefixHitCount: Int = 0
 
     // Track in-flight generation via token
     private let _activeToken = Mutex<GenerationToken?>(nil)
@@ -328,6 +332,22 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         samplingConfiguration: SamplingConfiguration,
         inferenceOptions: InferenceOptions
     ) throws -> GenerationSequence {
+        // Implicit prefix caching: resolve input against history.
+        if history.count > 0 {
+            let (commonPrefix, _) = history.resolve(input: input)
+            if commonPrefix < input.count && commonPrefix < history.count {
+                // Divergence — full reset (static engine has fixed-size KV)
+                processedTokenCount = 0
+                history.clear()
+            } else if processedTokenCount >= input.count {
+                // Extension — rewind for seeding
+                let resetTo = Swift.max(0, commonPrefix - 1)
+                processedTokenCount = resetTo
+                history.truncate(to: resetTo)
+            }
+            lastPrefixHitCount = commonPrefix
+        }
+
         let token = GenerationToken()
         _activeToken.withLock { $0 = token }
         return GenerationSequence(
@@ -552,13 +572,22 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         }
     }
 
-    public func reset() {
+    public func reset(to tokenIndex: Int) async throws {
+        precondition(
+            tokenIndex >= 0 && tokenIndex <= processedTokenCount,
+            "reset(to: \(tokenIndex)) out of range [0, \(processedTokenCount)]")
         _activeToken.withLock {
             $0?.cancel()
             $0 = nil
         }
         let resetSpan = InstrumentsProfiler.beginReset(engine: "StaticShape")
-        processedTokenCount = 0
+        if tokenIndex == 0 {
+            processedTokenCount = 0
+            history.clear()
+        } else {
+            processedTokenCount = tokenIndex
+            history.truncate(to: tokenIndex)
+        }
         resetSpan.end()
     }
 
@@ -566,7 +595,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         for fnName in extendFunctionNames {
             self.functions[fnName] = try Self.requireFunction(model: model, functionName: fnName)
         }
-        reset()
+        try await reset()
     }
 }
 
@@ -669,6 +698,8 @@ extension StaticShapeEngine.GenerationSequence {
             do {
                 try Task.checkCancellation()
 
+                let oldProcessedCount = engine.processedTokenCount
+
                 // When forced, we still need the forward pass (for logits + KV cache update)
                 // but skip the sampler — the next token is predetermined.
                 let (logits, sampledToken) = try await engine.inference(
@@ -676,6 +707,10 @@ extension StaticShapeEngine.GenerationSequence {
                     samplingConfig: samplingConfiguration,
                     returnsLogits: returnsLogits || forcedContinuation != nil
                 )
+
+                // Update history with newly processed tokens
+                let processedSlice = inputTokens[oldProcessedCount..<engine.processedTokenCount]
+                engine.history.append(contentsOf: processedSlice)
 
                 // Check cancellation after inference step
                 if generationToken.isCancelled {

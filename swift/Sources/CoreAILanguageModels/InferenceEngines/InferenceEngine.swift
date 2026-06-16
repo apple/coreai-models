@@ -106,8 +106,15 @@ public protocol InferenceEngine: Sendable {
 
     // MARK: - Lifecycle
 
-    /// Reset internal state including KV cache.
-    func reset() async throws
+    /// Number of tokens the engine has processed in the current session.
+    /// Resets to 0 on full reset. Used by callers to compute shared prefix length.
+    var processedTokenCount: Int { get }
+
+    /// Reset KV cache to the state after processing `tokenIndex` tokens.
+    /// - tokenIndex == 0: full reset (clear all state, equivalent to reset())
+    /// - tokenIndex > 0: partial reset (keep cache for first tokenIndex positions)
+    /// Precondition: tokenIndex >= 0 && tokenIndex <= processedTokenCount
+    func reset(to tokenIndex: Int) async throws
 
     /// Run dummy inference to trigger kernel compilation.
     func warmup(queryLength: Int, sampling: SamplingConfiguration?) async throws
@@ -127,6 +134,13 @@ public protocol InferenceEngine: Sendable {
     /// Whether this engine supports per-step logits extraction.
     /// GPU-pipelined engines (which sample on-device) return false.
     var supportsLogits: Bool { get }
+
+    /// How many tokens were reused from cache on the last `generate()` call.
+    ///
+    /// After each `generate()`, this reflects how many leading tokens of the input
+    /// matched the engine's cached history and were skipped (no recomputation needed).
+    /// Useful for debugging multi-turn efficiency and verifying prefix caching behavior.
+    var lastPrefixHitCount: Int { get }
 
     // MARK: - Configuration
 
@@ -173,6 +187,11 @@ extension InferenceEngine {
 }
 
 extension InferenceEngine {
+    /// Default: no prefix hits (engine doesn't track history).
+    public var lastPrefixHitCount: Int { 0 }
+}
+
+extension InferenceEngine {
     /// Default: engine is not busy.
     public var isBusy: Bool { false }
 
@@ -184,6 +203,18 @@ extension InferenceEngine {
     /// Default no-op implementation of warmup.
     public func warmup(queryLength: Int, sampling: SamplingConfiguration?) async throws {
         // No-op by default
+    }
+}
+
+extension InferenceEngine {
+    /// Default: processedTokenCount is 0 (engine hasn't processed anything).
+    public var processedTokenCount: Int { 0 }
+}
+
+extension InferenceEngine {
+    /// Default: reset() delegates to reset(to: 0) for full reset.
+    public func reset() async throws {
+        try await reset(to: 0)
     }
 }
 
