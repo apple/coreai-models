@@ -4,13 +4,11 @@ SAM 3 (Segment Anything Model 3) is a unified vision model from Meta for prompta
 
 This export targets the **Apple Neural Engine** by re-authoring the model in a BC1S layout (channels-first, `Conv2d(1x1)` projections, fp16-safe primitives, rank-4 window attention) and splitting it into three independently optimizable functions:
 
-| Function       | Compression                              | Inputs                          | Outputs                                                    |
-|----------------|------------------------------------------|---------------------------------|------------------------------------------------------------|
-| `image_encode` | 4-bit k-means palettization (gs=32) + fp16 | `pixel_values`                  | `backbone_features`                                        |
-| `text_encode`  | 6-bit k-means palettization (gs=8) + fp16  | `input_ids`, `attention_mask`   | `text_features`                                            |
-| `detect`       | fp16 (no weight compression)             | `backbone_features`, `text_features` | `pred_masks`, `pred_boxes`, `pred_logits`, `presence_logits` |
-
-The asymmetric palettization recipe (more aggressive on the larger image encoder, gentler on the smaller text encoder) and the deliberate omission of `enable_per_channel_scale` are both ANE-compatibility constraints — see "ANE compatibility" below.
+| Function       | Compression                                | Inputs                               | Outputs                                                      |
+|----------------|--------------------------------------------|--------------------------------------|--------------------------------------------------------------|
+| `image_encode` | 4-bit k-means palettization (gs=32) + fp16 | `pixel_values`                       | `backbone_features`                                          |
+| `text_encode`  | 6-bit k-means palettization (gs=8) + fp16  | `input_ids`, `attention_mask`        | `text_features`                                              |
+| `detect`       | fp16 (no weight compression)               | `backbone_features`, `text_features` | `pred_masks`, `pred_boxes`, `pred_logits`, `presence_logits` |
 
 ## Setup
 
@@ -29,16 +27,14 @@ hf auth login --token <YOUR_TOKEN_HERE>
 
 ## Export
 
-SAM3 needs `transformers>=5.5.4,<5.10.1`, which doesn't overlap with the workspace's `transformers>=4.57,<5.0` pin. To avoid a workspace-wide split, this script ships as a [PEP 723 inline-script](https://peps.python.org/pep-0723/) — its dependencies (including the SAM3 transformers pin) are declared in a header at the top of `models/sam3/export.py` and uv resolves them in an isolated per-script env. No `uv sync` step is needed.
-
 ```sh
-uv run models/sam3/export.py
+uv run export.py
 ```
 
-Saves to `<repo-root>/exports/<model>_reauthored_<image-size>_w<n-bits>_static/` as a bundle directory containing `<...>.aimodel`, a `tokenizer/` folder, and a `metadata.json` (segmenter bundle, schema 0.2). Pass `--output-dir <path>` to override the destination.
+Saves to `<repo-root>/exports/<model>_reauthored_<image-size>_w<n-bits>_static/` as a bundle directory containing `<...>.aimodel`, a `tokenizer/` folder, and a `metadata.json` (segmenter bundle, schema 0.2). Pass `--output-dir <path>` to override the destination. If exporting the baseline (vanilla HF model), saves to `<repo-root>/exports/<model>_<dtype>/`.
 
 ```sh
-uv run models/sam3/export.py --help
+uv run export.py --help
 ```
 
 **Options:**
@@ -73,17 +69,9 @@ uv run models/sam3/export.py --baseline --dtype float16
 
 Baseline bundles land at `<repo-root>/exports/<model>_<dtype>/` (e.g. `exports/sam3_float32/`), so they sit next to the optimized `sam3_reauthored_336_w4_static/` without colliding.
 
-## Running (pure Python)
+## Running
 
-After exporting, you can run the model end-to-end on the host (loaded via `coreai.runtime`). `models/sam3/run.py` is also a PEP 723 inline-script, so it resolves its own SAM3-compatible env:
-
-```sh
-uv run models/sam3/run.py --image path/to/image.jpg --prompt "flower"
-```
-
-The runner picks the most recently exported bundle in `exports/` whose name starts with `sam3_reauthored_`. Pass `--bundle path/to/bundle/` to point at a specific bundle, and `--output result.png` to override where the annotated PNG is written. Defaults to Neural Engine specialization; pass `--compute-unit gpu|cpu` to override.
-
-## Running on iOS / macOS
+## In your iOS and macOS applications
 
 ```swift
 import ImageSegmenter
@@ -95,6 +83,7 @@ let segmenter = try await ImageSegmenter(resourcesAt: "coreai-models/exports/sam
 let segments = try await segmenter.segment(image: cgImage, prompt: "cat")
 ```
 
+### On your Mac using built-in Command Line Tool
 ```bash
 swift run -c release image-segmenter --model path/to/exported_model_folder --prompt "cat" --image path/to/image.jpg
 ```
