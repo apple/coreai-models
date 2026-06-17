@@ -237,29 +237,73 @@ struct ImageSegmentationTests {
         #expect(response.segments[0].box == .zero)
     }
 
-    // MARK: - nearestNeighborUpsampleToBool
+    // MARK: - bilinearUpsampleToBool / bilinearUpsampleToFloat
 
-    @Test("Nearest-neighbor upsample: 2×2 → 4×4 with threshold")
-    func nearestNeighborUpsampleBoolThreshold() {
-        // source (row-major): top-left=0.3, top-right=0.7, bot-left=0.8, bot-right=0.1
+    @Test("Bilinear upsample (Bool): identity case (2×2 → 2×2) round-trips through threshold")
+    func bilinearUpsampleBoolIdentity() {
         let source: [Float] = [0.3, 0.7, 0.8, 0.1]
-        let result = SegmentationPostprocessor.nearestNeighborUpsampleToBool(
-            source: source, sourceHeight: 2, sourceWidth: 2, destinationHeight: 4, destinationWidth: 4, threshold: 0.5
+        let result = SegmentationPostprocessor.bilinearUpsampleToBool(
+            source: source, sourceHeight: 2, sourceWidth: 2, destinationHeight: 2, destinationWidth: 2,
+            threshold: 0.5
+        )
+        // sH==dH, sW==dW collapses to source >= threshold per cell.
+        #expect(result == [false, true, true, false])
+    }
+
+    @Test("Bilinear upsample (Bool): 2×2 → 4×4 produces gradients across cells, not staircase")
+    func bilinearUpsampleBoolGradient() {
+        // source (row-major):
+        //   0.3 0.7
+        //   0.8 0.1
+        let source: [Float] = [0.3, 0.7, 0.8, 0.1]
+        let result = SegmentationPostprocessor.bilinearUpsampleToBool(
+            source: source, sourceHeight: 2, sourceWidth: 2, destinationHeight: 4, destinationWidth: 4,
+            threshold: 0.5
         )
 
         #expect(result.count == 16)
-        // top-left 2×2 block → source (0,0)=0.3 → false
-        #expect(!result[0 * 4 + 0])
-        #expect(!result[1 * 4 + 1])
-        // top-right 2×2 block → source (0,1)=0.7 → true
+
+        // Source corner samples land on destination corners (anchor invariant) — the bilinear
+        // formula clamps so the dst (0,0) cell sees pure src[0,0] = 0.3 < 0.5 → false.
+        #expect(!result[0 * 4 + 0])  // src[0,0] = 0.3 → false
+        #expect(result[0 * 4 + 3])  // src[0,1] = 0.7 → true
+        #expect(result[3 * 4 + 0])  // src[1,0] = 0.8 → true
+        #expect(!result[3 * 4 + 3])  // src[1,1] = 0.1 → false
+
+        // Mid-row interior cells blend between corners — verifies the resampling actually
+        // interpolates rather than nearest-neighbor-snapping. Row 0 col 2 sees ~0.6 (between
+        // 0.3 and 0.7), which crosses the 0.5 threshold; col 1 sees ~0.4, which doesn't.
+        #expect(!result[0 * 4 + 1])
         #expect(result[0 * 4 + 2])
-        #expect(result[1 * 4 + 3])
-        // bot-left 2×2 block → source (1,0)=0.8 → true
-        #expect(result[2 * 4 + 0])
-        #expect(result[3 * 4 + 1])
-        // bot-right 2×2 block → source (1,1)=0.1 → false
-        #expect(!result[2 * 4 + 2])
-        #expect(!result[3 * 4 + 3])
+    }
+
+    @Test("Bilinear upsample (Float): 2×2 → 4×4 produces smooth interpolated values")
+    func bilinearUpsampleFloatGradient() {
+        // source (row-major):
+        //   0.0 1.0
+        //   0.0 1.0
+        // → expect a horizontal ramp at every destination row.
+        let source: [Float] = [0.0, 1.0, 0.0, 1.0]
+        let result = SegmentationPostprocessor.bilinearUpsampleToFloat(
+            source: source, sourceHeight: 2, sourceWidth: 2, destinationHeight: 4, destinationWidth: 4
+        )
+
+        #expect(result.count == 16)
+        // Row 0 should be the same horizontal ramp as row 3 (no vertical gradient in source).
+        for row in 0..<4 {
+            let r0 = result[row * 4 + 0]
+            let r1 = result[row * 4 + 1]
+            let r2 = result[row * 4 + 2]
+            let r3 = result[row * 4 + 3]
+            // Strictly increasing across columns proves bilinear interpolation rather than
+            // staircase repetition.
+            #expect(r0 < r1)
+            #expect(r1 < r2)
+            #expect(r2 < r3)
+            // Source corners (clamped) hit destination corners.
+            #expect(abs(r0 - 0.0) < 1e-6)
+            #expect(abs(r3 - 1.0) < 1e-6)
+        }
     }
 
     // MARK: - SegmentationVisualization
