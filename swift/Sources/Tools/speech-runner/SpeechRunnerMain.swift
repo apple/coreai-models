@@ -88,7 +88,8 @@ private func printResults(tokens: [Int32], stepTimesMs: [Double]) async {
     let tokenizerURL = snapshot.map { cacheBase.appending(path: $0) }
 
     if let url = tokenizerURL,
-       let tokenizer = try? await AutoTokenizer.from(modelFolder: url) {
+        let tokenizer = try? await AutoTokenizer.from(modelFolder: url)
+    {
         let ids = tokens.filter { $0 < 50257 }.map { Int($0) }
         print("  \(tokenizer.decode(tokens: ids))")
     } else {
@@ -105,14 +106,14 @@ func runSplit(bundleDir: String, audioPath: String?) async throws {
     let decModel = try await AIModel(contentsOf: URL(fileURLWithPath: "\(bundleDir)/decoder.aimodel"))
 
     guard let encFn = try encModel.loadFunction(named: "main"),
-          let decFn = try decModel.loadFunction(named: "main")
+        let decFn = try decModel.loadFunction(named: "main")
     else { fatalError("No 'main' function") }
 
     let encDesc = encModel.functionDescriptor(for: "main")!
     let decDesc = decModel.functionDescriptor(for: "main")!
 
-    guard case .ndArray(let melNDDesc)    = encDesc.inputDescriptor(of: "input_features"),
-          case .ndArray(let encOutNDDesc) = encDesc.outputDescriptor(of: "encoder_hidden_states")
+    guard case .ndArray(let melNDDesc) = encDesc.inputDescriptor(of: "input_features"),
+        case .ndArray(let encOutNDDesc) = encDesc.outputDescriptor(of: "encoder_hidden_states")
     else { fatalError("Unexpected encoder descriptors") }
 
     let encOutShape = encOutNDDesc.shape
@@ -131,31 +132,33 @@ func runSplit(bundleDir: String, audioPath: String?) async throws {
     do {
         var out = InferenceFunction.MutableViews()
         out.insert(&encOutArray, for: "encoder_hidden_states")
-        _ = try await encFn.run(inputs: ["input_features": melArray],
-                                states: InferenceFunction.MutableViews(), outputViews: consume out)
+        _ = try await encFn.run(
+            inputs: ["input_features": melArray],
+            states: InferenceFunction.MutableViews(), outputViews: consume out)
     }
     print("\n── Encoder ────────────────────────────────────────────────────────────")
     let encT0 = Date()
     do {
         var out = InferenceFunction.MutableViews()
         out.insert(&encOutArray, for: "encoder_hidden_states")
-        _ = try await encFn.run(inputs: ["input_features": melArray],
-                                states: InferenceFunction.MutableViews(), outputViews: consume out)
+        _ = try await encFn.run(
+            inputs: ["input_features": melArray],
+            states: InferenceFunction.MutableViews(), outputViews: consume out)
     }
     print(String(format: "  latency: %.1f ms", Date().timeIntervalSince(encT0) * 1000))
 
     guard case .ndArray(let inputIdsNDDesc) = decDesc.inputDescriptor(of: "input_ids"),
-          case .ndArray(let posIdsNDDesc)   = decDesc.inputDescriptor(of: "position_ids"),
-          case .ndArray(let encHSNDDesc)    = decDesc.inputDescriptor(of: "encoder_hidden_states"),
-          case .ndArray(let keyCacheNDDesc) = decDesc.stateDescriptor(of: "keyCache"),
-          case .ndArray(let valCacheNDDesc) = decDesc.stateDescriptor(of: "valueCache"),
-          case .ndArray(let logitsNDDesc)   = decDesc.outputDescriptor(of: "logits")
+        case .ndArray(let posIdsNDDesc) = decDesc.inputDescriptor(of: "position_ids"),
+        case .ndArray(let encHSNDDesc) = decDesc.inputDescriptor(of: "encoder_hidden_states"),
+        case .ndArray(let keyCacheNDDesc) = decDesc.stateDescriptor(of: "keyCache"),
+        case .ndArray(let valCacheNDDesc) = decDesc.stateDescriptor(of: "valueCache"),
+        case .ndArray(let logitsNDDesc) = decDesc.outputDescriptor(of: "logits")
     else { fatalError("Unexpected decoder descriptors") }
 
     let vocabSize = logitsNDDesc.shape.last!
     let kcShape = keyCacheNDDesc.shape.map { $0 < 0 ? maxTargetPositions : $0 }
     let vcShape = valCacheNDDesc.shape.map { $0 < 0 ? maxTargetPositions : $0 }
-    var keyCache   = NDArray(descriptor: keyCacheNDDesc.resolvingDynamicDimensions(kcShape))
+    var keyCache = NDArray(descriptor: keyCacheNDDesc.resolvingDynamicDimensions(kcShape))
     var valueCache = NDArray(descriptor: valCacheNDDesc.resolvingDynamicDimensions(vcShape))
 
     let encFlat = readNDArray(encOutArray, as: Float.self, count: encOutShape.reduce(1, *))
@@ -173,8 +176,10 @@ func runSplit(bundleDir: String, audioPath: String?) async throws {
         fillNDArray(&ids, as: Int32.self, with: [tok])
         fillNDArray(&posIds, as: Int32.self, count: pos + 1) { Int32($0) }
         var st = InferenceFunction.MutableViews()
-        st.insert(&keyCache, for: "keyCache"); st.insert(&valueCache, for: "valueCache")
-        var out = InferenceFunction.MutableViews(); out.insert(&logitsArray, for: "logits")
+        st.insert(&keyCache, for: "keyCache")
+        st.insert(&valueCache, for: "valueCache")
+        var out = InferenceFunction.MutableViews()
+        out.insert(&logitsArray, for: "logits")
         _ = try await decFn.run(
             inputs: ["input_ids": ids, "position_ids": posIds, "encoder_hidden_states": encHSArray],
             states: consume st, outputViews: consume out)
@@ -188,8 +193,10 @@ func runSplit(bundleDir: String, audioPath: String?) async throws {
         fillNDArray(&ids, as: Int32.self, with: [tokens.last!])
         fillNDArray(&posIds, as: Int32.self, count: pos + 1) { Int32($0) }
         var st = InferenceFunction.MutableViews()
-        st.insert(&keyCache, for: "keyCache"); st.insert(&valueCache, for: "valueCache")
-        var out = InferenceFunction.MutableViews(); out.insert(&logitsArray, for: "logits")
+        st.insert(&keyCache, for: "keyCache")
+        st.insert(&valueCache, for: "valueCache")
+        var out = InferenceFunction.MutableViews()
+        out.insert(&logitsArray, for: "logits")
         let t0 = Date()
         _ = try await decFn.run(
             inputs: ["input_ids": ids, "position_ids": posIds, "encoder_hidden_states": encHSArray],
@@ -197,7 +204,8 @@ func runSplit(bundleDir: String, audioPath: String?) async throws {
         stepTimesMs.append(Date().timeIntervalSince(t0) * 1000)
         let logits = flattenAsFloat(logitsArray)
         let next = Int32(logits.indices.max(by: { logits[$0] < logits[$1] })!)
-        tokens.append(next); pos += 1
+        tokens.append(next)
+        pos += 1
         if next == eotToken { break }
     }
 
@@ -213,9 +221,9 @@ func runLegacy(modelPath: String, audioPath: String?) async throws {
     guard let fn = try model.loadFunction(named: "main") else { fatalError("No 'main' function") }
     let desc = model.functionDescriptor(for: "main")!
 
-    guard case .ndArray(let melNDDesc)  = desc.inputDescriptor(of: "input_features"),
-          case .ndArray(let idsNDDesc)  = desc.inputDescriptor(of: "decoder_input_ids"),
-          case .ndArray(let logitsDesc) = desc.outputDescriptor(of: "logits")
+    guard case .ndArray(let melNDDesc) = desc.inputDescriptor(of: "input_features"),
+        case .ndArray(let idsNDDesc) = desc.inputDescriptor(of: "decoder_input_ids"),
+        case .ndArray(let logitsDesc) = desc.outputDescriptor(of: "logits")
     else { fatalError("Unexpected model descriptors") }
 
     let vocabSize = logitsDesc.shape.last!
@@ -245,7 +253,8 @@ func runLegacy(modelPath: String, audioPath: String?) async throws {
         var ids = NDArray(descriptor: idsNDDesc.resolvingDynamicDimensions([1, seqLen]))
         fillNDArray(&ids, as: Int32.self, with: inputTokens)
         var logitsArray = NDArray(descriptor: logitsDesc.resolvingDynamicDimensions([1, seqLen, vocabSize]))
-        var out = InferenceFunction.MutableViews(); out.insert(&logitsArray, for: "logits")
+        var out = InferenceFunction.MutableViews()
+        out.insert(&logitsArray, for: "logits")
         let t0 = Date()
         _ = try await fn.run(
             inputs: ["input_features": melArray, "decoder_input_ids": ids],
@@ -253,7 +262,7 @@ func runLegacy(modelPath: String, audioPath: String?) async throws {
         stepTimesMs.append(Date().timeIntervalSince(t0) * 1000)
         let logits = flattenAsFloat(logitsArray)
         let lastStart = (seqLen - 1) * vocabSize
-        let lastLogits = Array(logits[lastStart ..< lastStart + vocabSize])
+        let lastLogits = Array(logits[lastStart..<lastStart + vocabSize])
         let next = Int32(lastLogits.indices.max(by: { lastLogits[$0] < lastLogits[$1] })!)
         tokens.append(next)
         if next == eotToken { break }
