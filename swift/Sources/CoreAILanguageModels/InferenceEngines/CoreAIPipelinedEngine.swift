@@ -186,12 +186,17 @@ final class CoreAIPipelinedEngine: InferenceEngine, Sendable {
     }
 
     func reset() {
-        drain()
+        // Cancel active generation BEFORE draining — otherwise drain() waits
+        // forever for a producer that will never release the engine.
         _activeToken.withLock {
             $0?.cancel()
             $0 = nil
         }
-        _generationTask.withLock { $0 = nil }
+        _generationTask.withLock {
+            $0?.cancel()
+            $0 = nil
+        }
+        drain()
         guard tryAcquireEngine() else { return }
         defer { releaseEngine() }
         engine.reset()
