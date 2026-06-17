@@ -13,6 +13,10 @@ private enum GraphNames {
     static let main = "main"
     static let loadEmbeddings = "load_embeddings"
     static let extendPrefix = "extend"
+    // Multi-function segmenter (re-authored ANE-targeted SAM3 export).
+    static let imageEncode = "image_encode"
+    static let textEncode = "text_encode"
+    static let detect = "detect"
 }
 
 /// Represents the detected structure of a Core AI model.
@@ -20,6 +24,8 @@ private enum GraphNames {
 /// Model structure determines which inference engine variant should be used:
 /// - `chunkedStatic`: Uses static-shape `StaticShapeEngine`
 /// - `dynamic`: Uses `CoreAISequentialEngine` or `CoreAIPipelinedEngine`
+/// - `multiFunctionSegmenter`: Uses `CoreAISegmentationEngine` against an asset
+///   with `image_encode` / `text_encode` / `detect` graphs (e.g. optimized SAM3).
 public enum ModelStructure: Equatable, Sendable, CustomStringConvertible {
     /// Chunked static model with fixed batch size for static-shape execution.
     /// Identified by presence of `extend_*` and `load_embeddings` functions.
@@ -28,12 +34,18 @@ public enum ModelStructure: Equatable, Sendable, CustomStringConvertible {
     /// Dynamic model with single `main` function for GPU/CPU inference.
     case dynamic
 
+    /// Three-function segmenter targeting Apple Neural Engine.
+    /// Identified by presence of `image_encode`, `text_encode`, and `detect` graphs.
+    case multiFunctionSegmenter
+
     public var description: String {
         switch self {
         case .chunkedStatic(let batchSize):
             return "chunkedStatic(batchSize: \(batchSize))"
         case .dynamic:
             return "dynamic"
+        case .multiFunctionSegmenter:
+            return "multiFunctionSegmenter"
         }
     }
 
@@ -41,9 +53,10 @@ public enum ModelStructure: Equatable, Sendable, CustomStringConvertible {
     ///
     /// - `chunkedStatic` → NeuralEngine
     /// - `dynamic` → GPU
+    /// - `multiFunctionSegmenter` → NeuralEngine
     public var preferredDevice: String {
         switch self {
-        case .chunkedStatic:
+        case .chunkedStatic, .multiFunctionSegmenter:
             return "NeuralEngine"
         case .dynamic:
             return "GPU"
@@ -54,9 +67,10 @@ public enum ModelStructure: Equatable, Sendable, CustomStringConvertible {
     ///
     /// - `chunkedStatic` → prefer `.neuralEngine`
     /// - `dynamic` → prefer `.gpu` + `expectFrequentReshapes`
+    /// - `multiFunctionSegmenter` → prefer `.neuralEngine`
     public var specializationOptions: SpecializationOptions {
         switch self {
-        case .chunkedStatic:
+        case .chunkedStatic, .multiFunctionSegmenter:
             return SpecializationOptions(preferredComputeUnitKind: .neuralEngine)
         case .dynamic:
             var opts = SpecializationOptions(preferredComputeUnitKind: .gpu)
@@ -181,6 +195,16 @@ public struct PreparedModel: Sendable {
         if !extendFunctions.isEmpty && graphSet.contains(GraphNames.loadEmbeddings) {
             let batchSize = extractBatchSize(from: extendFunctions.first!) ?? 1
             return .chunkedStatic(batchSize: batchSize)
+        }
+
+        // Multi-function segmenter (e.g. optimized SAM3 — image_encode / text_encode / detect).
+        // Targets ANE; checked before the `main` fallback because some asset variants ship
+        // a thin `main` graph alongside the trio.
+        if graphSet.contains(GraphNames.imageEncode)
+            && graphSet.contains(GraphNames.textEncode)
+            && graphSet.contains(GraphNames.detect)
+        {
+            return .multiFunctionSegmenter
         }
 
         // GPU model (dynamic)

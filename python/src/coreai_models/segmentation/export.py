@@ -132,15 +132,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--n-bits",
         type=int,
-        default=4,
+        default=None,
         choices=[2, 3, 4, 6, 8],
-        help="(optimized) K-means palettization bit-width for image/text encoders.",
+        help=(
+            "(optimized) Uniform K-means palettization bit-width override applied "
+            "to BOTH image and text encoders. Default is asymmetric: image w4, text w6."
+        ),
     )
     parser.add_argument(
         "--group-size",
         type=int,
-        default=16,
-        help="(optimized) Per-grouped-channel palettization group size.",
+        default=None,
+        help=(
+            "(optimized) Uniform palettization group-size override applied to BOTH "
+            "image and text encoders. Default is asymmetric: image gs32, text gs8."
+        ),
     )
     # ---- Baseline-only flags --------------------------------------------
     parser.add_argument(
@@ -233,12 +239,26 @@ def main() -> None:
             return
         bundle_path = export_baseline(config)
     else:
+        # Resolve asymmetric defaults from SegmentationExportConfig; --n-bits / --group-size
+        # are uniform overrides that apply to BOTH encoders when set.
+        defaults = SegmentationExportConfig()
+        image_n_bits = args.n_bits if args.n_bits is not None else defaults.image_n_bits
+        text_n_bits = args.n_bits if args.n_bits is not None else defaults.text_n_bits
+        image_group_size = (
+            args.group_size if args.group_size is not None else defaults.image_group_size
+        )
+        text_group_size = (
+            args.group_size if args.group_size is not None else defaults.text_group_size
+        )
+
         config = SegmentationExportConfig(
             hf_model_id=hf_model_id,
             image_size=image_size,
             max_text_seq_len=args.max_text_seq_len,
-            n_bits=args.n_bits,
-            group_size=args.group_size,
+            image_n_bits=image_n_bits,
+            image_group_size=image_group_size,
+            text_n_bits=text_n_bits,
+            text_group_size=text_group_size,
             output_dir=args.output_dir or _default_output_dir(),
             output_name=args.output_name,
             overwrite=args.overwrite,
@@ -248,8 +268,10 @@ def main() -> None:
             print(f"  model:             {config.hf_model_id}")
             print(f"  image_size:        {config.image_size}")
             print(f"  max_text_seq_len:  {config.max_text_seq_len}")
-            print(f"  n_bits:            {config.n_bits}")
-            print(f"  group_size:        {config.group_size}")
+            print(f"  image_n_bits:      {config.image_n_bits}")
+            print(f"  image_group_size:  {config.image_group_size}")
+            print(f"  text_n_bits:       {config.text_n_bits}")
+            print(f"  text_group_size:   {config.text_group_size}")
             print(f"  output_dir:        {config.output_dir}")
             if config.output_name:
                 print(f"  output_name:       {config.output_name}")

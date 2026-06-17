@@ -6,9 +6,11 @@ This export targets the **Apple Neural Engine** by re-authoring the model in a B
 
 | Function       | Compression                              | Inputs                          | Outputs                                                    |
 |----------------|------------------------------------------|---------------------------------|------------------------------------------------------------|
-| `image_encode` | 4-bit k-means palettization + fp16       | `pixel_values`                  | `backbone_features`                                        |
-| `text_encode`  | 4-bit k-means palettization + fp16       | `input_ids`, `attention_mask`   | `text_features`                                            |
+| `image_encode` | 4-bit k-means palettization (gs=32) + fp16 | `pixel_values`                  | `backbone_features`                                        |
+| `text_encode`  | 6-bit k-means palettization (gs=8) + fp16  | `input_ids`, `attention_mask`   | `text_features`                                            |
 | `detect`       | fp16 (no weight compression)             | `backbone_features`, `text_features` | `pred_masks`, `pred_boxes`, `pred_logits`, `presence_logits` |
+
+The asymmetric palettization recipe (more aggressive on the larger image encoder, gentler on the smaller text encoder) and the deliberate omission of `enable_per_channel_scale` are both ANE-compatibility constraints — see "ANE compatibility" below.
 
 ## Setup
 
@@ -48,13 +50,17 @@ uv run models/sam3/export.py --help
 | `--output-name`        | Custom bundle directory name                   | derived                |
 | `--image-size`         | Input resolution (336 optimized / 1008 baseline) | `336` / `1008`       |
 | `--max-text-seq-len`   | (optimized) Static text sequence length        | `32`                   |
-| `--n-bits`             | (optimized) K-means palettization bit-width    | `4`                    |
-| `--group-size`         | (optimized) Per-grouped-channel group size     | `16`                   |
+| `--n-bits`             | (optimized) Uniform palettization bit-width override applied to BOTH encoders | asymmetric: image w4, text w6 |
+| `--group-size`         | (optimized) Uniform palettization group-size override applied to BOTH encoders | asymmetric: image gs32, text gs8 |
 | `--dtype`              | (`--baseline`) Torch dtype: `float16` or `float32` | `float32`           |
 | `--overwrite`          | Overwrite existing bundle                      | —                      |
 | `--dry-run`            | Print resolved config and exit                 | —                      |
 
 `image-size=336` keeps the global-attention sequence small enough to fit Neural Engine SRAM; it is the resolution we recommend for ANE deployment.
+
+### ANE compatibility
+
+The optimized export deliberately leaves `enable_per_channel_scale=False` (the coreai-opt default). The WWDC demo notebook used `enable_per_channel_scale=True` because per-channel scale produces visually nicer outputs in PyTorch — but in MPS lowering it becomes `mps.dequantize_lut` ops with rank-6 LUT tensors (`[num_groups, 1, 1, 1, num_palettes, 1]`). ANE hardware caps tensors at rank 5; with hundreds of such ops in image_encode + text_encode the ANE compiler errors out (`Too many fvmlibs (more than 255)`) and the runtime silently falls back to GPU. The fall-back is *slower than the baseline export* because palettized weights pay the dequantization cost without the LUT-cache speedup ANE provides. Keeping per-channel scale off keeps the asset compilable on ANE for the price of a small PyTorch-side quality regression.
 
 ### Baseline export (parity reference)
 

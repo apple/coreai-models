@@ -146,6 +146,13 @@ public struct EngineFactory: Sendable {
             return .staticShape
         case .dynamic:
             return .pipelined
+        case .multiFunctionSegmenter:
+            // EngineFactory drives LLM engines only; a segmenter asset shouldn't reach
+            // it. Surface the misuse loudly rather than silently returning a default.
+            preconditionFailure(
+                "EngineFactory cannot run a multi-function segmenter asset. "
+                    + "Use CoreAISegmentationEngine instead."
+            )
         }
     }
 
@@ -161,6 +168,8 @@ public struct EngineFactory: Sendable {
             return (false, "Core AI pipelined variant requires dynamic model")
         case (.sequential, .chunkedStatic):
             return (false, "Sequential variant requires dynamic model")
+        case (_, .multiFunctionSegmenter):
+            return (false, "LLM engine variants are incompatible with multi-function segmenter assets")
         default:
             return (true, nil)
         }

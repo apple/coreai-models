@@ -127,13 +127,24 @@ class DetectorModule(nn.Module):
 
 @dataclass
 class SegmentationExportConfig:
-    """Configuration for a segmentation model export."""
+    """Configuration for a segmentation model export.
+
+    The palettization defaults are asymmetric — image_encode is more
+    aggressive (w4 / gs32) while text_encode trades a bit of size for
+    quality (w6 / gs8). Both encoders deliberately disable per-channel
+    scale: ``enable_per_channel_scale=True`` lowers to ``mps.dequantize_lut``
+    ops with rank-6 LUTs, which ANE rejects (max tensor rank 5), forcing
+    the runtime to fall back to GPU. Keeping it off keeps the asset
+    ANE-compatible at the cost of a small PyTorch-side quality regression.
+    """
 
     hf_model_id: str = "facebook/sam3"
     image_size: int = 336
     max_text_seq_len: int = 32
-    n_bits: int = 4
-    group_size: int = 16
+    image_n_bits: int = 4
+    image_group_size: int = 32
+    text_n_bits: int = 6
+    text_group_size: int = 8
     output_dir: str = "exports"
     output_name: str | None = None
     overwrite: bool = False
@@ -143,7 +154,7 @@ def _bundle_name(config: SegmentationExportConfig) -> str:
     if config.output_name is not None:
         return config.output_name
     safe = Path(config.hf_model_id).name.lower()
-    return f"{safe}_reauthored_{config.image_size}_w{config.n_bits}_static"
+    return f"{safe}_reauthored_{config.image_size}_w{config.image_n_bits}_static"
 
 
 # ---------------------------------------------------------------------------
@@ -162,7 +173,6 @@ def export_segmentation(config: SegmentationExportConfig) -> str:
 async def _async_export_segmentation(config: SegmentationExportConfig) -> str:
     # Imports kept inline so `--list-presets` / `--help` don't pay the cost.
     import coreai_torch
-    import transformers
     from coreai_opt import ExportBackend
     from coreai_opt.casting import cast_to_16_bit_precision
     from coreai_opt.palettization import (
@@ -189,14 +199,20 @@ async def _async_export_segmentation(config: SegmentationExportConfig) -> str:
     )
     sam3_reauth.eval()
 
-    pal_spec = PalettizationSpec(
-        n_bits=config.n_bits,
-        granularity=PerGroupedChannelGranularity(axis=0, group_size=config.group_size),
-        enable_per_channel_scale=True,
-    )
-    pal_config = KMeansPalettizerConfig(
-        global_config=ModuleKMeansPalettizerConfig(op_state_spec={"weight": pal_spec}),
-    )
+    # Asymmetric palettization recipe: image_encode w4/gs32, text_encode w6/gs8.
+    # `enable_per_channel_scale` is left at the default `False` — see
+    # `SegmentationExportConfig`'s docstring for the ANE-rank-6 reasoning.
+    def _make_pal_config(n_bits: int, group_size: int) -> KMeansPalettizerConfig:
+        spec = PalettizationSpec(
+            n_bits=n_bits,
+            granularity=PerGroupedChannelGranularity(axis=0, group_size=group_size),
+        )
+        return KMeansPalettizerConfig(
+            global_config=ModuleKMeansPalettizerConfig(op_state_spec={"weight": spec}),
+        )
+
+    img_pal_config = _make_pal_config(config.image_n_bits, config.image_group_size)
+    txt_pal_config = _make_pal_config(config.text_n_bits, config.text_group_size)
 
     pixel_ref = torch.randn(1, 3, image_size, image_size)
     ids_ref = torch.randint(0, 49408, (1, config.max_text_seq_len), dtype=torch.int32)
@@ -205,18 +221,24 @@ async def _async_export_segmentation(config: SegmentationExportConfig) -> str:
     text_feat_ref = torch.randn(1, 256, 1, config.max_text_seq_len)
 
     logger.info(
-        "Palettizing image encoder (%d-bit, group_size=%d)...", config.n_bits, config.group_size
+        "Palettizing image encoder (%d-bit, group_size=%d)...",
+        config.image_n_bits,
+        config.image_group_size,
     )
     img_enc = ImageEncoderModule(sam3_reauth.image_encoder)
     img_enc.eval()
-    img_palettizer = KMeansPalettizer(img_enc, pal_config)
+    img_palettizer = KMeansPalettizer(img_enc, img_pal_config)
     img_enc = img_palettizer.prepare(example_inputs=(pixel_ref,))
     img_enc = img_palettizer.finalize(backend=ExportBackend.CoreAI)
 
-    logger.info("Palettizing text encoder...")
+    logger.info(
+        "Palettizing text encoder (%d-bit, group_size=%d)...",
+        config.text_n_bits,
+        config.text_group_size,
+    )
     txt_enc = TextEncoderModule(sam3_reauth.text_encoder, sam3_reauth.text_projection)
     txt_enc.eval()
-    txt_palettizer = KMeansPalettizer(txt_enc, pal_config)
+    txt_palettizer = KMeansPalettizer(txt_enc, txt_pal_config)
     txt_enc = txt_palettizer.prepare(example_inputs=(ids_ref, mask_ref))
     txt_enc = txt_palettizer.finalize(backend=ExportBackend.CoreAI)
 
@@ -265,8 +287,10 @@ async def _async_export_segmentation(config: SegmentationExportConfig) -> str:
     coreai_program.save_asset(asset_path, metadata)
     logger.info("Saved Core AI asset to %s", asset_path)
 
-    _write_tokenizer(bundle_dir / "tokenizer", config.hf_model_id, transformers)
+    # Write the bundle's metadata.json before fetching the tokenizer, so a tokenizer-fetch
+    # failure (e.g. flaky HF network) doesn't leave the bundle unloadable by ImageSegmenter.
     _write_bundle_metadata(bundle_dir, asset_path.name)
+    _write_tokenizer(bundle_dir / "tokenizer", config.hf_model_id)
     return str(bundle_dir)
 
 
@@ -290,9 +314,11 @@ def _prepare_bundle_dir(bundle_dir: Path, overwrite: bool) -> None:
     bundle_dir.mkdir(parents=True, exist_ok=True)
 
 
-def _write_tokenizer(dest: Path, hf_model_id: str, transformers_module) -> None:
+def _write_tokenizer(dest: Path, hf_model_id: str) -> None:
+    import transformers
+
     logger.info("Saving tokenizer from %s to %s", hf_model_id, dest)
-    tokenizer = transformers_module.AutoTokenizer.from_pretrained(hf_model_id)
+    tokenizer = transformers.AutoTokenizer.from_pretrained(hf_model_id)
     tokenizer.save_pretrained(str(dest))
 
 
@@ -432,6 +458,8 @@ async def _async_export_baseline(config: BaselineExportConfig) -> str:
     coreai_program.save_asset(asset_path, metadata)
     logger.info("Saved Core AI asset to %s", asset_path)
 
-    _write_tokenizer(bundle_dir / "tokenizer", config.hf_model_id, transformers)
+    # Write the bundle's metadata.json before fetching the tokenizer, so a tokenizer-fetch
+    # failure (e.g. flaky HF network) doesn't leave the bundle unloadable by ImageSegmenter.
     _write_bundle_metadata(bundle_dir, asset_path.name)
+    _write_tokenizer(bundle_dir / "tokenizer", config.hf_model_id)
     return str(bundle_dir)

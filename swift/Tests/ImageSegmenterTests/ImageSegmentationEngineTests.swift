@@ -27,6 +27,56 @@ struct CoreAISegmentationEngineTests {
         #expect(CoreAISegmentationEngine.findTextInputName(in: ["pixel_values", "embed_input"]) == nil)
     }
 
+    @Test("findTextInputName: ignores attention_mask and text_features (multi-function siblings)")
+    func findTextInputNameSkipsMaskAndFeatures() {
+        // attention_mask sits next to input_ids in `text_encode`'s input list — must not be picked
+        // as the text input.
+        #expect(
+            CoreAISegmentationEngine.findTextInputName(in: ["input_ids", "attention_mask"]) == "input_ids"
+        )
+        // text_features is a `detect` input, not a text input — must not be picked.
+        #expect(
+            CoreAISegmentationEngine.findTextInputName(in: ["backbone_features", "text_features"]) == nil
+        )
+    }
+
+    @Test("findAttentionMaskInputName: matches attention_mask and attn_mask")
+    func findAttentionMaskInputName() {
+        #expect(
+            CoreAISegmentationEngine.findAttentionMaskInputName(in: ["input_ids", "attention_mask"])
+                == "attention_mask"
+        )
+        #expect(
+            CoreAISegmentationEngine.findAttentionMaskInputName(in: ["input_ids", "attn_mask"])
+                == "attn_mask"
+        )
+        #expect(CoreAISegmentationEngine.findAttentionMaskInputName(in: ["input_ids"]) == nil)
+    }
+
+    @Test("findBackboneFeaturesName: matches outputs/inputs containing 'backbone'")
+    func findBackboneFeaturesName() {
+        #expect(
+            CoreAISegmentationEngine.findBackboneFeaturesName(in: ["backbone_features"])
+                == "backbone_features"
+        )
+        #expect(
+            CoreAISegmentationEngine.findBackboneFeaturesName(in: ["text_features", "backbone_features"])
+                == "backbone_features"
+        )
+        #expect(CoreAISegmentationEngine.findBackboneFeaturesName(in: ["pred_masks"]) == nil)
+    }
+
+    @Test("findTextFeaturesName: matches 'text_features' / 'text_feat' but not unrelated 'text' inputs")
+    func findTextFeaturesName() {
+        #expect(
+            CoreAISegmentationEngine.findTextFeaturesName(in: ["backbone_features", "text_features"])
+                == "text_features"
+        )
+        #expect(CoreAISegmentationEngine.findTextFeaturesName(in: ["text_feat"]) == "text_feat")
+        // 'text_tokens' is the text input, not the text-features intermediate — must not match.
+        #expect(CoreAISegmentationEngine.findTextFeaturesName(in: ["text_tokens", "input_ids"]) == nil)
+    }
+
     @Test("findPointsInputName: matches 'point' but excludes 'point_label'")
     func findPointsInputName() {
         let inputs = ["batched_images", "batched_points", "batched_point_labels"]
