@@ -17,7 +17,7 @@ import Tokenizers
 ///
 /// ## Engine Selection
 /// The engine type is determined by `EngineFactory` based on model structure:
-/// - **Pipelined**: GPU-accelerated with double buffering (fastest for GPU models)
+/// - **Pipelined**: GPU-accelerated with pipeline-depth-matched buffering (fastest for GPU models)
 /// - **Sequential**: CPU-based synchronous execution (fallback)
 /// - **Static-shape**: Neural Engine optimized for chunked static models
 ///
