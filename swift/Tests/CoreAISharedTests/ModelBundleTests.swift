@@ -78,4 +78,40 @@ struct ModelBundleTests {
             _ = try ModelBundle(at: dir)
         }
     }
+
+    @Test("Pointing at a .aimodelc asset throws pointedAtModelAsset, not a parse error")
+    func pointedAtCompiledAssetThrows() throws {
+        // A compiled `.aimodelc` is a directory with its own unrelated
+        // metadata.json. Pointing the tool at it must fail fast with guidance,
+        // not parse that inner metadata as a bogus 0.1 bundle.
+        let bundleDir = FileManager.default.temporaryDirectory.appending(
+            path: "ModelBundleTests-\(UUID().uuidString)"
+        )
+        let asset = bundleDir.appending(path: "model.aimodelc")
+        try FileManager.default.createDirectory(at: asset, withIntermediateDirectories: true)
+        try """
+        { "producer": "coreai-build", "assetVersion": "2.0" }
+        """.write(
+            to: asset.appending(path: "metadata.json"), atomically: true, encoding: .utf8)
+
+        let error = #expect(throws: ModelBundle.BundleError.self) {
+            _ = try ModelBundle(at: asset)
+        }
+        guard case .pointedAtModelAsset = error else {
+            Issue.record("expected pointedAtModelAsset, got \(String(describing: error))")
+            return
+        }
+        #expect(String(describing: error).contains("model.aimodelc"))
+    }
+
+    @Test("Pointing at a .aimodel asset throws pointedAtModelAsset")
+    func pointedAtUncompiledAssetThrows() throws {
+        let error = #expect(throws: ModelBundle.BundleError.self) {
+            _ = try ModelBundle(from: "/some/where/model.aimodel")
+        }
+        guard case .pointedAtModelAsset = error else {
+            Issue.record("expected pointedAtModelAsset, got \(String(describing: error))")
+            return
+        }
+    }
 }
