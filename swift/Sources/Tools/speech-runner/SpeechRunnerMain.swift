@@ -242,8 +242,10 @@ func runLegacy(modelPath: String, audioPath: String?) async throws {
         var out = InferenceFunction.MutableViews()
         out.insert(&logitsWarmup, for: "logits")
         _ = try await fn.run(
-            inputs: ["input_features": NDArray(descriptor: melNDDesc.resolvingDynamicDimensions([1, 128, 3000])),
-                     "decoder_input_ids": ids],
+            inputs: [
+                "input_features": NDArray(descriptor: melNDDesc.resolvingDynamicDimensions([1, 128, 3000])),
+                "decoder_input_ids": ids,
+            ],
             states: InferenceFunction.MutableViews(), outputViews: consume out)
     }
 
