@@ -16,18 +16,17 @@ import MetalPerformanceShadersGraph
 // ## Design Decisions
 //
 // ### Protocol-Based Architecture
-// Both argmax (greedy) and TopK (probabilistic) samplers conform to the
+// Both argmax (greedy) and composite (probabilistic) samplers conform to the
 // `MPSGraphSampler` protocol, enabling runtime selection based on temperature:
 // - temperature == 0: Argmax sampler (deterministic, fastest)
-// - temperature > 0:  TopK sampler (probabilistic, more creative)
+// - temperature > 0:  Composite sampler (probabilistic with topK/topP/minP)
 //
 // The factory pattern (`MPSGraphSamplerFactory`) selects the appropriate sampler
 // once at generation start, with the sampler cached for the entire generation.
 //
 // ### Fixed Vocab Size at Compile Time
-// Unlike MPSGraphInferenceEngine which uses dynamic shape `[1, -1]` for the
-// vocab dimension, these samplers fix the vocab size at compile time. This
-// enables better MPSGraph optimization and eliminates runtime shape inference.
+// These samplers fix the vocab size at compile time. This enables better
+// MPSGraph optimization and eliminates runtime shape inference.
 //
 // ### Temperature at Init (Immutable)
 // Temperature is baked into the TopK sampler at initialization rather than
@@ -39,25 +38,6 @@ import MetalPerformanceShadersGraph
 // extracting the last token's logits using a blit encoder before sampling.
 // This is critical for efficient prefill where we only need to sample from
 // the final position.
-//
-// ### Comparison with MPSGraphInferenceEngine
-// | Feature              | MPSGraphInferenceEngine | Core AI Samplers        |
-// |---------------------|-------------------------|----------------------|
-// | Sampling types      | Argmax only             | Argmax + TopK        |
-// | Vocab shape         | Dynamic [1, -1]         | Fixed [1, vocabSize] |
-// | Temperature         | N/A (greedy only)       | At init (immutable)  |
-// | Slice handling      | N/A                     | Blit + encode        |
-// | Testing hooks       | None                    | testingOnlyRandomOverride |
-// | Buffer allocation   | Per-call                | Pre-allocated        |
-//
-// ### Why Not Use MPSGraphInferenceEngine's Sampler?
-// 1. Core AI needs TopK sampling with temperature for creative generation
-// 2. Core AI uses ComputeStream's Metal3 queue (withMetal3Queue), not direct
-//    command queue - we need sampler methods that take a queue parameter
-// 3. CoreAI.s pipelined architecture requires completion handlers for yielding
-//    tokens without blocking the main inference loop
-// 4. Fixed vocab size enables better graph optimization for large vocabs
-//    (150K+ for Qwen models)
 
 // MARK: - MPSGraph Sampler Protocol
 
@@ -120,22 +100,47 @@ enum MPSGraphSamplerFactory {
     ///
     /// Selection logic:
     /// - temperature == 0: Returns argmax sampler (greedy, deterministic)
-    /// - temperature > 0: Returns TopK sampler (probabilistic)
+    /// - temperature > 0: Returns composite sampler (topK + topP + minP)
+    static func makeSampler(
+        device: MTLDevice,
+        vocabSize: Int,
+        config: SamplingConfiguration
+    ) throws -> any MPSGraphSampler {
+        if config.temperature == 0 {
+            return try MPSGraphArgmaxSampler(device: device, vocabSize: vocabSize)
+        }
+
+        // Determine effective K for the topK operation:
+        // - If topK is explicitly set, use it
+        // - If only topP or minP is set, use a generous window (1000)
+        // - Default (just temperature): use 40
+        let effectiveK: Int
+        if let k = config.topK {
+            effectiveK = k
+        } else if config.topP != nil || config.minP != nil {
+            effectiveK = min(1000, vocabSize)
+        } else {
+            effectiveK = 40
+        }
+
+        return try MPSGraphCompositeSampler(
+            device: device,
+            vocabSize: vocabSize,
+            k: effectiveK,
+            temperature: Float(config.temperature),
+            topP: config.topP.map { Float($0) } ?? 1.0,
+            minP: config.minP.map { Float($0) } ?? 0.0
+        )
+    }
+
+    /// Legacy convenience for temperature-only creation (used by tests).
     static func makeSampler(
         device: MTLDevice,
         vocabSize: Int,
         temperature: Double
     ) throws -> any MPSGraphSampler {
-        if temperature == 0 {
-            return try MPSGraphArgmaxSampler(device: device, vocabSize: vocabSize)
-        } else {
-            return try MPSGraphTopKSampler(
-                device: device,
-                vocabSize: vocabSize,
-                k: 40,
-                temperature: Float(temperature)
-            )
-        }
+        let config = SamplingConfiguration(temperature: temperature)
+        return try makeSampler(device: device, vocabSize: vocabSize, config: config)
     }
 }
 
@@ -193,7 +198,6 @@ final class MPSGraphArgmaxSampler: @unchecked Sendable {
         self.graph = graph
 
         // Input: logits for a single token position [1, vocabSize] as Float16
-        // Match MPSGraphInferenceEngine pattern: [1, vocabSize] with axis 1 reduction
         let inputPlaceholder = graph.placeholder(
             shape: [1, vocabSize as NSNumber],
             dataType: .float16,
@@ -424,34 +428,24 @@ extension MPSGraphArgmaxSampler: MPSGraphSampler {}
 
 // MARK: - MPSGraph Top-K Sampler
 
-/// MPSGraph-based Top-K sampler with temperature scaling.
+/// MPSGraph-based composite sampler with temperature, TopK, TopP, and MinP.
 ///
 /// This sampler uses Apple's optimized `topK` operation combined with softmax
-/// for probabilistic token sampling. Unlike greedy argmax, this enables:
+/// for probabilistic token sampling. Supports:
 /// - Temperature-controlled randomness
 /// - Top-K filtering for quality/diversity tradeoff
+/// - Top-P (nucleus) filtering for adaptive vocabulary
+/// - Min-P filtering for relative probability thresholding
 ///
 /// ## Sampling Algorithm
-/// 1. Extract Top-K logits and indices
+/// 1. Extract Top-K logits and indices from full vocab
 /// 2. Apply temperature scaling: logits / temperature
 /// 3. Apply softmax to get probabilities
-/// 4. Sample using multinomial (cumsum + random comparison)
-///
-/// ## Usage with Core AI's ComputeStream
-/// ```swift
-/// computeStream.withMetal3Queue { queue in
-///     topKSampler.encode(
-///         to: queue,
-///         logitsBuffer: logitsBuffer,
-///         temperature: 0.7,
-///         outputBuffer: tokenBuffer,
-///         completion: { token in
-///             continuation.yield(token)
-///         }
-///     )
-/// }
-/// ```
-final class MPSGraphTopKSampler: @unchecked Sendable {
+/// 4. Apply MinP filter: keep probs >= minP × max_prob
+/// 5. Apply TopP filter: keep probs where exclusive cumsum < topP
+/// 6. Re-normalize masked probabilities
+/// 7. Sample using multinomial (cumsum + random comparison)
+final class MPSGraphCompositeSampler: @unchecked Sendable {
     private let device: MTLDevice
     private let mpsDevice: MPSGraphDevice
     private let graph: MPSGraph
@@ -460,6 +454,8 @@ final class MPSGraphTopKSampler: @unchecked Sendable {
     private let logitsPlaceholder: MPSGraphTensor
     private let temperaturePlaceholder: MPSGraphTensor
     private let randomPlaceholder: MPSGraphTensor
+    private let topPPlaceholder: MPSGraphTensor
+    private let minPPlaceholder: MPSGraphTensor
     private let outputTensor: MPSGraphTensor
 
     private let executable: MPSGraphExecutable
@@ -473,11 +469,23 @@ final class MPSGraphTopKSampler: @unchecked Sendable {
     /// The temperature this sampler was configured with
     let temperature: Float
 
+    /// The topP value (1.0 = disabled)
+    let topP: Float
+
+    /// The minP value (0.0 = disabled)
+    let minP: Float
+
     /// Pre-allocated buffer for random value
     private let randomBuffer: MTLBuffer
 
     /// Pre-allocated buffer for temperature
     private let temperatureBuffer: MTLBuffer
+
+    /// Pre-allocated buffer for topP value
+    private let topPBuffer: MTLBuffer
+
+    /// Pre-allocated buffer for minP value
+    private let minPBuffer: MTLBuffer
 
     // Pre-allocated objects reused every step to avoid CPU object creation overhead.
     private var cachedLogitsData: MPSGraphTensorData?
@@ -486,36 +494,46 @@ final class MPSGraphTopKSampler: @unchecked Sendable {
     private var cachedOutputBuffer: MTLBuffer?
     private let temperatureData: MPSGraphTensorData
     private let randomData: MPSGraphTensorData
+    private let topPData: MPSGraphTensorData
+    private let minPData: MPSGraphTensorData
     private let execDescriptor: MPSGraphExecutableExecutionDescriptor
 
     /// Testing only: Override random value for deterministic tests.
-    /// When set, this value is used instead of generating a random number.
-    /// Set to nil for production use.
     var testingOnlyRandomOverride: Float?
 
-    /// Initialize the MPSGraph Top-K sampler.
+    /// Initialize the MPSGraph composite sampler.
     /// - Parameters:
     ///   - device: Metal device
     ///   - vocabSize: Vocabulary size (fixed for compilation)
-    ///   - k: Number of top tokens to sample from (default: 40)
-    ///   - temperature: Sampling temperature (default: 1.0)
-    init(device: MTLDevice, vocabSize: Int, k: Int = 40, temperature: Float = 1.0) throws {
+    ///   - k: Number of top tokens to consider
+    ///   - temperature: Sampling temperature
+    ///   - topP: Nucleus sampling threshold (1.0 = disabled)
+    ///   - minP: Minimum probability threshold (0.0 = disabled)
+    init(device: MTLDevice, vocabSize: Int, k: Int = 40, temperature: Float = 1.0, topP: Float = 1.0, minP: Float = 0.0)
+        throws
+    {
         self.device = device
         self.mpsDevice = MPSGraphDevice(mtlDevice: device)
         self.vocabSize = vocabSize
         self.k = k
+        self.temperature = temperature
+        self.topP = topP
+        self.minP = minP
 
         // Pre-allocate buffers
         guard let randomBuffer = device.makeBuffer(length: MemoryLayout<Float>.size, options: .storageModeShared),
-            let temperatureBuffer = device.makeBuffer(length: MemoryLayout<Float>.size, options: .storageModeShared)
+            let temperatureBuffer = device.makeBuffer(length: MemoryLayout<Float>.size, options: .storageModeShared),
+            let topPBuffer = device.makeBuffer(length: MemoryLayout<Float>.size, options: .storageModeShared),
+            let minPBuffer = device.makeBuffer(length: MemoryLayout<Float>.size, options: .storageModeShared)
         else {
             throw MPSGraphSamplerError.bufferAllocationFailed
         }
-        self.temperature = temperature
         self.randomBuffer = randomBuffer
         self.temperatureBuffer = temperatureBuffer
+        self.topPBuffer = topPBuffer
+        self.minPBuffer = minPBuffer
 
-        // Build the Top-K sampling graph
+        // Build the composite sampling graph
         let graph = MPSGraph()
         self.graph = graph
 
@@ -543,45 +561,74 @@ final class MPSGraphTopKSampler: @unchecked Sendable {
         )
         self.randomPlaceholder = randomPlaceholder
 
+        // TopP threshold [1]
+        let topPPlaceholder = graph.placeholder(
+            shape: [1 as NSNumber],
+            dataType: .float32,
+            name: "topP"
+        )
+        self.topPPlaceholder = topPPlaceholder
+
+        // MinP threshold [1]
+        let minPPlaceholder = graph.placeholder(
+            shape: [1 as NSNumber],
+            dataType: .float32,
+            name: "minP"
+        )
+        self.minPPlaceholder = minPPlaceholder
+
         // Cast logits to Float32 for numerical stability
         let logitsFloat32 = graph.cast(logitsPlaceholder, to: .float32, name: "logits_f32")
 
-        // Get Top-K values and indices
-        // topK returns a tuple: (values: [1, k], indices: [1, k])
+        // Step 1: Get Top-K values and indices
         let topKResult = graph.topK(logitsFloat32, k: k, name: "topk")
-        let topKValues = topKResult[0]  // [1, k]
+        let topKValues = topKResult[0]  // [1, k] sorted descending
         let topKIndices = topKResult[1]  // [1, k] as Int32
 
-        // Apply temperature: values / temperature
-        // Broadcast temperature to match shape
+        // Step 2: Apply temperature: values / temperature
         let scaledValues = graph.division(topKValues, temperaturePlaceholder, name: "scaled")
 
-        // Softmax over the K dimension (axis 1)
+        // Step 3: Softmax over the K dimension (axis 1)
         let probabilities = graph.softMax(with: scaledValues, axis: 1, name: "probs")
 
-        // Multinomial sampling via cumulative sum + random comparison
-        // cumsum: [1, k] where each element is sum of probs up to that point
-        let cumsum = graph.cumulativeSum(probabilities, axis: 1, exclusive: false, reverse: false, name: "cumsum")
+        // Step 4: MinP filtering
+        // max_prob is the first element (topK returns sorted descending)
+        let maxProb = graph.sliceTensor(probabilities, dimension: 1, start: 0, length: 1, name: "max_prob")
+        // threshold = minP * max_prob
+        let minPThreshold = graph.multiplication(minPPlaceholder, maxProb, name: "minp_threshold")
+        // mask: probs >= threshold (broadcasts [1,1] to [1,k])
+        let minPMask = graph.greaterThanOrEqualTo(probabilities, minPThreshold, name: "minp_mask")
 
-        // Compare: cumsum >= random (broadcast random across k dimension)
-        // This gives us a boolean mask where True means "this token or later"
-        let randomBroadcast = graph.broadcast(randomPlaceholder, shape: [1, k as NSNumber], name: "random_broadcast")
-        let mask = graph.greaterThanOrEqualTo(cumsum, randomBroadcast, name: "mask")
+        // Step 5: TopP filtering via exclusive cumulative sum
+        // exclusive_cumsum[i] = sum of probs[0..i-1], so position 0 always has value 0
+        let exclusiveCumsum = graph.cumulativeSum(
+            probabilities, axis: 1, exclusive: true, reverse: false, name: "excl_cumsum")
+        // mask: exclusive_cumsum < topP (includes all tokens before cumsum reaches topP)
+        let topPMask = graph.lessThan(exclusiveCumsum, topPPlaceholder, name: "topp_mask")
 
-        // Convert mask to float and use argmax to find first True
-        let maskFloat = graph.cast(mask, to: .float32, name: "mask_float")
-        let selectedIdx = graph.reductionArgMaximum(with: maskFloat, axis: 1, name: "selected_idx")
+        // Step 6: Combined mask = minP AND topP
+        let combinedMask = graph.logicalAND(minPMask, topPMask, name: "combined_mask")
+        let maskFloat = graph.cast(combinedMask, to: .float32, name: "mask_float")
 
-        // Gather the token index from topKIndices using selectedIdx
-        // selectedIdx is [1] with value 0..k-1
-        // We need to index into topKIndices[0, selectedIdx] to get the actual token ID
+        // Step 7: Apply mask and re-normalize
+        let maskedProbs = graph.multiplication(probabilities, maskFloat, name: "masked_probs")
+        let sumMasked = graph.reductionSum(with: maskedProbs, axis: 1, name: "sum_masked")
+        // Avoid division by zero: use max(sum, epsilon)
+        let epsilon = graph.constant(1e-10, dataType: .float32)
+        let safeDenominator = graph.maximum(sumMasked, epsilon, name: "safe_denom")
+        let normalizedProbs = graph.division(maskedProbs, safeDenominator, name: "normalized_probs")
+
+        // Step 8: Multinomial sampling via cumulative sum + random comparison
+        let cumsum = graph.cumulativeSum(normalizedProbs, axis: 1, exclusive: false, reverse: false, name: "cumsum")
+        let selectionMask = graph.greaterThanOrEqualTo(cumsum, randomPlaceholder, name: "selection_mask")
+        let selectionMaskFloat = graph.cast(selectionMask, to: .float32, name: "selection_mask_float")
+        let selectedIdx = graph.reductionArgMaximum(with: selectionMaskFloat, axis: 1, name: "selected_idx")
+
+        // Step 9: Gather the token index from topKIndices
         let selectedIdxInt32 = graph.cast(selectedIdx, to: .int32, name: "selected_idx_i32")
-
-        // Flatten topKIndices to [k] and use gatherElements
         let indicesFlat = graph.reshape(topKIndices, shape: [k as NSNumber], name: "indices_flat")
         let selectedIdxFlat = graph.reshape(selectedIdxInt32, shape: [1 as NSNumber], name: "selected_flat")
 
-        // Gather the actual token ID
         let outputTensor = graph.gatherAlongAxis(
             0,
             updates: indicesFlat,
@@ -595,6 +642,8 @@ final class MPSGraphTopKSampler: @unchecked Sendable {
             logitsPlaceholder: MPSGraphShapedType(shape: [1, vocabSize as NSNumber], dataType: .float16),
             temperaturePlaceholder: MPSGraphShapedType(shape: [1 as NSNumber], dataType: .float32),
             randomPlaceholder: MPSGraphShapedType(shape: [1 as NSNumber], dataType: .float32),
+            topPPlaceholder: MPSGraphShapedType(shape: [1 as NSNumber], dataType: .float32),
+            minPPlaceholder: MPSGraphShapedType(shape: [1 as NSNumber], dataType: .float32),
         ]
 
         let compilationDescriptor = MPSGraphCompilationDescriptor()
@@ -608,7 +657,7 @@ final class MPSGraphTopKSampler: @unchecked Sendable {
             compilationDescriptor: compilationDescriptor
         )
 
-        // Pre-allocate tensor data for temperature and random buffers (never change)
+        // Pre-allocate tensor data for buffers
         self.temperatureData = MPSGraphTensorData(
             temperatureBuffer,
             shape: [1 as NSNumber],
@@ -619,12 +668,20 @@ final class MPSGraphTopKSampler: @unchecked Sendable {
             shape: [1 as NSNumber],
             dataType: .float32
         )
+        self.topPData = MPSGraphTensorData(
+            topPBuffer,
+            shape: [1 as NSNumber],
+            dataType: .float32
+        )
+        self.minPData = MPSGraphTensorData(
+            minPBuffer,
+            shape: [1 as NSNumber],
+            dataType: .float32
+        )
         self.execDescriptor = MPSGraphExecutableExecutionDescriptor()
     }
 
-    /// Encode Top-K sampling asynchronously (protocol conformance).
-    ///
-    /// Uses the temperature configured at init time.
+    /// Encode composite sampling asynchronously (protocol conformance).
     func encode(
         to queue: MTLCommandQueue,
         logitsBuffer: MTLBuffer,
@@ -633,10 +690,11 @@ final class MPSGraphTopKSampler: @unchecked Sendable {
         outputOffset: Int,
         completion: @escaping (Int32) -> Void
     ) {
-        // Write temperature to buffer (use configured temperature)
+        // Write runtime values to buffers
         temperatureBuffer.contents().assumingMemoryBound(to: Float.self).pointee = max(temperature, 0.01)
+        topPBuffer.contents().assumingMemoryBound(to: Float.self).pointee = topP
+        minPBuffer.contents().assumingMemoryBound(to: Float.self).pointee = minP
 
-        // Use override if set (for testing), otherwise generate random value [0, 1)
         let randomValue = testingOnlyRandomOverride ?? Float.random(in: 0..<1)
         randomBuffer.contents().assumingMemoryBound(to: Float.self).pointee = randomValue
 
@@ -667,10 +725,9 @@ final class MPSGraphTopKSampler: @unchecked Sendable {
             cachedOutputBuffer = outputBuffer
         }
 
-        // Reuse pre-allocated execution descriptor, update completion handler
         execDescriptor.completionHandler = { [outputBuffer, outputOffset] (_, error) in
             if let error = error {
-                print("MPSGraph Top-K error: \(error)")
+                print("MPSGraph composite sampler error: \(error)")
                 completion(0)
                 return
             }
@@ -682,18 +739,15 @@ final class MPSGraphTopKSampler: @unchecked Sendable {
             completion(result)
         }
 
-        // Run async — temperatureData and randomData are pre-allocated, buffer contents updated above
         executable.runAsync(
             with: queue,
-            inputs: [logitsData, temperatureData, randomData],
+            inputs: [logitsData, temperatureData, randomData, topPData, minPData],
             results: [outputData],
             executionDescriptor: execDescriptor
         )
     }
 
-    /// Encode Top-K sampling with slice support for prefill scenarios (protocol conformance).
-    ///
-    /// Uses the temperature configured at init time.
+    /// Encode composite sampling with slice support for prefill scenarios.
     func encodeWithSlice(
         to queue: MTLCommandQueue,
         logitsBuffer: MTLBuffer,
@@ -702,7 +756,6 @@ final class MPSGraphTopKSampler: @unchecked Sendable {
         outputOffset: Int,
         completion: @escaping (Int32) -> Void
     ) {
-        // For single-token decode, use direct encoding
         if queryLength == 1 {
             encode(
                 to: queue,
@@ -715,25 +768,19 @@ final class MPSGraphTopKSampler: @unchecked Sendable {
             return
         }
 
-        // For multi-token (prefill), we need to handle the offset
-        // Pattern: Commit blit separately, then use runAsync for sampling
-        // This avoids the issue where encode() to MPSCommandBuffer commits internally
-
         let logitsOffset = (queryLength - 1) * vocabSize * MemoryLayout<UInt16>.size
         let sliceSize = vocabSize * MemoryLayout<UInt16>.size
 
-        // Create a temporary buffer for the single token's logits
         guard let tempBuffer = device.makeBuffer(length: sliceSize, options: .storageModeShared) else {
             completion(0)
             return
         }
 
-        // Step 1: Create and commit blit command buffer separately
         guard let blitCmdBuffer = queue.makeCommandBuffer() else {
             completion(0)
             return
         }
-        blitCmdBuffer.label = "MPSGraph Top-K Blit"
+        blitCmdBuffer.label = "MPSGraph Composite Blit"
 
         guard let blitEncoder = blitCmdBuffer.makeBlitCommandEncoder() else {
             completion(0)
@@ -747,23 +794,22 @@ final class MPSGraphTopKSampler: @unchecked Sendable {
             size: sliceSize
         )
         blitEncoder.endEncoding()
-        blitCmdBuffer.commit()  // Commit blit immediately (GPU will order operations)
+        blitCmdBuffer.commit()
 
-        // Step 2: Use runAsync for sampling (executes after blit due to GPU queue ordering)
-        // Write temperature and random to buffers (use configured temperature)
+        // Write runtime values
         temperatureBuffer.contents().assumingMemoryBound(to: Float.self).pointee = max(self.temperature, 0.01)
+        topPBuffer.contents().assumingMemoryBound(to: Float.self).pointee = topP
+        minPBuffer.contents().assumingMemoryBound(to: Float.self).pointee = minP
         let randomValue = testingOnlyRandomOverride ?? Float.random(in: 0..<1)
         randomBuffer.contents().assumingMemoryBound(to: Float.self).pointee = randomValue
 
-        // Create tensor data (tempBuffer is unique per prefill call, can't cache)
         let logitsData = MPSGraphTensorData(tempBuffer, shape: [1, vocabSize as NSNumber], dataType: .float16)
         let outputData = MPSGraphTensorData(outputBuffer, shape: [1 as NSNumber], dataType: .int32)
 
-        // Use a separate execution descriptor for prefill
         let prefillExecDescriptor = MPSGraphExecutableExecutionDescriptor()
         prefillExecDescriptor.completionHandler = { [outputBuffer, outputOffset] (_, error) in
             if let error = error {
-                print("MPSGraph Top-K error: \(error)")
+                print("MPSGraph composite sampler error: \(error)")
                 completion(0)
                 return
             }
@@ -775,10 +821,9 @@ final class MPSGraphTopKSampler: @unchecked Sendable {
             completion(result)
         }
 
-        // Run async - GPU naturally orders this after the blit due to queue ordering
         executable.runAsync(
             with: queue,
-            inputs: [logitsData, temperatureData, randomData],
+            inputs: [logitsData, temperatureData, randomData, topPData, minPData],
             results: [outputData],
             executionDescriptor: prefillExecDescriptor
         )
@@ -786,7 +831,7 @@ final class MPSGraphTopKSampler: @unchecked Sendable {
 }
 
 // Conformance to MPSGraphSampler protocol
-extension MPSGraphTopKSampler: MPSGraphSampler {}
+extension MPSGraphCompositeSampler: MPSGraphSampler {}
 
 // MARK: - Errors
 

@@ -179,6 +179,104 @@ struct CompositeSamplerTests {
         }
     }
 
+    // MARK: - MinP sampling
+
+    @Test("minP limits the sampled set to tokens with sufficient relative probability")
+    func minPLimitsSampledSet() {
+        let vocab = 100
+        var rng = Xoshiro256StarStar(seed: 0xAAAA_BBBB)
+
+        // Token 99 has logit 10.0, tokens 98-95 have logit ~9.5-8.0
+        // Everything else is -5.0 (very low relative probability)
+        var rawLogits = [Float](repeating: -5.0, count: vocab)
+        rawLogits[99] = 10.0
+        rawLogits[98] = 9.5
+        rawLogits[97] = 9.0
+        rawLogits[96] = 8.5
+        rawLogits[95] = 8.0
+
+        var sampledIndices = Set<Int32>()
+        for _ in 0..<2_000 {
+            var logits = rawLogits
+            let token = CompositeSampler.sample(
+                from: &logits, config: .init(temperature: 1.0, minP: 0.1), using: &rng)
+            sampledIndices.insert(token)
+        }
+
+        // With minP=0.1, only tokens whose probability is >= 10% of the max token's probability
+        // should be sampled. The -5.0 tokens should be far below this threshold.
+        for idx in sampledIndices {
+            #expect(idx >= 95, "minP=0.1 sampled low-probability token \(idx)")
+        }
+    }
+
+    @Test("minP=1.0 keeps only the most probable token (equivalent to greedy)")
+    func minPOneIsGreedy() {
+        let vocab = 50
+        var rng = Xoshiro256StarStar(seed: 0xCCCC_DDDD)
+
+        var rawLogits = [Float](repeating: 0, count: vocab)
+        rawLogits[42] = 5.0
+        rawLogits[10] = 4.9
+
+        var allSame = true
+        for _ in 0..<100 {
+            var logits = rawLogits
+            let token = CompositeSampler.sample(
+                from: &logits, config: .init(temperature: 1.0, minP: 1.0), using: &rng)
+            if token != 42 {
+                allSame = false
+                break
+            }
+        }
+        #expect(allSame, "minP=1.0 should always pick the top token")
+    }
+
+    @Test("minP + topK combined: both filters apply")
+    func minPWithTopK() {
+        let vocab = 100
+        var rng = Xoshiro256StarStar(seed: 0x1111_2222)
+
+        // Spread: top 5 tokens have high logits, next 5 have medium, rest are low
+        var rawLogits = [Float](repeating: -10.0, count: vocab)
+        for i in 95..<100 { rawLogits[i] = 5.0 }  // high
+        for i in 90..<95 { rawLogits[i] = 2.0 }  // medium
+
+        var sampledIndices = Set<Int32>()
+        for _ in 0..<2_000 {
+            var logits = rawLogits
+            // topK=10 would include indices 90-99, but minP=0.3 should exclude
+            // the medium ones since exp(2-5)/exp(0) = exp(-3) ≈ 0.05 < 0.3
+            let token = CompositeSampler.sample(
+                from: &logits, config: .init(temperature: 1.0, topK: 10, minP: 0.3), using: &rng)
+            sampledIndices.insert(token)
+        }
+
+        // Only the top 5 (indices 95-99) should survive both filters
+        for idx in sampledIndices {
+            #expect(idx >= 95, "minP+topK: sampled \(idx) which should have been filtered")
+        }
+    }
+
+    @Test("minP with guided generation mask: masked tokens never sampled")
+    func minPWithGGMask() {
+        let vocab = 256
+        let allowed: Set<Int32> = [10, 20, 30, 40, 50]
+        var rng = Xoshiro256StarStar(seed: 0x3333_4444)
+
+        var counts = [Int](repeating: 0, count: vocab)
+        for _ in 0..<5_000 {
+            var logits = makeMaskedLogits(vocab: vocab, allowed: allowed, fill: 2.0, sentinel: -.infinity)
+            let token = CompositeSampler.sample(
+                from: &logits, config: .init(temperature: 1.0, minP: 0.05), using: &rng)
+            counts[Int(token)] += 1
+        }
+
+        for i in 0..<vocab where !allowed.contains(Int32(i)) {
+            #expect(counts[i] == 0, "GG+minP: masked \(i) sampled \(counts[i]) times")
+        }
+    }
+
     // MARK: - Guided generation (mask + topK/topP)
 
     @Test("GG path: -inf + topK=50, masked positions never sampled")

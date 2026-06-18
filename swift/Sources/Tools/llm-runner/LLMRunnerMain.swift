@@ -84,6 +84,11 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         help: "Top-P (nucleus) sampling: consider tokens in top P probability mass (e.g., 0.9)")
     var topP: Double?
 
+    @Option(
+        name: .customLong("min-p"),
+        help: "Min-P sampling: keep tokens with probability >= minP × max probability (e.g., 0.05)")
+    var minP: Double?
+
     @Option(help: "Sampling strategy. Options: 'temperature' (default), 'greedy'")
     var samplingStrategy: String = "temperature"
 
@@ -302,6 +307,9 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         }
         if let p = topP {
             CLILogger.log("TopP: \(p)", component: "Main")
+        }
+        if let m = minP {
+            CLILogger.log("MinP: \(m)", component: "Main")
         }
         if kvCacheStrategy != .auto {
             CLILogger.log("KV Cache Strategy: \(kvCacheStrategy.rawValue)", component: "Main")
@@ -669,13 +677,14 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
                 temperature: temperature,
                 topK: topK,
                 topP: topP,
+                minP: minP,
                 combined: !synchronousSampling
             )
         case "greedy":
-            // Fatal error if topK/topP set with greedy
-            if topK != nil || topP != nil {
-                print("Error: --top-k and --top-p cannot be used with --sampling-strategy greedy")
-                print("Use --sampling-strategy temperature with --top-k/--top-p, or remove --top-k/--top-p for greedy")
+            // Fatal error if topK/topP/minP set with greedy
+            if topK != nil || topP != nil || minP != nil {
+                print("Error: --top-k, --top-p, and --min-p cannot be used with --sampling-strategy greedy")
+                print("Use --sampling-strategy temperature with --top-k/--top-p/--min-p, or remove them for greedy")
                 throw ExitCode.failure
             }
             config = SamplingConfiguration(temperature: 0, combined: !synchronousSampling)

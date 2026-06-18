@@ -198,4 +198,54 @@ struct SamplingConfigurationTests {
         #expect(sampledTokens.contains(1))
         #expect(!sampledTokens.contains(2))
     }
+
+    // MARK: - MinP Configuration Tests
+
+    @Test("MinP configuration")
+    func minPConfig() {
+        let config = SamplingConfiguration(temperature: 0.9, minP: 0.05)
+
+        #expect(config.temperature == 0.9)
+        #expect(config.minP == 0.05)
+        #expect(config.isComposite == true)
+    }
+
+    @Test("MinP=nil means isComposite is false (temp only)")
+    func minPNilNotComposite() {
+        let config = SamplingConfiguration(temperature: 0.9)
+
+        #expect(config.minP == nil)
+        #expect(config.isComposite == false)
+    }
+
+    @Test("Normalized config removes minP for greedy")
+    func normalizedRemovesMinPForGreedy() {
+        let config = SamplingConfiguration(temperature: 0, minP: 0.1)
+        let normalized = config.normalized()
+
+        #expect(normalized.minP == nil)
+    }
+
+    @Test("MinP sampling excludes low relative probability tokens")
+    func minPSamplingExclusion() {
+        // Logits: [10.0, 9.5, 2.0]
+        // After temp=1 softmax: token 0 ≈ 0.62, token 1 ≈ 0.38, token 2 ≈ 0.0003
+        // minP=0.1 threshold: 0.1 * 0.62 = 0.062
+        // Token 2 (0.0003) < 0.062 → filtered out
+        let config = SamplingConfiguration(temperature: 1.0, minP: 0.1)
+        let logits: [Float16] = [10.0, 9.5, 2.0]
+
+        var sampledTokens = Set<Int32>()
+        for _ in 0..<100 {
+            var logitsCopy = logits
+            let token = config.fallbackSampler(from: &logitsCopy)
+            sampledTokens.insert(token)
+        }
+
+        // Token 2 should never be sampled
+        #expect(!sampledTokens.contains(2), "minP should filter out token 2")
+        // Tokens 0 and 1 should both appear
+        #expect(sampledTokens.contains(0))
+        #expect(sampledTokens.contains(1))
+    }
 }

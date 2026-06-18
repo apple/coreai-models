@@ -11,13 +11,15 @@ import CoreAIShared
 /// - **Temperature**: Controls overall randomness
 /// - **TopK**: Limits vocabulary to K most likely tokens
 /// - **TopP (nucleus)**: Limits vocabulary by cumulative probability threshold
+/// - **MinP**: Limits vocabulary by minimum probability relative to the most likely token
 ///
 /// ## Sampling Algorithm Order
 /// When multiple parameters are set, they are applied in this order:
 /// 1. Temperature scaling (logits / temperature)
-/// 2. TopP filtering (cumulative probability cutoff)
-/// 3. TopK filtering (hard limit on vocabulary)
-/// 4. Softmax and multinomial sampling
+/// 2. MinP filtering (relative probability threshold)
+/// 3. TopP filtering (cumulative probability cutoff)
+/// 4. TopK filtering (hard limit on vocabulary)
+/// 5. Softmax and multinomial sampling
 ///
 /// ## Usage Example
 /// ```swift
@@ -32,6 +34,9 @@ import CoreAIShared
 ///
 /// // Nucleus (TopP) sampling
 /// let nucleus = SamplingConfiguration(temperature: 0.9, topP: 0.95)
+///
+/// // MinP sampling (cheaper alternative to TopP)
+/// let minP = SamplingConfiguration(temperature: 0.9, minP: 0.05)
 ///
 /// // Combined TopK + TopP (recommended for best quality)
 /// let combined = SamplingConfiguration(temperature: 0.8, topK: 50, topP: 0.9)
@@ -72,6 +77,19 @@ public struct SamplingConfiguration: Sendable, Equatable, Hashable {
     /// When uncertain (flat distribution), vocabulary expands.
     public let topP: Double?
 
+    /// Min-P sampling: only consider tokens whose probability is at least minP times
+    /// the most likely token's probability.
+    ///
+    /// - **nil**: No min-P filtering
+    /// - **0.05**: Common default (keep tokens with >= 5% of top token's probability)
+    /// - **0.1**: More aggressive filtering
+    /// - **0.01**: Very permissive
+    ///
+    /// MinP is a simpler, cheaper alternative to TopP that adapts to the distribution shape.
+    /// When the model is confident, fewer tokens pass. When uncertain, more tokens pass.
+    /// Unlike TopP, it does not require sorting — it operates as a simple threshold in logit space.
+    public let minP: Double?
+
     /// A boolean flag that requests the sampling operation be combined
     /// with logit inference.
     ///
@@ -88,17 +106,21 @@ public struct SamplingConfiguration: Sendable, Equatable, Hashable {
     ///   - temperature: The randomness factor for token generation. Must be >= 0.0.
     ///   - topK: Optional top-K limit. Must be > 0 if set.
     ///   - topP: Optional top-P threshold. Must be in (0, 1] if set.
+    ///   - minP: Optional min-P threshold. Must be in (0, 1] if set.
     ///   - combined: Whether to combine sampling with logit inference. Defaults to true.
     ///
     /// - Note: Call `validate()` to check for potentially suboptimal configurations.
-    public init(temperature: Double, topK: Int? = nil, topP: Double? = nil, combined: Bool = true) {
+    public init(temperature: Double, topK: Int? = nil, topP: Double? = nil, minP: Double? = nil, combined: Bool = true)
+    {
         precondition(temperature >= 0, "Temperature must be non-negative.")
         precondition(topK == nil || topK! > 0, "TopK must be positive if set.")
         precondition(topP == nil || (topP! > 0 && topP! <= 1), "TopP must be in (0, 1] if set.")
+        precondition(minP == nil || (minP! > 0 && minP! <= 1), "MinP must be in (0, 1] if set.")
 
         self.temperature = temperature
         self.topK = topK
         self.topP = topP
+        self.minP = minP
         self.combined = combined
     }
 
@@ -125,11 +147,11 @@ public struct SamplingConfiguration: Sendable, Equatable, Hashable {
         temperature == 0
     }
 
-    /// Whether this configuration requires composite sampling (topK and/or topP).
+    /// Whether this configuration requires composite sampling (topK, topP, and/or minP).
     ///
-    /// True when temperature > 0 and either topK or topP is set.
+    /// True when temperature > 0 and any of topK, topP, or minP is set.
     public var isComposite: Bool {
-        temperature > 0 && (topK != nil || topP != nil)
+        temperature > 0 && (topK != nil || topP != nil || minP != nil)
     }
 
     /// Validates the configuration and returns warnings for potentially suboptimal settings.
@@ -137,7 +159,8 @@ public struct SamplingConfiguration: Sendable, Equatable, Hashable {
     /// This method checks for:
     /// - topK=1 with temperature>0 (should use greedy instead)
     /// - topP=1.0 (effectively disabled, same as nil)
-    /// - topK/topP set with temperature=0 (ignored for greedy)
+    /// - minP=1.0 (effectively greedy, should use temperature=0)
+    /// - topK/topP/minP set with temperature=0 (ignored for greedy)
     ///
     /// - Returns: Array of warning messages, empty if configuration is optimal.
     private func validate() -> [String] {
@@ -159,11 +182,27 @@ public struct SamplingConfiguration: Sendable, Equatable, Hashable {
             )
         }
 
-        // Check for topK/topP with temperature=0 (ignored)
-        if temperature == 0 && (topK != nil || topP != nil) {
+        // Check for minP=1.0 (effectively greedy)
+        if let m = minP, m == 1.0 {
             warnings.append(
-                "topK/topP are ignored when temperature=0 (greedy sampling). "
-                    + "Set temperature>0 to enable filtering, or remove topK/topP."
+                "minP=1.0 keeps only the single most-probable token. "
+                    + "Use temperature=0 for deterministic output, or a smaller minP value."
+            )
+        }
+
+        // Check for minP + topP together (unusual, may indicate confusion)
+        if minP != nil && topP != nil {
+            warnings.append(
+                "Both minP and topP are set. They serve similar purposes (adaptive filtering). "
+                    + "Both will apply (minP first, then topP), but typically only one is needed."
+            )
+        }
+
+        // Check for topK/topP/minP with temperature=0 (ignored)
+        if temperature == 0 && (topK != nil || topP != nil || minP != nil) {
+            warnings.append(
+                "topK/topP/minP are ignored when temperature=0 (greedy sampling). "
+                    + "Set temperature>0 to enable filtering, or remove topK/topP/minP."
             )
         }
 
@@ -183,27 +222,31 @@ public struct SamplingConfiguration: Sendable, Equatable, Hashable {
     /// Returns a normalized configuration with redundant settings removed.
     ///
     /// - topP=1.0 is replaced with nil (no effect)
-    /// - topK/topP are removed if temperature=0 (greedy ignores them)
+    /// - topK/topP/minP are removed if temperature=0 (greedy ignores them)
     ///
     /// - Returns: A new configuration with redundant settings removed.
     public func normalized() -> SamplingConfiguration {
         let effectiveTopK: Int?
         let effectiveTopP: Double?
+        let effectiveMinP: Double?
 
         if temperature == 0 {
-            // Greedy ignores topK/topP
+            // Greedy ignores topK/topP/minP
             effectiveTopK = nil
             effectiveTopP = nil
+            effectiveMinP = nil
         } else {
             effectiveTopK = topK
             // topP=1.0 is equivalent to nil
             effectiveTopP = (topP == 1.0) ? nil : topP
+            effectiveMinP = minP
         }
 
         return SamplingConfiguration(
             temperature: temperature,
             topK: effectiveTopK,
             topP: effectiveTopP,
+            minP: effectiveMinP,
             combined: combined
         )
     }

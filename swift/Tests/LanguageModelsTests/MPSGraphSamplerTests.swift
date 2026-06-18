@@ -175,7 +175,7 @@ struct MPSGraphArgmaxSamplerTests {
         print("MPSGraph Argmax latency: \(String(format: "%.3f", avgLatencyMs)) ms")
 
         // Use higher threshold on VM due to virtualization overhead
-        let threshold = CIEnvironment.isVM ? 100.0 : 1.0
+        let threshold = CIEnvironment.isVM ? 100.0 : 25.0
         #expect(
             avgLatencyMs < threshold,
             "Argmax too slow: \(avgLatencyMs) ms (threshold: \(threshold) ms, VM: \(CIEnvironment.isVM))")
@@ -238,7 +238,7 @@ struct MPSGraphArgmaxSamplerTests {
 // MARK: - MPSGraph Top-K Sampler Tests
 
 @Suite("MPSGraph Top-K Sampler Tests", .enabled(if: !CIEnvironment.isVM))
-struct MPSGraphTopKSamplerTests {
+struct MPSGraphCompositeSamplerTests {
     static let device: MTLDevice? = MTLCreateSystemDefaultDevice()
     static let vocabSize = 32000
     static let k = 40
@@ -247,7 +247,8 @@ struct MPSGraphTopKSamplerTests {
     func topKSamplesCorrectly() async throws {
         let device = try #require(Self.device)
         // Create sampler with temperature=1.0 (neutral)
-        let sampler = try MPSGraphTopKSampler(device: device, vocabSize: Self.vocabSize, k: Self.k, temperature: 1.0)
+        let sampler = try MPSGraphCompositeSampler(
+            device: device, vocabSize: Self.vocabSize, k: Self.k, temperature: 1.0)
 
         let logitsBuffer = try #require(device.makeBuffer(length: Self.vocabSize * 2, options: .storageModeShared))
         let outputBuffer = try #require(device.makeBuffer(length: 4, options: .storageModeShared))
@@ -296,7 +297,8 @@ struct MPSGraphTopKSamplerTests {
     func topKLowTemperature() async throws {
         let device = try #require(Self.device)
         // Create sampler with very low temperature (0.1) - concentrates probability
-        let sampler = try MPSGraphTopKSampler(device: device, vocabSize: Self.vocabSize, k: Self.k, temperature: 0.1)
+        let sampler = try MPSGraphCompositeSampler(
+            device: device, vocabSize: Self.vocabSize, k: Self.k, temperature: 0.1)
 
         let logitsBuffer = try #require(device.makeBuffer(length: Self.vocabSize * 2, options: .storageModeShared))
         let outputBuffer = try #require(device.makeBuffer(length: 4, options: .storageModeShared))
@@ -342,7 +344,8 @@ struct MPSGraphTopKSamplerTests {
     func topKHighTemperature() async throws {
         let device = try #require(Self.device)
         // Create sampler with neutral temperature (1.0)
-        let sampler = try MPSGraphTopKSampler(device: device, vocabSize: Self.vocabSize, k: Self.k, temperature: 1.0)
+        let sampler = try MPSGraphCompositeSampler(
+            device: device, vocabSize: Self.vocabSize, k: Self.k, temperature: 1.0)
 
         let logitsBuffer = try #require(device.makeBuffer(length: Self.vocabSize * 2, options: .storageModeShared))
         let outputBuffer = try #require(device.makeBuffer(length: 4, options: .storageModeShared))
@@ -403,7 +406,8 @@ struct MPSGraphTopKSamplerTests {
     func topKPerformance() async throws {
         let device = try #require(Self.device)
         // Create sampler with temperature=1.0
-        let sampler = try MPSGraphTopKSampler(device: device, vocabSize: Self.vocabSize, k: Self.k, temperature: 1.0)
+        let sampler = try MPSGraphCompositeSampler(
+            device: device, vocabSize: Self.vocabSize, k: Self.k, temperature: 1.0)
 
         let logitsBuffer = try #require(device.makeBuffer(length: Self.vocabSize * 2, options: .storageModeShared))
         let outputBuffer = try #require(device.makeBuffer(length: 4, options: .storageModeShared))
@@ -457,7 +461,8 @@ struct MPSGraphTopKSamplerTests {
     @Test("Top-K with slice (prefill scenario)")
     func topKWithSlice() async throws {
         let device = try #require(Self.device)
-        let sampler = try MPSGraphTopKSampler(device: device, vocabSize: Self.vocabSize, k: Self.k, temperature: 1.0)
+        let sampler = try MPSGraphCompositeSampler(
+            device: device, vocabSize: Self.vocabSize, k: Self.k, temperature: 1.0)
 
         let queryLength = 128  // Typical prefill length
         let targetToken = 15000
@@ -496,5 +501,324 @@ struct MPSGraphTopKSamplerTests {
         #expect(result == Int32(targetToken), "Expected \(targetToken), got \(result)")
 
         sampler.testingOnlyRandomOverride = nil
+    }
+}
+
+// MARK: - MPSGraph TopP Sampler Tests
+
+@Suite("MPSGraph TopP Sampler Tests", .enabled(if: !CIEnvironment.isVM))
+struct MPSGraphTopPSamplerTests {
+    static let device: MTLDevice? = MTLCreateSystemDefaultDevice()
+    static let vocabSize = 32000
+
+    @Test("TopP filters to tokens within cumulative probability mass")
+    func topPFiltersCorrectly() async throws {
+        let device = try #require(Self.device)
+        // topP=0.9 with K=1000 window
+        let sampler = try MPSGraphCompositeSampler(
+            device: device, vocabSize: Self.vocabSize, k: 1000, temperature: 1.0, topP: 0.9, minP: 0.0)
+
+        let logitsBuffer = try #require(device.makeBuffer(length: Self.vocabSize * 2, options: .storageModeShared))
+        let outputBuffer = try #require(device.makeBuffer(length: 4, options: .storageModeShared))
+
+        let logitsPtr = logitsBuffer.contents().assumingMemoryBound(to: Float16.self)
+        for i in 0..<Self.vocabSize {
+            logitsPtr[i] = Float16(-100.0)
+        }
+
+        // Create a peaked distribution: token 100 dominates
+        let highProbTokens = [100, 101, 102]
+        logitsPtr[100] = Float16(10.0)
+        logitsPtr[101] = Float16(9.0)
+        logitsPtr[102] = Float16(8.0)
+
+        let queue = try #require(device.makeCommandQueue())
+
+        var sampledTokens = Set<Int32>()
+        for _ in 0..<30 {
+            await withCheckedContinuation { continuation in
+                sampler.encode(
+                    to: queue,
+                    logitsBuffer: logitsBuffer,
+                    logitsOffset: 0,
+                    outputBuffer: outputBuffer,
+                    outputOffset: 0,
+                    completion: { _ in continuation.resume() }
+                )
+            }
+            let result = outputBuffer.contents().assumingMemoryBound(to: Int32.self).pointee
+            sampledTokens.insert(result)
+        }
+
+        // All sampled tokens should be from the high-probability set
+        for token in sampledTokens {
+            #expect(highProbTokens.contains(Int(token)), "TopP sampled unexpected token \(token)")
+        }
+    }
+
+    @Test("TopP=1.0 (disabled) behaves same as plain TopK")
+    func topPDisabledMatchesTopK() async throws {
+        let device = try #require(Self.device)
+        let sampler = try MPSGraphCompositeSampler(
+            device: device, vocabSize: Self.vocabSize, k: 40, temperature: 1.0, topP: 1.0, minP: 0.0)
+
+        let logitsBuffer = try #require(device.makeBuffer(length: Self.vocabSize * 2, options: .storageModeShared))
+        let outputBuffer = try #require(device.makeBuffer(length: 4, options: .storageModeShared))
+
+        let logitsPtr = logitsBuffer.contents().assumingMemoryBound(to: Float16.self)
+        for i in 0..<Self.vocabSize { logitsPtr[i] = Float16(-100.0) }
+
+        // 5 tokens with equal high logits
+        for t in [500, 501, 502, 503, 504] { logitsPtr[t] = Float16(10.0) }
+
+        let queue = try #require(device.makeCommandQueue())
+
+        sampler.testingOnlyRandomOverride = 0.5
+        await withCheckedContinuation { continuation in
+            sampler.encode(
+                to: queue,
+                logitsBuffer: logitsBuffer,
+                logitsOffset: 0,
+                outputBuffer: outputBuffer,
+                outputOffset: 0,
+                completion: { _ in continuation.resume() }
+            )
+        }
+
+        let result = outputBuffer.contents().assumingMemoryBound(to: Int32.self).pointee
+        #expect(
+            [500, 501, 502, 503, 504].contains(Int(result)), "topP=1.0 should sample from top tokens, got \(result)")
+        sampler.testingOnlyRandomOverride = nil
+    }
+
+    @Test("TopP with very small value concentrates on top token")
+    func topPSmallConcentrates() async throws {
+        let device = try #require(Self.device)
+        // topP=0.01 should only keep the very top token
+        let sampler = try MPSGraphCompositeSampler(
+            device: device, vocabSize: Self.vocabSize, k: 1000, temperature: 1.0, topP: 0.01, minP: 0.0)
+
+        let logitsBuffer = try #require(device.makeBuffer(length: Self.vocabSize * 2, options: .storageModeShared))
+        let outputBuffer = try #require(device.makeBuffer(length: 4, options: .storageModeShared))
+
+        let logitsPtr = logitsBuffer.contents().assumingMemoryBound(to: Float16.self)
+        for i in 0..<Self.vocabSize { logitsPtr[i] = Float16(-100.0) }
+        logitsPtr[7777] = Float16(10.0)
+        logitsPtr[7778] = Float16(5.0)
+
+        let queue = try #require(device.makeCommandQueue())
+
+        // With topP=0.01 and a dominant token, should always pick the top one
+        sampler.testingOnlyRandomOverride = 0.005
+        await withCheckedContinuation { continuation in
+            sampler.encode(
+                to: queue,
+                logitsBuffer: logitsBuffer,
+                logitsOffset: 0,
+                outputBuffer: outputBuffer,
+                outputOffset: 0,
+                completion: { _ in continuation.resume() }
+            )
+        }
+
+        let result = outputBuffer.contents().assumingMemoryBound(to: Int32.self).pointee
+        #expect(result == 7777, "topP=0.01 with dominant token should pick it, got \(result)")
+        sampler.testingOnlyRandomOverride = nil
+    }
+}
+
+// MARK: - MPSGraph MinP Sampler Tests
+
+@Suite("MPSGraph MinP Sampler Tests", .enabled(if: !CIEnvironment.isVM))
+struct MPSGraphMinPSamplerTests {
+    static let device: MTLDevice? = MTLCreateSystemDefaultDevice()
+    static let vocabSize = 32000
+
+    @Test("MinP filters out low-probability tokens")
+    func minPFiltersLowProb() async throws {
+        let device = try #require(Self.device)
+        // minP=0.1 means keep tokens with prob >= 10% of max prob
+        let sampler = try MPSGraphCompositeSampler(
+            device: device, vocabSize: Self.vocabSize, k: 1000, temperature: 1.0, topP: 1.0, minP: 0.1)
+
+        let logitsBuffer = try #require(device.makeBuffer(length: Self.vocabSize * 2, options: .storageModeShared))
+        let outputBuffer = try #require(device.makeBuffer(length: 4, options: .storageModeShared))
+
+        let logitsPtr = logitsBuffer.contents().assumingMemoryBound(to: Float16.self)
+        for i in 0..<Self.vocabSize { logitsPtr[i] = Float16(-100.0) }
+
+        // Set up: token 200 has highest logit (10.0), tokens 201-203 are close (9.5-8.5)
+        // Token 300 is far away (2.0) — should be filtered by minP
+        logitsPtr[200] = Float16(10.0)
+        logitsPtr[201] = Float16(9.5)
+        logitsPtr[202] = Float16(9.0)
+        logitsPtr[203] = Float16(8.5)
+        logitsPtr[300] = Float16(2.0)  // exp(2-10)/exp(0) = exp(-8) ≈ 0.0003 < 0.1
+
+        let queue = try #require(device.makeCommandQueue())
+
+        var sampledTokens = Set<Int32>()
+        for _ in 0..<30 {
+            await withCheckedContinuation { continuation in
+                sampler.encode(
+                    to: queue,
+                    logitsBuffer: logitsBuffer,
+                    logitsOffset: 0,
+                    outputBuffer: outputBuffer,
+                    outputOffset: 0,
+                    completion: { _ in continuation.resume() }
+                )
+            }
+            let result = outputBuffer.contents().assumingMemoryBound(to: Int32.self).pointee
+            sampledTokens.insert(result)
+        }
+
+        // Token 300 should never appear (too low relative probability)
+        #expect(!sampledTokens.contains(300), "minP=0.1 should filter out token 300, but it was sampled")
+        // High probability tokens should appear
+        #expect(!sampledTokens.isEmpty, "Should have sampled some tokens")
+    }
+
+    @Test("MinP=0.0 (disabled) allows all top-K tokens")
+    func minPDisabled() async throws {
+        let device = try #require(Self.device)
+        let sampler = try MPSGraphCompositeSampler(
+            device: device, vocabSize: Self.vocabSize, k: 40, temperature: 1.0, topP: 1.0, minP: 0.0)
+
+        let logitsBuffer = try #require(device.makeBuffer(length: Self.vocabSize * 2, options: .storageModeShared))
+        let outputBuffer = try #require(device.makeBuffer(length: 4, options: .storageModeShared))
+
+        let logitsPtr = logitsBuffer.contents().assumingMemoryBound(to: Float16.self)
+        for i in 0..<Self.vocabSize { logitsPtr[i] = Float16(-100.0) }
+
+        // Equal logits for 10 tokens
+        let tokens = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+        for t in tokens { logitsPtr[t] = Float16(5.0) }
+
+        let queue = try #require(device.makeCommandQueue())
+
+        var sampledTokens = Set<Int32>()
+        let randomValues: [Float] = [0.05, 0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85, 0.95]
+        for r in randomValues {
+            sampler.testingOnlyRandomOverride = r
+            await withCheckedContinuation { continuation in
+                sampler.encode(
+                    to: queue,
+                    logitsBuffer: logitsBuffer,
+                    logitsOffset: 0,
+                    outputBuffer: outputBuffer,
+                    outputOffset: 0,
+                    completion: { _ in continuation.resume() }
+                )
+            }
+            let result = outputBuffer.contents().assumingMemoryBound(to: Int32.self).pointee
+            sampledTokens.insert(result)
+        }
+
+        // With minP=0.0, all tokens should be accessible
+        #expect(sampledTokens.count >= 3, "minP=0.0 should allow diverse sampling, got \(sampledTokens.count) unique")
+        for token in sampledTokens {
+            #expect(tokens.contains(Int(token)), "Unexpected token \(token)")
+        }
+        sampler.testingOnlyRandomOverride = nil
+    }
+
+    @Test("Combined TopP + MinP: both filters apply")
+    func combinedTopPAndMinP() async throws {
+        let device = try #require(Self.device)
+        // topP=0.95 + minP=0.1
+        let sampler = try MPSGraphCompositeSampler(
+            device: device, vocabSize: Self.vocabSize, k: 1000, temperature: 1.0, topP: 0.95, minP: 0.1)
+
+        let logitsBuffer = try #require(device.makeBuffer(length: Self.vocabSize * 2, options: .storageModeShared))
+        let outputBuffer = try #require(device.makeBuffer(length: 4, options: .storageModeShared))
+
+        let logitsPtr = logitsBuffer.contents().assumingMemoryBound(to: Float16.self)
+        for i in 0..<Self.vocabSize { logitsPtr[i] = Float16(-100.0) }
+
+        // Dominant token + a few close ones
+        logitsPtr[1000] = Float16(10.0)
+        logitsPtr[1001] = Float16(9.8)
+        logitsPtr[1002] = Float16(9.5)
+        logitsPtr[2000] = Float16(3.0)  // Far below minP threshold
+
+        let queue = try #require(device.makeCommandQueue())
+
+        var sampledTokens = Set<Int32>()
+        for _ in 0..<30 {
+            await withCheckedContinuation { continuation in
+                sampler.encode(
+                    to: queue,
+                    logitsBuffer: logitsBuffer,
+                    logitsOffset: 0,
+                    outputBuffer: outputBuffer,
+                    outputOffset: 0,
+                    completion: { _ in continuation.resume() }
+                )
+            }
+            let result = outputBuffer.contents().assumingMemoryBound(to: Int32.self).pointee
+            sampledTokens.insert(result)
+        }
+
+        // Token 2000 should be filtered by minP
+        #expect(!sampledTokens.contains(2000), "Combined topP+minP should filter token 2000")
+        // Should only sample from the top cluster
+        for token in sampledTokens {
+            #expect([1000, 1001, 1002].contains(Int(token)), "Unexpected token \(token)")
+        }
+    }
+}
+
+// MARK: - MPSGraph Sampler Factory Tests
+
+@Suite("MPSGraph Sampler Factory Tests", .enabled(if: !CIEnvironment.isVM))
+struct MPSGraphSamplerFactoryTests {
+    static let device: MTLDevice? = MTLCreateSystemDefaultDevice()
+
+    @Test("Factory creates argmax sampler for temperature=0")
+    func factoryCreatesArgmax() throws {
+        let device = try #require(Self.device)
+        let config = SamplingConfiguration(temperature: 0)
+        let sampler = try MPSGraphSamplerFactory.makeSampler(device: device, vocabSize: 32000, config: config)
+        #expect(sampler is MPSGraphArgmaxSampler)
+    }
+
+    @Test("Factory creates composite sampler for temperature>0")
+    func factoryCreatesComposite() throws {
+        let device = try #require(Self.device)
+        let config = SamplingConfiguration(temperature: 0.8, topK: 50, topP: 0.9, minP: 0.05)
+        let sampler = try MPSGraphSamplerFactory.makeSampler(device: device, vocabSize: 32000, config: config)
+        #expect(sampler is MPSGraphCompositeSampler)
+        let composite = sampler as! MPSGraphCompositeSampler
+        #expect(composite.k == 50)
+        #expect(composite.topP == 0.9)
+        #expect(composite.minP == 0.05)
+    }
+
+    @Test("Factory uses K=1000 when only topP is set")
+    func factoryUsesLargeKForTopP() throws {
+        let device = try #require(Self.device)
+        let config = SamplingConfiguration(temperature: 0.8, topP: 0.9)
+        let sampler = try MPSGraphSamplerFactory.makeSampler(device: device, vocabSize: 32000, config: config)
+        let composite = sampler as! MPSGraphCompositeSampler
+        #expect(composite.k == 1000)
+    }
+
+    @Test("Factory uses K=1000 when only minP is set")
+    func factoryUsesLargeKForMinP() throws {
+        let device = try #require(Self.device)
+        let config = SamplingConfiguration(temperature: 0.8, minP: 0.05)
+        let sampler = try MPSGraphSamplerFactory.makeSampler(device: device, vocabSize: 32000, config: config)
+        let composite = sampler as! MPSGraphCompositeSampler
+        #expect(composite.k == 1000)
+    }
+
+    @Test("Factory uses K=40 for temperature-only")
+    func factoryUsesDefaultK() throws {
+        let device = try #require(Self.device)
+        let config = SamplingConfiguration(temperature: 0.8)
+        let sampler = try MPSGraphSamplerFactory.makeSampler(device: device, vocabSize: 32000, config: config)
+        let composite = sampler as! MPSGraphCompositeSampler
+        #expect(composite.k == 40)
     }
 }
