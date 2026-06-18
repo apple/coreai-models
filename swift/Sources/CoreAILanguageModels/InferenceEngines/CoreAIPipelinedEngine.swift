@@ -514,7 +514,8 @@ private struct EngineImpl: ~Copyable {
         var decodeOutBuffers: [MTLBuffer] = []
         for _ in 0..<pipelineDepth {
             guard let buf = device.makeBuffer(length: MemoryLayout<Int32>.size, options: .storageModeShared) else {
-                throw InferenceRuntimeError.bufferAllocationFailed("decodeOutputBuffer (\(MemoryLayout<Int32>.size) bytes)")
+                throw InferenceRuntimeError.bufferAllocationFailed(
+                    "decodeOutputBuffer (\(MemoryLayout<Int32>.size) bytes)")
             }
             decodeOutBuffers.append(buf)
         }
