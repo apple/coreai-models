@@ -21,6 +21,10 @@ private func milliseconds(since start: ContinuousClock.Instant) -> Double {
 
 // MARK: - Constants
 
+/// Maximum number of in-flight pipeline stages. Shared by the backpressure gate
+/// and all buffer rotation logic to guarantee no two concurrent stages alias
+/// the same memory.
+private let pipelineDepth = 3
 private let averageExpectedPromptSize = 256
 private let temperatureTolerance: Double = 0.001
 
@@ -31,13 +35,15 @@ private let temperatureTolerance: Double = 0.001
 /// Key features:
 /// - Non-blocking GPU encoding via `InferenceFunction.encode`
 /// - GPU-direct token sampling (argmax/topK) via MPSGraph compute shaders
-/// - Double-buffered cache positions for CPU/GPU overlap
+/// - Pipeline-depth-matched buffer rotation for CPU/GPU overlap
 /// - Growing KV cache with pipelined expansion
 /// - All tensors are owned MTLBuffers — Core AI never allocates/frees them
 final class CoreAIPipelinedEngine: InferenceEngine, Sendable {
     typealias ConfigType = ModelConfig
 
     nonisolated(unsafe) private var engine: EngineImpl
+    nonisolated(unsafe) private var history = TokenHistory()
+    nonisolated(unsafe) private(set) var lastPrefixHitCount: Int = 0
     private let engineInUse = Atomic<Bool>(false)
     let config: ModelConfig
 
@@ -46,6 +52,8 @@ final class CoreAIPipelinedEngine: InferenceEngine, Sendable {
     private let _generationTask = Mutex<Task<Void, Never>?>(nil)
 
     var isBusy: Bool { _activeToken.withLock { $0 != nil } }
+
+    var processedTokenCount: Int { engine.processedTokenCount }
 
     init(
         config: ModelConfig,
@@ -128,9 +136,42 @@ final class CoreAIPipelinedEngine: InferenceEngine, Sendable {
                 let (tokenStream, tokenContinuation) =
                     AsyncThrowingStream<InferenceEngine.TokenId, any Error>.makeStream()
 
+                // Implicit prefix caching: resolve input against history
+                var (commonPrefix, resolvedNewTokens) = self.history.resolve(input: input)
+                self.lastPrefixHitCount = commonPrefix
+
+                // Detect TRUE divergence before backup (tokens actually differ)
+                let isDivergence = commonPrefix < input.count && commonPrefix < self.history.count
+
+                // Ensure at least 1 token for prefill (seeds the decode loop).
+                // Back up by 1 if the entire input is cached.
+                if resolvedNewTokens.isEmpty && commonPrefix > 0 {
+                    commonPrefix -= 1
+                    resolvedNewTokens = input[commonPrefix...]
+                }
+
+                if isDivergence {
+                    // Tokens differ — full reset (partial rewind corrupts buffer rotation)
+                    await self.engine.computeStream.currentWorkCompleted()
+                    self.engine.reset()
+                    self.history.clear()
+                    resolvedNewTokens = input[...]
+                    commonPrefix = 0
+                } else if commonPrefix < self.engine.processedTokenCount {
+                    // Pure extension — partial rewind (buffer phase preserved)
+                    await self.engine.computeStream.currentWorkCompleted()
+                    self.engine.processedTokenCount = commonPrefix
+                    self.engine.step = commonPrefix
+                    self.history.truncate(to: commonPrefix)
+                }
+
+                let newTokens = Array(resolvedNewTokens)
+
                 async let forwarding: Void = {
                     do {
                         for try await token in tokenStream {
+                            // Track generated tokens in history
+                            self.history.append(token)
                             outputContinuation.yield(InferenceOutput(tokenId: token))
                         }
                     } catch {
@@ -138,12 +179,19 @@ final class CoreAIPipelinedEngine: InferenceEngine, Sendable {
                     }
                 }()
 
+                // Track prefill tokens BEFORE runCompletion — the forwarding loop
+                // concurrently appends generated tokens, so prefill must come first.
+                if !newTokens.isEmpty {
+                    self.history.append(contentsOf: newTokens[...])
+                }
+
                 try await self.engine.runCompletion(
-                    prompt: input,
+                    prompt: newTokens,
                     sampler: samplingConfiguration,
                     maxTokens: maxTokens,
                     yieldingTo: tokenContinuation
                 )
+
                 tokenContinuation.finish()
                 await forwarding
                 stopReasonStore.setIfUnset(.maxTokens)
@@ -185,21 +233,38 @@ final class CoreAIPipelinedEngine: InferenceEngine, Sendable {
         await task?.value
     }
 
-    func reset() {
-        // Cancel active generation BEFORE draining — otherwise drain() waits
-        // forever for a producer that will never release the engine.
-        _activeToken.withLock {
-            $0?.cancel()
-            $0 = nil
+    func reset(to tokenIndex: Int) async throws {
+        precondition(
+            tokenIndex >= 0 && tokenIndex <= processedTokenCount,
+            "reset(to: \(tokenIndex)) out of range [0, \(processedTokenCount)]")
+        if tokenIndex == 0 {
+            // Full reset: cancel + drain + clear everything
+            _activeToken.withLock {
+                $0?.cancel()
+                $0 = nil
+            }
+            _generationTask.withLock {
+                $0?.cancel()
+                $0 = nil
+            }
+            drain()
+            await engine.computeStream.currentWorkCompleted()
+            guard tryAcquireEngine() else { return }
+            defer { releaseEngine() }
+            engine.reset()
+            history.clear()
+        } else {
+            // Partial reset: wait for generation to finish naturally, then rewind counter.
+            // Do NOT cancel — cancelling corrupts the pipeline's double-buffer state.
+            // The KV cache is valid up to processedTokenCount after natural completion.
+            drain()
+            await engine.computeStream.currentWorkCompleted()
+            guard tryAcquireEngine() else { return }
+            defer { releaseEngine() }
+            engine.processedTokenCount = tokenIndex
+            engine.step = tokenIndex
+            history.truncate(to: tokenIndex)
         }
-        _generationTask.withLock {
-            $0?.cancel()
-            $0 = nil
-        }
-        drain()
-        guard tryAcquireEngine() else { return }
-        defer { releaseEngine() }
-        engine.reset()
     }
 
     func cleanup() async throws {
@@ -233,7 +298,7 @@ final class CoreAIPipelinedEngine: InferenceEngine, Sendable {
 /// sampler callback drains them (~70/s); depth grows until
 /// `MPSCommandBufferImageCache` fails to allocate another private MTLBuffer.
 ///
-/// Capacity 3 covers {logits encode + sampler commit + optional KV-cache grow};
+/// Capacity matches `pipelineDepth` — covers {logits encode + sampler commit + optional KV-cache grow};
 /// deeper queues only cost memory.
 ///
 /// Class, not actor: `release()` runs synchronously from the Metal callback —
@@ -335,7 +400,9 @@ private struct EngineImpl: ~Copyable {
 
     // Owned MTLBuffers
     var inputTokensBuffer: MTLBuffer
-    var cachePositionBuffers: (MTLBuffer, MTLBuffer)
+    var cachePositionBuffers: [MTLBuffer]
+    var decodeOutputBuffers: [MTLBuffer]
+    var decodeLogitsBuffers: [MTLBuffer]
 
     // KV cache — reuses CoreAIKVCache protocol from KVCache+CoreAI.swift
     var kvCache: any CoreAIKVCache
@@ -352,8 +419,8 @@ private struct EngineImpl: ~Copyable {
     var step: Int = 0
 
     // Backpressure gate — see PipelineGate doc-comment for the failure mode it prevents.
-    // Capacity 3 covers {encode logits + sampler commit + optional KV-cache grow} in flight.
-    let inFlightGate = PipelineGate(capacity: 3)
+    // Capacity matches pipeline depth: {encode logits + sampler commit + optional KV-cache grow} in flight.
+    let inFlightGate = PipelineGate(capacity: pipelineDepth)
 
     // MARK: - Init
 
@@ -425,20 +492,42 @@ private struct EngineImpl: ~Copyable {
             throw InferenceRuntimeError.bufferAllocationFailed("inputTokens (\(inputTokensByteCount) bytes)")
         }
 
-        // Allocate double-buffered cache positions
+        // Allocate pipeline-depth-matched cache position buffers
         let cachePosSize = config.maxContextLength * posIdsDesc.scalarType.byteSize
-        guard let cachePosBuf0 = device.makeBuffer(length: cachePosSize, options: .storageModeShared),
-            let cachePosBuf1 = device.makeBuffer(length: cachePosSize, options: .storageModeShared)
-        else {
-            throw InferenceRuntimeError.bufferAllocationFailed("cachePositions (\(cachePosSize * 2) bytes)")
+        var cachePosBuffers: [MTLBuffer] = []
+        for _ in 0..<pipelineDepth {
+            guard let buf = device.makeBuffer(length: cachePosSize, options: .storageModeShared) else {
+                throw InferenceRuntimeError.bufferAllocationFailed("cachePositions (\(cachePosSize) bytes)")
+            }
+            cachePosBuffers.append(buf)
         }
 
         // Pre-populate cache positions with [0, 1, ..., maxCtx-1]
-        for buf in [cachePosBuf0, cachePosBuf1] {
+        for buf in cachePosBuffers {
             let ptr = buf.contents().bindMemory(to: Int32.self, capacity: config.maxContextLength)
             for i in 0..<config.maxContextLength {
                 ptr[i] = Int32(i)
             }
+        }
+
+        // Allocate pipeline-depth-matched decode output buffers (sampler writes next token)
+        var decodeOutBuffers: [MTLBuffer] = []
+        for _ in 0..<pipelineDepth {
+            guard let buf = device.makeBuffer(length: MemoryLayout<Int32>.size, options: .storageModeShared) else {
+                throw InferenceRuntimeError.bufferAllocationFailed(
+                    "decodeOutputBuffer (\(MemoryLayout<Int32>.size) bytes)")
+            }
+            decodeOutBuffers.append(buf)
+        }
+
+        // Allocate pipeline-depth-matched decode logits buffers (inference writes logits for decode)
+        let decodeLogitsSize = config.vocabSize * MemoryLayout<UInt16>.size
+        var decodeLogBufs: [MTLBuffer] = []
+        for _ in 0..<pipelineDepth {
+            guard let buf = device.makeBuffer(length: decodeLogitsSize, options: .storageModeShared) else {
+                throw InferenceRuntimeError.bufferAllocationFailed("decodeLogitsBuffer (\(decodeLogitsSize) bytes)")
+            }
+            decodeLogBufs.append(buf)
         }
 
         // Create KV cache using factory — pass original descriptors (with -1 dynamic dims intact)
@@ -495,7 +584,9 @@ private struct EngineImpl: ~Copyable {
         self.positionIdsBaseDesc = posIdsDesc
         self.logitsBaseDesc = logitsDesc
         self.inputTokensBuffer = inputTokensBuf
-        self.cachePositionBuffers = (cachePosBuf0, cachePosBuf1)
+        self.cachePositionBuffers = cachePosBuffers
+        self.decodeOutputBuffers = decodeOutBuffers
+        self.decodeLogitsBuffers = decodeLogBufs
         self.kvCache = kvCacheLocal
         self.logits = logitsRef
         self.cachedSampler = nil
@@ -542,7 +633,7 @@ private struct EngineImpl: ~Copyable {
     ///
     /// 1. Construct RawView/MutableRawView from MTLBuffers with current shapes
     /// 2. Encode to ComputeStream (non-blocking)
-    /// 3. withMetal3Queue: encode GPU argmax/topK (writes directly to inputTokensBuffer)
+    /// 3. withMetal3Queue: encode GPU argmax/topK (writes to rotating decodeOutputBuffers)
     /// 4. Callback yields token
     private mutating func _encodeNextStepGPU(
         tokens: some Collection<Int32>,
@@ -571,7 +662,7 @@ private struct EngineImpl: ~Copyable {
         // Prefill: write tokens at their natural position so this step's region is disjoint
         // from any prior chunk's region still in-flight on the GPU (encode holds a live
         // MTLBuffer reference; no encodeWriteOperands serialization available in Core AI).
-        // Decode: token is already at offset 0 via GPU-direct argmax write — no CPU write needed.
+        // Decode: token is in the previous step's decodeOutputBuffer — no CPU write needed.
         let tokenByteOffset = processedTokenCount * MemoryLayout<Int32>.size
         if !tokens.isEmpty {
             let ptr = inputTokensBuffer.contents().bindMemory(
@@ -581,20 +672,33 @@ private struct EngineImpl: ~Copyable {
             }
         }
 
-        // Select cache position buffer for this step (double-buffered)
-        let cachePosBuffer = step % 2 == 0 ? cachePositionBuffers.0 : cachePositionBuffers.1
+        // Select cache position buffer for this step (pipeline-depth-matched rotation)
+        let cachePosBuffer = cachePositionBuffers[step % pipelineDepth]
         let posLength = processedTokenCount + queryLength
 
         // Build Inputs as AsyncValue (from MTLBuffers)
         let tokenShape = [1, queryLength]
         let tokenStrides = try resolvedStrides(descriptor: inputIdsBaseDesc, shape: tokenShape)
-        let tokenValue = unsafe InferenceFunction.AsyncValue(
-            unsafeBuffer: inputTokensBuffer,
-            byteOffset: tokens.isEmpty ? 0 : tokenByteOffset,
-            scalarType: .int32,
-            shape: tokenShape,
-            strides: tokenStrides
-        )
+        let tokenValue: InferenceFunction.AsyncValue
+        if tokens.isEmpty {
+            // Decode: read input token from previous step's decode output buffer
+            tokenValue = unsafe InferenceFunction.AsyncValue(
+                unsafeBuffer: decodeOutputBuffers[(step + pipelineDepth - 1) % pipelineDepth],
+                byteOffset: 0,
+                scalarType: .int32,
+                shape: tokenShape,
+                strides: tokenStrides
+            )
+        } else {
+            // Prefill: read from inputTokensBuffer at natural position
+            tokenValue = unsafe InferenceFunction.AsyncValue(
+                unsafeBuffer: inputTokensBuffer,
+                byteOffset: tokenByteOffset,
+                scalarType: .int32,
+                shape: tokenShape,
+                strides: tokenStrides
+            )
+        }
         let posShape = [1, posLength]
         let posStrides = try resolvedStrides(descriptor: positionIdsBaseDesc, shape: posShape)
         let posValue = unsafe InferenceFunction.AsyncValue(
@@ -637,11 +741,12 @@ private struct EngineImpl: ~Copyable {
         asyncStates.insert(&valState, for: valueCacheName)
 
         // Build Output as AsyncMutableValue (logits)
-        let logitsBuffer = logits.metalBuffer
+        // Decode uses per-step rotating buffer; prefill uses the shared growing buffer.
+        let logitsOutputBuffer = tokens.isEmpty ? decodeLogitsBuffers[step % pipelineDepth] : logits.metalBuffer
         let logitsShape = [1, queryLength, vocabSize]
         let logitsStrides = try resolvedStrides(descriptor: logitsBaseDesc, shape: logitsShape)
         var logitsOutput = unsafe InferenceFunction.AsyncMutableValue(
-            unsafeBuffer: logitsBuffer,
+            unsafeBuffer: logitsOutputBuffer,
             byteOffset: 0,
             scalarType: .float16,
             shape: logitsShape,
@@ -670,7 +775,8 @@ private struct EngineImpl: ~Copyable {
 
         // GPU sampling via Metal queue
         let localGPUSampler = gpuSampler
-        let outputBuffer = inputTokensBuffer
+        let outputBuffer = decodeOutputBuffers[step % pipelineDepth]
+        let samplerLogitsBuffer = tokens.isEmpty ? decodeLogitsBuffers[step % pipelineDepth] : logits.metalBuffer
         let logitsOffset = (actualTokenCount - 1) * vocabSize * MemoryLayout<UInt16>.size
         let samplerStrategy = gpuSampler is MPSGraphArgmaxSampler ? "GPU-argmax" : "GPU-composite"
         let samplerTemperature = cachedSamplerTemperature ?? 0.0
@@ -696,7 +802,7 @@ private struct EngineImpl: ~Copyable {
             if queryLength == 1 {
                 localGPUSampler.encode(
                     to: queue,
-                    logitsBuffer: logitsBuffer,
+                    logitsBuffer: samplerLogitsBuffer,
                     logitsOffset: logitsOffset,
                     outputBuffer: outputBuffer,
                     outputOffset: 0,
@@ -705,7 +811,7 @@ private struct EngineImpl: ~Copyable {
             } else {
                 localGPUSampler.encodeWithSlice(
                     to: queue,
-                    logitsBuffer: logitsBuffer,
+                    logitsBuffer: samplerLogitsBuffer,
                     queryLength: actualTokenCount,
                     outputBuffer: outputBuffer,
                     outputOffset: 0,
@@ -804,27 +910,30 @@ private struct EngineImpl: ~Copyable {
         }
 
         // Split prompt into chunks when it exceeds the chunk threshold.
-        let prefillTokens: ArraySlice<Int32>
-        if prompt.count > config.chunkThreshold {
-            prefillTokens = try await processChunkedInput(tokens: prompt)
-        } else {
-            let prefillCapacity = max(1, prompt.count)
-            if try logits.ensureCapacity(forContextLength: prefillCapacity) {
-                let fmt = ByteCountFormatter()
-                fmt.countStyle = .memory
-                CLILogger.log(
-                    "Logits buffer grew to capacity \(logits.currentCapacity) (\(fmt.string(fromByteCount: Int64(logits.currentByteCount))))"
-                )
+        // Skip prefill entirely if prompt is empty (prefix-cached continuation).
+        if !prompt.isEmpty {
+            let prefillTokens: ArraySlice<Int32>
+            if prompt.count > config.chunkThreshold {
+                prefillTokens = try await processChunkedInput(tokens: prompt)
+            } else {
+                let prefillCapacity = max(1, prompt.count)
+                if try logits.ensureCapacity(forContextLength: prefillCapacity) {
+                    let fmt = ByteCountFormatter()
+                    fmt.countStyle = .memory
+                    CLILogger.log(
+                        "Logits buffer grew to capacity \(logits.currentCapacity) (\(fmt.string(fromByteCount: Int64(logits.currentByteCount))))"
+                    )
+                }
+                prefillTokens = prompt[...]
             }
-            prefillTokens = prompt[...]
-        }
 
-        // Process prompt with sampling
-        try await _encodeNextStepGPU(
-            tokens: prefillTokens,
-            gpuSampler: gpuSampler,
-            yieldingTo: continuation
-        )
+            // Process prompt with sampling
+            try await _encodeNextStepGPU(
+                tokens: prefillTokens,
+                gpuSampler: gpuSampler,
+                yieldingTo: continuation
+            )
+        }
 
         // Generate-Grow-Continue loop
         var remainingTokens = totalMaxTokens - 1
@@ -905,7 +1014,7 @@ private struct EngineImpl: ~Copyable {
             ptr[processedTokenCount + i] = token
         }
 
-        let cachePosBuffer = step % 2 == 0 ? cachePositionBuffers.0 : cachePositionBuffers.1
+        let cachePosBuffer = cachePositionBuffers[step % pipelineDepth]
         let posLength = processedTokenCount + queryLength
 
         // Build async values and encode
@@ -1012,7 +1121,7 @@ private struct EngineImpl: ~Copyable {
             let ptr = inputTokensBuffer.contents().bindMemory(to: Int32.self, capacity: shape)
             for i in 0..<shape { ptr[i] = 1 }
 
-            let cachePosBuffer = step % 2 == 0 ? cachePositionBuffers.0 : cachePositionBuffers.1
+            let cachePosBuffer = cachePositionBuffers[step % pipelineDepth]
             let posLength = processedTokenCount + shape
 
             let tShape = [1, shape]
@@ -1061,18 +1170,18 @@ private struct EngineImpl: ~Copyable {
                 to: computeStream
             )
 
-            // Warm up argmax kernel
-            let logitsBuffer = logits.metalBuffer
-            let outputBuffer = inputTokensBuffer
+            // Warm up argmax kernel using pipeline-matched decode buffers
+            let warmupLogitsBuffer = decodeLogitsBuffers[step % pipelineDepth]
+            let warmupOutputBuffer = decodeOutputBuffers[step % pipelineDepth]
             let logitsOffset = (shape - 1) * vocabSize * MemoryLayout<UInt16>.size
 
             do {
                 let queue = pipelineQueue
                 warmupSampler.encode(
                     to: queue,
-                    logitsBuffer: logitsBuffer,
+                    logitsBuffer: warmupLogitsBuffer,
                     logitsOffset: logitsOffset,
-                    outputBuffer: outputBuffer,
+                    outputBuffer: warmupOutputBuffer,
                     outputOffset: 0,
                     completion: { _ in }
                 )

@@ -38,6 +38,13 @@ class MockEngine: InferenceEngine, @unchecked Sendable {
     /// Tracks whether reset() was called
     private(set) var resetCalled: Bool = false
 
+    /// Number of tokens the engine has processed in the current session.
+    var processedTokenCount: Int = 0
+
+    /// Token history for implicit prefix caching
+    var history = TokenHistory()
+    private(set) var lastPrefixHitCount: Int = 0
+
     // Generation lifecycle
     private let _activeToken = Mutex<GenerationToken?>(nil)
 
@@ -67,6 +74,22 @@ class MockEngine: InferenceEngine, @unchecked Sendable {
     ) throws -> GenerationSequence {
         let token = GenerationToken()
         _activeToken.withLock { $0 = token }
+
+        // Implicit prefix caching: resolve input against history
+        let (commonPrefix, resolvedNewTokens) = history.resolve(input: input)
+        lastPrefixHitCount = commonPrefix
+
+        if commonPrefix < processedTokenCount {
+            // Input diverged — rewind
+            processedTokenCount = commonPrefix
+            history.truncate(to: commonPrefix)
+        }
+
+        // Simulate prefill: count new tokens beyond what's already cached.
+        let newInputTokens = Array(resolvedNewTokens)
+        processedTokenCount += newInputTokens.count
+        history.append(contentsOf: newInputTokens[...])
+
         return GenerationSequence(
             engine: self,
             input: input,
@@ -159,8 +182,12 @@ class MockEngine: InferenceEngine, @unchecked Sendable {
                     let idx = engine.inferenceCallCount % engine.tokenSequence.count
                     let sequenceToken = engine.tokenSequence[idx]
                     engine.inferenceCallCount += 1
+                    engine.processedTokenCount += 1
 
                     let nextToken = forcedContinuation?[step] ?? sequenceToken
+
+                    // Track generated token in history
+                    engine.history.append(nextToken)
 
                     let logits: [Float16]?
                     if returnsLogits, let vocabSize = engine.vocabSize {
@@ -202,10 +229,16 @@ class MockEngine: InferenceEngine, @unchecked Sendable {
         }
     }
 
-    func reset() async throws {
+    func reset(to tokenIndex: Int) async throws {
         try await cancel()
         resetCalled = true
-        inferenceCallCount = 0
+        processedTokenCount = tokenIndex
+        if tokenIndex == 0 {
+            inferenceCallCount = 0
+            history.clear()
+        } else {
+            history.truncate(to: tokenIndex)
+        }
     }
 
     func cleanup() async throws {}
