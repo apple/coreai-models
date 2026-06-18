@@ -159,6 +159,7 @@ let package = Package(
             name: "speech-runner",
             dependencies: [
                 "CoreAIShared",
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
                 .product(name: "Transformers", package: "swift-transformers"),
             ],
             path: "swift/Sources/Tools/speech-runner",

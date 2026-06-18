@@ -3,6 +3,7 @@
 // Use of this source code is governed by a BSD-3-clause license that can
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
+import ArgumentParser
 import CoreAI
 import CoreAIShared
 import Foundation
@@ -17,32 +18,25 @@ private let melElements = 128 * 3000
 
 // MARK: - Entry point
 
-// Usage: speech-runner <model-path> [audio-or-mel]
-//
-// model-path  A bundle dir with encoder.aimodel + decoder.aimodel (--mode coreai),
-//             or a single .aimodel file (--mode legacy).
-//
-// audio-or-mel  An audio file (wav, flac, m4a, …) or a precomputed mel .bin
-//               from tools/compute_mel.py. Omit for silence benchmarking.
 @main
-struct Main {
-    static func main() async {
-        guard CommandLine.arguments.count > 1 else {
-            print("Usage: speech-runner <model-path> [audio-or-mel]")
-            exit(1)
-        }
-        let modelPath = CommandLine.arguments[1]
-        let audioPath = CommandLine.arguments.count > 2 ? CommandLine.arguments[2] : nil
-        do {
-            let encURL = URL(fileURLWithPath: "\(modelPath)/encoder.aimodel")
-            if FileManager.default.fileExists(atPath: encURL.path) {
-                try await runSplit(bundleDir: modelPath, audioPath: audioPath)
-            } else {
-                try await runLegacy(modelPath: modelPath, audioPath: audioPath)
-            }
-        } catch {
-            print("Fatal: \(error)")
-            exit(1)
+struct SpeechRunner: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "speech-runner",
+        abstract: "Transcribe audio using a CoreAI Whisper export"
+    )
+
+    @Argument(help: "Path to encoder+decoder bundle dir (--mode coreai) or single .aimodel (--mode legacy)")
+    var modelPath: String
+
+    @Argument(help: "Audio file (wav, flac, m4a, …) or precomputed mel .bin. Omit for silence benchmarking.")
+    var audioPath: String?
+
+    func run() async throws {
+        let encURL = URL(fileURLWithPath: "\(modelPath)/encoder.aimodel")
+        if FileManager.default.fileExists(atPath: encURL.path) {
+            try await runSplit(bundleDir: modelPath, audioPath: audioPath)
+        } else {
+            try await runLegacy(modelPath: modelPath, audioPath: audioPath)
         }
     }
 }
@@ -61,7 +55,7 @@ private func loadMelArray(from path: String, descriptor: NDArrayDescriptor) thro
         let data = try Data(contentsOf: url)
         let count = data.count / MemoryLayout<Float>.size
         guard count == melElements else {
-            fatalError("mel bin has \(count) floats, expected \(melElements) (128×3000)")
+            throw ValidationError("mel bin has \(count) floats, expected \(melElements) (128×3000)")
         }
         floats = data.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
     }
@@ -72,7 +66,7 @@ private func loadMelArray(from path: String, descriptor: NDArrayDescriptor) thro
 
 // MARK: - Results
 
-private func printResults(tokens: [Int32], stepTimesMs: [Double]) async {
+private func printResults(tokens: [Int32], stepTimesMs: [Double]) async throws {
     let avgMs = stepTimesMs.reduce(0, +) / Double(stepTimesMs.count)
     print(String(format: "  steps:    %d", stepTimesMs.count))
     print(String(format: "  latency:  %.1f ms/tok", avgMs))
@@ -81,20 +75,25 @@ private func printResults(tokens: [Int32], stepTimesMs: [Double]) async {
         print(String(format: "  min/max:  %.1f / %.1f ms", lo, hi))
     }
     print("\n── Transcription ──────────────────────────────────────────────────────")
-    // Load tokenizer from local HF cache (no network needed)
     let cacheBase = FileManager.default.homeDirectoryForCurrentUser
         .appending(path: ".cache/huggingface/hub/models--openai--whisper-large-v3-turbo/snapshots")
-    let snapshot = (try? FileManager.default.contentsOfDirectory(atPath: cacheBase.path))?.first
-    let tokenizerURL = snapshot.map { cacheBase.appending(path: $0) }
-
-    if let url = tokenizerURL,
-        let tokenizer = try? await AutoTokenizer.from(modelFolder: url)
-    {
-        let ids = tokens.filter { $0 < 50257 }.map { Int($0) }
-        print("  \(tokenizer.decode(tokens: ids))")
-    } else {
-        print("  (tokenizer unavailable — token ids: \(tokens))")
+    guard
+        let snapshot = (try? FileManager.default.contentsOfDirectory(atPath: cacheBase.path))?.first,
+        let tokenizer = try? await AutoTokenizer.from(modelFolder: cacheBase.appending(path: snapshot))
+    else {
+        throw RuntimeError("Tokenizer not found — run the model export once to populate the HF cache")
     }
+    let ids = tokens.filter { $0 < 50257 }.map { Int($0) }
+    print("  \(tokenizer.decode(tokens: ids))")
+}
+
+struct RuntimeError: Error, CustomStringConvertible {
+    let description: String
+    init(_ message: String) { description = message }
+}
+
+extension Duration {
+    var inMilliseconds: Double { Double(components.seconds) * 1000 + Double(components.attoseconds) / 1e15 }
 }
 
 // MARK: - Split runner (encoder + decoder with KV cache)
@@ -107,14 +106,14 @@ func runSplit(bundleDir: String, audioPath: String?) async throws {
 
     guard let encFn = try encModel.loadFunction(named: "main"),
         let decFn = try decModel.loadFunction(named: "main")
-    else { fatalError("No 'main' function") }
+    else { throw RuntimeError("No 'main' function in model") }
 
     let encDesc = encModel.functionDescriptor(for: "main")!
     let decDesc = decModel.functionDescriptor(for: "main")!
 
     guard case .ndArray(let melNDDesc) = encDesc.inputDescriptor(of: "input_features"),
         case .ndArray(let encOutNDDesc) = encDesc.outputDescriptor(of: "encoder_hidden_states")
-    else { fatalError("Unexpected encoder descriptors") }
+    else { throw RuntimeError("Unexpected encoder descriptors") }
 
     let encOutShape = encOutNDDesc.shape
 
@@ -137,7 +136,7 @@ func runSplit(bundleDir: String, audioPath: String?) async throws {
             states: InferenceFunction.MutableViews(), outputViews: consume out)
     }
     print("\n── Encoder ────────────────────────────────────────────────────────────")
-    let encT0 = Date()
+    let encT0 = ContinuousClock.now
     do {
         var out = InferenceFunction.MutableViews()
         out.insert(&encOutArray, for: "encoder_hidden_states")
@@ -145,7 +144,8 @@ func runSplit(bundleDir: String, audioPath: String?) async throws {
             inputs: ["input_features": melArray],
             states: InferenceFunction.MutableViews(), outputViews: consume out)
     }
-    print(String(format: "  latency: %.1f ms", Date().timeIntervalSince(encT0) * 1000))
+    let encMs = (ContinuousClock.now - encT0).inMilliseconds
+    print(String(format: "  latency: %.1f ms", encMs))
 
     guard case .ndArray(let inputIdsNDDesc) = decDesc.inputDescriptor(of: "input_ids"),
         case .ndArray(let posIdsNDDesc) = decDesc.inputDescriptor(of: "position_ids"),
@@ -153,7 +153,7 @@ func runSplit(bundleDir: String, audioPath: String?) async throws {
         case .ndArray(let keyCacheNDDesc) = decDesc.stateDescriptor(of: "keyCache"),
         case .ndArray(let valCacheNDDesc) = decDesc.stateDescriptor(of: "valueCache"),
         case .ndArray(let logitsNDDesc) = decDesc.outputDescriptor(of: "logits")
-    else { fatalError("Unexpected decoder descriptors") }
+    else { throw RuntimeError("Unexpected decoder descriptors") }
 
     let vocabSize = logitsNDDesc.shape.last!
     let kcShape = keyCacheNDDesc.shape.map { $0 < 0 ? maxTargetPositions : $0 }
@@ -197,11 +197,11 @@ func runSplit(bundleDir: String, audioPath: String?) async throws {
         st.insert(&valueCache, for: "valueCache")
         var out = InferenceFunction.MutableViews()
         out.insert(&logitsArray, for: "logits")
-        let t0 = Date()
+        let t0 = ContinuousClock.now
         _ = try await decFn.run(
             inputs: ["input_ids": ids, "position_ids": posIds, "encoder_hidden_states": encHSArray],
             states: consume st, outputViews: consume out)
-        stepTimesMs.append(Date().timeIntervalSince(t0) * 1000)
+        stepTimesMs.append((ContinuousClock.now - t0).inMilliseconds)
         let logits = flattenAsFloat(logitsArray)
         let next = Int32(logits.indices.max(by: { logits[$0] < logits[$1] })!)
         tokens.append(next)
@@ -209,7 +209,7 @@ func runSplit(bundleDir: String, audioPath: String?) async throws {
         if next == eotToken { break }
     }
 
-    await printResults(tokens: tokens, stepTimesMs: stepTimesMs)
+    try await printResults(tokens: tokens, stepTimesMs: stepTimesMs)
 }
 
 // MARK: - Legacy runner (monolithic model, no KV cache)
@@ -218,19 +218,33 @@ func runLegacy(modelPath: String, audioPath: String?) async throws {
     print("Format: legacy (monolithic, no KV cache)")
 
     let model = try await AIModel(contentsOf: URL(fileURLWithPath: modelPath))
-    guard let fn = try model.loadFunction(named: "main") else { fatalError("No 'main' function") }
+    guard let fn = try model.loadFunction(named: "main")
+    else { throw RuntimeError("No 'main' function in model") }
     let desc = model.functionDescriptor(for: "main")!
 
     guard case .ndArray(let melNDDesc) = desc.inputDescriptor(of: "input_features"),
         case .ndArray(let idsNDDesc) = desc.inputDescriptor(of: "decoder_input_ids"),
         case .ndArray(let logitsDesc) = desc.outputDescriptor(of: "logits")
-    else { fatalError("Unexpected model descriptors") }
+    else { throw RuntimeError("Unexpected model descriptors") }
 
     let vocabSize = logitsDesc.shape.last!
     let isStaticIds = !idsNDDesc.shape.contains(where: { $0 < 0 })
     if isStaticIds {
         print("decoder_input_ids exported with static shape — no past context per step")
-        print("Re-export with --mode legacy to get dynamic shapes")
+        print("Re-export with --mode legacy to fix")
+    }
+
+    // Warmup pass
+    do {
+        var ids = NDArray(descriptor: idsNDDesc.resolvingDynamicDimensions([1, 1]))
+        fillNDArray(&ids, as: Int32.self, with: [forcedPrefix[0]])
+        var logitsWarmup = NDArray(descriptor: logitsDesc.resolvingDynamicDimensions([1, 1, vocabSize]))
+        var out = InferenceFunction.MutableViews()
+        out.insert(&logitsWarmup, for: "logits")
+        _ = try await fn.run(
+            inputs: ["input_features": NDArray(descriptor: melNDDesc.resolvingDynamicDimensions([1, 128, 3000])),
+                     "decoder_input_ids": ids],
+            states: InferenceFunction.MutableViews(), outputViews: consume out)
     }
 
     var melArray: NDArray
@@ -255,11 +269,11 @@ func runLegacy(modelPath: String, audioPath: String?) async throws {
         var logitsArray = NDArray(descriptor: logitsDesc.resolvingDynamicDimensions([1, seqLen, vocabSize]))
         var out = InferenceFunction.MutableViews()
         out.insert(&logitsArray, for: "logits")
-        let t0 = Date()
+        let t0 = ContinuousClock.now
         _ = try await fn.run(
             inputs: ["input_features": melArray, "decoder_input_ids": ids],
             states: InferenceFunction.MutableViews(), outputViews: consume out)
-        stepTimesMs.append(Date().timeIntervalSince(t0) * 1000)
+        stepTimesMs.append((ContinuousClock.now - t0).inMilliseconds)
         let logits = flattenAsFloat(logitsArray)
         let lastStart = (seqLen - 1) * vocabSize
         let lastLogits = Array(logits[lastStart..<lastStart + vocabSize])
@@ -268,5 +282,5 @@ func runLegacy(modelPath: String, audioPath: String?) async throws {
         if next == eotToken { break }
     }
 
-    await printResults(tokens: tokens, stepTimesMs: stepTimesMs)
+    try await printResults(tokens: tokens, stepTimesMs: stepTimesMs)
 }
