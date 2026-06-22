@@ -54,11 +54,11 @@ uv run export.py --help
 
 `image-size=336` keeps the global-attention sequence small enough to fit Neural Engine SRAM; it is the resolution we recommend for ANE deployment.
 
-### ANE compatibility
+### Optimized export (re-authored for iOS)
 
-The optimized export deliberately leaves `enable_per_channel_scale=False` (the coreai-opt default). The WWDC demo notebook used `enable_per_channel_scale=True` because per-channel scale produces visually nicer outputs in PyTorch — but in MPS lowering it becomes `mps.dequantize_lut` ops with rank-6 LUT tensors (`[num_groups, 1, 1, 1, num_palettes, 1]`). ANE hardware caps tensors at rank 5; with hundreds of such ops in image_encode + text_encode the ANE compiler errors out (`Too many fvmlibs (more than 255)`) and the runtime silently falls back to GPU. The fall-back is *slower than the baseline export* because palettized weights pay the dequantization cost without the LUT-cache speedup ANE provides. Keeping per-channel scale off keeps the asset compilable on ANE for the price of a small PyTorch-side quality regression.
+The optimized, re-authored export, as shown in the WWDC26 [Dive into Core AI model authoring and optimization](https://developer.apple.com/videos/play/wwdc2026/325/) video, is exported as the default model (no `--baseline` argument). This export is split into 3 individually-optimized/compressed functions (image encoder, text encoder, detector) at a smaller 336x336 input image resolution.
 
-### Baseline export (parity reference)
+### Baseline export (direct from Hugging Face)
 
 Pass `--baseline` to skip re-authoring and palettization and emit the unmodified `transformers.Sam3Model` as a single-entrypoint asset (one `main` function returning the five raw outputs). Useful for parity / regression checks against the optimized export.
 
@@ -71,7 +71,7 @@ Baseline bundles land at `<repo-root>/exports/<model>_<dtype>/` (e.g. `exports/s
 
 ## Running
 
-## In your iOS and macOS applications
+### In your iOS and macOS applications
 
 ```swift
 import ImageSegmenter
@@ -84,6 +84,7 @@ let segments = try await segmenter.segment(image: cgImage, prompt: "cat")
 ```
 
 ### On your Mac using built-in Command Line Tool
+
 ```bash
 swift run -c release image-segmenter --model path/to/exported_model_folder --prompt "cat" --image path/to/image.jpg
 ```
