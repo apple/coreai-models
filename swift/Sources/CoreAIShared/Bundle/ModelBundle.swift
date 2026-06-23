@@ -82,9 +82,14 @@ public struct ModelBundle: Sendable {
         case kindMismatch(expected: BundleKind, got: BundleKind)
         case missingField(String)
         case missingAsset(key: String, path: URL)
+        case pointedAtModelAsset(URL)
 
         public var description: String {
             switch self {
+            case .pointedAtModelAsset(let url):
+                return "'\(url.lastPathComponent)' is a model asset, not a model bundle "
+                    + "directory. A model bundle directory contains metadata, a tokenizer, "
+                    + "and a model asset."
             case .missingMetadata(let url):
                 return "metadata.json not found at \(url.path)"
             case .malformedMetadata(let url, let err):
@@ -114,6 +119,16 @@ public struct ModelBundle: Sendable {
     }
 
     public init(at url: URL) throws {
+        // A model bundle is a *directory* (metadata.json + assets + tokenizer).
+        // If the caller points us directly at a `.aimodel`/`.aimodelc` asset,
+        // fail with actionable guidance. This must run before any filesystem
+        // read: a compiled `.aimodelc` is itself a directory holding its own
+        // unrelated metadata.json, which would otherwise parse as a bogus 0.1
+        // bundle and surface a misleading "unsupported metadata_version" error.
+        let ext = url.pathExtension.lowercased()
+        if ext == "aimodel" || ext == "aimodelc" {
+            throw BundleError.pointedAtModelAsset(url)
+        }
         let metadataURL = url.appending(path: "metadata.json")
         guard FileManager.default.fileExists(atPath: metadataURL.path) else {
             throw BundleError.missingMetadata(metadataURL)
