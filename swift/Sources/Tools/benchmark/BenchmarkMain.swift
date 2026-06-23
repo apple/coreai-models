@@ -22,7 +22,7 @@ struct LLMBenchmark: AsyncParsableCommand {
         abstract: "LLM inference benchmark for CoreAI models"
     )
 
-    @Option(name: .customLong("model"), help: "Path to model bundle directory")
+    @Option(name: .customLong("model"), help: "Path to a model bundle directory")
     var model: String
 
     @Option(name: [.customShort("p"), .customLong("prompt-tokens")], help: "Length of prompt")
