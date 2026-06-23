@@ -26,15 +26,15 @@ public actor SpeechModel {
     /// Load a model from a bundle directory.
     ///
     /// - Parameters:
-    ///   - bundleURL: Directory containing encoder.aimodel and decoder.aimodel.
+    ///   - url: Directory containing encoder.aimodel and decoder.aimodel.
     ///   - decoder: Decode strategy. Defaults to ``WhisperDecoder``.
     ///   - melConfig: Mel spectrogram parameters. Defaults to ``MelConfig/whisper``.
     public init(
-        bundleURL: URL,
+        resourcesAt url: URL,
         decoder: any SpeechDecoder = WhisperDecoder(),
         melConfig: MelConfig = .whisper
     ) async throws {
-        self.bundle = try await SpeechBundle(at: bundleURL)
+        self.bundle = try await SpeechBundle(at: url)
         self.decoder = decoder
         self.melConfig = melConfig
         try await warmUp()

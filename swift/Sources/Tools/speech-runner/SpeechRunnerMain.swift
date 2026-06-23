@@ -39,7 +39,7 @@ struct SpeechRunner: AsyncParsableCommand {
 
 func runBundle(bundleURL: URL, audioPath: String?) async throws {
     print("Format: split (encoder + decoder, KV cache)")
-    let model = try await SpeechModel(bundleURL: bundleURL)
+    let model = try await SpeechModel(resourcesAt: bundleURL)
 
     if let path = audioPath {
         let url = URL(fileURLWithPath: path)
