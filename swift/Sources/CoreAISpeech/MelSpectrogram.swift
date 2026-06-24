@@ -14,13 +14,57 @@ import Foundation
 public struct MelConfig: Sendable {
     public let sampleRate: Double
     public let nFFT: Int
+    public let winLength: Int
     public let hopLength: Int
     public let nMelBins: Int
-    public let nFrames: Int
+    /// Fixed number of frames; `nil` lets the spectrogram length follow the audio length.
+    public let nFrames: Int?
+    /// Pre-emphasis coefficient applied as `y[t] = x[t] − α·x[t−1]`. `nil` disables it.
+    public let preemphasis: Float?
+    public let normalization: Normalization
+    public let layout: Layout
 
-    /// Whisper / Parakeet shared parameters.
+    public enum Normalization: Sendable {
+        /// Whisper: clip to `max−8`, shift+scale by `(x+4)/4`. log base 10.
+        case whisperLogClip
+        /// Per-instance scalar mean/std normalization on natural-log mel. NeMo/Parakeet convention.
+        case perInstanceMeanStd
+    }
+
+    public enum Layout: Sendable {
+        /// Whisper-style `[B, n_mels, n_frames]`.
+        case channelMajor
+        /// Parakeet-style `[B, n_frames, n_mels]`.
+        case timeMajor
+    }
+
+    public init(
+        sampleRate: Double, nFFT: Int, winLength: Int, hopLength: Int,
+        nMelBins: Int, nFrames: Int?, preemphasis: Float?,
+        normalization: Normalization, layout: Layout
+    ) {
+        self.sampleRate = sampleRate
+        self.nFFT = nFFT
+        self.winLength = winLength
+        self.hopLength = hopLength
+        self.nMelBins = nMelBins
+        self.nFrames = nFrames
+        self.preemphasis = preemphasis
+        self.normalization = normalization
+        self.layout = layout
+    }
+
+    /// Whisper v3-turbo parameters.
     public static let whisper = MelConfig(
-        sampleRate: 16_000, nFFT: 400, hopLength: 160, nMelBins: 128, nFrames: 3_000)
+        sampleRate: 16_000, nFFT: 400, winLength: 400, hopLength: 160,
+        nMelBins: 128, nFrames: 3_000, preemphasis: nil,
+        normalization: .whisperLogClip, layout: .channelMajor)
+
+    /// Parakeet TDT v3 parameters (matches `ParakeetFeatureExtractor`).
+    public static let parakeet = MelConfig(
+        sampleRate: 16_000, nFFT: 512, winLength: 400, hopLength: 160,
+        nMelBins: 128, nFrames: nil, preemphasis: 0.97,
+        normalization: .perInstanceMeanStd, layout: .timeMajor)
 }
 
 // MARK: - MelSpectrogram
@@ -29,43 +73,50 @@ public struct MelConfig: Sendable {
 public enum MelSpectrogram {
     // MARK: Public API
 
+    /// The number of mel frames the configured pipeline will emit for a given PCM length.
+    public static func frameCount(forPCMLength count: Int, config: MelConfig) -> Int {
+        if let n = config.nFrames { return n }
+        // Variable: right-pad to a multiple of hopLength, one frame per hop.
+        let rounded = ((count + config.hopLength - 1) / config.hopLength) * config.hopLength
+        return rounded / config.hopLength
+    }
+
     public static func fromFile(_ url: URL, config: MelConfig = .whisper) throws -> [Float] {
         return fromPCM(try loadAndResample(url, targetSampleRate: config.sampleRate), config: config)
     }
 
     public static func fromPCM(_ raw: [Float], config: MelConfig = .whisper) -> [Float] {
-        let nSamples = config.nFrames * config.hopLength
-
-        var audio = raw
-        if audio.count > nSamples {
-            audio = Array(audio.prefix(nSamples))
-        } else if audio.count < nSamples {
-            audio += [Float](repeating: 0, count: nSamples - audio.count)
-        }
+        let preemph = applyPreemphasis(raw, alpha: config.preemphasis)
+        let (audio, nFrames) = padToFrameGrid(preemph, config: config)
 
         let pad = config.nFFT / 2
-        var padded = [Float](repeating: 0, count: nSamples + 2 * pad)
-        for i in 0..<pad { padded[pad - 1 - i] = audio[i + 1] }
-        for i in 0..<nSamples { padded[pad + i] = audio[i] }
-        for i in 0..<pad { padded[pad + nSamples + i] = audio[nSamples - 2 - i] }
+        let padded = reflectPad(audio, pad: pad)
 
-        let window = hannWindow(size: config.nFFT)
+        let window = hannWindow(size: config.winLength)
+        let frameOffset = (config.nFFT - config.winLength) / 2
         let (cosBasis, sinBasis) = dftBasis(nFFT: config.nFFT)
         let filterbank = melFilterbank(config: config)
         let nFreqs = config.nFFT / 2 + 1
 
+        var windowed = [Float](repeating: 0, count: config.winLength)
         var frame = [Float](repeating: 0, count: config.nFFT)
         var yReal = [Float](repeating: 0, count: nFreqs)
         var yImag = [Float](repeating: 0, count: nFreqs)
         var powerSpec = [Float](repeating: 0, count: nFreqs)
         var melFrame = [Float](repeating: 0, count: config.nMelBins)
-        var mel = [Float](repeating: 0, count: config.nMelBins * config.nFrames)
+        var mel = [Float](repeating: 0, count: config.nMelBins * nFrames)
 
-        for t in 0..<config.nFrames {
+        let logFloor: Float = 1e-10
+        let useLog10 = (config.normalization == .whisperLogClip)
+
+        for t in 0..<nFrames {
             let offset = t * config.hopLength
             vDSP_vmul(
-                Array(padded[offset..<offset + config.nFFT]), 1,
-                window, 1, &frame, 1, vDSP_Length(config.nFFT))
+                Array(padded[offset..<offset + config.winLength]), 1,
+                window, 1, &windowed, 1, vDSP_Length(config.winLength))
+            // Place the windowed slice into a zero-padded nFFT buffer.
+            for i in 0..<config.nFFT { frame[i] = 0 }
+            for i in 0..<config.winLength { frame[frameOffset + i] = windowed[i] }
             cblas_sgemv(
                 CblasRowMajor, CblasNoTrans,
                 Int32(nFreqs), Int32(config.nFFT), 1.0, cosBasis, Int32(config.nFFT),
@@ -80,12 +131,14 @@ public enum MelSpectrogram {
                 Int32(config.nMelBins), Int32(nFreqs), 1.0, filterbank, Int32(nFreqs),
                 powerSpec, 1, 0.0, &melFrame, 1)
             for i in 0..<config.nMelBins {
-                mel[i * config.nFrames + t] = log10(max(melFrame[i], 1e-10))
+                let v = max(melFrame[i], logFloor)
+                let lv = useLog10 ? log10(v) : log(v)
+                let idx = (config.layout == .channelMajor) ? (i * nFrames + t) : (t * config.nMelBins + i)
+                mel[idx] = lv
             }
         }
 
-        let maxVal = mel.max() ?? 0
-        for i in 0..<mel.count { mel[i] = (max(mel[i], maxVal - 8) + 4) / 4 }
+        normalize(&mel, normalization: config.normalization)
         return mel
     }
 
@@ -123,6 +176,68 @@ public enum MelSpectrogram {
             UnsafeBufferPointer(
                 start: out.floatChannelData![0],
                 count: Int(out.frameLength)))
+    }
+
+    // MARK: Preprocessing
+
+    private static func applyPreemphasis(_ raw: [Float], alpha: Float?) -> [Float] {
+        guard let alpha, !raw.isEmpty else { return raw }
+        var out = [Float](repeating: 0, count: raw.count)
+        out[0] = raw[0]
+        for i in 1..<raw.count { out[i] = raw[i] - alpha * raw[i - 1] }
+        return out
+    }
+
+    private static func padToFrameGrid(_ raw: [Float], config: MelConfig) -> ([Float], Int) {
+        if let target = config.nFrames {
+            let n = target * config.hopLength
+            var audio = raw
+            if audio.count > n {
+                audio = Array(audio.prefix(n))
+            } else if audio.count < n {
+                audio += [Float](repeating: 0, count: n - audio.count)
+            }
+            return (audio, target)
+        }
+        let nFrames = frameCount(forPCMLength: raw.count, config: config)
+        let n = nFrames * config.hopLength
+        var audio = raw
+        if audio.count < n {
+            audio += [Float](repeating: 0, count: n - audio.count)
+        } else if audio.count > n {
+            audio = Array(audio.prefix(n))
+        }
+        return (audio, nFrames)
+    }
+
+    private static func reflectPad(_ audio: [Float], pad: Int) -> [Float] {
+        let n = audio.count
+        var padded = [Float](repeating: 0, count: n + 2 * pad)
+        for i in 0..<pad { padded[pad - 1 - i] = audio[i + 1] }
+        for i in 0..<n { padded[pad + i] = audio[i] }
+        for i in 0..<pad { padded[pad + n + i] = audio[n - 2 - i] }
+        return padded
+    }
+
+    private static func normalize(_ mel: inout [Float], normalization: MelConfig.Normalization) {
+        switch normalization {
+        case .whisperLogClip:
+            let maxVal = mel.max() ?? 0
+            for i in 0..<mel.count { mel[i] = (max(mel[i], maxVal - 8) + 4) / 4 }
+        case .perInstanceMeanStd:
+            if mel.isEmpty { return }
+            var sum: Float = 0
+            for v in mel { sum += v }
+            let mean = sum / Float(mel.count)
+            var sqSum: Float = 0
+            for v in mel {
+                let d = v - mean
+                sqSum += d * d
+            }
+            let std = sqrt(sqSum / Float(mel.count))
+            let denom = max(std, 1e-5)
+            for i in 0..<mel.count { mel[i] = (mel[i] - mean) / denom }
+        }
     }
 
     // MARK: Precomputed basis

@@ -13,4 +13,6 @@ public enum BundleKind: String, Codable, Sendable, CaseIterable {
     case vlm
     case diffusion
     case segmenter
+    case speechRecognizer = "speech_recognizer"
+    case speechRecognizerTDT = "speech_recognizer_tdt"
 }

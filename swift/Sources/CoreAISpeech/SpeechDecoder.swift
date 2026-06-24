@@ -7,6 +7,14 @@ import CoreAI
 import CoreAIShared
 import Foundation
 
+// MARK: - DecoderResources
+
+/// Architecture-specific assets handed to a `SpeechDecoder` per call.
+public enum DecoderResources: Sendable {
+    case whisper(decoder: AIModel, generationConfig: GenerationConfig)
+    case parakeetTDT(decoderStep: AIModel, joint: AIModel, config: ParakeetTDTConfig)
+}
+
 // MARK: - SpeechDecoder protocol
 
 /// Model-specific decode logic.
@@ -14,8 +22,7 @@ public protocol SpeechDecoder: Sendable {
     func decode(
         encoderOutput: NDArray,
         encoderOutputShape: [Int],
-        decoderModel: AIModel,
-        config: GenerationConfig
+        resources: DecoderResources
     ) async throws -> [Int32]
 }
 
@@ -28,9 +35,11 @@ public struct WhisperDecoder: SpeechDecoder {
     public func decode(
         encoderOutput: NDArray,
         encoderOutputShape: [Int],
-        decoderModel: AIModel,
-        config: GenerationConfig
+        resources: DecoderResources
     ) async throws -> [Int32] {
+        guard case .whisper(let decoderModel, let config) = resources else {
+            throw SpeechError.incompatibleResources("WhisperDecoder requires .whisper resources")
+        }
         guard let decFn = try decoderModel.loadFunction(named: "main") else {
             throw SpeechError.missingModel("No 'main' function in decoder")
         }

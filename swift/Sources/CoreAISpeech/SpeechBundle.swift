@@ -13,46 +13,110 @@ import Tokenizers
 
 /// Locates and loads the assets inside a CoreAISpeech model bundle directory.
 ///
-/// A bundle directory contains:
-///   encoder.aimodel      — audio features → encoder hidden states
-///   decoder.aimodel      — autoregressive decoder with persistent state
-///   generation_config.json (optional) — prefix, EOT token, etc.
+/// Two layouts are supported:
 ///
-/// The tokenizer is loaded from the local HF cache if it can be found there.
+/// **Whisper (legacy)**: directory contains `encoder.aimodel` + `decoder.aimodel`,
+/// optional `generation_config.json`, and an optional `tokenizer.json` (else loaded
+/// from the local Hugging Face cache).
+///
+/// **Parakeet TDT**: directory contains `metadata.json` (with `kind:
+/// "speech_recognizer_tdt"`, an `assets` map for `encoder` / `decoder_step` /
+/// `joint`, and a TDT `config` block), the three `.aimodel` assets, and a
+/// `processor/` subdirectory carrying the tokenizer.
 public struct SpeechBundle: Sendable {
-    public let encoder: AIModel
-    public let decoder: AIModel
+    public let kind: Kind
     public let tokenizer: (any Tokenizer)?
-    public let generationConfig: GenerationConfig
+
+    public enum Kind: Sendable {
+        case whisper(WhisperAssets)
+        case parakeetTDT(ParakeetTDTAssets)
+    }
+
+    public struct WhisperAssets: Sendable {
+        public let encoder: AIModel
+        public let decoder: AIModel
+        public let generationConfig: GenerationConfig
+        public let melConfig: MelConfig
+    }
+
+    public struct ParakeetTDTAssets: Sendable {
+        public let encoder: AIModel
+        public let decoderStep: AIModel
+        public let joint: AIModel
+        public let config: ParakeetTDTConfig
+        public let melConfig: MelConfig
+    }
 
     public init(at url: URL) async throws {
-        let encURL = url.appending(path: "encoder.aimodel")
-        let decURL = url.appending(path: "decoder.aimodel")
+        let metadataURL = url.appending(path: "metadata.json")
+        if FileManager.default.fileExists(atPath: metadataURL.path) {
+            let bundle = try ModelBundle(at: url)
+            switch bundle.kind {
+            case .speechRecognizerTDT:
+                let assets = try await Self.loadParakeetTDT(bundle: bundle)
+                self.kind = .parakeetTDT(assets)
+                self.tokenizer = try? await Self.loadParakeetTokenizer(bundleURL: url)
+            case .speechRecognizer:
+                let assets = try await Self.loadWhisper(bundleURL: url)
+                self.kind = .whisper(assets)
+                self.tokenizer = try? await Self.loadWhisperTokenizer(
+                    bundleURL: url, config: assets.generationConfig)
+            default:
+                throw SpeechError.missingModel(
+                    "metadata.json kind '\(bundle.kind.rawValue)' is not a speech recognizer")
+            }
+            return
+        }
+        // Legacy Whisper bundle (no metadata.json).
+        let assets = try await Self.loadWhisper(bundleURL: url)
+        self.kind = .whisper(assets)
+        self.tokenizer = try? await Self.loadWhisperTokenizer(
+            bundleURL: url, config: assets.generationConfig)
+    }
+
+    // MARK: - Loaders
+
+    private static func loadWhisper(bundleURL: URL) async throws -> WhisperAssets {
+        let encURL = bundleURL.appending(path: "encoder.aimodel")
+        let decURL = bundleURL.appending(path: "decoder.aimodel")
         guard FileManager.default.fileExists(atPath: encURL.path),
             FileManager.default.fileExists(atPath: decURL.path)
         else {
             throw SpeechError.missingModel(
-                "bundle at \(url.lastPathComponent) must contain encoder.aimodel and decoder.aimodel")
+                "Whisper bundle at \(bundleURL.lastPathComponent) must contain encoder.aimodel and decoder.aimodel")
         }
-        encoder = try await AIModel(contentsOf: encURL)
-        decoder = try await AIModel(contentsOf: decURL)
-
-        // Load generation config from bundle if present, otherwise use Whisper defaults
-        let cfgURL = url.appending(path: "generation_config.json")
-        generationConfig = (try? GenerationConfig(from: cfgURL)) ?? .whisper
-
-        // Tokenizer — look in bundle first, then fall back to HF cache
-        tokenizer = try? await Self.loadTokenizer(bundleURL: url, config: generationConfig)
+        let encoder = try await AIModel(contentsOf: encURL)
+        let decoder = try await AIModel(contentsOf: decURL)
+        let cfgURL = bundleURL.appending(path: "generation_config.json")
+        let generationConfig = (try? GenerationConfig(from: cfgURL)) ?? .whisper
+        return WhisperAssets(
+            encoder: encoder, decoder: decoder,
+            generationConfig: generationConfig, melConfig: .whisper)
     }
 
-    private static func loadTokenizer(
+    private static func loadParakeetTDT(bundle: ModelBundle) async throws -> ParakeetTDTAssets {
+        let encURL = try bundle.requireModelURL(for: "encoder")
+        let stepURL = try bundle.requireModelURL(for: "decoder_step")
+        let jointURL = try bundle.requireModelURL(for: "joint")
+        let encoder = try await AIModel(contentsOf: encURL)
+        let decoderStep = try await AIModel(contentsOf: stepURL)
+        let joint = try await AIModel(contentsOf: jointURL)
+        let config = try ParakeetTDTConfig.decode(fromMetadata: bundle.raw)
+        return ParakeetTDTAssets(
+            encoder: encoder, decoderStep: decoderStep, joint: joint,
+            config: config, melConfig: .parakeet)
+    }
+
+    // MARK: - Tokenizer loading
+
+    private static func loadWhisperTokenizer(
         bundleURL: URL, config: GenerationConfig
     ) async throws -> (any Tokenizer)? {
-        // 1. Try tokenizer files in the bundle itself
+        // 1. tokenizer.json next to the assets.
         if FileManager.default.fileExists(atPath: bundleURL.appending(path: "tokenizer.json").path) {
             return try? await AutoTokenizer.from(modelFolder: bundleURL)
         }
-        // 2. Fall back to local HF cache using the model name from config
+        // 2. Local HF cache via the model name from the generation config.
         if let name = config.tokenizerName {
             let cacheRoot = FileManager.default.homeDirectoryForCurrentUser
                 .appending(path: ".cache/huggingface/hub")
@@ -67,11 +131,25 @@ public struct SpeechBundle: Sendable {
         }
         return nil
     }
+
+    private static func loadParakeetTokenizer(bundleURL: URL) async throws -> (any Tokenizer)? {
+        // Parakeet bundles ship the tokenizer in `processor/`.
+        let processor = bundleURL.appending(path: "processor")
+        if FileManager.default.fileExists(atPath: processor.appending(path: "tokenizer.json").path) {
+            do {
+                return try await AutoTokenizer.from(modelFolder: processor, strict: false)
+            } catch {
+                fputs("[SpeechBundle] Failed to load Parakeet tokenizer: \(error)\n", stderr)
+                return nil
+            }
+        }
+        return nil
+    }
 }
 
-// MARK: - GenerationConfig
+// MARK: - GenerationConfig (Whisper)
 
-/// Model-specific generation parameters, read from generation_config.json in the bundle.
+/// Whisper-style generation parameters, read from `generation_config.json` in the bundle.
 public struct GenerationConfig: Sendable {
     /// Tokens prepended to every decode sequence before free generation.
     public let forcedPrefix: [Int32]
@@ -120,12 +198,93 @@ public struct GenerationConfig: Sendable {
     }
 }
 
+// MARK: - ParakeetTDTConfig
+
+/// Parakeet TDT decoder configuration, decoded from the `config` block of a
+/// `speech_recognizer_tdt` bundle's metadata.json.
+public struct ParakeetTDTConfig: Sendable {
+    public let vocabSize: Int
+    public let blankTokenId: Int32
+    public let decoderHiddenSize: Int
+    public let numDecoderLayers: Int
+    public let maxSymbolsPerStep: Int
+    public let durations: [Int]
+    public let encoderNumMelBins: Int
+    public let encoderSubsamplingFactor: Int
+
+    public init(
+        vocabSize: Int, blankTokenId: Int32, decoderHiddenSize: Int,
+        numDecoderLayers: Int, maxSymbolsPerStep: Int, durations: [Int],
+        encoderNumMelBins: Int, encoderSubsamplingFactor: Int
+    ) {
+        self.vocabSize = vocabSize
+        self.blankTokenId = blankTokenId
+        self.decoderHiddenSize = decoderHiddenSize
+        self.numDecoderLayers = numDecoderLayers
+        self.maxSymbolsPerStep = maxSymbolsPerStep
+        self.durations = durations
+        self.encoderNumMelBins = encoderNumMelBins
+        self.encoderSubsamplingFactor = encoderSubsamplingFactor
+    }
+
+    static func decode(fromMetadata raw: Data) throws -> ParakeetTDTConfig {
+        let payload = try JSONDecoder().decode(MetadataPayload.self, from: raw)
+        guard let cfg = payload.config else {
+            throw ModelBundle.BundleError.missingField("config")
+        }
+        return ParakeetTDTConfig(
+            vocabSize: cfg.vocabSize,
+            blankTokenId: Int32(cfg.blankTokenId),
+            decoderHiddenSize: cfg.decoderHiddenSize,
+            numDecoderLayers: cfg.numDecoderLayers,
+            maxSymbolsPerStep: cfg.maxSymbolsPerStep,
+            durations: cfg.durations,
+            encoderNumMelBins: cfg.encoder.numMelBins,
+            encoderSubsamplingFactor: cfg.encoder.subsamplingFactor)
+    }
+
+    fileprivate struct MetadataPayload: Decodable {
+        let config: ConfigBlock?
+    }
+
+    fileprivate struct ConfigBlock: Decodable {
+        let vocabSize: Int
+        let blankTokenId: Int
+        let decoderHiddenSize: Int
+        let numDecoderLayers: Int
+        let maxSymbolsPerStep: Int
+        let durations: [Int]
+        let encoder: EncoderBlock
+
+        enum CodingKeys: String, CodingKey {
+            case vocabSize = "vocab_size"
+            case blankTokenId = "blank_token_id"
+            case decoderHiddenSize = "decoder_hidden_size"
+            case numDecoderLayers = "num_decoder_layers"
+            case maxSymbolsPerStep = "max_symbols_per_step"
+            case durations
+            case encoder
+        }
+    }
+
+    fileprivate struct EncoderBlock: Decodable {
+        let numMelBins: Int
+        let subsamplingFactor: Int
+
+        enum CodingKeys: String, CodingKey {
+            case numMelBins = "num_mel_bins"
+            case subsamplingFactor = "subsampling_factor"
+        }
+    }
+}
+
 // MARK: - SpeechError
 
 public enum SpeechError: Error, CustomStringConvertible {
     case missingModel(String)
     case missingTokenizer
     case invalidAudio(String)
+    case incompatibleResources(String)
 
     public var description: String {
         switch self {
@@ -133,6 +292,7 @@ public enum SpeechError: Error, CustomStringConvertible {
         case .missingTokenizer:
             return "Tokenizer not found — ensure the model bundle includes a tokenizer or the HF cache is populated"
         case .invalidAudio(let msg): return "Invalid audio: \(msg)"
+        case .incompatibleResources(let msg): return "Incompatible decoder resources: \(msg)"
         }
     }
 }

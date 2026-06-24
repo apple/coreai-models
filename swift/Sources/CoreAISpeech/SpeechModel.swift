@@ -12,32 +12,38 @@ import Tokenizers
 
 /// On-device speech recognition model.
 ///
-/// Loads a CoreAISpeech bundle (encoder.aimodel + decoder.aimodel) and transcribes
-/// audio files. The decoder architecture is pluggable via ``SpeechDecoder``
+/// Loads a CoreAISpeech bundle and transcribes audio. Supports both Whisper-style
+/// encoder-decoder bundles and Parakeet TDT bundles; the architecture is
+/// auto-detected from the bundle's metadata.json (or the legacy
+/// encoder/decoder filename convention for Whisper).
 public actor SpeechModel {
     private let bundle: SpeechBundle
     private let decoder: any SpeechDecoder
     private let melConfig: MelConfig
+    private let resources: DecoderResources
 
-    // Encoder function and descriptor, cached after first load
-    private var encFn: InferenceFunction?
-    private var encOutShape: [Int]?
-
-    /// Load a model from a bundle directory.
-    ///
-    /// - Parameters:
-    ///   - url: Directory containing encoder.aimodel and decoder.aimodel.
-    ///   - decoder: Decode strategy. Defaults to ``WhisperDecoder``.
-    ///   - melConfig: Mel spectrogram parameters. Defaults to ``MelConfig/whisper``.
-    public init(
-        resourcesAt url: URL,
-        decoder: any SpeechDecoder = WhisperDecoder(),
-        melConfig: MelConfig = .whisper
-    ) async throws {
+    public init(resourcesAt url: URL) async throws {
         self.bundle = try await SpeechBundle(at: url)
-        self.decoder = decoder
-        self.melConfig = melConfig
+        switch bundle.kind {
+        case .whisper(let assets):
+            self.decoder = WhisperDecoder()
+            self.melConfig = assets.melConfig
+            self.resources = .whisper(decoder: assets.decoder, generationConfig: assets.generationConfig)
+        case .parakeetTDT(let assets):
+            self.decoder = ParakeetTDTDecoder()
+            self.melConfig = assets.melConfig
+            self.resources = .parakeetTDT(
+                decoderStep: assets.decoderStep, joint: assets.joint, config: assets.config)
+        }
         try await warmUp()
+    }
+
+    /// Human-readable architecture label (for logging).
+    public var architecture: String {
+        switch bundle.kind {
+        case .whisper: return "Whisper"
+        case .parakeetTDT: return "Parakeet TDT"
+        }
     }
 
     // MARK: - Transcription
@@ -56,45 +62,53 @@ public actor SpeechModel {
 
     // MARK: - Internals
 
+    private var encoder: AIModel {
+        switch bundle.kind {
+        case .whisper(let a): return a.encoder
+        case .parakeetTDT(let a): return a.encoder
+        }
+    }
+
     private func warmUp() async throws {
-        // Run the encoder once with silence to trigger JIT compilation
-        guard let fn = try bundle.encoder.loadFunction(named: "main") else {
+        let nSamples: Int
+        switch bundle.kind {
+        case .whisper:
+            nSamples = (melConfig.nFrames ?? 3_000) * melConfig.hopLength
+        case .parakeetTDT:
+            // 5 s of silence — matches the static export's traced shape and is
+            // representative for dynamic exports too.
+            nSamples = Int(melConfig.sampleRate) * 5
+        }
+        _ = try await runEncoder(pcm: [Float](repeating: 0, count: nSamples))
+    }
+
+    /// Run the encoder over PCM and return the encoder hidden states + concrete shape.
+    private func runEncoder(pcm: [Float]) async throws -> (NDArray, [Int]) {
+        guard let fn = try encoder.loadFunction(named: "main") else {
             throw SpeechError.missingModel("No 'main' function in encoder")
         }
-        encFn = fn
-        let encDesc = bundle.encoder.functionDescriptor(for: "main")!
-        guard case .ndArray(let encOutNDDesc) = encDesc.outputDescriptor(of: "encoder_hidden_states")
-        else { throw SpeechError.missingModel("Unexpected encoder output descriptor") }
-        encOutShape = encOutNDDesc.shape
-
+        let encDesc = encoder.functionDescriptor(for: "main")!
         guard case .ndArray(let melNDDesc) = encDesc.inputDescriptor(of: "input_features")
         else { throw SpeechError.missingModel("Unexpected encoder input descriptor") }
 
-        var silence = NDArray(
-            descriptor: melNDDesc.resolvingDynamicDimensions([1, melConfig.nMelBins, melConfig.nFrames]))
-        fillNDArray(&silence, as: Float.self, count: melConfig.nMelBins * melConfig.nFrames) { _ in 0.0 }
-        var encOut = NDArray(descriptor: encOutNDDesc.resolvingDynamicDimensions(encOutNDDesc.shape))
-        var out = InferenceFunction.MutableViews()
-        out.insert(&encOut, for: "encoder_hidden_states")
-        _ = try await fn.run(
-            inputs: ["input_features": silence],
-            states: InferenceFunction.MutableViews(), outputViews: consume out)
+        let mel = MelSpectrogram.fromPCM(pcm, config: melConfig)
+        let nFrames = MelSpectrogram.frameCount(forPCMLength: pcm.count, config: melConfig)
+        let inputShape = encoderInputShape(nFrames: nFrames)
+        var melArray = NDArray(descriptor: melNDDesc.resolvingDynamicDimensions(inputShape))
+        fillNDArray(&melArray, as: Float.self, with: mel)
+
+        var outputs = try await fn.run(inputs: ["input_features": melArray])
+        guard let encOut = outputs.remove("encoder_hidden_states")?.ndArray else {
+            throw SpeechError.missingModel("Encoder did not produce 'encoder_hidden_states'")
+        }
+        return (encOut, encOut.shape)
     }
 
-    private func runEncoder(_ melArray: inout NDArray) async throws -> NDArray {
-        guard let fn = encFn, let shape = encOutShape else {
-            throw SpeechError.missingModel("Encoder not initialised")
+    private func encoderInputShape(nFrames: Int) -> [Int] {
+        switch melConfig.layout {
+        case .channelMajor: return [1, melConfig.nMelBins, nFrames]
+        case .timeMajor: return [1, nFrames, melConfig.nMelBins]
         }
-        let encDesc = bundle.encoder.functionDescriptor(for: "main")!
-        guard case .ndArray(let encOutNDDesc) = encDesc.outputDescriptor(of: "encoder_hidden_states")
-        else { throw SpeechError.missingModel("Unexpected encoder output") }
-        var encOut = NDArray(descriptor: encOutNDDesc.resolvingDynamicDimensions(shape))
-        var out = InferenceFunction.MutableViews()
-        out.insert(&encOut, for: "encoder_hidden_states")
-        _ = try await fn.run(
-            inputs: ["input_features": melArray],
-            states: InferenceFunction.MutableViews(), outputViews: consume out)
-        return encOut
     }
 
     private func decodeAudio(from url: URL) async throws -> [Int32] {
@@ -103,28 +117,23 @@ public actor SpeechModel {
     }
 
     private func decodeAudio(pcm: [Float]) async throws -> [Int32] {
-        let encDesc = bundle.encoder.functionDescriptor(for: "main")!
-        guard case .ndArray(let melNDDesc) = encDesc.inputDescriptor(of: "input_features")
-        else { throw SpeechError.missingModel("Unexpected encoder input") }
-
-        let floats = MelSpectrogram.fromPCM(pcm, config: melConfig)
-        var melArray = NDArray(
-            descriptor: melNDDesc.resolvingDynamicDimensions(
-                [1, melConfig.nMelBins, melConfig.nFrames]))
-        fillNDArray(&melArray, as: Float.self, with: floats)
-
-        let encoderOutput = try await runEncoder(&melArray)
-        let shape = encOutShape ?? [1, 1500, 1280]
+        let (encOut, encShape) = try await runEncoder(pcm: pcm)
         return try await decoder.decode(
-            encoderOutput: encoderOutput,
-            encoderOutputShape: shape,
-            decoderModel: bundle.decoder,
-            config: bundle.generationConfig)
+            encoderOutput: encOut,
+            encoderOutputShape: encShape,
+            resources: resources)
     }
 
     private func detokenize(_ tokens: [Int32]) throws -> String {
         guard let tokenizer = bundle.tokenizer else { throw SpeechError.missingTokenizer }
-        let ids = tokens.filter { $0 < bundle.generationConfig.eotToken }.map { Int($0) }
+        let ids: [Int]
+        switch bundle.kind {
+        case .whisper(let assets):
+            ids = tokens.filter { $0 < assets.generationConfig.eotToken }.map { Int($0) }
+        case .parakeetTDT:
+            // Decoder already filters blanks; pass everything through.
+            ids = tokens.map { Int($0) }
+        }
         return tokenizer.decode(tokens: ids).trimmingCharacters(in: .whitespaces)
     }
 }

@@ -74,6 +74,7 @@ func runBundle(bundleURL: URL, audioPath: String?) async throws {
     let model = try await SpeechModel(resourcesAt: bundleURL)
     let loadElapsed = ContinuousClock.now - loadStart
     print(" done in \(String(format: "%.3f", loadElapsed.inSeconds))s\(cacheHit ? " (cache hit)" : "")")
+    print("Format: bundle (\(await model.architecture))")
 
     if let path = audioPath {
         let url = URL(fileURLWithPath: path)
