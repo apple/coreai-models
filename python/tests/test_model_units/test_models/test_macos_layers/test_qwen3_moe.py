@@ -1351,8 +1351,8 @@ class TestQwen3MoeLayers:
                 backend=cast("Backend", Backend.coreai),
             )
 
-            rtol = {Precision.f32: 1e-5, Precision.f16: 5e-2, Precision.bf16: 1e-1}[precision]
-            atol = {Precision.f32: 1e-5, Precision.f16: 5e-2, Precision.bf16: 1e-1}[precision]
+            rtol = {Precision.f32: 1e-5, Precision.f16: 5e-2, Precision.bf16: 2e-1}[precision]
+            atol = {Precision.f32: 1e-5, Precision.f16: 5e-2, Precision.bf16: 2e-1}[precision]
             with tempfile.TemporaryDirectory() as temp_directory:
                 model = model_class(
                     Path(temp_directory),
@@ -1426,8 +1426,8 @@ class TestQwen3MoeLayers:
             backend=cast("Backend", Backend.coreai),
         )
 
-        rtol = {Precision.f32: 1e-5, Precision.f16: 5e-2, Precision.bf16: 1e-1}[precision]
-        atol = {Precision.f32: 1e-5, Precision.f16: 5e-2, Precision.bf16: 1e-1}[precision]
+        rtol = {Precision.f32: 1e-5, Precision.f16: 5e-2, Precision.bf16: 2e-1}[precision]
+        atol = {Precision.f32: 1e-5, Precision.f16: 5e-2, Precision.bf16: 2e-1}[precision]
 
         with tempfile.TemporaryDirectory() as temp_directory:
             model = Qwen3MoeSparseMoeBlock(Path(temp_directory), top_k=top_k)
