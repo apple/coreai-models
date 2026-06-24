@@ -23,6 +23,7 @@ public struct MelConfig: Sendable {
     public let preemphasis: Float?
     public let normalization: Normalization
     public let layout: Layout
+    public let padMode: PadMode
 
     public enum Normalization: Sendable {
         /// Whisper: clip to `max−8`, shift+scale by `(x+4)/4`. log base 10.
@@ -38,10 +39,28 @@ public struct MelConfig: Sendable {
         case timeMajor
     }
 
+    public enum PadMode: Sendable {
+        /// Mirror the signal across the boundary (matches torch.stft `pad_mode="reflect"`).
+        case reflect
+        /// Zero-pad the boundary (matches torch.stft `pad_mode="constant"` — what HF
+        /// `ParakeetFeatureExtractor` uses).
+        case constant
+    }
+
+    public enum MelScale: Sendable {
+        /// `2595·log10(1 + f/700)` — original HTK formula. Whisper's convention.
+        case htk
+        /// Slaney auditory toolbox: linear ≤ 1000Hz at `1 mel = 200/3 Hz`, log
+        /// above with step `log(6.4)/27`. Default for `librosa.filters.mel` and
+        /// what HF `ParakeetFeatureExtractor` uses.
+        case slaney
+    }
+
     public init(
         sampleRate: Double, nFFT: Int, winLength: Int, hopLength: Int,
         nMelBins: Int, nFrames: Int?, preemphasis: Float?,
-        normalization: Normalization, layout: Layout
+        normalization: Normalization, layout: Layout,
+        padMode: PadMode, melScale: MelScale
     ) {
         self.sampleRate = sampleRate
         self.nFFT = nFFT
@@ -52,19 +71,31 @@ public struct MelConfig: Sendable {
         self.preemphasis = preemphasis
         self.normalization = normalization
         self.layout = layout
+        self.padMode = padMode
+        self.melScale = melScale
     }
+
+    public let melScale: MelScale
 
     /// Whisper v3-turbo parameters.
     public static let whisper = MelConfig(
         sampleRate: 16_000, nFFT: 400, winLength: 400, hopLength: 160,
         nMelBins: 128, nFrames: 3_000, preemphasis: nil,
-        normalization: .whisperLogClip, layout: .channelMajor)
+        normalization: .whisperLogClip, layout: .channelMajor,
+        padMode: .reflect, melScale: .htk)
 
-    /// Parakeet TDT v3 parameters (matches `ParakeetFeatureExtractor`).
+    /// Parakeet TDT v3 parameters. HF `ParakeetFeatureExtractor` uses Slaney mel,
+    /// per-mel-bin Bessel-corrected normalization, and the `soxr_hq` resampler;
+    /// we currently use HTK mel + scalar normalization + AVAudioConverter, which
+    /// happens to give better empirical transcripts on our test clips than the
+    /// "more correct" HF spec because the model is fed slightly different mel
+    /// regardless (the resampler is the dominant mismatch). Don't change these
+    /// without testing transcripts on multiple clips.
     public static let parakeet = MelConfig(
         sampleRate: 16_000, nFFT: 512, winLength: 400, hopLength: 160,
         nMelBins: 128, nFrames: nil, preemphasis: 0.97,
-        normalization: .perInstanceMeanStd, layout: .timeMajor)
+        normalization: .perInstanceMeanStd, layout: .timeMajor,
+        padMode: .constant, melScale: .htk)
 }
 
 // MARK: - MelSpectrogram
@@ -76,9 +107,11 @@ public enum MelSpectrogram {
     /// The number of mel frames the configured pipeline will emit for a given PCM length.
     public static func frameCount(forPCMLength count: Int, config: MelConfig) -> Int {
         if let n = config.nFrames { return n }
-        // Variable: right-pad to a multiple of hopLength, one frame per hop.
-        let rounded = ((count + config.hopLength - 1) / config.hopLength) * config.hopLength
-        return rounded / config.hopLength
+        // torch.stft with center=True emits `1 + N // hop` frames. HF's
+        // ParakeetFeatureExtractor passes that whole tensor to the encoder
+        // (with the trailing frame zeroed via attention_mask) — we match
+        // its shape so the encoder sees the same number of time steps.
+        return 1 + count / config.hopLength
     }
 
     public static func fromFile(_ url: URL, config: MelConfig = .whisper) throws -> [Float] {
@@ -87,10 +120,15 @@ public enum MelSpectrogram {
 
     public static func fromPCM(_ raw: [Float], config: MelConfig = .whisper) -> [Float] {
         let preemph = applyPreemphasis(raw, alpha: config.preemphasis)
-        let (audio, nFrames) = padToFrameGrid(preemph, config: config)
+        let (audio, validFrames) = padToFrameGrid(preemph, config: config)
+        // For variable-length configs we allocate one extra trailing frame
+        // (left as zeros) so the encoder sees `1 + N//hop` time steps — same
+        // as torch.stft(center=True). For fixed-length (Whisper) configs,
+        // total == valid.
+        let totalFrames = (config.nFrames == nil) ? validFrames + 1 : validFrames
 
         let pad = config.nFFT / 2
-        let padded = reflectPad(audio, pad: pad)
+        let padded = padAudio(audio, pad: pad, mode: config.padMode)
 
         let window = hannWindow(size: config.winLength)
         let frameOffset = (config.nFFT - config.winLength) / 2
@@ -104,12 +142,12 @@ public enum MelSpectrogram {
         var yImag = [Float](repeating: 0, count: nFreqs)
         var powerSpec = [Float](repeating: 0, count: nFreqs)
         var melFrame = [Float](repeating: 0, count: config.nMelBins)
-        var mel = [Float](repeating: 0, count: config.nMelBins * nFrames)
+        var mel = [Float](repeating: 0, count: config.nMelBins * totalFrames)
 
         let logFloor: Float = 1e-10
         let useLog10 = (config.normalization == .whisperLogClip)
 
-        for t in 0..<nFrames {
+        for t in 0..<validFrames {
             let offset = t * config.hopLength
             vDSP_vmul(
                 Array(padded[offset..<offset + config.winLength]), 1,
@@ -133,12 +171,16 @@ public enum MelSpectrogram {
             for i in 0..<config.nMelBins {
                 let v = max(melFrame[i], logFloor)
                 let lv = useLog10 ? log10(v) : log(v)
-                let idx = (config.layout == .channelMajor) ? (i * nFrames + t) : (t * config.nMelBins + i)
+                let idx = (config.layout == .channelMajor) ? (i * totalFrames + t) : (t * config.nMelBins + i)
                 mel[idx] = lv
             }
         }
 
-        normalize(&mel, normalization: config.normalization)
+        // Normalize over the *valid* portion only — the trailing zero frame
+        // (if any) stays zero, matching HF's masked-out-tail behavior.
+        normalize(
+            &mel, normalization: config.normalization,
+            validCount: validFrames * config.nMelBins)
         return mel
     }
 
@@ -199,44 +241,58 @@ public enum MelSpectrogram {
             }
             return (audio, target)
         }
-        let nFrames = frameCount(forPCMLength: raw.count, config: config)
-        let n = nFrames * config.hopLength
+        // Variable-length: HF emits `1 + N//hop` frames with the last zeroed
+        // (torch.stft center=True semantics). We compute `validFrames = N//hop`
+        // valid frames here; the caller appends a trailing zero frame to match
+        // HF's tensor shape.
+        let validFrames = raw.count / config.hopLength
+        let n = validFrames * config.hopLength
         var audio = raw
         if audio.count < n {
             audio += [Float](repeating: 0, count: n - audio.count)
         } else if audio.count > n {
             audio = Array(audio.prefix(n))
         }
-        return (audio, nFrames)
+        return (audio, validFrames)
     }
 
-    private static func reflectPad(_ audio: [Float], pad: Int) -> [Float] {
+    private static func padAudio(_ audio: [Float], pad: Int, mode: MelConfig.PadMode) -> [Float] {
         let n = audio.count
         var padded = [Float](repeating: 0, count: n + 2 * pad)
-        for i in 0..<pad { padded[pad - 1 - i] = audio[i + 1] }
         for i in 0..<n { padded[pad + i] = audio[i] }
-        for i in 0..<pad { padded[pad + n + i] = audio[n - 2 - i] }
+        switch mode {
+        case .constant:
+            break  // edges already zero-filled
+        case .reflect:
+            for i in 0..<pad { padded[pad - 1 - i] = audio[i + 1] }
+            for i in 0..<pad { padded[pad + n + i] = audio[n - 2 - i] }
+        }
         return padded
     }
 
-    private static func normalize(_ mel: inout [Float], normalization: MelConfig.Normalization) {
+    private static func normalize(
+        _ mel: inout [Float], normalization: MelConfig.Normalization, validCount: Int? = nil
+    ) {
+        let count = validCount ?? mel.count
         switch normalization {
         case .whisperLogClip:
+            // Whisper has fixed nFrames so validCount == mel.count; operate on whole array.
             let maxVal = mel.max() ?? 0
             for i in 0..<mel.count { mel[i] = (max(mel[i], maxVal - 8) + 4) / 4 }
         case .perInstanceMeanStd:
-            if mel.isEmpty { return }
+            if count == 0 { return }
             var sum: Float = 0
-            for v in mel { sum += v }
-            let mean = sum / Float(mel.count)
+            for i in 0..<count { sum += mel[i] }
+            let mean = sum / Float(count)
             var sqSum: Float = 0
-            for v in mel {
-                let d = v - mean
+            for i in 0..<count {
+                let d = mel[i] - mean
                 sqSum += d * d
             }
-            let std = sqrt(sqSum / Float(mel.count))
+            let std = sqrt(sqSum / Float(count))
             let denom = max(std, 1e-5)
-            for i in 0..<mel.count { mel[i] = (mel[i] - mean) / denom }
+            for i in 0..<count { mel[i] = (mel[i] - mean) / denom }
+        // Trailing entries beyond `count` (if any) stay zero.
         }
     }
 
@@ -262,25 +318,50 @@ public enum MelSpectrogram {
 
     private static func melFilterbank(config: MelConfig) -> [Float] {
         let nFreqs = config.nFFT / 2 + 1
-        let fMax = Float(config.sampleRate) / 2
-        func h2m(_ f: Float) -> Float { 2595 * log10(1 + f / 700) }
-        func m2h(_ m: Float) -> Float { 700 * (pow(10, m / 2595) - 1) }
-        let pts = (0..<config.nMelBins + 2).map { i -> Float in
-            m2h(h2m(0) + Float(i) / Float(config.nMelBins + 1) * (h2m(fMax) - h2m(0)))
+        let fMax = Double(config.sampleRate) / 2
+
+        // HTK mel — original 1980 toolkit. Whisper uses this.
+        func htkH2M(_ f: Double) -> Double { 2595 * Foundation.log10(1 + f / 700) }
+        func htkM2H(_ m: Double) -> Double { 700 * (Foundation.pow(10, m / 2595) - 1) }
+        // Slaney auditory toolbox — librosa default; HF Parakeet uses this.
+        let fSp: Double = 200.0 / 3
+        let minLogHz: Double = 1000
+        let minLogMel: Double = minLogHz / fSp  // = 15
+        let logstep: Double = Foundation.log(6.4) / 27
+        func slaneyH2M(_ f: Double) -> Double {
+            f >= minLogHz ? minLogMel + Foundation.log(f / minLogHz) / logstep : f / fSp
         }
-        let fftFreqs = (0..<nFreqs).map { Float($0) * Float(config.sampleRate) / Float(config.nFFT) }
+        func slaneyM2H(_ m: Double) -> Double {
+            m >= minLogMel ? minLogHz * Foundation.exp(logstep * (m - minLogMel)) : fSp * m
+        }
+
+        let h2m: (Double) -> Double
+        let m2h: (Double) -> Double
+        switch config.melScale {
+        case .htk:
+            h2m = htkH2M
+            m2h = htkM2H
+        case .slaney:
+            h2m = slaneyH2M
+            m2h = slaneyM2H
+        }
+
+        let pts = (0..<config.nMelBins + 2).map { i -> Double in
+            m2h(h2m(0) + Double(i) / Double(config.nMelBins + 1) * (h2m(fMax) - h2m(0)))
+        }
+        let fftFreqs = (0..<nFreqs).map { Double($0) * Double(config.sampleRate) / Double(config.nFFT) }
         var fb = [Float](repeating: 0, count: config.nMelBins * nFreqs)
         for m in 0..<config.nMelBins {
             let fL = pts[m]
             let fC = pts[m + 1]
             let fR = pts[m + 2]
-            let norm: Float = 2 / (fR - fL)
+            let norm: Double = 2 / (fR - fL)
             for k in 0..<nFreqs {
                 let f = fftFreqs[k]
                 if f >= fL && f <= fC {
-                    fb[m * nFreqs + k] = norm * (f - fL) / (fC - fL)
+                    fb[m * nFreqs + k] = Float(norm * (f - fL) / (fC - fL))
                 } else if f > fC && f <= fR {
-                    fb[m * nFreqs + k] = norm * (fR - f) / (fR - fC)
+                    fb[m * nFreqs + k] = Float(norm * (fR - f) / (fR - fC))
                 }
             }
         }
