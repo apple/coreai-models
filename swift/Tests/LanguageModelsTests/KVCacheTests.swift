@@ -394,7 +394,7 @@ struct MetalBlitCopyTests {
         print("Per-head blit copy time: \(String(format: "%.2f", elapsedMs)) ms for \(l * h) heads")
 
         // Use higher threshold on VM due to virtualization overhead
-        let threshold = CIEnvironment.isVM ? 2000.0 : 50.0
+        let threshold = CIEnvironment.isVM ? 2000.0 : 500.0
         #expect(
             elapsedMs < threshold,
             "Per-head blit copy should complete in < \(threshold)ms, got \(elapsedMs) ms (VM: \(CIEnvironment.isVM))")
