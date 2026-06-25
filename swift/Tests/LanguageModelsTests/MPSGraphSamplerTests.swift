@@ -30,7 +30,7 @@ struct MPSGraphArgmaxSamplerTests {
 
         let targetIndex = 12345
         let logitsBuffer = try #require(device.makeBuffer(length: Self.vocabSize32K * 2, options: .storageModeShared))
-        let outputBuffer = try #require(device.makeBuffer(length: 4, options: .storageModeShared))
+        let outputBuffer = try #require(device.makeBuffer(length: 64, options: .storageModeShared))
 
         let logitsPtr = logitsBuffer.contents().assumingMemoryBound(to: Float16.self)
         for i in 0..<Self.vocabSize32K {
@@ -63,7 +63,7 @@ struct MPSGraphArgmaxSamplerTests {
 
         let targetIndex = 100000
         let logitsBuffer = try #require(device.makeBuffer(length: Self.vocabSize150K * 2, options: .storageModeShared))
-        let outputBuffer = try #require(device.makeBuffer(length: 4, options: .storageModeShared))
+        let outputBuffer = try #require(device.makeBuffer(length: 64, options: .storageModeShared))
 
         let logitsPtr = logitsBuffer.contents().assumingMemoryBound(to: Float16.self)
         for i in 0..<Self.vocabSize150K {
@@ -98,7 +98,7 @@ struct MPSGraphArgmaxSamplerTests {
         let targetIndex = 15000
         let totalElements = queryLength * Self.vocabSize32K
         let logitsBuffer = try #require(device.makeBuffer(length: totalElements * 2, options: .storageModeShared))
-        let outputBuffer = try #require(device.makeBuffer(length: 4, options: .storageModeShared))
+        let outputBuffer = try #require(device.makeBuffer(length: 64, options: .storageModeShared))
 
         let logitsPtr = logitsBuffer.contents().assumingMemoryBound(to: Float16.self)
         for i in 0..<totalElements {
@@ -133,7 +133,7 @@ struct MPSGraphArgmaxSamplerTests {
         let sampler = try MPSGraphArgmaxSampler(device: device, vocabSize: Self.vocabSize150K)
 
         let logitsBuffer = try #require(device.makeBuffer(length: Self.vocabSize150K * 2, options: .storageModeShared))
-        let outputBuffer = try #require(device.makeBuffer(length: 4, options: .storageModeShared))
+        let outputBuffer = try #require(device.makeBuffer(length: 64, options: .storageModeShared))
 
         let queue = try #require(device.makeCommandQueue())
 
@@ -187,7 +187,7 @@ struct MPSGraphArgmaxSamplerTests {
         let sampler = try MPSGraphArgmaxSampler(device: device, vocabSize: Self.vocabSize32K)
 
         let logitsBuffer = try #require(device.makeBuffer(length: Self.vocabSize32K * 2, options: .storageModeShared))
-        let outputBuffer = try #require(device.makeBuffer(length: 4, options: .storageModeShared))
+        let outputBuffer = try #require(device.makeBuffer(length: 64, options: .storageModeShared))
         let queue = try #require(device.makeCommandQueue())
 
         // Test first index (0)
@@ -251,7 +251,7 @@ struct MPSGraphCompositeSamplerTests {
             device: device, vocabSize: Self.vocabSize, k: Self.k, temperature: 1.0)
 
         let logitsBuffer = try #require(device.makeBuffer(length: Self.vocabSize * 2, options: .storageModeShared))
-        let outputBuffer = try #require(device.makeBuffer(length: 4, options: .storageModeShared))
+        let outputBuffer = try #require(device.makeBuffer(length: 64, options: .storageModeShared))
 
         // Create logits where only a few tokens have high probability
         let logitsPtr = logitsBuffer.contents().assumingMemoryBound(to: Float16.self)
@@ -301,7 +301,7 @@ struct MPSGraphCompositeSamplerTests {
             device: device, vocabSize: Self.vocabSize, k: Self.k, temperature: 0.1)
 
         let logitsBuffer = try #require(device.makeBuffer(length: Self.vocabSize * 2, options: .storageModeShared))
-        let outputBuffer = try #require(device.makeBuffer(length: 4, options: .storageModeShared))
+        let outputBuffer = try #require(device.makeBuffer(length: 64, options: .storageModeShared))
 
         let logitsPtr = logitsBuffer.contents().assumingMemoryBound(to: Float16.self)
         for i in 0..<Self.vocabSize {
@@ -348,7 +348,7 @@ struct MPSGraphCompositeSamplerTests {
             device: device, vocabSize: Self.vocabSize, k: Self.k, temperature: 1.0)
 
         let logitsBuffer = try #require(device.makeBuffer(length: Self.vocabSize * 2, options: .storageModeShared))
-        let outputBuffer = try #require(device.makeBuffer(length: 4, options: .storageModeShared))
+        let outputBuffer = try #require(device.makeBuffer(length: 64, options: .storageModeShared))
 
         let logitsPtr = logitsBuffer.contents().assumingMemoryBound(to: Float16.self)
         for i in 0..<Self.vocabSize {
@@ -410,7 +410,7 @@ struct MPSGraphCompositeSamplerTests {
             device: device, vocabSize: Self.vocabSize, k: Self.k, temperature: 1.0)
 
         let logitsBuffer = try #require(device.makeBuffer(length: Self.vocabSize * 2, options: .storageModeShared))
-        let outputBuffer = try #require(device.makeBuffer(length: 4, options: .storageModeShared))
+        let outputBuffer = try #require(device.makeBuffer(length: 64, options: .storageModeShared))
 
         let queue = try #require(device.makeCommandQueue())
 
@@ -468,7 +468,7 @@ struct MPSGraphCompositeSamplerTests {
         let targetToken = 15000
         let totalElements = queryLength * Self.vocabSize
         let logitsBuffer = try #require(device.makeBuffer(length: totalElements * 2, options: .storageModeShared))
-        let outputBuffer = try #require(device.makeBuffer(length: 4, options: .storageModeShared))
+        let outputBuffer = try #require(device.makeBuffer(length: 64, options: .storageModeShared))
 
         let logitsPtr = logitsBuffer.contents().assumingMemoryBound(to: Float16.self)
         // Fill with very low values
@@ -519,7 +519,7 @@ struct MPSGraphTopPSamplerTests {
             device: device, vocabSize: Self.vocabSize, k: 1000, temperature: 1.0, topP: 0.9, minP: 0.0)
 
         let logitsBuffer = try #require(device.makeBuffer(length: Self.vocabSize * 2, options: .storageModeShared))
-        let outputBuffer = try #require(device.makeBuffer(length: 4, options: .storageModeShared))
+        let outputBuffer = try #require(device.makeBuffer(length: 64, options: .storageModeShared))
 
         let logitsPtr = logitsBuffer.contents().assumingMemoryBound(to: Float16.self)
         for i in 0..<Self.vocabSize {
@@ -563,7 +563,7 @@ struct MPSGraphTopPSamplerTests {
             device: device, vocabSize: Self.vocabSize, k: 40, temperature: 1.0, topP: 1.0, minP: 0.0)
 
         let logitsBuffer = try #require(device.makeBuffer(length: Self.vocabSize * 2, options: .storageModeShared))
-        let outputBuffer = try #require(device.makeBuffer(length: 4, options: .storageModeShared))
+        let outputBuffer = try #require(device.makeBuffer(length: 64, options: .storageModeShared))
 
         let logitsPtr = logitsBuffer.contents().assumingMemoryBound(to: Float16.self)
         for i in 0..<Self.vocabSize { logitsPtr[i] = Float16(-100.0) }
@@ -599,7 +599,7 @@ struct MPSGraphTopPSamplerTests {
             device: device, vocabSize: Self.vocabSize, k: 1000, temperature: 1.0, topP: 0.01, minP: 0.0)
 
         let logitsBuffer = try #require(device.makeBuffer(length: Self.vocabSize * 2, options: .storageModeShared))
-        let outputBuffer = try #require(device.makeBuffer(length: 4, options: .storageModeShared))
+        let outputBuffer = try #require(device.makeBuffer(length: 64, options: .storageModeShared))
 
         let logitsPtr = logitsBuffer.contents().assumingMemoryBound(to: Float16.self)
         for i in 0..<Self.vocabSize { logitsPtr[i] = Float16(-100.0) }
@@ -642,7 +642,7 @@ struct MPSGraphMinPSamplerTests {
             device: device, vocabSize: Self.vocabSize, k: 1000, temperature: 1.0, topP: 1.0, minP: 0.1)
 
         let logitsBuffer = try #require(device.makeBuffer(length: Self.vocabSize * 2, options: .storageModeShared))
-        let outputBuffer = try #require(device.makeBuffer(length: 4, options: .storageModeShared))
+        let outputBuffer = try #require(device.makeBuffer(length: 64, options: .storageModeShared))
 
         let logitsPtr = logitsBuffer.contents().assumingMemoryBound(to: Float16.self)
         for i in 0..<Self.vocabSize { logitsPtr[i] = Float16(-100.0) }
@@ -686,7 +686,7 @@ struct MPSGraphMinPSamplerTests {
             device: device, vocabSize: Self.vocabSize, k: 40, temperature: 1.0, topP: 1.0, minP: 0.0)
 
         let logitsBuffer = try #require(device.makeBuffer(length: Self.vocabSize * 2, options: .storageModeShared))
-        let outputBuffer = try #require(device.makeBuffer(length: 4, options: .storageModeShared))
+        let outputBuffer = try #require(device.makeBuffer(length: 64, options: .storageModeShared))
 
         let logitsPtr = logitsBuffer.contents().assumingMemoryBound(to: Float16.self)
         for i in 0..<Self.vocabSize { logitsPtr[i] = Float16(-100.0) }
@@ -726,12 +726,12 @@ struct MPSGraphMinPSamplerTests {
     @Test("Combined TopP + MinP: both filters apply")
     func combinedTopPAndMinP() async throws {
         let device = try #require(Self.device)
-        // topP=0.95 + minP=0.1
+        // topP=0.95 + minP=0.1, k=10 to avoid float16 boundary noise from large topK
         let sampler = try MPSGraphCompositeSampler(
-            device: device, vocabSize: Self.vocabSize, k: 1000, temperature: 1.0, topP: 0.95, minP: 0.1)
+            device: device, vocabSize: Self.vocabSize, k: 10, temperature: 1.0, topP: 0.95, minP: 0.1)
 
         let logitsBuffer = try #require(device.makeBuffer(length: Self.vocabSize * 2, options: .storageModeShared))
-        let outputBuffer = try #require(device.makeBuffer(length: 4, options: .storageModeShared))
+        let outputBuffer = try #require(device.makeBuffer(length: 64, options: .storageModeShared))
 
         let logitsPtr = logitsBuffer.contents().assumingMemoryBound(to: Float16.self)
         for i in 0..<Self.vocabSize { logitsPtr[i] = Float16(-100.0) }
@@ -745,7 +745,9 @@ struct MPSGraphMinPSamplerTests {
         let queue = try #require(device.makeCommandQueue())
 
         var sampledTokens = Set<Int32>()
-        for _ in 0..<30 {
+        let randomValues: [Float] = [0.05, 0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85, 0.95]
+        for r in randomValues {
+            sampler.testingOnlyRandomOverride = r
             await withCheckedContinuation { continuation in
                 sampler.encode(
                     to: queue,
@@ -759,6 +761,7 @@ struct MPSGraphMinPSamplerTests {
             let result = outputBuffer.contents().assumingMemoryBound(to: Int32.self).pointee
             sampledTokens.insert(result)
         }
+        sampler.testingOnlyRandomOverride = nil
 
         // Token 2000 should be filtered by minP
         #expect(!sampledTokens.contains(2000), "Combined topP+minP should filter token 2000")

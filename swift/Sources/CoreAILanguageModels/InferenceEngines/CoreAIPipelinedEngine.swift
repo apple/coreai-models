@@ -28,6 +28,9 @@ private let pipelineDepth = 3
 private let averageExpectedPromptSize = 256
 private let temperatureTolerance: Double = 0.001
 
+/// MPSNDArray enforces 64-byte row-stride alignment on backing buffers.
+private let minimumMPSNDArrayBufferSize = 64
+
 // MARK: - Core AI Pipelined Engine (Public Wrapper)
 
 /// GPU-pipelined inference engine using Core AI's encode API.
@@ -513,9 +516,10 @@ private struct EngineImpl: ~Copyable {
         // Allocate pipeline-depth-matched decode output buffers (sampler writes next token)
         var decodeOutBuffers: [MTLBuffer] = []
         for _ in 0..<pipelineDepth {
-            guard let buf = device.makeBuffer(length: MemoryLayout<Int32>.size, options: .storageModeShared) else {
+            let decodeOutSize = max(minimumMPSNDArrayBufferSize, MemoryLayout<Int32>.size)
+            guard let buf = device.makeBuffer(length: decodeOutSize, options: .storageModeShared) else {
                 throw InferenceRuntimeError.bufferAllocationFailed(
-                    "decodeOutputBuffer (\(MemoryLayout<Int32>.size) bytes)")
+                    "decodeOutputBuffer (\(decodeOutSize) bytes)")
             }
             decodeOutBuffers.append(buf)
         }
