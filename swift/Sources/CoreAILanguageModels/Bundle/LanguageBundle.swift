@@ -21,6 +21,7 @@ public struct LanguageBundle: Sendable {
     public let bundle: ModelBundle
     public let modelAssetPath: String
     public let language: LanguageConfig
+    public let visionConfig: VisionConfig?
 
     public init(from path: String) throws {
         let expanded = (path as NSString).expandingTildeInPath
@@ -45,6 +46,7 @@ public struct LanguageBundle: Sendable {
         }
         self.modelAssetPath = main
         self.language = language
+        self.visionConfig = payload.vision
     }
 
     // MARK: - Convenience accessors
@@ -98,6 +100,7 @@ extension LanguageBundle {
     fileprivate struct LanguagePayload: Decodable {
         let assets: Assets
         let language: LanguageConfig?
+        let vision: VisionConfig?
 
         struct Assets: Decodable {
             let main: String?

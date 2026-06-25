@@ -22,18 +22,23 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
     /// known role conventions (`main`, `extend_<N>`, `load_embeddings`, ...).
     public let functionMap: FunctionMap?
 
+    /// Vision-specific configuration. Nil for text-only language models.
+    public let vision: VisionConfig?
+
     public init(
         tokenizer: String,
         vocabSize: Int,
         maxContextLength: Int,
         embeddedTokenizer: Bool = true,
-        functionMap: FunctionMap? = nil
+        functionMap: FunctionMap? = nil,
+        vision: VisionConfig? = nil
     ) {
         self.tokenizer = tokenizer
         self.vocabSize = vocabSize
         self.maxContextLength = maxContextLength
         self.embeddedTokenizer = embeddedTokenizer
         self.functionMap = functionMap
+        self.vision = vision
     }
 
     enum CodingKeys: String, CodingKey {
@@ -42,6 +47,7 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
         case maxContextLength = "max_context_length"
         case embeddedTokenizer = "embedded_tokenizer"
         case functionMap = "function_map"
+        case vision
     }
 
     public init(from decoder: Swift.Decoder) throws {
@@ -51,6 +57,7 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
         self.maxContextLength = try c.decode(Int.self, forKey: .maxContextLength)
         self.embeddedTokenizer = try c.decodeIfPresent(Bool.self, forKey: .embeddedTokenizer) ?? true
         self.functionMap = try c.decodeIfPresent(FunctionMap.self, forKey: .functionMap)
+        self.vision = try c.decodeIfPresent(VisionConfig.self, forKey: .vision)
     }
 
     // MARK: - Additional Stop Tokens
@@ -135,5 +142,40 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
         }
 
         return Array(result)
+    }
+}
+
+/// Vision-specific configuration for VLM bundles.
+/// Nil for text-only language models.
+public struct VisionConfig: Codable, Sendable, Equatable {
+    /// Input image size (square). Vision encoder expects this resolution.
+    public let imageSize: Int
+
+    /// Patch size for the vision transformer.
+    public let patchSize: Int
+
+    /// Number of embedding tokens produced per image after projection.
+    public let imageTokenCount: Int
+
+    /// Token ID used as a placeholder in the text sequence for image positions.
+    public let imageTokenId: Int32
+
+    public init(
+        imageSize: Int,
+        patchSize: Int,
+        imageTokenCount: Int,
+        imageTokenId: Int32
+    ) {
+        self.imageSize = imageSize
+        self.patchSize = patchSize
+        self.imageTokenCount = imageTokenCount
+        self.imageTokenId = imageTokenId
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case imageSize = "image_size"
+        case patchSize = "patch_size"
+        case imageTokenCount = "image_token_count"
+        case imageTokenId = "image_token_id"
     }
 }

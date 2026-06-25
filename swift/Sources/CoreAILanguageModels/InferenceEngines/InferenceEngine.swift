@@ -288,6 +288,38 @@ public enum InferenceRuntimeError: Error, LocalizedError {
 
 // MARK: - Engine Options
 
+// MARK: - Multimodal
+
+/// Engine that supports vision/audio input in addition to text tokens.
+///
+/// The typical flow:
+/// 1. `encodeImage(at:)` — preprocess + run vision encoder, return embeddings
+/// 2. `generate(with: EmbeddedInput, ...)` — scatter-merge embeddings into
+///    token sequence and run prefill + decode
+///
+/// The caller owns the embeddings and decides caching strategy.
+public protocol MultimodalInferenceEngine: InferenceEngine {
+    /// Encode an image into embeddings suitable for injection into the LLM.
+    /// Returns the embedded representation — caller decides whether to cache.
+    func encodeImage(at url: URL) async throws -> EmbeddedInput
+
+    /// Generate tokens from a token sequence with embedded image regions.
+    /// The engine scatter-merges `input.imageTokenPositions` with the embedded data
+    /// during prefill, then continues standard autoregressive decode.
+    func generate(
+        with input: EmbeddedInput,
+        tokens: [TokenId],
+        samplingConfiguration: SamplingConfiguration,
+        inferenceOptions: InferenceOptions
+    ) throws -> OutputSequence
+}
+
+// TODO: Multi-turn — caller can cache EmbeddedInput across turns and pass it
+// again with the accumulated token context. Engine keeps image in KV cache
+// via reset(to:) preserving the prefill portion.
+
+// MARK: - Engine Options
+
 /// KV cache memory management strategy.
 ///
 /// Determines how the KV cache is allocated and managed at runtime.
