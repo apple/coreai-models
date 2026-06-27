@@ -4,17 +4,19 @@
 # Use of this source code is governed by a BSD-3-clause license that can
 # be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
-"""Export Qwen3-VL text decoder (inputs_embeds variant, explicit scatter KV cache).
+"""Export Qwen3-VL text decoder (inputs_embeds variant, stateful KV cache).
 
-Creates exports/qwen3_vl_2b_explicit_kv.llmasset/ with:
-  - qwen3_vl_2b_explicit_kv.aimodel  (text decoder)
-  - embed_tokens.bin                   (flat float16 embedding table)
+Creates exports/qwen3_vl_2b.llmasset/ with:
+  - qwen3_vl_2b.aimodel                (text decoder, asset role `main`)
+  - embed.aimodel                      (token-embedding lookup, asset role `embedding`)
   - tokenizer/                         (embedded HF tokenizer)
   - metadata.json                      (bundle manifest, kind=vlm)
 
+Run export_vision_encoder_224.py afterwards to add the `vision` component.
+
 Usage:
     cd <repo-root>
-    uv run python python/export_qwen3vl_explicit_kv.py [--max-ctx 4096] [--num-layers N]
+    uv run python python/export_qwen3vl.py [--max-ctx 4096] [--num-layers N]
 """
 
 import argparse
@@ -23,6 +25,7 @@ import json
 import logging
 import os
 import re
+import shutil
 from pathlib import Path
 
 import torch
@@ -33,43 +36,26 @@ from transformers import AutoConfig, AutoTokenizer
 from coreai_models.export.macos import export_to_coreai
 from coreai_models.export.metadata import build_aimodel_metadata
 from coreai_models.models.gpu.qwen3_vl import Qwen3VLForCausalLMEmbeddings
-from coreai_models.primitives.macos.cache_scatter import KVCache as KVCacheScatter
 
 HF_MODEL_ID = "Qwen/Qwen3-VL-2B-Instruct"
-OUTPUT_NAME = "qwen3_vl_2b_explicit_kv"
+OUTPUT_NAME = "qwen3_vl_2b"
 IMAGE_TOKEN_ID = 151655  # <|image_pad|>
 NUM_VISUAL_TOKENS = 196  # 448×448 / patch_size(16) / spatial_merge_size(2) squared
+IMAGE_SIZE = 448  # vision encoder input resolution (see export_vision_encoder_224.py)
+PATCH_SIZE = 16
 
+IMAGE_MEAN = [0.48145466, 0.4578275, 0.40821073]
+IMAGE_STD = [0.26862954, 0.26130258, 0.27577711]
+RESCALE_FACTOR = 1.0
 
-# ---------------------------------------------------------------------------
-# Model subclass: use explicit scatter KV cache
-# ---------------------------------------------------------------------------
-
-class Qwen3VLEmbeddingsExplicitKV(Qwen3VLForCausalLMEmbeddings):
-    """inputs_embeds decoder returning (logits, k_cache_updated, v_cache_updated).
-
-    Uses slice_scatter KV cache so each call takes and returns the full cache
-    explicitly — avoids GPU state mutations that cause Metal OOM on some hardware.
-    """
-
-    def forward(
-        self,
-        inputs_embeds: torch.Tensor,
-        position_ids: torch.IntTensor,
-        k_cache: torch.Tensor,
-        v_cache: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        cache = KVCacheScatter(k_cache, v_cache)
-        out = self.model(inputs_embeds, position_ids, cache)
-        logits = self.lm_head(out)
-        if logits.dtype == torch.bfloat16:
-            logits = logits.to(torch.float16)
-        return logits, cache._k_cache, cache._v_cache
+# Core AI state names for the persistent KV cache
+KV_STATE_NAMES = ("k_cache", "v_cache")
 
 
 # ---------------------------------------------------------------------------
 # Direct safetensors loader (avoids the hf_memory_efficient layer-regex issue)
 # ---------------------------------------------------------------------------
+
 
 def _get_safetensors_files(model_dir: str) -> list[str]:
     index_path = os.path.join(model_dir, "model.safetensors.index.json")
@@ -115,14 +101,14 @@ def load_model_from_safetensors(
     state_dict: dict[str, torch.Tensor] = {}
     for path in st_files:
         with safe_open(path, framework="pt", device="cpu") as f:
-            for key in f.keys():
+            for key in f.keys():  # noqa: SIM118 — safe_open has no __iter__/__contains__
                 if key.startswith("model.visual."):
                     continue
                 if not key.startswith(prefix):
                     continue
                 # Strip "model.language_model." → add "model."
                 # "model.language_model.layers.0.self_attn.q_proj.weight" → "model.layers.0.*"
-                stripped = key[len(prefix):]  # e.g. "layers.0.self_attn.q_proj.weight"
+                stripped = key[len(prefix) :]  # e.g. "layers.0.self_attn.q_proj.weight"
                 model_key = "model." + stripped  # e.g. "model.layers.0.self_attn.q_proj.weight"
                 # Skip layers beyond num_layers
                 m = layer_pattern.match(stripped)
@@ -148,35 +134,79 @@ def load_model_from_safetensors(
 
 
 # ---------------------------------------------------------------------------
-# embed_tokens extraction
+# embed.aimodel: token-embedding lookup component
 # ---------------------------------------------------------------------------
 
-def export_embed_tokens(bundle_path: Path, model_dir: str, hidden_size: int, vocab_size: int) -> str:
-    """Save embed_tokens weights as flat float16 binary."""
-    st_files = _get_safetensors_files(model_dir)
+
+class EmbedTokens(torch.nn.Module):
+    """Token-embedding lookup, exported as the bundle's `embedding` component.
+
+    Mirrors the float path of ``primitives.ios.embedding.GatherEmbeddings``
+    (``table[input_ids]``), which lowers cleanly with Int32 indices — unlike
+    ``nn.Embedding``, whose gather requires Int64 indices the runtime won't feed.
+
+    Input:  input_ids   int32 [1, seq_len]
+    Output: embeddings   f16  [1, seq_len, hidden_size]
+    """
+
+    def __init__(self, weight: torch.Tensor) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(weight, requires_grad=False)
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.weight[input_ids]
+
+
+def _load_embed_weight(model_dir: str) -> torch.Tensor:
+    """Read the f16 embed_tokens weight table [vocab, hidden] from safetensors."""
     embed_key = "model.language_model.embed_tokens.weight"
-    weights = None
-    for path in st_files:
+    for path in _get_safetensors_files(model_dir):
         with safe_open(path, framework="pt", device="cpu") as f:
-            if embed_key in f.keys():
-                weights = f.get_tensor(embed_key).to(torch.float16)
-                break
-    if weights is None:
-        raise RuntimeError(f"embed_tokens not found in safetensors (looked for '{embed_key}')")
-    embed_path = bundle_path / "embed_tokens.bin"
-    with open(embed_path, "wb") as f:
-        f.write(weights.numpy().tobytes())
-    logging.info(f"Saved embed_tokens.bin: {vocab_size} × {hidden_size} × f16")
-    return "embed_tokens.bin"
+            if embed_key in f.keys():  # noqa: SIM118 — safe_open has no __contains__
+                return f.get_tensor(embed_key).to(torch.float16)
+    raise RuntimeError(f"embed_tokens not found in safetensors (looked for '{embed_key}')")
+
+
+async def export_embed_model(
+    bundle_path: Path, model_dir: str, max_ctx: int, overwrite: bool
+) -> str:
+    """Export the token-embedding lookup as embed.aimodel (asset role `embedding`)."""
+    weight = _load_embed_weight(model_dir)
+    vocab_size, hidden_size = weight.shape
+    module = EmbedTokens(weight).eval()
+
+    seq_len = 64
+    input_ids = torch.zeros(1, seq_len, dtype=torch.int32)
+    program = export_to_coreai(
+        module,
+        {"input_ids": input_ids},
+        dynamic_shapes={"input_ids": {1: torch.export.Dim("embed_seq", max=max_ctx - 1)}},
+        input_names=("input_ids",),
+        output_names=("embeddings",),
+        state_names=None,
+    )
+    program.optimize()
+
+    embed_path = bundle_path / "embed.aimodel"
+    if embed_path.exists():
+        if not overwrite:
+            raise FileExistsError(f"{embed_path} exists. Use --overwrite.")
+        shutil.rmtree(embed_path)
+    meta = build_aimodel_metadata(HF_MODEL_ID)
+    await asyncio.to_thread(program.save_asset, embed_path, meta)
+    logging.info(f"Saved embed.aimodel: {vocab_size} × {hidden_size} × f16")
+    return "embed.aimodel"
 
 
 # ---------------------------------------------------------------------------
 # Main export
 # ---------------------------------------------------------------------------
 
+
 async def main(args: argparse.Namespace) -> None:
-    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
-                        format="%(levelname)s: %(message)s")
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO, format="%(levelname)s: %(message)s"
+    )
 
     max_ctx = args.max_ctx
     output_name = OUTPUT_NAME
@@ -196,7 +226,7 @@ async def main(args: argparse.Namespace) -> None:
     # ---- 2. Load model directly from safetensors ----
     logging.info("Loading model from safetensors (direct, skips vision encoder)...")
     model = load_model_from_safetensors(
-        model_class=Qwen3VLEmbeddingsExplicitKV,
+        model_class=Qwen3VLForCausalLMEmbeddings,
         hf_config=raw_cfg,
         model_dir=model_dir,
         max_ctx=max_ctx,
@@ -206,13 +236,11 @@ async def main(args: argparse.Namespace) -> None:
     model = model.eval()
     logging.info("Model loaded.")
 
-    # ---- 3. Build reference inputs (explicit KV I/O — avoids Metal state OOM) ----
+    # ---- 3. Build reference inputs (stateful KV: caches are in-place states) ----
     QUERY_LEN = 64
     OFFSET = 64
     inputs_embeds = torch.randn(1, QUERY_LEN, hidden_size, dtype=torch.float16)
-    position_ids = (
-        torch.arange(QUERY_LEN + OFFSET, dtype=torch.int32).unsqueeze(0)
-    )
+    position_ids = torch.arange(QUERY_LEN + OFFSET, dtype=torch.int32).unsqueeze(0)
 
     n_layers = args.num_layers or text_cfg.num_hidden_layers
     n_kv_heads = text_cfg.num_key_value_heads
@@ -228,22 +256,20 @@ async def main(args: argparse.Namespace) -> None:
     }
     dynamic_shapes = {
         "inputs_embeds": {1: torch.export.Dim("query_len", max=max_ctx - 2)},
-        "position_ids": {
-            1: torch.export.Dim("seq_pos", min=QUERY_LEN, max=max_ctx - 1)
-        },
+        "position_ids": {1: torch.export.Dim("seq_pos", min=QUERY_LEN, max=max_ctx - 1)},
         "k_cache": None,  # fixed size
         "v_cache": None,
     }
 
-    # ---- 4. Export (explicit KV: returns updated caches as outputs) ----
-    logging.info("Exporting text decoder to CoreAI format (explicit KV)...")
+    # ---- 4. Export (stateful KV: k_cache/v_cache surfaced as in-place states) ----
+    logging.info("Exporting text decoder to CoreAI format (stateful KV)...")
     program = export_to_coreai(
         model,
         reference_inputs,
         dynamic_shapes=dynamic_shapes,
-        input_names=("inputs_embeds", "position_ids", "k_cache", "v_cache"),
-        output_names=("logits", "k_cache", "v_cache"),
-        state_names=None,
+        input_names=("inputs_embeds", "position_ids"),
+        output_names=("logits",),
+        state_names=KV_STATE_NAMES,
     )
     logging.info("Optimizing AIProgram...")
     program.optimize()
@@ -257,6 +283,7 @@ async def main(args: argparse.Namespace) -> None:
         raise FileExistsError(f"{aimodel_path} exists. Use --overwrite.")
     elif aimodel_path.exists():
         import shutil
+
         shutil.rmtree(aimodel_path)
 
     logging.info(f"Saving model to {aimodel_path}...")
@@ -264,9 +291,9 @@ async def main(args: argparse.Namespace) -> None:
     await asyncio.to_thread(program.save_asset, aimodel_path, meta)
     del model
 
-    # ---- 6. Embed tokens ----
-    logging.info("Extracting embed_tokens.bin...")
-    embed_rel = export_embed_tokens(bundle_path, model_dir, hidden_size, vocab_size)
+    # ---- 6. Embed model ----
+    logging.info("Exporting embed.aimodel...")
+    embed_rel = await export_embed_model(bundle_path, model_dir, max_ctx, args.overwrite)
 
     # ---- 7. Tokenizer ----
     logging.info("Saving tokenizer...")
@@ -274,12 +301,15 @@ async def main(args: argparse.Namespace) -> None:
     tokenizer.save_pretrained(str(bundle_path / "tokenizer"))
 
     # ---- 8. metadata.json ----
+    # Asset roles match Swift ModelBundle.ComponentKey: `main` (decoder),
+    # `embedding` (embed.aimodel), `vision` (added by export_vision_encoder_224.py).
     metadata = {
         "metadata_version": "0.2",
         "kind": "vlm",
         "name": output_name,
         "assets": {
             "main": f"{output_name}.aimodel",
+            "embedding": embed_rel,
         },
         "language": {
             "tokenizer": HF_MODEL_ID,
@@ -288,11 +318,15 @@ async def main(args: argparse.Namespace) -> None:
             "embedded_tokenizer": True,
             "function_map": {"main": ["main"]},
         },
+        # Top-level `vision` block consumed by Swift VisionConfig (snake_case keys).
         "vision": {
+            "image_size": IMAGE_SIZE,
+            "patch_size": PATCH_SIZE,
+            "image_token_count": NUM_VISUAL_TOKENS,
             "image_token_id": IMAGE_TOKEN_ID,
-            "num_visual_tokens": NUM_VISUAL_TOKENS,
-            "hidden_size": hidden_size,
-            "embed_tokens_path": embed_rel,
+            "image_mean": IMAGE_MEAN,
+            "image_std": IMAGE_STD,
+            "rescale_factor": RESCALE_FACTOR,
         },
         "source": {
             "hf_model_id": HF_MODEL_ID,

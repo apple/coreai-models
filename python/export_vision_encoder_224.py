@@ -7,17 +7,17 @@
 """Export the Qwen3-VL vision encoder (448×448 fixed input, static shapes).
 
 Adds vision.aimodel to an existing VLM bundle directory:
-  exports/qwen3_vl_2b_explicit_kv.llmasset/vision.aimodel
+  exports/qwen3_vl_2b.llmasset/vision.aimodel
 
 The exported model uses fully-static shapes (all position embeddings and cu_seqlens
 pre-computed as constant buffers), making it compatible with torch.export.
 
-  Input:  pixel_values  float32 [784, 1536]   (784 patches × 1536 patch-features)
-  Output: image_features float32 [196, 2048]  (196 visual tokens × text-hidden-dim)
+  Input:  pixel_values   float32 [1, 3, 448, 448]  (CLIP-normalized NCHW, runner-produced)
+  Output: image_features float16 [1, 196, 2048]    (batch × 196 visual tokens × text-hidden-dim)
 
 Usage:
     cd <repo-root>
-    uv run python python/export_vision_encoder_224.py [--bundle-path exports/qwen3_vl_2b_explicit_kv.llmasset]
+    uv run python python/export_vision_encoder_224.py [--bundle-path exports/qwen3_vl_2b.llmasset]
 """
 
 import argparse
@@ -28,10 +28,11 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from transformers import AutoConfig
 from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLForConditionalGeneration as HFModel,
+)
+from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLVisionModel,
 )
 
@@ -39,14 +40,16 @@ from coreai_models.export.macos import export_to_coreai
 from coreai_models.export.metadata import build_aimodel_metadata
 
 HF_MODEL_ID = "Qwen/Qwen3-VL-2B-Instruct"
-BUNDLE_NAME = "qwen3_vl_2b_explicit_kv"
+BUNDLE_NAME = "qwen3_vl_2b"
 
 # Fixed shapes for 448×448 images
 PATCH_SIZE = 16
 IMAGE_SIZE = 448
 SPATIAL_MERGE_SIZE = 2
-NUM_PATCHES = (IMAGE_SIZE // PATCH_SIZE) ** 2      # 784
-PATCH_DIM = 2 * 3 * PATCH_SIZE * PATCH_SIZE        # 1536 (temporal=2, channels=3)
+TEMPORAL_PATCH_SIZE = 2  # Qwen frames-per-image (single image → duplicated)
+CHANNELS = 3
+NUM_PATCHES = (IMAGE_SIZE // PATCH_SIZE) ** 2  # 784
+PATCH_DIM = TEMPORAL_PATCH_SIZE * CHANNELS * PATCH_SIZE * PATCH_SIZE  # 1536
 NUM_VISUAL_TOKENS = (IMAGE_SIZE // PATCH_SIZE // SPATIAL_MERGE_SIZE) ** 2  # 196
 
 # Pre-computed grid parameters (constant for 448×448)
@@ -59,7 +62,11 @@ class StaticVisionEncoder(nn.Module):
     Avoids all data-dependent operations (linspace, repeat_interleave, etc.)
     by baking in the constant values at init time.
 
-    Input:  pixel_values  float32 [784, 1536]
+    Accepts raw CHW pixel values (the layout the Swift runner's ImagePreprocessor
+    produces) and reproduces the Qwen image-processor patchify internally, so the
+    runner needs no Qwen-specific preprocessing beyond resize + normalize.
+
+    Input:  pixel_values  float32 [1, 3, 448, 448]   (CLIP-normalized, NCHW)
     Output: image_features float32 [196, text_hidden]
     """
 
@@ -91,9 +98,38 @@ class StaticVisionEncoder(nn.Module):
             cu = torch.tensor([0, total_patches], dtype=torch.int32)
             self.register_buffer("cu_seqlens", cu)
 
+    @staticmethod
+    def _patchify(pixel_values: torch.Tensor) -> torch.Tensor:
+        """Turn NCHW pixels into Qwen's pre-patchified [NUM_PATCHES, PATCH_DIM].
+
+        Reproduces the exact reshape/permute of Qwen2/3-VL's image processor
+        (transpose order ``(0,3,6,4,7,2,1,5,8)``) so the resulting patch order
+        matches both the precomputed ``pos_embeds`` and the merger's 2×2
+        spatial-merge grouping. The single image is duplicated across the
+        temporal dimension, matching the processor's last-frame repeat.
+        """
+        # [1, 3, 448, 448] → [3, 448, 448] → [temporal, 3, 448, 448]
+        x = pixel_values.reshape(CHANNELS, IMAGE_SIZE, IMAGE_SIZE)
+        x = x.unsqueeze(0).repeat(TEMPORAL_PATCH_SIZE, 1, 1, 1)
+        # split H,W into (grid, merge, patch) and T into (grid_t, temporal)
+        x = x.reshape(
+            GRID_T,
+            TEMPORAL_PATCH_SIZE,
+            CHANNELS,
+            GRID_H // SPATIAL_MERGE_SIZE,
+            SPATIAL_MERGE_SIZE,
+            PATCH_SIZE,
+            GRID_W // SPATIAL_MERGE_SIZE,
+            SPATIAL_MERGE_SIZE,
+            PATCH_SIZE,
+        )
+        x = x.permute(0, 3, 6, 4, 7, 2, 1, 5, 8)
+        return x.reshape(NUM_PATCHES, PATCH_DIM)
+
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        # pixel_values: [NUM_PATCHES, PATCH_DIM]
-        hidden_states = self.patch_embed(pixel_values)  # [NUM_PATCHES, vision_hidden]
+        # pixel_values: [1, 3, 448, 448] (NCHW) → patchify → [NUM_PATCHES, PATCH_DIM]
+        patches = self._patchify(pixel_values)
+        hidden_states = self.patch_embed(patches)  # [NUM_PATCHES, vision_hidden]
         hidden_states = hidden_states + self.pos_embeds
 
         position_embeddings = (self.rot_cos, self.rot_sin)
@@ -105,8 +141,27 @@ class StaticVisionEncoder(nn.Module):
                 position_embeddings=position_embeddings,
             )
 
-        # merger applies pixel_shuffle: [NUM_PATCHES, vision_hidden] → [NUM_VISUAL_TOKENS, text_hidden]
+        # merger pixel_shuffle → [NUM_VISUAL_TOKENS, text_hidden]
         return self.merger(hidden_states)
+
+
+class BatchedF16VisionEncoder(nn.Module):
+    """Conform the encoder output to the runner contract shared with embed/main.
+
+    StaticVisionEncoder emits f32 [NUM_VISUAL_TOKENS, text_hidden]; PR #65 expects
+    f16/bf16 [1, image_token_count, hidden] (a leading batch dim, like embed.aimodel).
+    The vision math stays in f32; only the final result is batched and cast to f16.
+    """
+
+    def __init__(self, encoder: nn.Module) -> None:
+        super().__init__()
+        self.encoder = encoder
+
+    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        out = self.encoder(pixel_values)
+        if isinstance(out, tuple):
+            out = out[0]
+        return out.unsqueeze(0).to(torch.float16)
 
 
 def _patch_fast_pos_embed_interpolate():
@@ -117,7 +172,7 @@ def _patch_fast_pos_embed_interpolate():
         idx_list = [[] for _ in range(4)]
         weight_list = [[] for _ in range(4)]
 
-        for t, h, w in zip(grid_ts.tolist(), grid_hs.tolist(), grid_ws.tolist()):
+        for _t, h, w in zip(grid_ts.tolist(), grid_hs.tolist(), grid_ws.tolist(), strict=False):
             h, w = int(h), int(w)
             h_idxs = torch.linspace(0, self.num_grid_per_side - 1, h)
             w_idxs = torch.linspace(0, self.num_grid_per_side - 1, w)
@@ -152,12 +207,14 @@ def _patch_fast_pos_embed_interpolate():
         pos_embeds = self.pos_embed(idx_tensor) * weight_tensor[:, :, None]
         patch_pos_embeds = pos_embeds[0] + pos_embeds[1] + pos_embeds[2] + pos_embeds[3]
 
-        hw_pairs = [(int(h), int(w)) for h, w in zip(grid_hs.tolist(), grid_ws.tolist())]
+        hw_pairs = [
+            (int(h), int(w)) for h, w in zip(grid_hs.tolist(), grid_ws.tolist(), strict=False)
+        ]
         patch_pos_embeds = patch_pos_embeds.split([h * w for h, w in hw_pairs])
 
         merge_size = self.config.spatial_merge_size
         patch_pos_embeds_permute = []
-        for pos_embed, t, (h, w) in zip(patch_pos_embeds, grid_ts.tolist(), hw_pairs):
+        for pos_embed, t, (h, w) in zip(patch_pos_embeds, grid_ts.tolist(), hw_pairs, strict=False):
             t = int(t)
             pos_embed = pos_embed.repeat(t, 1)
             pos_embed = (
@@ -172,20 +229,18 @@ def _patch_fast_pos_embed_interpolate():
 
 
 async def main(args: argparse.Namespace) -> None:
-    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
-                        format="%(levelname)s: %(message)s")
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO, format="%(levelname)s: %(message)s"
+    )
 
     _patch_fast_pos_embed_interpolate()
 
     bundle_path = Path(args.bundle_path)
     if not bundle_path.exists():
-        raise FileNotFoundError(
-            f"Bundle not found: {bundle_path}. Run export_qwen3vl_explicit_kv.py first.")
+        raise FileNotFoundError(f"Bundle not found: {bundle_path}. Run export_qwen3vl.py first.")
 
-    # ---- 1. Load text hidden size from metadata ----
-    with open(bundle_path / "metadata.json") as f:
-        meta = json.load(f)
-    text_hidden = meta["vision"]["hidden_size"]  # 2048
+    # ---- 1. Text hidden size (projection target) from the HF config ----
+    text_hidden = AutoConfig.from_pretrained(HF_MODEL_ID).text_config.hidden_size  # 2048
 
     # ---- 2. Load HF model (vision part only) ----
     logging.info(f"Loading {HF_MODEL_ID} for vision encoder extraction...")
@@ -196,16 +251,20 @@ async def main(args: argparse.Namespace) -> None:
     del hf_model
 
     # ---- 3. Validate output shape before export ----
+    pixel_shape = (1, CHANNELS, IMAGE_SIZE, IMAGE_SIZE)
     with torch.no_grad():
-        test_input = torch.randn(NUM_PATCHES, PATCH_DIM, dtype=torch.float32)
+        test_input = torch.randn(*pixel_shape, dtype=torch.float32)
         test_out = wrapper(test_input)
         # merger returns (hidden_states, deepstack_features) in newer transformers
         if isinstance(test_out, tuple):
             test_out = test_out[0]
-        logging.info(f"Vision encoder output shape: {test_out.shape} (expected [{NUM_VISUAL_TOKENS}, {text_hidden}])")
+        logging.info(
+            f"Vision encoder output {tuple(test_out.shape)}; "
+            f"expected [{NUM_VISUAL_TOKENS}, {text_hidden}]"
+        )
 
     # ---- 4. Wrap merger to handle tuple output ----
-    if isinstance(wrapper(torch.randn(NUM_PATCHES, PATCH_DIM)), tuple):
+    if isinstance(wrapper(torch.randn(*pixel_shape)), tuple):
         original_merger = wrapper.merger
 
         class MergerWrapper(nn.Module):
@@ -220,15 +279,25 @@ async def main(args: argparse.Namespace) -> None:
         wrapper.merger = MergerWrapper(original_merger)
 
     # ---- 5. Export ----
-    pixel_values = torch.randn(NUM_PATCHES, PATCH_DIM, dtype=torch.float32)
+    export_module = BatchedF16VisionEncoder(wrapper).eval()
+
+    # Final-shape sanity check (batched + f16) before export.
+    with torch.no_grad():
+        final_out = export_module(torch.randn(*pixel_shape, dtype=torch.float32))
+        logging.info(
+            f"Export module output: {tuple(final_out.shape)} {final_out.dtype} "
+            f"(expected (1, {NUM_VISUAL_TOKENS}, {text_hidden}) torch.float16)"
+        )
+
+    pixel_values = torch.randn(*pixel_shape, dtype=torch.float32)
     reference_inputs = {"pixel_values": pixel_values}
 
     logging.info(
         f"Exporting vision encoder "
-        f"(input: [{NUM_PATCHES},{PATCH_DIM}] → output: [{NUM_VISUAL_TOKENS},{text_hidden}])..."
+        f"(input: {list(pixel_shape)} → output: [1,{NUM_VISUAL_TOKENS},{text_hidden}] f16)..."
     )
     program = export_to_coreai(
-        wrapper,
+        export_module,
         reference_inputs,
         dynamic_shapes=None,
         input_names=("pixel_values",),
@@ -243,6 +312,7 @@ async def main(args: argparse.Namespace) -> None:
         raise FileExistsError(f"{vision_path} exists. Use --overwrite.")
     elif vision_path.exists():
         import shutil
+
         shutil.rmtree(vision_path)
 
     logging.info(f"Saving to {vision_path}...")
