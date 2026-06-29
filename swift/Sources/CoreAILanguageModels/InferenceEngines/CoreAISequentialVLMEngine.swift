@@ -264,9 +264,9 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
             throw InferenceRuntimeError.invalidOutputType(
                 "Cannot get descriptor for '\(logitsName)'")
         }
-        guard logitsDesc.scalarType == .float16 else {
+        guard logitsDesc.scalarType == .float16 || logitsDesc.scalarType == .bfloat16 else {
             throw InferenceRuntimeError.unsupportedLogitsType(
-                "Only float16 logits supported, got \(logitsDesc.scalarType)")
+                "Only float16/bfloat16 logits supported, got \(logitsDesc.scalarType)")
         }
         self.logitsDescriptor = logitsDesc
 
@@ -381,7 +381,7 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
 
         return EmbeddedInput(
             embeddings: projectedEmbeddings,
-            imageTokenPositions: placeholderRange
+            embeddingPositions: placeholderRange
         )
     }
 
@@ -567,6 +567,11 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
                 "scatterMerge: image position \(imagePositions.last ?? -1) exceeds sequence length \(seqLen)")
         }
 
+        // Copy image embeddings into placeholder positions.
+        precondition(
+            imageEmbeddings.scalarType == .float16,
+            "scatterMerge only supports float16 embeddings; got \(imageEmbeddings.scalarType)"
+        )
         imageEmbeddings.view(as: Float16.self).withUnsafePointer { imgPtr, _, _ in
             var mutableView = merged.mutableView(as: Float16.self)
             mutableView.withUnsafeMutablePointer { mergedPtr, _, _ in

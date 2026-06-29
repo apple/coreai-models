@@ -304,7 +304,7 @@ public protocol MultimodalInferenceEngine: InferenceEngine {
     func encodeImage(at url: URL) async throws -> EmbeddedInput
 
     /// Generate tokens from a token sequence with embedded image regions.
-    /// The engine scatter-merges `input.imageTokenPositions` with the embedded data
+    /// The engine scatter-merges `input.embeddingPositions` with the embedded data
     /// during prefill, then continues standard autoregressive decode.
     func generate(
         with input: EmbeddedInput,

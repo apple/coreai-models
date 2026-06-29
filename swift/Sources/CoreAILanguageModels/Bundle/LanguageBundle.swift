@@ -47,6 +47,10 @@ public struct LanguageBundle: Sendable {
         self.modelAssetPath = main
         self.language = language
         self.visionConfig = payload.vision
+
+        if bundle.kind == .vlm && self.visionConfig == nil {
+            throw ModelBundle.BundleError.missingField("vision")
+        }
     }
 
     // MARK: - Convenience accessors

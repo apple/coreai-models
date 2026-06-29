@@ -16,12 +16,12 @@ public struct EmbeddedInput: Sendable {
     /// Scalar type matches the LLM's expected input (float16, bFloat16, etc.).
     public let embeddings: NDArray
 
-    /// Positions in the token sequence where image embeddings replace placeholders.
-    public let imageTokenPositions: Range<Int>
+    /// Positions in the token sequence where embeddings replace placeholders.
+    public let embeddingPositions: Range<Int>
 
-    public init(embeddings: NDArray, imageTokenPositions: Range<Int>) {
+    public init(embeddings: NDArray, embeddingPositions: Range<Int>) {
         self.embeddings = embeddings
-        self.imageTokenPositions = imageTokenPositions
+        self.embeddingPositions = embeddingPositions
     }
 
     /// Number of embedding tokens (seq_len dimension).
