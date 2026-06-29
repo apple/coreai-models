@@ -203,7 +203,8 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
         // --- Embed pipeline ---
 
         // embed_tokens may be named "main" or "embed_tokens" depending on the asset
-        let embedFunctionName = embedModel.model.functionDescriptor(for: "embed_tokens") != nil
+        let embedFunctionName =
+            embedModel.model.functionDescriptor(for: "embed_tokens") != nil
             ? "embed_tokens" : "main"
 
         guard let embedDesc = embedModel.model.functionDescriptor(for: embedFunctionName) else {
@@ -363,7 +364,8 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
         let encoderOutput = try await runVisionEncoder(pixels: chwPixels)
 
         // Step 3: Run projector (skip if fused with encoder)
-        let projectedEmbeddings = visionProjectorFused ? encoderOutput : try await runProjector(encoderOutput: encoderOutput)
+        let projectedEmbeddings =
+            visionProjectorFused ? encoderOutput : try await runProjector(encoderOutput: encoderOutput)
 
         InstrumentsProfiler.endCustomInterval(
             name: "CoreAIVLM EncodeImage",
@@ -551,7 +553,7 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
         guard imagePositions.count == imageTokenCount else {
             throw InferenceRuntimeError.invalidArgument(
                 "scatterMerge: found \(imagePositions.count) image placeholder tokens, "
-                + "expected \(imageTokenCount) from config. Check prompt template.")
+                    + "expected \(imageTokenCount) from config. Check prompt template.")
         }
 
         let seqLen = textEmbeddings.shape.count >= 2 ? textEmbeddings.shape[1] : 0

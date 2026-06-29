@@ -932,9 +932,11 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         // The template should emit a single <image> token that we expand.
         let imageToken = tokenizer.convertIdToToken(Int(imageTokenId)) ?? "<image>"
         let templatedPrompt = "\(imageToken)\n\(prompt)"
-        guard let tokens = try? PromptUtils.maybeApplyTokenizerChatTemplate(
-            .prompt(templatedPrompt), tokenizer: tokenizer
-        ) else {
+        guard
+            let tokens = try? PromptUtils.maybeApplyTokenizerChatTemplate(
+                .prompt(templatedPrompt), tokenizer: tokenizer
+            )
+        else {
             return nil
         }
 

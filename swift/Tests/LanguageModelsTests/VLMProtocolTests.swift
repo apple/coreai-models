@@ -6,10 +6,11 @@
 import Foundation
 import Testing
 
+@testable import CoreAILanguageModels
+
 #if canImport(CoreAI)
 import CoreAI
 #endif
-@testable import CoreAILanguageModels
 
 @Suite("Multimodal types")
 struct MultimodalTypeTests {
