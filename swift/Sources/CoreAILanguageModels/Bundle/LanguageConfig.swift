@@ -160,16 +160,35 @@ public struct VisionConfig: Codable, Sendable, Equatable {
     /// Token ID used as a placeholder in the text sequence for image positions.
     public let imageTokenId: Int32
 
+    /// Per-channel normalization mean (RGB). Defaults to CLIP values when omitted.
+    public let imageMean: [Double]
+
+    /// Per-channel normalization std (RGB). Defaults to CLIP values when omitted.
+    public let imageStd: [Double]
+
+    /// Pixel rescale factor applied before normalization. Defaults to 1.0 when omitted.
+    public let rescaleFactor: Double
+
+    /// CLIP normalization (Qwen VL, Pixtral, InternVL, Phi-3.5-vision).
+    public static let clipMean = [0.48145466, 0.4578275, 0.40821073]
+    public static let clipStd = [0.26862954, 0.26130258, 0.27577711]
+
     public init(
         imageSize: Int,
         patchSize: Int,
         imageTokenCount: Int,
-        imageTokenId: Int32
+        imageTokenId: Int32,
+        imageMean: [Double]? = nil,
+        imageStd: [Double]? = nil,
+        rescaleFactor: Double? = nil
     ) {
         self.imageSize = imageSize
         self.patchSize = patchSize
         self.imageTokenCount = imageTokenCount
         self.imageTokenId = imageTokenId
+        self.imageMean = imageMean ?? Self.clipMean
+        self.imageStd = imageStd ?? Self.clipStd
+        self.rescaleFactor = rescaleFactor ?? 1.0
     }
 
     enum CodingKeys: String, CodingKey {
@@ -177,5 +196,19 @@ public struct VisionConfig: Codable, Sendable, Equatable {
         case patchSize = "patch_size"
         case imageTokenCount = "image_token_count"
         case imageTokenId = "image_token_id"
+        case imageMean = "image_mean"
+        case imageStd = "image_std"
+        case rescaleFactor = "rescale_factor"
+    }
+
+    public init(from decoder: Swift.Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.imageSize = try c.decode(Int.self, forKey: .imageSize)
+        self.patchSize = try c.decode(Int.self, forKey: .patchSize)
+        self.imageTokenCount = try c.decode(Int.self, forKey: .imageTokenCount)
+        self.imageTokenId = try c.decode(Int32.self, forKey: .imageTokenId)
+        self.imageMean = try c.decodeIfPresent([Double].self, forKey: .imageMean) ?? Self.clipMean
+        self.imageStd = try c.decodeIfPresent([Double].self, forKey: .imageStd) ?? Self.clipStd
+        self.rescaleFactor = try c.decodeIfPresent(Double.self, forKey: .rescaleFactor) ?? 1.0
     }
 }

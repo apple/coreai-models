@@ -312,16 +312,13 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
         }
         self.llmFunction = llmFn
 
-        // Select image preprocessor based on vision config
-        // Default to gemma3/SigLIP preset; can be extended for other encoders
+        // Build image preprocessor from vision config normalization fields.
+        let vc = config.visionConfig
         self.imagePreprocessor = ImagePreprocessor(
-            targetSize: CGSize(
-                width: config.visionConfig.imageSize,
-                height: config.visionConfig.imageSize
-            ),
-            mean: (0.485, 0.456, 0.406),
-            std: (0.229, 0.224, 0.225),
-            rescaleFactor: 1.0
+            targetSize: CGSize(width: vc.imageSize, height: vc.imageSize),
+            mean: (CGFloat(vc.imageMean[0]), CGFloat(vc.imageMean[1]), CGFloat(vc.imageMean[2])),
+            std: (CGFloat(vc.imageStd[0]), CGFloat(vc.imageStd[1]), CGFloat(vc.imageStd[2])),
+            rescaleFactor: CGFloat(vc.rescaleFactor)
         )
 
         InstrumentsProfiler.endCustomInterval(
