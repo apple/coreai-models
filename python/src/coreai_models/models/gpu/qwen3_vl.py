@@ -191,9 +191,11 @@ class Qwen3VLForCausalLM(BaseForCausalLM):
                 del state_dict[key]
             elif key.startswith("model.language_model."):
                 # Raw checkpoint form: strip "model.language_model." → add "model."
-                new_key = "model." + key[len("model.language_model."):]
+                new_key = "model." + key[len("model.language_model.") :]
                 state_dict[new_key] = state_dict.pop(key)
-            elif key.startswith("layers.") or key.startswith("norm.") or key == "embed_tokens.weight":
+            elif (
+                key.startswith("layers.") or key.startswith("norm.") or key == "embed_tokens.weight"
+            ):
                 # Already-stripped form: add "model." prefix
                 state_dict["model." + key] = state_dict.pop(key)
             # Keys already in "model.*" form pass through unchanged
@@ -253,6 +255,7 @@ class Qwen3VLForCausalLM(BaseForCausalLM):
 # Embeddings variant (takes inputs_embeds instead of input_ids)
 # ---------------------------------------------------------------------------
 
+
 class Qwen3VLModelEmbeddings(nn.Module):
     """Variant of Qwen3VLModel that accepts pre-computed embeddings."""
 
@@ -279,7 +282,7 @@ class Qwen3VLModelEmbeddings(nn.Module):
 class Qwen3VLForCausalLMEmbeddings(BaseForCausalLM):
     """Engine-compatible Qwen3-VL text decoder (inputs_embeds variant).
 
-    forward(inputs_embeds: [1, seq, hidden], position_ids: [1, total_pos], k_cache, v_cache) -> logits
+    forward(inputs_embeds, position_ids, k_cache, v_cache) -> logits
     """
 
     _HF_MODEL_CLASS = HFQwen3VLForConditionalGeneration
@@ -336,9 +339,11 @@ class Qwen3VLForCausalLMEmbeddings(BaseForCausalLM):
             if key.startswith("model.visual."):
                 del state_dict[key]
             elif key.startswith("model.language_model."):
-                new_key = "model." + key[len("model.language_model."):]
+                new_key = "model." + key[len("model.language_model.") :]
                 state_dict[new_key] = state_dict.pop(key)
-            elif key.startswith("layers.") or key.startswith("norm.") or key == "embed_tokens.weight":
+            elif (
+                key.startswith("layers.") or key.startswith("norm.") or key == "embed_tokens.weight"
+            ):
                 state_dict["model." + key] = state_dict.pop(key)
 
         # Drop embed_tokens or convert to lm_head.weight for tied embeddings
