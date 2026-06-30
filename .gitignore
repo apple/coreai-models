@@ -30,6 +30,7 @@ python/.venv/
 
 # Local settings
 .claude/settings.local.json
+
+# Local artifacts
 exports/
 *.jpeg
-**/__pycache__/
