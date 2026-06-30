@@ -88,31 +88,51 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
         var emitted: [Int32] = []
         var frame = 0
         var firstStep = true
+        var cachedDecBuf: [Float]? = nil  // last decoder output; reused on blank-input frames
         let emitCap = tEnc * cfg.maxSymbolsPerStep
         let vocabSize = cfg.vocabSize
 
         while frame < tEnc && emitted.count < emitCap {
             var advance = 0
             for _ in 0..<cfg.maxSymbolsPerStep {
-                fillNDArray(&inputIds, as: Int32.self, with: [lastToken])
-                fillNDArray(&hIn, as: Float.self, with: hState)
-                fillNDArray(&cIn, as: Float.self, with: cState)
+                let wasInputBlank = (lastToken == cfg.blankTokenId)
 
-                var stepOut = InferenceFunction.MutableViews()
-                stepOut.insert(&decOut, for: "decoder_output")
-                stepOut.insert(&hOut, for: "new_hidden_state")
-                stepOut.insert(&cOut, for: "new_cell_state")
-                _ = try await stepFn.run(
-                    inputs: [
-                        "input_ids": inputIds,
-                        "hidden_state": hIn,
-                        "cell_state": cIn,
-                    ],
-                    states: InferenceFunction.MutableViews(),
-                    outputViews: consume stepOut)
+                // HF blank-skip: when the cache is warm and the input is blank, reuse the
+                // last cached decoder output without re-running the LSTM step.
+                let decBuf: [Float]
+                if !firstStep && wasInputBlank, let cached = cachedDecBuf {
+                    decBuf = cached
+                } else {
+                    fillNDArray(&inputIds, as: Int32.self, with: [lastToken])
+                    fillNDArray(&hIn, as: Float.self, with: hState)
+                    fillNDArray(&cIn, as: Float.self, with: cState)
+
+                    var stepOut = InferenceFunction.MutableViews()
+                    stepOut.insert(&decOut, for: "decoder_output")
+                    stepOut.insert(&hOut, for: "new_hidden_state")
+                    stepOut.insert(&cOut, for: "new_cell_state")
+                    _ = try await stepFn.run(
+                        inputs: [
+                            "input_ids": inputIds,
+                            "hidden_state": hIn,
+                            "cell_state": cIn,
+                        ],
+                        states: InferenceFunction.MutableViews(),
+                        outputViews: consume stepOut)
+
+                    decBuf = flattenAsFloat(decOut)
+                    cachedDecBuf = decBuf
+
+                    // LSTM-state update rule: always on the very first call; afterwards only
+                    // when the input was non-blank (matches HF cache.update mask=~blank_mask).
+                    if firstStep || !wasInputBlank {
+                        hState = flattenAsFloat(hOut)
+                        cState = flattenAsFloat(cOut)
+                    }
+                    firstStep = false
+                }
 
                 // Joint(decoder_output, encoder[:, frame:frame+1, :]).
-                let decBuf = flattenAsFloat(decOut)
                 fillNDArray(&jointDecIn, as: Float.self, with: decBuf)
                 let encOffset = frame * hidden
                 let encSlice = Array(encFlat[encOffset..<encOffset + hidden])
@@ -143,16 +163,6 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
                     bestDurIdx = i
                 }
                 let dur = cfg.durations[bestDurIdx]
-
-                // LSTM-state update rule: always on the very first call (matches HF's
-                // lazy_initialization + unconditional first update); afterwards only
-                // when the current input was non-blank.
-                let wasInputBlank = (lastToken == cfg.blankTokenId)
-                if firstStep || !wasInputBlank {
-                    hState = flattenAsFloat(hOut)
-                    cState = flattenAsFloat(cOut)
-                }
-                firstStep = false
 
                 if bestTok != cfg.blankTokenId {
                     emitted.append(bestTok)

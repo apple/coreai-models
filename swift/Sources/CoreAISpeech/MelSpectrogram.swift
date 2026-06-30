@@ -28,8 +28,11 @@ public struct MelConfig: Sendable {
     public enum Normalization: Sendable {
         /// Whisper: clip to `max−8`, shift+scale by `(x+4)/4`. log base 10.
         case whisperLogClip
-        /// Per-instance scalar mean/std normalization on natural-log mel. NeMo/Parakeet convention.
+        /// Per-instance scalar mean/std normalization on natural-log mel.
         case perInstanceMeanStd
+        /// Per-mel-bin mean/std over time with Bessel correction. NeMo `per_feature`
+        /// convention; matches HF `ParakeetFeatureExtractor`.
+        case perBinMeanStd
     }
 
     public enum Layout: Sendable {
@@ -84,18 +87,15 @@ public struct MelConfig: Sendable {
         normalization: .whisperLogClip, layout: .channelMajor,
         padMode: .reflect, melScale: .htk)
 
-    /// Parakeet TDT v3 parameters. HF `ParakeetFeatureExtractor` uses Slaney mel,
-    /// per-mel-bin Bessel-corrected normalization, and the `soxr_hq` resampler;
-    /// we currently use HTK mel + scalar normalization + AVAudioConverter, which
-    /// happens to give better empirical transcripts on our test clips than the
-    /// "more correct" HF spec because the model is fed slightly different mel
-    /// regardless (the resampler is the dominant mismatch). Don't change these
-    /// without testing transcripts on multiple clips.
+    /// Parakeet TDT v3 parameters. Matches HF `ParakeetFeatureExtractor`: Slaney mel scale,
+    /// per-mel-bin Bessel-corrected normalization (NeMo `per_feature`), zero-pad boundary,
+    /// and 16 kHz target sample rate. AVAudioConverter is used for resampling instead of
+    /// `soxr_hq`; that remaining mismatch is small and tolerated by the model.
     public static let parakeet = MelConfig(
         sampleRate: 16_000, nFFT: 512, winLength: 400, hopLength: 160,
         nMelBins: 128, nFrames: nil, preemphasis: 0.97,
-        normalization: .perInstanceMeanStd, layout: .timeMajor,
-        padMode: .constant, melScale: .htk)
+        normalization: .perBinMeanStd, layout: .timeMajor,
+        padMode: .constant, melScale: .slaney)
 }
 
 // MARK: - MelSpectrogram
@@ -180,7 +180,7 @@ public enum MelSpectrogram {
         // (if any) stays zero, matching HF's masked-out-tail behavior.
         normalize(
             &mel, normalization: config.normalization,
-            validCount: validFrames * config.nMelBins)
+            validFrames: validFrames, nMelBins: config.nMelBins, layout: config.layout)
         return mel
     }
 
@@ -195,6 +195,7 @@ public enum MelSpectrogram {
             throw SpeechError.invalidAudio(
                 "Cannot resample \(file.processingFormat) to \(targetSampleRate) Hz mono")
         }
+        conv.sampleRateConverterQuality = AVAudioQuality.max.rawValue
         let cap = AVAudioFrameCount(
             ceil(Double(file.length) * targetSampleRate / file.processingFormat.sampleRate) + 1)
         let out = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: cap)!
@@ -271,12 +272,16 @@ public enum MelSpectrogram {
     }
 
     private static func normalize(
-        _ mel: inout [Float], normalization: MelConfig.Normalization, validCount: Int? = nil
+        _ mel: inout [Float],
+        normalization: MelConfig.Normalization,
+        validFrames: Int,
+        nMelBins: Int,
+        layout: MelConfig.Layout
     ) {
-        let count = validCount ?? mel.count
+        let count = validFrames * nMelBins
         switch normalization {
         case .whisperLogClip:
-            // Whisper has fixed nFrames so validCount == mel.count; operate on whole array.
+            // Whisper has fixed nFrames so validFrames*nMelBins == mel.count; operate on whole array.
             let maxVal = mel.max() ?? 0
             for i in 0..<mel.count { mel[i] = (max(mel[i], maxVal - 8) + 4) / 4 }
         case .perInstanceMeanStd:
@@ -292,7 +297,35 @@ public enum MelSpectrogram {
             let std = sqrt(sqSum / Float(count))
             let denom = max(std, 1e-5)
             for i in 0..<count { mel[i] = (mel[i] - mean) / denom }
-        // Trailing entries beyond `count` (if any) stay zero.
+        case .perBinMeanStd:
+            // NeMo `per_feature`: normalize each mel bin independently over time.
+            // Bessel-corrected std (divide by validFrames−1).
+            if validFrames < 2 { return }
+            // totalFrames may be validFrames+1 (trailing zero frame). For channelMajor the
+            // stride between successive time steps within one bin is 1, but the bin-start
+            // offset depends on the full (possibly padded) frame count stored in the array.
+            let totalFrames = mel.count / nMelBins  // actual allocation width per bin
+            for b in 0..<nMelBins {
+                var sum: Float = 0
+                for t in 0..<validFrames {
+                    let idx = (layout == .timeMajor) ? (t * nMelBins + b) : (b * totalFrames + t)
+                    sum += mel[idx]
+                }
+                let mean = sum / Float(validFrames)
+                var sqSum: Float = 0
+                for t in 0..<validFrames {
+                    let idx = (layout == .timeMajor) ? (t * nMelBins + b) : (b * totalFrames + t)
+                    let d = mel[idx] - mean
+                    sqSum += d * d
+                }
+                let std = sqrt(sqSum / Float(validFrames - 1))
+                let denom = max(std, 1e-5)
+                for t in 0..<validFrames {
+                    let idx = (layout == .timeMajor) ? (t * nMelBins + b) : (b * totalFrames + t)
+                    mel[idx] = (mel[idx] - mean) / denom
+                }
+            }
+        // Trailing entries beyond validFrames (if any) stay zero.
         }
     }
 
