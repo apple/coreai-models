@@ -23,10 +23,10 @@ struct MultimodalTypeTests {
         )
         let input = EmbeddedInput(
             embeddings: embeddings,
-            imageTokenPositions: 5..<261
+            embeddingPositions: 5..<261
         )
         #expect(input.tokenCount == 256)
-        #expect(input.imageTokenPositions.count == 256)
+        #expect(input.embeddingPositions.count == 256)
     }
     #endif
 
