@@ -30,9 +30,6 @@ class ModelEntry:
 @lru_cache(maxsize=1)
 def _get_registry() -> dict[str, ModelEntry]:
     """Build the model registry (cached singleton). Lazy imports to avoid circular deps."""
-    from coreai_models.models.gpu.qwen3_vl import (
-        Qwen3VLForCausalLM,
-    )
     from coreai_models.models.ios.mistral import MistralForCausalLMForiOS
     from coreai_models.models.ios.qwen2 import Qwen2ForCausalLMForiOS
     from coreai_models.models.ios.qwen3 import Qwen3ForCausalLMForiOS
@@ -43,6 +40,9 @@ def _get_registry() -> dict[str, ModelEntry]:
     from coreai_models.models.macos.qwen2 import Qwen2ForCausalLM
     from coreai_models.models.macos.qwen3 import Qwen3ForCausalLM
     from coreai_models.models.macos.qwen3_moe import Qwen3MoeForCausalLM
+    from coreai_models.models.macos.qwen3_vl import (
+        Qwen3VLForCausalLM,
+    )
 
     return {
         "gemma3_text": ModelEntry(

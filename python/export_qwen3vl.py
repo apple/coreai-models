@@ -35,7 +35,7 @@ from transformers import AutoConfig, AutoTokenizer
 
 from coreai_models.export.macos import export_to_coreai
 from coreai_models.export.metadata import build_aimodel_metadata
-from coreai_models.models.gpu.qwen3_vl import Qwen3VLForCausalLMEmbeddings
+from coreai_models.models.macos.qwen3_vl import Qwen3VLForCausalLMEmbeddings
 
 HF_MODEL_ID = "Qwen/Qwen3-VL-2B-Instruct"
 OUTPUT_NAME = "qwen3_vl_2b"
