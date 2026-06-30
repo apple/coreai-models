@@ -299,7 +299,7 @@ public enum InferenceRuntimeError: Error, LocalizedError {
 ///
 /// The caller owns the embeddings and decides caching strategy.
 public protocol MultimodalInferenceEngine: InferenceEngine {
-    /// Encode an image into embeddings suitable for injection into the LLM.
+    /// Encode an image into embeddings suitable for injection into the VLM.
     /// Returns the embedded representation — caller decides whether to cache.
     func encodeImage(at url: URL) async throws -> EmbeddedInput
 
