@@ -176,6 +176,9 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     )
     var chunkSize: Int?
 
+    @Option(name: .customLong("image"), help: "Path to an image file for vision-language models")
+    var imagePath: String?
+
     @Flag(help: "Enable verbose logging")
     var verbose: Bool = false
 
@@ -335,33 +338,69 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         // Create inference engine
         CLILogger.log("Creating inference engine...", component: "Main")
 
-        let modelURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.main)
         let engineOptions = EngineOptions(
             variant: inferenceEngineVariant,
             kvCacheStrategy: kvCacheStrategy,
             kvCacheSize: kvCacheInitialCapacity
         )
-        let engineConfig = ModelConfig(
-            name: bundle.name,
-            tokenizer: bundle.tokenizer,
-            vocabSize: bundle.vocabSize,
-            maxContextLength: bundle.maxContextLength,
-            serializedModel: [bundle.modelAssetPath],
-            function: bundle.language.functionMap?.name(for: "main") ?? "main"
-        )
-        let configData = try JSONEncoder().encode(engineConfig)
 
         // Parallel loading: engine compilation + tokenizer are independent.
         let modelLoadSpan = InstrumentsProfiler.beginModelLoad(name: bundle.name)
         let tokenizerLoadSpan = InstrumentsProfiler.beginTokenizerLoad(id: modelFile)
-        async let engineResult = EngineFactory.createEngine(
-            config: configData,
-            modelURL: modelURL,
-            options: engineOptions
-        )
         async let tokenizerResult = bundle.loadTokenizer()
 
-        let inferenceEngine = try await engineResult
+        let inferenceEngine: any InferenceEngine
+        if bundle.bundle.kind == .vlm {
+            // VLM: load 3 models and create VLM engine directly
+            let visionURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.vision)
+            let embedURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.embedding)
+            let mainURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.main)
+
+            guard let visionConfig = bundle.visionConfig else {
+                throw InferenceRuntimeError.invalidArgument(
+                    "VLM bundle missing 'vision' config in metadata.json")
+            }
+
+            let baseConfig = ModelConfig(
+                name: bundle.name,
+                tokenizer: bundle.tokenizer,
+                vocabSize: bundle.vocabSize,
+                maxContextLength: bundle.maxContextLength,
+                serializedModel: [mainURL.path],
+                function: bundle.language.functionMap?.name(for: "main") ?? "main"
+            )
+            let vlmConfig = VLMModelConfig(base: baseConfig, visionConfig: visionConfig)
+
+            let visionModel = try await PreparedModel.prepare(at: visionURL)
+            let embedModel = try await PreparedModel.prepare(at: embedURL)
+            let llmModel = try await PreparedModel.prepare(at: mainURL)
+
+            inferenceEngine = try await CoreAISequentialVLMEngine(
+                config: vlmConfig,
+                visionModel: visionModel,
+                embedModel: embedModel,
+                llmModel: llmModel,
+                options: engineOptions
+            )
+        } else {
+            // Standard LLM: use EngineFactory
+            let modelURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.main)
+            let engineConfig = ModelConfig(
+                name: bundle.name,
+                tokenizer: bundle.tokenizer,
+                vocabSize: bundle.vocabSize,
+                maxContextLength: bundle.maxContextLength,
+                serializedModel: [bundle.modelAssetPath],
+                function: bundle.language.functionMap?.name(for: "main") ?? "main"
+            )
+            let configData = try JSONEncoder().encode(engineConfig)
+            inferenceEngine = try await EngineFactory.createEngine(
+                config: configData,
+                modelURL: modelURL,
+                options: engineOptions
+            )
+        }
+
         modelLoadSpan.end()
         let tokenizer = try await tokenizerResult
         tokenizerLoadSpan.end()
@@ -442,6 +481,21 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         CLILogger.log("   Max generation tokens: \(maxTokens)", component: "Main")
         CLILogger.log("   Required context length: \(requiredContextLength)", component: "Main")
         // Engines will validate context length during inference
+
+        // VLM path: if --image is provided and engine supports multimodal
+        if let imagePath = imagePath {
+            try await runVLMInference(
+                imagePath: imagePath,
+                inferenceEngine: inferenceEngine,
+                bundle: bundle,
+                tokenizer: tokenizer,
+                samplingConfiguration: samplingConfiguration,
+                maxTokens: maxTokens,
+                additionalEosTokenIds: additionalEosTokenIds,
+                displayPrompt: displayPrompt
+            )
+            return
+        }
 
         // Build text generator with preloaded inference engine
         CLILogger.log("Building text generator...", component: "Main")
@@ -746,6 +800,166 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             additionalSequences: sequences,
             additionalEosTokenIds: additionalEosTokenIds
         )
+    }
+
+    // MARK: - VLM Inference
+
+    private func runVLMInference(
+        imagePath: String,
+        inferenceEngine: any InferenceEngine,
+        bundle: LanguageBundle,
+        tokenizer: any Tokenizer,
+        samplingConfiguration: SamplingConfiguration,
+        maxTokens: Int,
+        additionalEosTokenIds: [Int32],
+        displayPrompt: String
+    ) async throws {
+        guard let vlmEngine = inferenceEngine as? any MultimodalInferenceEngine else {
+            print("Error: --image requires a vision-language model (engine does not support multimodal)")
+            throw ExitCode.failure
+        }
+
+        let imageURL = URL(fileURLWithPath: imagePath)
+        guard FileManager.default.fileExists(atPath: imageURL.path) else {
+            print("Error: image not found at \(imagePath)")
+            throw ExitCode.failure
+        }
+
+        guard let visionConfig = bundle.visionConfig else {
+            print("Error: VLM bundle missing 'vision' config in metadata.json")
+            throw ExitCode.failure
+        }
+
+        if !CLILogger.isVerbose {
+            print("Generating...")
+        }
+
+        CLILogger.log("Encoding image: \(imagePath)", component: "VLM")
+        let embeddedInput = try await vlmEngine.encodeImage(at: imageURL)
+        CLILogger.log("Image encoded: \(embeddedInput.tokenCount) visual tokens", component: "VLM")
+
+        // Build VLM prompt with image placeholder tokens.
+        // Try using the tokenizer's chat template if available; fall back to
+        // generic "USER: <image>×N \n prompt \nASSISTANT:" format.
+        let imageTokenCount = embeddedInput.tokenCount
+        let imageTokenId = visionConfig.imageTokenId
+        let vlmTokens: [Int32]
+
+        if let chatTemplateTokens = try? buildVLMPromptFromChatTemplate(
+            prompt: displayPrompt,
+            imageTokenCount: imageTokenCount,
+            imageTokenId: imageTokenId,
+            tokenizer: tokenizer
+        ) {
+            vlmTokens = chatTemplateTokens
+            CLILogger.log("VLM prompt: used tokenizer chat template", component: "VLM")
+        } else {
+            CLILogger.log(
+                "VLM prompt: no chat template found, using fallback USER/ASSISTANT format",
+                component: "VLM")
+            var tokens = tokenizer.encode(text: "USER: ", addSpecialTokens: true).map { Int32($0) }
+            tokens.append(contentsOf: [Int32](repeating: imageTokenId, count: imageTokenCount))
+            let suffix = "\n" + displayPrompt + "\nASSISTANT:"
+            tokens.append(
+                contentsOf: tokenizer.encode(text: suffix, addSpecialTokens: false).map { Int32($0) })
+            vlmTokens = tokens
+        }
+
+        CLILogger.log(
+            "VLM prompt: \(vlmTokens.count) tokens (\(imageTokenCount) image placeholders)",
+            component: "VLM")
+
+        // Build stop token set
+        var eosTokenIds = Set<Int32>()
+        if let eos = tokenizer.eosTokenId { eosTokenIds.insert(Int32(eos)) }
+        eosTokenIds.formUnion(additionalEosTokenIds)
+
+        let stopSequences = try validateAndEncodeStopTokens(
+            stopTokens: stopTokens,
+            tokenizer: tokenizer,
+            additionalEosTokenIds: additionalEosTokenIds
+        )
+        for seq in stopSequences.sequences where seq.count == 1 {
+            eosTokenIds.insert(seq[0])
+        }
+
+        let inferenceID = InstrumentsProfiler.beginInference(
+            promptTokens: vlmTokens.count, maxTokens: maxTokens)
+
+        let tokenStream = try vlmEngine.generate(
+            with: embeddedInput,
+            tokens: vlmTokens,
+            samplingConfiguration: samplingConfiguration,
+            inferenceOptions: InferenceOptions(maxTokens: maxTokens)
+        )
+
+        var generatedTokens: [Int] = []
+        var previousText = ""
+        for try await output in tokenStream {
+            let token = output.tokenId
+            if eosTokenIds.contains(token) { break }
+            generatedTokens.append(Int(token))
+            let fullText = tokenizer.decode(tokens: generatedTokens)
+            let delta = String(fullText.dropFirst(previousText.count))
+            previousText = fullText
+            print(delta, terminator: "")
+            fflush(stdout)
+        }
+        print()
+
+        InstrumentsProfiler.endInference(
+            generatedTokens: generatedTokens.count, signpostID: inferenceID)
+        await PerformanceMetrics.shared.setGeneratedTokenCount(generatedTokens.count)
+        await PerformanceMetrics.shared.endOverallTiming()
+        await PerformanceMetrics.shared.printSummary(verbose: CLILogger.isVerbose)
+
+        if verbose {
+            await StatsReporter(storage: .shared).printVerboseTable()
+        }
+        InstrumentsProfiler.logMemoryUsage(phase: "ModelFinal")
+    }
+
+    /// Build a VLM prompt using the tokenizer's chat template.
+    /// Returns nil if the tokenizer doesn't support multimodal chat templates
+    /// or if the template doesn't produce the expected image placeholder tokens.
+    private func buildVLMPromptFromChatTemplate(
+        prompt: String,
+        imageTokenCount: Int,
+        imageTokenId: Int32,
+        tokenizer: any Tokenizer
+    ) throws -> [Int32]? {
+        // Use the tokenizer's applyChatTemplate with a multimodal message.
+        // The template should emit a single <image> token that we expand.
+        let imageToken = tokenizer.convertIdToToken(Int(imageTokenId)) ?? "<image>"
+        let templatedPrompt = "\(imageToken)\n\(prompt)"
+        guard
+            let tokens = try? PromptUtils.maybeApplyTokenizerChatTemplate(
+                .prompt(templatedPrompt), tokenizer: tokenizer
+            )
+        else {
+            return nil
+        }
+
+        // Expand the single image placeholder to imageTokenCount copies
+        var result: [Int32] = []
+        result.reserveCapacity(tokens.count + imageTokenCount - 1)
+        var foundPlaceholder = false
+        for tokenInt in tokens {
+            let token = Int32(tokenInt)
+            if token == imageTokenId && !foundPlaceholder {
+                result.append(contentsOf: [Int32](repeating: imageTokenId, count: imageTokenCount))
+                foundPlaceholder = true
+            } else if token == imageTokenId {
+                // Skip additional single image tokens (already expanded the first one)
+                continue
+            } else {
+                result.append(token)
+            }
+        }
+
+        // If we never found the placeholder, the template didn't produce it — fall back
+        guard foundPlaceholder else { return nil }
+        return result
     }
 
     // MARK: - Asset Type Label
