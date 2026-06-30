@@ -3,7 +3,17 @@
 # Use of this source code is governed by a BSD-3-clause license that can
 # be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
-"""Functional KV cache backed by slice_scatter (explicit KV, avoids Metal prefill crash)."""
+"""Functional KV cache backed by slice_scatter (explicit KV).
+
+Difference from ``cache.py``: ``KVCache`` updates the cache buffers
+in-place via ``mutable_slice_update`` (a mutating ``index_put_``-style op).
+This variant rebuilds the cache functionally with
+``torch.ops.aten.slice_scatter`` (out-of-place: each update returns a new
+tensor that is reassigned to ``self._k_cache``/``self._v_cache``).
+
+The public API (``create_cache_tensors``, ``update_and_fetch``, cache layout/shape) is kept
+identical so the two are drop-in interchangeable.
+"""
 
 import torch
 from typing_extensions import Self
