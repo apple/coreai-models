@@ -845,7 +845,7 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
         cleanupSpan.end()
     }
 
-    public func warmup(queryLength: Int, sampling: SamplingConfiguration?) async throws {
+    public func warmup(queryLength _: Int, sampling _: SamplingConfiguration?) async throws {
         // Warmup the decode path with a single dummy token through embed + LLM
         let dummyTokens: ArraySlice<Int32> = [Int32(1)][...]
         _ = try await processTokenBatch(dummyTokens)
@@ -864,7 +864,7 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
                 "Context length \(needed) exceeds maximum \(config.maxContextLength)")
         }
 
-        var newCapacity = currentKVCapacity
+        var newCapacity = max(currentKVCapacity, 1)
         while newCapacity < needed { newCapacity *= 2 }
         newCapacity = min(newCapacity, config.maxContextLength)
 
