@@ -45,6 +45,7 @@ dependencies = [
 [project.scripts]
 "coreai.llm.export" = "coreai_models.llm.export:main"
 "coreai.llm.eval" = "coreai_models.llm.eval:main"
+"coreai.vlm.export" = "coreai_models.vlm.export:main"
 "coreai.diffusion.export" = "coreai_models.diffusion.export:main"
 "coreai.model.registry" = "coreai_models.model_registry:main"
 
