@@ -20,8 +20,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from coreai_models.models.ios.sam3.primitives.layer_norm import LayerNormReauthored
-from coreai_models.models.ios.sam3.primitives.sdpa import BidirectionalSDPA
+from coreai_models.primitives.ios.bidirectional_sdpa import BidirectionalSDPA
+from coreai_models.primitives.ios.layer_norm import LayerNormReauthored
 
 
 def _linear_to_conv2d(linear: nn.Linear) -> nn.Conv2d:

@@ -116,11 +116,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--image-size",
         type=int,
         default=None,
-        help=(
-            "Input resolution. Defaults to 336 (optimized) or 1008 (--baseline). "
-            "336 keeps the optimized path's global-attention sequence inside "
-            "Neural Engine SRAM."
-        ),
+        help=("Input resolution. Defaults to 336 (optimized) or 1008 (--baseline). "),
     )
     # ---- Optimized-only flags -------------------------------------------
     parser.add_argument(

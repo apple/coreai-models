@@ -52,7 +52,7 @@ uv run export.py --help
 | `--overwrite`          | Overwrite existing bundle                      | —                      |
 | `--dry-run`            | Print resolved config and exit                 | —                      |
 
-`image-size=336` keeps the global-attention sequence small enough to fit Neural Engine SRAM; it is the resolution we recommend for ANE deployment.
+`image-size=336` is the resolution we recommend for ANE deployment.
 
 ### Optimized export (re-authored for iOS)
 

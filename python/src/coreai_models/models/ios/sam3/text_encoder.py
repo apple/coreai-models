@@ -14,9 +14,9 @@ on masked positions.
 import torch
 import torch.nn as nn
 
-from coreai_models.models.ios.sam3.primitives.gelu import GELUReauthored
-from coreai_models.models.ios.sam3.primitives.layer_norm import LayerNormReauthored
-from coreai_models.models.ios.sam3.primitives.sdpa import BidirectionalSDPA
+from coreai_models.primitives.ios.bidirectional_sdpa import BidirectionalSDPA
+from coreai_models.primitives.ios.gelu import GELUReauthored
+from coreai_models.primitives.ios.layer_norm import LayerNormReauthored
 
 
 def _make_causal_mask(seq_len: int) -> torch.Tensor:

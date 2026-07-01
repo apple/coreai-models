@@ -45,8 +45,7 @@ class Sam3Reauthored(nn.Module):
     """Full SAM3 re-authored model for Apple Neural Engine.
 
     The default ``image_size=336`` keeps the global-attention sequence
-    short enough to fit Neural Engine SRAM. Pass ``image_size=1008`` to
-    match HF's default.
+    short. Pass ``image_size=1008`` to match HF's default.
 
     Inputs:
         pixel_values: (B, 3, image_size, image_size) float tensor.

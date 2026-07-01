@@ -5,9 +5,7 @@
 
 """Re-authored bidirectional scaled dot-product attention for SAM3.
 
-Pure PyTorch ops (split / cat / matmul / softmax) in BC1S layout. The
-per-head split + cat pattern keeps the compiler from inflating the graph
-into shapes that overflow accelerator SRAM on long sequences.
+Pure PyTorch ops (split / cat / matmul / softmax) in BC1S layout.
 
 Mask convention: ``attention_mask`` (when provided) is in GPU layout
 (B, num_heads, query_seq, key_seq), with ``-40000.0`` for masked
@@ -21,8 +19,7 @@ import torch.nn as nn
 class BidirectionalSDPA(nn.Module):
     """Per-head split/cat SDPA for Apple Neural Engine.
 
-    Chunks the query when ``query_seq > query_chunk_size`` so that even very
-    long-sequence attention stays within accelerator SRAM.
+    Chunks the query when ``query_seq > query_chunk_size``
     """
 
     def __init__(

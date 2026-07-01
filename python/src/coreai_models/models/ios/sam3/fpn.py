@@ -16,7 +16,7 @@ import math
 import torch
 import torch.nn as nn
 
-from coreai_models.models.ios.sam3.primitives.gelu import gelu_ane
+from coreai_models.primitives.ios.gelu import gelu_ane
 
 _BACKBONE_HIDDEN_SIZE = 1024
 _FPN_HIDDEN_SIZE = 256

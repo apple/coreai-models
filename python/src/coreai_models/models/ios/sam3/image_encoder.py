@@ -17,14 +17,14 @@ HF reference: ``Sam3ViTModel`` in
 import torch
 import torch.nn as nn
 
-from coreai_models.models.ios.sam3.primitives.gelu import gelu_ane
-from coreai_models.models.ios.sam3.primitives.layer_norm import LayerNormReauthored
 from coreai_models.models.ios.sam3.primitives.rope import AxialRoPE2DReauthored
-from coreai_models.models.ios.sam3.primitives.sdpa import BidirectionalSDPA
 from coreai_models.models.ios.sam3.primitives.window import (
     window_partition_ane,
     window_unpartition_ane,
 )
+from coreai_models.primitives.ios.bidirectional_sdpa import BidirectionalSDPA
+from coreai_models.primitives.ios.gelu import gelu_ane
+from coreai_models.primitives.ios.layer_norm import LayerNormReauthored
 
 # Constants matching the SAM3 image-encoder config defaults.
 _HIDDEN_SIZE = 1024
