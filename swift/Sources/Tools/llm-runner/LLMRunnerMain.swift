@@ -179,6 +179,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     @Option(name: .customLong("image"), help: "Path to an image file for vision-language models")
     var imagePath: String?
 
+
     @Flag(help: "Enable verbose logging")
     var verbose: Bool = false
 
@@ -886,27 +887,62 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         let inferenceID = InstrumentsProfiler.beginInference(
             promptTokens: vlmTokens.count, maxTokens: maxTokens)
 
+        await PerformanceMetrics.shared.setPromptTokenCount(vlmTokens.count)
+
         let tokenStream = try vlmEngine.generate(
             with: embeddedInput,
             tokens: vlmTokens,
             samplingConfiguration: samplingConfiguration,
-            inferenceOptions: InferenceOptions(maxTokens: maxTokens)
+            inferenceOptions: InferenceOptions(
+                maxTokens: maxTokens,
+                includeLogits: printLogits || saveLogits != nil
+            )
         )
+
+        CLILogger.log("VLM generate started, maxTokens=\(maxTokens)", component: "VLM")
+
+        // Prompt (prefill) timing — first token latency
+        var promptSpan: ProfileSpan? = InstrumentsProfiler.beginPrompt(tokens: vlmTokens.count, engine: "CoreAIVLM")
+        var extendSpan: ProfileSpan?
 
         var generatedTokens: [Int] = []
         var previousText = ""
         for try await output in tokenStream {
+            if promptSpan != nil {
+                promptSpan?.end()
+                promptSpan = nil
+                extendSpan = InstrumentsProfiler.beginExtend(step: 0, tokens: 1)
+            }
+
             let token = output.tokenId
+            if printLogits {
+                print("\n  raw token=\(token)", terminator: "")
+            }
             if eosTokenIds.contains(token) { break }
             generatedTokens.append(Int(token))
+
+            if printLogits {
+                if let logits = output.logits {
+                    let indexed = logits.enumerated().map { (idx: $0.offset, val: Float($0.element)) }
+                    let topK = indexed.sorted { $0.val > $1.val }.prefix(5)
+                    let desc = topK.map { "[\($0.idx)]=\(String(format: "%.3f", $0.val))" }.joined(separator: " ")
+                    print("\n  logits top5: \(desc)", terminator: "")
+                } else {
+                    print("\n  token=\(token) (logits=nil)", terminator: "")
+                }
+            }
+
             let fullText = tokenizer.decode(tokens: generatedTokens)
             let delta = String(fullText.dropFirst(previousText.count))
             previousText = fullText
             print(delta, terminator: "")
             fflush(stdout)
         }
+        promptSpan?.end()
+        extendSpan?.end()
         print()
 
+        // Record generation stats (extend spans are tracked internally by the engine)
         InstrumentsProfiler.endInference(
             generatedTokens: generatedTokens.count, signpostID: inferenceID)
         await PerformanceMetrics.shared.setGeneratedTokenCount(generatedTokens.count)
