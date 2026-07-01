@@ -19,8 +19,7 @@ import Foundation
 ///   * Multi-function — three graphs (``image_encode``, ``text_encode``, ``detect``) wired
 ///     together at runtime. Produced by the optimized re-authored SAM3 export targeting
 ///     Apple Neural Engine. The engine pipes the encoder outputs into the detector and
-///     returns the same `SegmentationOutput` shape as the single-function path
-///     (without `semantic_seg`, which the optimized graph drops).
+///     returns the same `SegmentationOutput` shape as the single-function path.
 public struct CoreAISegmentationEngine {
     private let backend: Backend
 
@@ -270,6 +269,7 @@ public struct CoreAISegmentationEngine {
         let boxesOutputName: String
         let logitsOutputName: String
         let presenceLogitsOutputName: String
+        let semanticSegOutputName: String
 
         init(
             model: AIModel,
@@ -308,7 +308,7 @@ public struct CoreAISegmentationEngine {
                 )
             }
 
-            // detect: needs both encoder outputs as inputs + the four detection outputs.
+            // detect: needs both encoder outputs as inputs + the five detection outputs.
             guard
                 let backboneFeaturesInputName = findBackboneFeaturesName(
                     in: detectDescriptor.inputNames)
@@ -345,6 +345,12 @@ public struct CoreAISegmentationEngine {
             else {
                 throw SegmentationRuntimeError.invalidConfiguration(
                     "Cannot find presence-logits output in 'detect'. Outputs: \(detectDescriptor.outputNames)"
+                )
+            }
+            guard let semanticSegOutputName = findSemanticOutputName(in: detectDescriptor.outputNames)
+            else {
+                throw SegmentationRuntimeError.invalidConfiguration(
+                    "Cannot find semantic segmentation output in 'detect'. Outputs: \(detectDescriptor.outputNames)"
                 )
             }
 
@@ -384,6 +390,7 @@ public struct CoreAISegmentationEngine {
             self.boxesOutputName = boxesOutputName
             self.logitsOutputName = logitsOutputName
             self.presenceLogitsOutputName = presenceLogitsOutputName
+            self.semanticSegOutputName = semanticSegOutputName
         }
     }
 
@@ -899,7 +906,8 @@ public struct CoreAISegmentationEngine {
         guard let masks = detectOutputs.remove(state.masksOutputName)?.ndArray,
             let boxes = detectOutputs.remove(state.boxesOutputName)?.ndArray,
             let logits = detectOutputs.remove(state.logitsOutputName)?.ndArray,
-            let presence = detectOutputs.remove(state.presenceLogitsOutputName)?.ndArray
+            let presence = detectOutputs.remove(state.presenceLogitsOutputName)?.ndArray,
+            let semantic = detectOutputs.remove(state.semanticSegOutputName)?.ndArray
         else {
             throw SegmentationRuntimeError.invalidConfiguration(
                 "Missing one or more outputs after detect.run."
@@ -912,8 +920,8 @@ public struct CoreAISegmentationEngine {
             predictedBoxes: flattenAsFloat(boxes),
             predictedLogits: flattenAsFloat(logits),
             presenceLogits: flattenAsFloat(presence),
-            semanticSegment: [],
-            semanticSegmentShape: []
+            semanticSegment: flattenAsFloat(semantic),
+            semanticSegmentShape: semantic.shape
         )
     }
 

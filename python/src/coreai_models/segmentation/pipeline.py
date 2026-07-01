@@ -81,7 +81,7 @@ class DetectorModule(nn.Module):
 
     def forward(
         self, backbone_features: torch.Tensor, text_features: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         fpn_hidden_states, fpn_position_encoding = self.fpn(backbone_features)
         fpn_hidden_states_trimmed = fpn_hidden_states[:-1]
         fpn_position_encoding_trimmed = fpn_position_encoding[:-1]
@@ -117,7 +117,13 @@ class DetectorModule(nn.Module):
             encoder_hidden_states=encoder_output,
             prompt_features=text_features,
         )
-        return mask_outputs["pred_masks"], pred_boxes, pred_logits, presence_logits
+        return (
+            mask_outputs["pred_masks"],
+            pred_boxes,
+            pred_logits,
+            presence_logits,
+            mask_outputs["semantic_seg"],
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -278,7 +284,7 @@ async def _async_export_segmentation(config: SegmentationExportConfig) -> str:
         det_program,
         entrypoint_name="detect",
         input_names=["backbone_features", "text_features"],
-        output_names=["pred_masks", "pred_boxes", "pred_logits", "presence_logits"],
+        output_names=["pred_masks", "pred_boxes", "pred_logits", "presence_logits", "semantic_seg"],
     )
     coreai_program = converter.to_coreai()
     coreai_program.optimize()

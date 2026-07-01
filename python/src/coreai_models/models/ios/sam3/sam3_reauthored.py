@@ -11,7 +11,8 @@ forward pass that mirrors the IO of HF ``Sam3Model``.
 
 Usage:
     model = Sam3Reauthored.from_pretrained("facebook/sam3", image_size=336)
-    pred_masks, pred_boxes, pred_logits, presence_logits = model(pixel_values, input_ids)
+    pred_masks, pred_boxes, pred_logits, presence_logits, semantic_seg =
+     model(pixel_values, input_ids)
 """
 
 import torch
@@ -52,7 +53,7 @@ class Sam3Reauthored(nn.Module):
         input_ids: (B, seq_len) int32 token IDs.
 
     Outputs:
-        Tuple ``(pred_masks, pred_boxes, pred_logits, presence_logits)``.
+        Tuple ``(pred_masks, pred_boxes, pred_logits, presence_logits, semantic_seg)``.
     """
 
     def __init__(self, image_size: int = 336) -> None:
@@ -80,7 +81,7 @@ class Sam3Reauthored(nn.Module):
         self,
         pixel_values: torch.Tensor,
         input_ids: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         backbone_features = self.image_encoder(pixel_values)
 
         fpn_hidden_states, fpn_position_encoding = self.fpn(backbone_features)
@@ -126,8 +127,9 @@ class Sam3Reauthored(nn.Module):
             prompt_features=text_features,
         )
         pred_masks = mask_outputs["pred_masks"]
+        semantic_seg = mask_outputs["semantic_seg"]
 
-        return pred_masks, pred_boxes, pred_logits, presence_logits
+        return pred_masks, pred_boxes, pred_logits, presence_logits, semantic_seg
 
     @classmethod
     def from_pretrained(
