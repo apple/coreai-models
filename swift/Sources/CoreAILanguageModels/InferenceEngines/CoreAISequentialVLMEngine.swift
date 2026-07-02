@@ -574,10 +574,10 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
         }
 
         // Copy image embeddings into placeholder positions.
-        precondition(
-            imageEmbeddings.scalarType == .float16,
-            "scatterMerge only supports float16 embeddings; got \(imageEmbeddings.scalarType)"
-        )
+        guard imageEmbeddings.scalarType == .float16 else {
+            throw InferenceRuntimeError.invalidInputType(
+                "scatterMerge only supports float16 embeddings; got \(imageEmbeddings.scalarType)")
+        }
         imageEmbeddings.view(as: Float16.self).withUnsafePointer { imgPtr, _, _ in
             var mutableView = merged.mutableView(as: Float16.self)
             mutableView.withUnsafeMutablePointer { mergedPtr, _, _ in

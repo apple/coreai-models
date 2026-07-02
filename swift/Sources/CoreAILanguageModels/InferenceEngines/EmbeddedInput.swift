@@ -26,7 +26,11 @@ public struct EmbeddedInput: Sendable {
 
     /// Number of embedding tokens (seq_len dimension).
     public var tokenCount: Int {
-        embeddings.shape.count >= 2 ? embeddings.shape[1] : 0
+        switch embeddings.shape.count {
+        case 3...: embeddings.shape[1]  // [batch, seq_len, hidden_dim]
+        case 2: embeddings.shape[0]  // [seq_len, hidden_dim]
+        default: 0
+        }
     }
 
     // TODO: Multi-turn support — allow multiple image regions per input,
