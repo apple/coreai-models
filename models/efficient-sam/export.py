@@ -6,8 +6,8 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "coreai-core==1.0.0b1",
-#     "coreai-torch==0.4.0",
+#     "coreai-core==1.0.0b2",
+#     "coreai-torch==0.4.1",
 #     "efficient-sam @ git+https://github.com/yformer/EfficientSAM.git",
 #     "torch<=2.11.0"
 # ]
@@ -235,7 +235,7 @@ def main():
     parser.add_argument(
         "--num-pts",
         type=int,
-        default=1,
+        default=2,
         help=(
             "Number of points per query (P dim of batched_points). Use 1 for a single "
             "point prompt, or 2 with labels [2, 3] for a box prompt (top-left + "

@@ -6,8 +6,8 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "coreai-core==1.0.0b1",
-#     "coreai-torch==0.4.0",
+#     "coreai-core==1.0.0b2",
+#     "coreai-torch==0.4.1",
 #     "timm",
 # ]
 #
@@ -27,9 +27,11 @@ from coreai.runtime import AIModelAssetMetadata
 from coreai_torch import TorchConverter, get_decomp_table
 
 
-def reference_inputs(dynamic: bool = False) -> dict[str, torch.Tensor]:
+def reference_inputs(
+    dynamic: bool = False, dtype: torch.dtype = torch.float32
+) -> dict[str, torch.Tensor]:
     B = 2 if dynamic else 1
-    return {"x": torch.randn(B, 3, 224, 224)}
+    return {"x": torch.randn(B, 3, 224, 224, dtype=dtype)}
 
 
 def dynamic_shapes() -> dict:
@@ -97,7 +99,7 @@ def create_pvt(
     model.to(dtype)
     print("[INFO] Model sourced. Running torch export with decompositions...")
 
-    example_inputs = {k: v.to(dtype) for k, v in reference_inputs(dynamic).items()}
+    example_inputs = example_inputs = reference_inputs(dynamic, dtype)
     ds = dynamic_shapes() if dynamic else None
 
     with torch.autocast(device_type="cpu", dtype=dtype):
