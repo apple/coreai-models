@@ -95,6 +95,18 @@ uv run coreai.diffusion.export stabilityai/stable-diffusion-3.5-medium
 uv run coreai.diffusion.export black-forest-labs/FLUX.2-klein-4B
 ```
 
+### Vision-Language Models (VLMs)
+
+```bash
+uv run coreai.vlm.export --list-models   # list supported VLMs
+uv run coreai.vlm.export qwen3-vl        # text decoder + token embedding + vision encoder
+```
+
+This produces a single `<name>.llmasset/` bundle (`kind=vlm`) holding the text
+decoder (`main`), token-embedding lookup (`embedding`), vision encoder
+(`vision`), tokenizer, and `metadata.json`. Pass `--skip-vision` to export the
+text portion only.
+
 ### Standalone Export Scripts
 
 Models with a standalone `export.py` are run directly:
@@ -119,6 +131,10 @@ uv run models/<name>/export.py
 
 - [Stable Diffusion 1.5, 2.1, 3.5 Medium](stable-diffusion/)
 - [FLUX.2](flux2)
+
+### Vision-Language Models (VLMs)
+
+- [Qwen3-VL](vlm)
 
 ### Vision Models
 

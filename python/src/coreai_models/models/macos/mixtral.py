@@ -30,15 +30,12 @@ class SparseMoeBlock(nn.Module):
         self.switch_mlp = SwitchGLU(dim, hidden_dim, num_experts)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gates = self.gate(x)
-        gates = torch.softmax(gates, dim=-1, dtype=torch.float32)
+        router_logits = self.gate(x).to(torch.float32)
 
-        active_experts_scores, active_experts_indices = torch.topk(
-            gates, self.top_k, dim=-1, largest=True
+        top_logits, active_experts_indices = torch.topk(
+            router_logits, self.top_k, dim=-1, largest=True
         )
-
-        active_experts_scores /= active_experts_scores.sum(dim=-1, keepdim=True)
-        active_experts_scores = active_experts_scores.to(x.dtype)
+        active_experts_scores = torch.softmax(top_logits, dim=-1).to(x.dtype)
 
         y_active_experts = self.switch_mlp(x, active_experts_indices)
         active_experts_scores = active_experts_scores.unsqueeze(-1)
