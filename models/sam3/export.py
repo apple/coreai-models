@@ -6,8 +6,8 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "coreai-core==1.0.0b1",
-#     "coreai-torch==0.4.0",
+#     "coreai-core==1.0.0b2",
+#     "coreai-torch==0.4.1",
 #     "tokenizers<0.23.0rc",
 #     "torchvision",
 #     "transformers>=5.5.4,<5.10.1",
