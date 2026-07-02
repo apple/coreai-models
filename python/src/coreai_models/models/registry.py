@@ -36,6 +36,7 @@ def _get_registry() -> dict[str, ModelEntry]:
     from coreai_models.models.macos.gemma3_text import Gemma3ForCausalLM
     from coreai_models.models.macos.gpt_oss import GptOssForCausalLM
     from coreai_models.models.macos.mistral import MistralForCausalLM
+    from coreai_models.models.macos.phi3 import Phi3ForCausalLM
     from coreai_models.models.macos.mixtral import MixtralForCausalLM
     from coreai_models.models.macos.qwen2 import Qwen2ForCausalLM
     from coreai_models.models.macos.qwen3 import Qwen3ForCausalLM
@@ -56,6 +57,9 @@ def _get_registry() -> dict[str, ModelEntry]:
         "mistral": ModelEntry(
             macos_class=MistralForCausalLM,
             ios_class=MistralForCausalLMForiOS,
+        ),
+        "phi3": ModelEntry(
+            macos_class=Phi3ForCausalLM,
         ),
         "mixtral": ModelEntry(
             macos_class=MixtralForCausalLM,
