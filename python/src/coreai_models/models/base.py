@@ -117,7 +117,23 @@ def _save_and_mmap_safetensors(
 
     param_names = {name for name, _ in module.named_parameters()}
 
-    save_file({k: v.contiguous() for k, v in tensors.items()}, path)
+    # safetensors `save_file` rejects entries that share storage (e.g. the iOS
+    # mutate ties `extend.emb_scale` to `gather_embeddings.scale`). Clone any
+    # entry that aliases an earlier one so each key is written independently.
+    # The mmap round-trip below returns independent tensors per key regardless,
+    # so this does not change the reloaded model.
+    seen_storage: dict[int, str] = {}
+    to_save: dict[str, torch.Tensor] = {}
+    for key, value in tensors.items():
+        value = value.contiguous()
+        storage_ptr = value.untyped_storage().data_ptr()
+        if storage_ptr in seen_storage:
+            value = value.clone()
+        else:
+            seen_storage[storage_ptr] = key
+        to_save[key] = value
+
+    save_file(to_save, path)
 
     new_sd: dict[str, torch.Tensor] = {}
     with safe_open(path, framework="pt", device="cpu") as f:
@@ -229,6 +245,12 @@ class BaseForCausalLM(torch.nn.Module):
 
     # Subclasses must override this with their specific HuggingFace model class
     _HF_MODEL_CLASS: type | None = None
+
+    # When True, the memory-efficient streaming loader runs `_mutate_state_dict`
+    # on the shared (non-layer) params too, so subclasses that transform
+    # embeddings / lm_head / norms (e.g. the iOS models) produce their expected
+    # keys. macOS models load shared params as-is and leave this False.
+    _MUTATE_SHARED_PARAMS_ON_STREAM: bool = False
 
     @staticmethod
     def cast_logits_bfloat16_to_float16(forward_fn: Callable) -> Callable:
@@ -465,6 +487,12 @@ class BaseForCausalLM(torch.nn.Module):
         shared_dict = {k.removeprefix(hf_state_dict_prefix): v for k, v in shared_dict.items()}
         del shared_index
 
+        # Models that transform shared params (iOS embedding quantization,
+        # lm_head / norm renaming) mutate the shared slice here. macOS models
+        # load shared params unchanged.
+        if model._MUTATE_SHARED_PARAMS_ON_STREAM:
+            model._mutate_state_dict(shared_dict)
+
         if mmap_path is not None:
             os.makedirs(mmap_path, exist_ok=True)
             shared_path = os.path.join(mmap_path, "shared.safetensors")
@@ -476,29 +504,22 @@ class BaseForCausalLM(torch.nn.Module):
         gc.collect()
 
         # One transformer layer at a time.
-        exclude_buffers = {KVCache.HF_K_BUFFER_NAME, KVCache.HF_V_BUFFER_NAME}
         for layer_idx in sorted(per_layer_index.keys()):
             layer_key_to_file = per_layer_index.pop(layer_idx)
             layer_sd = _load_tensors_for_keys(layer_key_to_file, target_dtype)
             layer_sd = {k.removeprefix(hf_state_dict_prefix): v for k, v in layer_sd.items()}
             del layer_key_to_file
 
-            # Per-model fusion (qkv, qk_norm, MoE expert stacking, ...).
-            # Subclass `_mutate_state_dict` is layer-keyed and safe on a
-            # single-layer slice.
+            # Per-model fusion (qkv, qk_norm, MoE expert stacking, Conv2d
+            # reshapes, ...). Subclass `_mutate_state_dict` is layer-keyed and
+            # safe on a single-layer slice; it rewrites keys into the model's
+            # own namespace (e.g. iOS wraps layers under `extend.`), so the
+            # mutated slice is assigned against the whole model.
             model._mutate_state_dict(layer_sd)
 
             if mmap_path is not None:
-                layer_prefix = f"model.layers.{layer_idx}."
-                relative_sd = {
-                    k.removeprefix(layer_prefix): v
-                    for k, v in layer_sd.items()
-                    if k.removeprefix(layer_prefix) not in exclude_buffers
-                }
-                layer_module = model.model.layers[layer_idx]
                 layer_path = os.path.join(mmap_path, f"layer_{layer_idx}.safetensors")
-                _save_and_mmap_safetensors(layer_module, relative_sd, layer_path)
-                del relative_sd
+                _save_and_mmap_safetensors(model, layer_sd, layer_path)
             else:
                 model.load_state_dict(layer_sd, assign=True, strict=False)
 
@@ -578,6 +599,10 @@ class BaseForCausalLM(torch.nn.Module):
 
 
 class BaseForCausalLMForiOS(BaseForCausalLM):
+    # iOS models rewrite the shared embedding / lm_head / norm keys inside
+    # `_mutate_state_dict`, so the streaming loader must mutate the shared slice.
+    _MUTATE_SHARED_PARAMS_ON_STREAM: bool = True
+
     def __init__(self: Self, config, model_device: str, disable_embedding_quantization=False):
         super().__init__(config, model_device)
         self.load_embeddings = LoadEmbeddings(

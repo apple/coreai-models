@@ -207,6 +207,7 @@ def palettize_pytorch_model(
     model: nn.Module,
     example_inputs: tuple,
     palettization_config: "dict | KMeansPalettizerConfig",
+    mmap_dir: str | None = None,
 ) -> nn.Module:
     """
     Palettize a PyTorch model using post-training palettization with coreai-opt.
@@ -218,6 +219,10 @@ def palettize_pytorch_model(
         palettization_config: Either a configuration dictionary (matching the
             inner shape coreai-opt expects under `kmeans_palettization_config`)
             or a prebuilt KMeansPalettizerConfig instance.
+        mmap_dir: Optional directory for memory-efficient finalization.
+            When provided, each finalized layer is saved to a per-layer
+            safetensors file and reloaded mmap-backed.
+            When None, finalization keeps weights in RAM.
 
     Returns:
         Palettized model ready for export.
@@ -240,7 +245,9 @@ def palettize_pytorch_model(
     palettizer = KMeansPalettizer(model, config)
     prepared_model = palettizer.prepare(example_inputs=example_inputs, num_workers=32)
 
-    finalized_model = palettizer.finalize(prepared_model, backend=ExportBackend.CoreAI)
+    finalized_model = palettizer.finalize(
+        prepared_model, backend=ExportBackend.CoreAI, mmap_dir=mmap_dir
+    )
 
     logger.info("Palettization with coreai-opt complete")
     return finalized_model
