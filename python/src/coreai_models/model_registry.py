@@ -127,6 +127,16 @@ LLM_PRESETS: list[ModelPreset] = [
         32768,
     ),
     ModelPreset(
+        "smollm2-1.7b-instruct",
+        "HuggingFaceTB/SmolLM2-1.7B-Instruct",
+        "llama",
+        "llm",
+        "macOS",
+        "4bit",
+        "float16",
+        8192,
+    ),
+    ModelPreset(
         "gpt-oss-20b", "openai/gpt-oss-20b", "gpt-oss", "llm", "macOS", "none", "bfloat16", 32768
     ),
     # --- iOS (compression = palettized) ---
