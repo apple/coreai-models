@@ -102,7 +102,7 @@ public protocol InferenceEngine: Sendable {
         with input: [TokenId],
         samplingConfiguration: SamplingConfiguration,
         inferenceOptions: InferenceOptions
-    ) throws -> OutputSequence
+    ) async throws -> OutputSequence
 
     // MARK: - Lifecycle
 
@@ -311,7 +311,7 @@ public protocol MultimodalInferenceEngine: InferenceEngine {
         tokens: [TokenId],
         samplingConfiguration: SamplingConfiguration,
         inferenceOptions: InferenceOptions
-    ) throws -> OutputSequence
+    ) async throws -> OutputSequence
 }
 
 // TODO: Multi-turn — caller can cache EmbeddedInput across turns and pass it

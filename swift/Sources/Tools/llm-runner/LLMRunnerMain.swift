@@ -891,7 +891,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
 
         await PerformanceMetrics.shared.setPromptTokenCount(vlmTokens.count)
 
-        let tokenStream = try vlmEngine.generate(
+        let tokenStream = try await vlmEngine.generate(
             with: embeddedInput,
             tokens: vlmTokens,
             samplingConfiguration: samplingConfiguration,
