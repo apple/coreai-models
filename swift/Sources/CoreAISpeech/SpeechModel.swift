@@ -48,16 +48,16 @@ public actor SpeechModel {
 
     // MARK: - Transcription
 
-    /// Transcribe an audio file, returning the full text.
-    public func transcribe(audioURL: URL) async throws -> String {
-        let tokens = try await decodeAudio(from: audioURL)
-        return try detokenize(tokens)
+    /// Transcribe an audio file, returning the full text and decode stats.
+    public func transcribe(audioURL: URL) async throws -> (String, DecodeStats) {
+        let (tokens, stats) = try await decodeAudio(from: audioURL)
+        return try (detokenize(tokens), stats)
     }
 
-    /// Transcribe raw 16 kHz mono PCM samples.
-    public func transcribe(pcm: [Float]) async throws -> String {
-        let tokens = try await decodeAudio(pcm: pcm)
-        return try detokenize(tokens)
+    /// Transcribe raw 16 kHz mono PCM samples, returning the full text and decode stats.
+    public func transcribe(pcm: [Float]) async throws -> (String, DecodeStats) {
+        let (tokens, stats) = try await decodeAudio(pcm: pcm)
+        return try (detokenize(tokens), stats)
     }
 
     // MARK: - Internals
@@ -111,12 +111,12 @@ public actor SpeechModel {
         }
     }
 
-    private func decodeAudio(from url: URL) async throws -> [Int32] {
+    private func decodeAudio(from url: URL) async throws -> ([Int32], DecodeStats) {
         let pcm = try MelSpectrogram.loadAndResample(url, targetSampleRate: melConfig.sampleRate)
         return try await decodeAudio(pcm: pcm)
     }
 
-    private func decodeAudio(pcm: [Float]) async throws -> [Int32] {
+    private func decodeAudio(pcm: [Float]) async throws -> ([Int32], DecodeStats) {
         let (encOut, encShape) = try await runEncoder(pcm: pcm)
         return try await decoder.decode(
             encoderOutput: encOut,

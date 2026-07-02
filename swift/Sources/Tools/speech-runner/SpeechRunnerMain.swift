@@ -31,15 +31,18 @@ struct SpeechRunner: AsyncParsableCommand {
     )
     var clearCoreAICache: Bool = false
 
+    @Flag(name: .long, help: "Run a full decode pass on silence before timing.")
+    var warmup = false
+
     func run() async throws {
         let bundleURL = URL(fileURLWithPath: modelPath)
         if clearCoreAICache {
             try clearCache(bundleURL: bundleURL)
         }
         if FileManager.default.fileExists(atPath: bundleURL.appending(path: "encoder.aimodel").path) {
-            try await runBundle(bundleURL: bundleURL, audioPath: audioPath)
+            try await runBundle(bundleURL: bundleURL, audioPath: audioPath, warmup: warmup)
         } else {
-            try await runLegacy(modelPath: modelPath, audioPath: audioPath)
+            try await runLegacy(modelPath: modelPath, audioPath: audioPath, warmup: warmup)
         }
     }
 
@@ -56,7 +59,7 @@ struct SpeechRunner: AsyncParsableCommand {
 
 // MARK: - Split bundle via CoreAISpeech
 
-func runBundle(bundleURL: URL, audioPath: String?) async throws {
+func runBundle(bundleURL: URL, audioPath: String?, warmup: Bool) async throws {
     print("Format: split (encoder + decoder, KV cache)")
 
     // Detect an existing cached specialization before loading so we can annotate the load time
@@ -76,27 +79,44 @@ func runBundle(bundleURL: URL, audioPath: String?) async throws {
     print(" done in \(String(format: "%.3f", loadElapsed.inSeconds))s\(cacheHit ? " (cache hit)" : "")")
     print("Format: bundle (\(await model.architecture))")
 
+    if warmup {
+        print("Warming up…")
+        _ = try await model.transcribe(pcm: [Float](repeating: 0, count: 480_000))
+    }
+
     if let path = audioPath {
         let url = URL(fileURLWithPath: path)
         print("Transcribing \(url.lastPathComponent)…")
         let t0 = ContinuousClock.now
-        let text = try await model.transcribe(audioURL: url)
-        let ms = (ContinuousClock.now - t0).inMilliseconds
-        print(String(format: "  %.1f ms total", ms))
+        let (text, stats) = try await model.transcribe(audioURL: url)
+        let totalMs = (ContinuousClock.now - t0).inMilliseconds
+        print("\n── Decode ─────────────────────────────────────────────────────────────")
+        print(
+            String(
+                format:
+                    "  steps: %d  latency: %.1f ms/step  speed: %.1f steps/s  min: %.1f ms  max: %.1f ms  [%.1f ms total]",
+                stats.stepCount, stats.avgLatencyMs, stats.stepsPerSecond,
+                stats.minLatencyMs, stats.maxLatencyMs, totalMs))
         print("\n── Transcription ──────────────────────────────────────────────────────")
         print("  \(text)")
     } else {
         print("No audio — silence benchmark")
         let pcm = [Float](repeating: 0, count: 480_000)
         let t0 = ContinuousClock.now
-        _ = try await model.transcribe(pcm: pcm)
-        print(String(format: "  %.1f ms (silence)", (ContinuousClock.now - t0).inMilliseconds))
+        let (_, stats) = try await model.transcribe(pcm: pcm)
+        let totalMs = (ContinuousClock.now - t0).inMilliseconds
+        print(
+            String(
+                format:
+                    "  steps: %d  latency: %.1f ms/step  speed: %.1f steps/s  min: %.1f ms  max: %.1f ms  [%.1f ms total]",
+                stats.stepCount, stats.avgLatencyMs, stats.stepsPerSecond,
+                stats.minLatencyMs, stats.maxLatencyMs, totalMs))
     }
 }
 
 // MARK: - Legacy monolithic model
 
-func runLegacy(modelPath: String, audioPath: String?) async throws {
+func runLegacy(modelPath: String, audioPath: String?, warmup: Bool) async throws {
     print("Format: legacy (monolithic, no KV cache)")
 
     let modelURL = URL(fileURLWithPath: modelPath)
@@ -153,6 +173,29 @@ func runLegacy(modelPath: String, audioPath: String?) async throws {
     var tokens: [Int32] = config.forcedPrefix
     var stepTimesMs: [Double] = []
 
+    if warmup {
+        print("Warming up…")
+        var warmupTokens: [Int32] = config.forcedPrefix
+        while warmupTokens.count - config.forcedPrefix.count < config.maxDecodeSteps {
+            let inputTokens: [Int32] = isStaticIds ? [warmupTokens.last!] : warmupTokens
+            let seqLen = inputTokens.count
+            var ids = NDArray(descriptor: idsNDDesc.resolvingDynamicDimensions([1, seqLen]))
+            fillNDArray(&ids, as: Int32.self, with: inputTokens)
+            var la = NDArray(descriptor: logitsDesc.resolvingDynamicDimensions([1, seqLen, vocabSize]))
+            var out = InferenceFunction.MutableViews()
+            out.insert(&la, for: "logits")
+            _ = try await fn.run(
+                inputs: ["input_features": melArray, "decoder_input_ids": ids],
+                states: InferenceFunction.MutableViews(), outputViews: consume out)
+            let logits = flattenAsFloat(la)
+            let base = (seqLen - 1) * vocabSize
+            let next = Int32(
+                (0..<vocabSize).max(by: { logits[base + $0] < logits[base + $1] })!)
+            warmupTokens.append(next)
+            if next == config.eotToken { break }
+        }
+    }
+
     print("\n── Decode ─────────────────────────────────────────────────────────────")
 
     while stepTimesMs.count < config.maxDecodeSteps {
@@ -179,7 +222,7 @@ func runLegacy(modelPath: String, audioPath: String?) async throws {
     let avgMs = stepTimesMs.reduce(0, +) / Double(stepTimesMs.count)
     print(
         String(
-            format: "  steps: %d  latency: %.1f ms/tok  speed: %.1f tok/s",
+            format: "  steps: %d  latency: %.1f ms/step  speed: %.1f steps/s",
             stepTimesMs.count, avgMs, 1000 / avgMs))
 
     print("\n── Transcription ──────────────────────────────────────────────────────")

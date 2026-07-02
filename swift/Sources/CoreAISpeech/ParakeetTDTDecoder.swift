@@ -21,7 +21,7 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
         encoderOutput: NDArray,
         encoderOutputShape: [Int],
         resources: DecoderResources
-    ) async throws -> [Int32] {
+    ) async throws -> (tokens: [Int32], stats: DecodeStats) {
         guard case .parakeetTDT(let decoderStep, let joint, let cfg) = resources else {
             throw SpeechError.incompatibleResources("ParakeetTDTDecoder requires .parakeetTDT resources")
         }
@@ -36,7 +36,7 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
             throw SpeechError.missingModel(
                 "Encoder output shape \(encoderOutputShape) doesn't match config (B=1, H=\(hidden))")
         }
-        if tEnc == 0 { return [] }
+        if tEnc == 0 { return (tokens: [], stats: DecodeStats(stepTimesMs: [])) }
 
         // Resolve descriptors for the two callable graphs.
         guard let stepFn = try decoderStep.loadFunction(named: "main") else {
@@ -92,7 +92,9 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
         let emitCap = tEnc * cfg.maxSymbolsPerStep
         let vocabSize = cfg.vocabSize
 
+        var stepTimesMs: [Double] = []
         while frame < tEnc && emitted.count < emitCap {
+            let t0 = ContinuousClock.now
             var advance = 0
             for _ in 0..<cfg.maxSymbolsPerStep {
                 let wasInputBlank = (lastToken == cfg.blankTokenId)
@@ -179,9 +181,10 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
             // No duration > 0 was selected within max_symbols_per_step — force one frame
             // forward to guarantee outer-loop progress.
             if advance == 0 { advance = 1 }
+            stepTimesMs.append((ContinuousClock.now - t0).inMilliseconds)
             frame += advance
         }
 
-        return emitted
+        return (tokens: emitted, stats: DecodeStats(stepTimesMs: stepTimesMs))
     }
 }

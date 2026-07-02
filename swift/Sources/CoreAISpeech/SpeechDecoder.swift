@@ -15,6 +15,22 @@ public enum DecoderResources: Sendable {
     case parakeetTDT(decoderStep: AIModel, joint: AIModel, config: ParakeetTDTConfig)
 }
 
+// MARK: - DecodeStats
+
+/// Per-step timing collected during the autoregressive decode loop.
+public struct DecodeStats: Sendable {
+    public let stepTimesMs: [Double]
+
+    public var stepCount: Int { stepTimesMs.count }
+    public var avgLatencyMs: Double {
+        guard !stepTimesMs.isEmpty else { return 0 }
+        return stepTimesMs.reduce(0, +) / Double(stepTimesMs.count)
+    }
+    public var minLatencyMs: Double { stepTimesMs.min() ?? 0 }
+    public var maxLatencyMs: Double { stepTimesMs.max() ?? 0 }
+    public var stepsPerSecond: Double { avgLatencyMs > 0 ? 1000 / avgLatencyMs : 0 }
+}
+
 // MARK: - SpeechDecoder protocol
 
 /// Model-specific decode logic.
@@ -23,10 +39,16 @@ public protocol SpeechDecoder: Sendable {
         encoderOutput: NDArray,
         encoderOutputShape: [Int],
         resources: DecoderResources
-    ) async throws -> [Int32]
+    ) async throws -> (tokens: [Int32], stats: DecodeStats)
 }
 
-// MARK: - WhisperDecoder
+// MARK: - Helpers
+
+extension Duration {
+    public var inMilliseconds: Double {
+        Double(components.seconds) * 1000 + Double(components.attoseconds) / 1e15
+    }
+}
 
 /// Greedy decoder for Whisper (encoder-decoder, cross-attention, KV cache).
 public struct WhisperDecoder: SpeechDecoder {
@@ -36,7 +58,7 @@ public struct WhisperDecoder: SpeechDecoder {
         encoderOutput: NDArray,
         encoderOutputShape: [Int],
         resources: DecoderResources
-    ) async throws -> [Int32] {
+    ) async throws -> (tokens: [Int32], stats: DecodeStats) {
         guard case .whisper(let decoderModel, let config) = resources else {
             throw SpeechError.incompatibleResources("WhisperDecoder requires .whisper resources")
         }
@@ -91,9 +113,12 @@ public struct WhisperDecoder: SpeechDecoder {
         }
 
         // Greedy decode
+        var stepTimesMs: [Double] = []
         var pos = config.forcedPrefix.count
         while tokens.count - config.forcedPrefix.count < config.maxDecodeSteps {
+            let t0 = ContinuousClock.now
             try await step(tokens.last!, pos: pos)
+            stepTimesMs.append((ContinuousClock.now - t0).inMilliseconds)
             let logits = flattenAsFloat(logitsArray)
             let next = Int32(logits.indices.max(by: { logits[$0] < logits[$1] })!)
             tokens.append(next)
@@ -101,6 +126,6 @@ public struct WhisperDecoder: SpeechDecoder {
             if next == config.eotToken { break }
         }
 
-        return tokens
+        return (tokens: tokens, stats: DecodeStats(stepTimesMs: stepTimesMs))
     }
 }
