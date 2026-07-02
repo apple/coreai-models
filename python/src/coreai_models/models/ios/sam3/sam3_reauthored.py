@@ -3,14 +3,14 @@
 # Use of this source code is governed by a BSD-3-clause license that can
 # be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
-"""Re-authored SAM3 for Apple Neural Engine.
+"""SAM3 Lite model for Apple Neural Engine.
 
-Assembles the re-authored image encoder, FPN neck, text encoder, DETR
+Assembles the ANE-targeted image encoder, FPN neck, text encoder, DETR
 encoder/decoder, mask decoder, and dot-product scoring into a single
 forward pass that mirrors the IO of HF ``Sam3Model``.
 
 Usage:
-    model = Sam3Reauthored.from_pretrained("facebook/sam3", image_size=336)
+    model = Sam3Lite.from_pretrained("facebook/sam3", image_size=336)
     pred_masks, pred_boxes, pred_logits, presence_logits, semantic_seg =
      model(pixel_values, input_ids)
 """
@@ -42,8 +42,8 @@ def _linear_to_conv2d(linear: nn.Linear) -> nn.Conv2d:
     return conv
 
 
-class Sam3Reauthored(nn.Module):
-    """Full SAM3 re-authored model for Apple Neural Engine.
+class Sam3Lite(nn.Module):
+    """SAM3 Lite model for Apple Neural Engine (ANE-targeted, palettized).
 
     The default ``image_size=336`` keeps the global-attention sequence
     short. Pass ``image_size=1008`` to match HF's default.
@@ -136,39 +136,35 @@ class Sam3Reauthored(nn.Module):
         cls,
         model_id: str = "facebook/sam3",
         image_size: int = 336,
-    ) -> "Sam3Reauthored":
+    ) -> "Sam3Lite":
         import transformers
 
         hf_model = transformers.Sam3Model.from_pretrained(model_id)
 
         grid_size = image_size // 14
-        reauthored_model = cls(image_size=image_size)
+        lite_model = cls(image_size=image_size)
 
-        reauthored_model.image_encoder = ImageEncoderBackbone.from_hf_backbone(
+        lite_model.image_encoder = ImageEncoderBackbone.from_hf_backbone(
             hf_model.vision_encoder.backbone,
             image_size=image_size,
         )
-        reauthored_model.fpn = FPNNeckReauthored.from_hf_fpn(
+        lite_model.fpn = FPNNeckReauthored.from_hf_fpn(
             hf_model.vision_encoder.neck,
             grid_h=grid_size,
             grid_w=grid_size,
         )
-        reauthored_model.text_encoder = TextEncoderReauthored.from_hf_text_encoder(
-            hf_model.text_encoder
-        )
-        reauthored_model.text_projection = _linear_to_conv2d(hf_model.text_projection)
-        reauthored_model.detr_encoder = DETREncoderReauthored.from_hf_encoder(hf_model.detr_encoder)
-        reauthored_model.detr_decoder = DETRDecoderReauthored.from_hf_decoder(
+        lite_model.text_encoder = TextEncoderReauthored.from_hf_text_encoder(hf_model.text_encoder)
+        lite_model.text_projection = _linear_to_conv2d(hf_model.text_projection)
+        lite_model.detr_encoder = DETREncoderReauthored.from_hf_encoder(hf_model.detr_encoder)
+        lite_model.detr_decoder = DETRDecoderReauthored.from_hf_decoder(
             hf_model.detr_decoder,
             spatial_h=grid_size,
             spatial_w=grid_size,
         )
-        reauthored_model.mask_decoder = MaskDecoderReauthored.from_hf_mask_decoder(
-            hf_model.mask_decoder
-        )
-        reauthored_model.scoring = DotProductScoringReauthored.from_hf_scoring(
+        lite_model.mask_decoder = MaskDecoderReauthored.from_hf_mask_decoder(hf_model.mask_decoder)
+        lite_model.scoring = DotProductScoringReauthored.from_hf_scoring(
             hf_model.dot_product_scoring
         )
 
         del hf_model
-        return reauthored_model
+        return lite_model

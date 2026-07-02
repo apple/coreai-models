@@ -5,9 +5,9 @@
 
 """Segmentation export pipeline.
 
-The optimized SAM3 export targets the Apple Neural Engine. The HF
-``Sam3Model`` is replaced with a re-authored model
-(``coreai_models.models.ios.sam3.Sam3Reauthored``) split into three
+The lite SAM3 export targets the Apple Neural Engine. The HF
+``Sam3Model`` is replaced with a lite model
+(``coreai_models.models.ios.sam3.Sam3Lite``) split into three
 independently optimizable functions:
 
   * ``image_encode``  — vision backbone (palettized + fp16)
@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 
 class ImageEncoderModule(nn.Module):
-    """Wraps the re-authored vision backbone for ``image_encode``."""
+    """Wraps the lite vision backbone for ``image_encode``."""
 
     def __init__(self, image_encoder: nn.Module) -> None:
         super().__init__()
@@ -52,7 +52,7 @@ class ImageEncoderModule(nn.Module):
 
 
 class TextEncoderModule(nn.Module):
-    """Wraps the re-authored text encoder + projection for ``text_encode``."""
+    """Wraps the lite text encoder + projection for ``text_encode``."""
 
     def __init__(self, text_encoder: nn.Module, text_projection: nn.Module) -> None:
         super().__init__()
@@ -160,7 +160,7 @@ def _bundle_name(config: SegmentationExportConfig) -> str:
     if config.output_name is not None:
         return config.output_name
     safe = Path(config.hf_model_id).name.lower()
-    return f"{safe}_reauthored_{config.image_size}_w{config.image_n_bits}_static"
+    return f"{safe}_lite_{config.image_size}_w{config.image_n_bits}_static"
 
 
 # ---------------------------------------------------------------------------
@@ -169,7 +169,7 @@ def _bundle_name(config: SegmentationExportConfig) -> str:
 
 
 def export_segmentation(config: SegmentationExportConfig) -> str:
-    """Export the optimized re-authored SAM3 model to a Core AI bundle.
+    """Export the lite SAM3 model to a Core AI bundle.
 
     Returns the path to the bundle directory.
     """
@@ -190,7 +190,7 @@ async def _async_export_segmentation(config: SegmentationExportConfig) -> str:
     from coreai_opt.palettization.spec import PerGroupedChannelGranularity
 
     from coreai_models.export.metadata import build_aimodel_metadata
-    from coreai_models.models.ios.sam3 import Sam3Reauthored
+    from coreai_models.models.ios.sam3 import Sam3Lite
 
     bundle_dir, asset_path = _resolve_paths(config)
     _prepare_bundle_dir(bundle_dir, config.overwrite)
@@ -198,12 +198,12 @@ async def _async_export_segmentation(config: SegmentationExportConfig) -> str:
     image_size = config.image_size
     grid = image_size // 14
 
-    logger.info("Loading re-authored SAM3 (%s, image_size=%d)...", config.hf_model_id, image_size)
-    sam3_reauth = Sam3Reauthored.from_pretrained(
+    logger.info("Loading SAM3 Lite (%s, image_size=%d)...", config.hf_model_id, image_size)
+    sam3_lite = Sam3Lite.from_pretrained(
         model_id=config.hf_model_id,
         image_size=image_size,
     )
-    sam3_reauth.eval()
+    sam3_lite.eval()
 
     # Asymmetric palettization recipe: image_encode w4/gs32, text_encode w6/gs8.
     # `enable_per_channel_scale` is left at the default `False` — see
@@ -231,7 +231,7 @@ async def _async_export_segmentation(config: SegmentationExportConfig) -> str:
         config.image_n_bits,
         config.image_group_size,
     )
-    img_enc = ImageEncoderModule(sam3_reauth.image_encoder)
+    img_enc = ImageEncoderModule(sam3_lite.image_encoder)
     img_enc.eval()
     img_palettizer = KMeansPalettizer(img_enc, img_pal_config)
     img_enc = img_palettizer.prepare(example_inputs=(pixel_ref,))
@@ -242,13 +242,13 @@ async def _async_export_segmentation(config: SegmentationExportConfig) -> str:
         config.text_n_bits,
         config.text_group_size,
     )
-    txt_enc = TextEncoderModule(sam3_reauth.text_encoder, sam3_reauth.text_projection)
+    txt_enc = TextEncoderModule(sam3_lite.text_encoder, sam3_lite.text_projection)
     txt_enc.eval()
     txt_palettizer = KMeansPalettizer(txt_enc, txt_pal_config)
     txt_enc = txt_palettizer.prepare(example_inputs=(ids_ref, mask_ref))
     txt_enc = txt_palettizer.finalize(backend=ExportBackend.CoreAI)
 
-    det = DetectorModule(sam3_reauth)
+    det = DetectorModule(sam3_lite)
     det.eval()
 
     logger.info("Exporting image_encode...")
@@ -343,16 +343,16 @@ def _write_bundle_metadata(bundle_dir: Path, asset_filename: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Plain HF Sam3Model export (no re-authoring, no ANE optimizations)
+# Plain HF Sam3Model export (no ANE targeting, no weight compression)
 # ---------------------------------------------------------------------------
 
 
 @dataclass
-class BaselineExportConfig:
+class FullExportConfig:
     """Configuration for the plain ``transformers.Sam3Model`` export.
 
     Mirrors what the original ``models/sam3/export.py`` produced before the
-    ANE-targeted re-authoring landed: a single-entrypoint ``main`` asset
+    ANE-targeted lite variant landed: a single-entrypoint ``main`` asset
     that takes ``(pixel_values, input_ids)`` and returns the five raw
     ``Sam3Model`` outputs.
     """
@@ -365,7 +365,7 @@ class BaselineExportConfig:
     overwrite: bool = False
 
 
-class _Sam3BaselineModule(nn.Module):
+class _Sam3FullModule(nn.Module):
     """Wrap ``transformers.Sam3Model`` and return the five detection tensors."""
 
     def __init__(self, model_id: str) -> None:
@@ -385,29 +385,29 @@ class _Sam3BaselineModule(nn.Module):
         )
 
 
-def _baseline_bundle_name(config: BaselineExportConfig) -> str:
+def _full_bundle_name(config: FullExportConfig) -> str:
     if config.output_name is not None:
         return config.output_name
     safe = Path(config.hf_model_id).name.lower()
     return f"{safe}_{config.dtype}"
 
 
-def _baseline_resolve_paths(config: BaselineExportConfig) -> tuple[Path, Path]:
-    name = _baseline_bundle_name(config)
+def _full_resolve_paths(config: FullExportConfig) -> tuple[Path, Path]:
+    name = _full_bundle_name(config)
     bundle_dir = Path(config.output_dir) / name
     asset_path = bundle_dir / f"{name}.aimodel"
     return bundle_dir, asset_path
 
 
-def export_baseline(config: BaselineExportConfig) -> str:
+def export_full(config: FullExportConfig) -> str:
     """Export the plain HF ``Sam3Model`` to a Core AI bundle.
 
     Returns the path to the bundle directory.
     """
-    return asyncio.run(_async_export_baseline(config))
+    return asyncio.run(_async_export_full(config))
 
 
-async def _async_export_baseline(config: BaselineExportConfig) -> str:
+async def _async_export_full(config: FullExportConfig) -> str:
     # Inline imports — keep `--help` cheap.
     import coreai_torch
     import transformers
@@ -420,7 +420,7 @@ async def _async_export_baseline(config: BaselineExportConfig) -> str:
         raise ValueError(f"Invalid dtype {config.dtype!r}; expected one of {sorted(dtype_map)}.")
     torch_dtype = dtype_map[config.dtype]
 
-    bundle_dir, asset_path = _baseline_resolve_paths(config)
+    bundle_dir, asset_path = _full_resolve_paths(config)
     _prepare_bundle_dir(bundle_dir, config.overwrite)
 
     logger.info(
@@ -429,7 +429,7 @@ async def _async_export_baseline(config: BaselineExportConfig) -> str:
         config.image_size,
         config.dtype,
     )
-    model = _Sam3BaselineModule(model_id=config.hf_model_id)
+    model = _Sam3FullModule(model_id=config.hf_model_id)
     model.eval()
     model.to(torch_dtype)
 

@@ -6,15 +6,15 @@
 """Segmentation export and inference for Core AI."""
 
 from coreai_models.segmentation.pipeline import (
-    BaselineExportConfig,
+    FullExportConfig,
     SegmentationExportConfig,
-    export_baseline,
+    export_full,
     export_segmentation,
 )
 
 __all__ = [
-    "BaselineExportConfig",
+    "FullExportConfig",
     "SegmentationExportConfig",
-    "export_baseline",
+    "export_full",
     "export_segmentation",
 ]
