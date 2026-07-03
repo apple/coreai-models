@@ -21,7 +21,7 @@ struct MultimodalTypeTests {
             shape: [1, 256, 2048],
             scalarType: .float16
         )
-        let input = EmbeddedInput(
+        let input = try EmbeddedInput(
             embeddings: embeddings,
             embeddingPositions: 5..<261
         )
