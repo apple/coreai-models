@@ -560,8 +560,8 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
                     + "expected \(imageTokenCount) from config. Check prompt template.")
         }
 
-        let seqLen = EmbeddedInput.seqLen(of: textEmbeddings)
-        let imgSeqLen = EmbeddedInput.seqLen(of: imageEmbeddings)
+        let seqLen = textEmbeddings.shape[1]
+        let imgSeqLen = imageEmbeddings.shape[1]
         guard imgSeqLen >= imageTokenCount else {
             throw InferenceRuntimeError.invalidArgument(
                 "scatterMerge: image embeddings have \(imgSeqLen) tokens, need \(imageTokenCount)")
