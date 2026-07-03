@@ -19,7 +19,12 @@ public struct EmbeddedInput: Sendable {
     /// Positions in the token sequence where embeddings replace placeholders.
     public let embeddingPositions: Range<Int>
 
-    public init(embeddings: NDArray, embeddingPositions: Range<Int>) {
+    public init(embeddings: NDArray, embeddingPositions: Range<Int>) throws {
+        guard embeddings.shape.count == 3 else {
+            throw InferenceRuntimeError.invalidArgument(
+                "EmbeddedInput requires 3D embeddings [batch, seq_len, hidden_dim], "
+                    + "got shape with \(embeddings.shape.count) dimensions")
+        }
         self.embeddings = embeddings
         self.embeddingPositions = embeddingPositions
     }

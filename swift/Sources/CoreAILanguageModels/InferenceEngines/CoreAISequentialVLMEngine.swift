@@ -385,7 +385,7 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
 
         CLILogger.log("VLM encodeImage complete: \(tokenCount) embedding tokens")
 
-        return EmbeddedInput(
+        return try EmbeddedInput(
             embeddings: projectedEmbeddings,
             embeddingPositions: placeholderRange
         )
