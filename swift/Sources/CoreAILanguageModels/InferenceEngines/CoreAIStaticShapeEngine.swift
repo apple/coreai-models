@@ -300,7 +300,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     // MARK: - Causal Mask
 
     private static func fillCausalMask(
-        _ view: inout NDArray.MutableView<LogitsScalarType>,
+        _ view: consuming NDArray.MutableView<LogitsScalarType>,
         tokensInBatch: Int,
         alignedStep: Int
     ) {
@@ -501,8 +501,8 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         // Causal mask
         if case .ndArray(let nd) = desc.inputDescriptor(of: "causal_mask") {
             var mask = NDArray(descriptor: nd)
-            var maskView = mask.mutableView(as: LogitsScalarType.self)
-            Self.fillCausalMask(&maskView, tokensInBatch: tokensInBatch, alignedStep: alignedStep)
+            let maskView = mask.mutableView(as: LogitsScalarType.self)
+            Self.fillCausalMask(maskView, tokensInBatch: tokensInBatch, alignedStep: alignedStep)
             inputs["causal_mask"] = mask
         }
 
