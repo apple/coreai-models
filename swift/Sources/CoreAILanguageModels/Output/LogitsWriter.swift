@@ -77,16 +77,22 @@ public enum LogitsLength: Sendable {
 
 /// Represents logits information for a single generated token
 public struct TokenLogits: Sendable {
-    let tokenId: Int32
-    let tokenText: String
-    let topLogits: [TopLogitEntry]
+    public let tokenId: Int32
+    public let tokenText: String
+    public let topLogits: [TopLogitEntry]
+
+    public init(tokenId: Int32, tokenText: String, topLogits: [TopLogitEntry]) {
+        self.tokenId = tokenId
+        self.tokenText = tokenText
+        self.topLogits = topLogits
+    }
 }
 
 /// Represents a single entry in top-K logits
 public struct TopLogitEntry: Codable, Sendable {
-    let tokenId: Int32
-    let tokenText: String
-    let logit: Float
+    public let tokenId: Int32
+    public let tokenText: String
+    public let logit: Float
 
     enum CodingKeys: String, CodingKey {
         case tokenId = "token_id"

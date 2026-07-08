@@ -12,7 +12,7 @@ struct GenerationStopReasonTests {
     @Test("iterates all tokens and sets .maxTokens on normal completion")
     func normalCompletion() async throws {
         let engine = MockEngine(tokens: [1, 2, 3], maxContextLength: 100)
-        let stream = try engine.generate(
+        let stream = try await engine.generate(
             with: [0],
             samplingConfiguration: .greedy,
             inferenceOptions: InferenceOptions(maxTokens: 3)
@@ -31,7 +31,7 @@ struct GenerationStopReasonTests {
     func eosSetByDecoder() async throws {
         let eosToken: Int32 = 99
         let engine = MockEngine(tokens: [10, 20, eosToken, 40], maxContextLength: 100)
-        let stream = try engine.generate(
+        let stream = try await engine.generate(
             with: [0],
             samplingConfiguration: .greedy,
             inferenceOptions: InferenceOptions(maxTokens: 10)

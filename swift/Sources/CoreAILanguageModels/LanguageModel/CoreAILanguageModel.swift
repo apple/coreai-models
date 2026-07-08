@@ -335,7 +335,7 @@ public struct CoreAILanguageModel: LanguageModel {
             maxTokens: Int,
             channel: LanguageModelExecutorGenerationChannel
         ) async throws {
-            let tokenStream = try engine.generate(
+            let tokenStream = try await engine.generate(
                 with: promptTokens.map(Int32.init),
                 samplingConfiguration: samplingConfig,
                 inferenceOptions: InferenceOptions(maxTokens: maxTokens)

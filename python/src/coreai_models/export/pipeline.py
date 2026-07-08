@@ -25,6 +25,7 @@ from coreai_opt.palettization.config.palettization_config import KMeansPalettize
 from transformers import AutoConfig, AutoTokenizer
 
 from coreai_models.export._constants import (
+    IOS_DEFAULT_MAX_CONTEXT_LENGTH,
     QUANT_TRACE_OFFSET,
     QUANT_TRACE_QUERY_LEN,
     TRACE_KV_CACHE_SEQ_LEN,
@@ -151,7 +152,26 @@ async def _async_export_model(config: ExportConfig) -> str:
     # ---- 2. Load model ----
     target_dtype = _resolve_precision(config.compute_precision)
 
+    # The model's native context window from its HuggingFace config. Any
+    # user-provided override must not exceed it.
+    native_max_ctx = getattr(hf_config, "max_position_embeddings", None)
+
     max_context_length = config.max_context_length
+    if max_context_length is None and config.variant == "iOS":
+        max_context_length = min(
+            IOS_DEFAULT_MAX_CONTEXT_LENGTH, native_max_ctx or IOS_DEFAULT_MAX_CONTEXT_LENGTH
+        )
+
+    if (
+        max_context_length is not None
+        and native_max_ctx is not None
+        and max_context_length > native_max_ctx
+    ):
+        raise ValueError(
+            f"--max-context-length ({max_context_length}) exceeds the model's "
+            f"max_position_embeddings ({native_max_ctx}). Choose a value <= {native_max_ctx}."
+        )
+
     if max_context_length is not None:
         hf_config.max_position_embeddings = max_context_length
     if config.num_layers is not None:

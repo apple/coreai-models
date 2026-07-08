@@ -122,7 +122,7 @@ public struct ConstrainedDecodingStrategy: DecodingStrategy {
         constrainedOptions: InferenceOptions
     ) async throws -> (Int32?, [LogitsScalarType]?) {
         var rawLogits: [LogitsScalarType]? = nil
-        for try await output in try inferenceEngine.generate(
+        for try await output in try await inferenceEngine.generate(
             with: inputTokens,
             samplingConfiguration: samplingConfiguration,
             inferenceOptions: constrainedOptions

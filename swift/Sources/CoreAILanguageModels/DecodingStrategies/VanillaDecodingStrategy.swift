@@ -34,7 +34,7 @@ public struct VanillaDecodingStrategy: DecodingStrategy {
         samplingConfiguration: SamplingConfiguration,
         options: InferenceOptions,
         stopSequences: StopSequences
-    ) throws -> VanillaDecodedSequence {
+    ) async throws -> VanillaDecodedSequence {
         CLILogger.log("🔄 Starting vanilla decoding generation")
 
         // Eager setup.
@@ -44,7 +44,7 @@ public struct VanillaDecodingStrategy: DecodingStrategy {
             .map(Int32.init)
         CLILogger.log("Input tokens: \(inputTokens.prefix(10))... (showing first 10)")
 
-        let stream = try inferenceEngine.generate(
+        let stream = try await inferenceEngine.generate(
             with: inputTokens,
             samplingConfiguration: samplingConfiguration,
             inferenceOptions: options

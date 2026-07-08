@@ -348,7 +348,7 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         with input: [TokenId],
         samplingConfiguration: SamplingConfiguration,
         inferenceOptions: InferenceOptions
-    ) throws -> GenerationSequence {
+    ) async throws -> GenerationSequence {
         // Implicit prefix caching: resolve before creating Iterator.
         // Implicit prefix caching: resolve input against history.
         if history.count > 0 {
