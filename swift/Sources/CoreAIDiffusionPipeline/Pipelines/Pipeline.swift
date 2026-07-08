@@ -4,6 +4,7 @@
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
 import CoreAI
+import CoreAIShared
 import CoreGraphics
 
 /// Result from image generation — both displayable images and raw latents.

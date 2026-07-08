@@ -14,30 +14,43 @@ import Tokenizers
 /// Wraps any `InferenceEngine` (pipelined, sequential, or static-shape) and exposes it
 /// through the FoundationModels `LanguageModel` protocol. It uses the modern `tokenSequence()`
 /// API for efficient streaming token generation.
-///
 /// ## Engine Selection
 /// The engine type is determined by `EngineFactory` based on model structure:
-/// - **Pipelined**: GPU-accelerated with pipeline-depth-matched buffering (fastest for GPU models)
+/// - **Pipelined**: GPU-accelerated with double buffering (fastest for GPU models)
 /// - **Sequential**: CPU-based synchronous execution (fallback)
 /// - **Static-shape**: Neural Engine optimized for chunked static models
 ///
 /// ## Usage
 /// ```swift
-/// let engine = try await EngineFactory.createEngine(...)
-/// let model = CoreAILanguageModel(engine: engine, tokenizer: tokenizer)
+/// let model = try await CoreAILanguageModel(resourcesAt: url)  // .lazy by default
+/// print(model.estimatedSizeOnDiskBytes ?? 0)
+/// try await model.load()                                       // optional; respond auto-loads
 /// let session = LanguageModelSession(model: model)
+/// // ... generate ...
+/// model.unload()
 /// ```
 public struct CoreAILanguageModel: LanguageModel {
+    public enum LoadMode: Sendable {
+        case lazy
+        case eager
+    }
+
     // MARK: - Properties
 
-    private let engine: any InferenceEngine
-    private let tokenizer: any Tokenizer
-    private let modelIdentifier: String
-    private let samplingConfig: SamplingConfiguration
-    private let vocabSize: Int?
+    private let url: URL
+    private let variant: String?
+    private let kvCacheStrategy: KVCacheStrategy
+    fileprivate let samplingConfig: SamplingConfiguration
+    fileprivate let bundle: LanguageBundle
+    fileprivate let tokenizer: any Tokenizer
+    fileprivate let thinkingMarkers: (open: String, close: String)
+    fileprivate let toolCallMarkers: (open: String, close: String)?
     private let supportsToolCalling: Bool
-    private let supportsReasoning: Bool
-    private let additionalEosTokenIds: [Int32]
+    fileprivate let supportsReasoning: Bool
+    fileprivate let resources: ModelResources
+    /// All EOS-like token IDs beyond the tokenizer's main `eosTokenId` — e.g.
+    /// Gemma's `<end_of_turn>`, read from tokenizer_config.json at init.
+    fileprivate let additionalEosTokenIds: [Int32]
 
     // MARK: - Protocol Requirements
 
@@ -47,71 +60,124 @@ public struct CoreAILanguageModel: LanguageModel {
         var caps: [LanguageModelCapabilities.Capability] = []
         if supportsToolCalling { caps.append(.toolCalling) }
         if supportsReasoning { caps.append(.reasoning) }
-        if engine.supportsLogits { caps.append(.guidedGeneration) }
+        if isGuidedGenerationSupported { caps.append(.guidedGeneration) }
         return LanguageModelCapabilities(capabilities: caps)
     }
 
     public var executorConfiguration: CoreAIExecutor.Configuration {
         CoreAIExecutor.Configuration(
-            engine: engine,
-            tokenizer: tokenizer,
-            modelIdentifier: modelIdentifier,
+            url: url,
+            variant: variant,
+            kvCacheStrategy: kvCacheStrategy,
+            modelIdentifier: bundle.name,
             samplingConfig: samplingConfig,
-            vocabSize: vocabSize,
-            additionalEosTokenIds: additionalEosTokenIds
+            vocabSize: bundle.vocabSize
         )
     }
 
     // MARK: - Initialization
 
-    /// Creates a CoreAILanguageModel by loading a model bundle from the given URL.
-    ///
-    /// This convenience initializer handles the full pipeline: asset loading, engine creation
-    /// (auto-detected based on model structure), and tokenizer initialization.
+    /// Creates a model from a resource bundle on disk.
     ///
     /// ```swift
-    /// let model = try await CoreAILanguageModel(resourcesAt: url)
-    /// let session = LanguageModelSession(model: model)
+    /// let model = try await CoreAILanguageModel(resourcesAt: url)             // lazy
+    /// let model = try await CoreAILanguageModel(resourcesAt: url, mode: .eager)
     /// ```
     ///
     /// - Parameter url: URL to the model bundle directory.
+    /// - Parameter mode: When to load the engine. Defaults to `.lazy`. With
+    ///   `.eager`, the tokenizer and engine load concurrently
     /// - Parameter variant: Engine variant override (e.g. "coreai-sequential",
     ///   "ane"). Nil for auto-detect from model structure.
     /// - Parameter kvCacheStrategy: KV cache memory strategy. Defaults to
     ///   `.auto` (256-token initial size for dynamic models). Pass
     ///   `.fixedSize` to pre-allocate at full `maxContextLength`.
-    /// - Throws: If the asset bundle is invalid, engine creation fails, or tokenizer loading fails.
+    /// - Throws: If the asset bundle is invalid or the tokenizer fails to load.
+    ///   With `.eager`, also throws on engine-creation failure.
     public init(
         resourcesAt url: URL,
+        mode: LoadMode = .lazy,
         variant: String? = nil,
         kvCacheStrategy: KVCacheStrategy = .auto
     ) async throws {
-        let runner = try CoreAIRunner(
-            contentsOf: url,
+        let bundle = try LanguageBundle(at: url)
+        let configuration = CoreAIExecutor.Configuration(
+            url: url,
             variant: variant,
-            kvCacheStrategy: kvCacheStrategy
+            kvCacheStrategy: kvCacheStrategy,
+            modelIdentifier: bundle.name,
+            samplingConfig: .greedy,
+            vocabSize: bundle.vocabSize
         )
-        self = try await runner.makeLanguageModel()
+        let resources = ModelResources.shared(for: configuration)
+
+        async let engineLoad: Void = {
+            if mode == .eager { try await resources.loadResources() }
+        }()
+
+        let tokenizerLoadSpan = InstrumentsProfiler.beginTokenizerLoad(id: bundle.tokenizer)
+        let tokenizer = try await bundle.loadTokenizer()
+        tokenizerLoadSpan.end()
+
+        try await engineLoad
+        self.init(
+            configuration: configuration, bundle: bundle, tokenizer: tokenizer,
+            resources: resources)
     }
 
-    init(
-        engine: any InferenceEngine,
+    private init(
+        configuration: CoreAIExecutor.Configuration,
+        bundle: LanguageBundle,
         tokenizer: any Tokenizer,
-        modelIdentifier: String = "coreai-model",
-        samplingConfig: SamplingConfiguration = .greedy,
-        vocabSize: Int? = nil,
-        additionalEosTokenIds: [Int32] = []
+        resources: ModelResources
     ) {
-        self.engine = engine
+        let toolCallMarkers = CoreAIExecutor.detectToolCallMarkers(using: tokenizer)
+        self.url = configuration.url
+        self.variant = configuration.variant
+        self.kvCacheStrategy = configuration.kvCacheStrategy
+        self.samplingConfig = configuration.samplingConfig
+        self.bundle = bundle
         self.tokenizer = tokenizer
-        self.modelIdentifier = modelIdentifier
-        self.samplingConfig = samplingConfig
-        self.vocabSize = vocabSize
-        self.additionalEosTokenIds = additionalEosTokenIds
-        self.supportsToolCalling = CoreAIExecutor.detectToolCallMarkers(using: tokenizer) != nil
+        self.thinkingMarkers = CoreAIExecutor.detectThinkingMarkers(using: tokenizer)
+        self.toolCallMarkers = toolCallMarkers
+        self.supportsToolCalling = toolCallMarkers != nil
         self.supportsReasoning =
             tokenizer.convertTokenToId("<think>") != nil
             || tokenizer.convertTokenToId("<|reasoning_start|>") != nil
+        self.resources = resources
+        // Read additional stop token IDs from tokenizer_config.json (e.g. Gemma's
+        // <end_of_turn>). Empty when the bundle has no tokenizer directory.
+        if let tokenizerDir = bundle.tokenizerPath {
+            self.additionalEosTokenIds = LanguageConfig.additionalStopTokenIds(
+                from: tokenizerDir, tokenizer: tokenizer)
+        } else {
+            self.additionalEosTokenIds = []
+        }
+    }
+
+    // MARK: - Resource control
+
+    /// Estimated on-disk size of the model's main asset, in bytes.
+
+    public var estimatedSizeOnDiskBytes: Int? {
+        guard let assetURL = bundle.modelURL(for: ModelBundle.ComponentKey.main) else { return nil }
+        return assetURL.recursiveFileSizeInBytes()
+    }
+
+    public func load() async throws {
+        try await resources.loadResources()
+    }
+
+    public func unload() {
+        resources.unloadResources()
+    }
+
+    /// Whether guided generation is available for this model.
+    private var isGuidedGenerationSupported: Bool {
+        if let supportsLogits = resources.loadedEngineSupportsLogits {
+            return supportsLogits
+        }
+        return variant != "coreai-pipelined"
     }
 
     // MARK: - Executor
@@ -120,64 +186,22 @@ public struct CoreAILanguageModel: LanguageModel {
         public typealias Model = CoreAILanguageModel
 
         public struct Configuration: Hashable, Sendable {
-            fileprivate let engine: any InferenceEngine
-            fileprivate let tokenizer: any Tokenizer
-            fileprivate let modelIdentifier: String
-            fileprivate let samplingConfig: SamplingConfiguration
-            fileprivate let vocabSize: Int?
-            fileprivate let additionalEosTokenIds: [Int32]
-
-            public static func == (lhs: Configuration, rhs: Configuration) -> Bool {
-                lhs.modelIdentifier == rhs.modelIdentifier
-                    && lhs.samplingConfig == rhs.samplingConfig
-            }
-
-            public func hash(into hasher: inout Hasher) {
-                hasher.combine(modelIdentifier)
-                hasher.combine(samplingConfig)
-            }
+            let url: URL
+            let variant: String?
+            let kvCacheStrategy: KVCacheStrategy
+            let modelIdentifier: String
+            let samplingConfig: SamplingConfiguration
+            let vocabSize: Int?
         }
 
         // MARK: - Properties
 
-        private let engine: any InferenceEngine
-        private let tokenizer: any Tokenizer
-        private let modelIdentifier: String
-        private let samplingConfig: SamplingConfiguration
-        private let vocabSize: Int?
-        /// All EOS-like token IDs: the main `eosTokenId` plus any additional
-        /// stop tokens from tokenizer_config.json (e.g. Gemma's `<end_of_turn>`).
-        private let eosTokenIds: Set<Int32>
-        /// Open / close marker pair the model uses for chain-of-thought
-        /// blocks, discovered from the tokenizer's known token ids at init
-        /// (see `detectThinkingMarkers`). For models that don't emit
-        /// reasoning, the markers still default to `<think>`/`</think>` and
-        /// the parser passes everything through as `.text`.
-        private let thinkingMarkers: (open: String, close: String)
-        /// Open / close marker pair the model uses for tool call blocks,
-        /// discovered from the tokenizer's known token ids at init
-        /// (see `detectToolCallMarkers`). nil when the model's tokenizer
-        /// has no tool call tokens.
-        private let toolCallMarkers: (open: String, close: String)?
+        private let resources: ModelResources
 
         // MARK: - Initialization
 
         public init(configuration: Configuration) throws {
-            self.engine = configuration.engine
-            self.tokenizer = configuration.tokenizer
-            self.modelIdentifier = configuration.modelIdentifier
-            self.samplingConfig = configuration.samplingConfig
-            self.vocabSize = configuration.vocabSize
-            self.thinkingMarkers = Self.detectThinkingMarkers(using: configuration.tokenizer)
-            self.toolCallMarkers = Self.detectToolCallMarkers(using: configuration.tokenizer)
-
-            // Build the full set of EOS-like token IDs
-            var eos = Set<Int32>()
-            if let id = configuration.tokenizer.eosTokenId {
-                eos.insert(Int32(id))
-            }
-            eos.formUnion(configuration.additionalEosTokenIds)
-            self.eosTokenIds = eos
+            self.resources = ModelResources.shared(for: configuration)
         }
 
         /// Probes the tokenizer for known reasoning marker pairs. Each
@@ -191,7 +215,7 @@ public struct CoreAILanguageModel: LanguageModel {
         /// markers. For models with non-pair-symmetric formats (e.g.
         /// gpt-oss / Harmony), a different parser is needed; this one
         /// covers the `<open>...</close>` shape.
-        private static func detectThinkingMarkers(
+        fileprivate static func detectThinkingMarkers(
             using tokenizer: any Tokenizer
         ) -> (open: String, close: String) {
             let candidates: [(open: String, close: String)] = [
@@ -240,38 +264,11 @@ public struct CoreAILanguageModel: LanguageModel {
             return nil
         }
 
-        // MARK: - Prewarm
+        // MARK: - Prewarm (FoundationModels, synchronous)
 
-        public func prewarm(transcript: Transcript) throws {
-            // Use engine's warmup method - blocks until warmup completes.
-            //
-            // We dispatch async work onto a dedicated DispatchQueue instead of using
-            // Task { } + semaphore.wait(). This avoids deadlock: if prewarm() is called
-            // from a Swift Concurrency cooperative thread, semaphore.wait() would block
-            // a cooperative thread while Task { } needs one to run — thread starvation.
-            //
-            // With DispatchQueue, the async work runs on a GCD thread (not the cooperative
-            // pool), so semaphore.wait() on the calling thread is safe.
-            let semaphore = DispatchSemaphore(value: 0)
-            let warmupError: Mutex<(any Error)?> = Mutex(nil)
-
-            let queue = DispatchQueue(label: "com.coreai.prewarm")
-            queue.async {
-                Task {
-                    do {
-                        try await self.engine.warmup(queryLength: 1, sampling: nil)
-                    } catch {
-                        warmupError.withLock({ $0 = error })
-                    }
-                    semaphore.signal()
-                }
-            }
-
-            semaphore.wait()
-
-            if let error: any Error = warmupError.withLock(\.self) {
-                throw error
-            }
+        /// Kicks off the engine load in the background.
+        public func prewarm(model: CoreAILanguageModel, transcript: Transcript) {
+            Task { try? await resources.loadResources() }
         }
 
         // MARK: - respond(to:model:streamingInto:) — new channel-based API
@@ -285,7 +282,7 @@ public struct CoreAILanguageModel: LanguageModel {
             let tokenizationSpan = InstrumentsProfiler.beginTokenization(inputLength: 0)
             let promptTokens = Self.makeTokens(
                 from: Array(request.transcript),
-                using: tokenizer,
+                using: model.tokenizer,
                 tools: request.enabledToolDefinitions,
                 component: "CoreAIExecutor"
             )
@@ -302,47 +299,75 @@ public struct CoreAILanguageModel: LanguageModel {
 
             CLILogger.log("Tokenized \(promptTokens.count) tokens", component: "CoreAIExecutor")
 
-            let effectiveSamplingConfig = createSamplingConfig(from: request.generationOptions)
-            let maxTokens = request.generationOptions.maximumResponseTokens ?? 512
+            let effectiveSamplingConfig = makeSamplingConfig(
+                from: request.generationOptions, base: model.samplingConfig)
+            let defaultMaxTokens = model.supportsReasoning ? 2048 : 512
+            let maxTokens = request.generationOptions.maximumResponseTokens ?? defaultMaxTokens
 
-            // FoundationModels now threads entry identity itself based on event
-            // ordering — we no longer mint an entryID and pass it down.
+            // Borrow the engine for the whole generation.
+            try await resources.withEngine { engine in
+                // Reset engine state for new generation
+                try await engine.reset()
 
-            // Check if guided generation is requested
-            if let schema = request.schema {
-                try await respondConstrained(
-                    schema: schema,
-                    promptTokens: promptTokens,
-                    samplingConfig: effectiveSamplingConfig,
-                    maxTokens: maxTokens,
-                    channel: channel
-                )
-            } else {
-                try await respondVanilla(
-                    promptTokens: promptTokens,
-                    samplingConfig: effectiveSamplingConfig,
-                    maxTokens: maxTokens,
-                    channel: channel
-                )
+                // FoundationModels now threads entry identity itself based on event
+                // ordering — we no longer mint an entryID and pass it down.
+
+                // Check if guided generation is requested
+                if let schema = request.schema {
+                    guard engine.supportsLogits else {
+                        throw LanguageModelError.unsupportedCapability(
+                            .init(
+                                capability: .guidedGeneration,
+                                debugDescription:
+                                    "This model's inference engine does not support guided generation "
+                                    + "(constrained decoding requires per-step logits)."
+                            )
+                        )
+                    }
+                    try await respondConstrained(
+                        engine: engine,
+                        model: model,
+                        schema: schema,
+                        promptTokens: promptTokens,
+                        samplingConfig: effectiveSamplingConfig,
+                        maxTokens: maxTokens,
+                        channel: channel
+                    )
+                } else {
+                    try await respondVanilla(
+                        engine: engine,
+                        model: model,
+                        promptTokens: promptTokens,
+                        samplingConfig: effectiveSamplingConfig,
+                        maxTokens: maxTokens,
+                        channel: channel
+                    )
+                }
             }
         }
 
         // MARK: - Vanilla Generation (no schema)
 
         private func respondVanilla(
+            engine: any InferenceEngine,
+            model: CoreAILanguageModel,
             promptTokens: [Int],
             samplingConfig: SamplingConfiguration,
             maxTokens: Int,
             channel: LanguageModelExecutorGenerationChannel
         ) async throws {
+            let tokenizer = model.tokenizer
             let tokenStream = try await engine.generate(
                 with: promptTokens.map(Int32.init),
                 samplingConfiguration: samplingConfig,
                 inferenceOptions: InferenceOptions(maxTokens: maxTokens)
             )
 
-            // Use pre-computed set of all EOS-like tokens (main + additional)
-            let eosTokens = eosTokenIds
+            // All EOS-like tokens: the tokenizer's main EOS plus any additional
+            // stop tokens from tokenizer_config.json (e.g. Gemma's <end_of_turn>).
+            var eosTokens = Set<Int32>()
+            if let id = tokenizer.eosTokenId { eosTokens.insert(Int32(id)) }
+            eosTokens.formUnion(model.additionalEosTokenIds)
             // Incremental-decode buffer. After a clean emit, one token is
             // retained as context for the next step (see below). During a
             // multi-byte sequence that hasn't decoded cleanly yet, multiple
@@ -358,14 +383,14 @@ public struct CoreAILanguageModel: LanguageModel {
             // to a top-level `.reasoning(...)` channel event so it lands as
             // its own `Transcript.Reasoning` entry, not mixed into the
             // user-facing `Transcript.Response`. Markers were resolved at
-            // executor init from the tokenizer's known token ids.
+            // model init from the tokenizer's known token ids.
             var thinkParser = ThinkTagParser(
-                open: thinkingMarkers.open,
-                close: thinkingMarkers.close
+                open: model.thinkingMarkers.open,
+                close: model.thinkingMarkers.close
             )
             // Routes tool call markup to .toolCalls(...) channel events.
             // nil when the model's tokenizer has no tool call tokens.
-            var toolCallParser: ToolCallParser? = toolCallMarkers.map {
+            var toolCallParser: ToolCallParser? = model.toolCallMarkers.map {
                 ToolCallParser(openMarker: $0.open, closeMarker: $0.close)
             }
             var generatedTokenCount: Int = 0
@@ -524,6 +549,8 @@ public struct CoreAILanguageModel: LanguageModel {
         // MARK: - Constrained Generation (with schema)
 
         private func respondConstrained(
+            engine: any InferenceEngine,
+            model: CoreAILanguageModel,
             schema: GenerationSchema,
             promptTokens: [Int],
             samplingConfig: SamplingConfiguration,
@@ -536,15 +563,16 @@ public struct CoreAILanguageModel: LanguageModel {
                 preconditionFailure("GenerationSchema JSON encoding produced invalid UTF-8")
             }
 
-            let strategy = ConstrainedDecodingStrategy(jsonSchema: jsonSchema, vocabSize: vocabSize)
+            let strategy = ConstrainedDecodingStrategy(
+                jsonSchema: jsonSchema, vocabSize: model.bundle.vocabSize)
             let stopSequences = StopSequences(
-                for: tokenizer,
-                additionalEosTokenIds: Array(eosTokenIds)
+                for: model.tokenizer,
+                additionalEosTokenIds: model.additionalEosTokenIds
             )
 
             let stream = try await strategy.decode(
                 from: .tokens(promptTokens),
-                tokenizer: tokenizer,
+                tokenizer: model.tokenizer,
                 inferenceEngine: engine,
                 samplingConfiguration: samplingConfig,
                 options: InferenceOptions(maxTokens: maxTokens),
@@ -560,9 +588,15 @@ public struct CoreAILanguageModel: LanguageModel {
                 )
             }
 
-            // Usage telemetry placeholder — awaiting Usage(input:output:) API.
-            _ = promptTokens.count
-            _ = generatedTokenCount
+            await channel.send(
+                .response(
+                    action: .updateUsage(
+                        input: .init(totalTokenCount: promptTokens.count, cachedTokenCount: 0),
+                        output: .init(
+                            totalTokenCount: generatedTokenCount,
+                            reasoningTokenCount: 0
+                        )
+                    )))
 
             // Yield to let the engine's tokenSequence Task finish cleanup
             // (putBackEngine, state reset, etc.) before the next respond().
@@ -733,11 +767,14 @@ public struct CoreAILanguageModel: LanguageModel {
 
         // MARK: - Helper Methods
 
-        private func createSamplingConfig(from options: GenerationOptions) -> SamplingConfiguration {
+        private func makeSamplingConfig(
+            from options: GenerationOptions,
+            base: SamplingConfiguration
+        ) -> SamplingConfiguration {
             if let temperature = options.temperature {
                 return SamplingConfiguration(temperature: temperature)
             }
-            return samplingConfig
+            return base
         }
     }
 }

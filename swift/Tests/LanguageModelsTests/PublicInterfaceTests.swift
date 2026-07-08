@@ -32,4 +32,16 @@ struct PublicInterfaceTests {
             _ = response.content
         }
     }
+
+    /// Compile-time check that the resource-control surface
+    @Test("Resource-control API compiles (runtime throws on missing asset)")
+    func resourceControlAPICompiles() async {
+        let missing = URL(fileURLWithPath: "/nonexistent/model")
+        await #expect(throws: (any Error).self) {
+            let model = try await CoreAILanguageModel(resourcesAt: missing, mode: .lazy)
+            _ = model.estimatedSizeOnDiskBytes
+            try await model.load()
+            model.unload()
+        }
+    }
 }
