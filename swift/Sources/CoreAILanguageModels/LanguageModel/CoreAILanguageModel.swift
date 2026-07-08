@@ -306,9 +306,6 @@ public struct CoreAILanguageModel: LanguageModel {
 
             // Borrow the engine for the whole generation.
             try await resources.withEngine { engine in
-                // Reset engine state for new generation
-                try await engine.reset()
-
                 // FoundationModels now threads entry identity itself based on event
                 // ordering — we no longer mint an entryID and pass it down.
 
