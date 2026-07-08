@@ -121,11 +121,10 @@ public enum MelSpectrogram {
     public static func fromPCM(_ raw: [Float], config: MelConfig = .whisper) -> [Float] {
         let preemph = applyPreemphasis(raw, alpha: config.preemphasis)
         let (audio, validFrames) = padToFrameGrid(preemph, config: config)
-        // For variable-length configs we allocate one extra trailing frame
-        // (left as zeros) so the encoder sees `1 + N//hop` time steps — same
-        // as torch.stft(center=True). For fixed-length (Whisper) configs,
-        // total == valid.
-        let totalFrames = (config.nFrames == nil) ? validFrames + 1 : validFrames
+        // For static configs totalFrames == nFrames (the full traced shape, which
+        // may be larger than validFrames when audio is shorter than the window).
+        // For dynamic configs totalFrames == validFrames + 1 (trailing zero frame).
+        let totalFrames = config.nFrames ?? (validFrames + 1)
 
         let pad = config.nFFT / 2
         let padded = padAudio(audio, pad: pad, mode: config.padMode)
@@ -233,14 +232,18 @@ public enum MelSpectrogram {
 
     private static func padToFrameGrid(_ raw: [Float], config: MelConfig) -> ([Float], Int) {
         if let target = config.nFrames {
+            // Static model: pad or truncate to exactly target frames.
+            // Return validFrames = min(actual, target) so normalization only
+            // covers real audio, not the zero-padding.
             let n = target * config.hopLength
+            let validFrames = min(raw.count / config.hopLength, target)
             var audio = raw
             if audio.count > n {
                 audio = Array(audio.prefix(n))
             } else if audio.count < n {
                 audio += [Float](repeating: 0, count: n - audio.count)
             }
-            return (audio, target)
+            return (audio, validFrames)
         }
         // Variable-length: HF emits `1 + N//hop` frames with the last zeroed
         // (torch.stft center=True semantics). We compute `validFrames = N//hop`

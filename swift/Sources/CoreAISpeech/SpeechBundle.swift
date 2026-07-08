@@ -102,9 +102,36 @@ public struct SpeechBundle: Sendable {
         let decoderStep = try await AIModel(contentsOf: stepURL)
         let joint = try await AIModel(contentsOf: jointURL)
         let config = try ParakeetTDTConfig.decode(fromMetadata: bundle.raw)
+
+        // Auto-detect static encoder shape and bake nFrames into the mel config
+        // so that fromPCM pads/truncates to exactly the traced frame count.
+        // Dynamic encoders (dim < 0) leave nFrames nil, preserving existing behaviour.
+        var melConfig = MelConfig.parakeet
+        if let desc = encoder.functionDescriptor(for: "main"),
+            case .ndArray(let nd) = desc.inputDescriptor(of: "input_features")
+        {
+            let tDim = MelConfig.parakeet.layout == .timeMajor ? 1 : 2
+            let dimVal = nd.shape[tDim]
+            if dimVal > 0 {
+                melConfig = MelConfig(
+                    sampleRate: MelConfig.parakeet.sampleRate,
+                    nFFT: MelConfig.parakeet.nFFT,
+                    winLength: MelConfig.parakeet.winLength,
+                    hopLength: MelConfig.parakeet.hopLength,
+                    nMelBins: MelConfig.parakeet.nMelBins,
+                    nFrames: dimVal,
+                    preemphasis: MelConfig.parakeet.preemphasis,
+                    normalization: MelConfig.parakeet.normalization,
+                    layout: MelConfig.parakeet.layout,
+                    padMode: MelConfig.parakeet.padMode,
+                    melScale: MelConfig.parakeet.melScale
+                )
+            }
+        }
+
         return ParakeetTDTAssets(
             encoder: encoder, decoderStep: decoderStep, joint: joint,
-            config: config, melConfig: .parakeet)
+            config: config, melConfig: melConfig)
     }
 
     // MARK: - Tokenizer loading

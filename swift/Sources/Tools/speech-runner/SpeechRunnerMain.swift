@@ -34,13 +34,16 @@ struct SpeechRunner: AsyncParsableCommand {
     @Flag(name: .long, help: "Run a full decode pass on silence before timing.")
     var warmup = false
 
+    @Flag(name: .long, help: "Print verbose debug output")
+    var verbose = false
+
     func run() async throws {
         let bundleURL = URL(fileURLWithPath: modelPath)
         if clearCoreAICache {
             try clearCache(bundleURL: bundleURL)
         }
         if FileManager.default.fileExists(atPath: bundleURL.appending(path: "encoder.aimodel").path) {
-            try await runBundle(bundleURL: bundleURL, audioPath: audioPath, warmup: warmup)
+            try await runBundle(bundleURL: bundleURL, audioPath: audioPath, warmup: warmup, verbose: verbose)
         } else {
             try await runLegacy(modelPath: modelPath, audioPath: audioPath, warmup: warmup)
         }
@@ -59,7 +62,7 @@ struct SpeechRunner: AsyncParsableCommand {
 
 // MARK: - Split bundle via CoreAISpeech
 
-func runBundle(bundleURL: URL, audioPath: String?, warmup: Bool) async throws {
+func runBundle(bundleURL: URL, audioPath: String?, warmup: Bool, verbose: Bool) async throws {
     print("Format: split (encoder + decoder, KV cache)")
 
     // Detect an existing cached specialization before loading so we can annotate the load time
@@ -79,16 +82,22 @@ func runBundle(bundleURL: URL, audioPath: String?, warmup: Bool) async throws {
     print(" done in \(String(format: "%.3f", loadElapsed.inSeconds))s\(cacheHit ? " (cache hit)" : "")")
     print("Format: bundle (\(await model.architecture))")
 
-    if warmup {
-        print("Warming up…")
-        _ = try await model.transcribe(pcm: [Float](repeating: 0, count: 480_000))
+    if verbose {
+        CLILogger.setLevel(to: 1)
     }
 
     if let path = audioPath {
         let url = URL(fileURLWithPath: path)
+        let pcm = try MelSpectrogram.loadAndResample(url, targetSampleRate: await model.sampleRate)
+
+        if warmup {
+            print("Warming up…")
+            try await model.prewarm(sampleCount: pcm.count)
+        }
+
         print("Transcribing \(url.lastPathComponent)…")
         let t0 = ContinuousClock.now
-        let (text, stats) = try await model.transcribe(audioURL: url)
+        let (text, stats) = try await model.transcribe(pcm: pcm)
         let totalMs = (ContinuousClock.now - t0).inMilliseconds
         print("\n── Decode ─────────────────────────────────────────────────────────────")
         print(
@@ -102,6 +111,10 @@ func runBundle(bundleURL: URL, audioPath: String?, warmup: Bool) async throws {
     } else {
         print("No audio — silence benchmark")
         let pcm = [Float](repeating: 0, count: 480_000)
+        if warmup {
+            print("Warming up…")
+            try await model.prewarm(sampleCount: pcm.count)
+        }
         let t0 = ContinuousClock.now
         let (_, stats) = try await model.transcribe(pcm: pcm)
         let totalMs = (ContinuousClock.now - t0).inMilliseconds

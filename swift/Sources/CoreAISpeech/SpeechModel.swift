@@ -46,6 +46,14 @@ public actor SpeechModel {
         }
     }
 
+    public var sampleRate: Double { melConfig.sampleRate }
+
+    /// Warm the encoder and decoder for a specific PCM sample count so MPSGraph
+    /// compiles and caches graphs for that input shape before real audio arrives.
+    public func prewarm(sampleCount: Int) async throws {
+        _ = try await decodeAudio(pcm: [Float](repeating: 0, count: sampleCount))
+    }
+
     // MARK: - Transcription
 
     /// Transcribe an audio file, returning the full text and decode stats.
@@ -70,16 +78,17 @@ public actor SpeechModel {
     }
 
     private func warmUp() async throws {
-        let nSamples: Int
         switch bundle.kind {
         case .whisper:
-            nSamples = (melConfig.nFrames ?? 3_000) * melConfig.hopLength
+            let nSamples = (melConfig.nFrames ?? 3_000) * melConfig.hopLength
+            _ = try await runEncoder(pcm: [Float](repeating: 0, count: nSamples))
         case .parakeetTDT:
-            // 5 s of silence — matches the static export's traced shape and is
-            // representative for dynamic exports too.
-            nSamples = Int(melConfig.sampleRate) * 5
+            // Static exports have nFrames set; warm up at exactly that size.
+            // Dynamic exports skip init warmup — callers use prewarm(sampleCount:)
+            // once the actual audio length is known, avoiding a wasted compilation.
+            guard let nFrames = melConfig.nFrames else { return }
+            _ = try await runEncoder(pcm: [Float](repeating: 0, count: nFrames * melConfig.hopLength))
         }
-        _ = try await runEncoder(pcm: [Float](repeating: 0, count: nSamples))
     }
 
     /// Run the encoder over PCM and return the encoder hidden states + concrete shape.
@@ -90,14 +99,18 @@ public actor SpeechModel {
         let encDesc = encoder.functionDescriptor(for: "main")!
         guard case .ndArray(let melNDDesc) = encDesc.inputDescriptor(of: "input_features")
         else { throw SpeechError.missingModel("Unexpected encoder input descriptor") }
-
+        let start = SuspendingClock().now
         let mel = MelSpectrogram.fromPCM(pcm, config: melConfig)
         let nFrames = MelSpectrogram.frameCount(forPCMLength: pcm.count, config: melConfig)
         let inputShape = encoderInputShape(nFrames: nFrames)
         var melArray = NDArray(descriptor: melNDDesc.resolvingDynamicDimensions(inputShape))
         fillNDArray(&melArray, as: Float.self, with: mel)
-
+        let preprocessDuration = SuspendingClock().now - start
+        CLILogger.log("The preprocessing took \(preprocessDuration)", level: 2)
+        let startEncode = SuspendingClock().now
         var outputs = try await fn.run(inputs: ["input_features": melArray])
+        let encodeDuration = SuspendingClock().now - startEncode
+        CLILogger.log("The encoding took \(encodeDuration)", level: 2)
         guard let encOut = outputs.remove("encoder_hidden_states")?.ndArray else {
             throw SpeechError.missingModel("Encoder did not produce 'encoder_hidden_states'")
         }
