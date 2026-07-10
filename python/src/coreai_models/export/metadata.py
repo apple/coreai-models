@@ -122,6 +122,16 @@ _METADATA: dict[str, AIModelMetadataFields] = {
             "Source: https://huggingface.co/openai/gpt-oss-20b"
         ),
     ),
+    # ---- VLMs ----
+    "Qwen/Qwen3-VL-2B-Instruct": AIModelMetadataFields(
+        author="Qwen Team",
+        license="Apache-2.0",
+        model_description=(
+            "Qwen3-VL-2B-Instruct is a 2B-parameter instruction-tuned "
+            "vision-language model from the Qwen3-VL family. "
+            "Source: https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct"
+        ),
+    ),
     # ---- Diffusion ----
     "runwayml/stable-diffusion-v1-5": AIModelMetadataFields(
         author="Robin Rombach, Patrick Esser, et al.",
