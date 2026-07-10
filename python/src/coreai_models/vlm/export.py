@@ -260,7 +260,15 @@ async def export_text_bundle(
     logging.info(f"Downloading {spec.hf_model_id}...")
     model_dir = snapshot_download(
         spec.hf_model_id,
-        allow_patterns=["*.safetensors", "*.safetensors.index.json", "config.json"],
+        allow_patterns=[
+            "*.safetensors",
+            "*.safetensors.index.json",
+            "config.json",
+            "tokenizer*",
+            "vocab.json",
+            "merges.txt",
+            "*.model",
+        ],
     )
     raw_cfg = AutoConfig.from_pretrained(model_dir)
     text_cfg = raw_cfg.text_config
