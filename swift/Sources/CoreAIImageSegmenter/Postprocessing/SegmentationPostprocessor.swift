@@ -180,7 +180,7 @@ public enum SegmentationPostprocessor {
         // Mask: sigmoid → bilinear upsample → threshold.
         // Threshold AFTER upsampling: pre-thresholding then resampling locks in nearest-neighbor
         // staircase artifacts (the binary edge propagates straight through any kernel), which is
-        // especially obvious for the optimized re-authored SAM3 export — its mask grid is
+        // especially obvious for the SAM3 lite export — its mask grid is
         // ~10× lower resolution than the baseline's.
         let maskBase = (batchIndex * queryCount + queryIndex) * maskHeight * maskWidth
         let lowResMask = output.predictedMasks[maskBase..<(maskBase + maskHeight * maskWidth)].map {

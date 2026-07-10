@@ -5,7 +5,7 @@
 
 """Segmentation export pipeline.
 
-The lite SAM3 export targets the Apple Neural Engine. The HF
+The lite SAM3 export is intended for iOS. The HF
 ``Sam3Model`` is replaced with a lite model
 (``coreai_models.models.ios.sam3.Sam3Lite``) split into three
 independently optimizable functions:

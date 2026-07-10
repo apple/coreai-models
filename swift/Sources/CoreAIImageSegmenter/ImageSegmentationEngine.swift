@@ -17,9 +17,9 @@ import Foundation
 ///     prompt) and emits all detection outputs in one call. Produced by the baseline
 ///     SAM3 export and EfficientSAM.
 ///   * Multi-function — three graphs (``image_encode``, ``text_encode``, ``detect``) wired
-///     together at runtime. Produced by the optimized re-authored SAM3 export targeting
-///     Apple Neural Engine. The engine pipes the encoder outputs into the detector and
-///     returns the same `SegmentationOutput` shape as the single-function path.
+///     together at runtime. Produced by the SAM3 lite export. The engine pipes the encoder
+///     outputs into the detector and returns the same `SegmentationOutput` shape as the
+///     single-function path.
 public struct CoreAISegmentationEngine {
     private let backend: Backend
 
@@ -241,8 +241,7 @@ public struct CoreAISegmentationEngine {
         }
     }
 
-    /// Backing state for the optimized re-authored SAM3 export (`image_encode` →
-    /// `text_encode` → `detect`).
+    /// Backing state for the SAM3 lite export (`image_encode` → `text_encode` → `detect`).
     fileprivate struct MultiFunctionContext {
         let imageEncode: InferenceFunction
         let imageEncodeDescriptor: InferenceFunctionDescriptor
@@ -255,7 +254,7 @@ public struct CoreAISegmentationEngine {
         let imageInputName: String
         let backboneFeaturesOutputName: String
 
-        // text_encode i/o. `attentionMaskInputName` is optional because the re-authored
+        // text_encode i/o. `attentionMaskInputName` is optional because the SAM3 lite
         // exporter takes it for iOS-side signature symmetry but the graph itself ignores it.
         let textInputName: String
         let attentionMaskInputName: String?

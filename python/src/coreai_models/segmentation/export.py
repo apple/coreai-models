@@ -77,7 +77,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="coreai.segmentation.export",
         description=(
             "Export segmentation models to Core AI format. By default exports "
-            "the lite variant targeting Apple Neural Engine via a 3-function bundle "
+            "the lite variant targeting iOS via a 3-function bundle "
             "(image_encode / text_encode / detect) with palettized encoders "
             "+ fp16. Pass --full to instead export the unmodified HF model "
             "as a single-entrypoint asset."

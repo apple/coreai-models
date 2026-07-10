@@ -179,7 +179,7 @@ _METADATA: dict[str, AIModelMetadataFields] = {
             "SAM 3 is a unified foundation model for promptable segmentation in "
             "images and videos. It can detect, segment, and track objects using "
             "text or visual prompts such as points, boxes, and masks. This export "
-            "targets image segmentation, re-authored for Apple Neural Engine. "
+            "targets image segmentation, re-authored for iOS. "
             "Source: https://github.com/facebookresearch/sam3"
         ),
     ),

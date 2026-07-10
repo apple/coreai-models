@@ -6,7 +6,7 @@
 """Re-authored SAM3 text encoder in BC1S layout.
 
 24 transformer layers from the HF ``CLIPTextModelWithProjection``,
-re-implemented for Apple Neural Engine: ``nn.Linear`` becomes
+re-implemented for iOS: ``nn.Linear`` becomes
 ``nn.Conv2d(1x1)`` and the causal mask uses ``-40000.0`` (not ``-inf``)
 on masked positions.
 """

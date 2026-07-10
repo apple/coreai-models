@@ -13,7 +13,7 @@ private enum GraphNames {
     static let main = "main"
     static let loadEmbeddings = "load_embeddings"
     static let extendPrefix = "extend"
-    // Multi-function segmenter (re-authored ANE-targeted SAM3 export).
+    // Multi-function segmenter (lite SAM3 export for iOS).
     static let imageEncode = "image_encode"
     static let textEncode = "text_encode"
     static let detect = "detect"
@@ -34,7 +34,7 @@ public enum ModelStructure: Equatable, Sendable, CustomStringConvertible {
     /// Dynamic model with single `main` function for GPU/CPU inference.
     case dynamic
 
-    /// Three-function segmenter targeting Apple Neural Engine.
+    /// Three-function segmenter targeting iOS.
     /// Identified by presence of `image_encode`, `text_encode`, and `detect` graphs.
     case multiFunctionSegmenter
 

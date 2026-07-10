@@ -3,7 +3,7 @@
 # Use of this source code is governed by a BSD-3-clause license that can
 # be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
-"""SAM3 Lite model for Apple Neural Engine.
+"""SAM3 Lite model for iOS.
 
 Assembles the ANE-targeted image encoder, FPN neck, text encoder, DETR
 encoder/decoder, mask decoder, and dot-product scoring into a single
@@ -43,7 +43,7 @@ def _linear_to_conv2d(linear: nn.Linear) -> nn.Conv2d:
 
 
 class Sam3Lite(nn.Module):
-    """SAM3 Lite model for Apple Neural Engine (ANE-targeted, palettized).
+    """SAM3 Lite model for iOS (palettized).
 
     The default ``image_size=336`` keeps the global-attention sequence
     short. Pass ``image_size=1008`` to match HF's default.

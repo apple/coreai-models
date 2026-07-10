@@ -17,7 +17,7 @@ import torch.nn as nn
 
 
 class BidirectionalSDPA(nn.Module):
-    """Per-head split/cat SDPA for Apple Neural Engine.
+    """Per-head split/cat SDPA for iOS.
 
     Chunks the query when ``query_seq > query_chunk_size``
     """

@@ -2,7 +2,7 @@
 
 SAM 3 (Segment Anything Model 3) is a unified vision model from Meta for promptable image and video segmentation given text or visual prompts.[^1]
 
-This export targets the **Apple Neural Engine** by restructuring the model in a BC1S layout (channels-first, `Conv2d(1x1)` projections, fp16-safe primitives, rank-4 window attention) and splitting it into three independently optimizable functions:
+This export targets **iOS** by restructuring the model in a BC1S layout (channels-first, `Conv2d(1x1)` projections, fp16-safe primitives, rank-4 window attention) and splitting it into three independently optimizable functions:
 
 | Function       | Compression                                | Inputs                               | Outputs                                                      |
 |----------------|--------------------------------------------|--------------------------------------|--------------------------------------------------------------|
@@ -41,7 +41,7 @@ uv run export.py --help
 
 | Flag                   | Description                                    | Default                |
 |------------------------|------------------------------------------------|------------------------|
-| `--full`               | Export plain HF `Sam3Model` (no ANE targeting) | —                      |
+| `--full`               | Export plain HF `Sam3Model` (no iOS targeting) | —                      |
 | `--output-dir`         | Output directory for the bundle                | `<repo-root>/exports/` |
 | `--output-name`        | Custom bundle directory name                   | derived                |
 | `--image-size`         | Input resolution (336 lite / 1008 full)        | `336` / `1008`         |
@@ -52,15 +52,15 @@ uv run export.py --help
 | `--overwrite`          | Overwrite existing bundle                      | —                      |
 | `--dry-run`            | Print resolved config and exit                 | —                      |
 
-`image-size=336` is the resolution we recommend for ANE deployment.
+`image-size=336` is the resolution we recommend for iOS deployment.
 
-### Lite export (ANE-targeted for iOS)
+### Lite export (targeting iOS)
 
-The lite export, as shown in the WWDC26 [Dive into Core AI model authoring and optimization](https://developer.apple.com/videos/play/wwdc2026/325/) video, is the default (no extra flags needed). The model is restructured for Apple Neural Engine in BC1S layout with palettized encoders, and split into 3 independently compressed functions (image encoder, text encoder, detector) at a 336×336 input resolution.
+The lite export, as shown in the WWDC26 [Dive into Core AI model authoring and optimization](https://developer.apple.com/videos/play/wwdc2026/325/) video, is the default (no extra flags needed). The model is restructured for iOS in BC1S layout with palettized encoders, and split into 3 independently compressed functions (image encoder, text encoder, detector) at a 336×336 input resolution.
 
 ### Full export (direct from Hugging Face)
 
-Pass `--full` to skip ANE targeting and palettization and emit the unmodified `transformers.Sam3Model` as a single-entrypoint asset (one `main` function returning the five raw outputs). Higher quality than the lite variant at the cost of larger model size and slower on-device inference.
+Pass `--full` to skip iOS targeting and palettization and emit the unmodified `transformers.Sam3Model` as a single-entrypoint asset (one `main` function returning the five raw outputs). Higher quality than the lite variant at the cost of larger model size and slower on-device inference.
 
 ```sh
 uv run models/sam3/export.py --full                    # float32, 1008x1008
