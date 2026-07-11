@@ -185,9 +185,13 @@ public struct ObjectDetector {
     // MARK: - Preprocessing
 
     /// Preprocess each image and write its `[3, H, W]` Float pixels directly
-    /// into the corresponding batch slot of a freshly allocated `[B, 3, H, W]`
-    /// NDArray. Avoids materializing a per-image `[Float]` array-of-arrays
-    /// or a flattened `B*3*H*W` intermediate.
+    /// into its batch slot of a freshly allocated `[B, 3, H, W]` NDArray —
+    /// no per-image or flattened `B*3*H*W` intermediate.
+    ///
+    /// `contiguousElements` is consuming, so the `MutableSpan` is obtained once
+    /// outside the loop and indexed per image; being a safe, bounds-checked
+    /// handle lets `try` stay inline. It is `nil` for a non-contiguous buffer,
+    /// which the slot arithmetic's dense row-major assumption treats as an error.
     private func buildInputNDArray(
         images: [CGImage],
         plan: BatchPlan,
@@ -206,28 +210,31 @@ public struct ObjectDetector {
         if descriptor.scalarType == .float16 {
             #if !((os(macOS) || targetEnvironment(macCatalyst)) && arch(x86_64))
             var view = imageArray.mutableView(as: Float16.self)
+            guard var span = view.contiguousElements else {
+                throw DetectionRuntimeError.invalidConfiguration(
+                    "Image input NDArray is not contiguous")
+            }
             for (b, image) in images.enumerated() {
                 let chw = try preprocessor.preprocessCHW(cgImage: image)
-                view.withUnsafeMutablePointer { ptr, _, _ in
-                    let slot = ptr.advanced(by: b * slotCount)
-                    for i in 0..<slotCount { slot[i] = Float16(chw[i]) }
-                }
+                let start = b * slotCount
+                for i in 0..<slotCount { span[start + i] = Float16(chw[i]) }
             }
             #else
             fatalError("Float16 is not supported on this platform")
             #endif
         } else {
             var view = imageArray.mutableView(as: Float.self)
+            guard var span = view.contiguousElements else {
+                throw DetectionRuntimeError.invalidConfiguration(
+                    "Image input NDArray is not contiguous")
+            }
             for (b, image) in images.enumerated() {
                 let chw = try preprocessor.preprocessCHW(cgImage: image)
-                view.withUnsafeMutablePointer { ptr, _, _ in
-                    let slot = ptr.advanced(by: b * slotCount)
-                    chw.withUnsafeBufferPointer { src in
-                        slot.update(from: src.baseAddress!, count: slotCount)
-                    }
-                }
+                let start = b * slotCount
+                for i in 0..<slotCount { span[start + i] = chw[i] }
             }
         }
+
         return imageArray
     }
 

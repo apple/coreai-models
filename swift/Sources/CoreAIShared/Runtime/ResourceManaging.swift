@@ -6,6 +6,7 @@
 import Foundation
 
 /// Lifecycle management for lazily-loaded resources (models, buffers).
+///
 public protocol ResourceManaging: Sendable {
     /// Load model weights and allocate inference buffers.
     func loadResources() async throws

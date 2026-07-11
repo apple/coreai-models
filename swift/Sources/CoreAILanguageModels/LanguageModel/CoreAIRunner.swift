@@ -14,8 +14,7 @@ import Tokenizers
 /// ```swift
 /// let url = URL(fileURLWithPath: "/path/to/model")
 /// let runner = try CoreAIRunner(contentsOf: url)
-/// let model = try await runner.makeLanguageModel()
-/// let session = LanguageModelSession(model: model)
+/// let engine = try await runner.makeInferenceEngine()
 /// ```
 public struct CoreAIRunner {
     // MARK: - Properties
@@ -66,36 +65,6 @@ public struct CoreAIRunner {
             config: configData,
             modelURL: try bundle.requireModelURL(for: ModelBundle.ComponentKey.main),
             options: options
-        )
-    }
-
-    /// Creates a LanguageModel for FM API usage.
-    func makeLanguageModel() async throws -> CoreAILanguageModel {
-        let modelLoadSpan = InstrumentsProfiler.beginModelLoad(name: bundle.name)
-        let engine = try await makeInferenceEngine()
-        modelLoadSpan.end()
-
-        let tokenizerLoadSpan = InstrumentsProfiler.beginTokenizerLoad(
-            id: bundle.tokenizer)
-        let tokenizer = try await bundle.loadTokenizer()
-        tokenizerLoadSpan.end()
-
-        // Read additional stop token IDs from tokenizer_config.json
-        let additionalEos: [Int32]
-        if let tokenizerDir = bundle.tokenizerPath {
-            additionalEos = LanguageConfig.additionalStopTokenIds(
-                from: tokenizerDir, tokenizer: tokenizer)
-        } else {
-            additionalEos = []
-        }
-
-        return CoreAILanguageModel(
-            engine: engine,
-            tokenizer: tokenizer,
-            modelIdentifier: bundle.name,
-            samplingConfig: SamplingConfiguration.greedy,
-            vocabSize: bundle.vocabSize,
-            additionalEosTokenIds: additionalEos
         )
     }
 

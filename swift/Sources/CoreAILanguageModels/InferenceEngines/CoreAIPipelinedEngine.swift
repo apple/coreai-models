@@ -104,7 +104,7 @@ final class CoreAIPipelinedEngine: InferenceEngine, Sendable {
         with input: [TokenId],
         samplingConfiguration: SamplingConfiguration,
         inferenceOptions: InferenceOptions
-    ) throws -> GenerationSequence {
+    ) async throws -> GenerationSequence {
         if inferenceOptions.includeLogits {
             throw InferenceRuntimeError.invalidArgument(
                 "CoreAI pipelined engine does not support logits (GPU-side sampling). "
@@ -117,6 +117,14 @@ final class CoreAIPipelinedEngine: InferenceEngine, Sendable {
                     + "Use a sequential engine for evaluation."
             )
         }
+
+        // Serialize: if a prior generation is still winding down (GPU drain),
+        // cancel it and wait for the engine slot to be released.
+        if let priorTask = _generationTask.withLock({ $0 }) {
+            _activeToken.withLock { $0?.cancel() }
+            await priorTask.value
+        }
+
         let maxTokens = inferenceOptions.maxTokens
         let stopReasonStore = StopReasonStore()
         let (base, outputContinuation) =

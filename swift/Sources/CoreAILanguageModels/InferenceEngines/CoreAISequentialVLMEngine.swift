@@ -769,7 +769,7 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
         with input: [TokenId],
         samplingConfiguration: SamplingConfiguration,
         inferenceOptions: InferenceOptions
-    ) throws -> GenerationSequence {
+    ) async throws -> GenerationSequence {
         let token = GenerationToken()
         _activeToken.withLock { $0 = token }
         return GenerationSequence(
@@ -794,7 +794,7 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
         tokens: [TokenId],
         samplingConfiguration: SamplingConfiguration,
         inferenceOptions: InferenceOptions
-    ) throws -> GenerationSequence {
+    ) async throws -> GenerationSequence {
         let token = GenerationToken()
         _activeToken.withLock { $0 = token }
         return GenerationSequence(
