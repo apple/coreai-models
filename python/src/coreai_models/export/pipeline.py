@@ -62,6 +62,8 @@ class ExportConfig:
     output_name: str | None = None
     num_layers: int | None = None
     overwrite: bool = False
+    # iOS only. When True, embedding table is not quantized to int8.
+    disable_embedding_quantization: bool = False
     # Optional prebuilt coreai-opt config (KMeansPalettizerConfig or
     # QuantizerConfig) loaded from a user-provided YAML. When set, the pipeline
     # uses this directly and ignores `compression` for config resolution
@@ -210,6 +212,7 @@ async def _async_export_model(config: ExportConfig) -> str:
                 max_context_length=max_context_length,
                 target_dtype=target_dtype,
                 num_layers=config.num_layers,
+                disable_embedding_quantization=config.disable_embedding_quantization,
             )
         model = model.eval()
         # ---- 3. Resolve compression preset ----

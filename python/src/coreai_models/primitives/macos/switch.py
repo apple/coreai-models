@@ -78,6 +78,11 @@ class SwitchGLU(torch.nn.Module):
         self.up_proj = SwitchLinear(hidden_size, moe_intermediate_size, 1, num_experts, bias=bias)
         self.down_proj = SwitchLinear(moe_intermediate_size, hidden_size, 1, num_experts, bias=bias)
         self._activate = activation if activation is not None else SwiGLU()
+        # Eager-only optimization. When set, tokens are processed in chunks of
+        # this size to bound the peak GatherMM intermediate. Left None for
+        # export/production so the traced
+        # graph carries no data-dependent control flow on the token dimension.
+        self.eager_chunk_size: int | None = None
 
     def forward(
         self: Self,
@@ -90,12 +95,27 @@ class SwitchGLU(torch.nn.Module):
         x = x.reshape((-1, 1, 1, hidden_size))
         # batch size mul query length x num active experts
         indices = indices.reshape((-1, num_active_experts))
-        # batch size mul query length x num active experts x 1 x moe intermediate size
-        gate = self.gate_proj(x, indices)
-        up = self.up_proj(x, indices)
-        gated_up = self._activate(up, gate)
-        # batch size mul query length x num active experts x 1 x hidden size
-        x = self.down_proj(gated_up, indices)
+        bsql = x.shape[0]
+
+        chunk_size = self.eager_chunk_size
+        if chunk_size is None or bsql <= chunk_size:
+            gate = self.gate_proj(x, indices)
+            up = self.up_proj(x, indices)
+            gated_up = self._activate(up, gate)
+            # nws x bsql x nae x 1 x hidden size
+            x = self.down_proj(gated_up, indices)
+        else:
+            chunks = []
+            for start in range(0, bsql, chunk_size):
+                x_c = x[start : start + chunk_size]
+                idx_c = indices[start : start + chunk_size]
+                gate_c = self.gate_proj(x_c, idx_c)
+                up_c = self.up_proj(x_c, idx_c)
+                gated_c = self._activate(up_c, gate_c)
+                chunks.append(self.down_proj(gated_c, idx_c))
+            # nws x bsql x nae x 1 x hidden size
+            x = torch.cat(chunks, dim=1)
+
         # batch size x query length x num active experts x hidden size
         x = x.reshape((batch_size, query_length, num_active_experts, hidden_size))
         return x
