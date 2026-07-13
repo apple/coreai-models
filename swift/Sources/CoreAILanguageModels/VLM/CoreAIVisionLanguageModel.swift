@@ -83,8 +83,6 @@ public struct CoreAIVisionLanguageModel: LanguageModel {
             visionConfig: visionConfig
         )
     }
-
-    public func validate(_ transcript: some Collection<Transcript.Entry>) async throws {}
 }
 
 // MARK: - CoreAIVLMExecutor
@@ -198,9 +196,8 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
             .response(
                 action: .updateUsage(
                     input: .init(totalTokenCount: promptTokens.count, cachedTokenCount: 0),
-                    output: .init(totalTokenCount: generatedTokens.count, reasoningTokenCount: 0)
+                    output: .init(totalTokenCount: generatedCount, reasoningTokenCount: 0)
                 )))
-        await Task.yield()
     }
 
     // MARK: - Prompt Construction
