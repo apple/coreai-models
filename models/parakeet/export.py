@@ -211,7 +211,7 @@ def _bundle_paths(
 
 def _build_aimodel_metadata(graph: str) -> AIModelAssetMetadata:
     metadata = AIModelAssetMetadata()
-    metadata.author = "K. C. Puvvada et al."
+    metadata.author = "M. Sekoyan et al."
     metadata.license = "CC-BY-4.0"
     metadata.model_description = (
         f"Parakeet-TDT v3 ASR ({graph} subgraph). Parakeet is a FastConformer "

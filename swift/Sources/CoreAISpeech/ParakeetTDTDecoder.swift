@@ -20,6 +20,7 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
     public func decode(
         encoderOutput: NDArray,
         encoderOutputShape: [Int],
+        validEncoderFrames: Int,
         resources: DecoderResources
     ) async throws -> (tokens: [Int32], stats: DecodeStats) {
         guard case .parakeetTDT(let decoderStep, let joint, let cfg) = resources else {
@@ -37,6 +38,11 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
                 "Encoder output shape \(encoderOutputShape) doesn't match config (B=1, H=\(hidden))")
         }
         if tEnc == 0 { return (tokens: [], stats: DecodeStats(stepTimesMs: [])) }
+
+        // For a static (padded) encoder the tail frames are zero-padding; decoding
+        // them yields spurious tokens (trailing periods). Cap the loop at the number
+        // of frames that carry real audio. Dynamic exports pass tEnc, so cap == tEnc.
+        let cap = max(1, min(tEnc, validEncoderFrames))
 
         // Resolve descriptors for the two callable graphs.
         guard let stepFn = try decoderStep.loadFunction(named: "main") else {
@@ -89,11 +95,11 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
         var frame = 0
         var firstStep = true
         var cachedDecBuf: [Float]? = nil  // last decoder output; reused on blank-input frames
-        let emitCap = tEnc * cfg.maxSymbolsPerStep
+        let emitCap = cap * cfg.maxSymbolsPerStep
         let vocabSize = cfg.vocabSize
 
         var stepTimesMs: [Double] = []
-        while frame < tEnc && emitted.count < emitCap {
+        while frame < cap && emitted.count < emitCap {
             let t0 = ContinuousClock.now
             var advance = 0
             for _ in 0..<cfg.maxSymbolsPerStep {

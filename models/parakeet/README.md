@@ -39,6 +39,32 @@ uv run export.py --help
 | ----------------------------- | ---------- |
 | nvidia/parakeet-tdt-0.6b-v3   | 0.6B       |
 
+## Running
+
+### In your iOS and macOS applications
+
+```swift
+import CoreAISpeech
+
+// Load an exported bundle directory (metadata.json + encoder/decoder_step/joint .aimodel assets + processor/).
+let model = try await SpeechModel(resourcesAt: "coreai-models/exports/parakeet-tdt-0.6b-v3_float32_static")
+
+// Transcribe an audio file — decoded and resampled to the model's sample rate automatically:
+let (text, stats) = try await model.transcribe(audioURL: URL(fileURLWithPath: "audio.wav"))
+print(text)
+
+// Or transcribe raw mono PCM you already hold at model.sampleRate:
+let (text2, _) = try await model.transcribe(pcm: pcmSamples)
+```
+
+### On your Mac using built-in Command Line Tool
+
+```bash
+swift run -c release speech-runner path/to/exported_bundle_dir path/to/audio.wav
+```
+
+Accepts any audio the system can decode (`wav`, `flac`, `m4a`, …). Add `--warmup` to run a full transcription pass (encode + decode) on silence before timing, or `--verbose` for debug output. Omit the audio file to run a silence latency benchmark.
+
 ## Why three graphs?
 
 Parakeet TDT's runtime decoding is autoregressive with duration-aware time advancement: each step samples a `(token, duration)` pair from the joint network, then advances the encoder frame pointer by `duration` (and only runs the LSTM prediction net when the token is not blank). That control flow lives in `ParakeetTDTGenerationMixin.generate`, not in `forward`, so `torch.export` cannot capture it as a single graph. The bundle exposes the three building blocks the runtime needs:
@@ -55,4 +81,4 @@ The encoder graph already includes `encoder_projector`, so the joint network's t
 
 This recipe exports the full-utterance encoder; cache-aware / chunked-attention streaming is not yet implemented in `transformers` for Parakeet. The `decoder_step` and `joint` graphs are already streaming-shaped (single-step, explicit LSTM state in/out), so once a chunked encoder lands upstream the same bundle layout extends to streaming with only an encoder swap.
 
-[^1]: [TDT paper](https://arxiv.org/abs/2304.06795) · [HuggingFace](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3)
+[^1]: [TDT paper](https://arxiv.org/abs/2304.06795) · [Parakeet TDT v3 paper](https://arxiv.org/abs/2509.14128) · [HuggingFace](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3)

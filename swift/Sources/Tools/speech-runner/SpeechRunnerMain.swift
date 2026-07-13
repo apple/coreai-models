@@ -19,7 +19,7 @@ struct SpeechRunner: AsyncParsableCommand {
         abstract: "Transcribe audio using a CoreAI speech model bundle"
     )
 
-    @Argument(help: "Bundle dir (encoder.aimodel + decoder.aimodel) or single .aimodel (legacy)")
+    @Argument(help: "Bundle dir (metadata.json + .aimodel assets) or single .aimodel (legacy)")
     var modelPath: String
 
     @Argument(help: "Audio file (wav, flac, m4a, …). Omit for latency benchmarking with silence.")
@@ -31,7 +31,7 @@ struct SpeechRunner: AsyncParsableCommand {
     )
     var clearCoreAICache: Bool = false
 
-    @Flag(name: .long, help: "Run a full decode pass on silence before timing.")
+    @Flag(name: .long, help: "Run a full transcription pass (encode + decode) on silence before timing.")
     var warmup = false
 
     @Flag(name: .long, help: "Print verbose debug output")

@@ -38,6 +38,7 @@ public protocol SpeechDecoder: Sendable {
     func decode(
         encoderOutput: NDArray,
         encoderOutputShape: [Int],
+        validEncoderFrames: Int,
         resources: DecoderResources
     ) async throws -> (tokens: [Int32], stats: DecodeStats)
 }
@@ -57,8 +58,12 @@ public struct WhisperDecoder: SpeechDecoder {
     public func decode(
         encoderOutput: NDArray,
         encoderOutputShape: [Int],
+        validEncoderFrames: Int,
         resources: DecoderResources
     ) async throws -> (tokens: [Int32], stats: DecodeStats) {
+        // `validEncoderFrames` is ignored: Whisper is encoder-decoder and stops on
+        // `eotToken`, not on encoder-frame exhaustion, so padded encoder frames don't
+        // produce trailing tokens the way the Parakeet TDT frame loop does.
         guard case .whisper(let decoderModel, let config) = resources else {
             throw SpeechError.incompatibleResources("WhisperDecoder requires .whisper resources")
         }

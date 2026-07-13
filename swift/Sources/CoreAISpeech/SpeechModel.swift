@@ -131,9 +131,24 @@ public actor SpeechModel {
 
     private func decodeAudio(pcm: [Float]) async throws -> ([Int32], DecodeStats) {
         let (encOut, encShape) = try await runEncoder(pcm: pcm)
+        let tEnc = encShape[1]
+        // Exclude a static window's zero-padded tail: decode only the encoder frames
+        // that carry real audio. Estimated proportionally from the mel valid/total
+        // ratio and the encoder's actual output length (robust to conv edge effects).
+        // Round to nearest so the boundary frame is kept only when it's majority real
+        // audio — this drops the mostly-padding tail frame (a spurious trailing period)
+        // while keeping the final token. Dynamic exports have no padding (validEnc == tEnc).
+        let validEnc: Int
+        if let total = melConfig.nFrames {
+            let validMel = MelSpectrogram.validFrameCount(forPCMLength: pcm.count, config: melConfig)
+            validEnc = min(tEnc, max(1, Int((Double(validMel) / Double(total) * Double(tEnc)).rounded())))
+        } else {
+            validEnc = tEnc
+        }
         return try await decoder.decode(
             encoderOutput: encOut,
             encoderOutputShape: encShape,
+            validEncoderFrames: validEnc,
             resources: resources)
     }
 

@@ -114,6 +114,15 @@ public enum MelSpectrogram {
         return 1 + count / config.hopLength
     }
 
+    /// Number of *valid* (non-padded) mel frames for a given PCM length — i.e. the
+    /// frames that carry real audio, excluding a static window's zero padding. For
+    /// a dynamic config every frame is real. Mirrors the count computed in
+    /// `padToFrameGrid`.
+    public static func validFrameCount(forPCMLength count: Int, config: MelConfig) -> Int {
+        if let n = config.nFrames { return min(count / config.hopLength, n) }  // static: clamp to window
+        return count / config.hopLength  // dynamic: all real
+    }
+
     public static func fromFile(_ url: URL, config: MelConfig = .whisper) throws -> [Float] {
         return fromPCM(try loadAndResample(url, targetSampleRate: config.sampleRate), config: config)
     }
@@ -233,10 +242,10 @@ public enum MelSpectrogram {
     private static func padToFrameGrid(_ raw: [Float], config: MelConfig) -> ([Float], Int) {
         if let target = config.nFrames {
             // Static model: pad or truncate to exactly target frames.
-            // Return validFrames = min(actual, target) so normalization only
-            // covers real audio, not the zero-padding.
+            // validFrames = min(actual, target) so normalization only covers
+            // real audio, not the zero-padding.
             let n = target * config.hopLength
-            let validFrames = min(raw.count / config.hopLength, target)
+            let validFrames = validFrameCount(forPCMLength: raw.count, config: config)
             var audio = raw
             if audio.count > n {
                 audio = Array(audio.prefix(n))
