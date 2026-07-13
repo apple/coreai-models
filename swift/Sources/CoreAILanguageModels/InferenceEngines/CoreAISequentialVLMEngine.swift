@@ -346,18 +346,22 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
     /// - Parameter url: URL to the image file (JPEG, PNG, HEIC, etc.)
     /// - Returns: `EmbeddedInput` containing projected embeddings and token positions
     public func encodeImage(at url: URL) async throws -> EmbeddedInput {
-        let encodeSignpost = InstrumentsProfiler.beginCustomInterval(
-            name: "CoreAIVLM EncodeImage",
-            details: url.lastPathComponent
-        )
-
-        // Step 1: Preprocess image to CHW Float32
         guard let ciImage = CIImage(contentsOf: url) else {
             throw ImagePreprocessorError.loadFailed(url)
         }
         guard let cgImage = CIContext().createCGImage(ciImage, from: ciImage.extent) else {
             throw ImagePreprocessorError.renderFailed
         }
+        return try await encodeImage(cgImage: cgImage)
+    }
+
+    public func encodeImage(cgImage: CGImage) async throws -> EmbeddedInput {
+        let encodeSignpost = InstrumentsProfiler.beginCustomInterval(
+            name: "CoreAIVLM EncodeImage",
+            details: "cgImage"
+        )
+
+        // Step 1: Preprocess image to CHW Float32
         let chwPixels = try imagePreprocessor.preprocessCHW(cgImage: cgImage)
 
         // Step 2: Run encode_image

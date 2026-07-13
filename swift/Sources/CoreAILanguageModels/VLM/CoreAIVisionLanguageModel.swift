@@ -5,15 +5,11 @@
 
 // Foundation Models protocol implementation for VLM bundles.
 
-import CoreImage
+import CoreAI
+import CoreGraphics
 import Foundation
 import FoundationModels
-import ImageIO
 import Tokenizers
-import UniformTypeIdentifiers
-
-#if canImport(CoreAI)
-import CoreAI
 
 // MARK: - CoreAIVisionLanguageModel
 
@@ -29,7 +25,6 @@ import CoreAI
 ///     }
 /// }
 /// ```
-@available(macOS 27, iOS 27, *)
 public struct CoreAIVisionLanguageModel: LanguageModel {
     public typealias Executor = CoreAIVLMExecutor
 
@@ -67,24 +62,24 @@ public struct CoreAIVisionLanguageModel: LanguageModel {
         )
         let vlmConfig = VLMModelConfig(base: baseConfig, visionConfig: visionConfig)
 
+        // Load the tokenizer and the three model components concurrently.
         async let tokenizerResult = bundle.loadTokenizer()
-        let visionModel = try await PreparedModel.prepare(at: visionURL)
-        let embedModel = try await PreparedModel.prepare(at: embedURL)
-        let llmModel = try await PreparedModel.prepare(at: mainURL)
+        async let visionModelResult = PreparedModel.prepare(at: visionURL)
+        async let embedModelResult = PreparedModel.prepare(at: embedURL)
+        async let llmModelResult = PreparedModel.prepare(at: mainURL)
 
         let engine = try await CoreAISequentialVLMEngine(
             config: vlmConfig,
-            visionModel: visionModel,
-            embedModel: embedModel,
-            llmModel: llmModel,
+            visionModel: try await visionModelResult,
+            embedModel: try await embedModelResult,
+            llmModel: try await llmModelResult,
             options: EngineOptions()
         )
-        let tokenizer = try await tokenizerResult
 
         self.executorConfiguration = CoreAIVLMExecutor.Configuration(
             bundleURL: url,
             engine: engine,
-            tokenizer: tokenizer,
+            tokenizer: try await tokenizerResult,
             visionConfig: visionConfig
         )
     }
@@ -94,7 +89,6 @@ public struct CoreAIVisionLanguageModel: LanguageModel {
 
 // MARK: - CoreAIVLMExecutor
 
-@available(macOS 27, iOS 27, *)
 public struct CoreAIVLMExecutor: LanguageModelExecutor {
     public typealias Model = CoreAIVisionLanguageModel
 
@@ -122,14 +116,11 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
         self.visionConfig = configuration.visionConfig
     }
 
-    public func prewarm(model: CoreAIVisionLanguageModel, transcript: Transcript) {}
-
     public nonisolated(nonsending) func respond(
         to request: LanguageModelExecutorGenerationRequest,
         model: CoreAIVisionLanguageModel,
         streamingInto channel: LanguageModelExecutorGenerationChannel
     ) async throws {
-        // Extract the image attachment + user text from the transcript.
         var cgImage: CGImage?
         var userText = ""
         for entry in request.transcript {
@@ -139,7 +130,7 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
                 case .text(let text):
                     userText += text.content
                 case .attachment(let attachment):
-                    if case .image(let image) = attachment.content {
+                    if cgImage == nil, case .image(let image) = attachment.content {
                         cgImage = image.cgImage
                     }
                 default:
@@ -157,14 +148,9 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
                 ))
         }
 
-        // Encode the image through the vision encoder. `encodeImage(at:)`
-        let imageURL = try Self.writeTemporaryPNG(cgImage)
-        defer { try? FileManager.default.removeItem(at: imageURL) }
-
         try await engine.reset()
-        let embeddedInput = try await engine.encodeImage(at: imageURL)
+        let embeddedInput = try await engine.encodeImage(cgImage: cgImage)
 
-        // Build the token sequence with expanded image placeholders.
         let promptTokens = Self.buildPromptTokens(
             userText: userText,
             imageTokenCount: embeddedInput.tokenCount,
@@ -172,7 +158,6 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
             tokenizer: tokenizer
         )
 
-        // Generate, streaming decoded text deltas into the FM channel.
         let maxTokens = request.generationOptions.maximumResponseTokens ?? 512
         var stopTokens = Set<Int32>()
         if let eos = tokenizer.eosTokenId { stopTokens.insert(Int32(eos)) }
@@ -185,21 +170,27 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
             inferenceOptions: InferenceOptions(maxTokens: maxTokens, includeLogits: false)
         )
 
-        var generatedTokens: [Int] = []
+        var generatedCount = 0
+        var pendingTokens: [Int] = []
         var previousText = ""
         for try await output in stream {
-            let token = output.tokenId
-            if stopTokens.contains(token) { break }
-            generatedTokens.append(Int(token))
+            if stopTokens.contains(output.tokenId) { break }
+            generatedCount += 1
+            pendingTokens.append(Int(output.tokenId))
 
-            // Incremental decode: emit only the newly-completed suffix, and
-            // hold back partial UTF-8 (replacement char) until it resolves.
-            let fullText = tokenizer.decode(tokens: generatedTokens)
-            let delta = String(fullText.dropFirst(previousText.count))
-            if delta.unicodeScalars.contains("\u{FFFD}") { continue }
-            previousText = fullText
+            let decoded = tokenizer.decode(tokens: pendingTokens)
+            if decoded.unicodeScalars.contains("\u{FFFD}") {
+                previousText = decoded
+                continue
+            }
+            let common = decoded.commonPrefix(with: previousText)
+            let delta = String(decoded.dropFirst(common.count))
             if !delta.isEmpty {
                 await channel.send(.response(action: .appendText(delta, tokenCount: 1)))
+            }
+            if let last = pendingTokens.last {
+                pendingTokens = [last]
+                previousText = tokenizer.decode(tokens: pendingTokens)
             }
         }
 
@@ -243,7 +234,8 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
             if expanded { return result }
         }
 
-        // Fallback
+        // Fallback for tokenizers without a multimodal chat template. Uses the
+        // Qwen3-VL ChatML format.
         let placeholder = String(repeating: "<|image_pad|>", count: imageTokenCount)
         let chatText =
             "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
@@ -251,24 +243,4 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
             + "\(userText)<|im_end|>\n<|im_start|>assistant\n"
         return tokenizer.encode(text: chatText).map { Int32($0) }
     }
-
-    // MARK: - Image Staging
-
-    private static func writeTemporaryPNG(_ image: CGImage) throws -> URL {
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("coreai-vlm-\(UUID().uuidString).png")
-        guard
-            let destination = CGImageDestinationCreateWithURL(
-                url as CFURL, UTType.png.identifier as CFString, 1, nil)
-        else {
-            throw InferenceRuntimeError.genericError("Failed to create image destination")
-        }
-        CGImageDestinationAddImage(destination, image, nil)
-        guard CGImageDestinationFinalize(destination) else {
-            throw InferenceRuntimeError.genericError("Failed to write staged image to \(url.path)")
-        }
-        return url
-    }
 }
-
-#endif
