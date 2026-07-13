@@ -78,18 +78,8 @@ class SDPA(nn.Module):
             )
 
             q = query.reshape(B, n_heads, self.head_dim, S).transpose(2, 3).contiguous()
-            k = (
-                key[..., :S]
-                .reshape(B, n_kv_heads, self.head_dim, S)
-                .transpose(2, 3)
-                .contiguous()
-            )
-            v = (
-                value[..., :S]
-                .reshape(B, n_kv_heads, self.head_dim, S)
-                .transpose(2, 3)
-                .contiguous()
-            )
+            k = key[..., :S].reshape(B, n_kv_heads, self.head_dim, S).transpose(2, 3).contiguous()
+            v = value[..., :S].reshape(B, n_kv_heads, self.head_dim, S).transpose(2, 3).contiguous()
 
             out = F.scaled_dot_product_attention(
                 q,

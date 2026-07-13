@@ -325,8 +325,7 @@ def _resolve_export_config(args: argparse.Namespace) -> ExportConfig:
 
     if args.disable_embedding_quantization_ios and variant != "iOS":
         raise SystemExit(
-            "--disable-embedding-quantization-ios requires --platform iOS "
-            f"(got '{variant}')."
+            f"--disable-embedding-quantization-ios requires --platform iOS (got '{variant}')."
         )
 
     if args.compression_config is not None:
@@ -430,9 +429,7 @@ def main() -> None:
             print(f"  num_layers:         {config.num_layers}")
         print(f"  overwrite:          {config.overwrite}")
         if config.variant == "iOS":
-            print(
-                f"  disable_embedding_quantization: {config.disable_embedding_quantization}"
-            )
+            print(f"  disable_embedding_quantization: {config.disable_embedding_quantization}")
         return
 
     result = export_model(config)
