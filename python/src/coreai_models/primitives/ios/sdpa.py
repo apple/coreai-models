@@ -3,8 +3,11 @@
 # Use of this source code is governed by a BSD-3-clause license that can
 # be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
+import os
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class SDPA(nn.Module):
@@ -31,6 +34,7 @@ class SDPA(nn.Module):
                     if isinstance(scale, torch.Tensor)
                     else nn.Buffer(torch.tensor(scale), persistent=False)
                 )
+        self._use_hf_impl = os.environ.get("USE_HF_IMPL", "").lower() == "true"
 
     # Efficient implementation equivalent to the following:
     def forward(
@@ -51,6 +55,47 @@ class SDPA(nn.Module):
         Returns:
             torch.Tensor: Attention output with shape (batch_size, n_heads*head_dim, 1, seq_len)
         """
+
+        # use FlashAttention to avoid
+        # materializing the full attention score matrix.
+        # Trim K/V from max_pos to seq_len (cache positions beyond seq_len
+        # are zeros masked by -inf) so we can use is_causal=True, which is
+        # required for the FlashAttention kernel.
+        if query.is_cuda and self._use_hf_impl:
+            B, _, _, S = query.shape
+            n_heads = query.shape[1] // self.head_dim
+            n_kv_heads = key.shape[1] // self.head_dim
+
+            # This path is currently prefill-only: it trims K/V to the first S positions
+            # and relies on is_causal=True. In prefill every valid KV position
+            # lies within [0, S)- a valid (unmasked, == 0) entry at KV index
+            # >= S means this is an extend/decode call, which the trim and
+            # is_causal=True below would silently mishandle.
+            assert not (causal_mask[:, S:] == 0).any(), (
+                "CUDA/HF SDPA path is prefill-only. Got a causal_mask with "
+                "valid KV positions beyond query length S (extend/decode not "
+                "supported)."
+            )
+
+            q = query.reshape(B, n_heads, self.head_dim, S).transpose(2, 3).contiguous()
+            k = key[..., :S].reshape(B, n_kv_heads, self.head_dim, S).transpose(2, 3).contiguous()
+            v = value[..., :S].reshape(B, n_kv_heads, self.head_dim, S).transpose(2, 3).contiguous()
+
+            out = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                # is_causal=True is required by the FlashAttention kernel we
+                # target here, so causal_mask is intentionally not passed as
+                # attn_mask. This path is only taken for prefill, where the
+                # mask is guaranteed causal (asserted above), so is_causal=True
+                # and the provided causal_mask are equivalent.
+                is_causal=True,
+                scale=self._scale_factor,
+                enable_gqa=(n_kv_heads != n_heads),
+            )
+
+            return out.transpose(2, 3).reshape(B, n_heads * self.head_dim, 1, S)
 
         # Apply the scale factor before QK^T for numerical stability
         key = key.transpose(-3, -1) * self._scale_factor

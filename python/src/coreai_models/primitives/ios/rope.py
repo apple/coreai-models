@@ -72,17 +72,17 @@ class RoPECache(torch.nn.Module):
         self._compute_sin_and_cos()
 
     def _apply(self, fn):
-        # the `.to()` function implicitly calls into this function,
-        # and we should recompute the cos / sin rather then just do
+        # The `.to()` function implicitly calls into this function,
+        # and we should recompute the cos / sin rather than just do
         # a simple cast.
         super()._apply(fn)
-        dummy = torch.tensor(0.0)
-        transformed = fn(dummy)
-        self._compute_sin_and_cos(transformed.dtype)
-
-        target_device = transformed.device
-        self.cos_cached = self.cos_cached.to(device=target_device)
-        self.sin_cached = self.sin_cached.to(device=target_device)
+        # Read dtype/device from the buffer post-apply so device-only
+        # and dtype-only .to(...) calls are both honored.
+        new_dtype = self.cos_cached.dtype
+        new_device = self.cos_cached.device
+        self._compute_sin_and_cos(new_dtype)
+        self.cos_cached = self.cos_cached.to(new_device)
+        self.sin_cached = self.sin_cached.to(new_device)
         return self
 
     def _compute_sin_and_cos(self, dtype: torch.dtype = torch.float32) -> None:

@@ -108,6 +108,12 @@ class KVCache:
         torch._check_is_size(seq_len)
         device = self._k_cache.device
 
+        compute_device = k.device
+        cross_device = compute_device != device
+        if cross_device:
+            k = k.to(device)
+            v = v.to(device)
+
         layer_index = torch.tensor((layer_idx,), dtype=torch.int32, device=device)
         layer_index_end = torch.tensor((layer_idx + 1,), dtype=torch.int32, device=device)
 
@@ -162,7 +168,11 @@ class KVCache:
         # return the slice k, v
         k = self._k_cache.narrow(0, layer_idx, 1).narrow(-2, 0, seq_len)
         v = self._v_cache.narrow(0, layer_idx, 1).narrow(-2, 0, seq_len)
-        return k.squeeze(0), v.squeeze(0)
+        k_out = k.squeeze(0)
+        v_out = v.squeeze(0)
+        if cross_device:
+            return k_out.to(compute_device), v_out.to(compute_device)
+        return k_out, v_out
 
 
 class SSMState:
