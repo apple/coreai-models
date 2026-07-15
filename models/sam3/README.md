@@ -7,7 +7,7 @@ This export targets **iOS** by restructuring the model in a BC1S layout (channel
 | Function       | Compression                                | Inputs                               | Outputs                                                      |
 |----------------|--------------------------------------------|--------------------------------------|--------------------------------------------------------------|
 | `image_encode` | 4-bit k-means palettization (gs=32) + fp16 | `pixel_values`                       | `backbone_features`                                          |
-| `text_encode`  | 6-bit k-means palettization (gs=8) + fp16  | `input_ids`, `attention_mask`        | `text_features`                                              |
+| `text_encode`  | 6-bit k-means palettization (gs=8) + fp16  | `input_ids`                          | `text_features`                                              |
 | `detect`       | fp16 (no weight compression)               | `backbone_features`, `text_features` | `pred_masks`, `pred_boxes`, `pred_logits`, `presence_logits` |
 
 ## Setup

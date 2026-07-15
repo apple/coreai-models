@@ -59,10 +59,7 @@ class TextEncoderModule(nn.Module):
         self.text_encoder = text_encoder
         self.text_projection = text_projection
 
-    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        # attention_mask is taken so the function signature matches what the
-        # iOS-side ImageSegmenter feeds in; SAM3 itself doesn't use it.
-        del attention_mask
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         text_hidden = self.text_encoder(input_ids)
         return self.text_projection(text_hidden)
 
@@ -222,7 +219,6 @@ async def _async_export_segmentation(config: SegmentationExportConfig) -> str:
 
     pixel_ref = torch.randn(1, 3, image_size, image_size)
     ids_ref = torch.randint(0, 49408, (1, config.max_text_seq_len), dtype=torch.int32)
-    mask_ref = torch.ones(1, config.max_text_seq_len, dtype=torch.int32)
     backbone_ref = torch.randn(1, 1024, 1, grid * grid)
     text_feat_ref = torch.randn(1, 256, 1, config.max_text_seq_len)
 
@@ -245,7 +241,7 @@ async def _async_export_segmentation(config: SegmentationExportConfig) -> str:
     txt_enc = TextEncoderModule(sam3_lite.text_encoder, sam3_lite.text_projection)
     txt_enc.eval()
     txt_palettizer = KMeansPalettizer(txt_enc, txt_pal_config)
-    txt_enc = txt_palettizer.prepare(example_inputs=(ids_ref, mask_ref))
+    txt_enc = txt_palettizer.prepare(example_inputs=(ids_ref,))
     txt_enc = txt_palettizer.finalize(backend=ExportBackend.CoreAI)
 
     det = DetectorModule(sam3_lite)
@@ -257,7 +253,7 @@ async def _async_export_segmentation(config: SegmentationExportConfig) -> str:
     img_program = cast_to_16_bit_precision(img_program)
 
     logger.info("Exporting text_encode...")
-    txt_program = torch.export.export(txt_enc, args=(ids_ref, mask_ref))
+    txt_program = torch.export.export(txt_enc, args=(ids_ref,))
     txt_program = txt_program.run_decompositions(coreai_torch.get_decomp_table())
     txt_program = cast_to_16_bit_precision(txt_program)
 
@@ -277,7 +273,7 @@ async def _async_export_segmentation(config: SegmentationExportConfig) -> str:
     converter.add_exported_program(
         txt_program,
         entrypoint_name="text_encode",
-        input_names=["input_ids", "attention_mask"],
+        input_names=["input_ids"],
         output_names=["text_features"],
     )
     converter.add_exported_program(

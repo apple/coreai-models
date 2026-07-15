@@ -45,12 +45,21 @@ public struct CoreAISegmentationEngine {
         let preparedAsset = try await PreparedModel.prepare(at: modelURL)
         let model = preparedAsset.model
 
-        // Multi-function asset wins when all three entrypoints are present — that's the
-        // optimized SAM3 export. Falls through to single-function `main` otherwise.
-        if let imageEncodeDescriptor = model.functionDescriptor(for: "image_encode"),
-            let textEncodeDescriptor = model.functionDescriptor(for: "text_encode"),
-            let detectDescriptor = model.functionDescriptor(for: "detect")
-        {
+        // `PreparedModel` already classified the asset (and used that classification to pick
+        // the compute-unit specialization at load time). Reuse it as the single source of
+        // truth for multi- vs single-function dispatch rather than re-probing here.
+        if preparedAsset.structure == .multiFunctionSegmenter {
+            // Structure detection guarantees all three entrypoints exist; fetch the
+            // descriptors the contexts need to validate and wire their I/O.
+            guard let imageEncodeDescriptor = model.functionDescriptor(for: GraphNames.imageEncode),
+                let textEncodeDescriptor = model.functionDescriptor(for: GraphNames.textEncode),
+                let detectDescriptor = model.functionDescriptor(for: GraphNames.detect)
+            else {
+                throw SegmentationRuntimeError.invalidConfiguration(
+                    "Model classified as multi-function segmenter but is missing one of "
+                        + "{'image_encode','text_encode','detect'}. Available functions: \(model.functionNames)."
+                )
+            }
             self.backend = .multi(
                 try await MultiFunctionContext(
                     model: model,
@@ -62,7 +71,7 @@ public struct CoreAISegmentationEngine {
             return
         }
 
-        guard let mainDescriptor = model.functionDescriptor(for: "main") else {
+        guard let mainDescriptor = model.functionDescriptor(for: GraphNames.main) else {
             throw SegmentationRuntimeError.invalidConfiguration(
                 "Model has no 'main' function and no {'image_encode','text_encode','detect'} bundle. "
                     + "Available functions: \(model.functionNames)."
@@ -219,7 +228,7 @@ public struct CoreAISegmentationEngine {
                 )
             }
 
-            guard let fn = try model.loadFunction(named: "main") else {
+            guard let fn = try model.loadFunction(named: GraphNames.main) else {
                 throw SegmentationRuntimeError.invalidConfiguration(
                     "Cannot load 'main' function from model"
                 )
@@ -254,10 +263,8 @@ public struct CoreAISegmentationEngine {
         let imageInputName: String
         let backboneFeaturesOutputName: String
 
-        // text_encode i/o. `attentionMaskInputName` is optional because the SAM3 lite
-        // exporter takes it for iOS-side signature symmetry but the graph itself ignores it.
+        // text_encode i/o.
         let textInputName: String
-        let attentionMaskInputName: String?
         let textFeaturesOutputName: String
 
         // detect i/o. The two intermediate inputs are matched by name against the encoder
@@ -292,13 +299,12 @@ public struct CoreAISegmentationEngine {
                 )
             }
 
-            // text_encode: needs a token-id input + text-features output. attention_mask is optional.
+            // text_encode: needs a token-id input + text-features output.
             guard let textInputName = findTextInputName(in: textEncodeDescriptor.inputNames) else {
                 throw SegmentationRuntimeError.invalidConfiguration(
                     "Cannot find text input in 'text_encode'. Inputs: \(textEncodeDescriptor.inputNames)"
                 )
             }
-            let attentionMaskInputName = findAttentionMaskInputName(in: textEncodeDescriptor.inputNames)
             guard let textFeaturesOutputName = findTextFeaturesName(in: textEncodeDescriptor.outputNames)
             else {
                 throw SegmentationRuntimeError.invalidConfiguration(
@@ -353,17 +359,17 @@ public struct CoreAISegmentationEngine {
                 )
             }
 
-            guard let imageEncode = try model.loadFunction(named: "image_encode") else {
+            guard let imageEncode = try model.loadFunction(named: GraphNames.imageEncode) else {
                 throw SegmentationRuntimeError.invalidConfiguration(
                     "Cannot load 'image_encode' function from model"
                 )
             }
-            guard let textEncode = try model.loadFunction(named: "text_encode") else {
+            guard let textEncode = try model.loadFunction(named: GraphNames.textEncode) else {
                 throw SegmentationRuntimeError.invalidConfiguration(
                     "Cannot load 'text_encode' function from model"
                 )
             }
-            guard let detect = try model.loadFunction(named: "detect") else {
+            guard let detect = try model.loadFunction(named: GraphNames.detect) else {
                 throw SegmentationRuntimeError.invalidConfiguration(
                     "Cannot load 'detect' function from model"
                 )
@@ -380,7 +386,6 @@ public struct CoreAISegmentationEngine {
             self.backboneFeaturesOutputName = backboneFeaturesOutputName
 
             self.textInputName = textInputName
-            self.attentionMaskInputName = attentionMaskInputName
             self.textFeaturesOutputName = textFeaturesOutputName
 
             self.backboneFeaturesInputName = backboneFeaturesInputName
@@ -803,13 +808,11 @@ public struct CoreAISegmentationEngine {
         fillNDArray(&textArray, as: Int32.self, count: textDescriptor.shape.reduce(1, *)) { _ in
             CLIPTokenizer.eotTokenId
         }
-        let attentionMaskArray = try Self.makeAttentionMaskAllOnes(state: state)
 
         try await runMultiFunctionInference(
             state: state,
             imageArray: imageArray,
-            textArray: textArray,
-            attentionMaskArray: attentionMaskArray
+            textArray: textArray
         )
     }
 
@@ -856,13 +859,10 @@ public struct CoreAISegmentationEngine {
             )
         }
 
-        let attentionMaskArray = try Self.makeAttentionMaskAllOnes(state: state)
-
         return try await runMultiFunctionInference(
             state: state,
             imageArray: imageArray,
-            textArray: textArray,
-            attentionMaskArray: attentionMaskArray
+            textArray: textArray
         )
     }
 
@@ -872,8 +872,7 @@ public struct CoreAISegmentationEngine {
     private func runMultiFunctionInference(
         state: MultiFunctionContext,
         imageArray: NDArray,
-        textArray: NDArray,
-        attentionMaskArray: NDArray?
+        textArray: NDArray
     ) async throws -> SegmentationOutput {
         var imageOutputs = try await state.imageEncode.run(
             inputs: [state.imageInputName: imageArray]
@@ -885,11 +884,7 @@ public struct CoreAISegmentationEngine {
             )
         }
 
-        var textInputs: [String: NDArray] = [state.textInputName: textArray]
-        if let attentionMaskInputName = state.attentionMaskInputName, let am = attentionMaskArray {
-            textInputs[attentionMaskInputName] = am
-        }
-        var textOutputs = try await state.textEncode.run(inputs: textInputs)
+        var textOutputs = try await state.textEncode.run(inputs: [state.textInputName: textArray])
         guard let textFeatures = textOutputs.remove(state.textFeaturesOutputName)?.ndArray else {
             throw SegmentationRuntimeError.invalidConfiguration(
                 "Missing '\(state.textFeaturesOutputName)' output from text_encode."
@@ -922,25 +917,6 @@ public struct CoreAISegmentationEngine {
             semanticSegment: flattenAsFloat(semantic),
             semanticSegmentShape: semantic.shape
         )
-    }
-
-    /// All-ones `attention_mask` matching the `text_encode` descriptor's expected shape and dtype,
-    /// or nil if the function has no `attention_mask` input. The optimized exporter takes the
-    /// mask only to keep the iOS-side function signature aligned — the graph itself ignores it.
-    private static func makeAttentionMaskAllOnes(state: MultiFunctionContext) throws -> NDArray? {
-        guard let attentionMaskInputName = state.attentionMaskInputName else { return nil }
-        guard
-            case .ndArray(let descriptor) = state.textEncodeDescriptor.inputDescriptor(
-                of: attentionMaskInputName)
-        else {
-            throw SegmentationRuntimeError.invalidConfiguration(
-                "No array descriptor for attention_mask input '\(attentionMaskInputName)'"
-            )
-        }
-        var array = NDArray(descriptor: descriptor)
-        let count = descriptor.shape.reduce(1, *)
-        fillNDArray(&array, as: Int32.self, count: count) { _ in 1 }
-        return array
     }
 
     // MARK: - Shared NDArray builders
@@ -1224,10 +1200,10 @@ public struct CoreAISegmentationEngine {
     static func findTextInputName(in names: [String]) -> String? {
         names.first {
             let l = $0.lowercased()
-            // Match input_id / token / text but exclude attention_mask, which would otherwise
-            // hit the "text" substring via the multi-function `text_encode` descriptor.
+            // Match input_id / token / text, but exclude text_features (a `detect` input that
+            // also contains "text") so it isn't mistaken for the token input.
             return (l.contains("input_id") || l.contains("token") || l.contains("text"))
-                && !l.contains("mask") && !l.contains("feat")
+                && !l.contains("feat")
         }
     }
 
@@ -1249,13 +1225,6 @@ public struct CoreAISegmentationEngine {
         names.first {
             let l = $0.lowercased()
             return l.contains("point") && l.contains("label")
-        }
-    }
-
-    static func findAttentionMaskInputName(in names: [String]) -> String? {
-        names.first {
-            let l = $0.lowercased()
-            return l.contains("attention_mask") || l.contains("attn_mask")
         }
     }
 

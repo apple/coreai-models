@@ -27,30 +27,16 @@ struct CoreAISegmentationEngineTests {
         #expect(CoreAISegmentationEngine.findTextInputName(in: ["pixel_values", "embed_input"]) == nil)
     }
 
-    @Test("findTextInputName: ignores attention_mask and text_features (multi-function siblings)")
-    func findTextInputNameSkipsMaskAndFeatures() {
-        // attention_mask sits next to input_ids in `text_encode`'s input list — must not be picked
-        // as the text input.
+    @Test("findTextInputName: ignores text_features (multi-function detect sibling)")
+    func findTextInputNameSkipsFeatures() {
+        // input_ids is the token input.
         #expect(
-            CoreAISegmentationEngine.findTextInputName(in: ["input_ids", "attention_mask"]) == "input_ids"
+            CoreAISegmentationEngine.findTextInputName(in: ["input_ids"]) == "input_ids"
         )
         // text_features is a `detect` input, not a text input — must not be picked.
         #expect(
             CoreAISegmentationEngine.findTextInputName(in: ["backbone_features", "text_features"]) == nil
         )
-    }
-
-    @Test("findAttentionMaskInputName: matches attention_mask and attn_mask")
-    func findAttentionMaskInputName() {
-        #expect(
-            CoreAISegmentationEngine.findAttentionMaskInputName(in: ["input_ids", "attention_mask"])
-                == "attention_mask"
-        )
-        #expect(
-            CoreAISegmentationEngine.findAttentionMaskInputName(in: ["input_ids", "attn_mask"])
-                == "attn_mask"
-        )
-        #expect(CoreAISegmentationEngine.findAttentionMaskInputName(in: ["input_ids"]) == nil)
     }
 
     @Test("findBackboneFeaturesName: matches outputs/inputs containing 'backbone'")

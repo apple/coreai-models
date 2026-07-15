@@ -9,14 +9,14 @@ import Foundation
 // MARK: - Model Structure Detection
 
 /// Well-known graph function names used for structure detection.
-private enum GraphNames {
-    static let main = "main"
-    static let loadEmbeddings = "load_embeddings"
-    static let extendPrefix = "extend"
+public enum GraphNames {
+    public static let main = "main"
+    public static let loadEmbeddings = "load_embeddings"
+    public static let extendPrefix = "extend"
     // Multi-function segmenter (lite SAM3 export for iOS).
-    static let imageEncode = "image_encode"
-    static let textEncode = "text_encode"
-    static let detect = "detect"
+    public static let imageEncode = "image_encode"
+    public static let textEncode = "text_encode"
+    public static let detect = "detect"
 }
 
 /// Represents the detected structure of a Core AI model.
@@ -198,7 +198,7 @@ public struct PreparedModel: Sendable {
         }
 
         // Multi-function segmenter (e.g. optimized SAM3 — image_encode / text_encode / detect).
-        // Targets ANE; checked before the `main` fallback because some asset variants ship
+        // Targets neuralEngine; checked before the `main` fallback because some asset variants ship
         // a thin `main` graph alongside the trio.
         if graphSet.contains(GraphNames.imageEncode)
             && graphSet.contains(GraphNames.textEncode)
