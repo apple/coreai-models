@@ -20,11 +20,9 @@
 # # Force these past the workspace's `coreai-models` pins:
 # #   - transformers: workspace is <5.0, SAM3 needs Sam3Model from >=5.5.4
 # #   - huggingface-hub: workspace is <1.0, transformers 5.x requires >=1.5.0,<2.0
-# #   - tokenizers: SAM3 needs the legacy <0.23 line
 # override-dependencies = [
 #     "transformers>=5.5.4,<5.10.1",
 #     "huggingface-hub>=1.5.0,<2.0",
-#     "tokenizers<0.23.0rc",
 # ]
 #
 # [tool.uv.sources]
