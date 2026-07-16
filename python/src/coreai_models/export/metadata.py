@@ -171,6 +171,18 @@ _METADATA: dict[str, AIModelMetadataFields] = {
             "Source: https://huggingface.co/black-forest-labs/FLUX.2-klein-4B"
         ),
     ),
+    # ---- Segmentation ----
+    "facebook/sam3": AIModelMetadataFields(
+        author="N. Carion et al.",
+        license="SAM License",
+        model_description=(
+            "SAM 3 is a unified foundation model for promptable segmentation in "
+            "images and videos. It can detect, segment, and track objects using "
+            "text or visual prompts such as points, boxes, and masks. This export "
+            "targets image segmentation, re-authored for iOS. "
+            "Source: https://github.com/facebookresearch/sam3"
+        ),
+    ),
 }
 
 

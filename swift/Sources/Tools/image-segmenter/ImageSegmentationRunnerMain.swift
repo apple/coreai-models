@@ -156,6 +156,9 @@ struct ImageSegmenterCLI: AsyncParsableCommand {
             // Already enforced in validate(); guard to satisfy the compiler.
             throw ValidationError("--image is required.")
         }
+        if verbose {
+            CLILogger.setLevel(to: 1)
+        }
 
         if verbose { print("Creating image segmenter...") }
         let runner = try await ImageSegmenter(resourcesAt: model)
