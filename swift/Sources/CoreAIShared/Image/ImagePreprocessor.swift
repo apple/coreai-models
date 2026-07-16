@@ -100,8 +100,9 @@ public struct ImagePreprocessor: Sendable {
     public func preprocess(cgImage: CGImage) throws -> (Data, Int, Int) {
         let w = Int(targetSize.width)
         let h = Int(targetSize.height)
-        let resized = try renderToContext(cgImage: cgImage, canvasWidth: w, canvasHeight: h,
-                                          drawRect: CGRect(x: 0, y: 0, width: w, height: h))
+        let resized = try renderToContext(
+            cgImage: cgImage, canvasWidth: w, canvasHeight: h,
+            drawRect: CGRect(x: 0, y: 0, width: w, height: h))
         return try normalize(pixels: resized, width: w, height: h)
     }
 
@@ -133,14 +134,16 @@ public struct ImagePreprocessor: Sendable {
         let srcW = cgImage.width
         let srcH = cgImage.height
 
-        let scale = srcW < srcH
+        let scale =
+            srcW < srcH
             ? CGFloat(targetW) / CGFloat(srcW)
             : CGFloat(targetH) / CGFloat(srcH)
         let resizedW = Int(round(CGFloat(srcW) * scale))
         let resizedH = Int(round(CGFloat(srcH) * scale))
 
-        let resized = try renderToContext(cgImage: cgImage, canvasWidth: resizedW, canvasHeight: resizedH,
-                                           drawRect: CGRect(x: 0, y: 0, width: resizedW, height: resizedH))
+        let resized = try renderToContext(
+            cgImage: cgImage, canvasWidth: resizedW, canvasHeight: resizedH,
+            drawRect: CGRect(x: 0, y: 0, width: resizedW, height: resizedH))
 
         let cropX = (resizedW - targetW) / 2
         let cropY = (resizedH - targetH) / 2
@@ -159,7 +162,8 @@ public struct ImagePreprocessor: Sendable {
         let srcW = cgImage.width
         let srcH = cgImage.height
 
-        let scale = srcW > srcH
+        let scale =
+            srcW > srcH
             ? CGFloat(targetW) / CGFloat(srcW)
             : CGFloat(targetH) / CGFloat(srcH)
         let resizedW = Int(round(CGFloat(srcW) * scale))
@@ -168,8 +172,9 @@ public struct ImagePreprocessor: Sendable {
         let offsetX = (targetW - resizedW) / 2
         let offsetY = (targetH - resizedH) / 2
 
-        let padded = try renderToContext(cgImage: cgImage, canvasWidth: targetW, canvasHeight: targetH,
-                                          drawRect: CGRect(x: offsetX, y: offsetY, width: resizedW, height: resizedH))
+        let padded = try renderToContext(
+            cgImage: cgImage, canvasWidth: targetW, canvasHeight: targetH,
+            drawRect: CGRect(x: offsetX, y: offsetY, width: resizedW, height: resizedH))
 
         return try preprocessCHW(cgImage: padded)
     }
@@ -177,28 +182,32 @@ public struct ImagePreprocessor: Sendable {
     /// Dispatch preprocessing based on strategy. Returns flat CHW `[3, H, W]`.
     public func preprocessCHW(cgImage: CGImage, strategy: ImageStrategy) throws -> [Float] {
         switch strategy {
-        case .stretch:     return try preprocessCHW(cgImage: cgImage)
-        case .centerCrop:  return try preprocessCHWCenterCrop(cgImage: cgImage)
-        case .pad:         return try preprocessCHWPad(cgImage: cgImage)
+        case .stretch: return try preprocessCHW(cgImage: cgImage)
+        case .centerCrop: return try preprocessCHWCenterCrop(cgImage: cgImage)
+        case .pad: return try preprocessCHWPad(cgImage: cgImage)
         }
     }
 
     // MARK: - Private Helpers
 
-    private func renderToContext(cgImage: CGImage, canvasWidth: Int, canvasHeight: Int,
-                                  drawRect: CGRect) throws -> CGImage {
+    private func renderToContext(
+        cgImage: CGImage, canvasWidth: Int, canvasHeight: Int,
+        drawRect: CGRect
+    ) throws -> CGImage {
         guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) else {
             throw ImagePreprocessorError.renderFailed
         }
-        guard let ctx = CGContext(
-            data: nil,
-            width: canvasWidth,
-            height: canvasHeight,
-            bitsPerComponent: 8,
-            bytesPerRow: canvasWidth * 4,
-            space: colorSpace,
-            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
-        ) else {
+        guard
+            let ctx = CGContext(
+                data: nil,
+                width: canvasWidth,
+                height: canvasHeight,
+                bitsPerComponent: 8,
+                bytesPerRow: canvasWidth * 4,
+                space: colorSpace,
+                bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+            )
+        else {
             throw ImagePreprocessorError.renderFailed
         }
         ctx.interpolationQuality = .high
@@ -213,15 +222,17 @@ public struct ImagePreprocessor: Sendable {
         guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) else {
             throw ImagePreprocessorError.renderFailed
         }
-        guard let ctx = CGContext(
-            data: nil,
-            width: w,
-            height: h,
-            bitsPerComponent: 8,
-            bytesPerRow: w * 4,
-            space: colorSpace,
-            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
-        ) else {
+        guard
+            let ctx = CGContext(
+                data: nil,
+                width: w,
+                height: h,
+                bitsPerComponent: 8,
+                bytesPerRow: w * 4,
+                space: colorSpace,
+                bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+            )
+        else {
             throw ImagePreprocessorError.renderFailed
         }
         ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: w, height: h))

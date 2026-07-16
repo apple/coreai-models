@@ -5,9 +5,9 @@
 
 import ArgumentParser
 import CoreAI
-import CoreImage
 import CoreAILanguageModels
 import CoreAIShared
+import CoreImage
 import Darwin
 import Foundation
 import Tokenizers
@@ -188,12 +188,14 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     @Option(name: .customLong("image"), help: "Path to an image file for vision-language models")
     var imagePath: String?
 
-    @Option(name: .customLong("image-strategy"),
-            help: "Image preprocessing: stretch, center_crop, or pad (default: from model metadata)")
+    @Option(
+        name: .customLong("image-strategy"),
+        help: "Image preprocessing: stretch, center_crop, or pad (default: from model metadata)")
     var imageStrategy: ImageStrategy?
 
-    @Option(name: .customLong("image-info"),
-            help: "Include original image resolution in prompt: on, off, auto (default: auto)")
+    @Option(
+        name: .customLong("image-info"),
+        help: "Include original image resolution in prompt: on, off, auto (default: auto)")
     var imageInfo: ImageInfoMode = .auto
 
     @Flag(help: "Enable verbose logging")
@@ -856,11 +858,12 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         let embeddedInput = try await vlmEngine.encodeImage(at: imageURL)
         CLILogger.log("Image encoded: \(embeddedInput.tokenCount) visual tokens", component: "VLM")
 
-        let shouldIncludeInfo = switch imageInfo {
-        case .on: true
-        case .off: false
-        case .auto: visionConfig.includeImageInfo
-        }
+        let shouldIncludeInfo =
+            switch imageInfo {
+            case .on: true
+            case .off: false
+            case .auto: visionConfig.includeImageInfo
+            }
 
         var effectivePrompt = displayPrompt
         if shouldIncludeInfo {
