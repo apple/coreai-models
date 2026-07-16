@@ -172,9 +172,10 @@ public struct StableDiffusionPipeline: DiffusionPipeline {
     // MARK: - Private Helpers
 
     private func encodeText(_ text: String) async throws -> [Float] {
-        let tokenize = components.textEncoder.tokenize
-        let ids = tokenize(text)
-        return try await components.textEncoder.function.run(intInputs: [(ids, [1, ids.count])])
+        let output = try await components.textEncoder.encode(text)
+        let shape = output.hiddenStates.shape
+        let count = shape.reduce(1, *)
+        return readNDArray(output.hiddenStates, as: Float.self, count: count)
     }
 
     private func runDenoiser(

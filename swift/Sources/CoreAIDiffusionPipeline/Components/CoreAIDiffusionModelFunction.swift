@@ -223,6 +223,17 @@ public actor CoreAIDiffusionModelFunction {
             return result
         }
     }
+
+    /// Infer the sequence length from the first input's shape (dim 1).
+    /// Returns nil if the model isn't loaded or has no rank-2 input.
+    public func inferSequenceLength() async throws -> Int? {
+        let descs = try await inputDescriptors
+        guard let desc = descs.values.first, desc.shape.count >= 2 else {
+            return nil
+        }
+        let dim = desc.shape[1]
+        return dim > 0 ? dim : nil
+    }
 }
 
 // MARK: - Errors
