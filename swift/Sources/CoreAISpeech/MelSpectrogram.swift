@@ -155,7 +155,13 @@ public enum MelSpectrogram {
         let logFloor: Float = 1e-10
         let useLog10 = (config.normalization == .whisperLogClip)
 
-        for t in 0..<validFrames {
+        // Whisper computes and normalizes its entire fixed window (including the
+        // zero-padded tail as log-silence) so results match reference OpenAI Whisper
+        // for sub-window audio. Every other pipeline (Parakeet) fills only the valid
+        // frames and leaves the masked tail at zero.
+        let framesToCompute = (config.normalization == .whisperLogClip) ? totalFrames : validFrames
+
+        for t in 0..<framesToCompute {
             let offset = t * config.hopLength
             vDSP_vmul(
                 Array(padded[offset..<offset + config.winLength]), 1,
@@ -293,7 +299,10 @@ public enum MelSpectrogram {
         let count = validFrames * nMelBins
         switch normalization {
         case .whisperLogClip:
-            // Whisper has fixed nFrames so validFrames*nMelBins == mel.count; operate on whole array.
+            // Whisper fills its entire fixed window (see `framesToCompute`), so every
+            // entry is real log-mel data — including the log-silence tail for sub-window
+            // audio. Clip and scale over the whole array together, matching reference
+            // OpenAI Whisper's global normalization.
             let maxVal = mel.max() ?? 0
             for i in 0..<mel.count { mel[i] = (max(mel[i], maxVal - 8) + 4) / 4 }
         case .perInstanceMeanStd:
