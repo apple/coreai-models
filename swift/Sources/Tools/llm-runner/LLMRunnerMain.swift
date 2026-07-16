@@ -5,6 +5,7 @@
 
 import ArgumentParser
 import CoreAI
+import CoreImage
 import CoreAILanguageModels
 import CoreAIShared
 import Darwin
@@ -39,6 +40,14 @@ enum WarmupMode: ExpressibleByArgument, Equatable {
         case .exact: return "exact"
         }
     }
+}
+
+extension ImageStrategy: ExpressibleByArgument {}
+
+enum ImageInfoMode: String, ExpressibleByArgument, Sendable {
+    case on
+    case off
+    case auto
 }
 
 @main
@@ -178,6 +187,14 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
 
     @Option(name: .customLong("image"), help: "Path to an image file for vision-language models")
     var imagePath: String?
+
+    @Option(name: .customLong("image-strategy"),
+            help: "Image preprocessing: stretch, center_crop, or pad (default: from model metadata)")
+    var imageStrategy: ImageStrategy?
+
+    @Option(name: .customLong("image-info"),
+            help: "Include original image resolution in prompt: on, off, auto (default: auto)")
+    var imageInfo: ImageInfoMode = .auto
 
     @Flag(help: "Enable verbose logging")
     var verbose: Bool = false
@@ -839,6 +856,23 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         let embeddedInput = try await vlmEngine.encodeImage(at: imageURL)
         CLILogger.log("Image encoded: \(embeddedInput.tokenCount) visual tokens", component: "VLM")
 
+        let shouldIncludeInfo = switch imageInfo {
+        case .on: true
+        case .off: false
+        case .auto: visionConfig.includeImageInfo
+        }
+
+        var effectivePrompt = displayPrompt
+        if shouldIncludeInfo {
+            let imageURL = URL(fileURLWithPath: imagePath)
+            if let ciImage = CIImage(contentsOf: imageURL) {
+                let w = Int(ciImage.extent.width)
+                let h = Int(ciImage.extent.height)
+                effectivePrompt = "Image: \(w)x\(h)\n\(displayPrompt)"
+                CLILogger.log("Injected image info: \(w)x\(h)", component: "VLM")
+            }
+        }
+
         // Build VLM prompt with image placeholder tokens.
         // Try using the tokenizer's chat template if available; fall back to
         // generic "USER: <image>×N \n prompt \nASSISTANT:" format.
@@ -847,7 +881,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         let vlmTokens: [Int32]
 
         if let chatTemplateTokens = try? buildVLMPromptFromChatTemplate(
-            prompt: displayPrompt,
+            prompt: effectivePrompt,
             imageTokenCount: imageTokenCount,
             imageTokenId: imageTokenId,
             tokenizer: tokenizer
@@ -860,7 +894,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
                 component: "VLM")
             var tokens = tokenizer.encode(text: "USER: ", addSpecialTokens: true).map { Int32($0) }
             tokens.append(contentsOf: [Int32](repeating: imageTokenId, count: imageTokenCount))
-            let suffix = "\n" + displayPrompt + "\nASSISTANT:"
+            let suffix = "\n" + effectivePrompt + "\nASSISTANT:"
             tokens.append(
                 contentsOf: tokenizer.encode(text: suffix, addSpecialTokens: false).map { Int32($0) })
             vlmTokens = tokens

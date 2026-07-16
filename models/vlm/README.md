@@ -43,6 +43,31 @@ with asset roles consumed by the Swift runner's `ModelBundle`:
 Add a `VLMSpec(...)` entry to `SUPPORTED_MODELS` in
 [`vlm/export.py`](../../python/src/coreai_models/vlm/export.py) with the
 HuggingFace ID, output name, image token id, and vision geometry (resolution,
-patch/merge sizes, CLIP normalization stats). Models whose text decoder needs a
+patch/merge sizes, normalization stats). Models whose text decoder needs a
 new architecture also require a class registered in
 [`models/registry.py`](../../python/src/coreai_models/models/registry.py).
+
+## Image preprocessing
+
+The vision encoder expects a fixed-size square input. How an arbitrary image
+reaches that square is controlled by `image_strategy` in `metadata.json`:
+
+| Strategy      | Behavior                                 | Use when                             |
+|---------------|------------------------------------------|--------------------------------------|
+| `stretch`     | Resize directly to target size           | Default. Works for most models.      |
+| `center_crop` | Shortest-edge resize, then center crop   | CLIP-based vision towers (FastVLM)   |
+| `pad`         | Longest-edge resize, zero-pad remainder  | Models expecting preserved geometry  |
+
+The strategy is inferred from the model's `preprocessor_config.json` at export
+time and written into the bundle's `metadata.json`. Override at runtime:
+
+```bash
+llm-runner --model vlm_bundle --image photo.jpg --image-strategy center_crop
+```
+
+### Original resolution in prompt
+
+Some models (Qwen-VL family) benefit from knowing the original image
+dimensions. When `include_image_info` is set in the bundle metadata (or
+overridden via `--image-info on`), the original `W×H` is prepended to the
+text prompt before tokenization.

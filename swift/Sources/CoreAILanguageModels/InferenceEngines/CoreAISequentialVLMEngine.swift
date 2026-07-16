@@ -362,7 +362,8 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
         )
 
         // Step 1: Preprocess image to CHW Float32
-        let chwPixels = try imagePreprocessor.preprocessCHW(cgImage: cgImage)
+        let chwPixels = try imagePreprocessor.preprocessCHW(
+            cgImage: cgImage, strategy: config.visionConfig.imageStrategy)
 
         // Step 2: Run encode_image
         let encoderOutput = try await runVisionEncoder(pixels: chwPixels)
