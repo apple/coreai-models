@@ -371,6 +371,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             )
             let vlmConfig = VLMModelConfig(base: baseConfig, visionConfig: visionConfig)
 
+            // Sequential to avoid runtime errors with concurrent model preparation.
             let visionModel = try await PreparedModel.prepare(at: visionURL)
             let embedModel = try await PreparedModel.prepare(at: embedURL)
             let llmModel = try await PreparedModel.prepare(at: mainURL)

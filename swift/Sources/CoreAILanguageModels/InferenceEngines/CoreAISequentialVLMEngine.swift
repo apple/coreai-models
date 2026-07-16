@@ -385,7 +385,7 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
 
         CLILogger.log("VLM encodeImage complete: \(tokenCount) embedding tokens")
 
-        return EmbeddedInput(
+        return try EmbeddedInput(
             embeddings: projectedEmbeddings,
             embeddingPositions: placeholderRange
         )
@@ -560,8 +560,8 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
                     + "expected \(imageTokenCount) from config. Check prompt template.")
         }
 
-        let seqLen = textEmbeddings.shape.count >= 2 ? textEmbeddings.shape[1] : 0
-        let imgSeqLen = imageEmbeddings.shape.count >= 2 ? imageEmbeddings.shape[1] : 0
+        let seqLen = textEmbeddings.shape[1]
+        let imgSeqLen = imageEmbeddings.shape[1]
         guard imgSeqLen >= imageTokenCount else {
             throw InferenceRuntimeError.invalidArgument(
                 "scatterMerge: image embeddings have \(imgSeqLen) tokens, need \(imageTokenCount)")
@@ -574,10 +574,10 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
         }
 
         // Copy image embeddings into placeholder positions.
-        precondition(
-            imageEmbeddings.scalarType == .float16,
-            "scatterMerge only supports float16 embeddings; got \(imageEmbeddings.scalarType)"
-        )
+        guard imageEmbeddings.scalarType == .float16 else {
+            throw InferenceRuntimeError.invalidInputType(
+                "scatterMerge only supports float16 embeddings; got \(imageEmbeddings.scalarType)")
+        }
         imageEmbeddings.view(as: Float16.self).withUnsafePointer { imgPtr, _, _ in
             var mutableView = merged.mutableView(as: Float16.self)
             mutableView.withUnsafeMutablePointer { mergedPtr, _, _ in

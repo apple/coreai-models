@@ -146,6 +146,11 @@ public struct EngineFactory: Sendable {
             return .staticShape
         case .dynamic:
             return .pipelined
+        default:
+            // EngineFactory drives LLM engines only
+            preconditionFailure(
+                "EngineFactory only supports chunkedStatic and dynamic model structures."
+            )
         }
     }
 
@@ -161,8 +166,12 @@ public struct EngineFactory: Sendable {
             return (false, "Core AI pipelined variant requires dynamic model")
         case (.sequential, .chunkedStatic):
             return (false, "Sequential variant requires dynamic model")
-        default:
+        case (_, .dynamic), (_, .chunkedStatic):
             return (true, nil)
+        default:
+            // Any other structure isn't an LLM model (e.g. a segmenter asset), so no LLM
+            // engine variant can run it.
+            return (false, "LLM engine variants are incompatible with this model structure")
         }
     }
 
