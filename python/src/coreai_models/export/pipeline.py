@@ -61,6 +61,8 @@ class ExportConfig:
     output_name: str | None = None
     num_layers: int | None = None
     overwrite: bool = False
+    # iOS-only: number of parallel worker processes for KMeans palettization.
+    palettization_num_workers: int = 32
     # iOS only. When True, embedding table is not quantized to int8.
     disable_embedding_quantization: bool = False
     # Optional prebuilt coreai-opt config (KMeansPalettizerConfig or
@@ -307,6 +309,7 @@ async def _async_export_model(config: ExportConfig) -> str:
                 palettization_inputs,
                 torch_palettization_config,
                 mmap_dir=palettization_mmap_dir,
+                num_workers=config.palettization_num_workers,
             )
 
         # ---- 4. Variant-specific export ----

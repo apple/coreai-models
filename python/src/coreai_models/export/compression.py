@@ -208,6 +208,7 @@ def palettize_pytorch_model(
     example_inputs: tuple,
     palettization_config: "dict | KMeansPalettizerConfig",
     mmap_dir: str | None = None,
+    num_workers: int = 32,
 ) -> nn.Module:
     """
     Palettize a PyTorch model using post-training palettization with coreai-opt.
@@ -223,6 +224,8 @@ def palettize_pytorch_model(
             When provided, each finalized layer is saved to a per-layer
             safetensors file and reloaded mmap-backed.
             When None, finalization keeps weights in RAM.
+        num_workers: Number of parallel worker processes for KMeans centroid
+            calculation. Defaults to 32.
 
     Returns:
         Palettized model ready for export.
@@ -243,7 +246,7 @@ def palettize_pytorch_model(
     logger.info(f"Palettization config: {config}")
 
     palettizer = KMeansPalettizer(model, config)
-    prepared_model = palettizer.prepare(example_inputs=example_inputs, num_workers=32)
+    prepared_model = palettizer.prepare(example_inputs=example_inputs, num_workers=num_workers)
 
     finalized_model = palettizer.finalize(
         prepared_model, backend=ExportBackend.CoreAI, mmap_dir=mmap_dir
