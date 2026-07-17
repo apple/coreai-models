@@ -327,7 +327,7 @@ FLUX2_COMPONENTS: dict[str, ComponentSpec] = {
         output_names=("hidden_states",),
         wrapper_fn=lambda p: Flux2TextEncoderWrapper(p.text_encoder),
         dummy_fn=dummy_flux2_text_encoder,
-        quantizable=True,
+        quantizable=False,
     ),
     "vae_decoder": ComponentSpec(
         asset_name="VAEDecoder",
