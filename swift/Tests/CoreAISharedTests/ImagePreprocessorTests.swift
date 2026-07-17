@@ -243,6 +243,17 @@ struct ImagePreprocessorTests {
         #expect(chw.count == 3 * 32 * 32)
     }
 
+    @Test("pad: portrait image has correct output size")
+    func padPortrait() throws {
+        let pre = ImagePreprocessor(
+            targetSize: CGSize(width: 32, height: 32),
+            mean: (0, 0, 0), std: (1, 1, 1), rescaleFactor: 1
+        )
+        let portrait = Self.makeSolidImage(width: 32, height: 64, r: 100, g: 150, b: 200)
+        let chw = try pre.preprocessCHWPad(cgImage: portrait)
+        #expect(chw.count == 3 * 32 * 32)
+    }
+
     @Test("strategy dispatch: all three strategies produce correct output size")
     func strategyDispatch() throws {
         let pre = ImagePreprocessor(

@@ -172,7 +172,7 @@ public struct VisionConfig: Codable, Sendable, Equatable {
     /// Image preprocessing strategy. Defaults to stretch when omitted.
     public let imageStrategy: ImageStrategy
 
-    /// Whether to include original image dimensions in the text prompt.
+    /// Whether to include original image dimensions in the text prompt. Defaults to false.
     public let includeImageInfo: Bool
 
     /// CLIP normalization (Qwen VL, Pixtral, InternVL, Phi-3.5-vision).
