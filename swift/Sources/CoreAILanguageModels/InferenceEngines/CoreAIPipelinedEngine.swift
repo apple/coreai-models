@@ -232,6 +232,57 @@ final class CoreAIPipelinedEngine: InferenceEngine, Sendable {
         return GenerationSequence(base: base, stopReasonStore: stopReasonStore)
     }
 
+    // MARK: - Constrained Generation (GPU bitmask path)
+
+    /// Generate tokens with grammar-constrained sampling on GPU.
+    ///
+    /// Unlike `generate()`, this method applies an xgrammar bitmask inside the GPU sampler
+    /// each step, enabling constrained decoding without falling back to the sequential engine.
+    ///
+    /// The loop is semi-pipelined: inference overlaps with bitmask computation, but sampling
+    /// waits per token (grammar state is inherently sequential).
+    func generateConstrained(
+        with input: [TokenId],
+        samplingConfiguration: SamplingConfiguration,
+        maxTokens: Int,
+        session: ConstrainedSessionBox
+    ) throws -> AsyncThrowingStream<TokenId, Error> {
+        let (stream, continuation) = AsyncThrowingStream<TokenId, Error>.makeStream()
+
+        let sessionBox = session
+
+        let token = GenerationToken()
+        _activeToken.withLock { $0 = token }
+
+        let task = Task {
+            self.acquireEngine()
+            defer {
+                self.releaseEngine()
+                if self._activeToken.withLock({ $0 === token }) {
+                    self._activeToken.withLock { $0 = nil }
+                    self._generationTask.withLock { $0 = nil }
+                }
+            }
+            do {
+                try await self.engine.runConstrainedCompletion(
+                    prompt: input,
+                    sampler: samplingConfiguration,
+                    sessionBox: sessionBox,
+                    maxTokens: maxTokens,
+                    yieldingTo: continuation
+                )
+                continuation.finish()
+            } catch is CancellationError {
+                continuation.finish()
+            } catch {
+                continuation.finish(throwing: error)
+            }
+        }
+        _generationTask.withLock { $0 = task }
+
+        return stream
+    }
+
     /// Wait for any in-flight generate() Task to return the engine.
     private func drain() {
         var attempts = 0
@@ -310,6 +361,18 @@ final class CoreAIPipelinedEngine: InferenceEngine, Sendable {
         acquireEngine()
         defer { releaseEngine() }
         try await engine.performWarmup(queryLength: queryLength, samplingConfig: sampling)
+    }
+}
+
+// MARK: - Constrained Session Box
+
+/// Mutable wrapper around ConstrainedGenerationSession for use inside a Task.
+/// Needed because `inout` parameters cannot cross actor/task boundaries.
+final class ConstrainedSessionBox: @unchecked Sendable {
+    var session: ConstrainedGenerationSession
+
+    init(session: consuming ConstrainedGenerationSession) {
+        self.session = session
     }
 }
 
@@ -1000,6 +1063,247 @@ private struct EngineImpl: ~Copyable {
                 }
                 cmdBuf.addCompletedHandler { _ in sentinelCont.resume() }
                 cmdBuf.commit()
+            }
+        }
+    }
+
+    // MARK: - Constrained Run Completion
+
+    /// Semi-pipelined constrained generation loop.
+    ///
+    /// Unlike `runCompletion` which fires steps asynchronously, this awaits each token
+    /// before computing the next bitmask (grammar state is sequential).
+    mutating func runConstrainedCompletion(
+        prompt: [Int32],
+        sampler: SamplingConfiguration,
+        sessionBox: ConstrainedSessionBox,
+        maxTokens: Int,
+        yieldingTo continuation: AsyncThrowingStream<Int32, Error>.Continuation
+    ) async throws {
+        let gpuSampler = try getOrCreateSampler(for: sampler)
+
+        // Get the bitmask buffer from whichever concrete sampler we have
+        let bitmaskBuffer: MTLBuffer
+        if let composite = gpuSampler as? MPSGraphCompositeSampler {
+            bitmaskBuffer = composite.bitmaskBuffer
+        } else if let argmax = gpuSampler as? MPSGraphArgmaxSampler {
+            bitmaskBuffer = argmax.bitmaskBuffer
+        } else {
+            throw InferenceRuntimeError.invalidArgument(
+                "Constrained generation requires MPSGraphArgmaxSampler or MPSGraphCompositeSampler")
+        }
+
+        // Pre-grow KV cache
+        let totalNeeded = prompt.count + maxTokens
+        try kvCache.ensureCapacity(forContextLength: totalNeeded, queue: pipelineQueue)
+        try logits.ensureCapacity(forContextLength: 1)
+
+        // Prefill prompt (unconstrained -- grammar doesn't constrain the prompt)
+        let prefillTokens: [Int32]
+        if prompt.count > config.chunkThreshold {
+            let remaining = try await processChunkedInput(tokens: prompt)
+            prefillTokens = Array(remaining)
+        } else {
+            prefillTokens = prompt
+        }
+
+        // Encode prefill and sample first token (unconstrained)
+        var lastToken: Int32 = try await withCheckedThrowingContinuation { cont in
+            do {
+                try _encodeStepForConstrainedGeneration(
+                    tokens: prefillTokens,
+                    gpuSampler: gpuSampler,
+                    applyBitmask: false
+                ) { token in
+                    cont.resume(returning: token)
+                }
+            } catch {
+                cont.resume(throwing: error)
+            }
+        }
+
+        continuation.yield(lastToken)
+
+        // Constrained decode loop
+        var generated = 1
+        while generated < maxTokens {
+            try Task.checkCancellation()
+
+            // Accept previous token in grammar
+            if !sessionBox.session.acceptToken(lastToken) { break }
+            if sessionBox.session.isTerminated { break }
+
+            // Fill bitmask for next step directly into the GPU-visible buffer
+            let bitmaskPtr = bitmaskBuffer.contents().assumingMemoryBound(to: Int32.self)
+            guard sessionBox.session.fillBitmask(into: bitmaskPtr) else { break }
+
+            // Encode inference + constrained sampling
+            lastToken = try await withCheckedThrowingContinuation { cont in
+                do {
+                    try _encodeStepForConstrainedGeneration(
+                        tokens: [],
+                        gpuSampler: gpuSampler,
+                        applyBitmask: true
+                    ) { token in
+                        cont.resume(returning: token)
+                    }
+                } catch {
+                    cont.resume(throwing: error)
+                }
+            }
+
+            continuation.yield(lastToken)
+            generated += 1
+        }
+
+        // Drain: sentinel command buffer to ensure all GPU work completes
+        await withCheckedContinuation { (sentinelCont: CheckedContinuation<Void, Never>) in
+            do {
+                let queue = pipelineQueue
+                guard let cmdBuf = queue.makeCommandBuffer() else {
+                    sentinelCont.resume()
+                    return
+                }
+                cmdBuf.addCompletedHandler { _ in sentinelCont.resume() }
+                cmdBuf.commit()
+            }
+        }
+    }
+
+    /// Single encode step for constrained generation (prefill or decode).
+    /// Calls completion with the sampled token.
+    private mutating func _encodeStepForConstrainedGeneration(
+        tokens: [Int32],
+        gpuSampler: any MPSGraphSampler,
+        applyBitmask: Bool,
+        completion: @escaping (Int32) -> Void
+    ) throws {
+        let actualTokenCount = tokens.isEmpty ? 1 : tokens.count
+        let queryLength = actualTokenCount
+
+        defer {
+            processedTokenCount += actualTokenCount
+            step += 1
+        }
+
+        // Write tokens to input buffer
+        let tokenByteOffset = processedTokenCount * MemoryLayout<Int32>.size
+        if !tokens.isEmpty {
+            let ptr = inputTokensBuffer.contents().bindMemory(
+                to: Int32.self, capacity: processedTokenCount + queryLength)
+            for (i, token) in tokens.enumerated() {
+                ptr[processedTokenCount + i] = token
+            }
+        }
+
+        let cachePosBuffer = cachePositionBuffers[step % pipelineDepth]
+        let posLength = processedTokenCount + queryLength
+
+        let tokenShape = [1, queryLength]
+        let tokenStrides = try resolvedStrides(descriptor: inputIdsBaseDesc, shape: tokenShape)
+        let tokenValue = unsafe InferenceFunction.AsyncValue(
+            unsafeBuffer: inputTokensBuffer,
+            byteOffset: tokens.isEmpty ? 0 : tokenByteOffset,
+            scalarType: .int32,
+            shape: tokenShape,
+            strides: tokenStrides
+        )
+        let posShape = [1, posLength]
+        let posStrides = try resolvedStrides(descriptor: positionIdsBaseDesc, shape: posShape)
+        let posValue = unsafe InferenceFunction.AsyncValue(
+            unsafeBuffer: cachePosBuffer,
+            byteOffset: 0,
+            scalarType: .int32,
+            shape: posShape,
+            strides: posStrides
+        )
+
+        let asyncInputs: [String: InferenceFunction.AsyncValue] = [
+            inputIdsName: tokenValue,
+            positionIdsName: posValue,
+        ]
+
+        let keyBuffer = kvCache.keyBinding.metalBuffer
+        let keyShape = kvCache.keyBinding.layout.shape
+        let keyStrides = kvCache.keyBinding.layout.strides
+        var keyState = unsafe InferenceFunction.AsyncMutableValue(
+            unsafeBuffer: keyBuffer, byteOffset: 0,
+            scalarType: keyCacheScalarType, shape: keyShape, strides: keyStrides
+        )
+        let valBuffer = kvCache.valueBinding.metalBuffer
+        let valShape = kvCache.valueBinding.layout.shape
+        let valStrides = kvCache.valueBinding.layout.strides
+        var valState = unsafe InferenceFunction.AsyncMutableValue(
+            unsafeBuffer: valBuffer, byteOffset: 0,
+            scalarType: valueCacheScalarType, shape: valShape, strides: valStrides
+        )
+
+        var asyncStates = InferenceFunction.AsyncMutableViews()
+        asyncStates.insert(&keyState, for: keyCacheName)
+        asyncStates.insert(&valState, for: valueCacheName)
+
+        let logitsBuffer = logits.metalBuffer
+        let logitsShape = [1, queryLength, vocabSize]
+        let logitsStrides = try resolvedStrides(descriptor: logitsBaseDesc, shape: logitsShape)
+        var logitsOutput = unsafe InferenceFunction.AsyncMutableValue(
+            unsafeBuffer: logitsBuffer, byteOffset: 0,
+            scalarType: .float16, shape: logitsShape, strides: logitsStrides
+        )
+
+        var asyncOutputs = InferenceFunction.AsyncMutableViews()
+        asyncOutputs.insert(&logitsOutput, for: logitsOutputName)
+
+        // Encode inference
+        let _ = try function.encode(
+            inputs: asyncInputs,
+            states: consume asyncStates,
+            outputViews: consume asyncOutputs,
+            to: computeStream
+        )
+
+        // GPU sampling
+        let outputBuffer = inputTokensBuffer
+        let queue = pipelineQueue
+
+        if queryLength == 1 {
+            if let compositeSampler = gpuSampler as? MPSGraphCompositeSampler {
+                compositeSampler.encode(
+                    to: queue, logitsBuffer: logitsBuffer, logitsOffset: 0,
+                    outputBuffer: outputBuffer, outputOffset: 0,
+                    applyBitmask: applyBitmask, completion: completion
+                )
+            } else if let argmaxSampler = gpuSampler as? MPSGraphArgmaxSampler {
+                argmaxSampler.encode(
+                    to: queue, logitsBuffer: logitsBuffer, logitsOffset: 0,
+                    outputBuffer: outputBuffer, outputOffset: 0,
+                    applyBitmask: applyBitmask, completion: completion
+                )
+            } else {
+                gpuSampler.encode(
+                    to: queue, logitsBuffer: logitsBuffer, logitsOffset: 0,
+                    outputBuffer: outputBuffer, outputOffset: 0,
+                    completion: completion
+                )
+            }
+        } else {
+            if let compositeSampler = gpuSampler as? MPSGraphCompositeSampler {
+                compositeSampler.encodeWithSlice(
+                    to: queue, logitsBuffer: logitsBuffer, queryLength: actualTokenCount,
+                    outputBuffer: outputBuffer, outputOffset: 0,
+                    applyBitmask: applyBitmask, completion: completion
+                )
+            } else if let argmaxSampler = gpuSampler as? MPSGraphArgmaxSampler {
+                argmaxSampler.encodeWithSlice(
+                    to: queue, logitsBuffer: logitsBuffer, queryLength: actualTokenCount,
+                    outputBuffer: outputBuffer, outputOffset: 0,
+                    applyBitmask: applyBitmask, completion: completion
+                )
+            } else {
+                gpuSampler.encodeWithSlice(
+                    to: queue, logitsBuffer: logitsBuffer, queryLength: actualTokenCount,
+                    outputBuffer: outputBuffer, outputOffset: 0,
+                    completion: completion
+                )
             }
         }
     }

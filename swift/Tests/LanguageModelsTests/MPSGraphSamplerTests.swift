@@ -825,3 +825,256 @@ struct MPSGraphSamplerFactoryTests {
         #expect(composite.k == 40)
     }
 }
+
+// MARK: - MPSGraph Constrained Sampler Tests
+
+@Suite("MPSGraph Constrained Argmax Tests", .enabled(if: !CIEnvironment.isVM))
+struct MPSGraphConstrainedArgmaxTests {
+    static let device: MTLDevice? = MTLCreateSystemDefaultDevice()
+    static let vocabSize = 32000
+
+    @Test("Bitmask blocks the dominant token -- argmax picks next best")
+    func bitmaskBlocksDominant() async throws {
+        let device = try #require(Self.device)
+        let sampler = try MPSGraphArgmaxSampler(device: device, vocabSize: Self.vocabSize)
+
+        let logitsBuffer = try #require(device.makeBuffer(length: Self.vocabSize * 2, options: .storageModeShared))
+        let outputBuffer = try #require(device.makeBuffer(length: 4, options: .storageModeShared))
+
+        // Token 5000 has highest logit, token 5001 is second
+        let logitsPtr = logitsBuffer.contents().assumingMemoryBound(to: Float16.self)
+        for i in 0..<Self.vocabSize { logitsPtr[i] = Float16(-100.0) }
+        logitsPtr[5000] = Float16(100.0)
+        logitsPtr[5001] = Float16(50.0)
+
+        // Block token 5000 in the bitmask
+        let bitmaskSize = (Self.vocabSize + 31) / 32
+        let bitmaskPtr = sampler.bitmaskBuffer.contents().assumingMemoryBound(to: Int32.self)
+        for i in 0..<bitmaskSize { bitmaskPtr[i] = ~Int32(0) }
+        bitmaskPtr[5000 / 32] &= ~(Int32(1) << (5000 % 32))
+
+        let queue = try #require(device.makeCommandQueue())
+
+        await withCheckedContinuation { continuation in
+            sampler.encode(
+                to: queue,
+                logitsBuffer: logitsBuffer,
+                logitsOffset: 0,
+                outputBuffer: outputBuffer,
+                outputOffset: 0,
+                applyBitmask: true,
+                completion: { _ in continuation.resume() }
+            )
+        }
+
+        let result = outputBuffer.contents().assumingMemoryBound(to: Int32.self).pointee
+        #expect(result == 5001, "Bitmask should block 5000, argmax picks 5001, got \(result)")
+    }
+
+    @Test("All-ones bitmask matches unconstrained argmax")
+    func allOnesBitmaskMatchesUnconstrained() async throws {
+        let device = try #require(Self.device)
+        let sampler = try MPSGraphArgmaxSampler(device: device, vocabSize: Self.vocabSize)
+
+        let logitsBuffer = try #require(device.makeBuffer(length: Self.vocabSize * 2, options: .storageModeShared))
+        let outputBuffer = try #require(device.makeBuffer(length: 4, options: .storageModeShared))
+
+        let logitsPtr = logitsBuffer.contents().assumingMemoryBound(to: Float16.self)
+        for i in 0..<Self.vocabSize { logitsPtr[i] = Float16(Float.random(in: -10..<10)) }
+        logitsPtr[12345] = Float16(100.0)
+
+        let bitmaskSize = (Self.vocabSize + 31) / 32
+        let bitmaskPtr = sampler.bitmaskBuffer.contents().assumingMemoryBound(to: Int32.self)
+        for i in 0..<bitmaskSize { bitmaskPtr[i] = ~Int32(0) }
+
+        let queue = try #require(device.makeCommandQueue())
+
+        await withCheckedContinuation { continuation in
+            sampler.encode(
+                to: queue, logitsBuffer: logitsBuffer, logitsOffset: 0,
+                outputBuffer: outputBuffer, outputOffset: 0,
+                applyBitmask: true, completion: { _ in continuation.resume() }
+            )
+        }
+        let constrainedResult = outputBuffer.contents().assumingMemoryBound(to: Int32.self).pointee
+
+        await withCheckedContinuation { continuation in
+            sampler.encode(
+                to: queue, logitsBuffer: logitsBuffer, logitsOffset: 0,
+                outputBuffer: outputBuffer, outputOffset: 0,
+                applyBitmask: false, completion: { _ in continuation.resume() }
+            )
+        }
+        let unconstrainedResult = outputBuffer.contents().assumingMemoryBound(to: Int32.self).pointee
+
+        #expect(constrainedResult == unconstrainedResult,
+                "All-ones bitmask should match unconstrained: \(constrainedResult) vs \(unconstrainedResult)")
+    }
+
+    @Test("Bitmask allows only 3 tokens -- argmax picks best among them")
+    func bitmaskAllowsOnlyThree() async throws {
+        let device = try #require(Self.device)
+        let sampler = try MPSGraphArgmaxSampler(device: device, vocabSize: Self.vocabSize)
+
+        let logitsBuffer = try #require(device.makeBuffer(length: Self.vocabSize * 2, options: .storageModeShared))
+        let outputBuffer = try #require(device.makeBuffer(length: 4, options: .storageModeShared))
+
+        let logitsPtr = logitsBuffer.contents().assumingMemoryBound(to: Float16.self)
+        for i in 0..<Self.vocabSize { logitsPtr[i] = Float16(50.0) }
+        logitsPtr[100] = Float16(60.0)
+        logitsPtr[200] = Float16(55.0)
+        logitsPtr[300] = Float16(52.0)
+
+        let bitmaskSize = (Self.vocabSize + 31) / 32
+        let bitmaskPtr = sampler.bitmaskBuffer.contents().assumingMemoryBound(to: Int32.self)
+        for i in 0..<bitmaskSize { bitmaskPtr[i] = 0 }
+        bitmaskPtr[100 / 32] |= Int32(1) << (100 % 32)
+        bitmaskPtr[200 / 32] |= Int32(1) << (200 % 32)
+        bitmaskPtr[300 / 32] |= Int32(1) << (300 % 32)
+
+        let queue = try #require(device.makeCommandQueue())
+
+        await withCheckedContinuation { continuation in
+            sampler.encode(
+                to: queue, logitsBuffer: logitsBuffer, logitsOffset: 0,
+                outputBuffer: outputBuffer, outputOffset: 0,
+                applyBitmask: true, completion: { _ in continuation.resume() }
+            )
+        }
+
+        let result = outputBuffer.contents().assumingMemoryBound(to: Int32.self).pointee
+        #expect(result == 100, "Should pick token 100 (highest among allowed), got \(result)")
+    }
+}
+
+@Suite("MPSGraph Constrained Composite Tests", .enabled(if: !CIEnvironment.isVM))
+struct MPSGraphConstrainedCompositeTests {
+    static let device: MTLDevice? = MTLCreateSystemDefaultDevice()
+    static let vocabSize = 32000
+    static let k = 40
+
+    @Test("Bitmask blocks dominant token -- composite never samples it")
+    func bitmaskBlocksDominantComposite() async throws {
+        let device = try #require(Self.device)
+        let sampler = try MPSGraphCompositeSampler(device: device, vocabSize: Self.vocabSize, k: Self.k, temperature: 1.0)
+
+        let logitsBuffer = try #require(device.makeBuffer(length: Self.vocabSize * 2, options: .storageModeShared))
+        let outputBuffer = try #require(device.makeBuffer(length: 4, options: .storageModeShared))
+
+        let logitsPtr = logitsBuffer.contents().assumingMemoryBound(to: Float16.self)
+        for i in 0..<Self.vocabSize { logitsPtr[i] = Float16(-100.0) }
+        logitsPtr[8000] = Float16(100.0)
+        for t in 8001...8005 { logitsPtr[t] = Float16(10.0) }
+
+        let bitmaskSize = (Self.vocabSize + 31) / 32
+        let bitmaskPtr = sampler.bitmaskBuffer.contents().assumingMemoryBound(to: Int32.self)
+        for i in 0..<bitmaskSize { bitmaskPtr[i] = ~Int32(0) }
+        bitmaskPtr[8000 / 32] &= ~(Int32(1) << (8000 % 32))
+
+        let queue = try #require(device.makeCommandQueue())
+
+        var sampledTokens = Set<Int32>()
+        for _ in 0..<20 {
+            await withCheckedContinuation { continuation in
+                sampler.encode(
+                    to: queue, logitsBuffer: logitsBuffer, logitsOffset: 0,
+                    outputBuffer: outputBuffer, outputOffset: 0,
+                    applyBitmask: true, completion: { _ in continuation.resume() }
+                )
+            }
+            let result = outputBuffer.contents().assumingMemoryBound(to: Int32.self).pointee
+            sampledTokens.insert(result)
+        }
+
+        #expect(!sampledTokens.contains(8000), "Token 8000 should be blocked by bitmask")
+        for token in sampledTokens {
+            #expect((8001...8005).contains(Int(token)), "Sampled \(token) outside allowed range 8001-8005")
+        }
+    }
+
+    @Test("Only 3 tokens allowed -- composite samples exclusively from them")
+    func compositeOnlyAllowedTokens() async throws {
+        let device = try #require(Self.device)
+        let sampler = try MPSGraphCompositeSampler(device: device, vocabSize: Self.vocabSize, k: Self.k, temperature: 1.0)
+
+        let logitsBuffer = try #require(device.makeBuffer(length: Self.vocabSize * 2, options: .storageModeShared))
+        let outputBuffer = try #require(device.makeBuffer(length: 4, options: .storageModeShared))
+
+        let logitsPtr = logitsBuffer.contents().assumingMemoryBound(to: Float16.self)
+        for i in 0..<Self.vocabSize { logitsPtr[i] = Float16(5.0) }
+        let allowed: [Int] = [1000, 2000, 3000]
+        for t in allowed { logitsPtr[t] = Float16(10.0) }
+
+        let bitmaskSize = (Self.vocabSize + 31) / 32
+        let bitmaskPtr = sampler.bitmaskBuffer.contents().assumingMemoryBound(to: Int32.self)
+        for i in 0..<bitmaskSize { bitmaskPtr[i] = 0 }
+        for t in allowed {
+            bitmaskPtr[t / 32] |= Int32(1) << (t % 32)
+        }
+
+        let queue = try #require(device.makeCommandQueue())
+
+        var sampledTokens = Set<Int32>()
+        for _ in 0..<50 {
+            await withCheckedContinuation { continuation in
+                sampler.encode(
+                    to: queue, logitsBuffer: logitsBuffer, logitsOffset: 0,
+                    outputBuffer: outputBuffer, outputOffset: 0,
+                    applyBitmask: true, completion: { _ in continuation.resume() }
+                )
+            }
+            let result = outputBuffer.contents().assumingMemoryBound(to: Int32.self).pointee
+            sampledTokens.insert(result)
+        }
+
+        for token in sampledTokens {
+            #expect(allowed.contains(Int(token)), "Sampled \(token) not in allowed set \(allowed)")
+        }
+        #expect(sampledTokens.count >= 2, "Should sample multiple allowed tokens, got \(sampledTokens.count)")
+    }
+
+    @Test("Constrained composite latency under 25ms for 32K vocab")
+    func constrainedCompositePerformance() async throws {
+        let device = try #require(Self.device)
+        let sampler = try MPSGraphCompositeSampler(device: device, vocabSize: Self.vocabSize, k: Self.k, temperature: 1.0)
+
+        let logitsBuffer = try #require(device.makeBuffer(length: Self.vocabSize * 2, options: .storageModeShared))
+        let outputBuffer = try #require(device.makeBuffer(length: 4, options: .storageModeShared))
+
+        let bitmaskSize = (Self.vocabSize + 31) / 32
+        let bitmaskPtr = sampler.bitmaskBuffer.contents().assumingMemoryBound(to: Int32.self)
+        for i in 0..<bitmaskSize { bitmaskPtr[i] = Int32(bitPattern: 0xAAAA_AAAA) }
+
+        let queue = try #require(device.makeCommandQueue())
+
+        for _ in 0..<10 {
+            await withCheckedContinuation { continuation in
+                sampler.encode(
+                    to: queue, logitsBuffer: logitsBuffer, logitsOffset: 0,
+                    outputBuffer: outputBuffer, outputOffset: 0,
+                    applyBitmask: true, completion: { _ in continuation.resume() }
+                )
+            }
+        }
+
+        let iterations = 100
+        let start = SuspendingClock().now
+        for _ in 0..<iterations {
+            await withCheckedContinuation { continuation in
+                sampler.encode(
+                    to: queue, logitsBuffer: logitsBuffer, logitsOffset: 0,
+                    outputBuffer: outputBuffer, outputOffset: 0,
+                    applyBitmask: true, completion: { _ in continuation.resume() }
+                )
+            }
+        }
+        let avgLatencyMs = (SuspendingClock().now - start).inMilliseconds / Double(iterations)
+
+        print("MPSGraph Constrained Composite latency: \(String(format: "%.3f", avgLatencyMs)) ms")
+
+        let threshold = CIEnvironment.isVM ? 100.0 : 25.0
+        #expect(
+            avgLatencyMs < threshold,
+            "Constrained Composite too slow: \(avgLatencyMs) ms (threshold: \(threshold) ms)")
+    }
+}

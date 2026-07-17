@@ -84,6 +84,42 @@ struct ConstrainedGenerationSessionTests {
         #expect(allowedTokenIDs(session: &session).isEmpty)
     }
 
+    @Test func fillBitmaskIntoPointerMatchesNextTokenBitmask() throws {
+        var session = try createTestSession()
+
+        // Get bitmask via the array-returning method
+        let arrayBitmask = session.nextTokenBitmask()
+        #expect(arrayBitmask != nil)
+
+        // Reset and get bitmask via the pointer method
+        session.reset()
+        let bitmaskSize = (session.vocabularySize + 31) / 32
+        var pointerBitmask = [Int32](repeating: 0, count: bitmaskSize)
+        let success = pointerBitmask.withUnsafeMutableBufferPointer { buf in
+            session.fillBitmask(into: buf.baseAddress!)
+        }
+        #expect(success)
+
+        // They should be identical
+        #expect(arrayBitmask!.count == pointerBitmask.count)
+        for i in 0..<arrayBitmask!.count {
+            #expect(arrayBitmask![i] == pointerBitmask[i],
+                    "Mismatch at word \(i): array=\(arrayBitmask![i]) pointer=\(pointerBitmask[i])")
+        }
+    }
+
+    @Test func fillBitmaskReturnsFalseWhenTerminated() throws {
+        var session = try createTestSession()
+        driveToCompletion(session: &session)
+
+        let bitmaskSize = (session.vocabularySize + 31) / 32
+        var buffer = [Int32](repeating: 0, count: bitmaskSize)
+        let success = buffer.withUnsafeMutableBufferPointer { buf in
+            session.fillBitmask(into: buf.baseAddress!)
+        }
+        #expect(!success)
+    }
+
     // MARK: - Token Acceptance Tests
 
     @Test func acceptToken() throws {
