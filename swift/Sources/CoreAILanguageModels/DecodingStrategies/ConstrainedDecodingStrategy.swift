@@ -324,16 +324,17 @@ extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
                 generatedTokens.append(bestToken)
                 tokenStep += 1
 
+                if terminatedAfterAccept {
+                    finished = true
+                    return nil
+                }
+
                 let delta = ConstrainedDecodingStrategy.computeTextDelta(
                     generatedTokens: generatedTokens,
                     previousDecodedText: &previousDecodedText,
                     tokenizer: tokenizer,
                     tokenStep: tokenStep
                 )
-
-                if terminatedAfterAccept {
-                    finished = true
-                }
 
                 return GenerationResult(text: delta, tokenId: bestToken, rawLogits: logits)
             }
