@@ -496,7 +496,6 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
     private let randomData: MPSGraphTensorData
     private let topPData: MPSGraphTensorData
     private let minPData: MPSGraphTensorData
-    private let execDescriptor: MPSGraphExecutableExecutionDescriptor
 
     /// Testing only: Override random value for deterministic tests.
     var testingOnlyRandomOverride: Float?
@@ -678,7 +677,6 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
             shape: [1 as NSNumber],
             dataType: .float32
         )
-        self.execDescriptor = MPSGraphExecutableExecutionDescriptor()
     }
 
     /// Encode composite sampling asynchronously (protocol conformance).
@@ -725,7 +723,10 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
             cachedOutputBuffer = outputBuffer
         }
 
-        execDescriptor.completionHandler = { [outputBuffer, outputOffset] (_, error) in
+        // Per-call descriptor — reusing one across pipelined steps corrupts
+        // intermediate scratch buffers when multiple runAsync calls overlap.
+        let desc = MPSGraphExecutableExecutionDescriptor()
+        desc.completionHandler = { [outputBuffer, outputOffset] (_, error) in
             if let error = error {
                 print("MPSGraph composite sampler error: \(error)")
                 completion(0)
@@ -743,7 +744,7 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
             with: queue,
             inputs: [logitsData, temperatureData, randomData, topPData, minPData],
             results: [outputData],
-            executionDescriptor: execDescriptor
+            executionDescriptor: desc
         )
     }
 
