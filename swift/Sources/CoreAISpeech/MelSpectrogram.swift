@@ -206,6 +206,26 @@ public enum MelSpectrogram {
 
     public static func loadAndResample(_ url: URL, targetSampleRate: Double) throws -> [Float] {
         let file = try AVAudioFile(forReading: url)
+
+        // Fast path: file is already mono at the target rate. Read the float samples
+        // directly instead of routing through AVAudioConverter. A 1:1 converter isn't
+        // guaranteed bit-exact and diverges slightly from HF/librosa, which skip
+        // resampling entirely when the rate already matches — keeping this path faithful.
+        // (processingFormat is always standard deinterleaved float32, so floatChannelData
+        // is valid.)
+        let processing = file.processingFormat
+        if processing.channelCount == 1 && processing.sampleRate == targetSampleRate {
+            guard
+                let buf = AVAudioPCMBuffer(
+                    pcmFormat: processing, frameCapacity: AVAudioFrameCount(file.length))
+            else { throw SpeechError.invalidAudio("Cannot allocate read buffer for \(url.lastPathComponent)") }
+            try file.read(into: buf)
+            guard let ch = buf.floatChannelData else {
+                throw SpeechError.invalidAudio("Expected float samples reading \(url.lastPathComponent)")
+            }
+            return Array(UnsafeBufferPointer(start: ch[0], count: Int(buf.frameLength)))
+        }
+
         let fmt = AVAudioFormat(
             commonFormat: .pcmFormatFloat32,
             sampleRate: targetSampleRate, channels: 1, interleaved: false)!
