@@ -8,7 +8,7 @@ import CoreAIShared
 import Foundation
 import Tokenizers
 
-// MARK: - SpeechModel
+// MARK: - SpeechRecognitionModel
 
 /// On-device speech recognition model.
 ///
@@ -16,7 +16,7 @@ import Tokenizers
 /// encoder-decoder bundles and Parakeet TDT bundles; the architecture is
 /// auto-detected from the bundle's metadata.json (or the legacy
 /// encoder/decoder filename convention for Whisper).
-public actor SpeechModel {
+public actor SpeechRecognitionModel {
     private let bundle: SpeechBundle
     private let decoder: any SpeechDecoder
     private let melConfig: MelConfig

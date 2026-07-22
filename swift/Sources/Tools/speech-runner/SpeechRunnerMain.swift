@@ -77,7 +77,7 @@ func runBundle(bundleURL: URL, audioPath: String?, warmup: Bool, verbose: Bool) 
     print("⏳ Preparing AI asset...", terminator: "")
     fflush(stdout)
     let loadStart = ContinuousClock.now
-    let model = try await SpeechModel(resourcesAt: bundleURL)
+    let model = try await SpeechRecognitionModel(resourcesAt: bundleURL)
     let loadElapsed = ContinuousClock.now - loadStart
     print(" done in \(String(format: "%.3f", loadElapsed.inSeconds))s\(cacheHit ? " (cache hit)" : "")")
     print("Format: bundle (\(await model.architecture))")

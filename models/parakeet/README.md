@@ -47,7 +47,7 @@ uv run export.py --help
 import CoreAISpeech
 
 // Load an exported bundle directory (metadata.json + encoder/decoder_step/joint .aimodel assets + processor/).
-let model = try await SpeechModel(resourcesAt: "coreai-models/exports/parakeet-tdt-0.6b-v3_float32_static")
+let model = try await SpeechRecognitionModel(resourcesAt: "coreai-models/exports/parakeet-tdt-0.6b-v3_float32_static")
 
 // Transcribe an audio file — decoded and resampled to the model's sample rate automatically:
 let (text, stats) = try await model.transcribe(audioURL: URL(fileURLWithPath: "audio.wav"))
