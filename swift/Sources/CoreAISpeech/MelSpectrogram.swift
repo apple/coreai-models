@@ -153,6 +153,11 @@ public enum MelSpectrogram {
         var mel = [Float](repeating: 0, count: config.nMelBins * totalFrames)
 
         let logFloor: Float = 1e-10
+        // Whisper clamps the mel floor then takes log10 (OpenAI convention); Parakeet/NeMo
+        // adds a small guard *inside* a natural log — HF ParakeetFeatureExtractor uses
+        // LOG_ZERO_GUARD_VALUE = 2^-24. The two differ sharply for low-energy frames, so
+        // honor each pipeline's exact convention rather than sharing one floor.
+        let logGuard: Float = 0x1p-24
         let useLog10 = (config.normalization == .whisperLogClip)
 
         // Whisper computes and normalizes its entire fixed window (including the
@@ -183,8 +188,7 @@ public enum MelSpectrogram {
                 Int32(config.nMelBins), Int32(nFreqs), 1.0, filterbank, Int32(nFreqs),
                 powerSpec, 1, 0.0, &melFrame, 1)
             for i in 0..<config.nMelBins {
-                let v = max(melFrame[i], logFloor)
-                let lv = useLog10 ? log10(v) : log(v)
+                let lv = useLog10 ? log10(max(melFrame[i], logFloor)) : log(melFrame[i] + logGuard)
                 let idx = (config.layout == .channelMajor) ? (i * totalFrames + t) : (t * config.nMelBins + i)
                 mel[idx] = lv
             }
@@ -340,7 +344,7 @@ public enum MelSpectrogram {
                     sqSum += d * d
                 }
                 let std = sqrt(sqSum / Float(validFrames - 1))
-                let denom = max(std, 1e-5)
+                let denom = std + 1e-5  // HF adds EPSILON inside the divide (not a clamp)
                 for t in 0..<validFrames {
                     let idx = (layout == .timeMajor) ? (t * nMelBins + b) : (b * totalFrames + t)
                     mel[idx] = (mel[idx] - mean) / denom

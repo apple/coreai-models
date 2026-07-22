@@ -105,10 +105,25 @@ public actor SpeechModel {
         let inputShape = encoderInputShape(nFrames: nFrames)
         var melArray = NDArray(descriptor: melNDDesc.resolvingDynamicDimensions(inputShape))
         fillNDArray(&melArray, as: Float.self, with: mel)
+
+        // Attention mask (B, T_audio): true for real-audio frames, false for the
+        // static window's zero-padding tail (and the dynamic path's trailing zero
+        // frame). Lets the encoder exclude padding from self-attention and the conv
+        // modules, matching HF. Guarded so bundles exported without the input still run.
+        var inputs: [String: NDArray] = ["input_features": melArray]
+        if encDesc.inputNames.contains("attention_mask"),
+            case .ndArray(let maskDesc) = encDesc.inputDescriptor(of: "attention_mask")
+        {
+            let validFrames = min(
+                MelSpectrogram.validFrameCount(forPCMLength: pcm.count, config: melConfig), nFrames)
+            var maskArray = NDArray(descriptor: maskDesc.resolvingDynamicDimensions([1, nFrames]))
+            fillNDArray(&maskArray, as: Bool.self, count: nFrames) { $0 < validFrames }
+            inputs["attention_mask"] = maskArray
+        }
         let preprocessDuration = SuspendingClock().now - start
         CLILogger.log("The preprocessing took \(preprocessDuration)", level: 2)
         let startEncode = SuspendingClock().now
-        var outputs = try await fn.run(inputs: ["input_features": melArray])
+        var outputs = try await fn.run(inputs: inputs)
         let encodeDuration = SuspendingClock().now - startEncode
         CLILogger.log("The encoding took \(encodeDuration)", level: 2)
         guard let encOut = outputs.remove("encoder_hidden_states")?.ndArray else {

@@ -59,9 +59,16 @@ class ParakeetEncoderModule(torch.nn.Module):
         self._encoder = model.encoder
         self._encoder_projector = model.encoder_projector
 
-    def forward(self, input_features: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, input_features: torch.Tensor, attention_mask: torch.Tensor
+    ) -> torch.Tensor:
+        # attention_mask is a (B, T_audio) bool mask marking real-audio frames.
+        # It makes the encoder exclude padding from self-attention *and* the
+        # subsampling / conformer conv modules (matching HF). Without it a
+        # fixed-window static export attends over its zero padding and degrades.
         outputs = self._encoder(
             input_features=input_features,
+            attention_mask=attention_mask,
             output_attention_mask=False,
         )
         return self._encoder_projector(outputs.last_hidden_state)
@@ -154,8 +161,13 @@ def _encoder_dynamic_shapes() -> dict:
 
     Feature-extractor output is (B, T_audio, n_mels), so the time axis is 1.
     n_mels (axis 2) is fixed by the checkpoint (128 for v3) and stays static.
+    The attention_mask shares that same time axis; DYNAMIC lets the exporter
+    unify the two dims (they must be equal).
     """
-    return {"input_features": {1: torch.export.Dim.DYNAMIC}}
+    return {
+        "input_features": {1: torch.export.Dim.DYNAMIC},
+        "attention_mask": {1: torch.export.Dim.DYNAMIC},
+    }
 
 
 def _convert(
@@ -300,13 +312,17 @@ def create_parakeet(
     _prepare_bundle_dir(bundle_dir, overwrite)
 
     print(f"[INFO] Exporting {ENCODER_GRAPH} graph...")
+    encoder_features = _audio_features(model_name, dtype, audio_seconds)
     encoder_inputs = {
-        "input_features": _audio_features(model_name, dtype, audio_seconds)
+        "input_features": encoder_features,
+        # All-valid mask for the trace; the Swift runtime supplies the real
+        # per-frame mask (1 for real audio, 0 for the static window's padding).
+        "attention_mask": torch.ones(encoder_features.shape[:2], dtype=torch.bool),
     }
     encoder_program = _convert(
         ParakeetEncoderModule(model),
         encoder_inputs,
-        input_names=["input_features"],
+        input_names=["input_features", "attention_mask"],
         output_names=["encoder_hidden_states"],
         dtype=dtype,
         dynamic_shapes=_encoder_dynamic_shapes() if dynamic else None,
