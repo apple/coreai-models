@@ -177,7 +177,8 @@ public struct CoreAILanguageModel: LanguageModel {
         if let supportsLogits = resources.loadedEngineSupportsLogits {
             return supportsLogits
         }
-        return variant != "coreai-pipelined"
+        // Pipelined engine supports constrained generation via GPU bitmask path
+        return true
     }
 
     // MARK: - Executor
@@ -311,7 +312,7 @@ public struct CoreAILanguageModel: LanguageModel {
 
                 // Check if guided generation is requested
                 if let schema = request.schema {
-                    guard engine.supportsLogits else {
+                    guard engine.supportsLogits || engine is CoreAIPipelinedEngine else {
                         throw LanguageModelError.unsupportedCapability(
                             .init(
                                 capability: .guidedGeneration,
@@ -560,8 +561,14 @@ public struct CoreAILanguageModel: LanguageModel {
                 preconditionFailure("GenerationSchema JSON encoding produced invalid UTF-8")
             }
 
-            let strategy = ConstrainedDecodingStrategy(
-                jsonSchema: jsonSchema, vocabSize: model.bundle.vocabSize)
+            let strategy: any DecodingStrategy
+            if engine is CoreAIPipelinedEngine {
+                strategy = PipelinedConstrainedDecodingStrategy(
+                    jsonSchema: jsonSchema, vocabSize: model.bundle.vocabSize)
+            } else {
+                strategy = ConstrainedDecodingStrategy(
+                    jsonSchema: jsonSchema, vocabSize: model.bundle.vocabSize)
+            }
             let stopSequences = StopSequences(
                 for: model.tokenizer,
                 additionalEosTokenIds: model.additionalEosTokenIds

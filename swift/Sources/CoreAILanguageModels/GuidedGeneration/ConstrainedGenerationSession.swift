@@ -193,6 +193,26 @@ public struct ConstrainedGenerationSession: ~Copyable {
         matcher.reset()
         allTokensBlocked = false
     }
+
+    /// Fill the bitmask directly into a caller-provided buffer (e.g., a GPU-visible MTLBuffer).
+    ///
+    /// The caller must ensure the pointer has room for at least `(vocabularySize + 31) / 32`
+    /// Int32 words. Returns `false` if the grammar is terminated (buffer untouched).
+    public mutating func fillBitmask(into pointer: UnsafeMutablePointer<Int32>) -> Bool {
+        if isTerminated { return false }
+
+        let hasConstraints = matcher.fillNextTokenBitmask(pointer)
+        if !hasConstraints {
+            allTokensBlocked = true
+            return false
+        }
+        // Check for all-zeros (no tokens allowed)
+        for i in 0..<bitmaskSize {
+            if pointer[i] != 0 { return true }
+        }
+        allTokensBlocked = true
+        return false
+    }
 }
 
 // MARK: - Float16 Masking
