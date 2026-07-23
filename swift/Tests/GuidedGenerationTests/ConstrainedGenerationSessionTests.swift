@@ -103,8 +103,9 @@ struct ConstrainedGenerationSessionTests {
         // They should be identical
         #expect(arrayBitmask!.count == pointerBitmask.count)
         for i in 0..<arrayBitmask!.count {
-            #expect(arrayBitmask![i] == pointerBitmask[i],
-                    "Mismatch at word \(i): array=\(arrayBitmask![i]) pointer=\(pointerBitmask[i])")
+            #expect(
+                arrayBitmask![i] == pointerBitmask[i],
+                "Mismatch at word \(i): array=\(arrayBitmask![i]) pointer=\(pointerBitmask[i])")
         }
     }
 

@@ -269,10 +269,12 @@ final class MPSGraphArgmaxSampler: @unchecked Sendable {
         self.bitmaskSize = (vocabSize + 31) / 32
 
         // Allocate bitmask buffer (shared memory -- CPU writes visible to GPU without DMA)
-        guard let bitmaskBuf = device.makeBuffer(
-            length: bitmaskSize * MemoryLayout<Int32>.size,
-            options: .storageModeShared
-        ) else {
+        guard
+            let bitmaskBuf = device.makeBuffer(
+                length: bitmaskSize * MemoryLayout<Int32>.size,
+                options: .storageModeShared
+            )
+        else {
             throw MPSGraphSamplerError.bufferAllocationFailed
         }
         self.bitmaskBuffer = bitmaskBuf
@@ -385,9 +387,10 @@ final class MPSGraphArgmaxSampler: @unchecked Sendable {
         outputOffset: Int,
         completion: @escaping (Int32) -> Void
     ) {
-        encode(to: queue, logitsBuffer: logitsBuffer, logitsOffset: logitsOffset,
-               outputBuffer: outputBuffer, outputOffset: outputOffset,
-               applyBitmask: false, completion: completion)
+        encode(
+            to: queue, logitsBuffer: logitsBuffer, logitsOffset: logitsOffset,
+            outputBuffer: outputBuffer, outputOffset: outputOffset,
+            applyBitmask: false, completion: completion)
     }
 
     /// Encode argmax sampling with optional bitmask constraint.
@@ -481,9 +484,10 @@ final class MPSGraphArgmaxSampler: @unchecked Sendable {
         outputOffset: Int,
         completion: @escaping (Int32) -> Void
     ) {
-        encodeWithSlice(to: queue, logitsBuffer: logitsBuffer, queryLength: queryLength,
-                        outputBuffer: outputBuffer, outputOffset: outputOffset,
-                        applyBitmask: false, completion: completion)
+        encodeWithSlice(
+            to: queue, logitsBuffer: logitsBuffer, queryLength: queryLength,
+            outputBuffer: outputBuffer, outputOffset: outputOffset,
+            applyBitmask: false, completion: completion)
     }
 
     /// Encode argmax with slice support and optional bitmask.
@@ -908,9 +912,10 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
         outputOffset: Int,
         completion: @escaping (Int32) -> Void
     ) {
-        encode(to: queue, logitsBuffer: logitsBuffer, logitsOffset: logitsOffset,
-               outputBuffer: outputBuffer, outputOffset: outputOffset,
-               applyBitmask: false, completion: completion)
+        encode(
+            to: queue, logitsBuffer: logitsBuffer, logitsOffset: logitsOffset,
+            outputBuffer: outputBuffer, outputOffset: outputOffset,
+            applyBitmask: false, completion: completion)
     }
 
     /// Encode composite sampling with optional bitmask constraint.
@@ -1003,9 +1008,10 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
         outputOffset: Int,
         completion: @escaping (Int32) -> Void
     ) {
-        encodeWithSlice(to: queue, logitsBuffer: logitsBuffer, queryLength: queryLength,
-                        outputBuffer: outputBuffer, outputOffset: outputOffset,
-                        applyBitmask: false, completion: completion)
+        encodeWithSlice(
+            to: queue, logitsBuffer: logitsBuffer, queryLength: queryLength,
+            outputBuffer: outputBuffer, outputOffset: outputOffset,
+            applyBitmask: false, completion: completion)
     }
 
     /// Encode composite sampling with slice and optional bitmask.

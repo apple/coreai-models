@@ -907,8 +907,9 @@ struct MPSGraphConstrainedArgmaxTests {
         }
         let unconstrainedResult = outputBuffer.contents().assumingMemoryBound(to: Int32.self).pointee
 
-        #expect(constrainedResult == unconstrainedResult,
-                "All-ones bitmask should match unconstrained: \(constrainedResult) vs \(unconstrainedResult)")
+        #expect(
+            constrainedResult == unconstrainedResult,
+            "All-ones bitmask should match unconstrained: \(constrainedResult) vs \(unconstrainedResult)")
     }
 
     @Test("Bitmask allows only 3 tokens -- argmax picks best among them")
@@ -956,7 +957,8 @@ struct MPSGraphConstrainedCompositeTests {
     @Test("Bitmask blocks dominant token -- composite never samples it")
     func bitmaskBlocksDominantComposite() async throws {
         let device = try #require(Self.device)
-        let sampler = try MPSGraphCompositeSampler(device: device, vocabSize: Self.vocabSize, k: Self.k, temperature: 1.0)
+        let sampler = try MPSGraphCompositeSampler(
+            device: device, vocabSize: Self.vocabSize, k: Self.k, temperature: 1.0)
 
         let logitsBuffer = try #require(device.makeBuffer(length: Self.vocabSize * 2, options: .storageModeShared))
         let outputBuffer = try #require(device.makeBuffer(length: 4, options: .storageModeShared))
@@ -995,7 +997,8 @@ struct MPSGraphConstrainedCompositeTests {
     @Test("Only 3 tokens allowed -- composite samples exclusively from them")
     func compositeOnlyAllowedTokens() async throws {
         let device = try #require(Self.device)
-        let sampler = try MPSGraphCompositeSampler(device: device, vocabSize: Self.vocabSize, k: Self.k, temperature: 1.0)
+        let sampler = try MPSGraphCompositeSampler(
+            device: device, vocabSize: Self.vocabSize, k: Self.k, temperature: 1.0)
 
         let logitsBuffer = try #require(device.makeBuffer(length: Self.vocabSize * 2, options: .storageModeShared))
         let outputBuffer = try #require(device.makeBuffer(length: 4, options: .storageModeShared))
@@ -1036,7 +1039,8 @@ struct MPSGraphConstrainedCompositeTests {
     @Test("Constrained composite latency under 25ms for 32K vocab")
     func constrainedCompositePerformance() async throws {
         let device = try #require(Self.device)
-        let sampler = try MPSGraphCompositeSampler(device: device, vocabSize: Self.vocabSize, k: Self.k, temperature: 1.0)
+        let sampler = try MPSGraphCompositeSampler(
+            device: device, vocabSize: Self.vocabSize, k: Self.k, temperature: 1.0)
 
         let logitsBuffer = try #require(device.makeBuffer(length: Self.vocabSize * 2, options: .storageModeShared))
         let outputBuffer = try #require(device.makeBuffer(length: 4, options: .storageModeShared))
