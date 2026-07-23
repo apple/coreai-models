@@ -32,7 +32,7 @@ public struct CoreAIRunner {
         kvCacheStrategy: KVCacheStrategy = .auto
     ) throws {
         self.init(
-            from: try LanguageBundle(at: url),
+            bundle: try LanguageBundle(at: url),
             variant: variant,
             kvCacheStrategy: kvCacheStrategy
         )
@@ -40,7 +40,7 @@ public struct CoreAIRunner {
 
     /// Creates a runner from a LanguageBundle.
     public init(
-        from bundle: LanguageBundle,
+        bundle: LanguageBundle,
         variant: String? = nil,
         kvCacheStrategy: KVCacheStrategy = .auto
     ) {

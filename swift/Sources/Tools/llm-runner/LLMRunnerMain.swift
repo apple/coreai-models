@@ -221,7 +221,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
 
     func run() async throws {
         let verboseLevel = max(self.verboseLevel ?? 0, verbose ? 1 : 0)
-        CLILogger.setLevel(to: verboseLevel)
+        CLILogger.level = verboseLevel
 
         let resolver = ModelPaths()
         let resolvedPath = try validateAndResolveModelPath(resolver: resolver)
@@ -308,7 +308,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
 
         // Set up verbose logging environment variable first
         let verboseLevel = max(self.verboseLevel ?? 0, verbose ? 1 : 0)
-        CLILogger.setLevel(to: verboseLevel)
+        CLILogger.level = verboseLevel
 
         // Bridge hidden CLI overrides to environment variables read by the Core AI engine
         if let b = bucketSize {
@@ -530,7 +530,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         CLILogger.log("Text generator built successfully", component: "Main")
 
         // Apply chat template and count tokens for metrics
-        await PerformanceMetrics.shared.setPromptTokenCount(promptTokens.count)
+        await PerformanceMetrics.shared.recordPromptTokens(promptTokens.count)
 
         CLILogger.log("Generating text...", component: "Main")
         CLILogger.log("Input: \(displayPrompt)", component: "Main")
@@ -632,7 +632,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             InstrumentsProfiler.endDecoding(signpostID: decodingID)
 
             // Generated token count is already set by the decoding strategy
-            let generatedTokenCount = await PerformanceMetrics.shared.getGeneratedTokenCount
+            let generatedTokenCount = await PerformanceMetrics.shared.generatedTokenCount
             InstrumentsProfiler.endInference(generatedTokens: generatedTokenCount, signpostID: inferenceID)
 
             // End overall timing now that core inference is complete
@@ -924,7 +924,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         let inferenceID = InstrumentsProfiler.beginInference(
             promptTokens: vlmTokens.count, maxTokens: maxTokens)
 
-        await PerformanceMetrics.shared.setPromptTokenCount(vlmTokens.count)
+        await PerformanceMetrics.shared.recordPromptTokens(vlmTokens.count)
 
         let tokenStream = try await vlmEngine.generate(
             with: embeddedInput,
@@ -993,7 +993,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         // Record generation stats
         InstrumentsProfiler.endInference(
             generatedTokens: generatedTokens.count, signpostID: inferenceID)
-        await PerformanceMetrics.shared.setGeneratedTokenCount(generatedTokens.count)
+        await PerformanceMetrics.shared.recordGeneratedTokens(generatedTokens.count)
         await PerformanceMetrics.shared.endOverallTiming()
         await PerformanceMetrics.shared.printSummary(verbose: CLILogger.isVerbose)
 

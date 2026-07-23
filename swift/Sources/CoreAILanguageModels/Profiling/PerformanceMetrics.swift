@@ -28,9 +28,8 @@ public final class PerformanceMetrics {
     private var startInstant: ContinuousClock.Instant?
     private var endInstant: ContinuousClock.Instant?
 
-    private var promptTokenCount: Int = 0
-    private var generatedTokenCount: Int = 0
-    private var totalTokenCount: Int = 0
+    public private(set) var promptTokenCount: Int = 0
+    public private(set) var generatedTokenCount: Int = 0
 
     /// The shared PerformanceMetrics instance for production use.
     public static let shared = PerformanceMetrics()
@@ -61,17 +60,19 @@ public final class PerformanceMetrics {
 
     // MARK: - Token Counting
 
-    public func setPromptTokenCount(_ count: Int) {
+    /// Total number of prompt and generated tokens.
+    public var totalTokenCount: Int {
+        promptTokenCount + generatedTokenCount
+    }
+
+    /// Records the number of tokens in the prompt.
+    public func recordPromptTokens(_ count: Int) {
         promptTokenCount = count
     }
 
-    public func setGeneratedTokenCount(_ count: Int) {
+    /// Records the number of tokens produced during generation.
+    public func recordGeneratedTokens(_ count: Int) {
         generatedTokenCount = count
-        totalTokenCount = promptTokenCount + generatedTokenCount
-    }
-
-    public var getGeneratedTokenCount: Int {
-        return generatedTokenCount
     }
 
     // MARK: - Computed Metrics (from StatsStorage)
@@ -236,7 +237,6 @@ public final class PerformanceMetrics {
         endInstant = nil
         promptTokenCount = 0
         generatedTokenCount = 0
-        totalTokenCount = 0
         // Also reset StatsStorage since this is a full reset
         StatsStorage.shared.reset()
     }

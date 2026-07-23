@@ -157,7 +157,7 @@ struct ImageSegmenterCLI: AsyncParsableCommand {
             throw ValidationError("--image is required.")
         }
         if verbose {
-            CLILogger.setLevel(to: 1)
+            CLILogger.level = 1
         }
 
         if verbose { print("Creating image segmenter...") }
