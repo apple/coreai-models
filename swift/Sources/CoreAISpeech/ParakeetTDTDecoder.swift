@@ -72,7 +72,9 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
         let logitsSize = logitsDesc.shape.last!  // vocab + |durations|
 
         // Pull the full encoder output once; slice frame-by-frame in pure Swift.
-        let encFlat = readNDArray(encoderOutput, as: Float.self, count: tEnc * hidden)
+        // flattenAsFloat inspects the array's own scalar type, so this reads an
+        // f16 encoder output correctly (a raw `as: Float.self` read would not).
+        let encFlat = flattenAsFloat(encoderOutput)
 
         // Persistent buffers (reused across all steps).
         var inputIds = NDArray(descriptor: inputIdsDesc.resolvingDynamicDimensions([1, 1]))
@@ -112,8 +114,8 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
                     decBuf = cached
                 } else {
                     fillNDArray(&inputIds, as: Int32.self, with: [lastToken])
-                    fillNDArray(&hIn, as: Float.self, with: hState)
-                    fillNDArray(&cIn, as: Float.self, with: cState)
+                    fillFloatNDArray(&hIn, with: hState)
+                    fillFloatNDArray(&cIn, with: cState)
 
                     var stepOut = InferenceFunction.MutableViews()
                     stepOut.insert(&decOut, for: "decoder_output")
@@ -141,10 +143,10 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
                 }
 
                 // Joint(decoder_output, encoder[:, frame:frame+1, :]).
-                fillNDArray(&jointDecIn, as: Float.self, with: decBuf)
+                fillFloatNDArray(&jointDecIn, with: decBuf)
                 let encOffset = frame * hidden
                 let encSlice = Array(encFlat[encOffset..<encOffset + hidden])
-                fillNDArray(&jointEncIn, as: Float.self, with: encSlice)
+                fillFloatNDArray(&jointEncIn, with: encSlice)
 
                 var jointOutViews = InferenceFunction.MutableViews()
                 jointOutViews.insert(&logits, for: "logits")

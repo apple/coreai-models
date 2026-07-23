@@ -20,9 +20,9 @@ import Tokenizers
 /// from the local Hugging Face cache).
 ///
 /// **Parakeet TDT**: directory contains `metadata.json` (with `kind:
-/// "speech_recognizer_tdt"`, an `assets` map for `encoder` / `decoder_step` /
-/// `joint`, and a TDT `config` block), the three `.aimodel` assets, and a
-/// `processor/` subdirectory carrying the tokenizer.
+/// "speech_recognizer"` and `config.architecture: "parakeet_tdt"`, an `assets`
+/// map for `encoder` / `decoder_step` / `joint`, and a TDT `config` block), the
+/// three `.aimodel` assets, and a `processor/` subdirectory carrying the tokenizer.
 public struct SpeechBundle: Sendable {
     public let kind: Kind
     public let tokenizer: (any Tokenizer)?
@@ -30,6 +30,14 @@ public struct SpeechBundle: Sendable {
     public enum Kind: Sendable {
         case whisper(WhisperAssets)
         case parakeetTDT(ParakeetTDTAssets)
+    }
+
+    /// Speech-recognizer architecture, read from the `architecture` field of the
+    /// metadata's `config` block. Absent ⇒ `.whisper` (legacy bundles predate the
+    /// field and only ever carried Whisper assets).
+    enum Architecture: String, Sendable, Decodable {
+        case whisper
+        case parakeetTDT = "parakeet_tdt"
     }
 
     public struct WhisperAssets: Sendable {
@@ -52,15 +60,18 @@ public struct SpeechBundle: Sendable {
         if FileManager.default.fileExists(atPath: metadataURL.path) {
             let bundle = try ModelBundle(at: url)
             switch bundle.kind {
-            case .speechRecognizerTDT:
-                let assets = try await Self.loadParakeetTDT(bundle: bundle)
-                self.kind = .parakeetTDT(assets)
-                self.tokenizer = try? await Self.loadParakeetTokenizer(bundleURL: url)
             case .speechRecognizer:
-                let assets = try await Self.loadWhisper(bundleURL: url)
-                self.kind = .whisper(assets)
-                self.tokenizer = try? await Self.loadWhisperTokenizer(
-                    bundleURL: url, config: assets.generationConfig)
+                switch Self.architecture(from: bundle.raw) {
+                case .parakeetTDT:
+                    let assets = try await Self.loadParakeetTDT(bundle: bundle)
+                    self.kind = .parakeetTDT(assets)
+                    self.tokenizer = try? await Self.loadParakeetTokenizer(bundleURL: url)
+                case .whisper:
+                    let assets = try await Self.loadWhisper(bundleURL: url)
+                    self.kind = .whisper(assets)
+                    self.tokenizer = try? await Self.loadWhisperTokenizer(
+                        bundleURL: url, config: assets.generationConfig)
+                }
             default:
                 throw SpeechError.missingModel(
                     "metadata.json kind '\(bundle.kind.rawValue)' is not a speech recognizer")
@@ -75,6 +86,17 @@ public struct SpeechBundle: Sendable {
     }
 
     // MARK: - Loaders
+
+    /// Read the speech architecture from the metadata's `config.architecture`
+    /// field, defaulting to `.whisper` when the block or field is absent.
+    private static func architecture(from raw: Data) -> Architecture {
+        struct Payload: Decodable {
+            struct Config: Decodable { let architecture: Architecture? }
+            let config: Config?
+        }
+        let payload = try? JSONDecoder().decode(Payload.self, from: raw)
+        return payload?.config?.architecture ?? .whisper
+    }
 
     private static func loadWhisper(bundleURL: URL) async throws -> WhisperAssets {
         let encURL = bundleURL.appending(path: "encoder.aimodel")
@@ -144,6 +166,9 @@ public struct SpeechBundle: Sendable {
             return try? await AutoTokenizer.from(modelFolder: bundleURL)
         }
         // 2. Local HF cache via the model name from the generation config.
+        //    Only meaningful on macOS — iOS has no user HF cache directory and
+        //    `homeDirectoryForCurrentUser` is unavailable there.
+        #if os(macOS)
         if let name = config.tokenizerName {
             let cacheRoot = FileManager.default.homeDirectoryForCurrentUser
                 .appending(path: ".cache/huggingface/hub")
@@ -156,6 +181,7 @@ public struct SpeechBundle: Sendable {
                     modelFolder: snapshotsDir.appending(path: snapshot))
             }
         }
+        #endif
         return nil
     }
 
@@ -228,7 +254,7 @@ public struct GenerationConfig: Sendable {
 // MARK: - ParakeetTDTConfig
 
 /// Parakeet TDT decoder configuration, decoded from the `config` block of a
-/// `speech_recognizer_tdt` bundle's metadata.json.
+/// `speech_recognizer` bundle whose `config.architecture` is `"parakeet_tdt"`.
 public struct ParakeetTDTConfig: Sendable {
     public let vocabSize: Int
     public let blankTokenId: Int32

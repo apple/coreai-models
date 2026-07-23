@@ -239,6 +239,7 @@ func runLegacy(modelPath: String, audioPath: String?, warmup: Bool) async throws
             stepTimesMs.count, avgMs, 1000 / avgMs))
 
     print("\n── Transcription ──────────────────────────────────────────────────────")
+    #if os(macOS)
     let cacheBase = FileManager.default.homeDirectoryForCurrentUser
         .appending(path: ".cache/huggingface/hub/models--openai--whisper-large-v3-turbo/snapshots")
     if let snap = try? FileManager.default.contentsOfDirectory(atPath: cacheBase.path).first,
@@ -249,6 +250,10 @@ func runLegacy(modelPath: String, audioPath: String?, warmup: Bool) async throws
     } else {
         print("  token ids: \(tokens)")
     }
+    #else
+    // iOS has no user HF cache to load the Whisper tokenizer from.
+    print("  token ids: \(tokens)")
+    #endif
 }
 
 // MARK: - Helpers

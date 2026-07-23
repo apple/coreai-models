@@ -267,10 +267,11 @@ def _write_bundle_metadata(
 ) -> None:
     metadata = {
         "metadata_version": "0.2",
-        "kind": "speech_recognizer_tdt",
+        "kind": "speech_recognizer",
         "name": variant,
         "assets": {graph: path.name for graph, path in assets.items()},
         "config": {
+            "architecture": "parakeet_tdt",
             "vocab_size": config.vocab_size,
             "blank_token_id": config.blank_token_id,
             "decoder_hidden_size": config.decoder_hidden_size,

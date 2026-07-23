@@ -104,7 +104,7 @@ public actor SpeechRecognitionModel {
         let nFrames = MelSpectrogram.frameCount(forPCMLength: pcm.count, config: melConfig)
         let inputShape = encoderInputShape(nFrames: nFrames)
         var melArray = NDArray(descriptor: melNDDesc.resolvingDynamicDimensions(inputShape))
-        fillNDArray(&melArray, as: Float.self, with: mel)
+        fillFloatNDArray(&melArray, with: mel)
 
         // Attention mask (B, T_audio): true for real-audio frames, false for the
         // static window's zero-padding tail (and the dynamic path's trailing zero
