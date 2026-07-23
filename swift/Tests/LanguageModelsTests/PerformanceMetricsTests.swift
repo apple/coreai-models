@@ -37,12 +37,12 @@ struct PerformanceMetricsTests {
         metrics.reset()
 
         metrics.startOverallTiming()
-        metrics.setPromptTokenCount(100)
-        metrics.setGeneratedTokenCount(50)
+        metrics.recordPromptTokens(100)
+        metrics.recordGeneratedTokens(50)
         metrics.reset()
 
         #expect(metrics.totalTime == 0)
-        #expect(metrics.getGeneratedTokenCount == 0)
+        #expect(metrics.generatedTokenCount == 0)
         #expect(metrics.modelLoadTime == 0)
     }
 
@@ -51,8 +51,8 @@ struct PerformanceMetricsTests {
         let metrics = PerformanceMetrics.shared
         metrics.reset()
 
-        metrics.setPromptTokenCount(100)
-        metrics.setGeneratedTokenCount(50)
+        metrics.recordPromptTokens(100)
+        metrics.recordGeneratedTokens(50)
 
         #expect(metrics.promptThroughput == 0)
         #expect(metrics.generationThroughput == 0)
