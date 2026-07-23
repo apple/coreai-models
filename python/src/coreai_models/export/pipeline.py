@@ -11,7 +11,6 @@ MLIR quantization, and compilation into a single ``export_model`` call.
 """
 
 import asyncio
-import contextlib
 import logging
 import os
 import re
@@ -62,6 +61,8 @@ class ExportConfig:
     output_name: str | None = None
     num_layers: int | None = None
     overwrite: bool = False
+    # iOS-only: number of parallel worker processes for KMeans palettization.
+    palettization_num_workers: int = 32
     # iOS only. When True, embedding table is not quantized to int8.
     disable_embedding_quantization: bool = False
     # Optional prebuilt coreai-opt config (KMeansPalettizerConfig or
@@ -181,39 +182,19 @@ async def _async_export_model(config: ExportConfig) -> str:
 
     logger.info(f"Loading {config.hf_model_id} ({config.variant}, dtype={target_dtype})...")
 
-    # Memory-efficient layer-by-layer loading + quantizer disk-checkpointing
-    # is macOS-only for now. The iOS variant keeps the legacy full-RAM path
-    # since its palettization flow has not been validated against streaming
-    # weight loading.
-    use_memory_efficient = config.variant == "macOS"
-    temp_dir_ctx: contextlib.AbstractContextManager[str | None] = (
-        tempfile.TemporaryDirectory(prefix="coreai_export_")
-        if use_memory_efficient
-        else contextlib.nullcontext(None)
-    )
-
-    with temp_dir_ctx as temp_dir:
-        if use_memory_efficient:
-            assert temp_dir is not None  # nullcontext yields None only when not memory-efficient
-            layer_mmap_dir = os.path.join(temp_dir, "layers")
-            os.makedirs(layer_mmap_dir, exist_ok=True)
-            model = model_class.from_hf_memory_efficient(
-                config.hf_model_id,
-                max_context_length=max_context_length,
-                target_dtype=target_dtype,
-                mmap_path=layer_mmap_dir,
-                num_layers=config.num_layers,
-                hf_config_attr=entry.hf_config_attr,
-                hf_state_dict_prefix=entry.hf_state_dict_prefix,
-            )
-        else:
-            model = model_class.from_hf(
-                config.hf_model_id,
-                max_context_length=max_context_length,
-                target_dtype=target_dtype,
-                num_layers=config.num_layers,
-                disable_embedding_quantization=config.disable_embedding_quantization,
-            )
+    # Both variants load weights layer-by-layer (mmap-backed).
+    with tempfile.TemporaryDirectory(prefix="coreai_export_") as temp_dir:
+        layer_mmap_dir = os.path.join(temp_dir, "layers")
+        os.makedirs(layer_mmap_dir, exist_ok=True)
+        model = model_class.from_hf_memory_efficient(
+            config.hf_model_id,
+            max_context_length=max_context_length,
+            target_dtype=target_dtype,
+            mmap_path=layer_mmap_dir,
+            num_layers=config.num_layers,
+            hf_config_attr=entry.hf_config_attr,
+            hf_state_dict_prefix=entry.hf_state_dict_prefix,
+        )
         model = model.eval()
         # ---- 3. Resolve compression preset ----
         if config.compression_config_object is not None:
@@ -271,11 +252,8 @@ async def _async_export_model(config: ExportConfig) -> str:
                 tokenizer = AutoTokenizer.from_pretrained(config.hf_model_id)
                 return get_c4(tokenizer)
 
-            quantizer_mmap_dir: str | None = None
-            if use_memory_efficient:
-                assert temp_dir is not None
-                quantizer_mmap_dir = os.path.join(temp_dir, "quantized")
-                os.makedirs(quantizer_mmap_dir, exist_ok=True)
+            quantizer_mmap_dir = os.path.join(temp_dir, "quantized")
+            os.makedirs(quantizer_mmap_dir, exist_ok=True)
 
             # Pass-through prebuilt QuantizerConfig objects.
             # copy dicts so we don't mutate the shared preset.
@@ -323,7 +301,16 @@ async def _async_export_model(config: ExportConfig) -> str:
                 key_cache,
                 value_cache,
             )
-            model = palettize_pytorch_model(model, palettization_inputs, torch_palettization_config)
+            palettization_mmap_dir = os.path.join(temp_dir, "palettized")
+            os.makedirs(palettization_mmap_dir, exist_ok=True)
+
+            model = palettize_pytorch_model(
+                model,
+                palettization_inputs,
+                torch_palettization_config,
+                mmap_dir=palettization_mmap_dir,
+                num_workers=config.palettization_num_workers,
+            )
 
         # ---- 4. Variant-specific export ----
         if config.variant == "macOS":

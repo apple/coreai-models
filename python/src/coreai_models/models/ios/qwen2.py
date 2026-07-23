@@ -257,47 +257,65 @@ class Qwen2ForCausalLMForiOS(BaseForCausalLMForiOS):
         )
 
     def _mutate_state_dict(self, state_dict: dict[str, torch.Tensor]) -> None:
-        max_layer = -1
+        """Rewrite HF weight keys into the iOS module layout, in place.
+
+        Called repeatedly on partial state_dicts: the full dict, one
+        single-layer slice at a time, and a shared-params-only slice
+        (embeddings / lm_head). Handles any subset of keys and does not assume
+        all layers are present.
+        """
+        present_layers = set()
         for k in state_dict:
             name_split = k.split(".")
             if len(name_split) != 6:
                 continue
             if not k.startswith("model.layers."):
                 continue
-            max_layer = max(max_layer, int(name_split[2]))
+            present_layers.add(int(name_split[2]))
 
-        if max_layer < 0:
-            err = "invalid state_dict"
+        # Access present layers' keys unconditionally so a malformed layer fails
+        # loudly instead of being silently skipped; a layer-less slice is valid
+        # only if it carries shared params.
+        has_shared_keys = (
+            "model.embed_tokens.weight" in state_dict or "lm_head.weight" in state_dict
+        )
+        if not present_layers and not has_shared_keys:
+            err = (
+                "state_dict has no recognizable keys: expected per-layer weights "
+                "('model.layers.N.*') and/or shared params "
+                "('model.embed_tokens.weight', 'lm_head.weight')."
+            )
             raise ValueError(err)
 
-        for i in range(max_layer + 1):
+        for layer_idx in sorted(present_layers):
             # Reshape attention weights for Conv2d
             for proj in ["q_proj", "k_proj", "v_proj", "o_proj"]:
-                weight_key = f"model.layers.{i}.self_attn.{proj}.weight"
+                weight_key = f"model.layers.{layer_idx}.self_attn.{proj}.weight"
                 state_dict[weight_key] = state_dict[weight_key].unsqueeze(-1).unsqueeze(-1)
 
             # Reshape MLP weights for Conv2d
             for proj in ["up_proj", "gate_proj", "down_proj"]:
-                weight_key = f"model.layers.{i}.mlp.{proj}.weight"
+                weight_key = f"model.layers.{layer_idx}.mlp.{proj}.weight"
                 state_dict[weight_key] = state_dict[weight_key].unsqueeze(-1).unsqueeze(-1)
 
-        # Handle embeddings
-        embedding_table = state_dict["model.embed_tokens.weight"].unsqueeze(1)
-        if not self.disable_embedding_quantization:
-            embedding_table, scale, zero_point = quantize_per_tensor(
-                embedding_table, nbits=8, symmetric=True
-            )
-        else:
-            scale = torch.tensor(1.0, dtype=embedding_table.dtype)
-            zero_point = torch.tensor(0, dtype=torch.int8)
+        # Handle embeddings (shared param; absent from per-layer slices)
+        if "model.embed_tokens.weight" in state_dict:
+            embedding_table = state_dict["model.embed_tokens.weight"].unsqueeze(1)
+            if not self.disable_embedding_quantization:
+                embedding_table, scale, zero_point = quantize_per_tensor(
+                    embedding_table, nbits=8, symmetric=True
+                )
+            else:
+                scale = torch.tensor(1.0, dtype=embedding_table.dtype)
+                zero_point = torch.tensor(0, dtype=torch.int8)
 
-        state_dict["load_embeddings.embedding_table"] = embedding_table
-        state_dict["gather_embeddings.scale"] = scale
-        state_dict["gather_embeddings.zero_point"] = zero_point
-        state_dict["extend.emb_scale"] = scale
-        state_dict["extend.emb_zero_point"] = zero_point
+            state_dict["load_embeddings.embedding_table"] = embedding_table
+            state_dict["gather_embeddings.scale"] = scale
+            state_dict["gather_embeddings.zero_point"] = zero_point
+            state_dict["extend.emb_scale"] = scale
+            state_dict["extend.emb_zero_point"] = zero_point
 
-        state_dict.pop("model.embed_tokens.weight")
+            state_dict.pop("model.embed_tokens.weight")
 
         # Qwen2Model is held inside Qwen2Extend — add "extend." prefix
         new_state_dict = {}
@@ -313,7 +331,7 @@ class Qwen2ForCausalLMForiOS(BaseForCausalLMForiOS):
             state_dict.pop(k)
         state_dict.update(new_state_dict)
 
-        if not self.config.tie_word_embeddings:
+        if not self.config.tie_word_embeddings and "lm_head.weight" in state_dict:
             state_dict["extend.lm_head.weight"] = state_dict["lm_head.weight"]
 
         state_dict.pop("lm_head.weight", None)

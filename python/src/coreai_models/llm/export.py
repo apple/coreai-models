@@ -114,6 +114,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Truncate to N layers (useful for debugging)",
     )
     parser.add_argument(
+        "--ios-compression-num-workers",
+        type=int,
+        default=None,
+        help="Number of parallel worker processes for KMeans palettization "
+        "(default: 32). iOS only.",
+    )
+    parser.add_argument(
         "--list-presets",
         action="store_true",
         help="List available compression presets and exit",
@@ -353,6 +360,12 @@ def _resolve_export_config(args: argparse.Namespace) -> ExportConfig:
             f"preset. Available: {list_presets()}"
         )
 
+    if args.ios_compression_num_workers is not None and variant != "iOS":
+        raise SystemExit(
+            f"--ios-compression-num-workers requires --platform iOS (got '{variant}')."
+        )
+    palettization_num_workers = args.ios_compression_num_workers or 32
+
     return ExportConfig(
         hf_model_id=hf_model_id,
         variant=variant,
@@ -365,6 +378,7 @@ def _resolve_export_config(args: argparse.Namespace) -> ExportConfig:
         overwrite=args.overwrite,
         compression_config_object=compression_config_object,
         disable_embedding_quantization=args.disable_embedding_quantization_ios,
+        palettization_num_workers=palettization_num_workers,
     )
 
 
@@ -430,6 +444,7 @@ def main() -> None:
         print(f"  overwrite:          {config.overwrite}")
         if config.variant == "iOS":
             print(f"  disable_embedding_quantization: {config.disable_embedding_quantization}")
+            print(f"  palettization_num_workers: {config.palettization_num_workers}")
         return
 
     result = export_model(config)
