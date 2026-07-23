@@ -9,6 +9,10 @@ import Foundation
 
 /// Extension to convert Duration to common time units.
 ///
+/// - Note: This is an internal implementation detail. It is intentionally not
+///   `public`: vending members on a standard-library type we don't own would
+///   pollute `Duration`'s API surface for every client of this library.
+///
 /// Example usage:
 /// ```swift
 /// let start = ContinuousClock.now
@@ -18,13 +22,13 @@ import Foundation
 /// ```
 extension Duration {
     /// Duration in seconds as a Double.
-    public var inSeconds: Double {
+    var inSeconds: Double {
         let (secs, attoseconds) = self.components
         return Double(secs) + Double(attoseconds) / 1e18
     }
 
     /// Duration in milliseconds as a Double.
-    public var inMilliseconds: Double {
+    var inMilliseconds: Double {
         inSeconds * 1000.0
     }
 }
