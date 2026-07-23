@@ -182,23 +182,16 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
             throw InferenceRuntimeError.invalidState("Cannot load 'load_embeddings'")
         }
 
-        guard case .ndArray(let embeddingDesc) = embeddingFunction.descriptor.outputDescriptor(of: "embedding_table")
+        var outputs = try await embeddingFunction.run(inputs: [:])
+        guard let embeddingTableValue = outputs.remove("embedding_table"),
+            let embeddingTableArray = embeddingTableValue.ndArray
         else {
             throw InferenceRuntimeError.invalidState(
-                "load_embeddings has no 'embedding_table' ndArray output descriptor")
+                "load_embeddings function should have output NDArray named embedding_table")
         }
-        var embeddingArray = NDArray(descriptor: embeddingDesc)
 
-        var outputViews = InferenceFunction.MutableViews()
-        outputViews.insert(&embeddingArray, for: "embedding_table")
-
-        _ = try await embeddingFunction.run(
-            inputs: [:],
-            outputViews: consume outputViews
-        )
-
-        CLILogger.log("Embeddings loaded: shape=\(embeddingArray.shape)")
-        return embeddingArray
+        CLILogger.log("Embeddings loaded: shape=\(embeddingTableArray.shape)")
+        return embeddingTableArray
     }
 
     // MARK: - Function Loading (lazy)
