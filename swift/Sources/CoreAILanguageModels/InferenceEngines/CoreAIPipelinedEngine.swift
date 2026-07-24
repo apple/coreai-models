@@ -9,6 +9,7 @@ import Foundation
 import Metal
 import MetalPerformanceShaders
 import Synchronization
+import Tokenizers
 import os
 
 // MARK: - Timing
@@ -41,7 +42,7 @@ private let minimumMPSNDArrayBufferSize = 64
 /// - Pipeline-depth-matched buffer rotation for CPU/GPU overlap
 /// - Growing KV cache with pipelined expansion
 /// - All tensors are owned MTLBuffers — Core AI never allocates/frees them
-final class CoreAIPipelinedEngine: InferenceEngine, Sendable {
+final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable, Sendable {
     typealias ConfigType = ModelConfig
 
     nonisolated(unsafe) private var engine: EngineImpl
@@ -59,6 +60,9 @@ final class CoreAIPipelinedEngine: InferenceEngine, Sendable {
     // Generation lifecycle
     private let _activeToken = Mutex<GenerationToken?>(nil)
     private let _generationTask = Mutex<Task<Void, Never>?>(nil)
+
+    // Constrained session cache — checkout/checkin pattern for reuse across calls
+    private let _constrainedSessionCache = Mutex<ConstrainedSessionHandle?>(nil)
 
     var isBusy: Bool { _activeToken.withLock { $0 != nil } }
 
@@ -242,6 +246,64 @@ final class CoreAIPipelinedEngine: InferenceEngine, Sendable {
         return GenerationSequence(base: base, stopReasonStore: stopReasonStore)
     }
 
+    // MARK: - Constrained Generation (GPU bitmask path)
+
+    /// Generate tokens with grammar-constrained sampling on GPU.
+    ///
+    /// Unlike `generate()`, this method applies an xgrammar bitmask inside the GPU sampler
+    /// each step, enabling constrained decoding without falling back to the sequential engine.
+    ///
+    /// The loop is semi-pipelined: inference overlaps with bitmask computation, but sampling
+    /// waits per token (grammar state is inherently sequential).
+    func generateConstrained(
+        with input: [TokenId],
+        samplingConfiguration: SamplingConfiguration,
+        maxTokens: Int,
+        session: ConstrainedSessionHandle
+    ) throws -> AsyncThrowingStream<TokenId, Error> {
+        let (stream, continuation) = AsyncThrowingStream<TokenId, Error>.makeStream()
+
+        let sessionBox = session
+        let isCancelled = Atomic<Bool>(false)
+        continuation.onTermination = { _ in
+            isCancelled.store(true, ordering: .relaxed)
+        }
+
+        let token = GenerationToken()
+        _activeToken.withLock { $0 = token }
+
+        let task = Task {
+            self.acquireEngine()
+            defer {
+                self.releaseEngine()
+                self.storeConstrainedSessionForReuse(sessionBox)
+                if self._activeToken.withLock({ $0 === token }) {
+                    self._activeToken.withLock { $0 = nil }
+                    self._generationTask.withLock { $0 = nil }
+                }
+            }
+            self.engine.reset()
+            do {
+                try await self.engine.runConstrainedCompletion(
+                    prompt: input,
+                    sampler: samplingConfiguration,
+                    sessionBox: sessionBox,
+                    maxTokens: maxTokens,
+                    isCancelled: isCancelled,
+                    yieldingTo: continuation
+                )
+                continuation.finish()
+            } catch is CancellationError {
+                continuation.finish()
+            } catch {
+                continuation.finish(throwing: error)
+            }
+        }
+        _generationTask.withLock { $0 = task }
+
+        return stream
+    }
+
     /// Wait for any in-flight generate() Task to return the engine.
     private func drain() {
         var attempts = 0
@@ -325,6 +387,98 @@ final class CoreAIPipelinedEngine: InferenceEngine, Sendable {
         acquireEngine()
         defer { releaseEngine() }
         try await engine.performWarmup(queryLength: queryLength, samplingConfig: sampling)
+    }
+}
+
+// MARK: - Constrained Session Cache
+
+extension CoreAIPipelinedEngine {
+    /// Check out a constrained session from the cache, or create a new one.
+    /// The cache slot is emptied — concurrent calls get independent sessions.
+    func getOrCreateConstrainedSession(
+        jsonSchema: String,
+        tokenizer: any Tokenizer,
+        vocabSize: Int,
+        stopTokenIds: [Int32]?
+    ) throws -> ConstrainedSessionHandle {
+        if let cached: ConstrainedSessionHandle = _constrainedSessionCache.withLock({ cache in
+            guard let box = cache, box.schema == jsonSchema else {
+                cache = nil
+                return nil
+            }
+            cache = nil
+            return box
+        }) {
+            cached.reset()
+            return cached
+        }
+        let session = try ConstrainedGenerationSession(
+            jsonSchema: jsonSchema,
+            tokenizer: tokenizer,
+            vocabSize: vocabSize,
+            stopTokenIds: stopTokenIds
+        )
+        return ConstrainedSessionHandle(session: session, tokenizer: tokenizer)
+    }
+
+    /// Return a session box to the cache for reuse by the next call.
+    func storeConstrainedSessionForReuse(_ box: ConstrainedSessionHandle) {
+        _constrainedSessionCache.withLock { $0 = box }
+    }
+}
+
+// MARK: - Constrained Session Handle
+
+/// Thread-safe handle to a `ConstrainedGenerationSession`.
+///
+/// Access is serialized by the engine's `acquireEngine()`/`releaseEngine()` atomic
+/// gate — only one Task mutates the session at a time. The `@unchecked Sendable`
+/// conformance is justified by this single-writer guarantee.
+///
+/// The handle exposes only the operations the engine loop needs — no raw
+/// session access from outside.
+package final class ConstrainedSessionHandle: @unchecked Sendable {
+    /// Schema string is immutable after init — cached to avoid repeated access.
+    let schema: String
+
+    /// Tokenizer used for jump-forward string encoding.
+    private let tokenizer: any Tokenizer
+
+    private var _session: ConstrainedGenerationSession
+
+    init(session: consuming ConstrainedGenerationSession, tokenizer: any Tokenizer) {
+        self.schema = session.schema
+        self.tokenizer = tokenizer
+        self._session = session
+    }
+
+    var isTerminated: Bool { _session.isTerminated }
+
+    func acceptToken(_ token: Int32) -> Bool {
+        _session.acceptToken(token)
+    }
+
+    func fillBitmask(into ptr: UnsafeMutablePointer<Int32>) -> ConstrainedGenerationSession.BitmaskResult {
+        _session.fillBitmask(into: ptr)
+    }
+
+    func reset() { _session.reset() }
+
+    func rollback(_ numTokens: Int = 1) { _session.rollback(numTokens) }
+
+    func findJumpForwardString() -> String? {
+        _session.findJumpForwardString()
+    }
+
+    /// Decode a sequence of token IDs back into a string using the stored tokenizer.
+    func decodeTokens(_ tokens: [Int32]) -> String {
+        tokenizer.decode(tokens: tokens.map(Int.init))
+    }
+
+    /// Tokenize a string for jump-forward injection. Uses the stored tokenizer
+    /// without adding special tokens.
+    func tokenizeForJumpForward(_ string: String) -> [Int32] {
+        tokenizer.encode(text: string).map(Int32.init)
     }
 }
 
@@ -1112,6 +1266,341 @@ private struct EngineImpl: ~Copyable {
                 }
                 cmdBuf.addCompletedHandler { _ in sentinelCont.resume() }
                 cmdBuf.commit()
+            }
+        }
+    }
+
+    // MARK: - Constrained Run Completion
+
+    /// Semi-pipelined constrained generation loop.
+    ///
+    /// Unlike `runCompletion` which fires steps asynchronously, this awaits each token
+    /// before computing the next bitmask (grammar state is sequential).
+    mutating func runConstrainedCompletion(
+        prompt: [Int32],
+        sampler: SamplingConfiguration,
+        sessionBox: ConstrainedSessionHandle,
+        maxTokens: Int,
+        isCancelled: borrowing Atomic<Bool>,
+        yieldingTo continuation: AsyncThrowingStream<Int32, Error>.Continuation
+    ) async throws {
+        let gpuSampler = try getOrCreateSampler(for: sampler)
+
+        // Get the bitmask buffer from whichever concrete sampler we have
+        let bitmaskBuffer: MTLBuffer
+        if let composite = gpuSampler as? MPSGraphCompositeSampler {
+            bitmaskBuffer = composite.bitmaskBuffer
+        } else if let argmax = gpuSampler as? MPSGraphArgmaxSampler {
+            bitmaskBuffer = argmax.bitmaskBuffer
+        } else {
+            throw InferenceRuntimeError.invalidArgument(
+                "Constrained generation requires MPSGraphArgmaxSampler or MPSGraphCompositeSampler")
+        }
+
+        // Pre-grow KV cache
+        let totalNeeded = prompt.count + maxTokens
+        try kvCache.ensureCapacity(forContextLength: totalNeeded, queue: pipelineQueue)
+        try logits.ensureCapacity(forContextLength: 1)
+
+        // Prefill prompt (unconstrained -- grammar doesn't constrain the prompt)
+        let prefillTokens: [Int32]
+        if prompt.count > config.chunkThreshold {
+            let remaining = try await processChunkedInput(tokens: prompt)
+            prefillTokens = Array(remaining)
+        } else {
+            prefillTokens = prompt
+        }
+
+        // Fill initial bitmask — the first generated token must also be constrained
+        // (e.g. JSON schema requires '{' as first character, not '<think>')
+        let bitmaskPtr = bitmaskBuffer.contents().assumingMemoryBound(to: Int32.self)
+        let initialMask = sessionBox.fillBitmask(into: bitmaskPtr)
+        if case .terminated = initialMask {
+            return  // Grammar already terminated — nothing to generate
+        }
+        let applyInitialMask = initialMask == .constrained
+
+        // Encode prefill and sample first token
+        var lastToken: Int32 = try await withCheckedThrowingContinuation { cont in
+            do {
+                try _encodeStepForConstrainedGeneration(
+                    tokens: prefillTokens,
+                    gpuSampler: gpuSampler,
+                    applyBitmask: applyInitialMask
+                ) { token in
+                    cont.resume(returning: token)
+                }
+            } catch {
+                cont.resume(throwing: error)
+            }
+        }
+
+        continuation.yield(lastToken)
+
+        // Constrained decode loop
+        var generated = 1
+        while generated < maxTokens {
+            guard !isCancelled.load(ordering: .relaxed) else { break }
+            try Task.checkCancellation()
+
+            // Accept previous token in grammar
+            if !sessionBox.acceptToken(lastToken) { break }
+            if sessionBox.isTerminated { break }
+
+            // Check for jump-forward: deterministic grammar segments that can be
+            // batch-encoded without per-token sampling (saves N-1 round-trips)
+            if let jumpString = sessionBox.findJumpForwardString(),
+                let jumpTokens = tokenizeJumpForward(jumpString, sessionBox: sessionBox)
+            {
+                // Batch-encode jump-forward tokens + sample next token after them
+                let bitmaskPtr = bitmaskBuffer.contents().assumingMemoryBound(to: Int32.self)
+                let postJumpMask = sessionBox.fillBitmask(into: bitmaskPtr)
+                if case .terminated = postJumpMask { break }
+                let applyMaskAfterJump = postJumpMask == .constrained
+
+                lastToken = try await withCheckedThrowingContinuation { cont in
+                    do {
+                        try _encodeStepForConstrainedGeneration(
+                            tokens: jumpTokens,
+                            gpuSampler: gpuSampler,
+                            applyBitmask: applyMaskAfterJump
+                        ) { token in
+                            cont.resume(returning: token)
+                        }
+                    } catch {
+                        cont.resume(throwing: error)
+                    }
+                }
+
+                // Yield the jump-forward tokens (deterministic) + the sampled token
+                for jt in jumpTokens {
+                    continuation.yield(jt)
+                }
+                continuation.yield(lastToken)
+                generated += jumpTokens.count + 1
+                continue
+            }
+
+            // Fill bitmask — may signal unconstrained (all tokens allowed) or terminated
+            let bitmaskPtr = bitmaskBuffer.contents().assumingMemoryBound(to: Int32.self)
+            let bitmaskResult = sessionBox.fillBitmask(into: bitmaskPtr)
+            if case .terminated = bitmaskResult { break }
+            let applyMask = bitmaskResult == .constrained
+
+            // Encode inference + sampling
+            lastToken = try await withCheckedThrowingContinuation { cont in
+                do {
+                    try _encodeStepForConstrainedGeneration(
+                        tokens: [],
+                        gpuSampler: gpuSampler,
+                        applyBitmask: applyMask
+                    ) { token in
+                        cont.resume(returning: token)
+                    }
+                } catch {
+                    cont.resume(throwing: error)
+                }
+            }
+
+            continuation.yield(lastToken)
+            generated += 1
+        }
+
+        // Drain: sentinel command buffer to ensure all GPU work completes
+        await withCheckedContinuation { (sentinelCont: CheckedContinuation<Void, Never>) in
+            do {
+                let queue = pipelineQueue
+                guard let cmdBuf = queue.makeCommandBuffer() else {
+                    sentinelCont.resume()
+                    return
+                }
+                cmdBuf.addCompletedHandler { _ in sentinelCont.resume() }
+                cmdBuf.commit()
+            }
+        }
+    }
+
+    /// Tokenize a jump-forward string and accept each token in the grammar.
+    ///
+    /// Returns the token IDs if ALL tokens are accepted by the grammar, or nil if
+    /// there's a tokenization disagreement (the host tokenizer produces tokens that
+    /// cross byte boundaries differently than xgrammar expects). On failure, rolls
+    /// back any partially-accepted tokens to restore grammar state.
+    private func tokenizeJumpForward(
+        _ string: String,
+        sessionBox: ConstrainedSessionHandle
+    ) -> [Int32]? {
+        let tokenIds = sessionBox.tokenizeForJumpForward(string)
+        guard !tokenIds.isEmpty else { return nil }
+
+        // Boundary-safety trim (MLX-style): only keep tokens whose cumulative
+        // decoded byte length is strictly less than the FF string's byte length.
+        // This prevents tokenization boundary disagreements where multi-byte
+        // tokens span grammar-forced character boundaries differently than the
+        // model's BPE tokenizer expects.
+        let ffByteLength = string.utf8.count
+        var safeCount = 0
+        for i in 1...tokenIds.count {
+            let prefixDecoded = sessionBox.decodeTokens(Array(tokenIds.prefix(i)))
+            if prefixDecoded.utf8.count < ffByteLength {
+                safeCount = i
+            } else {
+                break
+            }
+        }
+        guard safeCount > 0 else { return nil }
+
+        let safeTokens = Array(tokenIds.prefix(safeCount))
+
+        // Accept each safe token one-at-a-time; rollback on rejection.
+        var accepted = 0
+        for tokenId in safeTokens {
+            if !sessionBox.acceptToken(tokenId) {
+                if accepted > 0 {
+                    sessionBox.rollback(accepted)
+                }
+                return nil
+            }
+            accepted += 1
+        }
+
+        return safeTokens
+    }
+
+    /// Single encode step for constrained generation (prefill or decode).
+    /// Calls completion with the sampled token.
+    private mutating func _encodeStepForConstrainedGeneration(
+        tokens: [Int32],
+        gpuSampler: any MPSGraphSampler,
+        applyBitmask: Bool,
+        completion: @escaping (Int32) -> Void
+    ) throws {
+        let actualTokenCount = tokens.isEmpty ? 1 : tokens.count
+        let queryLength = actualTokenCount
+
+        defer {
+            processedTokenCount += actualTokenCount
+            step += 1
+        }
+
+        // Write tokens to input buffer
+        let tokenByteOffset = processedTokenCount * MemoryLayout<Int32>.size
+        if !tokens.isEmpty {
+            let ptr = inputTokensBuffer.contents().bindMemory(
+                to: Int32.self, capacity: processedTokenCount + queryLength)
+            for (i, token) in tokens.enumerated() {
+                ptr[processedTokenCount + i] = token
+            }
+        }
+
+        let cachePosBuffer = cachePositionBuffers[step % pipelineDepth]
+        let posLength = processedTokenCount + queryLength
+
+        let tokenShape = [1, queryLength]
+        let tokenStrides = try resolvedStrides(descriptor: inputIdsBaseDesc, shape: tokenShape)
+        let tokenValue = unsafe InferenceFunction.AsyncValue(
+            unsafeBuffer: inputTokensBuffer,
+            byteOffset: tokens.isEmpty ? 0 : tokenByteOffset,
+            scalarType: .int32,
+            shape: tokenShape,
+            strides: tokenStrides
+        )
+        let posShape = [1, posLength]
+        let posStrides = try resolvedStrides(descriptor: positionIdsBaseDesc, shape: posShape)
+        let posValue = unsafe InferenceFunction.AsyncValue(
+            unsafeBuffer: cachePosBuffer,
+            byteOffset: 0,
+            scalarType: .int32,
+            shape: posShape,
+            strides: posStrides
+        )
+
+        let asyncInputs: [String: InferenceFunction.AsyncValue] = [
+            inputIdsName: tokenValue,
+            positionIdsName: posValue,
+        ]
+
+        let keyBuffer = kvCache.keyBinding.metalBuffer
+        let keyShape = kvCache.keyBinding.layout.shape
+        let keyStrides = kvCache.keyBinding.layout.strides
+        var keyState = unsafe InferenceFunction.AsyncMutableValue(
+            unsafeBuffer: keyBuffer, byteOffset: 0,
+            scalarType: keyCacheScalarType, shape: keyShape, strides: keyStrides
+        )
+        let valBuffer = kvCache.valueBinding.metalBuffer
+        let valShape = kvCache.valueBinding.layout.shape
+        let valStrides = kvCache.valueBinding.layout.strides
+        var valState = unsafe InferenceFunction.AsyncMutableValue(
+            unsafeBuffer: valBuffer, byteOffset: 0,
+            scalarType: valueCacheScalarType, shape: valShape, strides: valStrides
+        )
+
+        var asyncStates = InferenceFunction.AsyncMutableViews()
+        asyncStates.insert(&keyState, for: keyCacheName)
+        asyncStates.insert(&valState, for: valueCacheName)
+
+        let logitsBuffer = logits.metalBuffer
+        let logitsShape = [1, queryLength, vocabSize]
+        let logitsStrides = try resolvedStrides(descriptor: logitsBaseDesc, shape: logitsShape)
+        var logitsOutput = unsafe InferenceFunction.AsyncMutableValue(
+            unsafeBuffer: logitsBuffer, byteOffset: 0,
+            scalarType: .float16, shape: logitsShape, strides: logitsStrides
+        )
+
+        var asyncOutputs = InferenceFunction.AsyncMutableViews()
+        asyncOutputs.insert(&logitsOutput, for: logitsOutputName)
+
+        // Encode inference
+        let _ = try function.encode(
+            inputs: asyncInputs,
+            states: consume asyncStates,
+            outputViews: consume asyncOutputs,
+            to: computeStream
+        )
+
+        // GPU sampling
+        let outputBuffer = inputTokensBuffer
+        let queue = pipelineQueue
+
+        if queryLength == 1 {
+            if let compositeSampler = gpuSampler as? MPSGraphCompositeSampler {
+                compositeSampler.encode(
+                    to: queue, logitsBuffer: logitsBuffer, logitsOffset: 0,
+                    outputBuffer: outputBuffer, outputOffset: 0,
+                    applyBitmask: applyBitmask, completion: completion
+                )
+            } else if let argmaxSampler = gpuSampler as? MPSGraphArgmaxSampler {
+                argmaxSampler.encode(
+                    to: queue, logitsBuffer: logitsBuffer, logitsOffset: 0,
+                    outputBuffer: outputBuffer, outputOffset: 0,
+                    applyBitmask: applyBitmask, completion: completion
+                )
+            } else {
+                gpuSampler.encode(
+                    to: queue, logitsBuffer: logitsBuffer, logitsOffset: 0,
+                    outputBuffer: outputBuffer, outputOffset: 0,
+                    completion: completion
+                )
+            }
+        } else {
+            if let compositeSampler = gpuSampler as? MPSGraphCompositeSampler {
+                compositeSampler.encodeWithSlice(
+                    to: queue, logitsBuffer: logitsBuffer, queryLength: actualTokenCount,
+                    outputBuffer: outputBuffer, outputOffset: 0,
+                    applyBitmask: applyBitmask, completion: completion
+                )
+            } else if let argmaxSampler = gpuSampler as? MPSGraphArgmaxSampler {
+                argmaxSampler.encodeWithSlice(
+                    to: queue, logitsBuffer: logitsBuffer, queryLength: actualTokenCount,
+                    outputBuffer: outputBuffer, outputOffset: 0,
+                    applyBitmask: applyBitmask, completion: completion
+                )
+            } else {
+                gpuSampler.encodeWithSlice(
+                    to: queue, logitsBuffer: logitsBuffer, queryLength: actualTokenCount,
+                    outputBuffer: outputBuffer, outputOffset: 0,
+                    completion: completion
+                )
             }
         }
     }
