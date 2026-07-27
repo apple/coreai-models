@@ -9,7 +9,7 @@ import CoreAIShared
 import Foundation
 import Tokenizers
 
-// MARK: - SpeechBundle
+// MARK: - SpeechRecognitionBundle
 
 /// Locates and loads the assets inside a CoreAISpeech model bundle directory.
 ///
@@ -23,7 +23,7 @@ import Tokenizers
 /// "speech_recognizer"` and `config.architecture: "parakeet_tdt"`, an `assets`
 /// map for `encoder` / `decoder_step` / `joint`, and a TDT `config` block), the
 /// three `.aimodel` assets, and a `processor/` subdirectory carrying the tokenizer.
-public struct SpeechBundle: Sendable {
+public struct SpeechRecognitionBundle: Sendable {
     public let kind: Kind
     public let tokenizer: (any Tokenizer)?
 
@@ -192,7 +192,7 @@ public struct SpeechBundle: Sendable {
             do {
                 return try await AutoTokenizer.from(modelFolder: processor, strict: false)
             } catch {
-                fputs("[SpeechBundle] Failed to load Parakeet tokenizer: \(error)\n", stderr)
+                fputs("[SpeechRecognitionBundle] Failed to load Parakeet tokenizer: \(error)\n", stderr)
                 return nil
             }
         }

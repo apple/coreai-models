@@ -17,13 +17,13 @@ import Tokenizers
 /// auto-detected from the bundle's metadata.json (or the legacy
 /// encoder/decoder filename convention for Whisper).
 public actor SpeechRecognitionModel {
-    private let bundle: SpeechBundle
+    private let bundle: SpeechRecognitionBundle
     private let decoder: any SpeechDecoder
     private let melConfig: MelConfig
     private let resources: DecoderResources
 
     public init(resourcesAt url: URL) async throws {
-        self.bundle = try await SpeechBundle(at: url)
+        self.bundle = try await SpeechRecognitionBundle(at: url)
         switch bundle.kind {
         case .whisper(let assets):
             self.decoder = WhisperDecoder()
