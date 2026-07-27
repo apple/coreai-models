@@ -177,13 +177,17 @@ public enum SegmentationPostprocessor {
             #endif
         }
 
-        // Mask: sigmoid → nearest-neighbor upsample → threshold.
+        // Mask: sigmoid → bilinear upsample → threshold.
+        // Threshold AFTER upsampling: pre-thresholding then resampling locks in nearest-neighbor
+        // staircase artifacts (the binary edge propagates straight through any kernel), which is
+        // especially obvious for the SAM3 lite export — its mask grid is
+        // ~10× lower resolution than the baseline's.
         let maskBase = (batchIndex * queryCount + queryIndex) * maskHeight * maskWidth
         let lowResMask = output.predictedMasks[maskBase..<(maskBase + maskHeight * maskWidth)].map {
             sigmoid($0)
         }
 
-        let binaryMask = nearestNeighborUpsampleToBool(
+        let binaryMask = bilinearUpsampleToBool(
             source: lowResMask,
             sourceHeight: maskHeight, sourceWidth: maskWidth,
             destinationHeight: outputHeight, destinationWidth: outputWidth,
@@ -214,7 +218,7 @@ public enum SegmentationPostprocessor {
         let probabilityGrid = output.semanticSegment[0..<(segmentHeight * segmentWidth)].map {
             sigmoid($0)
         }
-        let probabilities = nearestNeighborUpsampleToFloat(
+        let probabilities = bilinearUpsampleToFloat(
             source: probabilityGrid,
             sourceHeight: segmentHeight, sourceWidth: segmentWidth,
             destinationHeight: outputHeight, destinationWidth: outputWidth
@@ -228,39 +232,78 @@ public enum SegmentationPostprocessor {
         1.0 / (1.0 + exp(-x))
     }
 
-    /// Nearest-neighbor upsample a Float grid and threshold to Bool.
+    /// Bilinear-upsample a Float grid and threshold at the destination resolution.
     ///
-    /// Matches Python: `Image.fromarray(...).resize((W, H), Image.NEAREST)`
-    static func nearestNeighborUpsampleToBool(
+    /// Pre-image sampling (PIL `BILINEAR` / align-corners=False semantics): the
+    /// destination pixel center maps to source coordinate
+    /// `((row + 0.5) * sH/dH - 0.5, (col + 0.5) * sW/dW - 0.5)`, clamped into the
+    /// source bounds, and the four neighboring source samples are bilinearly
+    /// blended. Thresholding happens *after* the blend, so binary mask edges look
+    /// smooth even at large upscale ratios — pre-thresholding then resampling
+    /// would lock in a step-ladder staircase regardless of kernel choice.
+    public static func bilinearUpsampleToBool(
         source: [Float],
         sourceHeight: Int, sourceWidth: Int,
         destinationHeight: Int, destinationWidth: Int,
         threshold: Float
     ) -> [Bool] {
         var output = [Bool](repeating: false, count: destinationHeight * destinationWidth)
+        let scaleY = Float(sourceHeight) / Float(destinationHeight)
+        let scaleX = Float(sourceWidth) / Float(destinationWidth)
+        let maxY = Float(sourceHeight - 1)
+        let maxX = Float(sourceWidth - 1)
         for outputRow in 0..<destinationHeight {
-            let sourceRow = min(sourceHeight - 1, outputRow * sourceHeight / destinationHeight)
+            let yFloat = max(0, min(maxY, (Float(outputRow) + 0.5) * scaleY - 0.5))
+            let y0 = Int(yFloat.rounded(.down))
+            let y1 = min(sourceHeight - 1, y0 + 1)
+            let wy = yFloat - Float(y0)
             for outputColumn in 0..<destinationWidth {
-                let sourceColumn = min(sourceWidth - 1, outputColumn * sourceWidth / destinationWidth)
-                output[outputRow * destinationWidth + outputColumn] =
-                    source[sourceRow * sourceWidth + sourceColumn] >= threshold
+                let xFloat = max(0, min(maxX, (Float(outputColumn) + 0.5) * scaleX - 0.5))
+                let x0 = Int(xFloat.rounded(.down))
+                let x1 = min(sourceWidth - 1, x0 + 1)
+                let wx = xFloat - Float(x0)
+                let v00 = source[y0 * sourceWidth + x0]
+                let v01 = source[y0 * sourceWidth + x1]
+                let v10 = source[y1 * sourceWidth + x0]
+                let v11 = source[y1 * sourceWidth + x1]
+                let top = v00 * (1 - wx) + v01 * wx
+                let bottom = v10 * (1 - wx) + v11 * wx
+                let value = top * (1 - wy) + bottom * wy
+                output[outputRow * destinationWidth + outputColumn] = value >= threshold
             }
         }
         return output
     }
 
-    /// Nearest-neighbor upsample a Float grid, preserving values.
-    static func nearestNeighborUpsampleToFloat(
+    /// Bilinear-upsample a Float grid, preserving continuous values.
+    /// Same sampling convention as `bilinearUpsampleToBool`.
+    public static func bilinearUpsampleToFloat(
         source: [Float],
         sourceHeight: Int, sourceWidth: Int,
         destinationHeight: Int, destinationWidth: Int
     ) -> [Float] {
         var output = [Float](repeating: 0, count: destinationHeight * destinationWidth)
+        let scaleY = Float(sourceHeight) / Float(destinationHeight)
+        let scaleX = Float(sourceWidth) / Float(destinationWidth)
+        let maxY = Float(sourceHeight - 1)
+        let maxX = Float(sourceWidth - 1)
         for outputRow in 0..<destinationHeight {
-            let sourceRow = min(sourceHeight - 1, outputRow * sourceHeight / destinationHeight)
+            let yFloat = max(0, min(maxY, (Float(outputRow) + 0.5) * scaleY - 0.5))
+            let y0 = Int(yFloat.rounded(.down))
+            let y1 = min(sourceHeight - 1, y0 + 1)
+            let wy = yFloat - Float(y0)
             for outputColumn in 0..<destinationWidth {
-                let sourceColumn = min(sourceWidth - 1, outputColumn * sourceWidth / destinationWidth)
-                output[outputRow * destinationWidth + outputColumn] = source[sourceRow * sourceWidth + sourceColumn]
+                let xFloat = max(0, min(maxX, (Float(outputColumn) + 0.5) * scaleX - 0.5))
+                let x0 = Int(xFloat.rounded(.down))
+                let x1 = min(sourceWidth - 1, x0 + 1)
+                let wx = xFloat - Float(x0)
+                let v00 = source[y0 * sourceWidth + x0]
+                let v01 = source[y0 * sourceWidth + x1]
+                let v10 = source[y1 * sourceWidth + x0]
+                let v11 = source[y1 * sourceWidth + x1]
+                let top = v00 * (1 - wx) + v01 * wx
+                let bottom = v10 * (1 - wx) + v11 * wx
+                output[outputRow * destinationWidth + outputColumn] = top * (1 - wy) + bottom * wy
             }
         }
         return output

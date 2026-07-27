@@ -144,6 +144,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Allow exporting models without a registry preset. Requires --compute-precision.",
     )
+    parser.add_argument(
+        "--disable-embedding-quantization-ios",
+        action="store_true",
+        help=(
+            "iOS only. Skip int8 quantization of the embedding table and keep it in "
+            "float32. Default: False (embedding is quantized). Rejected when "
+            "--platform is macOS."
+        ),
+    )
     return parser
 
 
@@ -314,6 +323,11 @@ def _resolve_export_config(args: argparse.Namespace) -> ExportConfig:
             "different quantization options and kv-cache limits."
         )
 
+    if args.disable_embedding_quantization_ios and variant != "iOS":
+        raise SystemExit(
+            f"--disable-embedding-quantization-ios requires --platform iOS (got '{variant}')."
+        )
+
     if args.compression_config is not None:
         if not args.compression_config.is_file():
             raise SystemExit(f"--compression-config: file not found: {args.compression_config}")
@@ -350,6 +364,7 @@ def _resolve_export_config(args: argparse.Namespace) -> ExportConfig:
         num_layers=args.num_layers,
         overwrite=args.overwrite,
         compression_config_object=compression_config_object,
+        disable_embedding_quantization=args.disable_embedding_quantization_ios,
     )
 
 
@@ -413,6 +428,8 @@ def main() -> None:
         if config.num_layers:
             print(f"  num_layers:         {config.num_layers}")
         print(f"  overwrite:          {config.overwrite}")
+        if config.variant == "iOS":
+            print(f"  disable_embedding_quantization: {config.disable_embedding_quantization}")
         return
 
     result = export_model(config)

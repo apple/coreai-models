@@ -207,4 +207,64 @@ struct ImagePreprocessorTests {
             #expect(floats[i * 4 + 3] == 0)
         }
     }
+
+    // MARK: - Image Strategy Tests
+
+    @Test("center_crop: landscape image crops horizontally")
+    func centerCropLandscape() throws {
+        let pre = ImagePreprocessor(
+            targetSize: CGSize(width: 32, height: 32),
+            mean: (0, 0, 0), std: (1, 1, 1), rescaleFactor: 1
+        )
+        let landscape = Self.makeSolidImage(width: 64, height: 32, r: 100, g: 150, b: 200)
+        let chw = try pre.preprocessCHWCenterCrop(cgImage: landscape)
+        #expect(chw.count == 3 * 32 * 32)
+    }
+
+    @Test("center_crop: portrait image crops vertically")
+    func centerCropPortrait() throws {
+        let pre = ImagePreprocessor(
+            targetSize: CGSize(width: 32, height: 32),
+            mean: (0, 0, 0), std: (1, 1, 1), rescaleFactor: 1
+        )
+        let portrait = Self.makeSolidImage(width: 32, height: 64, r: 100, g: 150, b: 200)
+        let chw = try pre.preprocessCHWCenterCrop(cgImage: portrait)
+        #expect(chw.count == 3 * 32 * 32)
+    }
+
+    @Test("pad: landscape image has correct output size")
+    func padLandscape() throws {
+        let pre = ImagePreprocessor(
+            targetSize: CGSize(width: 32, height: 32),
+            mean: (0, 0, 0), std: (1, 1, 1), rescaleFactor: 1
+        )
+        let landscape = Self.makeSolidImage(width: 64, height: 32, r: 100, g: 150, b: 200)
+        let chw = try pre.preprocessCHWPad(cgImage: landscape)
+        #expect(chw.count == 3 * 32 * 32)
+    }
+
+    @Test("pad: portrait image has correct output size")
+    func padPortrait() throws {
+        let pre = ImagePreprocessor(
+            targetSize: CGSize(width: 32, height: 32),
+            mean: (0, 0, 0), std: (1, 1, 1), rescaleFactor: 1
+        )
+        let portrait = Self.makeSolidImage(width: 32, height: 64, r: 100, g: 150, b: 200)
+        let chw = try pre.preprocessCHWPad(cgImage: portrait)
+        #expect(chw.count == 3 * 32 * 32)
+    }
+
+    @Test("strategy dispatch: all three strategies produce correct output size")
+    func strategyDispatch() throws {
+        let pre = ImagePreprocessor(
+            targetSize: CGSize(width: 16, height: 16),
+            mean: (0, 0, 0), std: (1, 1, 1), rescaleFactor: 1
+        )
+        let img = Self.makeSolidImage(width: 32, height: 16, r: 128, g: 128, b: 128)
+        let expected = 3 * 16 * 16
+
+        #expect(try pre.preprocessCHW(cgImage: img, strategy: .stretch).count == expected)
+        #expect(try pre.preprocessCHW(cgImage: img, strategy: .centerCrop).count == expected)
+        #expect(try pre.preprocessCHW(cgImage: img, strategy: .pad).count == expected)
+    }
 }

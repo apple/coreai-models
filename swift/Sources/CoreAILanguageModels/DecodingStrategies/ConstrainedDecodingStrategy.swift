@@ -122,7 +122,7 @@ public struct ConstrainedDecodingStrategy: DecodingStrategy {
         constrainedOptions: InferenceOptions
     ) async throws -> (Int32?, [LogitsScalarType]?) {
         var rawLogits: [LogitsScalarType]? = nil
-        for try await output in try inferenceEngine.generate(
+        for try await output in try await inferenceEngine.generate(
             with: inputTokens,
             samplingConfiguration: samplingConfiguration,
             inferenceOptions: constrainedOptions
@@ -324,16 +324,17 @@ extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
                 generatedTokens.append(bestToken)
                 tokenStep += 1
 
+                if terminatedAfterAccept {
+                    finished = true
+                    return nil
+                }
+
                 let delta = ConstrainedDecodingStrategy.computeTextDelta(
                     generatedTokens: generatedTokens,
                     previousDecodedText: &previousDecodedText,
                     tokenizer: tokenizer,
                     tokenStep: tokenStep
                 )
-
-                if terminatedAfterAccept {
-                    finished = true
-                }
 
                 return GenerationResult(text: delta, tokenId: bestToken, rawLogits: logits)
             }

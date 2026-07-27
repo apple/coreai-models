@@ -122,6 +122,16 @@ _METADATA: dict[str, AIModelMetadataFields] = {
             "Source: https://huggingface.co/openai/gpt-oss-20b"
         ),
     ),
+    # ---- VLMs ----
+    "Qwen/Qwen3-VL-2B-Instruct": AIModelMetadataFields(
+        author="Qwen Team",
+        license="Apache-2.0",
+        model_description=(
+            "Qwen3-VL-2B-Instruct is a 2B-parameter instruction-tuned "
+            "vision-language model from the Qwen3-VL family. "
+            "Source: https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct"
+        ),
+    ),
     # ---- Diffusion ----
     "runwayml/stable-diffusion-v1-5": AIModelMetadataFields(
         author="Robin Rombach, Patrick Esser, et al.",
@@ -159,6 +169,18 @@ _METADATA: dict[str, AIModelMetadataFields] = {
             "FLUX.2 [klein] 4B is a distilled, open-weights text-to-image "
             "rectified-flow transformer from Black Forest Labs. "
             "Source: https://huggingface.co/black-forest-labs/FLUX.2-klein-4B"
+        ),
+    ),
+    # ---- Segmentation ----
+    "facebook/sam3": AIModelMetadataFields(
+        author="N. Carion et al.",
+        license="SAM License",
+        model_description=(
+            "SAM 3 is a unified foundation model for promptable segmentation in "
+            "images and videos. It can detect, segment, and track objects using "
+            "text or visual prompts such as points, boxes, and masks. This export "
+            "targets image segmentation, re-authored for iOS. "
+            "Source: https://github.com/facebookresearch/sam3"
         ),
     ),
 }

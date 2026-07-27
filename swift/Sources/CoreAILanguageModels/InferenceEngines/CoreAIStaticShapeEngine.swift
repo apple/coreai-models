@@ -293,7 +293,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     // MARK: - Causal Mask
 
     private static func fillCausalMask(
-        _ view: inout NDArray.MutableView<LogitsScalarType>,
+        _ view: consuming NDArray.MutableView<LogitsScalarType>,
         tokensInBatch: Int,
         alignedStep: Int
     ) {
@@ -324,7 +324,13 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         with input: [TokenId],
         samplingConfiguration: SamplingConfiguration,
         inferenceOptions: InferenceOptions
-    ) throws -> GenerationSequence {
+    ) async throws -> GenerationSequence {
+        // Cancel any prior generation so its Iterator stops on next poll.
+        _activeToken.withLock {
+            $0?.cancel()
+            $0 = nil
+        }
+
         // Implicit prefix caching: resolve input against history.
         if history.count > 0 {
             let (commonPrefix, _) = history.resolve(input: input)
@@ -494,8 +500,8 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         // Causal mask
         if case .ndArray(let nd) = desc.inputDescriptor(of: "causal_mask") {
             var mask = NDArray(descriptor: nd)
-            var maskView = mask.mutableView(as: LogitsScalarType.self)
-            Self.fillCausalMask(&maskView, tokensInBatch: tokensInBatch, alignedStep: alignedStep)
+            let maskView = mask.mutableView(as: LogitsScalarType.self)
+            Self.fillCausalMask(maskView, tokensInBatch: tokensInBatch, alignedStep: alignedStep)
             inputs["causal_mask"] = mask
         }
 

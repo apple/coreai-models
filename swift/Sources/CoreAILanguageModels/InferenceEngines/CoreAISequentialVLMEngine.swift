@@ -346,19 +346,24 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
     /// - Parameter url: URL to the image file (JPEG, PNG, HEIC, etc.)
     /// - Returns: `EmbeddedInput` containing projected embeddings and token positions
     public func encodeImage(at url: URL) async throws -> EmbeddedInput {
-        let encodeSignpost = InstrumentsProfiler.beginCustomInterval(
-            name: "CoreAIVLM EncodeImage",
-            details: url.lastPathComponent
-        )
-
-        // Step 1: Preprocess image to CHW Float32
         guard let ciImage = CIImage(contentsOf: url) else {
             throw ImagePreprocessorError.loadFailed(url)
         }
         guard let cgImage = CIContext().createCGImage(ciImage, from: ciImage.extent) else {
             throw ImagePreprocessorError.renderFailed
         }
-        let chwPixels = try imagePreprocessor.preprocessCHW(cgImage: cgImage)
+        return try await encodeImage(cgImage: cgImage)
+    }
+
+    public func encodeImage(cgImage: CGImage) async throws -> EmbeddedInput {
+        let encodeSignpost = InstrumentsProfiler.beginCustomInterval(
+            name: "CoreAIVLM EncodeImage",
+            details: "cgImage"
+        )
+
+        // Step 1: Preprocess image to CHW Float32
+        let chwPixels = try imagePreprocessor.preprocessCHW(
+            cgImage: cgImage, strategy: config.visionConfig.imageStrategy)
 
         // Step 2: Run encode_image
         let encoderOutput = try await runVisionEncoder(pixels: chwPixels)
@@ -381,7 +386,7 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
 
         CLILogger.log("VLM encodeImage complete: \(tokenCount) embedding tokens")
 
-        return EmbeddedInput(
+        return try EmbeddedInput(
             embeddings: projectedEmbeddings,
             embeddingPositions: placeholderRange
         )
@@ -556,8 +561,8 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
                     + "expected \(imageTokenCount) from config. Check prompt template.")
         }
 
-        let seqLen = textEmbeddings.shape.count >= 2 ? textEmbeddings.shape[1] : 0
-        let imgSeqLen = imageEmbeddings.shape.count >= 2 ? imageEmbeddings.shape[1] : 0
+        let seqLen = textEmbeddings.shape[1]
+        let imgSeqLen = imageEmbeddings.shape[1]
         guard imgSeqLen >= imageTokenCount else {
             throw InferenceRuntimeError.invalidArgument(
                 "scatterMerge: image embeddings have \(imgSeqLen) tokens, need \(imageTokenCount)")
@@ -570,10 +575,10 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
         }
 
         // Copy image embeddings into placeholder positions.
-        precondition(
-            imageEmbeddings.scalarType == .float16,
-            "scatterMerge only supports float16 embeddings; got \(imageEmbeddings.scalarType)"
-        )
+        guard imageEmbeddings.scalarType == .float16 else {
+            throw InferenceRuntimeError.invalidInputType(
+                "scatterMerge only supports float16 embeddings; got \(imageEmbeddings.scalarType)")
+        }
         imageEmbeddings.view(as: Float16.self).withUnsafePointer { imgPtr, _, _ in
             var mutableView = merged.mutableView(as: Float16.self)
             mutableView.withUnsafeMutablePointer { mergedPtr, _, _ in
@@ -769,7 +774,11 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
         with input: [TokenId],
         samplingConfiguration: SamplingConfiguration,
         inferenceOptions: InferenceOptions
-    ) throws -> GenerationSequence {
+    ) async throws -> GenerationSequence {
+        _activeToken.withLock {
+            $0?.cancel()
+            $0 = nil
+        }
         let token = GenerationToken()
         _activeToken.withLock { $0 = token }
         return GenerationSequence(
@@ -794,7 +803,11 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
         tokens: [TokenId],
         samplingConfiguration: SamplingConfiguration,
         inferenceOptions: InferenceOptions
-    ) throws -> GenerationSequence {
+    ) async throws -> GenerationSequence {
+        _activeToken.withLock {
+            $0?.cancel()
+            $0 = nil
+        }
         let token = GenerationToken()
         _activeToken.withLock { $0 = token }
         return GenerationSequence(

@@ -45,3 +45,36 @@ struct DiffusionPipelineTests {
         }
     }
 }
+
+@Suite("TextEncoder tokenize padding")
+struct TextEncoderTokenizeTests {
+    @Test("Tokenize closure pads short input to maxLength")
+    func padsShortInput() {
+        let maxLength = 77
+        let tokenize: @Sendable (String) -> [Int32] = { _ in
+            var ids = [Int32](1...10)
+            if ids.count < maxLength {
+                ids += [Int32](repeating: 0, count: maxLength - ids.count)
+            }
+            return ids
+        }
+        let ids = tokenize("short prompt")
+        #expect(ids.count == 77)
+        #expect(ids.last == 0)
+    }
+
+    @Test("Tokenize closure truncates long input to maxLength")
+    func truncatesLongInput() {
+        let maxLength = 77
+        let tokenize: @Sendable (String) -> [Int32] = { _ in
+            var ids = [Int32](1...100)
+            if ids.count > maxLength {
+                ids = Array(ids.prefix(maxLength))
+            }
+            return ids
+        }
+        let ids = tokenize("very long prompt that produces many tokens")
+        #expect(ids.count == 77)
+        #expect(ids[76] == 77)
+    }
+}

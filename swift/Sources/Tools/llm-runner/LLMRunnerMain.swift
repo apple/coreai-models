@@ -7,6 +7,7 @@ import ArgumentParser
 import CoreAI
 import CoreAILanguageModels
 import CoreAIShared
+import CoreImage
 import Darwin
 import Foundation
 import Tokenizers
@@ -39,6 +40,14 @@ enum WarmupMode: ExpressibleByArgument, Equatable {
         case .exact: return "exact"
         }
     }
+}
+
+extension ImageStrategy: ExpressibleByArgument {}
+
+enum ImageInfoMode: String, ExpressibleByArgument, Sendable {
+    case on
+    case off
+    case auto
 }
 
 @main
@@ -179,6 +188,16 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     @Option(name: .customLong("image"), help: "Path to an image file for vision-language models")
     var imagePath: String?
 
+    @Option(
+        name: .customLong("image-strategy"),
+        help: "Image preprocessing: stretch, center_crop, or pad (default: from model metadata)")
+    var imageStrategy: ImageStrategy?
+
+    @Option(
+        name: .customLong("image-info"),
+        help: "Include original image resolution in prompt: on, off, auto (default: auto)")
+    var imageInfo: ImageInfoMode = .auto
+
     @Flag(help: "Enable verbose logging")
     var verbose: Bool = false
 
@@ -202,7 +221,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
 
     func run() async throws {
         let verboseLevel = max(self.verboseLevel ?? 0, verbose ? 1 : 0)
-        CLILogger.setLevel(to: verboseLevel)
+        CLILogger.level = verboseLevel
 
         let resolver = ModelPaths()
         let resolvedPath = try validateAndResolveModelPath(resolver: resolver)
@@ -289,7 +308,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
 
         // Set up verbose logging environment variable first
         let verboseLevel = max(self.verboseLevel ?? 0, verbose ? 1 : 0)
-        CLILogger.setLevel(to: verboseLevel)
+        CLILogger.level = verboseLevel
 
         // Bridge hidden CLI overrides to environment variables read by the Core AI engine
         if let b = bucketSize {
@@ -371,6 +390,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             )
             let vlmConfig = VLMModelConfig(base: baseConfig, visionConfig: visionConfig)
 
+            // Sequential to avoid runtime errors with concurrent model preparation.
             let visionModel = try await PreparedModel.prepare(at: visionURL)
             let embedModel = try await PreparedModel.prepare(at: embedURL)
             let llmModel = try await PreparedModel.prepare(at: mainURL)
@@ -510,7 +530,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         CLILogger.log("Text generator built successfully", component: "Main")
 
         // Apply chat template and count tokens for metrics
-        await PerformanceMetrics.shared.setPromptTokenCount(promptTokens.count)
+        await PerformanceMetrics.shared.recordPromptTokens(promptTokens.count)
 
         CLILogger.log("Generating text...", component: "Main")
         CLILogger.log("Input: \(displayPrompt)", component: "Main")
@@ -612,7 +632,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             InstrumentsProfiler.endDecoding(signpostID: decodingID)
 
             // Generated token count is already set by the decoding strategy
-            let generatedTokenCount = await PerformanceMetrics.shared.getGeneratedTokenCount
+            let generatedTokenCount = await PerformanceMetrics.shared.generatedTokenCount
             InstrumentsProfiler.endInference(generatedTokens: generatedTokenCount, signpostID: inferenceID)
 
             // End overall timing now that core inference is complete
@@ -838,6 +858,24 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         let embeddedInput = try await vlmEngine.encodeImage(at: imageURL)
         CLILogger.log("Image encoded: \(embeddedInput.tokenCount) visual tokens", component: "VLM")
 
+        let shouldIncludeInfo =
+            switch imageInfo {
+            case .on: true
+            case .off: false
+            case .auto: visionConfig.includeImageInfo
+            }
+
+        var effectivePrompt = displayPrompt
+        if shouldIncludeInfo {
+            let imageURL = URL(fileURLWithPath: imagePath)
+            if let ciImage = CIImage(contentsOf: imageURL) {
+                let w = Int(ciImage.extent.width)
+                let h = Int(ciImage.extent.height)
+                effectivePrompt = "Image: \(w)x\(h)\n\(displayPrompt)"
+                CLILogger.log("Injected image info: \(w)x\(h)", component: "VLM")
+            }
+        }
+
         // Build VLM prompt with image placeholder tokens.
         // Try using the tokenizer's chat template if available; fall back to
         // generic "USER: <image>×N \n prompt \nASSISTANT:" format.
@@ -846,7 +884,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         let vlmTokens: [Int32]
 
         if let chatTemplateTokens = try? buildVLMPromptFromChatTemplate(
-            prompt: displayPrompt,
+            prompt: effectivePrompt,
             imageTokenCount: imageTokenCount,
             imageTokenId: imageTokenId,
             tokenizer: tokenizer
@@ -859,7 +897,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
                 component: "VLM")
             var tokens = tokenizer.encode(text: "USER: ", addSpecialTokens: true).map { Int32($0) }
             tokens.append(contentsOf: [Int32](repeating: imageTokenId, count: imageTokenCount))
-            let suffix = "\n" + displayPrompt + "\nASSISTANT:"
+            let suffix = "\n" + effectivePrompt + "\nASSISTANT:"
             tokens.append(
                 contentsOf: tokenizer.encode(text: suffix, addSpecialTokens: false).map { Int32($0) })
             vlmTokens = tokens
@@ -886,30 +924,76 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         let inferenceID = InstrumentsProfiler.beginInference(
             promptTokens: vlmTokens.count, maxTokens: maxTokens)
 
-        let tokenStream = try vlmEngine.generate(
+        await PerformanceMetrics.shared.recordPromptTokens(vlmTokens.count)
+
+        let tokenStream = try await vlmEngine.generate(
             with: embeddedInput,
             tokens: vlmTokens,
             samplingConfiguration: samplingConfiguration,
-            inferenceOptions: InferenceOptions(maxTokens: maxTokens)
+            inferenceOptions: InferenceOptions(
+                maxTokens: maxTokens,
+                includeLogits: printLogits || saveLogits != nil
+            )
         )
 
+        CLILogger.log("VLM generate started, maxTokens=\(maxTokens)", component: "VLM")
+
+        // Prompt (prefill) timing — first token latency
+        var promptSpan: ProfileSpan? = InstrumentsProfiler.beginPrompt(tokens: vlmTokens.count, engine: "CoreAIVLM")
+        var extendSpan: ProfileSpan?
+        let needsLogits = printLogits || saveLogits != nil
+        let topKCount = saveLogitsLength.topKForFile ?? 5
+
         var generatedTokens: [Int] = []
+        var allTokenLogits: [TokenLogits] = []
         var previousText = ""
         for try await output in tokenStream {
+            if promptSpan != nil {
+                promptSpan?.end()
+                promptSpan = nil
+                extendSpan = InstrumentsProfiler.beginExtend(step: 0, tokens: 1)
+            }
+
             let token = output.tokenId
             if eosTokenIds.contains(token) { break }
             generatedTokens.append(Int(token))
+
+            if needsLogits, let logits = output.logits {
+                let floatLogits = logits.map { Float($0) }
+                let topEntries = LogitsWriter.extractTopK(
+                    from: floatLogits, tokenizer: tokenizer, k: topKCount)
+                let tokenText = tokenizer.decode(tokens: [Int(token)])
+                allTokenLogits.append(
+                    TokenLogits(
+                        tokenId: token, tokenText: tokenText, topLogits: topEntries))
+
+                if printLogits {
+                    let desc = topEntries.prefix(5).map {
+                        "[\($0.tokenId)]=\(String(format: "%.3f", $0.logit))"
+                    }.joined(separator: " ")
+                    print("\n  logits top5: \(desc)", terminator: "")
+                }
+            }
+
             let fullText = tokenizer.decode(tokens: generatedTokens)
             let delta = String(fullText.dropFirst(previousText.count))
             previousText = fullText
             print(delta, terminator: "")
             fflush(stdout)
         }
+        promptSpan?.end()
+        extendSpan?.end()
         print()
 
+        // Save logits to JSON if requested
+        if let path = saveLogits, !allTokenLogits.isEmpty {
+            try LogitsWriter.saveTopKJSON(tokenLogits: allTokenLogits, path: path)
+        }
+
+        // Record generation stats
         InstrumentsProfiler.endInference(
             generatedTokens: generatedTokens.count, signpostID: inferenceID)
-        await PerformanceMetrics.shared.setGeneratedTokenCount(generatedTokens.count)
+        await PerformanceMetrics.shared.recordGeneratedTokens(generatedTokens.count)
         await PerformanceMetrics.shared.endOverallTiming()
         await PerformanceMetrics.shared.printSummary(verbose: CLILogger.isVerbose)
 

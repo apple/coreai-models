@@ -38,10 +38,10 @@ class SparseMoeBlock(nn.Module):
         active_experts_scores = torch.softmax(top_logits, dim=-1).to(x.dtype)
 
         y_active_experts = self.switch_mlp(x, active_experts_indices)
-        active_experts_scores = active_experts_scores.unsqueeze(-1)
+        active_experts_scores = active_experts_scores.unsqueeze(-1).to(y_active_experts.device)
         y_active_experts_weighted_by_scores = y_active_experts * active_experts_scores
         y_active_experts_summary = torch.sum(y_active_experts_weighted_by_scores, dim=-2)
-        return y_active_experts_summary.to(x.dtype)
+        return y_active_experts_summary.to(device=x.device, dtype=x.dtype)
 
 
 class Attention(nn.Module):

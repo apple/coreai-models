@@ -11,147 +11,400 @@ import Foundation
 // MARK: - CoreAISegmentationEngine
 
 /// Core AI-backed segmentation engine.
+///
+/// Supports two asset shapes, autodetected at init time:
+///   * Single-function — one ``main`` graph that consumes the image (and a text or point
+///     prompt) and emits all detection outputs in one call. Produced by the baseline
+///     SAM3 export and EfficientSAM.
+///   * Multi-function — three graphs (``image_encode``, ``text_encode``, ``detect``) wired
+///     together at runtime. Produced by the SAM3 lite export. The engine pipes the encoder
+///     outputs into the detector and returns the same `SegmentationOutput` shape as the
+///     single-function path.
 public struct CoreAISegmentationEngine {
-    private let function: InferenceFunction
-    private let functionDescriptor: InferenceFunctionDescriptor
-
-    // MARK: - Discovered tensor names
-
-    private let imageInputName: String
-
-    // Text-based inputs (SAM3)
-    private let textInputName: String?
-    private let embeddingsInputName: String?
-
-    // Point-based inputs (EfficientSAM)
-    private let pointsInputName: String?
-    private let pointLabelsInputName: String?
-
-    // Required for every model.
-    private let masksOutputName: String
-
-    // Text-model outputs. All validated non-nil at init when supportsTextQuery.
-    // Force-unwrapped in runTextInference — safe because init enforces the invariant.
-    private let boxesOutputName: String?
-    private let logitsOutputName: String?
-    private let presenceLogitsOutputName: String?
-    private let semanticSegOutputName: String?
-
-    // Point-model output. Validated non-nil at init when supportsPointQuery.
-    private let iouScoresOutputName: String?
+    private let backend: Backend
 
     // MARK: - Capabilities
 
-    public var supportsTextQuery: Bool { textInputName != nil }
-    public var supportsPointQuery: Bool { pointsInputName != nil && pointLabelsInputName != nil }
+    public var supportsTextQuery: Bool {
+        switch backend {
+        case .single(let s): return s.textInputName != nil
+        case .multi: return true
+        }
+    }
 
-    // MARK: public init
+    public var supportsPointQuery: Bool {
+        switch backend {
+        case .single(let s): return s.pointsInputName != nil && s.pointLabelsInputName != nil
+        case .multi: return false
+        }
+    }
+
+    // MARK: - Init
 
     public init(parameters: SegmentationParameters, modelURL: URL) async throws {
         let preparedAsset = try await PreparedModel.prepare(at: modelURL)
         let model = preparedAsset.model
 
-        guard let descriptor = model.functionDescriptor(for: "main") else {
+        // `PreparedModel` already classified the asset (and used that classification to pick
+        // the compute-unit specialization at load time). Reuse it as the single source of
+        // truth for multi- vs single-function dispatch rather than re-probing here.
+        if preparedAsset.structure == .multiFunctionSegmenter {
+            // Structure detection guarantees all three entrypoints exist; fetch the
+            // descriptors the contexts need to validate and wire their I/O.
+            guard let imageEncodeDescriptor = model.functionDescriptor(for: GraphNames.imageEncode),
+                let textEncodeDescriptor = model.functionDescriptor(for: GraphNames.textEncode),
+                let detectDescriptor = model.functionDescriptor(for: GraphNames.detect)
+            else {
+                throw SegmentationRuntimeError.invalidConfiguration(
+                    "Model classified as multi-function segmenter but is missing one of "
+                        + "{'image_encode','text_encode','detect'}. Available functions: \(model.functionNames)."
+                )
+            }
+            self.backend = .multi(
+                try await MultiFunctionContext(
+                    model: model,
+                    imageEncodeDescriptor: imageEncodeDescriptor,
+                    textEncodeDescriptor: textEncodeDescriptor,
+                    detectDescriptor: detectDescriptor
+                )
+            )
+            return
+        }
+
+        guard let mainDescriptor = model.functionDescriptor(for: GraphNames.main) else {
             throw SegmentationRuntimeError.invalidConfiguration(
-                "Cannot find 'main' function in model"
+                "Model has no 'main' function and no {'image_encode','text_encode','detect'} bundle. "
+                    + "Available functions: \(model.functionNames)."
             )
         }
 
-        guard let imageInputName = Self.findImageInputName(in: descriptor.inputNames) else {
-            throw SegmentationRuntimeError.invalidConfiguration(
-                "Cannot find image input in model. Inputs: \(descriptor.inputNames)"
-            )
-        }
-
-        let textInputName = Self.findTextInputName(in: descriptor.inputNames)
-        let embeddingsInputName = Self.findEmbeddingsInputName(in: descriptor.inputNames)
-        let pointsInputName = Self.findPointsInputName(in: descriptor.inputNames)
-        let pointLabelsInputName = Self.findPointLabelsInputName(in: descriptor.inputNames)
-
-        guard let masksOutputName = Self.findMasksOutputName(in: descriptor.outputNames) else {
-            throw SegmentationRuntimeError.invalidConfiguration(
-                "Cannot find masks output in model. Outputs: \(descriptor.outputNames)"
-            )
-        }
-        guard case .ndArray = descriptor.outputDescriptor(of: masksOutputName) else {
-            throw SegmentationRuntimeError.outputMissing(masksOutputName)
-        }
-
-        let boxesOutputName = Self.findBoxesOutputName(in: descriptor.outputNames)
-        let logitsOutputName = Self.findLogitsOutputName(in: descriptor.outputNames)
-        let presenceLogitsOutputName = Self.findPresenceOutputName(in: descriptor.outputNames)
-        let semanticSegOutputName = Self.findSemanticOutputName(in: descriptor.outputNames)
-        let iouScoresOutputName = Self.findIouScoresOutputName(in: descriptor.outputNames)
-
-        // Validate that the expected outputs are present for each model type.
-        if textInputName != nil {
-            if boxesOutputName == nil {
-                throw SegmentationRuntimeError.invalidConfiguration(
-                    "Text model missing boxes output. Outputs: \(descriptor.outputNames)"
-                )
-            }
-            if logitsOutputName == nil {
-                throw SegmentationRuntimeError.invalidConfiguration(
-                    "Text model missing logits output. Outputs: \(descriptor.outputNames)"
-                )
-            }
-            if presenceLogitsOutputName == nil {
-                throw SegmentationRuntimeError.invalidConfiguration(
-                    "Text model missing presence logits output. Outputs: \(descriptor.outputNames)"
-                )
-            }
-            if semanticSegOutputName == nil {
-                throw SegmentationRuntimeError.invalidConfiguration(
-                    "Text model missing semantic segmentation output. Outputs: \(descriptor.outputNames)"
-                )
-            }
-        } else if pointsInputName != nil && pointLabelsInputName != nil {
-            if iouScoresOutputName == nil {
-                throw SegmentationRuntimeError.invalidConfiguration(
-                    "Point model missing iou_scores output. Outputs: \(descriptor.outputNames)"
-                )
-            }
-        } else {
-            throw SegmentationRuntimeError.invalidConfiguration(
-                "Model has neither text nor point inputs. Inputs: \(descriptor.inputNames)"
-            )
-        }
-
-        guard let fn = try model.loadFunction(named: "main") else {
-            throw SegmentationRuntimeError.invalidConfiguration(
-                "Cannot load 'main' function from model"
-            )
-        }
-
-        self.function = fn
-        self.functionDescriptor = descriptor
-        self.imageInputName = imageInputName
-        self.textInputName = textInputName
-        self.embeddingsInputName = embeddingsInputName
-        self.pointsInputName = pointsInputName
-        self.pointLabelsInputName = pointLabelsInputName
-        self.masksOutputName = masksOutputName
-        self.boxesOutputName = boxesOutputName
-        self.logitsOutputName = logitsOutputName
-        self.presenceLogitsOutputName = presenceLogitsOutputName
-        self.semanticSegOutputName = semanticSegOutputName
-        self.iouScoresOutputName = iouScoresOutputName
+        self.backend = .single(
+            try await SingleFunctionContext(model: model, descriptor: mainDescriptor)
+        )
     }
 
-    // MARK: - SegmentationEngine
+    // MARK: - Warmup
 
     public func warmup() async throws {
-        if supportsTextQuery {
-            try await warmupTextModel()
-        } else if supportsPointQuery {
-            try await warmupPointModel()
+        switch backend {
+        case .single(let s):
+            if s.textInputName != nil {
+                try await warmupSingleFunctionTextModel(state: s)
+            } else if s.pointsInputName != nil, s.pointLabelsInputName != nil {
+                try await warmupSingleFunctionPointModel(state: s)
+            }
+        case .multi(let m):
+            try await warmupMultiFunctionTextModel(state: m)
         }
     }
 
-    private func warmupTextModel() async throws {
-        guard let textInputName else { return }
-        guard case .ndArray(let imageDescriptor) = functionDescriptor.inputDescriptor(of: imageInputName),
-            case .ndArray(let textDescriptor) = functionDescriptor.inputDescriptor(of: textInputName)
+    // MARK: - Public segment(image:textQuery:)
+
+    public func segment(image: CGImage, textQuery: TextQuery, parameters: SegmentationParameters) async throws
+        -> SegmentationOutput
+    {
+        switch backend {
+        case .single(let s):
+            return try await runSingleFunctionTextSegment(
+                state: s, image: image, textQuery: textQuery, parameters: parameters
+            )
+        case .multi(let m):
+            return try await runMultiFunctionTextSegment(
+                state: m, image: image, textQuery: textQuery, parameters: parameters
+            )
+        }
+    }
+
+    // MARK: - Public segment(image:pointQuery:)
+
+    public func segment(image: CGImage, pointQuery: PointQuery, parameters: SegmentationParameters) async throws
+        -> SegmentationOutput
+    {
+        switch backend {
+        case .single(let s):
+            return try await runSingleFunctionPointSegment(
+                state: s, image: image, pointQuery: pointQuery, parameters: parameters
+            )
+        case .multi:
+            throw SegmentationRuntimeError.unsupportedEngine(
+                "Multi-function segmentation assets do not accept point queries — "
+                    + "use segment(image:textQuery:parameters:) instead."
+            )
+        }
+    }
+
+    // MARK: - Backend storage
+
+    private enum Backend {
+        case single(SingleFunctionContext)
+        case multi(MultiFunctionContext)
+    }
+
+    /// Backing state for a single-`main`-function asset (baseline SAM3, EfficientSAM).
+    fileprivate struct SingleFunctionContext {
+        let function: InferenceFunction
+        let descriptor: InferenceFunctionDescriptor
+
+        let imageInputName: String
+
+        // Text-based inputs (SAM3-style baseline).
+        let textInputName: String?
+        let embeddingsInputName: String?
+
+        // Point-based inputs (EfficientSAM).
+        let pointsInputName: String?
+        let pointLabelsInputName: String?
+
+        // Required for every model.
+        let masksOutputName: String
+
+        // Text-model outputs. Validated non-nil at init when textInputName != nil.
+        let boxesOutputName: String?
+        let logitsOutputName: String?
+        let presenceLogitsOutputName: String?
+        let semanticSegOutputName: String?
+
+        // Point-model output. Validated non-nil at init when both point inputs present.
+        let iouScoresOutputName: String?
+
+        init(model: AIModel, descriptor: InferenceFunctionDescriptor) async throws {
+            guard let imageInputName = findImageInputName(in: descriptor.inputNames) else {
+                throw SegmentationRuntimeError.invalidConfiguration(
+                    "Cannot find image input in model. Inputs: \(descriptor.inputNames)"
+                )
+            }
+
+            let textInputName = findTextInputName(in: descriptor.inputNames)
+            let embeddingsInputName = findEmbeddingsInputName(in: descriptor.inputNames)
+            let pointsInputName = findPointsInputName(in: descriptor.inputNames)
+            let pointLabelsInputName = findPointLabelsInputName(in: descriptor.inputNames)
+
+            guard let masksOutputName = findMasksOutputName(in: descriptor.outputNames) else {
+                throw SegmentationRuntimeError.invalidConfiguration(
+                    "Cannot find masks output in model. Outputs: \(descriptor.outputNames)"
+                )
+            }
+            guard case .ndArray = descriptor.outputDescriptor(of: masksOutputName) else {
+                throw SegmentationRuntimeError.outputMissing(masksOutputName)
+            }
+
+            let boxesOutputName = findBoxesOutputName(in: descriptor.outputNames)
+            let logitsOutputName = findLogitsOutputName(in: descriptor.outputNames)
+            let presenceLogitsOutputName = findPresenceOutputName(in: descriptor.outputNames)
+            let semanticSegOutputName = findSemanticOutputName(in: descriptor.outputNames)
+            let iouScoresOutputName = findIouScoresOutputName(in: descriptor.outputNames)
+
+            // Validate that the expected outputs are present for each model type.
+            if textInputName != nil {
+                if boxesOutputName == nil {
+                    throw SegmentationRuntimeError.invalidConfiguration(
+                        "Text model missing boxes output. Outputs: \(descriptor.outputNames)"
+                    )
+                }
+                if logitsOutputName == nil {
+                    throw SegmentationRuntimeError.invalidConfiguration(
+                        "Text model missing logits output. Outputs: \(descriptor.outputNames)"
+                    )
+                }
+                if presenceLogitsOutputName == nil {
+                    throw SegmentationRuntimeError.invalidConfiguration(
+                        "Text model missing presence logits output. Outputs: \(descriptor.outputNames)"
+                    )
+                }
+                if semanticSegOutputName == nil {
+                    throw SegmentationRuntimeError.invalidConfiguration(
+                        "Text model missing semantic segmentation output. Outputs: \(descriptor.outputNames)"
+                    )
+                }
+            } else if pointsInputName != nil && pointLabelsInputName != nil {
+                if iouScoresOutputName == nil {
+                    throw SegmentationRuntimeError.invalidConfiguration(
+                        "Point model missing iou_scores output. Outputs: \(descriptor.outputNames)"
+                    )
+                }
+            } else {
+                throw SegmentationRuntimeError.invalidConfiguration(
+                    "Model has neither text nor point inputs. Inputs: \(descriptor.inputNames)"
+                )
+            }
+
+            guard let fn = try model.loadFunction(named: GraphNames.main) else {
+                throw SegmentationRuntimeError.invalidConfiguration(
+                    "Cannot load 'main' function from model"
+                )
+            }
+
+            self.function = fn
+            self.descriptor = descriptor
+            self.imageInputName = imageInputName
+            self.textInputName = textInputName
+            self.embeddingsInputName = embeddingsInputName
+            self.pointsInputName = pointsInputName
+            self.pointLabelsInputName = pointLabelsInputName
+            self.masksOutputName = masksOutputName
+            self.boxesOutputName = boxesOutputName
+            self.logitsOutputName = logitsOutputName
+            self.presenceLogitsOutputName = presenceLogitsOutputName
+            self.semanticSegOutputName = semanticSegOutputName
+            self.iouScoresOutputName = iouScoresOutputName
+        }
+    }
+
+    /// Backing state for the SAM3 lite export (`image_encode` → `text_encode` → `detect`).
+    fileprivate struct MultiFunctionContext {
+        let imageEncode: InferenceFunction
+        let imageEncodeDescriptor: InferenceFunctionDescriptor
+        let textEncode: InferenceFunction
+        let textEncodeDescriptor: InferenceFunctionDescriptor
+        let detect: InferenceFunction
+        let detectDescriptor: InferenceFunctionDescriptor
+
+        // image_encode i/o.
+        let imageInputName: String
+        let backboneFeaturesOutputName: String
+
+        // text_encode i/o.
+        let textInputName: String
+        let textFeaturesOutputName: String
+
+        // detect i/o. The two intermediate inputs are matched by name against the encoder
+        // outputs so re-export naming changes can be absorbed without code edits.
+        let backboneFeaturesInputName: String
+        let textFeaturesInputName: String
+        let masksOutputName: String
+        let boxesOutputName: String
+        let logitsOutputName: String
+        let presenceLogitsOutputName: String
+        let semanticSegOutputName: String
+
+        init(
+            model: AIModel,
+            imageEncodeDescriptor: InferenceFunctionDescriptor,
+            textEncodeDescriptor: InferenceFunctionDescriptor,
+            detectDescriptor: InferenceFunctionDescriptor
+        ) async throws {
+            // image_encode: needs an image input + backbone-features output.
+            guard let imageInputName = findImageInputName(in: imageEncodeDescriptor.inputNames) else {
+                throw SegmentationRuntimeError.invalidConfiguration(
+                    "Cannot find image input in 'image_encode'. Inputs: \(imageEncodeDescriptor.inputNames)"
+                )
+            }
+            guard
+                let backboneFeaturesOutputName = findBackboneFeaturesName(
+                    in: imageEncodeDescriptor.outputNames)
+            else {
+                throw SegmentationRuntimeError.invalidConfiguration(
+                    "Cannot find backbone-features output in 'image_encode'. "
+                        + "Outputs: \(imageEncodeDescriptor.outputNames)"
+                )
+            }
+
+            // text_encode: needs a token-id input + text-features output.
+            guard let textInputName = findTextInputName(in: textEncodeDescriptor.inputNames) else {
+                throw SegmentationRuntimeError.invalidConfiguration(
+                    "Cannot find text input in 'text_encode'. Inputs: \(textEncodeDescriptor.inputNames)"
+                )
+            }
+            guard let textFeaturesOutputName = findTextFeaturesName(in: textEncodeDescriptor.outputNames)
+            else {
+                throw SegmentationRuntimeError.invalidConfiguration(
+                    "Cannot find text-features output in 'text_encode'. "
+                        + "Outputs: \(textEncodeDescriptor.outputNames)"
+                )
+            }
+
+            // detect: needs both encoder outputs as inputs + the five detection outputs.
+            guard
+                let backboneFeaturesInputName = findBackboneFeaturesName(
+                    in: detectDescriptor.inputNames)
+            else {
+                throw SegmentationRuntimeError.invalidConfiguration(
+                    "Cannot find backbone-features input in 'detect'. Inputs: \(detectDescriptor.inputNames)"
+                )
+            }
+            guard let textFeaturesInputName = findTextFeaturesName(in: detectDescriptor.inputNames)
+            else {
+                throw SegmentationRuntimeError.invalidConfiguration(
+                    "Cannot find text-features input in 'detect'. Inputs: \(detectDescriptor.inputNames)"
+                )
+            }
+            guard let masksOutputName = findMasksOutputName(in: detectDescriptor.outputNames) else {
+                throw SegmentationRuntimeError.invalidConfiguration(
+                    "Cannot find masks output in 'detect'. Outputs: \(detectDescriptor.outputNames)"
+                )
+            }
+            guard case .ndArray = detectDescriptor.outputDescriptor(of: masksOutputName) else {
+                throw SegmentationRuntimeError.outputMissing(masksOutputName)
+            }
+            guard let boxesOutputName = findBoxesOutputName(in: detectDescriptor.outputNames) else {
+                throw SegmentationRuntimeError.invalidConfiguration(
+                    "Cannot find boxes output in 'detect'. Outputs: \(detectDescriptor.outputNames)"
+                )
+            }
+            guard let logitsOutputName = findLogitsOutputName(in: detectDescriptor.outputNames) else {
+                throw SegmentationRuntimeError.invalidConfiguration(
+                    "Cannot find logits output in 'detect'. Outputs: \(detectDescriptor.outputNames)"
+                )
+            }
+            guard let presenceLogitsOutputName = findPresenceOutputName(in: detectDescriptor.outputNames)
+            else {
+                throw SegmentationRuntimeError.invalidConfiguration(
+                    "Cannot find presence-logits output in 'detect'. Outputs: \(detectDescriptor.outputNames)"
+                )
+            }
+            guard let semanticSegOutputName = findSemanticOutputName(in: detectDescriptor.outputNames)
+            else {
+                throw SegmentationRuntimeError.invalidConfiguration(
+                    "Cannot find semantic segmentation output in 'detect'. Outputs: \(detectDescriptor.outputNames)"
+                )
+            }
+
+            guard let imageEncode = try model.loadFunction(named: GraphNames.imageEncode) else {
+                throw SegmentationRuntimeError.invalidConfiguration(
+                    "Cannot load 'image_encode' function from model"
+                )
+            }
+            guard let textEncode = try model.loadFunction(named: GraphNames.textEncode) else {
+                throw SegmentationRuntimeError.invalidConfiguration(
+                    "Cannot load 'text_encode' function from model"
+                )
+            }
+            guard let detect = try model.loadFunction(named: GraphNames.detect) else {
+                throw SegmentationRuntimeError.invalidConfiguration(
+                    "Cannot load 'detect' function from model"
+                )
+            }
+
+            self.imageEncode = imageEncode
+            self.imageEncodeDescriptor = imageEncodeDescriptor
+            self.textEncode = textEncode
+            self.textEncodeDescriptor = textEncodeDescriptor
+            self.detect = detect
+            self.detectDescriptor = detectDescriptor
+
+            self.imageInputName = imageInputName
+            self.backboneFeaturesOutputName = backboneFeaturesOutputName
+
+            self.textInputName = textInputName
+            self.textFeaturesOutputName = textFeaturesOutputName
+
+            self.backboneFeaturesInputName = backboneFeaturesInputName
+            self.textFeaturesInputName = textFeaturesInputName
+            self.masksOutputName = masksOutputName
+            self.boxesOutputName = boxesOutputName
+            self.logitsOutputName = logitsOutputName
+            self.presenceLogitsOutputName = presenceLogitsOutputName
+            self.semanticSegOutputName = semanticSegOutputName
+        }
+    }
+
+    // MARK: - Single-function warmup helpers
+
+    private func warmupSingleFunctionTextModel(state: SingleFunctionContext) async throws {
+        guard let textInputName = state.textInputName else { return }
+        guard
+            case .ndArray(let imageDescriptor) = state.descriptor.inputDescriptor(of: state.imageInputName),
+            case .ndArray(let textDescriptor) = state.descriptor.inputDescriptor(of: textInputName)
         else {
             throw SegmentationRuntimeError.invalidConfiguration(
                 "No array descriptor for image or text input"
@@ -162,24 +415,29 @@ public struct CoreAISegmentationEngine {
         fillNDArray(&textArray, as: Int32.self, count: textDescriptor.shape.reduce(1, *)) { _ in
             CLIPTokenizer.eotTokenId
         }
-        try await runTextInference(
-            inputs: [imageInputName: imageArray, textInputName: textArray]
+        try await runSingleFunctionTextInference(
+            state: state,
+            inputs: [state.imageInputName: imageArray, textInputName: textArray]
         )
     }
 
-    private func warmupPointModel() async throws {
-        guard let pointsInputName, let pointLabelsInputName else { return }
-        guard case .ndArray(let imageDescriptor) = functionDescriptor.inputDescriptor(of: imageInputName),
-            case .ndArray(let pointsDescriptor) = functionDescriptor.inputDescriptor(of: pointsInputName),
-            case .ndArray(let labelsDescriptor) = functionDescriptor.inputDescriptor(of: pointLabelsInputName)
+    private func warmupSingleFunctionPointModel(state: SingleFunctionContext) async throws {
+        guard let pointsInputName = state.pointsInputName,
+            let pointLabelsInputName = state.pointLabelsInputName
+        else { return }
+        guard
+            case .ndArray(let imageDescriptor) = state.descriptor.inputDescriptor(of: state.imageInputName),
+            case .ndArray(let pointsDescriptor) = state.descriptor.inputDescriptor(of: pointsInputName),
+            case .ndArray(let labelsDescriptor) = state.descriptor.inputDescriptor(of: pointLabelsInputName)
         else {
             throw SegmentationRuntimeError.invalidConfiguration(
                 "No array descriptor for image or point inputs"
             )
         }
-        try await runPointInference(
+        try await runSingleFunctionPointInference(
+            state: state,
             inputs: [
-                imageInputName: NDArray(descriptor: imageDescriptor),
+                state.imageInputName: NDArray(descriptor: imageDescriptor),
                 pointsInputName: NDArray(descriptor: pointsDescriptor),
                 pointLabelsInputName: NDArray(descriptor: labelsDescriptor),
             ],
@@ -188,48 +446,31 @@ public struct CoreAISegmentationEngine {
         )
     }
 
-    // MARK: Text-based segment (SAM3)
+    // MARK: - Single-function text path (preserves existing behavior)
 
-    public func segment(image: CGImage, textQuery: TextQuery, parameters: SegmentationParameters) async throws
-        -> SegmentationOutput
-    {
-        guard let textInputName else {
+    private func runSingleFunctionTextSegment(
+        state: SingleFunctionContext,
+        image: CGImage,
+        textQuery: TextQuery,
+        parameters: SegmentationParameters
+    ) async throws -> SegmentationOutput {
+        guard let textInputName = state.textInputName else {
             throw SegmentationRuntimeError.unsupportedEngine(
                 "This model has no text input — use segment(image:pointQuery:parameters:) instead."
             )
         }
 
-        guard case .ndArray(let imageDescriptor) = functionDescriptor.inputDescriptor(of: imageInputName) else {
+        guard case .ndArray(let imageDescriptor) = state.descriptor.inputDescriptor(of: state.imageInputName)
+        else {
             throw SegmentationRuntimeError.invalidConfiguration(
-                "No array descriptor for image input '\(imageInputName)'"
+                "No array descriptor for image input '\(state.imageInputName)'"
             )
         }
-        let expectedShape = imageDescriptor.shape
-        guard expectedShape.count == 4 else {
-            throw SegmentationRuntimeError.invalidConfiguration(
-                "Expected 4-dimensional input shape, got \(expectedShape.count)"
-            )
-        }
-        let height = expectedShape[2]
-        let width = expectedShape[3]
-        let floatPixels = try ImagePreprocessor(
-            targetSize: CGSize(width: width, height: height),
-            mean: parameters.normalizationMeans,
-            std: parameters.normalizationStds,
-            rescaleFactor: 1.0
-        ).preprocessCHW(cgImage: image)
-        var imageArray = NDArray(descriptor: imageDescriptor)
-        if imageDescriptor.scalarType == .float16 {
-            #if !((os(macOS) || targetEnvironment(macCatalyst)) && arch(x86_64))
-            fillNDArray(&imageArray, as: Float16.self, with: floatPixels.map(Float16.init))
-            #else
-            fatalError("Float16 is not supported on this platform")
-            #endif
-        } else {
-            fillNDArray(&imageArray, as: Float.self, with: floatPixels)
-        }
+        let imageArray = try Self.buildImageNDArray(
+            from: image, descriptor: imageDescriptor, parameters: parameters
+        )
 
-        var inputs: [String: NDArray] = [imageInputName: imageArray]
+        var inputs: [String: NDArray] = [state.imageInputName: imageArray]
 
         switch textQuery {
         case .prompt:
@@ -237,28 +478,24 @@ public struct CoreAISegmentationEngine {
                 "TextQuery.prompt must be resolved to .tokens by ImageSegmenter before reaching the engine."
             )
         case .tokens(let textTokensBatch):
-            guard case .ndArray(let textDescriptor) = functionDescriptor.inputDescriptor(of: textInputName) else {
+            guard case .ndArray(let textDescriptor) = state.descriptor.inputDescriptor(of: textInputName) else {
                 throw SegmentationRuntimeError.invalidConfiguration(
                     "No array descriptor for text input '\(textInputName)'"
                 )
             }
-            let batchSize = textDescriptor.shape[0]
-            let sequenceLength = textDescriptor.shape[1]
-            var textArray = NDArray(descriptor: textDescriptor)
-            fillNDArray(&textArray, as: Int32.self, count: batchSize * sequenceLength) { idx in
-                Self.tokenValue(
-                    at: idx, sequenceLength: sequenceLength, batch: textTokensBatch,
-                    eotTokenId: CLIPTokenizer.eotTokenId)
-            }
-            inputs[textInputName] = textArray
+            inputs[textInputName] = Self.buildTextTokensNDArray(
+                tokensBatch: textTokensBatch, descriptor: textDescriptor
+            )
 
         case .embeddings(let embeddingsBatch):
-            guard let embInputName = embeddingsInputName else {
+            guard let embInputName = state.embeddingsInputName else {
                 throw SegmentationRuntimeError.invalidConfiguration(
-                    "TextQuery.embeddings provided but no embeddings input found in model. Inputs: \(functionDescriptor.inputNames)"
+                    "TextQuery.embeddings provided but no embeddings input found in model. "
+                        + "Inputs: \(state.descriptor.inputNames)"
                 )
             }
-            guard case .ndArray(let embeddingsDescriptor) = functionDescriptor.inputDescriptor(of: embInputName) else {
+            guard case .ndArray(let embeddingsDescriptor) = state.descriptor.inputDescriptor(of: embInputName)
+            else {
                 throw SegmentationRuntimeError.invalidConfiguration(
                     "No array descriptor for embeddings input '\(embInputName)'"
                 )
@@ -274,24 +511,33 @@ public struct CoreAISegmentationEngine {
             inputs[embInputName] = embeddingsArray
         }
 
-        return try await runTextInference(inputs: inputs)
+        return try await runSingleFunctionTextInference(state: state, inputs: inputs)
     }
 
-    // MARK: Point-based segment (EfficientSAM)
+    // MARK: - Single-function point path (preserves existing behavior)
 
-    public func segment(image: CGImage, pointQuery: PointQuery, parameters: SegmentationParameters) async throws
-        -> SegmentationOutput
-    {
-        guard let pointsInputName, let pointLabelsInputName else {
+    private func runSingleFunctionPointSegment(
+        state: SingleFunctionContext,
+        image: CGImage,
+        pointQuery: PointQuery,
+        parameters: SegmentationParameters
+    ) async throws -> SegmentationOutput {
+        guard let pointsInputName = state.pointsInputName,
+            let pointLabelsInputName = state.pointLabelsInputName
+        else {
             throw SegmentationRuntimeError.unsupportedEngine(
                 "This model has no point inputs — use segment(image:textQuery:parameters:) instead."
             )
         }
 
-        let (imageArray, modelSize) = try preprocessImageForPoints(image: image)
+        let (imageArray, modelSize) = try preprocessImageForPoints(state: state, image: image)
 
         let (pointsDescriptor, labelsDescriptor, batchSize, queryCount, pointsPerQuery) =
-            try pointInputShapes(pointsInputName: pointsInputName, pointLabelsInputName: pointLabelsInputName)
+            try pointInputShapes(
+                state: state,
+                pointsInputName: pointsInputName,
+                pointLabelsInputName: pointLabelsInputName
+            )
 
         let imageHeight = Float(image.height)
         let imageWidth = Float(image.width)
@@ -313,8 +559,12 @@ public struct CoreAISegmentationEngine {
             scaleY: modelSize.height / imageHeight
         )
 
-        return try await runPointInference(
-            inputs: [imageInputName: imageArray, pointsInputName: pointsArray, pointLabelsInputName: labelsArray],
+        return try await runSingleFunctionPointInference(
+            state: state,
+            inputs: [
+                state.imageInputName: imageArray, pointsInputName: pointsArray,
+                pointLabelsInputName: labelsArray,
+            ],
             pointQuery: resolvedQuery,
             imageSize: CGSize(width: CGFloat(imageWidth), height: CGFloat(imageHeight))
         )
@@ -324,10 +574,13 @@ public struct CoreAISegmentationEngine {
     /// EfficientSAM bakes `(x - mean) / std` into the graph, so we feed raw `[0, 1]` pixels
     /// (`rescaleFactor=1/255`, identity mean/std).
     /// Returns the filled NDArray and the model's spatial size in pixels (`width × height`).
-    private func preprocessImageForPoints(image: CGImage) throws -> (NDArray, (width: Float, height: Float)) {
-        guard case .ndArray(let imageDescriptor) = functionDescriptor.inputDescriptor(of: imageInputName) else {
+    private func preprocessImageForPoints(state: SingleFunctionContext, image: CGImage) throws
+        -> (NDArray, (width: Float, height: Float))
+    {
+        guard case .ndArray(let imageDescriptor) = state.descriptor.inputDescriptor(of: state.imageInputName)
+        else {
             throw SegmentationRuntimeError.invalidConfiguration(
-                "No array descriptor for image input '\(imageInputName)'"
+                "No array descriptor for image input '\(state.imageInputName)'"
             )
         }
         let modelWidth = imageDescriptor.shape[3]
@@ -357,17 +610,21 @@ public struct CoreAISegmentationEngine {
     /// Throws if either descriptor is missing, the ranks differ from `[B,Q,P,2]`/`[B,Q,P]`,
     /// or the shapes disagree.
     private func pointInputShapes(
-        pointsInputName: String, pointLabelsInputName: String
+        state: SingleFunctionContext,
+        pointsInputName: String,
+        pointLabelsInputName: String
     ) throws -> (
         pointsDescriptor: NDArrayDescriptor, labelsDescriptor: NDArrayDescriptor,
         batchSize: Int, queryCount: Int, pointsPerQuery: Int
     ) {
-        guard case .ndArray(let pointsDescriptor) = functionDescriptor.inputDescriptor(of: pointsInputName) else {
+        guard case .ndArray(let pointsDescriptor) = state.descriptor.inputDescriptor(of: pointsInputName)
+        else {
             throw SegmentationRuntimeError.invalidConfiguration(
                 "No array descriptor for points input '\(pointsInputName)'"
             )
         }
-        guard case .ndArray(let labelsDescriptor) = functionDescriptor.inputDescriptor(of: pointLabelsInputName) else {
+        guard case .ndArray(let labelsDescriptor) = state.descriptor.inputDescriptor(of: pointLabelsInputName)
+        else {
             throw SegmentationRuntimeError.invalidConfiguration(
                 "No array descriptor for point labels input '\(pointLabelsInputName)'"
             )
@@ -414,7 +671,8 @@ public struct CoreAISegmentationEngine {
         for batchIndex in 0..<batchSize {
             for (queryIndex, query) in queries.enumerated() {
                 for (pointIndex, point) in query.enumerated() {
-                    let queryPointIndex = (batchIndex * queryCount + queryIndex) * pointsPerQuery + pointIndex
+                    let queryPointIndex =
+                        (batchIndex * queryCount + queryIndex) * pointsPerQuery + pointIndex
                     pointFloats[queryPointIndex * 2 + 0] = point.x * scaleX
                     pointFloats[queryPointIndex * 2 + 1] = point.y * scaleY
                     labelFloats[queryPointIndex] = Float(point.label.rawValue)
@@ -446,23 +704,24 @@ public struct CoreAISegmentationEngine {
         return (pointsArray, labelsArray)
     }
 
-    // MARK: - Per-model inference + output extraction
+    // MARK: - Single-function inference helpers
 
     @discardableResult
-    private func runTextInference(
+    private func runSingleFunctionTextInference(
+        state: SingleFunctionContext,
         inputs: [String: NDArray]
     ) async throws -> SegmentationOutput {
-        guard let boxesOutputName,
-            let logitsOutputName,
-            let presenceLogitsOutputName,
-            let semanticSegOutputName
+        guard let boxesOutputName = state.boxesOutputName,
+            let logitsOutputName = state.logitsOutputName,
+            let presenceLogitsOutputName = state.presenceLogitsOutputName,
+            let semanticSegOutputName = state.semanticSegOutputName
         else {
             throw SegmentationRuntimeError.invalidConfiguration(
                 "Text inference invoked on a non-text model."
             )
         }
-        var outputs = try await function.run(inputs: inputs)
-        guard let masks = outputs.remove(masksOutputName)?.ndArray,
+        var outputs = try await state.function.run(inputs: inputs)
+        guard let masks = outputs.remove(state.masksOutputName)?.ndArray,
             let boxes = outputs.remove(boxesOutputName)?.ndArray,
             let logits = outputs.remove(logitsOutputName)?.ndArray,
             let presence = outputs.remove(presenceLogitsOutputName)?.ndArray,
@@ -485,18 +744,19 @@ public struct CoreAISegmentationEngine {
     }
 
     @discardableResult
-    private func runPointInference(
+    private func runSingleFunctionPointInference(
+        state: SingleFunctionContext,
         inputs: [String: NDArray],
         pointQuery: PointQuery,
         imageSize: CGSize
     ) async throws -> SegmentationOutput {
-        guard let iouScoresOutputName else {
+        guard let iouScoresOutputName = state.iouScoresOutputName else {
             throw SegmentationRuntimeError.invalidConfiguration(
                 "Point inference invoked on a non-point model."
             )
         }
-        var outputs = try await function.run(inputs: inputs)
-        guard let masksOutput = outputs.remove(masksOutputName)?.ndArray,
+        var outputs = try await state.function.run(inputs: inputs)
+        guard let masksOutput = outputs.remove(state.masksOutputName)?.ndArray,
             let iouScoresOutput = outputs.remove(iouScoresOutputName)?.ndArray
         else {
             throw SegmentationRuntimeError.invalidConfiguration(
@@ -530,6 +790,191 @@ public struct CoreAISegmentationEngine {
             semanticSegmentShape: []
         )
     }
+
+    // MARK: - Multi-function text path
+
+    private func warmupMultiFunctionTextModel(state: MultiFunctionContext) async throws {
+        guard
+            case .ndArray(let imageDescriptor) = state.imageEncodeDescriptor.inputDescriptor(
+                of: state.imageInputName),
+            case .ndArray(let textDescriptor) = state.textEncodeDescriptor.inputDescriptor(of: state.textInputName)
+        else {
+            throw SegmentationRuntimeError.invalidConfiguration(
+                "No array descriptor for image_encode/text_encode inputs"
+            )
+        }
+        let imageArray = NDArray(descriptor: imageDescriptor)
+        var textArray = NDArray(descriptor: textDescriptor)
+        fillNDArray(&textArray, as: Int32.self, count: textDescriptor.shape.reduce(1, *)) { _ in
+            CLIPTokenizer.eotTokenId
+        }
+
+        try await runMultiFunctionInference(
+            state: state,
+            imageArray: imageArray,
+            textArray: textArray
+        )
+    }
+
+    private func runMultiFunctionTextSegment(
+        state: MultiFunctionContext,
+        image: CGImage,
+        textQuery: TextQuery,
+        parameters: SegmentationParameters
+    ) async throws -> SegmentationOutput {
+        guard
+            case .ndArray(let imageDescriptor) = state.imageEncodeDescriptor.inputDescriptor(
+                of: state.imageInputName)
+        else {
+            throw SegmentationRuntimeError.invalidConfiguration(
+                "No array descriptor for image input '\(state.imageInputName)'"
+            )
+        }
+        let imageArray = try Self.buildImageNDArray(
+            from: image, descriptor: imageDescriptor, parameters: parameters
+        )
+
+        let textArray: NDArray
+        switch textQuery {
+        case .prompt:
+            throw SegmentationRuntimeError.invalidConfiguration(
+                "TextQuery.prompt must be resolved to .tokens by ImageSegmenter before reaching the engine."
+            )
+        case .tokens(let textTokensBatch):
+            guard
+                case .ndArray(let textDescriptor) = state.textEncodeDescriptor.inputDescriptor(
+                    of: state.textInputName)
+            else {
+                throw SegmentationRuntimeError.invalidConfiguration(
+                    "No array descriptor for text input '\(state.textInputName)'"
+                )
+            }
+            textArray = Self.buildTextTokensNDArray(
+                tokensBatch: textTokensBatch, descriptor: textDescriptor
+            )
+        case .embeddings:
+            throw SegmentationRuntimeError.unsupportedEngine(
+                "Multi-function segmentation assets accept token IDs only — "
+                    + "the text_encode graph already projects them internally."
+            )
+        }
+
+        return try await runMultiFunctionInference(
+            state: state,
+            imageArray: imageArray,
+            textArray: textArray
+        )
+    }
+
+    /// Run image_encode → text_encode → detect, threading encoder outputs into `detect`.
+    /// Outputs are pulled out of each `function.run` return dict — never pre-allocated.
+    @discardableResult
+    private func runMultiFunctionInference(
+        state: MultiFunctionContext,
+        imageArray: NDArray,
+        textArray: NDArray
+    ) async throws -> SegmentationOutput {
+        var imageOutputs = try await state.imageEncode.run(
+            inputs: [state.imageInputName: imageArray]
+        )
+        guard let backboneFeatures = imageOutputs.remove(state.backboneFeaturesOutputName)?.ndArray
+        else {
+            throw SegmentationRuntimeError.invalidConfiguration(
+                "Missing '\(state.backboneFeaturesOutputName)' output from image_encode."
+            )
+        }
+
+        var textOutputs = try await state.textEncode.run(inputs: [state.textInputName: textArray])
+        guard let textFeatures = textOutputs.remove(state.textFeaturesOutputName)?.ndArray else {
+            throw SegmentationRuntimeError.invalidConfiguration(
+                "Missing '\(state.textFeaturesOutputName)' output from text_encode."
+            )
+        }
+
+        var detectOutputs = try await state.detect.run(
+            inputs: [
+                state.backboneFeaturesInputName: backboneFeatures,
+                state.textFeaturesInputName: textFeatures,
+            ]
+        )
+        guard let masks = detectOutputs.remove(state.masksOutputName)?.ndArray,
+            let boxes = detectOutputs.remove(state.boxesOutputName)?.ndArray,
+            let logits = detectOutputs.remove(state.logitsOutputName)?.ndArray,
+            let presence = detectOutputs.remove(state.presenceLogitsOutputName)?.ndArray,
+            let semantic = detectOutputs.remove(state.semanticSegOutputName)?.ndArray
+        else {
+            throw SegmentationRuntimeError.invalidConfiguration(
+                "Missing one or more outputs after detect.run."
+            )
+        }
+
+        return SegmentationOutput(
+            predictedMasks: flattenAsFloat(masks),
+            masksShape: masks.shape,
+            predictedBoxes: flattenAsFloat(boxes),
+            predictedLogits: flattenAsFloat(logits),
+            presenceLogits: flattenAsFloat(presence),
+            semanticSegment: flattenAsFloat(semantic),
+            semanticSegmentShape: semantic.shape
+        )
+    }
+
+    // MARK: - Shared NDArray builders
+
+    /// Resize, normalize, and dtype-convert `image` into the model's image-input NDArray.
+    /// Used by both single-function and multi-function text paths — the preprocessing config
+    /// (mean/std, target size) is identical between them.
+    static func buildImageNDArray(
+        from image: CGImage,
+        descriptor: NDArrayDescriptor,
+        parameters: SegmentationParameters
+    ) throws -> NDArray {
+        let expectedShape = descriptor.shape
+        guard expectedShape.count == 4 else {
+            throw SegmentationRuntimeError.invalidConfiguration(
+                "Expected 4-dimensional input shape, got \(expectedShape.count)"
+            )
+        }
+        let height = expectedShape[2]
+        let width = expectedShape[3]
+        let floatPixels = try ImagePreprocessor(
+            targetSize: CGSize(width: width, height: height),
+            mean: parameters.normalizationMeans,
+            std: parameters.normalizationStds,
+            rescaleFactor: 1.0
+        ).preprocessCHW(cgImage: image)
+
+        var array = NDArray(descriptor: descriptor)
+        if descriptor.scalarType == .float16 {
+            #if !((os(macOS) || targetEnvironment(macCatalyst)) && arch(x86_64))
+            fillNDArray(&array, as: Float16.self, with: floatPixels.map(Float16.init))
+            #else
+            fatalError("Float16 is not supported on this platform")
+            #endif
+        } else {
+            fillNDArray(&array, as: Float.self, with: floatPixels)
+        }
+        return array
+    }
+
+    /// Pack `tokensBatch` into an `[batch, sequenceLength]` int32 NDArray, padding with
+    /// `CLIPTokenizer.eotTokenId` when a row is shorter than `sequenceLength`.
+    static func buildTextTokensNDArray(
+        tokensBatch: [[Int32]],
+        descriptor: NDArrayDescriptor
+    ) -> NDArray {
+        let batchSize = descriptor.shape[0]
+        let sequenceLength = descriptor.shape[1]
+        var array = NDArray(descriptor: descriptor)
+        fillNDArray(&array, as: Int32.self, count: batchSize * sequenceLength) { idx in
+            tokenValue(
+                at: idx, sequenceLength: sequenceLength, batch: tokensBatch,
+                eotTokenId: CLIPTokenizer.eotTokenId)
+        }
+        return array
+    }
+
+    // MARK: - Best-of-K helpers (point path; pure-data, easily unit testable)
 
     /// For [B, Q, K, H, W] masks + [B, Q, K] scores, pick the highest-scoring K per (B, Q).
     /// Returns flat `[B, Q, H, W]` masks, the new shape, and `[B, Q]` scores.
@@ -574,7 +1019,8 @@ public struct CoreAISegmentationEngine {
                     bestScore = flatScores[scoreBase + candidate]
                     bestCandidate = candidate
                 }
-                let maskBase = ((batchIndex * queryCount + queryIndex) * candidateCount + bestCandidate) * pixelCount
+                let maskBase =
+                    ((batchIndex * queryCount + queryIndex) * candidateCount + bestCandidate) * pixelCount
                 outMasks.append(contentsOf: flatMasks[maskBase..<(maskBase + pixelCount)])
                 outScores.append(bestScore)
             }
@@ -616,7 +1062,7 @@ public struct CoreAISegmentationEngine {
         return (outMasks, [batchSize, userQueryCount, height, width], outScores)
     }
 
-    // MARK: - Internal helpers
+    // MARK: - Point query resolution + validation
 
     /// Resolve the user's `PointQuery` against the model's static `[Q, P]` shape.
     ///
@@ -742,6 +1188,8 @@ public struct CoreAISegmentationEngine {
         return flatBoxes
     }
 
+    // MARK: - Static name-discovery helpers
+
     static func findImageInputName(in names: [String]) -> String? {
         names.first {
             let l = $0.lowercased()
@@ -752,7 +1200,10 @@ public struct CoreAISegmentationEngine {
     static func findTextInputName(in names: [String]) -> String? {
         names.first {
             let l = $0.lowercased()
-            return l.contains("input_id") || l.contains("token") || l.contains("text")
+            // Match input_id / token / text, but exclude text_features (a `detect` input that
+            // also contains "text") so it isn't mistaken for the token input.
+            return (l.contains("input_id") || l.contains("token") || l.contains("text"))
+                && !l.contains("feat")
         }
     }
 
@@ -774,6 +1225,17 @@ public struct CoreAISegmentationEngine {
         names.first {
             let l = $0.lowercased()
             return l.contains("point") && l.contains("label")
+        }
+    }
+
+    static func findBackboneFeaturesName(in names: [String]) -> String? {
+        names.first { $0.lowercased().contains("backbone") }
+    }
+
+    static func findTextFeaturesName(in names: [String]) -> String? {
+        names.first {
+            let l = $0.lowercased()
+            return l.contains("text_feat") || l == "text_features"
         }
     }
 
@@ -806,6 +1268,8 @@ public struct CoreAISegmentationEngine {
     static func findSemanticOutputName(in names: [String]) -> String? {
         names.first { $0.lowercased().contains("semantic") }
     }
+
+    // MARK: - Token / embedding generators
 
     static func tokenValue(at idx: Int, sequenceLength: Int, batch: [[Int32]], eotTokenId: Int32) -> Int32 {
         let batchIndex = idx / sequenceLength

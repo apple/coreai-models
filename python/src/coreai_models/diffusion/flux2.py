@@ -201,7 +201,14 @@ class Flux2VAEEncoderWrapper(torch.nn.Module):
         self.vae = self.vae.to(next(vae.parameters()).dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return cast(torch.Tensor, self.vae.encode(x).latent_dist.parameters)
+        # diffusers encodes img2img reference images with
+        # `retrieve_latents(..., sample_mode="argmax")` -> `latent_dist.mode()`,
+        # i.e. the distribution MEAN (first `latent_channels` channels), not the
+        # raw `parameters` tensor (which is mean concat logvar = 2x channels).
+        # Returning `.parameters` would emit 64 channels where the pipeline
+        # expects 32, corrupting the img2img latents. `.mode()` is deterministic,
+        # so it is also the correct choice for a traced/exported graph.
+        return cast(torch.Tensor, self.vae.encode(x).latent_dist.mode())
 
 
 # ---------------------------------------------------------------------------

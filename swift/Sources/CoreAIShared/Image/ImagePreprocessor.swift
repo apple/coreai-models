@@ -9,6 +9,14 @@ import CoreImage
 import Foundation
 import ImageIO
 
+// MARK: - Image Strategy
+
+public enum ImageStrategy: String, Codable, Sendable {
+    case stretch
+    case centerCrop = "center_crop"
+    case pad
+}
+
 // MARK: - ImagePreprocessor
 
 /// Resizes an image to a target size and applies per-channel normalization
@@ -92,60 +100,10 @@ public struct ImagePreprocessor: Sendable {
     public func preprocess(cgImage: CGImage) throws -> (Data, Int, Int) {
         let w = Int(targetSize.width)
         let h = Int(targetSize.height)
-
-        guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) else {
-            throw ImagePreprocessorError.renderFailed
-        }
-        guard
-            let ctx = CGContext(
-                data: nil,
-                width: w,
-                height: h,
-                bitsPerComponent: 8,
-                bytesPerRow: w * 4,
-                space: colorSpace,
-                bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
-            )
-        else {
-            throw ImagePreprocessorError.renderFailed
-        }
-        ctx.interpolationQuality = .high
-        ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: w, height: h))
-
-        guard let pixelData = ctx.data else {
-            throw ImagePreprocessorError.renderFailed
-        }
-        let rawPixels = pixelData.bindMemory(to: UInt8.self, capacity: w * h * 4)
-
-        let pixelCount = w * h
-        let bytesPerPixel = 4 * MemoryLayout<Float>.size
-        var data = Data(count: pixelCount * bytesPerPixel)
-        data.withUnsafeMutableBytes { dstPtr in
-            guard let dstBase = dstPtr.bindMemory(to: Float.self).baseAddress else { return }
-
-            // Combine `(x*scale - mean) / std` into a single vDSP_vsmsa call:
-            //   y = x * (scale/std) + (-mean/std)
-            // For each color channel, read UInt8 with stride 4, write Float
-            // back to the interleaved RGBA destination at stride 4.
-            let scale = Float(rescaleFactor) / 255.0
-            let means: [Float] = [Float(mean.0), Float(mean.1), Float(mean.2)]
-            let stds: [Float] = [Float(std.0), Float(std.1), Float(std.2)]
-
-            var channel = [Float](repeating: 0, count: pixelCount)
-            let n = vDSP_Length(pixelCount)
-            for c in 0..<3 {
-                var a = scale / stds[c]
-                var b = -means[c] / stds[c]
-                vDSP_vfltu8(rawPixels.advanced(by: c), 4, &channel, 1, n)
-                vDSP_vsmsa(channel, 1, &a, &b, dstBase.advanced(by: c), 4, n)
-            }
-
-            // Alpha unused — write 0 at stride 4.
-            var zero: Float = 0
-            vDSP_vfill(&zero, dstBase.advanced(by: 3), 4, n)
-        }
-
-        return (data, w, h)
+        let resized = try renderToContext(
+            cgImage: cgImage, canvasWidth: w, canvasHeight: h,
+            drawRect: CGRect(x: 0, y: 0, width: w, height: h))
+        return try normalize(pixels: resized, width: w, height: h)
     }
 
     /// Preprocess a CGImage and return a flat CHW `[C, H, W]` Float32 array.
@@ -166,6 +124,148 @@ public struct ImagePreprocessor: Sendable {
             }
         }
         return chw
+    }
+
+    /// Preprocess with center-crop strategy: resize shortest edge to target,
+    /// then center-crop to square. Returns flat CHW `[3, H, W]` Float32.
+    public func preprocessCHWCenterCrop(cgImage: CGImage) throws -> [Float] {
+        let targetW = Int(targetSize.width)
+        let targetH = Int(targetSize.height)
+        let srcW = cgImage.width
+        let srcH = cgImage.height
+
+        let scale =
+            srcW < srcH
+            ? CGFloat(targetW) / CGFloat(srcW)
+            : CGFloat(targetH) / CGFloat(srcH)
+        let resizedW = Int(round(CGFloat(srcW) * scale))
+        let resizedH = Int(round(CGFloat(srcH) * scale))
+
+        let resized = try renderToContext(
+            cgImage: cgImage, canvasWidth: resizedW, canvasHeight: resizedH,
+            drawRect: CGRect(x: 0, y: 0, width: resizedW, height: resizedH))
+
+        let cropX = (resizedW - targetW) / 2
+        let cropY = (resizedH - targetH) / 2
+        guard let cropped = resized.cropping(to: CGRect(x: cropX, y: cropY, width: targetW, height: targetH)) else {
+            throw ImagePreprocessorError.renderFailed
+        }
+
+        return try preprocessCHW(cgImage: cropped)
+    }
+
+    /// Preprocess with pad strategy: resize longest edge to target, zero-pad
+    /// the shorter dimension. Returns flat CHW `[3, H, W]` Float32.
+    public func preprocessCHWPad(cgImage: CGImage) throws -> [Float] {
+        let targetW = Int(targetSize.width)
+        let targetH = Int(targetSize.height)
+        let srcW = cgImage.width
+        let srcH = cgImage.height
+
+        let scale =
+            srcW > srcH
+            ? CGFloat(targetW) / CGFloat(srcW)
+            : CGFloat(targetH) / CGFloat(srcH)
+        let resizedW = Int(round(CGFloat(srcW) * scale))
+        let resizedH = Int(round(CGFloat(srcH) * scale))
+
+        let offsetX = (targetW - resizedW) / 2
+        let offsetY = (targetH - resizedH) / 2
+
+        let padded = try renderToContext(
+            cgImage: cgImage, canvasWidth: targetW, canvasHeight: targetH,
+            drawRect: CGRect(x: offsetX, y: offsetY, width: resizedW, height: resizedH))
+
+        return try preprocessCHW(cgImage: padded)
+    }
+
+    /// Dispatch preprocessing based on strategy. Returns flat CHW `[3, H, W]`.
+    public func preprocessCHW(cgImage: CGImage, strategy: ImageStrategy) throws -> [Float] {
+        switch strategy {
+        case .stretch: return try preprocessCHW(cgImage: cgImage)
+        case .centerCrop: return try preprocessCHWCenterCrop(cgImage: cgImage)
+        case .pad: return try preprocessCHWPad(cgImage: cgImage)
+        }
+    }
+
+    // MARK: - Private Helpers
+
+    private func renderToContext(
+        cgImage: CGImage, canvasWidth: Int, canvasHeight: Int,
+        drawRect: CGRect
+    ) throws -> CGImage {
+        guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) else {
+            throw ImagePreprocessorError.renderFailed
+        }
+        guard
+            let ctx = CGContext(
+                data: nil,
+                width: canvasWidth,
+                height: canvasHeight,
+                bitsPerComponent: 8,
+                bytesPerRow: canvasWidth * 4,
+                space: colorSpace,
+                bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+            )
+        else {
+            throw ImagePreprocessorError.renderFailed
+        }
+        ctx.interpolationQuality = .high
+        ctx.draw(cgImage, in: drawRect)
+        guard let result = ctx.makeImage() else {
+            throw ImagePreprocessorError.renderFailed
+        }
+        return result
+    }
+
+    private func normalize(pixels cgImage: CGImage, width w: Int, height h: Int) throws -> (Data, Int, Int) {
+        guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) else {
+            throw ImagePreprocessorError.renderFailed
+        }
+        guard
+            let ctx = CGContext(
+                data: nil,
+                width: w,
+                height: h,
+                bitsPerComponent: 8,
+                bytesPerRow: w * 4,
+                space: colorSpace,
+                bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+            )
+        else {
+            throw ImagePreprocessorError.renderFailed
+        }
+        ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: w, height: h))
+
+        guard let pixelData = ctx.data else {
+            throw ImagePreprocessorError.renderFailed
+        }
+        let rawPixels = pixelData.bindMemory(to: UInt8.self, capacity: w * h * 4)
+
+        let pixelCount = w * h
+        let bytesPerPixel = 4 * MemoryLayout<Float>.size
+        var data = Data(count: pixelCount * bytesPerPixel)
+        data.withUnsafeMutableBytes { dstPtr in
+            guard let dstBase = dstPtr.bindMemory(to: Float.self).baseAddress else { return }
+
+            let scale = Float(rescaleFactor) / 255.0
+            let means: [Float] = [Float(mean.0), Float(mean.1), Float(mean.2)]
+            let stds: [Float] = [Float(std.0), Float(std.1), Float(std.2)]
+
+            var channel = [Float](repeating: 0, count: pixelCount)
+            let n = vDSP_Length(pixelCount)
+            for c in 0..<3 {
+                var a = scale / stds[c]
+                var b = -means[c] / stds[c]
+                vDSP_vfltu8(rawPixels.advanced(by: c), 4, &channel, 1, n)
+                vDSP_vsmsa(channel, 1, &a, &b, dstBase.advanced(by: c), 4, n)
+            }
+
+            var zero: Float = 0
+            vDSP_vfill(&zero, dstBase.advanced(by: 3), 4, n)
+        }
+
+        return (data, w, h)
     }
 }
 

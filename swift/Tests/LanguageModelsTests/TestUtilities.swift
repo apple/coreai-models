@@ -71,7 +71,7 @@ class MockEngine: InferenceEngine, @unchecked Sendable {
         with input: [TokenId],
         samplingConfiguration: SamplingConfiguration,
         inferenceOptions: InferenceOptions
-    ) throws -> GenerationSequence {
+    ) async throws -> GenerationSequence {
         let token = GenerationToken()
         _activeToken.withLock { $0 = token }
 

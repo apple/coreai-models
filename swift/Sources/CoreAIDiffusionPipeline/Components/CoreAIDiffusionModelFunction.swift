@@ -4,10 +4,11 @@
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
 import CoreAI
+import CoreAIShared
 import Foundation
 
-/// Core AI diffusion model function — loads a fresh InferenceFunction per call
-/// for clean buffer state in stateless model evaluation.
+/// Core AI diffusion model function — manages a single InferenceFunction
+/// for stateless model evaluation (text encoder, UNet, VAE).
 public actor CoreAIDiffusionModelFunction {
     private let modelURL: URL
     private var model: AIModel?
@@ -43,8 +44,7 @@ public actor CoreAIDiffusionModelFunction {
     // MARK: - [Float]-based API
 
     public func run(floatInputs: [([Float], [Int])]) async throws -> [Float] {
-        if function == nil { try await loadResources() }
-        guard let fn = function else { throw CoreAIDiffusionError.notLoaded }
+        let fn = try await ensureLoaded()
 
         var namedInputs: [String: NDArray] = [:]
         for (i, name) in fn.descriptor.inputNames.enumerated() where i < floatInputs.count {
@@ -71,12 +71,11 @@ public actor CoreAIDiffusionModelFunction {
             namedInputs[name] = array
         }
 
-        return try await encodeAndSync(inputs: namedInputs)
+        return try await encodeAndSync(fn: fn, inputs: namedInputs)
     }
 
     public func run(intInputs: [([Int32], [Int])]) async throws -> [Float] {
-        if function == nil { try await loadResources() }
-        guard let fn = function else { throw CoreAIDiffusionError.notLoaded }
+        let fn = try await ensureLoaded()
 
         var namedInputs: [String: NDArray] = [:]
         for (i, name) in fn.descriptor.inputNames.enumerated() where i < intInputs.count {
@@ -91,34 +90,31 @@ public actor CoreAIDiffusionModelFunction {
             namedInputs[name] = array
         }
 
-        return try await encodeAndSync(inputs: namedInputs)
+        return try await encodeAndSync(fn: fn, inputs: namedInputs)
     }
 
     // MARK: - NDArray-based API (for parity tests)
 
     public func predict(inputs: [String: NDArray]) async throws -> [String: [Float]] {
-        if function == nil { try await loadResources() }
-        guard let fn = function else { throw CoreAIDiffusionError.notLoaded }
+        let fn = try await ensureLoaded()
         try Self.requireSingleOutput(fn)
-        let floats = try await encodeAndSync(inputs: inputs)
+        let floats = try await encodeAndSync(fn: fn, inputs: inputs)
         return [fn.descriptor.outputNames[0]: floats]
     }
 
     public func predictAllOutputs(inputs: [String: NDArray]) async throws -> [String: [Float]] {
-        if function == nil { try await loadResources() }
-        guard function != nil else { throw CoreAIDiffusionError.notLoaded }
-        return try await encodeAndSyncAll(inputs: inputs)
+        let fn = try await ensureLoaded()
+        return try await encodeAndSyncAll(fn: fn, inputs: inputs)
     }
 
     public func predictAutoNamed(inputs: [NDArray]) async throws -> [String: [Float]] {
-        if function == nil { try await loadResources() }
-        guard let fn = function else { throw CoreAIDiffusionError.notLoaded }
+        let fn = try await ensureLoaded()
         try Self.requireSingleOutput(fn)
         var namedInputs: [String: NDArray] = [:]
         for (i, name) in fn.descriptor.inputNames.enumerated() where i < inputs.count {
             namedInputs[name] = inputs[i]
         }
-        let floats = try await encodeAndSync(inputs: namedInputs)
+        let floats = try await encodeAndSync(fn: fn, inputs: namedInputs)
         return [fn.descriptor.outputNames[0]: floats]
     }
 
@@ -131,18 +127,16 @@ public actor CoreAIDiffusionModelFunction {
 
     // MARK: - Core inference
 
-    /// Run inference by loading a fresh function each call.
-    /// InferenceFunction.run() can return stale data on alternating calls for
-    /// stateless models, so we always load a fresh one.
-    private func encodeAndSync(inputs: [String: NDArray]) async throws -> [Float] {
-        guard let mdl = model else { throw CoreAIDiffusionError.notLoaded }
-        guard let freshFn = try mdl.loadFunction(named: "main") else {
-            throw CoreAIDiffusionError.functionNotFound("main", modelURL)
-        }
+    private func ensureLoaded() async throws -> InferenceFunction {
+        if function == nil { try await loadResources() }
+        guard let fn = function else { throw CoreAIDiffusionError.notLoaded }
+        return fn
+    }
 
-        var outputs = try await freshFn.run(inputs: inputs)
+    private func encodeAndSync(fn: InferenceFunction, inputs: [String: NDArray]) async throws -> [Float] {
+        var outputs = try await fn.run(inputs: inputs)
 
-        guard let outputName = freshFn.descriptor.outputNames.first,
+        guard let outputName = fn.descriptor.outputNames.first,
             let srcArray = outputs.remove(outputName)?.ndArray
         else {
             return []
@@ -151,27 +145,17 @@ public actor CoreAIDiffusionModelFunction {
         return try ndArrayToFloats(srcArray)
     }
 
-    /// Multi-output variant of `encodeAndSync`. Reads every declared output
-    /// into a flat `[Float]` array and returns them keyed by name.
-    private func encodeAndSyncAll(inputs: [String: NDArray]) async throws -> [String: [Float]] {
-        guard let mdl = model else { throw CoreAIDiffusionError.notLoaded }
-        guard let freshFn = try mdl.loadFunction(named: "main") else {
-            throw CoreAIDiffusionError.functionNotFound("main", modelURL)
-        }
-
-        var outputs = try await freshFn.run(inputs: inputs)
+    private func encodeAndSyncAll(fn: InferenceFunction, inputs: [String: NDArray]) async throws -> [String: [Float]] {
+        var outputs = try await fn.run(inputs: inputs)
 
         var result: [String: [Float]] = [:]
-        for name in freshFn.descriptor.outputNames {
+        for name in fn.descriptor.outputNames {
             guard let srcArray = outputs.remove(name)?.ndArray else { continue }
             result[name] = try ndArrayToFloats(srcArray)
         }
         return result
     }
 
-    /// Read an NDArray's contents into a flat `[Float]`, converting from
-    /// the underlying scalar type. Throws on unsupported types so the
-    /// caller doesn't silently misinterpret bytes.
     private func ndArrayToFloats(_ array: NDArray) throws -> [Float] {
         var result = [Float]()
         switch array.scalarType {
@@ -197,8 +181,7 @@ public actor CoreAIDiffusionModelFunction {
 
     public var inputDescriptors: [String: NDArrayDescriptor] {
         get async throws {
-            if function == nil { try await loadResources() }
-            guard let fn = function else { throw CoreAIDiffusionError.notLoaded }
+            let fn = try await ensureLoaded()
             var result: [String: NDArrayDescriptor] = [:]
             for name in fn.descriptor.inputNames {
                 if case .ndArray(let desc) = fn.descriptor.inputDescriptor(of: name) {
@@ -211,8 +194,7 @@ public actor CoreAIDiffusionModelFunction {
 
     public var outputDescriptors: [String: NDArrayDescriptor] {
         get async throws {
-            if function == nil { try await loadResources() }
-            guard let fn = function else { throw CoreAIDiffusionError.notLoaded }
+            let fn = try await ensureLoaded()
             var result: [String: NDArrayDescriptor] = [:]
             for name in fn.descriptor.outputNames {
                 if case .ndArray(let desc) = fn.descriptor.outputDescriptor(of: name) {
@@ -221,6 +203,17 @@ public actor CoreAIDiffusionModelFunction {
             }
             return result
         }
+    }
+
+    /// Infer the sequence length from the first input's shape (dim 1).
+    /// Returns nil if the model isn't loaded or has no rank-2 input.
+    public func inferSequenceLength() async throws -> Int? {
+        let descs = try await inputDescriptors
+        guard let desc = descs.values.first, desc.shape.count >= 2 else {
+            return nil
+        }
+        let dim = desc.shape[1]
+        return dim > 0 ? dim : nil
     }
 }
 

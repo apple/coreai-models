@@ -128,7 +128,7 @@ struct LLMBenchmark: AsyncParsableCommand {
 
         let options = InferenceOptions(maxTokens: generationTokens, includeLogits: false)
         let start = SuspendingClock.now
-        let stream = try engine.generate(
+        let stream = try await engine.generate(
             with: prompt, samplingConfiguration: sampling, inferenceOptions: options
         )
 

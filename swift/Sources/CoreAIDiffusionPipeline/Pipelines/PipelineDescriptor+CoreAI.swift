@@ -113,13 +113,15 @@ extension PipelineDescriptor {
             throw PipelineLoadError.missingComponent("text_encoder")
         }
 
+        let textEncoderSeqLength = try await textEncoderFunction.inferSequenceLength() ?? 77
+
         let textEncoder = CoreAITextEncoder(
             function: textEncoderFunction,
             tokenize: { text in
-                let (_, ids) = tokenizer.tokenize(input: text, minCount: 77)
+                let (_, ids) = tokenizer.tokenize(input: text, minCount: textEncoderSeqLength)
                 return ids.map(Int32.init)
             },
-            maxLength: 77
+            maxLength: textEncoderSeqLength
         )
 
         let denoiser = CoreAIDenoiser(function: unetFunction)

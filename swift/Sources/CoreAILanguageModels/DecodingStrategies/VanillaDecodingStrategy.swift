@@ -34,7 +34,7 @@ public struct VanillaDecodingStrategy: DecodingStrategy {
         samplingConfiguration: SamplingConfiguration,
         options: InferenceOptions,
         stopSequences: StopSequences
-    ) throws -> VanillaDecodedSequence {
+    ) async throws -> VanillaDecodedSequence {
         CLILogger.log("🔄 Starting vanilla decoding generation")
 
         // Eager setup.
@@ -44,7 +44,7 @@ public struct VanillaDecodingStrategy: DecodingStrategy {
             .map(Int32.init)
         CLILogger.log("Input tokens: \(inputTokens.prefix(10))... (showing first 10)")
 
-        let stream = try inferenceEngine.generate(
+        let stream = try await inferenceEngine.generate(
             with: inputTokens,
             samplingConfiguration: samplingConfiguration,
             inferenceOptions: options
@@ -164,7 +164,7 @@ extension VanillaDecodingStrategy.VanillaDecodedSequence {
             if !flushed {
                 let count = generatedTokenCount
                 // Metrics recording is async; fire-and-forget on the abandon path.
-                Task { await PerformanceMetrics.shared.setGeneratedTokenCount(count) }
+                Task { await PerformanceMetrics.shared.recordGeneratedTokens(count) }
             }
         }
 
@@ -283,7 +283,7 @@ extension VanillaDecodingStrategy.VanillaDecodedSequence {
                 trailing = nil
             }
 
-            await PerformanceMetrics.shared.setGeneratedTokenCount(generatedTokenCount)
+            await PerformanceMetrics.shared.recordGeneratedTokens(generatedTokenCount)
             return trailing
         }
     }

@@ -64,6 +64,8 @@ class VLMSpec:
     image_mean: tuple[float, float, float]
     image_std: tuple[float, float, float]
     rescale_factor: float
+    image_strategy: str = "stretch"
+    include_image_info: bool = False
 
     @property
     def num_visual_tokens(self) -> int:
@@ -81,9 +83,11 @@ SUPPORTED_MODELS: dict[str, VLMSpec] = {
         patch_size=16,
         spatial_merge_size=2,
         temporal_patch_size=2,  # Qwen frames-per-image (single image -> duplicated)
-        image_mean=(0.48145466, 0.4578275, 0.40821073),
-        image_std=(0.26862954, 0.26130258, 0.27577711),
+        image_mean=(0.5, 0.5, 0.5),
+        image_std=(0.5, 0.5, 0.5),
         rescale_factor=1.0,
+        image_strategy="stretch",
+        include_image_info=True,
     ),
 }
 
@@ -260,7 +264,15 @@ async def export_text_bundle(
     logging.info(f"Downloading {spec.hf_model_id}...")
     model_dir = snapshot_download(
         spec.hf_model_id,
-        allow_patterns=["*.safetensors", "*.safetensors.index.json", "config.json"],
+        allow_patterns=[
+            "*.safetensors",
+            "*.safetensors.index.json",
+            "config.json",
+            "tokenizer*",
+            "vocab.json",
+            "merges.txt",
+            "*.model",
+        ],
     )
     raw_cfg = AutoConfig.from_pretrained(model_dir)
     text_cfg = raw_cfg.text_config
@@ -370,6 +382,8 @@ async def export_text_bundle(
             "image_mean": list(spec.image_mean),
             "image_std": list(spec.image_std),
             "rescale_factor": spec.rescale_factor,
+            "image_strategy": spec.image_strategy,
+            "include_image_info": spec.include_image_info,
         },
         "source": {
             "hf_model_id": spec.hf_model_id,

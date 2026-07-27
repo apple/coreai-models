@@ -27,6 +27,8 @@ from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from coreai_models.export._constants import IOS_DEFAULT_MAX_CONTEXT_LENGTH
+
 # ---------------------------------------------------------------------------
 # Data model
 # ---------------------------------------------------------------------------
@@ -138,7 +140,7 @@ LLM_PRESETS: list[ModelPreset] = [
         "iOS",
         "none",
         "float16",
-        4096,
+        IOS_DEFAULT_MAX_CONTEXT_LENGTH,
         compression_config="models/qwen3/qwen3_0_6b_mixed_4bit_8bit.yaml",
     ),
     ModelPreset(
@@ -149,7 +151,7 @@ LLM_PRESETS: list[ModelPreset] = [
         "iOS",
         "4bit_weight_palettized_group8",
         "float16",
-        4096,
+        IOS_DEFAULT_MAX_CONTEXT_LENGTH,
     ),
     ModelPreset(
         "qwen3-4b",
@@ -159,7 +161,7 @@ LLM_PRESETS: list[ModelPreset] = [
         "iOS",
         "none",
         "float16",
-        4096,
+        IOS_DEFAULT_MAX_CONTEXT_LENGTH,
         compression_config="models/qwen3/qwen3_4b_mixed_4bit_8bit.yaml",
     ),
 ]

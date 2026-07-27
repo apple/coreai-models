@@ -12,22 +12,25 @@ import Foundation
 /// language model. The engine performs scatter-merge: replacing placeholder
 /// token positions with these embeddings before the first forward pass.
 public struct EmbeddedInput: Sendable {
-    /// The embedding tensor, typically shape [1, seq_len, hidden_dim].
+    /// The embedding tensor, shape [batch, seq_len, hidden_dim].
     /// Scalar type matches the LLM's expected input (float16, bFloat16, etc.).
     public let embeddings: NDArray
 
     /// Positions in the token sequence where embeddings replace placeholders.
     public let embeddingPositions: Range<Int>
 
-    public init(embeddings: NDArray, embeddingPositions: Range<Int>) {
+    public init(embeddings: NDArray, embeddingPositions: Range<Int>) throws {
+        guard embeddings.shape.count == 3 else {
+            throw InferenceRuntimeError.invalidArgument(
+                "EmbeddedInput requires 3D embeddings [batch, seq_len, hidden_dim], "
+                    + "got shape with \(embeddings.shape.count) dimensions")
+        }
         self.embeddings = embeddings
         self.embeddingPositions = embeddingPositions
     }
 
     /// Number of embedding tokens (seq_len dimension).
-    public var tokenCount: Int {
-        embeddings.shape.count >= 2 ? embeddings.shape[1] : 0
-    }
+    public var tokenCount: Int { embeddings.shape[1] }
 
     // TODO: Multi-turn support — allow multiple image regions per input,
     // persistent across generate() calls (keep in KV cache on reset).

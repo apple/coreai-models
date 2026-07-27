@@ -6,8 +6,8 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "coreai-core==1.0.0b1",
-#     "coreai-torch==0.4.0",
+#     "coreai-core==1.0.0b2",
+#     "coreai-torch==0.4.1",
 #     "depth-anything-3 @ git+https://github.com/ByteDance-Seed/Depth-Anything-3.git",
 #     "scipy<1.15",
 # ]

@@ -5,6 +5,7 @@
 
 import Accelerate
 import CoreAI
+import CoreAIShared
 import CoreGraphics
 import Foundation
 

@@ -58,7 +58,7 @@ struct GenerateDefaultExtensionTests {
 
         var outputs: [InferenceOutput] = []
         let generation = InferenceOptions(maxTokens: 5)
-        for try await output in try engine.generate(
+        for try await output in try await engine.generate(
             with: [1, 2, 3],
             samplingConfiguration: SamplingConfiguration.greedy,
             inferenceOptions: generation
@@ -80,7 +80,7 @@ struct GenerateDefaultExtensionTests {
         let engine = MockEngine(tokens: [42])
 
         let generation = InferenceOptions(maxTokens: 1, includeLogits: false)
-        for try await output in try engine.generate(
+        for try await output in try await engine.generate(
             with: [1],
             samplingConfiguration: SamplingConfiguration.greedy,
             inferenceOptions: generation
@@ -94,7 +94,7 @@ struct GenerateDefaultExtensionTests {
         let engine = MockEngine(tokens: [42], vocabSize: 50)
 
         let generation = InferenceOptions(maxTokens: 1, includeLogits: true)
-        for try await output in try engine.generate(
+        for try await output in try await engine.generate(
             with: [1],
             samplingConfiguration: SamplingConfiguration.greedy,
             inferenceOptions: generation
@@ -109,7 +109,7 @@ struct GenerateDefaultExtensionTests {
         let engine = MockEngine(tokens: [5], vocabSize: 10)
 
         let generation = InferenceOptions(maxTokens: 1, includeLogits: true)
-        for try await output in try engine.generate(
+        for try await output in try await engine.generate(
             with: [1],
             samplingConfiguration: SamplingConfiguration.greedy,
             inferenceOptions: generation
@@ -129,7 +129,7 @@ struct GenerateDefaultExtensionTests {
         let engine = MockEngine(tokens: [42], vocabSize: nil)
 
         let generation = InferenceOptions(maxTokens: 1, includeLogits: true)
-        for try await output in try engine.generate(
+        for try await output in try await engine.generate(
             with: [1],
             samplingConfiguration: SamplingConfiguration.greedy,
             inferenceOptions: generation
@@ -145,7 +145,7 @@ struct GenerateDefaultExtensionTests {
 
         var count = 0
         let generation = InferenceOptions(maxTokens: 100)  // Request way more than available
-        for try await _ in try engine.generate(
+        for try await _ in try await engine.generate(
             with: [1, 2, 3],  // 3 tokens prompt
             samplingConfiguration: SamplingConfiguration.greedy,
             inferenceOptions: generation
@@ -162,7 +162,7 @@ struct GenerateDefaultExtensionTests {
 
         var count = 0
         let generation = InferenceOptions()  // nil maxTokens
-        for try await _ in try engine.generate(
+        for try await _ in try await engine.generate(
             with: [1, 2, 3],  // 3 tokens prompt
             samplingConfiguration: SamplingConfiguration.greedy,
             inferenceOptions: generation
@@ -178,7 +178,7 @@ struct GenerateDefaultExtensionTests {
         let engine = MockEngine(tokens: [10])
 
         // Generate a token to advance state
-        for try await _ in try engine.generate(
+        for try await _ in try await engine.generate(
             with: [1],
             samplingConfiguration: SamplingConfiguration.greedy,
             inferenceOptions: InferenceOptions(maxTokens: 1)
@@ -205,7 +205,7 @@ struct GenerateMultiCallTests {
         // Simulate guided-generation pattern: call generate(maxTokens:1) repeatedly
         for _ in 0..<20 {
             var got: InferenceOutput?
-            for try await output in try engine.generate(
+            for try await output in try await engine.generate(
                 with: tokens,
                 samplingConfiguration: .greedy,
                 inferenceOptions: InferenceOptions(maxTokens: 1, includeLogits: true)
@@ -227,7 +227,7 @@ struct GenerateMultiCallTests {
 
         // Turn 1
         var count1 = 0
-        for try await _ in try engine.generate(
+        for try await _ in try await engine.generate(
             with: [1, 2, 3],
             samplingConfiguration: .greedy,
             inferenceOptions: InferenceOptions(maxTokens: 5)
@@ -241,7 +241,7 @@ struct GenerateMultiCallTests {
 
         // Turn 2
         var count2 = 0
-        for try await _ in try engine.generate(
+        for try await _ in try await engine.generate(
             with: [4, 5, 6],
             samplingConfiguration: .greedy,
             inferenceOptions: InferenceOptions(maxTokens: 3)
@@ -257,7 +257,7 @@ struct GenerateMultiCallTests {
         let forced: [Int32] = [7, 8, 9]
 
         var outputs: [InferenceOutput] = []
-        for try await output in try engine.generate(
+        for try await output in try await engine.generate(
             with: [1, 2, 3],
             samplingConfiguration: .greedy,
             inferenceOptions: InferenceOptions(
@@ -278,7 +278,7 @@ struct GenerateMultiCallTests {
         let engine = MockEngine(tokens: [10, 20])
 
         var count = 0
-        for try await _ in try engine.generate(
+        for try await _ in try await engine.generate(
             with: [1],
             samplingConfiguration: .greedy,
             inferenceOptions: InferenceOptions(forcedContinuation: [])
@@ -346,7 +346,7 @@ struct PartialResetParityTests {
         // Generate the full reference sequence once
         try await engine.reset()
         var referenceTokens: [Int32] = []
-        for try await output in try engine.generate(
+        for try await output in try await engine.generate(
             with: prompt,
             samplingConfiguration: .greedy,
             inferenceOptions: InferenceOptions(maxTokens: totalTokens)
@@ -366,7 +366,7 @@ struct PartialResetParityTests {
             // --- Path A: Full reset + re-generate everything ---
             try await engine.reset()
             var fullTokens: [Int32] = []
-            for try await output in try engine.generate(
+            for try await output in try await engine.generate(
                 with: prompt,
                 samplingConfiguration: .greedy,
                 inferenceOptions: InferenceOptions(maxTokens: totalTokens)
@@ -379,7 +379,7 @@ struct PartialResetParityTests {
             var partialTokens: [Int32] = []
 
             // Generate first resetPoint tokens
-            for try await output in try engine.generate(
+            for try await output in try await engine.generate(
                 with: prompt,
                 samplingConfiguration: .greedy,
                 inferenceOptions: InferenceOptions(maxTokens: resetPoint)
@@ -395,7 +395,7 @@ struct PartialResetParityTests {
             // Continue generating the remaining tokens
             let remaining = totalTokens - resetPoint
             let continueInput = prompt + partialTokens  // full context so far
-            for try await output in try engine.generate(
+            for try await output in try await engine.generate(
                 with: continueInput,
                 samplingConfiguration: .greedy,
                 inferenceOptions: InferenceOptions(maxTokens: remaining)
@@ -423,7 +423,7 @@ struct PartialResetParityTests {
         #expect(engine.processedTokenCount == 0)
 
         // After generating 10 tokens from a 5-token prompt
-        for try await _ in try engine.generate(
+        for try await _ in try await engine.generate(
             with: prompt,
             samplingConfiguration: .greedy,
             inferenceOptions: InferenceOptions(maxTokens: 10)
@@ -436,7 +436,7 @@ struct PartialResetParityTests {
 
         // Generate again — input matches cached prefix, so no new prefill
         let continueInput = prompt
-        for try await _ in try engine.generate(
+        for try await _ in try await engine.generate(
             with: continueInput,
             samplingConfiguration: .greedy,
             inferenceOptions: InferenceOptions(maxTokens: 7)
@@ -551,7 +551,7 @@ struct PrefixCachingTests {
 
         // First generation: prompt [1, 2, 3]
         var tokens: [Int32] = [1, 2, 3]
-        for try await output in try engine.generate(
+        for try await output in try await engine.generate(
             with: tokens,
             samplingConfiguration: .greedy,
             inferenceOptions: InferenceOptions(maxTokens: 3)
@@ -563,7 +563,7 @@ struct PrefixCachingTests {
 
         // Second generation with same prefix + new suffix:
         // Engine should detect prefix hit for the first 6 tokens
-        for try await output in try engine.generate(
+        for try await output in try await engine.generate(
             with: tokens,
             samplingConfiguration: .greedy,
             inferenceOptions: InferenceOptions(maxTokens: 2)
@@ -581,7 +581,7 @@ struct PrefixCachingTests {
         let engine = MockEngine(tokens: [10, 20, 30, 40, 50], maxContextLength: 100)
 
         // First generation: prompt [1, 2, 3]
-        for try await _ in try engine.generate(
+        for try await _ in try await engine.generate(
             with: [1, 2, 3],
             samplingConfiguration: .greedy,
             inferenceOptions: InferenceOptions(maxTokens: 3)
@@ -592,7 +592,7 @@ struct PrefixCachingTests {
         // Second generation with divergent prefix: [1, 2, 99, ...]
         // Should auto-detect divergence at position 2 and rewind
         var tokens: [Int32] = []
-        for try await output in try engine.generate(
+        for try await output in try await engine.generate(
             with: [1, 2, 99, 100],
             samplingConfiguration: .greedy,
             inferenceOptions: InferenceOptions(maxTokens: 2)
@@ -612,7 +612,7 @@ struct PrefixCachingTests {
         let engine = MockEngine(tokens: [10, 20, 30], maxContextLength: 100)
 
         // First generation
-        for try await _ in try engine.generate(
+        for try await _ in try await engine.generate(
             with: [1, 2, 3],
             samplingConfiguration: .greedy,
             inferenceOptions: InferenceOptions(maxTokens: 2)
@@ -620,7 +620,7 @@ struct PrefixCachingTests {
         #expect(engine.processedTokenCount == 5)
 
         // Completely different input
-        for try await _ in try engine.generate(
+        for try await _ in try await engine.generate(
             with: [99, 98, 97],
             samplingConfiguration: .greedy,
             inferenceOptions: InferenceOptions(maxTokens: 1)
@@ -637,7 +637,7 @@ struct PrefixCachingTests {
 
         // Turn 1: generate with prompt [1, 2, 3]
         var context: [Int32] = [1, 2, 3]
-        for try await output in try engine.generate(
+        for try await output in try await engine.generate(
             with: context,
             samplingConfiguration: .greedy,
             inferenceOptions: InferenceOptions(maxTokens: 5)
@@ -650,7 +650,7 @@ struct PrefixCachingTests {
         // Turn 2: append user message tokens, generate again
         // The first 8 tokens should be a prefix hit
         context.append(contentsOf: [77, 78, 79])  // new user message
-        for try await output in try engine.generate(
+        for try await output in try await engine.generate(
             with: context,
             samplingConfiguration: .greedy,
             inferenceOptions: InferenceOptions(maxTokens: 3)
@@ -667,7 +667,7 @@ struct PrefixCachingTests {
         let engine = MockEngine(tokens: [10, 20], maxContextLength: 100)
 
         // Generate some tokens
-        for try await _ in try engine.generate(
+        for try await _ in try await engine.generate(
             with: [1, 2, 3],
             samplingConfiguration: .greedy,
             inferenceOptions: InferenceOptions(maxTokens: 2)
@@ -680,7 +680,7 @@ struct PrefixCachingTests {
         #expect(engine.processedTokenCount == 0)
 
         // Next generation starts fresh
-        for try await _ in try engine.generate(
+        for try await _ in try await engine.generate(
             with: [1, 2, 3],
             samplingConfiguration: .greedy,
             inferenceOptions: InferenceOptions(maxTokens: 1)
@@ -693,7 +693,7 @@ struct PrefixCachingTests {
         let engine = MockEngine(tokens: [10, 20, 30], maxContextLength: 100)
 
         // Generate: prompt [1, 2, 3] + 3 tokens = history of 6
-        for try await _ in try engine.generate(
+        for try await _ in try await engine.generate(
             with: [1, 2, 3],
             samplingConfiguration: .greedy,
             inferenceOptions: InferenceOptions(maxTokens: 3)
@@ -708,7 +708,7 @@ struct PrefixCachingTests {
         #expect(engine.history.tokens == [1, 2, 3])
 
         // Re-generate with same prompt — should be a full prefix hit
-        for try await _ in try engine.generate(
+        for try await _ in try await engine.generate(
             with: [1, 2, 3],
             samplingConfiguration: .greedy,
             inferenceOptions: InferenceOptions(maxTokens: 2)

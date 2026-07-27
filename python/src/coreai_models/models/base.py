@@ -340,6 +340,7 @@ class BaseForCausalLM(torch.nn.Module):
         target_dtype: torch.dtype = torch.float16,
         mmap_path: str | None = None,
         num_layers: int | None = None,
+        disable_embedding_quantization: bool = False,
     ) -> T:
         """Load model from HuggingFace model hub.
 
@@ -353,6 +354,9 @@ class BaseForCausalLM(torch.nn.Module):
             num_layers: Optional number of transformer layers. When set, only layers
                         0..num_layers-1 are loaded and the config is truncated.
                         Useful for fast smoke tests.
+            disable_embedding_quantization: iOS only. When True, the
+                embedding table is not quantized to int8.
+                Ignored for macOS model classes.
 
         Returns:
             Instance of the model class loaded with HuggingFace weights
@@ -370,8 +374,12 @@ class BaseForCausalLM(torch.nn.Module):
             hf_model.config, max_context_length, num_layers=num_layers
         )
 
-        # Create our model instance and load the state dict
-        model = cls(config, model_device="meta")
+        # Create our model instance and load the state dict.
+        # disable_embedding_quantization is only accepted by the iOS base class.
+        init_kwargs: dict = {"config": config, "model_device": "meta"}
+        if issubclass(cls, BaseForCausalLMForiOS):
+            init_kwargs["disable_embedding_quantization"] = disable_embedding_quantization
+        model = cls(**init_kwargs)
         model.to(dtype=target_dtype)
         state_dict = hf_model.state_dict()
         if not isinstance(state_dict, collections.abc.MutableMapping):
@@ -414,6 +422,7 @@ class BaseForCausalLM(torch.nn.Module):
         num_layers: int | None = None,
         hf_config_attr: str | None = None,
         hf_state_dict_prefix: str = "",
+        disable_embedding_quantization: bool = False,
     ) -> T:
         """Load model from HuggingFace with layer-by-layer memory offloading.
 
@@ -439,6 +448,9 @@ class BaseForCausalLM(torch.nn.Module):
                 prefix are loaded. The prefix is stripped before assigning.
                 Use for multimodal checkpoints where text weights live under
                 a prefix (e.g. ``"language_model."``).
+            disable_embedding_quantization: iOS only. When True, the
+                embedding table is not quantized to int8.
+                Ignored for non-iOS model classes.
         """
         model_dir = snapshot_download(
             huggingface_model_id,
@@ -450,7 +462,11 @@ class BaseForCausalLM(torch.nn.Module):
 
         config = cls._get_reauthored_config(hf_config, max_context_length, num_layers=num_layers)
 
-        model = cls(config, model_device="meta")
+        # disable_embedding_quantization is only accepted by the iOS base class.
+        init_kwargs: dict = {"config": config, "model_device": "meta"}
+        if issubclass(cls, BaseForCausalLMForiOS):
+            init_kwargs["disable_embedding_quantization"] = disable_embedding_quantization
+        model = cls(**init_kwargs)
         model.to(dtype=target_dtype)
 
         safetensors_files = _resolve_safetensors_files(model_dir)

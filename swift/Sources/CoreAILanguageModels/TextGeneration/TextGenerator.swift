@@ -138,7 +138,7 @@ public class TextGenerator {
             forcedContinuation: continuationTokens
         )
 
-        let stream = try inferenceEngine.generate(
+        let stream = try await inferenceEngine.generate(
             with: contextTokens,
             samplingConfiguration: SamplingConfiguration.greedy,
             inferenceOptions: options

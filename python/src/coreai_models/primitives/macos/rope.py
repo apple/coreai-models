@@ -109,7 +109,7 @@ class YarnRoPE(torch.nn.Module):
         return self._rope(
             x,
             position_ids=position_ids,
-            freqs=self._freqs,
+            freqs=self._freqs.to(x.device),
             offset=offset,
         )
 

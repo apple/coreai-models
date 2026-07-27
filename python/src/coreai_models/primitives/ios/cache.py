@@ -95,15 +95,23 @@ class KVCacheHandler:
     def gen_slice_args(
         self, layer_idx: int, offset: torch.IntTensor, num_token_updates: int
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        layer_index = self._layer_indices[layer_idx]
-        layer_index_end = self._layer_indices_end[layer_idx]
-        begin = torch.cat([layer_index, self._zero, self._zero, self._zero, offset])
+        layer_index = self._layer_indices[layer_idx].to(offset.device)
+        layer_index_end = self._layer_indices_end[layer_idx].to(offset.device)
+        begin = torch.cat(
+            [
+                layer_index,
+                self._zero.to(offset.device),
+                self._zero.to(offset.device),
+                self._zero.to(offset.device),
+                offset,
+            ]
+        )
         end = torch.cat(
             [
                 layer_index_end,
-                self._one,
-                self._hidden_size,
-                self._one,
+                self._one.to(offset.device),
+                self._hidden_size.to(offset.device),
+                self._one.to(offset.device),
                 offset + num_token_updates,
             ]
         )

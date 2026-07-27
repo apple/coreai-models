@@ -11,7 +11,7 @@ import Synchronization
 public struct CLILogger {
     private static let _level = Atomic<Int>(0)
 
-    static var level: Int {
+    public static var level: Int {
         get {
             _level.load(ordering: .acquiring)
         }
@@ -19,10 +19,6 @@ public struct CLILogger {
             assert(newValue >= 0, "Log level must be greater than or equal to 0")
             _level.store(newValue, ordering: .releasing)
         }
-    }
-
-    public static func setLevel(to level: Int) {
-        Self.level = level
     }
 
     /// Performs logging if enabled for the requested level.

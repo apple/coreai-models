@@ -191,7 +191,7 @@ public struct ConstrainedGenerator: DecodingStrategy {
             let options = InferenceOptions(maxTokens: 1, includeLogits: true)
 
             var rawLogits: [LogitsScalarType]? = nil
-            for try await output in try inferenceEngine.generate(
+            for try await output in try await inferenceEngine.generate(
                 with: inputTokens,
                 samplingConfiguration: samplingConfiguration,
                 inferenceOptions: options

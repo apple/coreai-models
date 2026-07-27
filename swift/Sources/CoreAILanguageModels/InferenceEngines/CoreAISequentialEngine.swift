@@ -348,8 +348,13 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         with input: [TokenId],
         samplingConfiguration: SamplingConfiguration,
         inferenceOptions: InferenceOptions
-    ) throws -> GenerationSequence {
-        // Implicit prefix caching: resolve before creating Iterator.
+    ) async throws -> GenerationSequence {
+        // Cancel any prior generation so its Iterator stops on next poll.
+        _activeToken.withLock {
+            $0?.cancel()
+            $0 = nil
+        }
+
         // Implicit prefix caching: resolve input against history.
         if history.count > 0 {
             let (commonPrefix, _) = history.resolve(input: input)

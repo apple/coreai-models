@@ -37,7 +37,17 @@ public final class DiscreteFlowScheduler {
         self.mu = mu
         self.counter = 0
 
-        let sigmaMin: Float = (mu != nil) ? (1.0 / trainSteps) : (1.0 / Float(stepCount))
+        // Lower bound of the pre-shift sigma linspace. Diffusers builds
+        //   sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
+        // (pipeline_flux2_klein.py) and passes it to
+        // FlowMatchEulerDiscreteScheduler.set_timesteps, which uses the provided
+        // sigmas as-is and only applies the mu/shift transform — it does NOT
+        // recompute the endpoints from num_train_timesteps. So the floor must be
+        // 1/stepCount for BOTH the dynamic-shift (mu) and static-shift paths.
+        // Using 1/trainStepCount here collapsed the final sigma to ~0 at low step
+        // counts (e.g. 4-step Klein), wasting the last step and misplacing all
+        // intermediate noise levels.
+        let sigmaMin: Float = 1.0 / Float(stepCount)
         var inferSigmas: [Float] = linspace(sigmaMax, sigmaMin, stepCount)
 
         if let mu {
