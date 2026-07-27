@@ -149,8 +149,7 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
                 // Joint(decoder_output, encoder[:, frame:frame+1, :]).
                 fillFloatNDArray(&jointDecIn, with: decBuf)
                 let encOffset = frame * hidden
-                let encSlice = Array(encFlat[encOffset..<encOffset + hidden])
-                fillFloatNDArray(&jointEncIn, with: encSlice)
+                fillFloatNDArray(&jointEncIn, with: encFlat[encOffset..<encOffset + hidden])
 
                 var jointOutViews = InferenceFunction.MutableViews()
                 jointOutViews.insert(&logits, for: "logits")

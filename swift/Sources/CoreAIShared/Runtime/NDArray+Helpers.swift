@@ -131,10 +131,19 @@ public func readNDArray<T: BitwiseCopyable>(
 /// scalar-type dispatch (callers hold `[Float]` and don't know the descriptor's
 /// dtype statically); the actual writes delegate to `fillNDArray`.
 public func fillFloatNDArray(_ array: inout NDArray, with elements: [Float]) {
+    fillFloatNDArray(&array, with: elements[...])
+}
+
+/// Slice overload of `fillFloatNDArray`. Lets hot-loop callers pass a slice
+/// (`buffer[a..<b]`) straight through without materializing an intermediate
+/// `Array`. This is the canonical implementation; the `[Float]` overload forwards
+/// here. Indices are taken relative to the slice's own `startIndex`.
+public func fillFloatNDArray(_ array: inout NDArray, with elements: ArraySlice<Float>) {
+    let base = elements.startIndex
     switch array.scalarType {
     #if !((os(macOS) || targetEnvironment(macCatalyst)) && arch(x86_64))
     case .float16:
-        fillNDArray(&array, as: Float16.self, count: elements.count) { Float16(elements[$0]) }
+        fillNDArray(&array, as: Float16.self, count: elements.count) { Float16(elements[base + $0]) }
     #endif
     case .float32:
         fillNDArray(&array, as: Float.self, with: elements)
