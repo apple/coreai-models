@@ -127,18 +127,17 @@ public func readNDArray<T: BitwiseCopyable>(
 /// A model input's dtype is fixed by the exported graph: an f16 export exposes
 /// f16 input tensors. Filling those via `fillNDArray(_:as: Float.self,…)` writes
 /// 4-byte elements into a 2-byte-per-element buffer — a size mismatch that traps
-/// or corrupts memory. Use this helper for any float model input whose dtype
-/// follows the descriptor rather than being fixed by the caller.
+/// or corrupts memory. This helper is the single home for that runtime
+/// scalar-type dispatch (callers hold `[Float]` and don't know the descriptor's
+/// dtype statically); the actual writes delegate to `fillNDArray`.
 public func fillFloatNDArray(_ array: inout NDArray, with elements: [Float]) {
     switch array.scalarType {
     #if !((os(macOS) || targetEnvironment(macCatalyst)) && arch(x86_64))
     case .float16:
-        var view = array.mutableView(as: Float16.self)
-        view.copyElements(fromContentsOf: elements.map { Float16($0) })
+        fillNDArray(&array, as: Float16.self, count: elements.count) { Float16(elements[$0]) }
     #endif
     case .float32:
-        var view = array.mutableView(as: Float.self)
-        view.copyElements(fromContentsOf: elements)
+        fillNDArray(&array, as: Float.self, with: elements)
     default:
         preconditionFailure("fillFloatNDArray: unsupported scalar type \(array.scalarType)")
     }

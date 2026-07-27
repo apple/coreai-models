@@ -168,9 +168,13 @@ public enum MelSpectrogram {
 
         for t in 0..<framesToCompute {
             let offset = t * config.hopLength
-            vDSP_vmul(
-                Array(padded[offset..<offset + config.winLength]), 1,
-                window, 1, &windowed, 1, vDSP_Length(config.winLength))
+            // Multiply the window straight out of `padded` via a base-pointer offset —
+            // avoids allocating an `Array` slice on every frame in this hot loop.
+            padded.withUnsafeBufferPointer { p in
+                vDSP_vmul(
+                    p.baseAddress! + offset, 1,
+                    window, 1, &windowed, 1, vDSP_Length(config.winLength))
+            }
             // Place the windowed slice into a zero-padded nFFT buffer.
             for i in 0..<config.nFFT { frame[i] = 0 }
             for i in 0..<config.winLength { frame[frameOffset + i] = windowed[i] }

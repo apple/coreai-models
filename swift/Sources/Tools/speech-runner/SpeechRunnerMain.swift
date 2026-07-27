@@ -86,44 +86,40 @@ func runBundle(bundleURL: URL, audioPath: String?, warmup: Bool, verbose: Bool) 
         CLILogger.setLevel(to: 1)
     }
 
+    // Resolve the PCM buffer once — either the decoded audio file or a fixed
+    // silence buffer for latency benchmarking — then share the warmup / transcribe
+    // / stats path for both.
+    let pcm: [Float]
+    let audioURL: URL?
     if let path = audioPath {
-        let url = URL(fileURLWithPath: path)
-        let pcm = try MelSpectrogram.loadAndResample(url, targetSampleRate: await model.sampleRate)
+        audioURL = URL(fileURLWithPath: path)
+        pcm = try MelSpectrogram.loadAndResample(audioURL!, targetSampleRate: await model.sampleRate)
+    } else {
+        audioURL = nil
+        print("No audio — silence benchmark")
+        pcm = [Float](repeating: 0, count: 480_000)
+    }
 
-        if warmup {
-            print("Warming up…")
-            try await model.prewarm(sampleCount: pcm.count)
-        }
+    if warmup {
+        print("Warming up…")
+        try await model.prewarm(sampleCount: pcm.count)
+    }
 
-        print("Transcribing \(url.lastPathComponent)…")
-        let t0 = ContinuousClock.now
-        let (text, stats) = try await model.transcribe(pcm: pcm)
-        let totalMs = (ContinuousClock.now - t0).inMilliseconds
-        print("\n── Decode ─────────────────────────────────────────────────────────────")
-        print(
-            String(
-                format:
-                    "  steps: %d  latency: %.1f ms/step  speed: %.1f steps/s  min: %.1f ms  max: %.1f ms  [%.1f ms total]",
-                stats.stepCount, stats.avgLatencyMs, stats.stepsPerSecond,
-                stats.minLatencyMs, stats.maxLatencyMs, totalMs))
+    if let audioURL { print("Transcribing \(audioURL.lastPathComponent)…") }
+    let t0 = ContinuousClock.now
+    let (text, stats) = try await model.transcribe(pcm: pcm)
+    let totalMs = (ContinuousClock.now - t0).inMilliseconds
+    print("\n── Decode ─────────────────────────────────────────────────────────────")
+    print(
+        String(
+            format:
+                "  steps: %d  latency: %.1f ms/step  speed: %.1f steps/s  min: %.1f ms  max: %.1f ms  [%.1f ms total]",
+            stats.stepCount, stats.avgLatencyMs, stats.stepsPerSecond,
+            stats.minLatencyMs, stats.maxLatencyMs, totalMs))
+    // Silence benchmark has no meaningful transcript to print.
+    if audioURL != nil {
         print("\n── Transcription ──────────────────────────────────────────────────────")
         print("  \(text)")
-    } else {
-        print("No audio — silence benchmark")
-        let pcm = [Float](repeating: 0, count: 480_000)
-        if warmup {
-            print("Warming up…")
-            try await model.prewarm(sampleCount: pcm.count)
-        }
-        let t0 = ContinuousClock.now
-        let (_, stats) = try await model.transcribe(pcm: pcm)
-        let totalMs = (ContinuousClock.now - t0).inMilliseconds
-        print(
-            String(
-                format:
-                    "  steps: %d  latency: %.1f ms/step  speed: %.1f steps/s  min: %.1f ms  max: %.1f ms  [%.1f ms total]",
-                stats.stepCount, stats.avgLatencyMs, stats.stepsPerSecond,
-                stats.minLatencyMs, stats.maxLatencyMs, totalMs))
     }
 }
 
@@ -145,7 +141,8 @@ func runLegacy(modelPath: String, audioPath: String?, warmup: Bool) async throws
     print(" done in \(String(format: "%.3f", loadElapsed.inSeconds))s\(cacheHit ? " (cache hit)" : "")")
     guard let fn = try model.loadFunction(named: "main")
     else { throw RuntimeError("No 'main' function in model") }
-    let desc = model.functionDescriptor(for: "main")!
+    guard let desc = model.functionDescriptor(for: "main")
+    else { throw RuntimeError("No 'main' descriptor in model") }
 
     guard case .ndArray(let melNDDesc) = desc.inputDescriptor(of: "input_features"),
         case .ndArray(let idsNDDesc) = desc.inputDescriptor(of: "decoder_input_ids"),

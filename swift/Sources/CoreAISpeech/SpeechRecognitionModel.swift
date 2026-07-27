@@ -96,7 +96,9 @@ public actor SpeechRecognitionModel {
         guard let fn = try encoder.loadFunction(named: "main") else {
             throw SpeechError.missingModel("No 'main' function in encoder")
         }
-        let encDesc = encoder.functionDescriptor(for: "main")!
+        guard let encDesc = encoder.functionDescriptor(for: "main") else {
+            throw SpeechError.missingModel("No 'main' descriptor in encoder")
+        }
         guard case .ndArray(let melNDDesc) = encDesc.inputDescriptor(of: "input_features")
         else { throw SpeechError.missingModel("Unexpected encoder input descriptor") }
         let start = SuspendingClock().now

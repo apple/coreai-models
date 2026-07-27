@@ -51,8 +51,12 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
         guard let jointFn = try joint.loadFunction(named: "main") else {
             throw SpeechError.missingModel("No 'main' function in joint")
         }
-        let stepDesc = decoderStep.functionDescriptor(for: "main")!
-        let jointDesc = joint.functionDescriptor(for: "main")!
+        guard let stepDesc = decoderStep.functionDescriptor(for: "main") else {
+            throw SpeechError.missingModel("No 'main' descriptor in decoder_step")
+        }
+        guard let jointDesc = joint.functionDescriptor(for: "main") else {
+            throw SpeechError.missingModel("No 'main' descriptor in joint")
+        }
 
         guard case .ndArray(let inputIdsDesc) = stepDesc.inputDescriptor(of: "input_ids"),
             case .ndArray(let hiddenInDesc) = stepDesc.inputDescriptor(of: "hidden_state"),
