@@ -261,6 +261,11 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
         maxTokens: Int,
         session: ConstrainedSessionHandle
     ) throws -> AsyncThrowingStream<TokenId, Error> {
+        precondition(
+            !engineInUse.load(ordering: .acquiring),
+            "generateConstrained called while a prior generation is still in flight — caller must drain first"
+        )
+
         let (stream, continuation) = AsyncThrowingStream<TokenId, Error>.makeStream()
 
         let sessionBox = session
@@ -1539,6 +1544,7 @@ private struct EngineImpl: ~Copyable {
         asyncStates.insert(&keyState, for: keyCacheName)
         asyncStates.insert(&valState, for: valueCacheName)
 
+        // Safe: constrained loop awaits each token before encoding the next step, so logits are consumed before overwrite.
         let logitsBuffer = logits.metalBuffer
         let logitsShape = [1, queryLength, vocabSize]
         let logitsStrides = try resolvedStrides(descriptor: logitsBaseDesc, shape: logitsShape)
