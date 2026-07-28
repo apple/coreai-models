@@ -28,7 +28,7 @@ Options:
 
 ## Bundle layout
 
-The export produces a `<name>.llmasset/` directory (`metadata.json` `kind=vlm`)
+The export produces a `<name>/` directory (`metadata.json` `kind=vlm`)
 with asset roles consumed by the Swift runner's `ModelBundle`:
 
 | Asset       | File             | Role                                            |

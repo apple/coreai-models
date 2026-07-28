@@ -88,7 +88,7 @@ public struct ConstrainedDecodingStrategy: DecodingStrategy {
         guard let vocabSize = vocabSizeOverride ?? Self.deriveVocabSize(from: tokenizer) else {
             throw InferenceRuntimeError.invalidArgument(
                 "Cannot determine vocabulary size from tokenizer. "
-                    + "Pass vocabSize explicitly via CoreAIRunner or LLMAsset metadata."
+                    + "Pass vocabSize explicitly via CoreAIRunner or ModelBundle metadata."
             )
         }
 

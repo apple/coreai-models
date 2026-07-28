@@ -6,7 +6,7 @@
 """CLI entry point for ``coreai.vlm.export``.
 
 Exports a vision-language model to Core AI format as a multi-asset bundle
-(``<name>.llmasset/``):
+(``<name>/``):
 
   - ``<name>.aimodel``   text decoder (asset role ``main``, inputs_embeds, stateful KV)
   - ``embed.aimodel``    token-embedding lookup (asset role ``embedding``)
@@ -332,7 +332,7 @@ async def export_text_bundle(
     program.optimize()
 
     # ---- 5. Save bundle ----
-    bundle_path = output_dir / (output_name + ".llmasset")
+    bundle_path = output_dir / output_name
     bundle_path.mkdir(parents=True, exist_ok=True)
     aimodel_path = bundle_path / f"{output_name}.aimodel"
 
