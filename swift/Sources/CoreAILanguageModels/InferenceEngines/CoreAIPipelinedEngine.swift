@@ -261,10 +261,11 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
         maxTokens: Int,
         session: ConstrainedSessionHandle
     ) throws -> AsyncThrowingStream<TokenId, Error> {
-        precondition(
-            !engineInUse.load(ordering: .acquiring),
-            "generateConstrained called while a prior generation is still in flight — caller must drain first"
-        )
+        if _generationTask.withLock({ $0 }) != nil || engineInUse.load(ordering: .acquiring) {
+            throw InferenceRuntimeError.invalidState(
+                "generateConstrained called while a prior generation is still in flight — caller must drain first"
+            )
+        }
 
         let (stream, continuation) = AsyncThrowingStream<TokenId, Error>.makeStream()
 
@@ -288,6 +289,7 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
                 }
             }
             self.engine.reset()
+            self.history.clear()
             do {
                 try await self.engine.runConstrainedCompletion(
                     prompt: input,
@@ -469,7 +471,8 @@ package final class ConstrainedSessionHandle: @unchecked Sendable {
 
     func reset() { _session.reset() }
 
-    func rollback(_ numTokens: Int = 1) { _session.rollback(numTokens) }
+    @discardableResult
+    func rollback(_ numTokens: Int = 1) -> Bool { _session.rollback(numTokens) }
 
     func findJumpForwardString() -> String? {
         _session.findJumpForwardString()
@@ -1305,7 +1308,6 @@ private struct EngineImpl: ~Copyable {
         // Pre-grow KV cache
         let totalNeeded = prompt.count + maxTokens
         try kvCache.ensureCapacity(forContextLength: totalNeeded, queue: pipelineQueue)
-        try logits.ensureCapacity(forContextLength: 1)
 
         // Prefill prompt (unconstrained -- grammar doesn't constrain the prompt)
         let prefillTokens: [Int32]
@@ -1315,6 +1317,8 @@ private struct EngineImpl: ~Copyable {
         } else {
             prefillTokens = prompt
         }
+
+        try logits.ensureCapacity(forContextLength: max(1, prefillTokens.count))
 
         // Fill initial bitmask — the first generated token must also be constrained
         // (e.g. JSON schema requires '{' as first character, not '<think>')
@@ -1366,7 +1370,7 @@ private struct EngineImpl: ~Copyable {
                 lastToken = try await withCheckedThrowingContinuation { cont in
                     do {
                         try _encodeStepForConstrainedGeneration(
-                            tokens: jumpTokens,
+                            tokens: [lastToken] + jumpTokens,
                             gpuSampler: gpuSampler,
                             applyBitmask: applyMaskAfterJump
                         ) { token in
@@ -1453,7 +1457,7 @@ private struct EngineImpl: ~Copyable {
                 break
             }
         }
-        guard safeCount > 0 else { return nil }
+        guard safeCount > 0, safeCount <= 64 else { return nil }
 
         let safeTokens = Array(tokenIds.prefix(safeCount))
 
