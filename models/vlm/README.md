@@ -62,7 +62,7 @@ The strategy is inferred from the model's `preprocessor_config.json` at export
 time and written into the bundle's `metadata.json`. Override at runtime:
 
 ```bash
-llm-runner --model vlm_bundle --image photo.jpg --image-strategy center_crop
+swift run -c release llm-runner --model vlm_bundle --image photo.jpg --image-strategy center_crop --prompt "your prompt"
 ```
 
 ### Original resolution in prompt
