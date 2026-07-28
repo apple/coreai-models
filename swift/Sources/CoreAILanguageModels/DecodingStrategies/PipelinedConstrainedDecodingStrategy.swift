@@ -54,7 +54,7 @@ public struct PipelinedConstrainedDecodingStrategy: DecodingStrategy {
         guard let vocabSize else {
             throw InferenceRuntimeError.invalidArgument(
                 "Cannot determine vocabulary size from tokenizer. "
-                    + "Pass vocabSize explicitly via CoreAIRunner or LLMAsset metadata."
+                    + "Pass vocabSize explicitly via the model metadata."
             )
         }
 
@@ -62,7 +62,7 @@ public struct PipelinedConstrainedDecodingStrategy: DecodingStrategy {
         if stopSequences.sequences.contains(where: { $0.count > 1 }) {
             CLILogger.log(
                 "Warning: Multi-token stop sequences not supported by xgrammar, using single-token stops only",
-                component: "PipelinedConstrained")
+                component: "PipelinedConstrained", level: 0)
         }
         let stopTokenIds: [Int32]? = singleTokenStops.isEmpty ? nil : singleTokenStops
 
@@ -193,6 +193,7 @@ extension PipelinedConstrainedSequence {
 
                     guard let tokenId = try await iterator.next() else {
                         finished = true
+                        self.innerIterator = nil
                         return nil
                     }
                     self.innerIterator = iterator
@@ -204,6 +205,7 @@ extension PipelinedConstrainedSequence {
                     }
                     if stopSequences.matches(recentTokens: recentTokens) {
                         finished = true
+                        self.innerIterator = nil
                         return nil
                     }
 
@@ -225,6 +227,7 @@ extension PipelinedConstrainedSequence {
                 }
             } catch {
                 finished = true
+                self.innerIterator = nil
                 throw error
             }
         }
