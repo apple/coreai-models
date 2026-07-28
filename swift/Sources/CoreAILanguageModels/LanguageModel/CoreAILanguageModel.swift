@@ -174,10 +174,12 @@ public struct CoreAILanguageModel: LanguageModel {
 
     /// Whether guided generation is available for this model.
     private var isGuidedGenerationSupported: Bool {
+        if let isConstrainedCapable = resources.loadedEngineIsConstrainedCapable {
+            return isConstrainedCapable
+        }
         if let supportsLogits = resources.loadedEngineSupportsLogits {
             return supportsLogits
         }
-        // Pipelined engine supports constrained generation via GPU bitmask path
         return true
     }
 
