@@ -176,13 +176,13 @@ let package = Package(
             ]
         ),
         .executableTarget(
-            name: "speech-runner",
+            name: "speech-recognizer",
             dependencies: [
                 "CoreAISpeech",
                 "CoreAIShared",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ],
-            path: "swift/Sources/Tools/speech-runner",
+            path: "swift/Sources/Tools/speech-recognizer",
             swiftSettings: [
                 .enableUpcomingFeature("MemberImportVisibility")
             ]

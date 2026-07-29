@@ -60,7 +60,7 @@ let (text2, _) = try await model.transcribe(pcm: pcmSamples)
 ### On your Mac using built-in Command Line Tool
 
 ```bash
-swift run -c release speech-runner path/to/exported_bundle_dir path/to/audio.wav
+swift run -c release speech-recognizer path/to/exported_bundle_dir path/to/audio.wav
 ```
 
 Accepts any audio the system can decode (`wav`, `flac`, `m4a`, …). Add `--warmup` to run a full transcription pass (encode + decode) on silence before timing, or `--verbose` for debug output. Omit the audio file to run a silence latency benchmark.

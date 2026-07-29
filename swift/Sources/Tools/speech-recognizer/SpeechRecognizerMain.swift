@@ -13,9 +13,9 @@ import Tokenizers
 // MARK: - Entry point
 
 @main
-struct SpeechRunner: AsyncParsableCommand {
+struct SpeechRecognizer: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
-        commandName: "speech-runner",
+        commandName: "speech-recognizer",
         abstract: "Transcribe audio using a CoreAI speech model bundle"
     )
 
