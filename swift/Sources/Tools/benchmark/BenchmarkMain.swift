@@ -6,7 +6,9 @@
 // Based on mlx-lm benchmark (https://github.com/ml-explore/mlx-lm)
 
 import ArgumentParser
+import CoreAI
 import CoreAILanguageModels
+import CoreAIShared
 import Foundation
 
 @main
@@ -40,6 +42,12 @@ struct LLMBenchmark: AsyncParsableCommand {
     @Option(name: .customLong("output-json"), help: "Write summary JSON to file")
     var outputJson: String?
 
+    @Flag(
+        name: .customLong("clear-coreai-cache"),
+        help: "Clear Core AI cached specialization for this model before loading (forces re-specialization)"
+    )
+    var clearCoreAICache: Bool = false
+
     func validate() throws {
         if promptTokens < 1 { throw ValidationError("--prompt-tokens must be >= 1") }
         if generationTokens < 1 { throw ValidationError("--generation-tokens must be >= 1") }
@@ -57,6 +65,17 @@ struct LLMBenchmark: AsyncParsableCommand {
         let bundle = try LanguageBundle(from: model)
         let vocabSize = bundle.vocabSize
 
+        let modelURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.main)
+
+        if clearCoreAICache {
+            let cleared = try PreparedModel.clearCache(at: bundle.bundlePath)
+            print("\n🗑️  Cleared specialization cache for \(bundle.name) (\(cleared.count) component(s))")
+        }
+
+        // Detect an existing cached specialization before loading so we can annotate the load
+        // time below. This only inspects the cache; it never triggers specialization.
+        let cacheHit = PreparedModel.isCached(at: modelURL)
+
         let engineConfig = ModelConfig(
             name: bundle.name,
             tokenizer: bundle.tokenizer,
@@ -66,11 +85,13 @@ struct LLMBenchmark: AsyncParsableCommand {
             function: bundle.language.functionMap?.name(for: "main") ?? "main"
         )
         let configData = try JSONEncoder().encode(engineConfig)
-        print("\n⏳ Preparing AI asset...")
+        print("\n⏳ Preparing AI asset...", terminator: "")
+        fflush(stdout)
         let engine = try await EngineFactory.createEngine(
             config: configData,
-            modelURL: try bundle.requireModelURL(for: ModelBundle.ComponentKey.main)
+            modelURL: modelURL
         )
+        print(cacheHit ? " done (cache hit)" : " done")
 
         let prompt = randomPrompt(vocabSize: vocabSize, count: promptTokens, seed: seed)
         let sampling = SamplingConfiguration(temperature: 0)

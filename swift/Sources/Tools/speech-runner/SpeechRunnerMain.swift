@@ -25,13 +25,32 @@ struct SpeechRunner: AsyncParsableCommand {
     @Argument(help: "Audio file (wav, flac, m4a, …). Omit for latency benchmarking with silence.")
     var audioPath: String?
 
+    @Flag(
+        name: .customLong("clear-coreai-cache"),
+        help: "Clear Core AI cached specialization for this model before loading (forces re-specialization)"
+    )
+    var clearCoreAICache: Bool = false
+
     func run() async throws {
         let bundleURL = URL(fileURLWithPath: modelPath)
+        if clearCoreAICache {
+            try clearCache(bundleURL: bundleURL)
+        }
         if FileManager.default.fileExists(atPath: bundleURL.appending(path: "encoder.aimodel").path) {
             try await runBundle(bundleURL: bundleURL, audioPath: audioPath)
         } else {
             try await runLegacy(modelPath: modelPath, audioPath: audioPath)
         }
+    }
+
+    /// Clear the specialization cache for this model's asset component(s).
+    ///
+    /// Delegates to `PreparedModel.clearCache`, which scans the bundle directory for every
+    /// `.aimodel`/`.aimodelc` component (or treats `bundleURL` as a single asset), so it stays
+    /// correct regardless of component filenames.
+    private func clearCache(bundleURL: URL) throws {
+        let cleared = try PreparedModel.clearCache(at: bundleURL)
+        print("🗑️  Cleared specialization cache for \(bundleURL.lastPathComponent) (\(cleared.count) component(s))")
     }
 }
 
@@ -39,7 +58,22 @@ struct SpeechRunner: AsyncParsableCommand {
 
 func runBundle(bundleURL: URL, audioPath: String?) async throws {
     print("Format: split (encoder + decoder, KV cache)")
+
+    // Detect an existing cached specialization before loading so we can annotate the load time
+    // below. Only inspects the cache; never specializes. `SpeechBundle` loads each asset via
+    // `AIModel(contentsOf:)`, which uses `.default` options — match that, and require both.
+    let encoderURL = bundleURL.appending(path: "encoder.aimodel")
+    let decoderURL = bundleURL.appending(path: "decoder.aimodel")
+    let cacheHit =
+        PreparedModel.isCached(at: encoderURL, options: .default)
+        && PreparedModel.isCached(at: decoderURL, options: .default)
+
+    print("⏳ Preparing AI asset...", terminator: "")
+    fflush(stdout)
+    let loadStart = ContinuousClock.now
     let model = try await SpeechModel(resourcesAt: bundleURL)
+    let loadElapsed = ContinuousClock.now - loadStart
+    print(" done in \(String(format: "%.3f", loadElapsed.inSeconds))s\(cacheHit ? " (cache hit)" : "")")
 
     if let path = audioPath {
         let url = URL(fileURLWithPath: path)
@@ -64,7 +98,17 @@ func runBundle(bundleURL: URL, audioPath: String?) async throws {
 func runLegacy(modelPath: String, audioPath: String?) async throws {
     print("Format: legacy (monolithic, no KV cache)")
 
-    let model = try await AIModel(contentsOf: URL(fileURLWithPath: modelPath))
+    let modelURL = URL(fileURLWithPath: modelPath)
+    // Detect an existing cached specialization before loading. Only inspects the cache; never
+    // specializes. The legacy path loads via `AIModel(contentsOf:)`, which uses `.default` options.
+    let cacheHit = PreparedModel.isCached(at: modelURL, options: .default)
+
+    print("⏳ Preparing AI asset...", terminator: "")
+    fflush(stdout)
+    let loadStart = ContinuousClock.now
+    let model = try await AIModel(contentsOf: modelURL)
+    let loadElapsed = ContinuousClock.now - loadStart
+    print(" done in \(String(format: "%.3f", loadElapsed.inSeconds))s\(cacheHit ? " (cache hit)" : "")")
     guard let fn = try model.loadFunction(named: "main")
     else { throw RuntimeError("No 'main' function in model") }
     let desc = model.functionDescriptor(for: "main")!
@@ -155,10 +199,4 @@ func runLegacy(modelPath: String, audioPath: String?) async throws {
 struct RuntimeError: Error, CustomStringConvertible {
     let description: String
     init(_ msg: String) { description = msg }
-}
-
-extension Duration {
-    var inMilliseconds: Double {
-        Double(components.seconds) * 1000 + Double(components.attoseconds) / 1e15
-    }
 }

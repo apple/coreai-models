@@ -4,6 +4,7 @@
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
 import ArgumentParser
+import CoreAI
 import CoreAIImageSegmenter
 import CoreAIShared
 import CoreGraphics
@@ -80,6 +81,12 @@ struct ImageSegmenterCLI: AsyncParsableCommand {
 
     @Flag(name: .long, help: "Print verbose progress information.")
     var verbose: Bool = false
+
+    @Flag(
+        name: .customLong("clear-coreai-cache"),
+        help: "Clear Core AI cached specialization for this model before loading (forces re-specialization)"
+    )
+    var clearCoreAICache: Bool = false
 
     @Option(
         name: .customLong("parity-test"),
@@ -160,8 +167,26 @@ struct ImageSegmenterCLI: AsyncParsableCommand {
             CLILogger.level = 1
         }
 
+        let bundle = try ModelBundle(from: model)
+        let modelURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.main)
+
+        if clearCoreAICache {
+            let cleared = try PreparedModel.clearCache(at: bundle.bundlePath)
+            print("🗑️  Cleared specialization cache for \(bundle.name) (\(cleared.count) component(s))")
+        }
+
+        // Detect an existing cached specialization before loading so we can annotate the load time
+        // below. Only inspects the cache; never specializes. `ImageSegmenter` loads via
+        // `PreparedModel.prepare`, so the structure-derived options overload matches.
+        let cacheHit = PreparedModel.isCached(at: modelURL)
+
         if verbose { print("Creating image segmenter...") }
+        print("⏳ Preparing AI asset...", terminator: "")
+        fflush(stdout)
+        let loadStart = ContinuousClock.now
         let runner = try await ImageSegmenter(resourcesAt: model)
+        let loadElapsed = ContinuousClock.now - loadStart
+        print(" done in \(String(format: "%.3f", loadElapsed.inSeconds))s\(cacheHit ? " (cache hit)" : "")")
 
         let cgImage = try loadCGImage(from: imagePath)
         if verbose { print("Loaded image: \(cgImage.width)×\(cgImage.height)") }

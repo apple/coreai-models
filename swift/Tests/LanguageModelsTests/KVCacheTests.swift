@@ -3,6 +3,7 @@
 // Use of this source code is governed by a BSD-3-clause license that can
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
+import CoreAIShared
 import Foundation
 import Metal
 import MetalPerformanceShaders
@@ -410,14 +411,5 @@ struct MetalBlitCopyTests {
         let lastOldHeadOffset = ((l - 1) * oldStrides[0] + (h - 1) * oldStrides[2])
         let lastNewHeadOffset = ((l - 1) * newStrides[0] + (h - 1) * newStrides[2])
         #expect(Float(dstPtr[lastNewHeadOffset]) == Float(srcPtr[lastOldHeadOffset]))
-    }
-}
-
-// MARK: - Extension to expose Duration inMilliseconds
-
-extension Duration {
-    var inMilliseconds: Double {
-        let (seconds, attoseconds) = self.components
-        return Double(seconds) * 1000.0 + Double(attoseconds) / 1_000_000_000_000_000.0
     }
 }

@@ -131,6 +131,86 @@ public struct PreparedModel: Sendable {
         return url
     }
 
+    // MARK: - Cache Inspection
+
+    /// File extensions that identify a Core AI model asset (source or compiled).
+    private static let assetExtensions: Set<String> = ["aimodel", "aimodelc"]
+
+    /// Enumerates the Core AI model asset(s) reachable from `url`.
+    ///
+    /// A model directory (e.g. an LLM bundle) contains one or more asset components alongside
+    /// other files (tokenizer, metadata); we can't assume specific component filenames, so scan
+    /// the directory for every `.aimodel`/`.aimodelc` entry. If `url` is itself an asset, it is
+    /// returned as the sole component. This filename-agnostic approach stays correct as new model
+    /// families add differently-named components.
+    ///
+    /// - Parameter url: Either a bundle directory containing asset components, or a single asset.
+    /// - Returns: The asset URLs to operate on, sorted for stable output. Empty only if `url` is a
+    ///   directory with no asset components.
+    public static func modelAssetURLs(at url: URL) throws -> [URL] {
+        // A path ending in a known asset extension IS the asset (asset bundles are themselves
+        // directories, so this must be checked before treating `url` as a container to scan).
+        if assetExtensions.contains(url.pathExtension) {
+            return [url]
+        }
+        let entries = try FileManager.default.contentsOfDirectory(
+            at: url,
+            includingPropertiesForKeys: nil
+        )
+        return
+            entries
+            .filter { assetExtensions.contains($0.pathExtension) }
+            .sorted { $0.path < $1.path }
+    }
+
+    /// Clears the Core AI specialization cache for every model asset reachable from `url`,
+    /// forcing re-specialization on the next load.
+    ///
+    /// Discovers components via ``modelAssetURLs(at:)`` — pass either a bundle directory or a
+    /// single asset. Used by CLI tools implementing `--clear-coreai-cache`.
+    ///
+    /// - Parameter url: A bundle directory containing asset components, or a single asset.
+    /// - Returns: The asset URLs whose cache entries were cleared.
+    @discardableResult
+    public static func clearCache(at url: URL) throws -> [URL] {
+        let assetURLs = try modelAssetURLs(at: url)
+        for assetURL in assetURLs {
+            let coreaiURL = resolveCoreAIModelURL(from: assetURL)
+            try AIModelCache.default.deleteEntries(for: coreaiURL)
+        }
+        return assetURLs
+    }
+
+    /// Reports whether the default Core AI cache already holds a specialized asset for `url`
+    /// under the given `options`.
+    ///
+    /// This only inspects the cache via `AIModelCache.model(for:options:)`; it never triggers
+    /// specialization. Returns `false` if no entry exists, or if an entry exists but fails to load.
+    ///
+    /// - Important: `options` must match the options the loader will use for `url`, otherwise a
+    ///   real cached specialization won't be found. Callers that load via `prepare(at:)` should use
+    ///   the ``isCached(at:)`` overload; callers that load via `AIModel(contentsOf:)` or a custom
+    ///   `SpecializationOptions` must pass the same value here.
+    public static func isCached(at url: URL, options: SpecializationOptions) -> Bool {
+        let coreaiURL = resolveCoreAIModelURL(from: url)
+        do {
+            return try AIModelCache.default.model(for: coreaiURL, options: options) != nil
+        } catch {
+            return false
+        }
+    }
+
+    /// Reports whether the default Core AI cache already holds a specialized asset for `url`,
+    /// using the same structure-derived `SpecializationOptions` that ``prepare(at:)`` uses.
+    ///
+    /// Use this only for models loaded through ``prepare(at:)``. For other loaders, use
+    /// ``isCached(at:options:)`` with the matching options.
+    public static func isCached(at url: URL) -> Bool {
+        let coreaiURL = resolveCoreAIModelURL(from: url)
+        let options = probeStructure(at: coreaiURL).specializationOptions
+        return isCached(at: coreaiURL, options: options)
+    }
+
     // MARK: - Asset Preparation
 
     /// Prepares a Core AI model asset by loading via `AIModel` and detecting its structure.

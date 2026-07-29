@@ -4,7 +4,9 @@
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
 import ArgumentParser
+import CoreAI
 import CoreAIObjectDetector
+import CoreAIShared
 import CoreGraphics
 import CoreText
 import Foundation
@@ -69,6 +71,12 @@ struct ObjectDetectorCLI: AsyncParsableCommand {
     @Flag(name: .long, help: "Print verbose progress information.")
     var verbose: Bool = false
 
+    @Flag(
+        name: .customLong("clear-coreai-cache"),
+        help: "Clear Core AI cached specialization for this model before loading (forces re-specialization)"
+    )
+    var clearCoreAICache: Bool = false
+
     // MARK: - Validation
 
     func validate() throws {
@@ -81,13 +89,31 @@ struct ObjectDetectorCLI: AsyncParsableCommand {
 
     func run() async throws {
         if verbose { print("Loading model from \(model)...") }
+
+        let modelURL = URL(fileURLWithPath: NSString(string: model).expandingTildeInPath)
+
+        if clearCoreAICache {
+            let cleared = try PreparedModel.clearCache(at: modelURL)
+            print("🗑️  Cleared specialization cache for \(modelURL.lastPathComponent) (\(cleared.count) component(s))")
+        }
+
+        // Detect an existing cached specialization before loading so we can annotate the load time
+        // below. Only inspects the cache; never specializes. `ObjectDetector` loads via
+        // `AIModel(contentsOf:)`, which uses `.default` options — match that here.
+        let cacheHit = PreparedModel.isCached(at: modelURL, options: .default)
+
         var params = DetectionParameters(
             threshold: threshold,
             maxDetections: maxDetections
         )
         if let h = inputHeight { params.inputHeight = h }
         if let w = inputWidth { params.inputWidth = w }
-        let detector = try await ObjectDetector(resourcesAt: model)
+        print("⏳ Preparing AI asset...", terminator: "")
+        fflush(stdout)
+        let loadStart = ContinuousClock.now
+        let detector = try await ObjectDetector(resourcesAt: modelURL.path)
+        let loadElapsed = ContinuousClock.now - loadStart
+        print(" done in \(String(format: "%.3f", loadElapsed.inSeconds))s\(cacheHit ? " (cache hit)" : "")")
 
         let loaded: [(path: String, image: CGImage)] = try image.map { path in
             let cgImage = try loadCGImage(from: path)
