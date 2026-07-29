@@ -296,9 +296,9 @@ def _replace_cache_update_autofuncs(
 
         getitem_fetched = getitem_by_idx.get(0)  # 4D fetched slice -> SDPA
         getitem_cache = getitem_by_idx.get(1)  # 5D mutated cache -> handle
-        assert getitem_fetched is not None and getitem_cache is not None, (
-            f"{autofunc_node.name}: expected getitem indices {{0, 1}} for "
-            f"(fetched slice, mutated cache); found {sorted(getitem_by_idx)}."
+        assert getitem_cache is not None, (
+            f"{autofunc_node.name}: no getitem at index 1 for the mutated cache; "
+            f"the cache write would be dead-code-eliminated. Found {sorted(getitem_by_idx)}."
         )
 
         with graph.inserting_before(autofunc_node):
@@ -361,11 +361,13 @@ def _replace_cache_update_autofuncs(
                 args=(pre_squeeze, [0]),
             )
             # 4D meta comes from the fetched-slice getitem (what SDPA expects).
-            _copy_node_provenance(squeeze_op, getitem_fetched)
+            if getitem_fetched is not None:
+                _copy_node_provenance(squeeze_op, getitem_fetched)
 
-        getitem_fetched.replace_all_uses_with(squeeze_op)
-        get_items.append(getitem_fetched)
-        get_item_replacements[getitem_fetched.name] = squeeze_op
+        if getitem_fetched is not None:
+            getitem_fetched.replace_all_uses_with(squeeze_op)
+            get_items.append(getitem_fetched)
+            get_item_replacements[getitem_fetched.name] = squeeze_op
 
         getitem_cache.replace_all_uses_with(isu_node)
         get_items.append(getitem_cache)
