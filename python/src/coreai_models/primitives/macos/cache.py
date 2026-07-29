@@ -6,7 +6,7 @@
 import torch
 from typing_extensions import Self
 
-from coreai_models.primitives._ops import mutable_slice_update
+from coreai_models.primitives._ops import mutable_cache_update_and_fetch, mutable_slice_update
 
 
 class KVCache:
@@ -117,10 +117,10 @@ class KVCache:
         layer_index = torch.tensor((layer_idx,), dtype=torch.int32, device=device)
         layer_index_end = torch.tensor((layer_idx + 1,), dtype=torch.int32, device=device)
 
-        # update k
-        mutable_slice_update(
+        # update k and fetch its populated prefix in a single fused op
+        k_out = mutable_cache_update_and_fetch(
             x=self._k_cache,
-            update=k.unsqueeze(0),
+            update=k,
             begin=torch.concatenate(
                 [
                     layer_index,
@@ -135,16 +135,19 @@ class KVCache:
                     layer_index_end,
                     torch.tensor((self._k_cache.size(1),), dtype=torch.int32, device=device),
                     torch.tensor((self._k_cache.size(2),), dtype=torch.int32, device=device),
-                    torch.tensor((offset + k.size(2),), dtype=torch.int32, device=device),
+                    torch.tensor((offset + k.size(-2),), dtype=torch.int32, device=device),
                     torch.tensor((self._k_cache.size(4),), dtype=torch.int32, device=device),
                 ]
             ),
+            layer_idx=layer_idx,
+            seq_dim=-2,
+            seq_len=seq_len,
         )
 
-        # update v
-        mutable_slice_update(
+        # update v and fetch its populated prefix in a single fused op
+        v_out = mutable_cache_update_and_fetch(
             x=self._v_cache,
-            update=v.unsqueeze(0),
+            update=v,
             begin=torch.cat(
                 [
                     layer_index,
@@ -159,17 +162,15 @@ class KVCache:
                     layer_index_end,
                     torch.tensor((int(self._v_cache.size(1)),), dtype=torch.int32, device=device),
                     torch.tensor((int(self._v_cache.size(2)),), dtype=torch.int32, device=device),
-                    torch.tensor((offset + v.size(2),), dtype=torch.int32, device=device),
+                    torch.tensor((offset + v.size(-2),), dtype=torch.int32, device=device),
                     torch.tensor((int(self._v_cache.size(4)),), dtype=torch.int32, device=device),
                 ]
             ),
+            layer_idx=layer_idx,
+            seq_dim=-2,
+            seq_len=seq_len,
         )
 
-        # return the slice k, v
-        k = self._k_cache.narrow(0, layer_idx, 1).narrow(-2, 0, seq_len)
-        v = self._v_cache.narrow(0, layer_idx, 1).narrow(-2, 0, seq_len)
-        k_out = k.squeeze(0)
-        v_out = v.squeeze(0)
         if cross_device:
             return k_out.to(compute_device), v_out.to(compute_device)
         return k_out, v_out
