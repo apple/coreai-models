@@ -13,6 +13,7 @@ Provides:
 - ``register_custom_torch_lowering`` to register all lowerings on a converter
 """
 
+import operator
 from collections.abc import Callable
 from typing import Annotated
 
@@ -149,6 +150,256 @@ def generate_node(
     raise RuntimeError(f"Unable to find {target_fn} in generated function")
 
 
+def _autofunc_base_tensor(autofunc_node: fx.Node) -> Argument:
+    """Return the mutated base tensor an auto-functionalized node wraps.
+
+    ``AutoFunctionalizedV2`` indirects the mutated tensor through
+    ``_all_bases[_x_base_index]``; v1 passes it directly as the ``x`` kwarg.
+    """
+    if isinstance(autofunc_node.target, AutoFunctionalizedV2):
+        base_idx = autofunc_node.kwargs["_x_base_index"]
+        all_bases = autofunc_node.kwargs["_all_bases"]
+        return all_bases[base_idx]
+    return autofunc_node.kwargs["x"]
+
+
+def _copy_node_provenance(dst: fx.Node, src: fx.Node) -> None:
+    """Copy ``val`` plus the provenance metadata from ``src`` onto ``dst``."""
+    dst.meta["val"] = src.meta["val"]
+    dst.meta["nn_module_stack"] = src.meta.get("nn_module_stack", {})
+    dst.meta["stack_trace"] = src.meta.get("stack_trace", "")
+    dst.meta["source_fn_stack"] = src.meta.get("source_fn_stack", [])
+    dst.stack_trace = src.stack_trace
+
+
+def _partition_autofunc_nodes(
+    graph: torch.fx.Graph,
+) -> tuple[dict[str, fx.Node], dict[str, fx.Node]]:
+    """Split auto-functionalized nodes by the mutable op they wrap.
+
+    Returns ``(slice_update_autofuncs, cache_update_autofuncs)``, each keyed by
+    node name. Raises ``AssertionError`` for any other auto-functionalized op,
+    or for a node with a consumer the rewrite paths can't handle.
+    """
+    slice_update_autofuncs: dict[str, fx.Node] = {}
+    cache_update_autofuncs: dict[str, fx.Node] = {}
+
+    for node in graph.nodes:
+        if not isinstance(node.target, AutoFunctionalized | AutoFunctionalizedV2):
+            continue
+        assert len(node.args) == 1, (
+            f"Expected 1 arg, found {len(node.args)} on {node.format_node()}"
+        )
+        non_getitem_users = [u for u in node.users if u.target is not operator.getitem]
+        assert not non_getitem_users, (
+            f"Auto-functionalized node {node.name} has non-getitem users "
+            f"{[u.name for u in non_getitem_users]}; remove_functionalization only "
+            "knows how to rewrite getitem consumers."
+        )
+        op_name = node.args[0].name()
+        if op_name == "coreai::mutable_slice_update":
+            slice_update_autofuncs[node.name] = node
+        elif op_name == "coreai::mutable_cache_update_and_fetch":
+            cache_update_autofuncs[node.name] = node
+        else:
+            raise AssertionError(
+                f"Expected mutable_slice_update or mutable_cache_update_and_fetch, found {op_name}"
+            )
+
+    return slice_update_autofuncs, cache_update_autofuncs
+
+
+def _replace_slice_update_autofuncs(
+    graph: torch.fx.Graph,
+    slice_update_autofuncs: dict[str, fx.Node],
+    get_items: list[fx.Node],
+    get_item_replacements: dict[str, fx.Node],
+) -> None:
+    """Replace each ``mutable_slice_update`` getitem with an ``immutable_slice_update``.
+
+    Appends the retired getitem nodes to ``get_items`` and records each
+    getitem-name → replacement-node mapping in ``get_item_replacements`` for the
+    caller's teardown pass.
+    """
+    autofunc_replacements: dict[str, fx.Node] = {}
+    # Snapshot the node list: the loop body inserts nodes via node_copy().
+    for getitem_node in list(graph.nodes):
+        # Find if there is an autofunc node that feeds into this node
+        autofunc_node = None
+        for input_node in getitem_node.all_input_nodes:
+            if input_node.name in slice_update_autofuncs:
+                autofunc_node = slice_update_autofuncs[input_node.name]
+                break
+
+        if autofunc_node is None:
+            continue
+
+        assert isinstance(autofunc_node, torch.fx.Node)
+        if autofunc_node.name in autofunc_replacements:
+            # Duplicate getitem — reuse the first slice_update node
+            slice_node = autofunc_replacements[autofunc_node.name]
+        else:
+            with graph.inserting_before(getitem_node):
+                # Create immutable version as a replacement
+                slice_node = generate_node(target_fn=immutable_slice_update)
+                slice_node = graph.node_copy(slice_node)
+
+                # Extract args differently for v1 vs v2
+                if isinstance(autofunc_node.target, AutoFunctionalizedV2):
+                    slice_node.args = (
+                        _autofunc_base_tensor(autofunc_node),
+                        autofunc_node.kwargs["update"],
+                        autofunc_node.kwargs["begin"],
+                        autofunc_node.kwargs["end"],
+                    )
+                else:
+                    # v1 kwargs: x, update, begin, end
+                    slice_node.args = tuple(autofunc_node.kwargs.values())
+
+                _copy_node_provenance(slice_node, getitem_node)
+
+            autofunc_replacements[autofunc_node.name] = slice_node
+
+        # Replace the getitem node with the slice_update node
+        getitem_node.replace_all_uses_with(slice_node)
+        get_items.append(getitem_node)
+        get_item_replacements[getitem_node.name] = slice_node
+
+
+def _replace_cache_update_autofuncs(
+    graph: torch.fx.Graph,
+    cache_update_autofuncs: dict[str, fx.Node],
+    get_items: list[fx.Node],
+    get_item_replacements: dict[str, fx.Node],
+) -> None:
+    """Decompose each ``mutable_cache_update_and_fetch`` into aten + immutable ops.
+
+    Emits ``aten.unsqueeze`` → ``immutable_slice_update`` (the 5D mutated cache,
+    getitem index 1) → ``aten.slice`` (layer) → optional ``aten.slice`` (seq) →
+    ``aten.squeeze`` (the 4D fetched slice, getitem index 0).
+
+    Appends the retired getitem nodes to ``get_items`` and records each
+    getitem-name → replacement-node mapping in ``get_item_replacements`` for the
+    caller's teardown pass.
+    """
+    for autofunc_node in cache_update_autofuncs.values():
+        # Map getitem index -> getitem node.
+        getitem_by_idx: dict[int, fx.Node] = {}
+        for user in autofunc_node.users:
+            if user.target is operator.getitem:
+                idx = user.args[1]
+                assert idx not in getitem_by_idx, (
+                    f"{autofunc_node.name} has multiple getitem users at index {idx} "
+                    f"({getitem_by_idx[idx].name}, {user.name}); expected one per index."
+                )
+                getitem_by_idx[idx] = user
+
+        getitem_fetched = getitem_by_idx.get(0)  # 4D fetched slice -> SDPA
+        getitem_cache = getitem_by_idx.get(1)  # 5D mutated cache -> handle
+        assert getitem_cache is not None, (
+            f"{autofunc_node.name}: no getitem at index 1 for the mutated cache; "
+            f"the cache write would be dead-code-eliminated. Found {sorted(getitem_by_idx)}."
+        )
+
+        with graph.inserting_before(autofunc_node):
+            update = autofunc_node.kwargs["update"]
+
+            unsqueeze_node = graph.call_function(
+                torch.ops.aten.unsqueeze.default,
+                args=(update, 0),
+            )
+            if "val" in update.meta:
+                unsqueeze_node.meta["val"] = update.meta["val"].unsqueeze(0)
+
+        # immutable_slice_update (5D), inserted after the unsqueeze_node.
+        with graph.inserting_after(unsqueeze_node):
+            isu_node = generate_node(target_fn=immutable_slice_update)
+            isu_node = graph.node_copy(isu_node)
+            isu_node.args = (
+                _autofunc_base_tensor(autofunc_node),
+                unsqueeze_node,
+                autofunc_node.kwargs["begin"],
+                autofunc_node.kwargs["end"],
+            )
+            # 5D meta comes from the mutated-cache getitem.
+            _copy_node_provenance(isu_node, getitem_cache)
+
+        # narrow(0, layer_idx, 1) -> [narrow(seq_dim, 0, seq_len)] -> squeeze(0).
+        # The seq narrow is skipped when seq_len is None.
+        # layer_idx is a Python int (loop unrolled at trace time);
+        # seq_len is either None or a SymInt -> fx.Node in the exported graph.
+        layer_idx = autofunc_node.kwargs["layer_idx"]
+        seq_dim = autofunc_node.kwargs["seq_dim"]
+        seq_len = autofunc_node.kwargs["seq_len"]
+
+        with graph.inserting_after(isu_node):
+            narrow_layer = graph.call_function(
+                torch.ops.aten.slice.Tensor,
+                args=(isu_node, 0, layer_idx, layer_idx + 1),
+            )
+            if "val" in isu_node.meta:
+                narrow_layer.meta["val"] = isu_node.meta["val"].narrow(0, layer_idx, 1)
+
+        # The pre-squeeze fetch tensor: narrow_seq if we emitted one, else narrow_layer.
+        pre_squeeze = narrow_layer
+        if seq_len is not None:
+            with graph.inserting_after(narrow_layer):
+                narrow_seq = graph.call_function(
+                    torch.ops.aten.slice.Tensor,
+                    args=(narrow_layer, seq_dim, 0, seq_len),
+                )
+                if "val" in narrow_layer.meta:
+                    seq_len_val = seq_len.meta["val"] if isinstance(seq_len, fx.Node) else seq_len
+                    narrow_seq.meta["val"] = narrow_layer.meta["val"].narrow(
+                        seq_dim, 0, seq_len_val
+                    )
+            pre_squeeze = narrow_seq
+
+        with graph.inserting_after(pre_squeeze):
+            squeeze_op = graph.call_function(
+                torch.ops.aten.squeeze.dims,
+                args=(pre_squeeze, [0]),
+            )
+            # 4D meta comes from the fetched-slice getitem (what SDPA expects).
+            if getitem_fetched is not None:
+                _copy_node_provenance(squeeze_op, getitem_fetched)
+
+        if getitem_fetched is not None:
+            getitem_fetched.replace_all_uses_with(squeeze_op)
+            get_items.append(getitem_fetched)
+            get_item_replacements[getitem_fetched.name] = squeeze_op
+
+        getitem_cache.replace_all_uses_with(isu_node)
+        get_items.append(getitem_cache)
+        get_item_replacements[getitem_cache.name] = isu_node
+
+
+def _erase_autofunc_nodes(
+    program: torch.export.ExportedProgram,
+    graph: torch.fx.Graph,
+    get_items: list[fx.Node],
+    get_item_replacements: dict[str, fx.Node],
+    autofunc_nodes: tuple[fx.Node, ...],
+) -> None:
+    """Erase the retired getitem + autofunc nodes and repoint output specs.
+
+    Any graph-signature output that named a retired getitem is repointed at that
+    getitem's replacement node so the exported program stays consistent.
+    """
+    signature_replacements: dict[int, fx.Node] = {}
+    for getitem_node in get_items:
+        graph.erase_node(getitem_node)
+        for i, spec in enumerate(program.graph_signature.output_specs):
+            if spec.arg.name == getitem_node.name:
+                signature_replacements[i] = get_item_replacements[getitem_node.name]
+
+    for auto_func_node in autofunc_nodes:
+        graph.erase_node(auto_func_node)
+
+    for idx, repl_node in signature_replacements.items():
+        program.graph_signature.output_specs[idx].arg.name = repl_node.name
+
+
 def remove_functionalization(program: torch.export.ExportedProgram) -> None:
     """
     Remove auto-functionalization wrappers inserted by torch.export.
@@ -158,98 +409,36 @@ def remove_functionalization(program: torch.export.ExportedProgram) -> None:
     functionalization op has the custom op function as an argument), this
     removes those nodes and replaces them with the immutable custom op directly.
 
-    Note: This only supports ``coreai::mutable_slice_update``; other custom ops
-    will raise an assertion error.
+    Two mutable ops are handled:
+
+    - ``coreai::mutable_slice_update`` → a single ``immutable_slice_update``
+      (used by ``SSMState`` and the iOS cache).
+    - ``coreai::mutable_cache_update_and_fetch`` → ``aten.unsqueeze`` followed by
+      ``immutable_slice_update``  (the 5D mutated cache) followed by
+      ``aten.slice`` (layer) + ``aten.slice`` (seq) + ``aten.squeeze``
+      (the 4D fetched slice feeding SDPA). The fused op has two consumers via getitem:
+      index 0 is the fetched slice, index 1 is the mutated cache.
+
+    Note: Any other auto-functionalized custom op will raise an assertion error.
     """
     graph = program.graph_module.graph
     assert isinstance(graph, torch.fx.Graph)
 
-    # Find pattern:
-    #   autofunc = autofunctionalize(slice_update)
-    #   output = getitem(autofunc)
-    # Replace with:
-    #   output = immutable_slice_update()
-
-    autofunc_outputs_to_remove: dict[str, fx.Node] = {}
-    for node in graph.nodes:
-        if isinstance(node.target, AutoFunctionalized | AutoFunctionalizedV2):
-            assert len(node.args) == 1, (
-                f"Expected 1 arg, found {len(node.args)} on {node.format_node()}"
-            )
-            assert node.args[0].name() == "coreai::mutable_slice_update", (
-                f"Expected mutable_slice_update, found {node.args[0].name()}"
-            )
-            autofunc_outputs_to_remove[node.name] = node
+    slice_update_autofuncs, cache_update_autofuncs = _partition_autofunc_nodes(graph)
 
     get_items: list[fx.Node] = []
     get_item_replacements: dict[str, fx.Node] = {}
-    autofunc_replacements: dict[str, fx.Node] = {}
-    for getitem_node in graph.nodes:
-        # Find if there is an autofunc node that feeds into this node
-        autofunc_node = None
-        for input_node in getitem_node.all_input_nodes:
-            if input_node.name in autofunc_outputs_to_remove:
-                autofunc_node = autofunc_outputs_to_remove[input_node.name]
-                break
 
-        if autofunc_node is not None:
-            assert isinstance(autofunc_node, torch.fx.Node)
-            if autofunc_node.name in autofunc_replacements:
-                # Duplicate getitem — reuse the first slice_update node
-                slice_node = autofunc_replacements[autofunc_node.name]
-            else:
-                with graph.inserting_before(getitem_node):
-                    # Create immutable version as a replacement
-                    slice_node = generate_node(target_fn=immutable_slice_update)
-                    slice_node = program.graph_module.graph.node_copy(slice_node)
+    _replace_slice_update_autofuncs(graph, slice_update_autofuncs, get_items, get_item_replacements)
+    _replace_cache_update_autofuncs(graph, cache_update_autofuncs, get_items, get_item_replacements)
 
-                    # Extract args differently for v1 vs v2
-                    if isinstance(autofunc_node.target, AutoFunctionalizedV2):
-                        base_idx = autofunc_node.kwargs["_x_base_index"]
-                        all_bases = autofunc_node.kwargs["_all_bases"]
-                        base_tensor = all_bases[base_idx]
-                        slice_node.args = (
-                            base_tensor,
-                            autofunc_node.kwargs["update"],
-                            autofunc_node.kwargs["begin"],
-                            autofunc_node.kwargs["end"],
-                        )
-                    else:
-                        # v1 kwargs: x, update, begin, end
-                        slice_node.args = tuple(autofunc_node.kwargs.values())
-
-                    # Copy necessary metadata
-                    slice_node.meta["val"] = getitem_node.meta["val"]
-                    slice_node.meta["nn_module_stack"] = getitem_node.meta.get(
-                        "nn_module_stack", {}
-                    )
-                    slice_node.meta["stack_trace"] = getitem_node.meta.get("stack_trace", "")
-                    slice_node.meta["source_fn_stack"] = getitem_node.meta.get(
-                        "source_fn_stack", []
-                    )
-                    slice_node.stack_trace = getitem_node.stack_trace
-
-                autofunc_replacements[autofunc_node.name] = slice_node
-
-            # Replace the getitem node with the slice_update node
-            getitem_node.replace_all_uses_with(slice_node)
-            get_items.append(getitem_node)
-            get_item_replacements[getitem_node.name] = slice_node
-
-    # Remove all the autofunc nodes and getitems
-    signature_replacements: dict[int, fx.Node] = {}
-
-    for getitem_node in get_items:
-        graph.erase_node(getitem_node)
-        for i, spec in enumerate(program.graph_signature.output_specs):
-            if spec.arg.name == getitem_node.name:
-                signature_replacements[i] = get_item_replacements[getitem_node.name]
-
-    for auto_func_node in autofunc_outputs_to_remove.values():
-        graph.erase_node(auto_func_node)
-
-    for idx, repl_node in signature_replacements.items():
-        program.graph_signature.output_specs[idx].arg.name = repl_node.name
+    _erase_autofunc_nodes(
+        program,
+        graph,
+        get_items,
+        get_item_replacements,
+        (*slice_update_autofuncs.values(), *cache_update_autofuncs.values()),
+    )
 
     # Recompile the program
     program.graph_module.recompile()
