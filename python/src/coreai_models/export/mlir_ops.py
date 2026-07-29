@@ -287,10 +287,19 @@ def _replace_cache_update_autofuncs(
         getitem_by_idx: dict[int, fx.Node] = {}
         for user in autofunc_node.users:
             if user.target is operator.getitem:
-                getitem_by_idx[user.args[1]] = user
+                idx = user.args[1]
+                assert idx not in getitem_by_idx, (
+                    f"{autofunc_node.name} has multiple getitem users at index {idx} "
+                    f"({getitem_by_idx[idx].name}, {user.name}); expected one per index."
+                )
+                getitem_by_idx[idx] = user
 
         getitem_fetched = getitem_by_idx.get(0)  # 4D fetched slice -> SDPA
         getitem_cache = getitem_by_idx.get(1)  # 5D mutated cache -> handle
+        assert getitem_fetched is not None and getitem_cache is not None, (
+            f"{autofunc_node.name}: expected getitem indices {{0, 1}} for "
+            f"(fetched slice, mutated cache); found {sorted(getitem_by_idx)}."
+        )
 
         with graph.inserting_before(autofunc_node):
             update = autofunc_node.kwargs["update"]
@@ -313,8 +322,7 @@ def _replace_cache_update_autofuncs(
                 autofunc_node.kwargs["end"],
             )
             # 5D meta comes from the mutated-cache getitem.
-            if getitem_cache is not None:
-                _copy_node_provenance(isu_node, getitem_cache)
+            _copy_node_provenance(isu_node, getitem_cache)
 
         # narrow(0, layer_idx, 1) -> [narrow(seq_dim, 0, seq_len)] -> squeeze(0).
         # The seq narrow is skipped when seq_len is None.
@@ -353,18 +361,15 @@ def _replace_cache_update_autofuncs(
                 args=(pre_squeeze, [0]),
             )
             # 4D meta comes from the fetched-slice getitem (what SDPA expects).
-            if getitem_fetched is not None:
-                _copy_node_provenance(squeeze_op, getitem_fetched)
+            _copy_node_provenance(squeeze_op, getitem_fetched)
 
-        if getitem_fetched is not None:
-            getitem_fetched.replace_all_uses_with(squeeze_op)
-            get_items.append(getitem_fetched)
-            get_item_replacements[getitem_fetched.name] = squeeze_op
+        getitem_fetched.replace_all_uses_with(squeeze_op)
+        get_items.append(getitem_fetched)
+        get_item_replacements[getitem_fetched.name] = squeeze_op
 
-        if getitem_cache is not None:
-            getitem_cache.replace_all_uses_with(isu_node)
-            get_items.append(getitem_cache)
-            get_item_replacements[getitem_cache.name] = isu_node
+        getitem_cache.replace_all_uses_with(isu_node)
+        get_items.append(getitem_cache)
+        get_item_replacements[getitem_cache.name] = isu_node
 
 
 def _erase_autofunc_nodes(
