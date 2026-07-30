@@ -332,6 +332,12 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         samplingConfiguration: SamplingConfiguration,
         inferenceOptions: InferenceOptions
     ) async throws -> GenerationSequence {
+        // Cancel any prior generation so its Iterator stops on next poll.
+        _activeToken.withLock {
+            $0?.cancel()
+            $0 = nil
+        }
+
         // Implicit prefix caching: resolve input against history.
         if history.count > 0 {
             let (commonPrefix, _) = history.resolve(input: input)

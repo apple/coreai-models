@@ -164,7 +164,7 @@ extension VanillaDecodingStrategy.VanillaDecodedSequence {
             if !flushed {
                 let count = generatedTokenCount
                 // Metrics recording is async; fire-and-forget on the abandon path.
-                Task { await PerformanceMetrics.shared.setGeneratedTokenCount(count) }
+                Task { await PerformanceMetrics.shared.recordGeneratedTokens(count) }
             }
         }
 
@@ -283,7 +283,7 @@ extension VanillaDecodingStrategy.VanillaDecodedSequence {
                 trailing = nil
             }
 
-            await PerformanceMetrics.shared.setGeneratedTokenCount(generatedTokenCount)
+            await PerformanceMetrics.shared.recordGeneratedTokens(generatedTokenCount)
             return trailing
         }
     }

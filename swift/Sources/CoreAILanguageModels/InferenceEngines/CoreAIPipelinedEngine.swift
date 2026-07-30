@@ -45,6 +45,12 @@ final class CoreAIPipelinedEngine: InferenceEngine, Sendable {
     typealias ConfigType = ModelConfig
 
     nonisolated(unsafe) private var engine: EngineImpl
+
+    /// Token history for implicit prefix caching. Marked nonisolated(unsafe) because
+    /// mutations are serialized by the generation lifecycle: generate() awaits any prior
+    /// Task before starting, and the forwarding `async let` only appends tokens while
+    /// runCompletion holds the engine lock. No concurrent writes are possible when the
+    /// cancel-and-await contract is upheld.
     nonisolated(unsafe) private var history = TokenHistory()
     nonisolated(unsafe) private(set) var lastPrefixHitCount: Int = 0
     private let engineInUse = Atomic<Bool>(false)
@@ -147,6 +153,10 @@ final class CoreAIPipelinedEngine: InferenceEngine, Sendable {
                 let (tokenStream, tokenContinuation) =
                     AsyncThrowingStream<InferenceEngine.TokenId, any Error>.makeStream()
 
+                outputContinuation.onTermination = { @Sendable _ in
+                    tokenContinuation.finish()
+                }
+
                 // Implicit prefix caching: resolve input against history
                 var (commonPrefix, resolvedNewTokens) = self.history.resolve(input: input)
                 self.lastPrefixHitCount = commonPrefix
@@ -181,9 +191,12 @@ final class CoreAIPipelinedEngine: InferenceEngine, Sendable {
                 async let forwarding: Void = {
                     do {
                         for try await token in tokenStream {
-                            // Track generated tokens in history
                             self.history.append(token)
-                            outputContinuation.yield(InferenceOutput(tokenId: token))
+                            let result = outputContinuation.yield(InferenceOutput(tokenId: token))
+                            if case .terminated = result {
+                                tokenContinuation.finish()
+                                break
+                            }
                         }
                     } catch {
                         outputContinuation.finish(throwing: error)

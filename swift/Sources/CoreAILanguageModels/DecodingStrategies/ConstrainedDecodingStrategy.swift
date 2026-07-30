@@ -88,7 +88,7 @@ public struct ConstrainedDecodingStrategy: DecodingStrategy {
         guard let vocabSize = vocabSizeOverride ?? Self.deriveVocabSize(from: tokenizer) else {
             throw InferenceRuntimeError.invalidArgument(
                 "Cannot determine vocabulary size from tokenizer. "
-                    + "Pass vocabSize explicitly via CoreAIRunner or LLMAsset metadata."
+                    + "Pass vocabSize explicitly via CoreAIRunner or ModelBundle metadata."
             )
         }
 
@@ -324,16 +324,17 @@ extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
                 generatedTokens.append(bestToken)
                 tokenStep += 1
 
+                if terminatedAfterAccept {
+                    finished = true
+                    return nil
+                }
+
                 let delta = ConstrainedDecodingStrategy.computeTextDelta(
                     generatedTokens: generatedTokens,
                     previousDecodedText: &previousDecodedText,
                     tokenizer: tokenizer,
                     tokenStep: tokenStep
                 )
-
-                if terminatedAfterAccept {
-                    finished = true
-                }
 
                 return GenerationResult(text: delta, tokenId: bestToken, rawLogits: logits)
             }

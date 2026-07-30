@@ -28,7 +28,7 @@ Options:
 
 ## Bundle layout
 
-The export produces a `<name>.llmasset/` directory (`metadata.json` `kind=vlm`)
+The export produces a `<name>/` directory (`metadata.json` `kind=vlm`)
 with asset roles consumed by the Swift runner's `ModelBundle`:
 
 | Asset       | File             | Role                                            |
@@ -62,7 +62,7 @@ The strategy is inferred from the model's `preprocessor_config.json` at export
 time and written into the bundle's `metadata.json`. Override at runtime:
 
 ```bash
-llm-runner --model vlm_bundle --image photo.jpg --image-strategy center_crop
+swift run -c release llm-runner --model vlm_bundle --image photo.jpg --image-strategy center_crop --prompt "your prompt"
 ```
 
 ### Original resolution in prompt

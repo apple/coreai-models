@@ -37,10 +37,44 @@ public struct Flux2Pipeline: DiffusionPipeline {
     private static let latentChannels = 128
     private static let textSeqLen = 512
     private static let defaultRopeTheta: Float = 2000.0
-    private static let schedulerBaseShift: Float = 0.5
-    private static let schedulerMaxShift: Float = 1.15
-    private static let schedulerBaseSeqLen: Float = 256
-    private static let schedulerMaxSeqLen: Float = 4096
+
+    /// FLUX.2 flow-matching timestep shift.
+    ///
+    /// Mirrors diffusers `compute_empirical_mu` (diffusers 0.37.1):
+    ///   pipelines/flux2/pipeline_flux2_klein.py:63-78
+    ///   (copied from pipelines/flux2/pipeline_flux2.py)
+    /// Call site — pipeline_flux2_klein.py:810-811:
+    ///   image_seq_len = latents.shape[1]
+    ///   mu = compute_empirical_mu(image_seq_len=image_seq_len, num_steps=num_inference_steps)
+    ///
+    /// Reference implementation:
+    ///   def compute_empirical_mu(image_seq_len: int, num_steps: int) -> float:
+    ///       a1, b1 = 8.73809524e-05, 1.89833333
+    ///       a2, b2 = 0.00016927, 0.45666666
+    ///       if image_seq_len > 4300:
+    ///           mu = a2 * image_seq_len + b2
+    ///           return float(mu)
+    ///       m_200 = a2 * image_seq_len + b2
+    ///       m_10 = a1 * image_seq_len + b1
+    ///       a = (m_200 - m_10) / 190.0
+    ///       b = m_200 - 200.0 * a
+    ///       mu = a * num_steps + b
+    ///       return float(mu)
+    private static func computeEmpiricalMu(imageSeqLen: Int, numSteps: Int) -> Float {
+        let a1: Float = 8.73809524e-05
+        let b1: Float = 1.89833333
+        let a2: Float = 0.00016927
+        let b2: Float = 0.45666666
+        let seq = Float(imageSeqLen)
+        if imageSeqLen > 4300 {
+            return a2 * seq + b2
+        }
+        let m200 = a2 * seq + b2
+        let m10 = a1 * seq + b1
+        let a = (m200 - m10) / 190.0
+        let b = m200 - 200.0 * a
+        return a * Float(numSteps) + b
+    }
 
     /// Image size is determined by the mode selected at init.
     public var defaultImageSize: (width: Int, height: Int) {
@@ -121,11 +155,7 @@ public struct Flux2Pipeline: DiffusionPipeline {
         // For img2img: the schedule covers [strength → 0] using all steps, so every requested step
         // contributes to denoising and the noising sigma matches the first scheduled step exactly.
         // For txt2img: the schedule covers [1.0 → 0] as usual.
-        let baseShift: Float = Self.schedulerBaseShift
-        let maxShift: Float = Self.schedulerMaxShift
-        let baseSeqLen: Float = Self.schedulerBaseSeqLen
-        let maxSeqLen: Float = Self.schedulerMaxSeqLen
-        let mu = baseShift + (maxShift - baseShift) * (Float(seqLen) - baseSeqLen) / (maxSeqLen - baseSeqLen)
+        let mu = Self.computeEmpiricalMu(imageSeqLen: seqLen, numSteps: steps)
         let isActuallyImg2Img = configuration.isImageToImage && encoder != nil && configuration.startingImage != nil
         let sigmaMax: Float = isActuallyImg2Img ? configuration.strength : 1.0
         let scheduler = DiscreteFlowScheduler(
@@ -285,13 +315,26 @@ public struct Flux2Pipeline: DiffusionPipeline {
     private func encodeText(_ text: String) async throws -> [Float] {
         let seqLen = Self.textSeqLen
 
-        // Tokenize using Qwen3 chat template
+        // Tokenize using Qwen3 chat template.
+        //
+        // Must match diffusers `_get_qwen3_prompt_embeds`
+        // (diffusers 0.37.1, pipelines/flux2/pipeline_flux2_klein.py), which builds the
+        // input as:
+        //     messages = [{"role": "user", "content": single_prompt}]
+        //     text = tokenizer.apply_chat_template(
+        //         messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+        //
+        // `enable_thinking=False` is significant for the Qwen3 template: it appends an
+        // empty `<think>\n\n</think>\n\n` block after the assistant prompt. Leaving it
+        // undefined omits that block, changing the trailing conditioning tokens and
+        // hurting prompt adherence. Pass it via additionalContext to match the reference.
         var ids: [Int]
         let messages: [[String: String]] = [["role": "user", "content": text]]
         do {
             ids = try tokenizer.applyChatTemplate(
                 messages: messages, chatTemplate: nil,
-                addGenerationPrompt: true, truncation: true, maxLength: seqLen, tools: nil
+                addGenerationPrompt: true, truncation: true, maxLength: seqLen, tools: nil,
+                additionalContext: ["enable_thinking": false]
             )
         } catch {
             let tokens = tokenizer.tokenize(text: text)
@@ -303,7 +346,14 @@ public struct Flux2Pipeline: DiffusionPipeline {
         }
 
         let realTokenCount = ids.count
-        let padTokenId = tokenizer.eosTokenId ?? 151643
+        // diffusers pads with the tokenizer's pad_token, not the eos_token. For
+        // FLUX.2 klein's Qwen tokenizer these differ: pad_token is <|endoftext|>
+        // (151643) while eos_token is <|im_end|> (151645). The reference builds
+        // input_ids via `tokenizer(text, padding="max_length", max_length=512)`
+        // (diffusers 0.37.1, pipeline_flux2_klein.py `_get_qwen3_prompt_embeds`),
+        // which uses pad_token. These ~490 padding tokens are fed to the DiT
+        // UNMASKED, so the id must match the reference exactly.
+        let padTokenId = tokenizer.convertTokenToId("<|endoftext|>") ?? 151643
 
         while ids.count < seqLen {
             ids.append(padTokenId)

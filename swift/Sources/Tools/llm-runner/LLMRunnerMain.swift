@@ -198,6 +198,12 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         help: "Include original image resolution in prompt: on, off, auto (default: auto)")
     var imageInfo: ImageInfoMode = .auto
 
+    @Flag(
+        name: .customLong("clear-coreai-cache"),
+        help: "Clear Core AI cached specialization for this model before loading (forces re-specialization)"
+    )
+    var clearCoreAICache: Bool = false
+
     @Flag(help: "Enable verbose logging")
     var verbose: Bool = false
 
@@ -221,7 +227,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
 
     func run() async throws {
         let verboseLevel = max(self.verboseLevel ?? 0, verbose ? 1 : 0)
-        CLILogger.setLevel(to: verboseLevel)
+        CLILogger.level = verboseLevel
 
         let resolver = ModelPaths()
         let resolvedPath = try validateAndResolveModelPath(resolver: resolver)
@@ -308,7 +314,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
 
         // Set up verbose logging environment variable first
         let verboseLevel = max(self.verboseLevel ?? 0, verbose ? 1 : 0)
-        CLILogger.setLevel(to: verboseLevel)
+        CLILogger.level = verboseLevel
 
         // Bridge hidden CLI overrides to environment variables read by the Core AI engine
         if let b = bucketSize {
@@ -345,6 +351,31 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         let modelName = bundle.name
         let modelVocabSize = bundle.vocabSize
 
+        // Resolve component model URLs once; reused for the cache check and model loading below.
+        // An LLM bundle has only `main`; VLM bundles also have `vision` and `embedding`.
+        let isVLM = bundle.bundle.kind == .vlm
+        let languageModelURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.main)
+        let visionModelURL = isVLM ? try bundle.requireModelURL(for: ModelBundle.ComponentKey.vision) : nil
+        let embeddingModelURL = isVLM ? try bundle.requireModelURL(for: ModelBundle.ComponentKey.embedding) : nil
+
+        if clearCoreAICache {
+            let cleared = try PreparedModel.clearCache(at: bundle.bundlePath)
+            print("\n🗑️  Cleared specialization cache for \(bundle.name) (\(cleared.count) component(s))")
+        }
+
+        // Detect an existing cached specialization before loading so we can annotate the load
+        // time below. This only inspects the cache; it never triggers specialization. For VLM
+        // bundles, all three components must be cached to count as a hit.
+        let cacheHit: Bool
+        if let visionModelURL, let embeddingModelURL {
+            cacheHit =
+                PreparedModel.isCached(at: visionModelURL)
+                && PreparedModel.isCached(at: embeddingModelURL)
+                && PreparedModel.isCached(at: languageModelURL)
+        } else {
+            cacheHit = PreparedModel.isCached(at: languageModelURL)
+        }
+
         let assetLabel = try modelAssetTypeLabel(for: bundle.modelAssetPath)
         if !CLILogger.isVerbose {
             print("\n⏳ Preparing AI asset from \(assetLabel)...", terminator: "")
@@ -369,12 +400,8 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         async let tokenizerResult = bundle.loadTokenizer()
 
         let inferenceEngine: any InferenceEngine
-        if bundle.bundle.kind == .vlm {
+        if let visionModelURL, let embeddingModelURL {
             // VLM: load 3 models and create VLM engine directly
-            let visionURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.vision)
-            let embedURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.embedding)
-            let mainURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.main)
-
             guard let visionConfig = bundle.visionConfig else {
                 throw InferenceRuntimeError.invalidArgument(
                     "VLM bundle missing 'vision' config in metadata.json")
@@ -385,15 +412,15 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
                 tokenizer: bundle.tokenizer,
                 vocabSize: bundle.vocabSize,
                 maxContextLength: bundle.maxContextLength,
-                serializedModel: [mainURL.path],
+                serializedModel: [languageModelURL.path],
                 function: bundle.language.functionMap?.name(for: "main") ?? "main"
             )
             let vlmConfig = VLMModelConfig(base: baseConfig, visionConfig: visionConfig)
 
             // Sequential to avoid runtime errors with concurrent model preparation.
-            let visionModel = try await PreparedModel.prepare(at: visionURL)
-            let embedModel = try await PreparedModel.prepare(at: embedURL)
-            let llmModel = try await PreparedModel.prepare(at: mainURL)
+            let visionModel = try await PreparedModel.prepare(at: visionModelURL)
+            let embedModel = try await PreparedModel.prepare(at: embeddingModelURL)
+            let llmModel = try await PreparedModel.prepare(at: languageModelURL)
 
             inferenceEngine = try await CoreAISequentialVLMEngine(
                 config: vlmConfig,
@@ -404,7 +431,6 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             )
         } else {
             // Standard LLM: use EngineFactory
-            let modelURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.main)
             let engineConfig = ModelConfig(
                 name: bundle.name,
                 tokenizer: bundle.tokenizer,
@@ -416,7 +442,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             let configData = try JSONEncoder().encode(engineConfig)
             inferenceEngine = try await EngineFactory.createEngine(
                 config: configData,
-                modelURL: modelURL,
+                modelURL: languageModelURL,
                 options: engineOptions
             )
         }
@@ -459,7 +485,8 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
 
         if !CLILogger.isVerbose {
             let prepareElapsed = await PerformanceMetrics.shared.modelLoadTime
-            print(" done in \(String(format: "%.3f", prepareElapsed))s\n")
+            let cacheSuffix = cacheHit ? " (cache hit)" : ""
+            print(" done in \(String(format: "%.3f", prepareElapsed))s\(cacheSuffix)\n")
         }
 
         // Resolve prompt input and tokenize
@@ -530,7 +557,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         CLILogger.log("Text generator built successfully", component: "Main")
 
         // Apply chat template and count tokens for metrics
-        await PerformanceMetrics.shared.setPromptTokenCount(promptTokens.count)
+        await PerformanceMetrics.shared.recordPromptTokens(promptTokens.count)
 
         CLILogger.log("Generating text...", component: "Main")
         CLILogger.log("Input: \(displayPrompt)", component: "Main")
@@ -632,7 +659,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             InstrumentsProfiler.endDecoding(signpostID: decodingID)
 
             // Generated token count is already set by the decoding strategy
-            let generatedTokenCount = await PerformanceMetrics.shared.getGeneratedTokenCount
+            let generatedTokenCount = await PerformanceMetrics.shared.generatedTokenCount
             InstrumentsProfiler.endInference(generatedTokens: generatedTokenCount, signpostID: inferenceID)
 
             // End overall timing now that core inference is complete
@@ -924,7 +951,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         let inferenceID = InstrumentsProfiler.beginInference(
             promptTokens: vlmTokens.count, maxTokens: maxTokens)
 
-        await PerformanceMetrics.shared.setPromptTokenCount(vlmTokens.count)
+        await PerformanceMetrics.shared.recordPromptTokens(vlmTokens.count)
 
         let tokenStream = try await vlmEngine.generate(
             with: embeddedInput,
@@ -993,7 +1020,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         // Record generation stats
         InstrumentsProfiler.endInference(
             generatedTokens: generatedTokens.count, signpostID: inferenceID)
-        await PerformanceMetrics.shared.setGeneratedTokenCount(generatedTokens.count)
+        await PerformanceMetrics.shared.recordGeneratedTokens(generatedTokens.count)
         await PerformanceMetrics.shared.endOverallTiming()
         await PerformanceMetrics.shared.printSummary(verbose: CLILogger.isVerbose)
 
