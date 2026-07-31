@@ -178,6 +178,16 @@ final class CoreAIPipelinedEngine: InferenceEngine, Sendable {
                     self.history.clear()
                     resolvedNewTokens = input[...]
                     commonPrefix = 0
+                } else if self.engine.hasNonTruncatableStates {
+                    // Hybrid model: recurrent state can't be partially rewound.
+                    // Full reset and replay the entire prompt.
+                    if commonPrefix < self.engine.processedTokenCount {
+                        await self.engine.computeStream.currentWorkCompleted()
+                        self.engine.reset()
+                        self.history.clear()
+                        resolvedNewTokens = input[...]
+                        commonPrefix = 0
+                    }
                 } else if commonPrefix < self.engine.processedTokenCount {
                     // Pure extension — partial rewind (buffer phase preserved)
                     await self.engine.computeStream.currentWorkCompleted()
@@ -281,6 +291,11 @@ final class CoreAIPipelinedEngine: InferenceEngine, Sendable {
             // Partial reset: wait for generation to finish naturally, then rewind counter.
             // Do NOT cancel — cancelling corrupts the pipeline's double-buffer state.
             // The KV cache is valid up to processedTokenCount after natural completion.
+            if engine.hasNonTruncatableStates {
+                throw InferenceRuntimeError.invalidState(
+                    "Partial reset is not supported for hybrid models with recurrent state. "
+                        + "Use reset(to: 0) and replay the prefix.")
+            }
             drain()
             await engine.computeStream.currentWorkCompleted()
             guard tryAcquireEngine() else { return }
@@ -431,6 +446,11 @@ private struct EngineImpl: ~Copyable {
     // KV cache — reuses CoreAIKVCache protocol from KVCache+CoreAI.swift
     var kvCache: any CoreAIKVCache
 
+    // Linear attention state bindings for hybrid models (nil for pure transformer models).
+    // States 0/1 are KV cache; additional states handled by handler.
+    var additionalStates: FixedMTLBufferState?
+    var hasNonTruncatableStates: Bool
+
     // Logits — reuses GrowingLogitsBuffer from TensorStorage+CoreAI.swift
     var logits: GrowingLogitsBuffer
 
@@ -474,16 +494,36 @@ private struct EngineImpl: ~Copyable {
             throw InferenceRuntimeError.invalidOutputType(
                 "Expected at least 1 output, got \(descriptor.outputNames.count)")
         }
-        guard descriptor.stateNames.count == 2 else {
+        guard descriptor.stateNames.count >= 2 && descriptor.stateNames.count <= 4 else {
             throw InferenceRuntimeError.invalidOutputType(
-                "Expected 2 states (KV cache), got \(descriptor.stateNames.count): \(descriptor.stateNames)")
+                "Expected 2–4 states, got \(descriptor.stateNames.count): \(descriptor.stateNames)"
+            )
         }
+
+        // Classify states using the shared factory logic
+        let classified = StateHandlerFactory.classifyStates(
+            descriptor: descriptor, stateKinds: nil, verbose: descriptor.stateNames.count > 2)
+
+        // Find the growing KV pair (first two states with .kvCache kind)
+        let growingNames = classified.filter { $0.kind == .kvCache }.map(\.name)
+        guard growingNames.count >= 2 else {
+            throw InferenceRuntimeError.invalidOutputType(
+                "Expected at least 2 growing KV cache states, found \(growingNames.count) "
+                    + "in: \(classified.map { "\($0.name)=\($0.kind.rawValue)" })")
+        }
+        let keyCacheName = growingNames[0]
+        let valueCacheName = growingNames[1]
+
+        // Fixed states: everything that isn't the primary growing KV pair
+        let fixedNames = classified
+            .filter { $0.kind == .slidingCache || $0.kind == .fixed }
+            .map(\.name)
+        // Additional growing states beyond the primary pair
+        let extraGrowingNames = Array(growingNames.dropFirst(2))
 
         // Extract names
         let inputIdsName = descriptor.inputNames[0]
         let positionIdsName = descriptor.inputNames[1]
-        let keyCacheName = descriptor.stateNames[0]
-        let valueCacheName = descriptor.stateNames[1]
         let logitsOutputName = descriptor.outputNames[0]
 
         // Extract state descriptors for KV cache shape/type
@@ -568,6 +608,27 @@ private struct EngineImpl: ~Copyable {
         let resolvedSize = options.resolvedKVCacheSize(maxContextLength: config.maxContextLength)
         CLILogger.log("Created \(options.kvCacheStrategy) KV cache with size \(resolvedSize, default: "nil")")
 
+        // Allocate fixed-size buffers for additional persistent states (sliding caches, hybrid states).
+        var additionalStatesLocal: FixedMTLBufferState? = nil
+        let allFixedNames = fixedNames + extraGrowingNames  // extra growing get resolved to max size
+        if !allFixedNames.isEmpty {
+            var extraStates: [(name: String, descriptor: NDArrayDescriptor)] = []
+            for name in allFixedNames {
+                guard case .ndArray(let desc) = descriptor.stateDescriptor(of: name) else {
+                    throw InferenceRuntimeError.invalidOutputType(
+                        "Cannot get descriptor for persistent state '\(name)'")
+                }
+                // Resolve dynamic dims to max for any extra growing states
+                let resolved = desc.shape.contains(where: { $0 < 0 })
+                    ? desc.resolvingDynamicDimensions(desc.shape.map { $0 < 0 ? config.maxContextLength : $0 })
+                    : desc
+                extraStates.append((name, resolved))
+            }
+            additionalStatesLocal = try FixedMTLBufferState(states: extraStates, device: device)
+            CLILogger.log(
+                "Pipelined additional states: \(allFixedNames.joined(separator: ", "))")
+        }
+
         // Create growing logits buffer (reuses TensorStorage+CoreAI.swift)
         let logitsRef = try GrowingLogitsBuffer(
             device: device,
@@ -613,6 +674,8 @@ private struct EngineImpl: ~Copyable {
         self.decodeOutputBuffers = decodeOutBuffers
         self.decodeLogitsBuffers = decodeLogBufs
         self.kvCache = kvCacheLocal
+        self.additionalStates = additionalStatesLocal
+        self.hasNonTruncatableStates = classified.contains(where: { $0.kind == .fixed })
         self.logits = logitsRef
         self.cachedSampler = nil
         self.cachedSamplerTemperature = nil
@@ -764,6 +827,7 @@ private struct EngineImpl: ~Copyable {
         var asyncStates = InferenceFunction.AsyncMutableViews()
         asyncStates.insert(&keyState, for: keyCacheName)
         asyncStates.insert(&valState, for: valueCacheName)
+        additionalStates?.insertAll(into: &asyncStates)
 
         // Build Output as AsyncMutableValue (logits)
         // Decode uses per-step rotating buffer; prefill uses the shared growing buffer.
@@ -1075,6 +1139,7 @@ private struct EngineImpl: ~Copyable {
         var asyncStates = InferenceFunction.AsyncMutableViews()
         asyncStates.insert(&keyState, for: keyCacheName)
         asyncStates.insert(&valState, for: valueCacheName)
+        additionalStates?.insertAll(into: &asyncStates)
 
         let logitsShape = [1, queryLength, vocabSize]
         let logitsStrides = try resolvedStrides(descriptor: logitsBaseDesc, shape: logitsShape)
@@ -1102,6 +1167,8 @@ private struct EngineImpl: ~Copyable {
         step = 0
         cachedSampler = nil
         cachedSamplerTemperature = nil
+        // Zero SSM states so the next conversation starts from a clean slate.
+        additionalStates?.reset()
         span.end()
     }
 
@@ -1179,6 +1246,7 @@ private struct EngineImpl: ~Copyable {
             var asyncStates = InferenceFunction.AsyncMutableViews()
             asyncStates.insert(&keyState, for: keyCacheName)
             asyncStates.insert(&valState, for: valueCacheName)
+            additionalStates?.insertAll(into: &asyncStates)
 
             let lShape = [1, shape, vocabSize]
             let lStrides = try resolvedStrides(descriptor: logitsBaseDesc, shape: lShape)

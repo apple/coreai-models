@@ -25,13 +25,18 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
     /// Vision-specific configuration. Nil for text-only language models.
     public let vision: VisionConfig?
 
+    /// Explicit state classification. Nil = use shape-based heuristic.
+    /// Keys are state names from the model descriptor, values are StateKind.
+    public let states: [String: StateKind]?
+
     public init(
         tokenizer: String,
         vocabSize: Int,
         maxContextLength: Int,
         embeddedTokenizer: Bool = true,
         functionMap: FunctionMap? = nil,
-        vision: VisionConfig? = nil
+        vision: VisionConfig? = nil,
+        states: [String: StateKind]? = nil
     ) {
         self.tokenizer = tokenizer
         self.vocabSize = vocabSize
@@ -39,6 +44,7 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
         self.embeddedTokenizer = embeddedTokenizer
         self.functionMap = functionMap
         self.vision = vision
+        self.states = states
     }
 
     enum CodingKeys: String, CodingKey {
@@ -48,6 +54,7 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
         case embeddedTokenizer = "embedded_tokenizer"
         case functionMap = "function_map"
         case vision
+        case states
     }
 
     public init(from decoder: Swift.Decoder) throws {
@@ -58,6 +65,7 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
         self.embeddedTokenizer = try c.decodeIfPresent(Bool.self, forKey: .embeddedTokenizer) ?? true
         self.functionMap = try c.decodeIfPresent(FunctionMap.self, forKey: .functionMap)
         self.vision = try c.decodeIfPresent(VisionConfig.self, forKey: .vision)
+        self.states = try c.decodeIfPresent([String: StateKind].self, forKey: .states)
     }
 
     // MARK: - Additional Stop Tokens
