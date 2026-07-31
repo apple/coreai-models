@@ -49,7 +49,7 @@ public func fillNDArray<T: BitwiseCopyable>(
 public func fillNDArray<T: BitwiseCopyable>(
     _ array: inout NDArray, as type: T.Type, count: Int, using generator: (Int) -> T
 ) {
-    var view = array.mutableView(as: type)
+    let view = array.mutableView(as: type)
     view.withUnsafeMutablePointer { ptr, shape, _ in
         let capacity = shape.product
         precondition(count <= capacity, "fillNDArray: count \(count) exceeds array capacity \(capacity)")

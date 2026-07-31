@@ -580,7 +580,7 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
                 "scatterMerge only supports float16 embeddings; got \(imageEmbeddings.scalarType)")
         }
         imageEmbeddings.view(as: Float16.self).withUnsafePointer { imgPtr, _, _ in
-            var mutableView = merged.mutableView(as: Float16.self)
+            let mutableView = merged.mutableView(as: Float16.self)
             mutableView.withUnsafeMutablePointer { mergedPtr, _, _ in
                 for (i, pos) in imagePositions.enumerated() {
                     let srcOffset = i * hiddenDim
@@ -916,7 +916,7 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
         let dstBlockStride = dstShape[seqDim...].reduce(1, *)
 
         source.view(as: LogitsScalarType.self).withUnsafePointer { srcPtr, _, _ in
-            var dstView = destination.mutableView(as: LogitsScalarType.self)
+            let dstView = destination.mutableView(as: LogitsScalarType.self)
             dstView.withUnsafeMutablePointer { dstPtr, _, _ in
                 for block in 0..<numBlocks {
                     let srcOff = block * srcBlockStride
@@ -932,7 +932,7 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
 
     private func zeroFill(_ array: inout NDArray) {
         let count = array.shape.reduce(1, *)
-        var view = array.mutableView(as: LogitsScalarType.self)
+        let view = array.mutableView(as: LogitsScalarType.self)
         view.withUnsafeMutablePointer { ptr, _, _ in
             for i in 0..<count {
                 ptr[i] = 0

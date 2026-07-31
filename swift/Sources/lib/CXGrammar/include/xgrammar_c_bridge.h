@@ -101,6 +101,16 @@ bool xgrammar_matcher_is_terminated(const XGrammarMatcher* matcher);
 // Reset matcher
 void xgrammar_matcher_reset(XGrammarMatcher* matcher);
 
+// Rollback N tokens (restores grammar state to N tokens ago)
+bool xgrammar_matcher_rollback(XGrammarMatcher* matcher, int num_tokens);
+
+// Find the longest deterministic string from the current grammar state.
+// Returns a malloc'd C string (caller must free), or NULL if no jump-forward is possible.
+const char* xgrammar_matcher_find_jump_forward_string(XGrammarMatcher* matcher);
+
+// Check if the grammar's root rule has been fully matched (without requiring stop token)
+bool xgrammar_matcher_is_completed(const XGrammarMatcher* matcher);
+
 // Free grammar matcher
 void xgrammar_matcher_free(XGrammarMatcher* matcher);
 

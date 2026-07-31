@@ -222,6 +222,39 @@ void xgrammar_matcher_reset(XGrammarMatcher* matcher) {
     } catch (...) {}
 }
 
+bool xgrammar_matcher_rollback(XGrammarMatcher* matcher, int num_tokens) {
+    try {
+        if (matcher) {
+            matcher->cpp_obj.Rollback(num_tokens);
+            return true;
+        }
+    } catch (...) {}
+    return false;
+}
+
+const char* xgrammar_matcher_find_jump_forward_string(XGrammarMatcher* matcher) {
+    try {
+        if (!matcher) return nullptr;
+        std::string result = matcher->cpp_obj.FindJumpForwardString();
+        if (result.empty()) return nullptr;
+        char* buf = static_cast<char*>(malloc(result.size() + 1));
+        if (!buf) return nullptr;
+        memcpy(buf, result.c_str(), result.size() + 1);
+        return buf;
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+bool xgrammar_matcher_is_completed(const XGrammarMatcher* matcher) {
+    try {
+        if (!matcher) return false;
+        return matcher->cpp_obj.IsCompleted();
+    } catch (...) {
+        return false;
+    }
+}
+
 void xgrammar_matcher_free(XGrammarMatcher* matcher) {
     delete matcher;
 }
