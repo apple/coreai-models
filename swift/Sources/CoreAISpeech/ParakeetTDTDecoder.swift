@@ -11,9 +11,9 @@ import Foundation
 ///
 /// Drives the autoregressive (token, duration) loop in Swift, calling the exported
 /// `decoder_step` (single LSTM step) and `joint` graphs per emission. The LSTM
-/// hidden/cell state is owned here, seeded with zeros and only advanced when a
-/// non-blank token is emitted — matching the HF `ParakeetTDTDecoderCache.update(...,
-/// mask=~blank_mask)` semantics.
+/// hidden/cell state is owned here, seeded with zeros and only advanced when the
+/// step's input token — i.e. the previous prediction — is non-blank, matching the HF
+/// `ParakeetTDTDecoderCache.update(..., mask=~blank_mask)` semantics.
 public struct ParakeetTDTDecoder: SpeechDecoder {
     public init() {}
 
@@ -176,13 +176,26 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
                     bestDurIdx = i
                 }
                 let dur = cfg.durations[bestDurIdx]
+                let isBlank = (bestTok == cfg.blankTokenId)
 
-                if bestTok != cfg.blankTokenId {
+                if !isBlank {
                     emitted.append(bestTok)
-                    lastToken = bestTok
                 }
-                // (If blank, lastToken stays as it was — typically still blank or the
-                // most recently emitted real token.)
+                // HF appends *every* prediction — blanks included — to the sequence, and
+                // the next step's blank-skip test reads that last token. `emitted` is what
+                // filters blanks out of the transcript. Holding the last non-blank token
+                // here instead would keep re-feeding it to the LSTM and advance the state
+                // as if the label repeated.
+                lastToken = bestTok
+
+                // A blank that picks duration 0 still moves one frame forward, matching HF's
+                // `torch.where(blank_mask & (durations == 0), 1, durations)`. Without this the
+                // inner loop re-runs the joint on the same frame with the same (cached)
+                // decoder output until maxSymbolsPerStep is exhausted.
+                if isBlank && dur == 0 {
+                    advance = 1
+                    break
+                }
 
                 if dur > 0 {
                     advance = dur

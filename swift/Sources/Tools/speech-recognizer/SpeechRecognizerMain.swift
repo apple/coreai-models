@@ -42,7 +42,7 @@ struct SpeechRecognizer: AsyncParsableCommand {
         if clearCoreAICache {
             try clearCache(bundleURL: bundleURL)
         }
-        if FileManager.default.fileExists(atPath: bundleURL.appending(path: "encoder.aimodel").path) {
+        if FileManager.default.fileExists(atPath: bundleURL.appending(path: "metadata.json").path) {
             try await runBundle(bundleURL: bundleURL, audioPath: audioPath, warmup: warmup, verbose: verbose)
         } else {
             try await runLegacy(modelPath: modelPath, audioPath: audioPath, warmup: warmup)
@@ -83,7 +83,7 @@ func runBundle(bundleURL: URL, audioPath: String?, warmup: Bool, verbose: Bool) 
     print("Format: bundle (\(await model.architecture))")
 
     if verbose {
-        CLILogger.setLevel(to: 1)
+        CLILogger.level = 1
     }
 
     // Resolve the PCM buffer once — either the decoded audio file or a fixed
@@ -108,7 +108,8 @@ func runBundle(bundleURL: URL, audioPath: String?, warmup: Bool, verbose: Bool) 
     if let audioURL { print("Transcribing \(audioURL.lastPathComponent)…") }
     let t0 = ContinuousClock.now
     let (text, stats) = try await model.transcribe(pcm: pcm)
-    let totalMs = (ContinuousClock.now - t0).inMilliseconds
+    let totalTranscribeTime = (ContinuousClock.now - t0)
+    let totalMs = totalTranscribeTime.inMilliseconds
     print("\n── Decode ─────────────────────────────────────────────────────────────")
     print(
         String(
@@ -220,7 +221,8 @@ func runLegacy(modelPath: String, audioPath: String?, warmup: Bool) async throws
         _ = try await fn.run(
             inputs: ["input_features": melArray, "decoder_input_ids": ids],
             states: InferenceFunction.MutableViews(), outputViews: consume out)
-        stepTimesMs.append((ContinuousClock.now - t0).inMilliseconds)
+        let thisStepTime = ContinuousClock.now - t0
+        stepTimesMs.append(thisStepTime.inMilliseconds)
         let logits = flattenAsFloat(la)
         let base = (seqLen - 1) * vocabSize
         let next = Int32(

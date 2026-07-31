@@ -175,17 +175,15 @@ def _convert(
     example_inputs: dict[str, torch.Tensor],
     input_names: list[str],
     output_names: list[str],
-    dtype: torch.dtype,
     dynamic_shapes: dict | None = None,
 ):
     module.eval()
-    with torch.autocast(device_type="cpu", dtype=dtype):
-        exported = torch.export.export(
-            module,
-            args=(),
-            kwargs=example_inputs,
-            dynamic_shapes=dynamic_shapes,
-        )
+    exported = torch.export.export(
+        module,
+        args=(),
+        kwargs=example_inputs,
+        dynamic_shapes=dynamic_shapes,
+    )
     exported = exported.run_decompositions(get_decomp_table())
     converter = TorchConverter().add_exported_program(
         exported_program=exported,
@@ -325,7 +323,6 @@ def create_parakeet(
         encoder_inputs,
         input_names=["input_features", "attention_mask"],
         output_names=["encoder_hidden_states"],
-        dtype=dtype,
         dynamic_shapes=_encoder_dynamic_shapes() if dynamic else None,
     )
     _save_program(encoder_program, assets[ENCODER_GRAPH], ENCODER_GRAPH)
@@ -336,7 +333,6 @@ def create_parakeet(
         _decoder_step_inputs(config, dtype),
         input_names=["input_ids", "hidden_state", "cell_state"],
         output_names=["decoder_output", "new_hidden_state", "new_cell_state"],
-        dtype=dtype,
     )
     _save_program(decoder_program, assets[DECODER_STEP_GRAPH], DECODER_STEP_GRAPH)
 
@@ -346,7 +342,6 @@ def create_parakeet(
         _joint_inputs(config, dtype),
         input_names=["decoder_hidden_states", "encoder_hidden_states"],
         output_names=["logits"],
-        dtype=dtype,
     )
     _save_program(joint_program, assets[JOINT_GRAPH], JOINT_GRAPH)
 

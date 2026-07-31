@@ -45,12 +45,6 @@ public protocol SpeechDecoder: Sendable {
 
 // MARK: - Helpers
 
-extension Duration {
-    public var inMilliseconds: Double {
-        Double(components.seconds) * 1000 + Double(components.attoseconds) / 1e15
-    }
-}
-
 /// Greedy decoder for Whisper (encoder-decoder, cross-attention, KV cache).
 public struct WhisperDecoder: SpeechDecoder {
     public init() {}
