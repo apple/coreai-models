@@ -474,7 +474,6 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         CLILogger.log("CoreAI clean engine cleanup complete")
         cleanupSpan.end()
     }
-
 }
 
 extension CoreAISequentialEngine {

@@ -515,7 +515,8 @@ private struct EngineImpl: ~Copyable {
         let valueCacheName = growingNames[1]
 
         // Fixed states: everything that isn't the primary growing KV pair
-        let fixedNames = classified
+        let fixedNames =
+            classified
             .filter { $0.kind == .slidingCache || $0.kind == .fixed }
             .map(\.name)
         // Additional growing states beyond the primary pair
@@ -619,7 +620,8 @@ private struct EngineImpl: ~Copyable {
                         "Cannot get descriptor for persistent state '\(name)'")
                 }
                 // Resolve dynamic dims to max for any extra growing states
-                let resolved = desc.shape.contains(where: { $0 < 0 })
+                let resolved =
+                    desc.shape.contains(where: { $0 < 0 })
                     ? desc.resolvingDynamicDimensions(desc.shape.map { $0 < 0 ? config.maxContextLength : $0 })
                     : desc
                 extraStates.append((name, resolved))

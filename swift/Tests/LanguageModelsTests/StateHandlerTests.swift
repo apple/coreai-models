@@ -60,8 +60,8 @@ struct StateKindTests {
     @Test("StateKind decodes from JSON")
     func decodable() throws {
         let json = """
-        {"key": "kv_cache", "sliding": "sliding_cache", "fix": "fixed"}
-        """
+            {"key": "kv_cache", "sliding": "sliding_cache", "fix": "fixed"}
+            """
         struct Wrapper: Decodable {
             let key: StateKind
             let sliding: StateKind

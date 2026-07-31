@@ -33,7 +33,6 @@ struct SyncStateHandlerSet {
 /// 2. Shape-based heuristic — dynamic dim → kvCache, static + "cache" in name → slidingCache, else → fixed
 /// 3. Legacy (2 states) — both kvCache, no warning
 enum StateHandlerFactory {
-
     /// Classify states using metadata or heuristic fallback.
     static func classifyStates(
         descriptor: InferenceFunctionDescriptor,
@@ -67,11 +66,13 @@ enum StateHandlerFactory {
                 guard case .ndArray(let desc) = descriptor.stateDescriptor(of: name) else { continue }
                 let shapeStr = desc.shape.map { $0 < 0 ? "?" : "\($0)" }.joined(separator: "×")
                 let growth = desc.shape.contains(where: { $0 < 0 }) ? "GROWING" : "FIXED"
-                CLILogger.log("  \(name): \(growth) \(kind.rawValue) (\(shapeStr))",
-                             component: "StateHandlerFactory")
+                CLILogger.log(
+                    "  \(name): \(growth) \(kind.rawValue) (\(shapeStr))",
+                    component: "StateHandlerFactory")
             }
-            CLILogger.log("  Add \"states\" to metadata.json for explicit control.",
-                         component: "StateHandlerFactory")
+            CLILogger.log(
+                "  Add \"states\" to metadata.json for explicit control.",
+                component: "StateHandlerFactory")
         }
         if !verbose && names.count > 2 {
             CLILogger.log(
