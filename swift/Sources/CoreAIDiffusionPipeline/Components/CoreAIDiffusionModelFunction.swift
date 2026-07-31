@@ -55,13 +55,13 @@ public actor CoreAIDiffusionModelFunction {
             switch resolved.scalarType {
             #if !((os(macOS) || targetEnvironment(macCatalyst)) && arch(x86_64))
             case .float16:
-                var view = array.mutableView(as: Float16.self)
+                let view = array.mutableView(as: Float16.self)
                 view.withUnsafeMutablePointer { ptr, _, _ in
                     for j in 0..<data.count { ptr[j] = Float16(data[j]) }
                 }
             #endif
             case .float32:
-                var view = array.mutableView(as: Float.self)
+                let view = array.mutableView(as: Float.self)
                 view.withUnsafeMutablePointer { ptr, _, _ in
                     for j in 0..<data.count { ptr[j] = data[j] }
                 }
@@ -83,7 +83,7 @@ public actor CoreAIDiffusionModelFunction {
             guard case .ndArray(let nd) = fn.descriptor.inputDescriptor(of: name) else { continue }
             let resolved = nd.resolvingDynamicDimensions(shape)
             var array = NDArray(descriptor: resolved)
-            var view = array.mutableView(as: Int32.self)
+            let view = array.mutableView(as: Int32.self)
             view.withUnsafeMutablePointer { ptr, _, _ in
                 for j in 0..<data.count { ptr[j] = data[j] }
             }

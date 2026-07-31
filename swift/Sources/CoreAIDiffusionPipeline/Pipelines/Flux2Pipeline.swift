@@ -274,7 +274,7 @@ public struct Flux2Pipeline: DiffusionPipeline {
         let image = try DiffusionUtilities.pixelsToCGImage(pixels, height: outputHeight, width: outputWidth)
 
         var latentsND = NDArray(shape: latentShape, scalarType: .float32)
-        var latentsView = latentsND.mutableView(as: Float.self)
+        let latentsView = latentsND.mutableView(as: Float.self)
         latentsView.withUnsafeMutablePointer { ptr, _, _ in
             for i in 0..<noise.count { ptr[i] = noise[i] }
         }

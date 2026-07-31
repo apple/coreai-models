@@ -161,7 +161,7 @@ public struct StableDiffusionPipeline: DiffusionPipeline {
 
         // Wrap latents back to NDArray for GenerationResult
         var latentsND = NDArray(shape: latentShape, scalarType: .float32)
-        var latentsView = latentsND.mutableView(as: Float.self)
+        let latentsView = latentsND.mutableView(as: Float.self)
         latentsView.withUnsafeMutablePointer { ptr, _, _ in
             for i in 0..<latents.count { ptr[i] = latents[i] }
         }

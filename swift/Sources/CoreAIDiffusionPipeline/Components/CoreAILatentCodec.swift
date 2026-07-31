@@ -44,7 +44,7 @@ public final class CoreAILatentDecoder: Sendable {
         let outW = shape[3] * 8
         let outShape = [1, 3, outH, outW]
         var result = NDArray(shape: outShape, scalarType: .float32)
-        var resultView = result.mutableView(as: Float.self)
+        let resultView = result.mutableView(as: Float.self)
         resultView.withUnsafeMutablePointer { ptr, _, _ in
             for i in 0..<outputFloats.count { ptr[i] = outputFloats[i] }
         }
@@ -107,7 +107,7 @@ public final class CoreAILatentEncoder: Sendable {
         // Scale and return as NDArray
         let outShape = [1, 4, height / 8, width / 8]
         var result = NDArray(shape: outShape, scalarType: .float32)
-        var resultView = result.mutableView(as: Float.self)
+        let resultView = result.mutableView(as: Float.self)
         resultView.withUnsafeMutablePointer { ptr, _, _ in
             for i in 0..<outputFloats.count { ptr[i] = outputFloats[i] * scaleFactor }
         }

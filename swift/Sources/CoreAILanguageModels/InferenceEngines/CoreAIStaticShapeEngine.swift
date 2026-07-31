@@ -494,7 +494,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         }
         if case .ndArray(let nd) = desc.inputDescriptor(of: posName) {
             var pos = NDArray(descriptor: nd)
-            var posView = pos.mutableView(as: UInt16.self)
+            let posView = pos.mutableView(as: UInt16.self)
             guard var posSpan = posView.contiguousElements else {
                 throw InferenceRuntimeError.invalidState("pos array has non-contiguous layout")
             }
@@ -517,7 +517,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
             case .ndArray(let nd) = desc.inputDescriptor(of: stepName)
         {
             var step = NDArray(descriptor: nd)
-            var stepView = step.mutableView(as: Int32.self)
+            let stepView = step.mutableView(as: Int32.self)
             guard var stepSpan = stepView.contiguousElements else {
                 throw InferenceRuntimeError.invalidState("step array has non-contiguous layout")
             }
@@ -544,7 +544,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         }
 
         var tokenArray = NDArray(descriptor: tokenNDDesc)
-        var tokenView = tokenArray.mutableView(as: Int32.self)
+        let tokenView = tokenArray.mutableView(as: Int32.self)
         guard var tokenSpan = tokenView.contiguousElements else {
             throw InferenceRuntimeError.invalidState("tokenArray has non-contiguous layout")
         }
