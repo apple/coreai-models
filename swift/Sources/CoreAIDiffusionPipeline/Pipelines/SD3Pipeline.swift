@@ -160,7 +160,7 @@ public struct SD3Pipeline: DiffusionPipeline {
             pixels, height: imageSize, width: imageSize)
 
         var latentsND = NDArray(shape: latentShape, scalarType: .float32)
-        var latentsView = latentsND.mutableView(as: Float.self)
+        let latentsView = latentsND.mutableView(as: Float.self)
         latentsView.withUnsafeMutablePointer { ptr, _, _ in
             for i in 0..<latents.count { ptr[i] = latents[i] }
         }
@@ -226,7 +226,7 @@ public struct SD3Pipeline: DiffusionPipeline {
         }
 
         var inputArray = NDArray(shape: [1, Self.clipSeqLen], scalarType: .int32)
-        var view = inputArray.mutableView(as: Int32.self)
+        let view = inputArray.mutableView(as: Int32.self)
         view.withUnsafeMutablePointer { ptr, _, _ in
             for i in 0..<ids.count { ptr[i] = ids[i] }
         }
