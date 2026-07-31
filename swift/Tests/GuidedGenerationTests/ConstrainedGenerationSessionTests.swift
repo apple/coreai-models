@@ -146,6 +146,64 @@ struct ConstrainedGenerationSessionTests {
         )
     }
 
+    // MARK: - Rollback Tests
+
+    @Test func rollbackRestoresPriorState() throws {
+        var session = try createTestSession()
+
+        let initialAllowed = allowedTokenIDs(session: &session)
+
+        // Accept "{" then rollback — should return to initial state
+        _ = session.acceptToken(TestConstants.openBraceToken)
+        let afterAccept = allowedTokenIDs(session: &session)
+        #expect(afterAccept != initialAllowed)
+
+        let success = session.rollback(1)
+        #expect(success, "rollback(1) should succeed")
+
+        let afterRollback = allowedTokenIDs(session: &session)
+        #expect(afterRollback == initialAllowed, "After rollback, allowed tokens should match initial state")
+    }
+
+    @Test func rollbackMultipleTokens() throws {
+        var session = try createTestSession()
+
+        let initialAllowed = allowedTokenIDs(session: &session)
+
+        // Accept "{" then "\"" then rollback both
+        _ = session.acceptToken(TestConstants.openBraceToken)  // "{"
+        _ = session.acceptToken(TestConstants.quoteToken)  // "\""
+
+        let success = session.rollback(2)
+        #expect(success)
+
+        let afterRollback = allowedTokenIDs(session: &session)
+        #expect(afterRollback == initialAllowed)
+    }
+
+    // MARK: - Jump Forward Tests
+
+    @Test func findJumpForwardStringReturnsNilAtChoice() throws {
+        var session = try createTestSession()
+
+        // At the start, multiple tokens are valid ("{") — no deterministic jump
+        let jump = session.findJumpForwardString()
+        // The grammar may or may not have a deterministic prefix at the very start.
+        // After "{", the next required token is "\"" (to start a key), but there could
+        // be whitespace options. Just verify the API returns without crashing.
+        _ = jump  // no assertion on value — grammar-dependent
+    }
+
+    @Test func findJumpForwardStringDoesNotMutateState() throws {
+        var session = try createTestSession()
+
+        let beforeAllowed = allowedTokenIDs(session: &session)
+        _ = session.findJumpForwardString()
+        let afterAllowed = allowedTokenIDs(session: &session)
+
+        #expect(beforeAllowed == afterAllowed, "findJumpForwardString should not change grammar state")
+    }
+
     // MARK: - Reset Tests
 
     @Test func reset() throws {

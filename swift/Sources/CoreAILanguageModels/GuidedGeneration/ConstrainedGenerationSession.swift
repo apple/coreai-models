@@ -17,6 +17,8 @@ import Tokenizers
 /// Each session is tied to a specific JSON schema and vocabulary. It tracks
 /// the generation state and produces token masks that enforce schema compliance.
 public struct ConstrainedGenerationSession: ~Copyable {
+    static let maxRollbackTokens = 64
+
     private let tokenizerInfo: TokenizerInfo
     private let compiler: GrammarCompiler
     private let compiledGrammar: CompiledGrammar
@@ -93,7 +95,7 @@ public struct ConstrainedGenerationSession: ~Copyable {
         self.tokenizerInfo = tokenizerInfo
         self.compiler = GrammarCompiler(tokenizerInfo: tokenizerInfo)
         self.compiledGrammar = try compiler.compileJSONSchema(jsonSchema)
-        self.matcher = GrammarMatcher(compiledGrammar: compiledGrammar, maxRollbackTokens: 64)
+        self.matcher = GrammarMatcher(compiledGrammar: compiledGrammar, maxRollbackTokens: Self.maxRollbackTokens)
         self.vocabularySize = tokenizerInfo.vocabularySize
         self.bitmaskSize = (vocabularySize + 31) / 32
         self.bitmaskBuffer = Array(repeating: 0, count: bitmaskSize)
@@ -198,7 +200,8 @@ public struct ConstrainedGenerationSession: ~Copyable {
     /// (e.g., exceeds maxRollbackTokens budget).
     @discardableResult
     public mutating func rollback(_ numTokens: Int = 1) -> Bool {
-        matcher.rollback(numTokens)
+        guard numTokens >= 0 else { return false }
+        return matcher.rollback(numTokens)
     }
 
     /// Find the longest deterministic string from the current grammar state.
