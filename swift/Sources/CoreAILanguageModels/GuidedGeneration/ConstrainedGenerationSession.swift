@@ -93,7 +93,7 @@ public struct ConstrainedGenerationSession: ~Copyable {
         self.tokenizerInfo = tokenizerInfo
         self.compiler = GrammarCompiler(tokenizerInfo: tokenizerInfo)
         self.compiledGrammar = try compiler.compileJSONSchema(jsonSchema)
-        self.matcher = GrammarMatcher(compiledGrammar: compiledGrammar)
+        self.matcher = GrammarMatcher(compiledGrammar: compiledGrammar, maxRollbackTokens: 64)
         self.vocabularySize = tokenizerInfo.vocabularySize
         self.bitmaskSize = (vocabularySize + 31) / 32
         self.bitmaskBuffer = Array(repeating: 0, count: bitmaskSize)
@@ -192,6 +192,49 @@ public struct ConstrainedGenerationSession: ~Copyable {
     public mutating func reset() {
         matcher.reset()
         allTokensBlocked = false
+    }
+
+    /// Rollback the grammar state by N tokens. Returns false if rollback failed
+    /// (e.g., exceeds maxRollbackTokens budget).
+    @discardableResult
+    public mutating func rollback(_ numTokens: Int = 1) -> Bool {
+        matcher.rollback(numTokens)
+    }
+
+    /// Find the longest deterministic string from the current grammar state.
+    /// Does not change the matcher state. Returns nil if no jump-forward is possible.
+    public func findJumpForwardString() -> String? {
+        matcher.findJumpForwardString()
+    }
+
+    /// Result of filling a bitmask for the next token.
+    public enum BitmaskResult: Equatable {
+        /// Grammar is terminated or all tokens are blocked — generation should stop.
+        case terminated
+        /// All tokens are allowed — no mask needed, generate unconstrained.
+        case unconstrained
+        /// Bitmask was written — apply it to constrain sampling.
+        case constrained
+    }
+
+    /// Fill the bitmask directly into a caller-provided buffer (e.g., a GPU-visible MTLBuffer).
+    ///
+    /// The caller must ensure the pointer has room for at least `(vocabularySize + 31) / 32`
+    /// Int32 words.
+    public mutating func fillBitmask(into pointer: UnsafeMutablePointer<Int32>) -> BitmaskResult {
+        if isTerminated { return .terminated }
+
+        let needsApplication = matcher.fillNextTokenBitmask(pointer)
+        if !needsApplication {
+            // xgrammar signals all tokens are allowed — no mask needed
+            return .unconstrained
+        }
+        // Check for all-zeros (no tokens allowed — grammar done)
+        for i in 0..<bitmaskSize {
+            if pointer[i] != 0 { return .constrained }
+        }
+        allTokensBlocked = true
+        return .terminated
     }
 }
 
