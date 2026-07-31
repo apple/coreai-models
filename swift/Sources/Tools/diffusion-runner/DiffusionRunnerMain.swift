@@ -755,7 +755,7 @@ struct DiffusionRunner: AsyncParsableCommand {
     {
         if asInt32 {
             var array = NDArray(shape: shape, scalarType: .int32)
-            var view = array.mutableView(as: Int32.self)
+            let view = array.mutableView(as: Int32.self)
             view.withUnsafeMutablePointer { ptr, _, _ in
                 for i in 0..<floats.count { ptr[i] = Int32(floats[i]) }
             }
@@ -763,7 +763,7 @@ struct DiffusionRunner: AsyncParsableCommand {
         } else if scalarType == .float16 {
             #if !((os(macOS) || targetEnvironment(macCatalyst)) && arch(x86_64))
             var array = NDArray(shape: shape, scalarType: .float16)
-            var view = array.mutableView(as: Float16.self)
+            let view = array.mutableView(as: Float16.self)
             view.withUnsafeMutablePointer { ptr, _, _ in
                 for i in 0..<floats.count { ptr[i] = Float16(floats[i]) }
             }
@@ -773,7 +773,7 @@ struct DiffusionRunner: AsyncParsableCommand {
             #endif
         } else {
             var array = NDArray(shape: shape, scalarType: scalarType ?? .float32)
-            var view = array.mutableView(as: Float.self)
+            let view = array.mutableView(as: Float.self)
             view.withUnsafeMutablePointer { ptr, _, _ in
                 for i in 0..<floats.count { ptr[i] = floats[i] }
             }

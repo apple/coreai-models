@@ -484,7 +484,7 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         let dstBlockStride = dstShape[seqDim...].reduce(1, *)  // S_new * D
 
         source.view(as: LogitsScalarType.self).withUnsafePointer { srcPtr, _, _ in
-            var dstView = destination.mutableView(as: LogitsScalarType.self)
+            let dstView = destination.mutableView(as: LogitsScalarType.self)
             dstView.withUnsafeMutablePointer { dstPtr, _, _ in
                 for block in 0..<numBlocks {
                     let srcOff = block * srcBlockStride
@@ -500,7 +500,7 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
 
     private func zeroFill(_ array: inout NDArray) {
         let count = array.shape.reduce(1, *)
-        var view = array.mutableView(as: LogitsScalarType.self)
+        let view = array.mutableView(as: LogitsScalarType.self)
         // Inlined constant write — under -Onone, fillNDArray's
         // `(Int) -> LogitsScalarType` closure is invoked per element (no inlining),
         // which made zeroing the KV cache (~14.7M elements for a 32K-context
