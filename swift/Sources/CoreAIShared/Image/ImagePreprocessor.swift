@@ -117,10 +117,13 @@ public struct ImagePreprocessor: Sendable {
         var chw = [Float](repeating: 0, count: 3 * pixelCount)
         data.withUnsafeBytes { rawSrc in
             let src = rawSrc.bindMemory(to: Float.self)
+            let n = vDSP_Length(pixelCount)
             for c in 0..<3 {
-                for i in 0..<pixelCount {
-                    chw[c * pixelCount + i] = src[i * 4 + c]
-                }
+                // Gather channel c from interleaved RGBA (stride 4) into planar output
+                vDSP_vsadd(
+                    src.baseAddress! + c, 4,
+                    [Float(0)], &chw[c * pixelCount], 1, n
+                )
             }
         }
         return chw
