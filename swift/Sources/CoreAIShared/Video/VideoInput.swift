@@ -103,7 +103,7 @@ public enum VideoInputError: Error, LocalizedError {
     case invalidVideo(String)
     case noVideoTrack
     case fileNotFound(URL)
-    case frameExtractionFailed(String)
+    case frameExtractionFailed(underlying: Error)
 
     public var errorDescription: String? {
         switch self {
@@ -113,8 +113,8 @@ public enum VideoInputError: Error, LocalizedError {
             return "File has no video track (may be audio-only)"
         case .fileNotFound(let url):
             return "Video file not found: \(url.path)"
-        case .frameExtractionFailed(let reason):
-            return "Frame extraction failed: \(reason)"
+        case .frameExtractionFailed(let underlying):
+            return "Frame extraction failed: \(underlying.localizedDescription)"
         }
     }
 }

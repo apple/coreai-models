@@ -94,6 +94,13 @@ struct FrameSamplingStrategyTests {
         #expect(timestamps.isEmpty)
     }
 
+    @Test("FPS-based sampling with zero maxFrames returns empty")
+    func fpsSamplingZeroMaxFrames() {
+        let timestamps = FrameSamplingStrategy.fps(rate: 1.0, maxFrames: 0)
+            .timestamps(forDuration: 10.0, videoFrameRate: 30.0)
+        #expect(timestamps.isEmpty)
+    }
+
     @Test("FPS-based sampling short video returns at least 1 frame")
     func fpsSamplingShortVideo() {
         let timestamps = FrameSamplingStrategy.fps(rate: 1.0, maxFrames: 10)

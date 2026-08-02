@@ -50,6 +50,11 @@ enum ImageInfoMode: String, ExpressibleByArgument, Sendable {
     case auto
 }
 
+enum VideoSamplingMode: String, ExpressibleByArgument, Sendable {
+    case uniform
+    case fps
+}
+
 @main
 struct Main {
     static func main() async throws {
@@ -209,7 +214,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     @Option(
         name: .customLong("video-sampling"),
         help: "Video frame sampling: uniform (default) or fps")
-    var videoSampling: String = "uniform"
+    var videoSampling: VideoSamplingMode = .uniform
 
     @Flag(
         name: .customLong("clear-coreai-cache"),
@@ -937,15 +942,96 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             }
         }
 
-        // Build VLM prompt with image placeholder tokens.
-        // Try using the tokenizer's chat template if available; fall back to
-        // generic "USER: <image>×N \n prompt \nASSISTANT:" format.
+        try await runVLMGeneration(
+            vlmEngine: vlmEngine,
+            embeddedInput: embeddedInput,
+            visionConfig: visionConfig,
+            tokenizer: tokenizer,
+            samplingConfiguration: samplingConfiguration,
+            maxTokens: maxTokens,
+            additionalEosTokenIds: additionalEosTokenIds,
+            displayPrompt: effectivePrompt
+        )
+    }
+
+    // MARK: - VLM Video Inference
+
+    private func runVLMVideoInference(
+        videoPath: String,
+        inferenceEngine: any InferenceEngine,
+        bundle: LanguageBundle,
+        tokenizer: any Tokenizer,
+        samplingConfiguration: SamplingConfiguration,
+        maxTokens: Int,
+        additionalEosTokenIds: [Int32],
+        displayPrompt: String
+    ) async throws {
+        guard let vlmEngine = inferenceEngine as? any MultimodalInferenceEngine else {
+            print("Error: --video requires a vision-language model (engine does not support multimodal)")
+            throw ExitCode.failure
+        }
+
+        let videoURL = URL(fileURLWithPath: videoPath)
+        guard FileManager.default.fileExists(atPath: videoURL.path) else {
+            print("Error: video not found at \(videoPath)")
+            throw ExitCode.failure
+        }
+
+        guard let visionConfig = bundle.visionConfig else {
+            print("Error: VLM bundle missing 'vision' config in metadata.json")
+            throw ExitCode.failure
+        }
+
+        let sampling: FrameSamplingStrategy
+        switch videoSampling {
+        case .fps:
+            sampling = .fps(rate: 1.0, maxFrames: videoFrames)
+        case .uniform:
+            sampling = .uniform(count: videoFrames)
+        }
+
+        if !CLILogger.isVerbose {
+            print("Generating...")
+        }
+
+        CLILogger.log("Extracting \(videoFrames) frames from: \(videoPath)", component: "VLM")
+        let videoInput = try await VideoInput.fromURL(videoURL, sampling: sampling)
+        CLILogger.log("Encoding video frames...", component: "VLM")
+        let embeddedInput = try await vlmEngine.encodeVideo(videoInput)
+        CLILogger.log(
+            "Video encoded: \(embeddedInput.tokenCount) visual tokens from \(videoInput.frameCount ?? 0) frames",
+            component: "VLM")
+
+        try await runVLMGeneration(
+            vlmEngine: vlmEngine,
+            embeddedInput: embeddedInput,
+            visionConfig: visionConfig,
+            tokenizer: tokenizer,
+            samplingConfiguration: samplingConfiguration,
+            maxTokens: maxTokens,
+            additionalEosTokenIds: additionalEosTokenIds,
+            displayPrompt: displayPrompt
+        )
+    }
+
+    // MARK: - Shared VLM Generation
+
+    private func runVLMGeneration(
+        vlmEngine: any MultimodalInferenceEngine,
+        embeddedInput: EmbeddedInput,
+        visionConfig: VisionConfig,
+        tokenizer: any Tokenizer,
+        samplingConfiguration: SamplingConfiguration,
+        maxTokens: Int,
+        additionalEosTokenIds: [Int32],
+        displayPrompt: String
+    ) async throws {
         let imageTokenCount = embeddedInput.tokenCount
         let imageTokenId = visionConfig.imageTokenId
         let vlmTokens: [Int32]
 
         if let chatTemplateTokens = try? buildVLMPromptFromChatTemplate(
-            prompt: effectivePrompt,
+            prompt: displayPrompt,
             imageTokenCount: imageTokenCount,
             imageTokenId: imageTokenId,
             tokenizer: tokenizer
@@ -958,17 +1044,16 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
                 component: "VLM")
             var tokens = tokenizer.encode(text: "USER: ", addSpecialTokens: true).map { Int32($0) }
             tokens.append(contentsOf: [Int32](repeating: imageTokenId, count: imageTokenCount))
-            let suffix = "\n" + effectivePrompt + "\nASSISTANT:"
+            let suffix = "\n" + displayPrompt + "\nASSISTANT:"
             tokens.append(
                 contentsOf: tokenizer.encode(text: suffix, addSpecialTokens: false).map { Int32($0) })
             vlmTokens = tokens
         }
 
         CLILogger.log(
-            "VLM prompt: \(vlmTokens.count) tokens (\(imageTokenCount) image placeholders)",
+            "VLM prompt: \(vlmTokens.count) tokens (\(imageTokenCount) visual placeholders)",
             component: "VLM")
 
-        // Build stop token set
         var eosTokenIds = Set<Int32>()
         if let eos = tokenizer.eosTokenId { eosTokenIds.insert(Int32(eos)) }
         eosTokenIds.formUnion(additionalEosTokenIds)
@@ -984,7 +1069,6 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
 
         let inferenceID = InstrumentsProfiler.beginInference(
             promptTokens: vlmTokens.count, maxTokens: maxTokens)
-
         await PerformanceMetrics.shared.recordPromptTokens(vlmTokens.count)
 
         let tokenStream = try await vlmEngine.generate(
@@ -999,8 +1083,8 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
 
         CLILogger.log("VLM generate started, maxTokens=\(maxTokens)", component: "VLM")
 
-        // Prompt (prefill) timing — first token latency
-        var promptSpan: ProfileSpan? = InstrumentsProfiler.beginPrompt(tokens: vlmTokens.count, engine: "CoreAIVLM")
+        var promptSpan: ProfileSpan? = InstrumentsProfiler.beginPrompt(
+            tokens: vlmTokens.count, engine: "CoreAIVLM")
         var extendSpan: ProfileSpan?
         let needsLogits = printLogits || saveLogits != nil
         let topKCount = saveLogitsLength.topKForFile ?? 5
@@ -1046,134 +1130,9 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         extendSpan?.end()
         print()
 
-        // Save logits to JSON if requested
         if let path = saveLogits, !allTokenLogits.isEmpty {
             try LogitsWriter.saveTopKJSON(tokenLogits: allTokenLogits, path: path)
         }
-
-        // Record generation stats
-        InstrumentsProfiler.endInference(
-            generatedTokens: generatedTokens.count, signpostID: inferenceID)
-        await PerformanceMetrics.shared.recordGeneratedTokens(generatedTokens.count)
-        await PerformanceMetrics.shared.endOverallTiming()
-        await PerformanceMetrics.shared.printSummary(verbose: CLILogger.isVerbose)
-
-        if verbose {
-            await StatsReporter(storage: .shared).printVerboseTable()
-        }
-        InstrumentsProfiler.logMemoryUsage(phase: "ModelFinal")
-    }
-
-    // MARK: - VLM Video Inference
-
-    private func runVLMVideoInference(
-        videoPath: String,
-        inferenceEngine: any InferenceEngine,
-        bundle: LanguageBundle,
-        tokenizer: any Tokenizer,
-        samplingConfiguration: SamplingConfiguration,
-        maxTokens: Int,
-        additionalEosTokenIds: [Int32],
-        displayPrompt: String
-    ) async throws {
-        guard let vlmEngine = inferenceEngine as? any MultimodalInferenceEngine else {
-            print("Error: --video requires a vision-language model (engine does not support multimodal)")
-            throw ExitCode.failure
-        }
-
-        let videoURL = URL(fileURLWithPath: videoPath)
-        guard FileManager.default.fileExists(atPath: videoURL.path) else {
-            print("Error: video not found at \(videoPath)")
-            throw ExitCode.failure
-        }
-
-        guard let visionConfig = bundle.visionConfig else {
-            print("Error: VLM bundle missing 'vision' config in metadata.json")
-            throw ExitCode.failure
-        }
-
-        let sampling: FrameSamplingStrategy
-        switch videoSampling.lowercased() {
-        case "fps":
-            sampling = .fps(rate: 1.0, maxFrames: videoFrames)
-        default:
-            sampling = .uniform(count: videoFrames)
-        }
-
-        if !CLILogger.isVerbose {
-            print("Generating...")
-        }
-
-        CLILogger.log("Extracting \(videoFrames) frames from: \(videoPath)", component: "VLM")
-        let videoInput = try await VideoInput.fromURL(videoURL, sampling: sampling)
-        CLILogger.log("Encoding video frames...", component: "VLM")
-        let embeddedInput = try await vlmEngine.encodeVideo(videoInput)
-        CLILogger.log(
-            "Video encoded: \(embeddedInput.tokenCount) visual tokens from \(videoInput.frameCount ?? 0) frames",
-            component: "VLM")
-
-        // Build prompt with image placeholder tokens (N * tokensPerFrame placeholders)
-        let imageTokenCount = embeddedInput.tokenCount
-        let imageTokenId = visionConfig.imageTokenId
-        let vlmTokens: [Int32]
-
-        if let chatTemplateTokens = try? buildVLMPromptFromChatTemplate(
-            prompt: displayPrompt,
-            imageTokenCount: imageTokenCount,
-            imageTokenId: imageTokenId,
-            tokenizer: tokenizer
-        ) {
-            vlmTokens = chatTemplateTokens
-        } else {
-            var tokens = tokenizer.encode(text: "USER: ", addSpecialTokens: true).map { Int32($0) }
-            tokens.append(contentsOf: [Int32](repeating: imageTokenId, count: imageTokenCount))
-            let suffix = "\n" + displayPrompt + "\nASSISTANT:"
-            tokens.append(
-                contentsOf: tokenizer.encode(text: suffix, addSpecialTokens: false).map { Int32($0) })
-            vlmTokens = tokens
-        }
-
-        CLILogger.log(
-            "VLM prompt: \(vlmTokens.count) tokens (\(imageTokenCount) video placeholders)",
-            component: "VLM")
-
-        var eosTokenIds = Set<Int32>()
-        if let eos = tokenizer.eosTokenId { eosTokenIds.insert(Int32(eos)) }
-        eosTokenIds.formUnion(additionalEosTokenIds)
-
-        let stopSequences = try validateAndEncodeStopTokens(
-            stopTokens: stopTokens,
-            tokenizer: tokenizer,
-            additionalEosTokenIds: additionalEosTokenIds
-        )
-        for seq in stopSequences.sequences where seq.count == 1 {
-            eosTokenIds.insert(seq[0])
-        }
-
-        let inferenceID = InstrumentsProfiler.beginInference(
-            promptTokens: vlmTokens.count, maxTokens: maxTokens)
-        await PerformanceMetrics.shared.recordPromptTokens(vlmTokens.count)
-
-        let tokenStream = try await vlmEngine.generate(
-            with: embeddedInput,
-            tokens: vlmTokens,
-            samplingConfiguration: samplingConfiguration,
-            inferenceOptions: InferenceOptions(maxTokens: maxTokens, includeLogits: false)
-        )
-
-        var generatedTokens: [Int] = []
-        var previousText = ""
-        for try await output in tokenStream {
-            if eosTokenIds.contains(output.tokenId) { break }
-            generatedTokens.append(Int(output.tokenId))
-
-            let fullText = tokenizer.decode(tokens: generatedTokens)
-            let delta = String(fullText.dropFirst(previousText.count))
-            previousText = fullText
-            print(delta, terminator: "")
-            fflush(stdout)
-        }
-        print()
 
         InstrumentsProfiler.endInference(
             generatedTokens: generatedTokens.count, signpostID: inferenceID)

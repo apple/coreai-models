@@ -114,6 +114,7 @@ public struct ImagePreprocessor: Sendable {
     public func preprocessCHW(cgImage: CGImage) throws -> [Float] {
         let (data, w, h) = try preprocess(cgImage: cgImage)
         let pixelCount = w * h
+        guard pixelCount > 0 else { return [] }
         var chw = [Float](repeating: 0, count: 3 * pixelCount)
         data.withUnsafeBytes { rawSrc in
             let src = rawSrc.bindMemory(to: Float.self)

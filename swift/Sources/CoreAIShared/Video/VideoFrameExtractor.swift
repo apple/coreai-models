@@ -67,7 +67,7 @@ struct VideoFrameExtractor {
                             continue
                         }
                         continuation.finish(
-                            throwing: VideoInputError.frameExtractionFailed("\(error)"))
+                            throwing: VideoInputError.frameExtractionFailed(underlying: error))
                         return
                     }
                 }

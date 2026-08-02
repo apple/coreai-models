@@ -34,7 +34,7 @@ public enum FrameSamplingStrategy: Sendable {
             return (0..<n).map { step * Double($0) + step / 2.0 }
 
         case .fps(let rate, let maxFrames):
-            guard rate > 0 else { return [] }
+            guard rate > 0, maxFrames > 0 else { return [] }
             let interval = 1.0 / rate
             var times: [Double] = []
             var t = interval / 2.0
@@ -42,7 +42,7 @@ public enum FrameSamplingStrategy: Sendable {
                 times.append(t)
                 t += interval
             }
-            if times.isEmpty && duration > 0 {
+            if times.isEmpty {
                 times.append(duration / 2.0)
             }
             return times

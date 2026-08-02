@@ -399,6 +399,9 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
     /// Each frame is processed independently through the vision encoder + projector.
     /// Embeddings are concatenated along the sequence dimension to produce a single
     /// `EmbeddedInput` with shape `[1, N * tokensPerFrame, hidden_dim]`.
+    ///
+    /// Frames are encoded sequentially because the GPU vision encoder cannot run
+    /// multiple inference calls concurrently on the same model function.
     public func encodeVideo(_ video: VideoInput) async throws -> EmbeddedInput {
         let tokensPerFrame = config.visionConfig.tokensPerFrame ?? config.visionConfig.imageTokenCount
 
@@ -428,23 +431,35 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
             )
         }
 
-        // Concatenate frame embeddings along the sequence dimension (axis 1).
-        // Each frame is [1, tokensPerFrame, hiddenDim]; result is [1, N*tokensPerFrame, hiddenDim].
         let totalTokens = frameEmbeddings.count * tokensPerFrame
         let hiddenDim = frameEmbeddings[0].shape[2]
         let scalarType = frameEmbeddings[0].scalarType
 
         var concatenated = NDArray(shape: [1, totalTokens, hiddenDim], scalarType: scalarType)
-
         let elementsPerFrame = tokensPerFrame * hiddenDim
-        var destView = concatenated.mutableView(as: Float16.self)
-        destView.withUnsafeMutablePointer { destPtr, _, _ in
-            for (i, embedding) in frameEmbeddings.enumerated() {
-                embedding.view(as: Float16.self).withUnsafePointer { srcPtr, _, _ in
-                    let dstOffset = i * elementsPerFrame
-                    (destPtr + dstOffset).update(from: srcPtr, count: elementsPerFrame)
+
+        switch scalarType {
+        case .float16, .bfloat16:
+            var destView = concatenated.mutableView(as: Float16.self)
+            destView.withUnsafeMutablePointer { destPtr, _, _ in
+                for (i, embedding) in frameEmbeddings.enumerated() {
+                    embedding.view(as: Float16.self).withUnsafePointer { srcPtr, _, _ in
+                        (destPtr + i * elementsPerFrame).update(from: srcPtr, count: elementsPerFrame)
+                    }
                 }
             }
+        case .float32:
+            var destView = concatenated.mutableView(as: Float.self)
+            destView.withUnsafeMutablePointer { destPtr, _, _ in
+                for (i, embedding) in frameEmbeddings.enumerated() {
+                    embedding.view(as: Float.self).withUnsafePointer { srcPtr, _, _ in
+                        (destPtr + i * elementsPerFrame).update(from: srcPtr, count: elementsPerFrame)
+                    }
+                }
+            }
+        default:
+            throw InferenceRuntimeError.invalidInputType(
+                "encodeVideo: unsupported embedding scalar type \(scalarType)")
         }
 
         CLILogger.log("VLM encodeVideo complete: \(frameEmbeddings.count) frames, \(totalTokens) tokens")

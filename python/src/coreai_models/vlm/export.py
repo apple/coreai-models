@@ -72,16 +72,6 @@ class VLMSpec:
         """Visual tokens after spatial merge, e.g. (448/16/2)**2 = 196."""
         return (self.image_size // self.patch_size // self.spatial_merge_size) ** 2
 
-    @property
-    def num_visual_tokens_for_frames(self) -> int:
-        """Visual tokens for multi-frame input: num_visual_tokens * grid_t.
-
-        For single-image export (grid_t=1), equals num_visual_tokens.
-        For multi-frame export, each temporal group of temporal_patch_size frames
-        produces one grid_t slot worth of tokens.
-        """
-        return self.num_visual_tokens
-
 
 SUPPORTED_MODELS: dict[str, VLMSpec] = {
     "qwen3-vl": VLMSpec(
