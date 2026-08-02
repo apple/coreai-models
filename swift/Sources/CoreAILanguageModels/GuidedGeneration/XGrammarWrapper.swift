@@ -136,8 +136,28 @@ public final class GrammarMatcher {
         return xgrammar_matcher_is_terminated(handle)
     }
 
+    public var isCompleted: Bool {
+        return xgrammar_matcher_is_completed(handle)
+    }
+
     public func reset() {
         xgrammar_matcher_reset(handle)
+    }
+
+    @discardableResult
+    public func rollback(_ numTokens: Int = 1) -> Bool {
+        xgrammar_matcher_rollback(handle, Int32(numTokens))
+    }
+
+    /// Returns the longest deterministic string from the current grammar state,
+    /// or nil if no jump-forward is possible. Does not change matcher state.
+    public func findJumpForwardString() -> String? {
+        guard let cStr = xgrammar_matcher_find_jump_forward_string(handle) else {
+            return nil
+        }
+        let result = String(cString: cStr)
+        free(UnsafeMutablePointer(mutating: cStr))
+        return result.isEmpty ? nil : result
     }
 }
 

@@ -162,8 +162,6 @@ def _load_hf_pipeline(model_id: str, pipeline_type: str, model_dtype: torch.dtyp
         from diffusers import Flux2KleinPipeline
 
         hf_pipe = Flux2KleinPipeline.from_pretrained(model_id, torch_dtype=model_dtype)
-        # Text encoder needs float32 for token embedding precision
-        hf_pipe.text_encoder = hf_pipe.text_encoder.float()
         return hf_pipe
 
     if pipeline_type == "sd3":
