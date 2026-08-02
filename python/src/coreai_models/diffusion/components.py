@@ -32,6 +32,16 @@ from coreai_models.diffusion.flux2 import (
     dummy_flux2_vae_encoder,
     dummy_flux2_vae_encoder_half,
 )
+from coreai_models.diffusion.ltx_video import (
+    LTXVideoTextEncoderWrapper,
+    LTXVideoTransformerWrapper,
+    LTXVideoVAEDecoderWrapper,
+    LTXVideoVAEEncoderWrapper,
+    dummy_ltx_video_text_encoder,
+    dummy_ltx_video_transformer,
+    dummy_ltx_video_vae_decoder,
+    dummy_ltx_video_vae_encoder,
+)
 
 # ---------------------------------------------------------------------------
 # Torch wrappers — thin adapters that extract the tensor we need from the
@@ -362,6 +372,49 @@ FLUX2_COMPONENTS: dict[str, ComponentSpec] = {
 ALL_FLUX2_COMPONENTS: list[str] = list(FLUX2_COMPONENTS.keys())
 
 
+LTX_VIDEO_COMPONENTS: dict[str, ComponentSpec] = {
+    "transformer": ComponentSpec(
+        asset_name="Transformer",
+        input_names=(
+            "hidden_states",
+            "encoder_hidden_states",
+            "timestep",
+            "encoder_attention_mask",
+            "rotary_emb_cos",
+            "rotary_emb_sin",
+        ),
+        output_names=("output",),
+        wrapper_fn=lambda p: LTXVideoTransformerWrapper(p.transformer),
+        dummy_fn=dummy_ltx_video_transformer,
+        quantizable=True,
+    ),
+    "text_encoder": ComponentSpec(
+        asset_name="TextEncoder",
+        input_names=("input_ids", "attention_mask"),
+        output_names=("hidden_states",),
+        wrapper_fn=lambda p: LTXVideoTextEncoderWrapper(p.text_encoder),
+        dummy_fn=dummy_ltx_video_text_encoder,
+        quantizable=True,
+    ),
+    "vae_decoder": ComponentSpec(
+        asset_name="VAEDecoder",
+        input_names=("z",),
+        output_names=("video",),
+        wrapper_fn=lambda p: LTXVideoVAEDecoderWrapper(p.vae),
+        dummy_fn=dummy_ltx_video_vae_decoder,
+    ),
+    "vae_encoder": ComponentSpec(
+        asset_name="VAEEncoder",
+        input_names=("video",),
+        output_names=("latent",),
+        wrapper_fn=lambda p: LTXVideoVAEEncoderWrapper(p.vae),
+        dummy_fn=dummy_ltx_video_vae_encoder,
+    ),
+}
+
+ALL_LTX_VIDEO_COMPONENTS: list[str] = list(LTX_VIDEO_COMPONENTS.keys())
+
+
 SD3_COMPONENTS: dict[str, ComponentSpec] = {
     "text_encoder": ComponentSpec(
         asset_name="TextEncoder",
@@ -408,12 +461,14 @@ def get_component_registry(
     Args:
         hf_pipe: The loaded HuggingFace pipeline (unused for routing, but
             available for future introspection).
-        pipeline_type: One of "sd", "sd3", or "flux2".
+        pipeline_type: One of "sd", "sd3", "flux2", or "ltx_video".
     """
     if pipeline_type == "flux2":
         return FLUX2_COMPONENTS
     if pipeline_type == "sd3":
         return SD3_COMPONENTS
+    if pipeline_type == "ltx_video":
+        return LTX_VIDEO_COMPONENTS
     return SD_COMPONENTS
 
 
@@ -423,4 +478,6 @@ def get_valid_components(pipeline_type: str) -> list[str]:
         return ALL_FLUX2_COMPONENTS
     if pipeline_type == "sd3":
         return ALL_SD3_COMPONENTS
+    if pipeline_type == "ltx_video":
+        return ALL_LTX_VIDEO_COMPONENTS
     return ALL_SD_COMPONENTS

@@ -39,6 +39,12 @@ let package = Package(
                 "CoreAIObjectDetector"
             ]
         ),
+        .library(
+            name: "CoreAIVideo",
+            targets: [
+                "CoreAIVideoPipeline"
+            ]
+        ),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.2.0"),
@@ -115,6 +121,19 @@ let package = Package(
             ]
         ),
 
+        // Video Pipeline
+        .target(
+            name: "CoreAIVideoPipeline",
+            dependencies: [
+                "CoreAIDiffusionPipeline",
+                "CoreAIShared",
+            ],
+            path: "swift/Sources/CoreAIVideoPipeline",
+            swiftSettings: [
+                .enableUpcomingFeature("MemberImportVisibility")
+            ]
+        ),
+
         // CXGrammar C bridge
         .target(
             name: "CXGrammar",
@@ -171,6 +190,18 @@ let package = Package(
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ],
             path: "swift/Sources/Tools/diffusion-runner",
+            swiftSettings: [
+                .enableUpcomingFeature("MemberImportVisibility")
+            ]
+        ),
+        .executableTarget(
+            name: "video-runner",
+            dependencies: [
+                "CoreAIVideoPipeline",
+                "CoreAIShared",
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+            ],
+            path: "swift/Sources/Tools/video-runner",
             swiftSettings: [
                 .enableUpcomingFeature("MemberImportVisibility")
             ]

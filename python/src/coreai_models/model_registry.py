@@ -212,6 +212,17 @@ DIFFUSION_PRESETS: list[ModelPreset] = [
         None,
         notes="4bit recommended; use --compression none for full precision",
     ),
+    ModelPreset(
+        "ltx-video",
+        "Lightricks/LTX-Video",
+        "ltx-video",
+        "diffusion",
+        None,
+        "none",
+        "bfloat16",
+        None,
+        notes="Text-to-video generation; 49 frames at 24fps by default",
+    ),
 ]
 
 # ---------------------------------------------------------------------------

@@ -171,6 +171,17 @@ _METADATA: dict[str, AIModelMetadataFields] = {
             "Source: https://huggingface.co/black-forest-labs/FLUX.2-klein-4B"
         ),
     ),
+    # ---- Video ----
+    "Lightricks/LTX-Video": AIModelMetadataFields(
+        author="Lightricks",
+        license="Apache-2.0",
+        model_description=(
+            "LTX-Video is a text-to-video diffusion transformer from Lightricks "
+            "that generates high-quality video clips from natural language prompts. "
+            "It uses a T5 text encoder and 3D VAE for spatio-temporal generation. "
+            "Source: https://huggingface.co/Lightricks/LTX-Video"
+        ),
+    ),
     # ---- Segmentation ----
     "facebook/sam3": AIModelMetadataFields(
         author="N. Carion et al.",

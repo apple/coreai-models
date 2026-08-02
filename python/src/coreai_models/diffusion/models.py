@@ -16,6 +16,7 @@ SUPPORTED_MODELS: list[tuple[str, str, str]] = [
     ("stable-diffusion-2.x", "sd2-community/stable-diffusion-2-1", "sd"),
     ("stable-diffusion-3.x", "stabilityai/stable-diffusion-3.5-medium", "sd3"),
     ("flux2", "black-forest-labs/FLUX.2-klein-4B", "flux2"),
+    ("ltx-video", "Lightricks/LTX-Video", "ltx_video"),
 ]
 
 
@@ -27,7 +28,7 @@ def list_models() -> list[str]:
 def get_pipeline_type(model_id: str) -> str:
     """Determine the pipeline type for a given HF model ID.
 
-    Returns "sd", "sd3", or "flux2". Raises ValueError for unknown models.
+    Returns "sd", "sd3", "flux2", or "ltx_video". Raises ValueError for unknown models.
     """
     for _, known_id, ptype in SUPPORTED_MODELS:
         if model_id == known_id:
