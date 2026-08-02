@@ -183,6 +183,12 @@ public struct VisionConfig: Codable, Sendable, Equatable {
     /// Whether to include original image dimensions in the text prompt. Defaults to false.
     public let includeImageInfo: Bool
 
+    /// Maximum number of video frames the model supports. Nil = image-only model.
+    public let maxVideoFrames: Int?
+
+    /// Visual tokens produced per frame. Nil defaults to `imageTokenCount`.
+    public let tokensPerFrame: Int?
+
     /// CLIP normalization (Qwen VL, Pixtral, InternVL, Phi-3.5-vision).
     public static let clipMean = [0.48145466, 0.4578275, 0.40821073]
     public static let clipStd = [0.26862954, 0.26130258, 0.27577711]
@@ -196,7 +202,9 @@ public struct VisionConfig: Codable, Sendable, Equatable {
         imageStd: [Double]? = nil,
         rescaleFactor: Double? = nil,
         imageStrategy: ImageStrategy? = nil,
-        includeImageInfo: Bool? = nil
+        includeImageInfo: Bool? = nil,
+        maxVideoFrames: Int? = nil,
+        tokensPerFrame: Int? = nil
     ) {
         self.imageSize = imageSize
         self.patchSize = patchSize
@@ -207,6 +215,8 @@ public struct VisionConfig: Codable, Sendable, Equatable {
         self.rescaleFactor = rescaleFactor ?? 1.0
         self.imageStrategy = imageStrategy ?? .stretch
         self.includeImageInfo = includeImageInfo ?? false
+        self.maxVideoFrames = maxVideoFrames
+        self.tokensPerFrame = tokensPerFrame
     }
 
     enum CodingKeys: String, CodingKey {
@@ -219,6 +229,8 @@ public struct VisionConfig: Codable, Sendable, Equatable {
         case rescaleFactor = "rescale_factor"
         case imageStrategy = "image_strategy"
         case includeImageInfo = "include_image_info"
+        case maxVideoFrames = "max_video_frames"
+        case tokensPerFrame = "tokens_per_frame"
     }
 
     public init(from decoder: Swift.Decoder) throws {
@@ -232,5 +244,7 @@ public struct VisionConfig: Codable, Sendable, Equatable {
         self.rescaleFactor = try c.decodeIfPresent(Double.self, forKey: .rescaleFactor) ?? 1.0
         self.imageStrategy = try c.decodeIfPresent(ImageStrategy.self, forKey: .imageStrategy) ?? .stretch
         self.includeImageInfo = try c.decodeIfPresent(Bool.self, forKey: .includeImageInfo) ?? false
+        self.maxVideoFrames = try c.decodeIfPresent(Int.self, forKey: .maxVideoFrames)
+        self.tokensPerFrame = try c.decodeIfPresent(Int.self, forKey: .tokensPerFrame)
     }
 }

@@ -392,6 +392,68 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
         )
     }
 
+    // MARK: - Video Encoding (MultimodalInferenceEngine)
+
+    /// Encode video frames into concatenated embeddings.
+    ///
+    /// Each frame is processed independently through the vision encoder + projector.
+    /// Embeddings are concatenated along the sequence dimension to produce a single
+    /// `EmbeddedInput` with shape `[1, N * tokensPerFrame, hidden_dim]`.
+    public func encodeVideo(_ video: VideoInput) async throws -> EmbeddedInput {
+        let tokensPerFrame = config.visionConfig.tokensPerFrame ?? config.visionConfig.imageTokenCount
+
+        var frameEmbeddings: [NDArray] = []
+        var frameIndex = 0
+
+        for try await frame in video.frames {
+            let chwPixels = try imagePreprocessor.preprocessCHW(
+                cgImage: frame.image, strategy: config.visionConfig.imageStrategy)
+            let encoderOutput = try await runVisionEncoder(pixels: chwPixels)
+            let projected =
+                visionProjectorFused ? encoderOutput : try await runProjector(encoderOutput: encoderOutput)
+            frameEmbeddings.append(projected)
+            frameIndex += 1
+            CLILogger.log("  - encoded video frame \(frameIndex)", level: 2)
+        }
+
+        guard !frameEmbeddings.isEmpty else {
+            throw InferenceRuntimeError.invalidArgument("encodeVideo: no frames in video input")
+        }
+
+        if frameEmbeddings.count == 1 {
+            CLILogger.log("VLM encodeVideo complete: 1 frame, \(tokensPerFrame) tokens")
+            return try EmbeddedInput(
+                embeddings: frameEmbeddings[0],
+                embeddingPositions: 0..<tokensPerFrame
+            )
+        }
+
+        // Concatenate frame embeddings along the sequence dimension (axis 1).
+        // Each frame is [1, tokensPerFrame, hiddenDim]; result is [1, N*tokensPerFrame, hiddenDim].
+        let totalTokens = frameEmbeddings.count * tokensPerFrame
+        let hiddenDim = frameEmbeddings[0].shape[2]
+        let scalarType = frameEmbeddings[0].scalarType
+
+        var concatenated = NDArray(shape: [1, totalTokens, hiddenDim], scalarType: scalarType)
+
+        let elementsPerFrame = tokensPerFrame * hiddenDim
+        var destView = concatenated.mutableView(as: Float16.self)
+        destView.withUnsafeMutablePointer { destPtr, _, _ in
+            for (i, embedding) in frameEmbeddings.enumerated() {
+                embedding.view(as: Float16.self).withUnsafePointer { srcPtr, _, _ in
+                    let dstOffset = i * elementsPerFrame
+                    (destPtr + dstOffset).update(from: srcPtr, count: elementsPerFrame)
+                }
+            }
+        }
+
+        CLILogger.log("VLM encodeVideo complete: \(frameEmbeddings.count) frames, \(totalTokens) tokens")
+        return try EmbeddedInput(
+            embeddings: concatenated,
+            embeddingPositions: 0..<totalTokens
+        )
+    }
+
     /// Run the vision encoder on preprocessed pixel values.
     ///
     /// - Parameter pixels: Float32 array in CHW layout, shape `[3, H, W]`
@@ -554,18 +616,18 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
         var merged = textEmbeddings
         guard !imagePositions.isEmpty else { return merged }
 
-        let imageTokenCount = config.visionConfig.imageTokenCount
-        guard imagePositions.count == imageTokenCount else {
+        let expectedCount = imageEmbeddings.shape[1]
+        guard imagePositions.count == expectedCount else {
             throw InferenceRuntimeError.invalidArgument(
                 "scatterMerge: found \(imagePositions.count) image placeholder tokens, "
-                    + "expected \(imageTokenCount) from config. Check prompt template.")
+                    + "expected \(expectedCount) from embeddings. Check prompt template.")
         }
 
         let seqLen = textEmbeddings.shape[1]
         let imgSeqLen = imageEmbeddings.shape[1]
-        guard imgSeqLen >= imageTokenCount else {
+        guard imgSeqLen >= expectedCount else {
             throw InferenceRuntimeError.invalidArgument(
-                "scatterMerge: image embeddings have \(imgSeqLen) tokens, need \(imageTokenCount)")
+                "scatterMerge: image embeddings have \(imgSeqLen) tokens, need \(expectedCount)")
         }
 
         // Validate all positions are within bounds

@@ -4,6 +4,7 @@
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
 import CoreAIShared
+import CoreGraphics
 import Foundation
 import Synchronization
 
@@ -302,6 +303,15 @@ public protocol MultimodalInferenceEngine: InferenceEngine {
     /// Encode an image into embeddings suitable for injection into the VLM.
     /// Returns the embedded representation — caller decides whether to cache.
     func encodeImage(at url: URL) async throws -> EmbeddedInput
+
+    /// Encode a CGImage into embeddings.
+    func encodeImage(cgImage: CGImage) async throws -> EmbeddedInput
+
+    /// Encode video frames into concatenated embeddings for injection into the VLM.
+    ///
+    /// Default implementation encodes each frame independently through `encodeImage(cgImage:)`
+    /// and concatenates embeddings along the sequence dimension.
+    func encodeVideo(_ video: VideoInput) async throws -> EmbeddedInput
 
     /// Generate tokens from a token sequence with embedded image regions.
     /// The engine scatter-merges `input.embeddingPositions` with the embedded data
