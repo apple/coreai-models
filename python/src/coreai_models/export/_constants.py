@@ -5,9 +5,16 @@
 
 """Constants for the export pipeline."""
 
-# KV cache names used by the Swift runner
+# KV cache names used by the Swift runner. keyCache/valueCache always name the
+# growable, full-attention-equivalent cache (the only cache for single-cache
+# models; the full-attention cache for dual-cache models like Gemma4).
 KEY_CACHE_NAME = "keyCache"
 VALUE_CACHE_NAME = "valueCache"
+
+# Secondary KV cache names for models with dual caches (e.g. Gemma4's bounded
+# sliding-window cache, which is distinct from its full-attention cache above).
+KEY_CACHE_SLIDING_NAME = "slidingKeyCache"
+VALUE_CACHE_SLIDING_NAME = "slidingValueCache"
 
 # Trace-time KV cache sequence length. Used only for export/quantization tracing
 # to bound peak memory; at inference the actual cache size is determined

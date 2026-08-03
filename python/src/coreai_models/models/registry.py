@@ -30,10 +30,12 @@ class ModelEntry:
 @lru_cache(maxsize=1)
 def _get_registry() -> dict[str, ModelEntry]:
     """Build the model registry (cached singleton). Lazy imports to avoid circular deps."""
+    from coreai_models.models.ios.gemma4_text import Gemma4ForCausalLMForiOS
     from coreai_models.models.ios.mistral import MistralForCausalLMForiOS
     from coreai_models.models.ios.qwen2 import Qwen2ForCausalLMForiOS
     from coreai_models.models.ios.qwen3 import Qwen3ForCausalLMForiOS
     from coreai_models.models.macos.gemma3_text import Gemma3ForCausalLM
+    from coreai_models.models.macos.gemma4_text import Gemma4ForCausalLM
     from coreai_models.models.macos.gpt_oss import GptOssForCausalLM
     from coreai_models.models.macos.mistral import MistralForCausalLM
     from coreai_models.models.macos.mixtral import MixtralForCausalLM
@@ -76,6 +78,18 @@ def _get_registry() -> dict[str, ModelEntry]:
         # Qwen3VLForCausalLMEmbeddings is used by the VLM export script (takes inputs_embeds).
         "qwen3_vl": ModelEntry(
             macos_class=Qwen3VLForCausalLM,
+            hf_config_attr="text_config",
+            hf_state_dict_prefix="model.language_model.",
+        ),
+        "gemma4_unified": ModelEntry(
+            macos_class=Gemma4ForCausalLM,
+            ios_class=Gemma4ForCausalLMForiOS,
+            hf_config_attr="text_config",
+            hf_state_dict_prefix="model.language_model.",
+        ),
+        "gemma4": ModelEntry(
+            macos_class=Gemma4ForCausalLM,
+            ios_class=Gemma4ForCausalLMForiOS,
             hf_config_attr="text_config",
             hf_state_dict_prefix="model.language_model.",
         ),

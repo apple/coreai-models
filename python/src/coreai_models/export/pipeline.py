@@ -306,15 +306,37 @@ async def _async_export_model(config: ExportConfig) -> str:
                 head_dim = hf_config.head_dim
             else:
                 head_dim = hf_config.hidden_size // hf_config.num_attention_heads
+            # Detect Gemma4: it carries per-layer-type KV cache configs.
+            layer_types: list[str] = getattr(hf_config, "layer_types", None) or []
+
+            n_sliding = sum(1 for t in layer_types if t == "sliding_attention")
+            n_full = sum(1 for t in layer_types if t == "full_attention")
+            use_alt = getattr(hf_config, "attention_k_eq_v", False)
+            global_head_dim = getattr(hf_config, "global_head_dim", None) or head_dim
+            n_kv_full = (
+                getattr(hf_config, "num_global_key_value_heads", None)
+                or hf_config.num_key_value_heads
+                if use_alt
+                else hf_config.num_key_value_heads
+            )
             key_cache = torch.zeros(
-                hf_config.num_hidden_layers,
-                1,  # batch_size
+                n_sliding,
+                1,
                 hf_config.num_key_value_heads * head_dim,
                 1,
-                effective_max_ctx,
+                max_context_length,
                 dtype=torch.float16,
             )
             value_cache = key_cache.clone()
+            key_cache_full = torch.zeros(
+                n_full,
+                1,
+                n_kv_full * global_head_dim,
+                1,
+                max_context_length,
+                dtype=torch.float16,
+            )
+            value_cache_full = key_cache_full.clone()
             palettization_inputs = (
                 input_ids,
                 position_ids,
@@ -322,6 +344,8 @@ async def _async_export_model(config: ExportConfig) -> str:
                 causal_mask,
                 key_cache,
                 value_cache,
+                key_cache_full,
+                value_cache_full,
             )
             model = palettize_pytorch_model(model, palettization_inputs, torch_palettization_config)
 
@@ -331,9 +355,7 @@ async def _async_export_model(config: ExportConfig) -> str:
         else:
             coreai_program = await export_ios_model(model, hf_config, config)
 
-        del model
-
-        # ---- 5. Save inside bundle directory ----
+        # ---- 5. Resolve bundle paths (needed before freeing the model) ----
         output_dir = Path(config.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -341,6 +363,17 @@ async def _async_export_model(config: ExportConfig) -> str:
         bundle_path = output_dir / output_name
         bundle_path.mkdir(parents=True, exist_ok=True)
         aimodel_path = bundle_path / f"{output_name}.aimodel"
+
+        # Dump externalized Per-Layer Embeddings (PLE) as a separate INT8
+        # artifact while the model is still in memory. The Swift runtime mmaps
+        # this file and gathers per-token rows to feed the `ple_embeddings`
+        # graph input -- see `Gemma4TextModel`/`dump_ple_embedding`.
+        if hasattr(model, "dump_ple_embedding") and hasattr(model, "_ple_weight"):
+            logger.info("Dumping Per-Layer Embeddings (PLE) artifact...")
+            ple_path = model.dump_ple_embedding(str(bundle_path), output_name)
+            logger.info(f"Wrote PLE artifact to {ple_path}")
+
+        del model
 
         if aimodel_path.exists():
             if config.overwrite:

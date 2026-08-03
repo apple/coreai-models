@@ -163,6 +163,7 @@ def _build_safetensors_key_index(
     safetensors_files: list[str],
     num_layers: int | None = None,
     hf_state_dict_prefix: str = "",
+    layer_key_pattern: str = r"model\.layers\.(\d+)\.",
 ) -> tuple[dict[int, dict[str, str]], dict[str, str]]:
     """Build a key-to-file index from safetensors files without loading tensors.
 
@@ -170,10 +171,14 @@ def _build_safetensors_key_index(
     to load only a sub-model from multimodal checkpoints (e.g., set
     ``hf_state_dict_prefix="language_model."`` to ignore vision/projector keys).
 
+    ``layer_key_pattern`` is matched against the *stripped* key to identify
+    per-layer entries. Override when the checkpoint stores layer weights under a
+    non-standard prefix (e.g. ``r"layers\\.(\\d+)\\."`` for Gemma4 unified).
+
     Returns ``(per_layer_index, shared_index)`` keyed by *original* safetensors
     keys (prefix not stripped); callers must strip before assigning.
     """
-    layer_pattern = re.compile(r"model\.layers\.(\d+)\.")
+    layer_pattern = re.compile(layer_key_pattern)
     per_layer: dict[int, dict[str, str]] = {}
     shared: dict[str, str] = {}
     for path in safetensors_files:
@@ -229,6 +234,12 @@ class BaseForCausalLM(torch.nn.Module):
 
     # Subclasses must override this with their specific HuggingFace model class
     _HF_MODEL_CLASS: type | None = None
+
+    # Pattern matched against stripped keys to identify per-layer safetensors entries.
+    # Override in subclasses whose checkpoints use a non-standard path layout
+    # (e.g. r"layers\.(\d+)\." for Gemma4 unified, where "model.language_model."
+    # is stripped so layer keys look like "layers.N.*" rather than "model.layers.N.*").
+    _hf_layer_key_pattern: str = r"model\.layers\.(\d+)\."
 
     @staticmethod
     def cast_logits_bfloat16_to_float16(forward_fn: Callable) -> Callable:
@@ -299,6 +310,16 @@ class BaseForCausalLM(torch.nn.Module):
             state_dict: The state dict from HuggingFace model (modified in-place)
         """
         ...
+
+    def _mutate_shared_dict(self: Self, state_dict: dict[str, torch.Tensor]) -> None:
+        """Hook called on the shared (non-per-layer) state dict slice in
+        ``from_hf_memory_efficient`` before it is loaded.
+
+        Override when prefix stripping leaves shared keys in a form that doesn't
+        match the model's own layout (e.g. Gemma4 unified strips
+        ``model.language_model.`` and remaining keys need ``model.`` prepended).
+        Default is a no-op.
+        """
 
     @classmethod
     def _get_reauthored_config(
@@ -399,7 +420,12 @@ class BaseForCausalLM(torch.nn.Module):
 
         # check the state_dict is in the correct dtype
         for k, v in state_dict.items():
-            if v.dtype != target_dtype and "embedding_table" not in k and "zero_point" not in k:
+            if (
+                v.is_floating_point()
+                and v.dtype != target_dtype
+                and "embedding_table" not in k
+                and "zero_point" not in k
+            ):
                 err = f"tensor {k} in an incorrect dtype {v.dtype}. Supposed to be {target_dtype}."
                 raise ValueError(err)
 
@@ -474,12 +500,16 @@ class BaseForCausalLM(torch.nn.Module):
             safetensors_files,
             num_layers=num_layers,
             hf_state_dict_prefix=hf_state_dict_prefix,
+            layer_key_pattern=cls._hf_layer_key_pattern,
         )
 
         # Shared params first (embeddings, norm, lm_head, ...).
         shared_dict = _load_tensors_for_keys(shared_index, target_dtype)
         shared_dict = {k.removeprefix(hf_state_dict_prefix): v for k, v in shared_dict.items()}
         del shared_index
+
+        # Allow subclasses to normalize shared keys before loading.
+        model._mutate_shared_dict(shared_dict)
 
         if mmap_path is not None:
             os.makedirs(mmap_path, exist_ok=True)

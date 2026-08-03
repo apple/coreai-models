@@ -94,7 +94,23 @@ def _build_reference_inputs(
     # allocate a full-context cache for huge models
     saved_max_pos = config.max_position_embeddings
     config.max_position_embeddings = TRACE_KV_CACHE_SEQ_LEN
-    k_cache, v_cache = KVCache.create_cache_tensors(config, dtype=target_dtype)
+    # Gemma4-style dual-cache models with a genuine sliding window preallocate
+    # the primary cache to exactly `sliding_window` tokens and keep it a fixed
+    # size (see KVCache.update_and_fetch_windowed) instead of letting it grow
+    # to the full context length.
+    sliding_window = (
+        getattr(config, "sliding_window", None)
+        if hasattr(model, "_build_sliding_kv_cache_tensors")
+        else None
+    )
+    if hasattr(model, "_build_sliding_kv_cache_tensors"):
+        # Models with dual KV caches (e.g. Gemma4) size the primary cache by
+        # their sliding-attention layer count rather than num_hidden_layers.
+        k_cache, v_cache = model._build_sliding_kv_cache_tensors(
+            config, sliding_window or TRACE_KV_CACHE_SEQ_LEN, target_dtype
+        )
+    else:
+        k_cache, v_cache = KVCache.create_cache_tensors(config, dtype=target_dtype)
     config.max_position_embeddings = saved_max_pos
 
     reference_inputs = {
@@ -104,22 +120,65 @@ def _build_reference_inputs(
         "v_cache": v_cache,
     }
 
-    dynamic_shapes = {
-        "input_ids": {1: torch.export.Dim("seq_ids", max=max_context_length - 2)},
+    seq_ids_max = max_context_length - 2
+    if sliding_window:
+        # A bounded sliding-window cache requires each call's chunk (query_len)
+        # to fit within the window -- see the torch._check(query_len <= capacity())
+        # in KVCache.update_and_fetch_windowed.
+        seq_ids_max = min(seq_ids_max, sliding_window)
+    seq_ids_dim = torch.export.Dim("seq_ids", max=seq_ids_max)
+    dynamic_shapes: dict[str, dict[int, torch.export.Dim] | None] = {
+        "input_ids": {1: seq_ids_dim},
         "position_ids": {
             1: torch.export.Dim("seq_pos", min=QUANT_TRACE_QUERY_LEN, max=max_context_length - 1)
         },
-        "k_cache": {
+    }
+    if sliding_window:
+        # Bounded window: the cache is preallocated at its final size and never
+        # grows, so its sequence dimension is fully static.
+        dynamic_shapes["k_cache"] = None
+        dynamic_shapes["v_cache"] = None
+    else:
+        dynamic_shapes["k_cache"] = {
             KVCache.seq_len_dim(): torch.export.Dim(
                 "k_seq_len", min=TRACE_KV_CACHE_SEQ_LEN, max=max_context_length
             )
-        },
-        "v_cache": {
+        }
+        dynamic_shapes["v_cache"] = {
             KVCache.seq_len_dim(): torch.export.Dim(
                 "v_seq_len", min=TRACE_KV_CACHE_SEQ_LEN, max=max_context_length
             )
-        },
-    }
+        }
+
+    # Models with dual KV caches (e.g. Gemma4) expose a _build_full_kv_cache_tensors
+    # classmethod that returns the extra (full-attention) k/v tensors.
+    if hasattr(model, "_build_full_kv_cache_tensors"):
+        k_full, v_full = model._build_full_kv_cache_tensors(
+            config, TRACE_KV_CACHE_SEQ_LEN, target_dtype
+        )
+        reference_inputs["k_cache_full"] = k_full
+        reference_inputs["v_cache_full"] = v_full
+        dynamic_shapes["k_cache_full"] = {
+            KVCache.seq_len_dim(): torch.export.Dim(
+                "k_full_seq_len", min=TRACE_KV_CACHE_SEQ_LEN, max=max_context_length
+            )
+        }
+        dynamic_shapes["v_cache_full"] = {
+            KVCache.seq_len_dim(): torch.export.Dim(
+                "v_full_seq_len", min=TRACE_KV_CACHE_SEQ_LEN, max=max_context_length
+            )
+        }
+
+    # Models with an externalized Per-Layer Embeddings (PLE) table (e.g. Gemma4)
+    # accept pre-gathered INT8 rows as a graph input rather than an in-graph
+    # embedding lookup -- see `Gemma4TextModel.forward`/`dump_ple_embedding`.
+    if hasattr(model, "_ple_weight"):
+        ple_dim = config.hidden_size_per_layer_input
+        ple_total_dim = config.num_hidden_layers * ple_dim
+        reference_inputs["ple_embeddings"] = torch.randint(
+            -128, 127, (batch_size, QUANT_TRACE_QUERY_LEN, ple_total_dim), dtype=torch.int8
+        )
+        dynamic_shapes["ple_embeddings"] = {1: seq_ids_dim}
 
     return reference_inputs, dynamic_shapes
 
@@ -231,9 +290,17 @@ def export_macos_model(
         model, config, target_dtype, max_context_length
     )
 
-    input_names = ("input_ids", "position_ids")
+    input_names: tuple[str, ...] = ("input_ids", "position_ids")
+    if hasattr(model, "_ple_weight"):
+        input_names = (*input_names, "ple_embeddings")
     output_names = ("logits",)
-    state_names = (KEY_CACHE_NAME, VALUE_CACHE_NAME)
+    # Models declare their own full state-name tuple (matching the exact order
+    # of their forward()'s state args) via `_state_names` when the default
+    # single-cache (KEY_CACHE_NAME, VALUE_CACHE_NAME) mapping doesn't apply --
+    # e.g. Gemma4's dual-cache forward(..., k_cache, v_cache, k_cache_full, v_cache_full)
+    # needs (slidingKeyCache, slidingValueCache, keyCache, valueCache) since the
+    # Swift runner expects keyCache/valueCache to name the full-attention cache.
+    state_names = getattr(model, "_state_names", (KEY_CACHE_NAME, VALUE_CACHE_NAME))
 
     logger.info("Exporting model to Core AI dialect...")
     coreai_program = export_to_coreai(
@@ -247,5 +314,5 @@ def export_macos_model(
 
     logger.info("Optimizing AIProgram...")
     coreai_program.optimize()
-
+    # coreai_program._mlir_module.dump()
     return coreai_program

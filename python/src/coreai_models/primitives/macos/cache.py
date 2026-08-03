@@ -31,6 +31,22 @@ class KVCache:
         """
         return 3
 
+    def capacity(self: Self) -> int:
+        """Preallocated cache length along the sequence dimension."""
+        return self._k_cache.size(self.seq_len_dim())
+
+    def clamped_len(self: Self, seq_len):
+        """Clamp an absolute sequence length to this cache's capacity.
+
+        A bounded cache (see `update_and_fetch_windowed`) only ever physically
+        holds up to `capacity()` of the most recent tokens, so any absolute
+        position count derived from `offset + query_len` must be clamped
+        before being used to size a read from `_k_cache`/`_v_cache` (e.g. the
+        KV-sharing donor read in gemma4_text.py). No-op for caches that never
+        overflow their capacity.
+        """
+        return torch.sym_min(seq_len, self.capacity())
+
     @classmethod
     def create_cache_tensors(
         cls,
@@ -174,6 +190,129 @@ class KVCache:
         if cross_device:
             return k_out.to(compute_device), v_out.to(compute_device)
         return k_out, v_out
+
+    def update_and_fetch_windowed(
+        self: Self,
+        layer_idx: int,
+        offset: int,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        query_len: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Bounded variant of `update_and_fetch` for sliding-window attention caches.
+
+        Unlike `update_and_fetch`, which assumes the cache is preallocated large
+        enough to hold every token ever written (true for full-attention caches
+        sized to the model's max context length), this method treats `capacity()`
+        as a hard cap: once `offset + query_len` would exceed it, the existing
+        window is shifted left (oldest tokens dropped) before the new tokens are
+        written, so the cache never grows past its preallocated size. Callers
+        should preallocate the cache to exactly `config.sliding_window` (see
+        export/macos.py) so this cap coincides with the attention window.
+
+        Returns the full `capacity()`-sized buffer (not narrowed to however many
+        tokens are actually valid) so its shape is always static -- narrowing to
+        a dynamic `min(capacity(), offset + query_len)` length triggers spurious
+        `torch.export` `ConstraintViolationError`s deep in stride/contiguity
+        checks (a compound `Min()` expression flowing into a tensor *size*, as
+        opposed to plain dynamic sizing, which is fine). Callers must build an
+        explicit attention mask from `clamped_len(offset + query_len)` to hide
+        the not-yet-written slots during ramp-up (before the window fills);
+        SDPA's own window_size masking is a no-op once window_size == capacity()
+        so it cannot do this hiding on the caller's behalf.
+
+        Note: for a multi-token query chunk that straddles the window boundary,
+        early rows within the chunk may see slightly less history than a strict
+        per-row sliding window would allow (up to `query_len - 1` tokens short),
+        since the shift is sized for the chunk's last row. This only affects
+        prefill/chunked-prefill; decode (query_len == 1) is exact. This is the
+        same tradeoff accepted by other chunked sliding-window KV cache
+        implementations that size the cache to exactly the window rather than
+        window + max_chunk_size.
+        """
+        if query_len is None:
+            query_len: int = k.shape[-2]
+        torch._check_is_size(query_len, message="int query length >= 0")
+
+        torch._check_is_size(layer_idx, message="int layer index >= 0")
+        torch._check(
+            layer_idx < self._k_cache.size(0),
+            message="layer index < number of transformer layers",
+        )
+        torch._check(
+            layer_idx < self._v_cache.size(0),
+            message="layer index < number of transformer layers",
+        )
+
+        torch._check_is_size(offset, message="int offset >= 0")
+
+        device = self._k_cache.device
+        seq_dim = self.seq_len_dim()
+        capacity = self.capacity()
+        torch._check(query_len <= capacity, message=lambda: "query length <= window capacity")
+
+        old_valid = torch.sym_min(offset, capacity)
+        new_valid = self.clamped_len(offset + query_len)
+        # max(x, 0), expressed via sym_min (not sym_max): coreai_torch's MLIR
+        # converter has a registered lowering for aten.sym_min but not
+        # aten.sym_max, so max(x, 0) == -min(-x, 0) avoids an unsupported op.
+        drop = -torch.sym_min(-(old_valid - (new_valid - query_len)), 0)
+        keep = old_valid - drop
+
+        layer_index = torch.tensor((layer_idx,), dtype=torch.int32, device=device)
+        layer_index_end = torch.tensor((layer_idx + 1,), dtype=torch.int32, device=device)
+        shift_idx = torch.clamp(torch.arange(capacity, device=device) + drop, max=capacity - 1)
+
+        for cache, update in ((self._k_cache, k), (self._v_cache, v)):
+            shifted = cache.narrow(0, layer_idx, 1).index_select(seq_dim, shift_idx)
+            mutable_slice_update(
+                x=cache,
+                update=shifted,
+                begin=torch.cat(
+                    [
+                        layer_index,
+                        torch.tensor((0,), dtype=torch.int32, device=device),
+                        torch.tensor((0,), dtype=torch.int32, device=device),
+                        torch.tensor((0,), dtype=torch.int32, device=device),
+                        torch.tensor((0,), dtype=torch.int32, device=device),
+                    ]
+                ),
+                end=torch.cat(
+                    [
+                        layer_index_end,
+                        torch.tensor((cache.size(1),), dtype=torch.int32, device=device),
+                        torch.tensor((cache.size(2),), dtype=torch.int32, device=device),
+                        torch.tensor((capacity,), dtype=torch.int32, device=device),
+                        torch.tensor((cache.size(4),), dtype=torch.int32, device=device),
+                    ]
+                ),
+            )
+            mutable_slice_update(
+                x=cache,
+                update=update.unsqueeze(0),
+                begin=torch.cat(
+                    [
+                        layer_index,
+                        torch.tensor((0,), dtype=torch.int32, device=device),
+                        torch.tensor((0,), dtype=torch.int32, device=device),
+                        torch.tensor((keep,), dtype=torch.int32, device=device),
+                        torch.tensor((0,), dtype=torch.int32, device=device),
+                    ]
+                ),
+                end=torch.cat(
+                    [
+                        layer_index_end,
+                        torch.tensor((cache.size(1),), dtype=torch.int32, device=device),
+                        torch.tensor((cache.size(2),), dtype=torch.int32, device=device),
+                        torch.tensor((keep + query_len,), dtype=torch.int32, device=device),
+                        torch.tensor((cache.size(4),), dtype=torch.int32, device=device),
+                    ]
+                ),
+            )
+
+        k_out = self._k_cache.narrow(0, layer_idx, 1)
+        v_out = self._v_cache.narrow(0, layer_idx, 1)
+        return k_out.squeeze(0), v_out.squeeze(0)
 
 
 class SSMState:

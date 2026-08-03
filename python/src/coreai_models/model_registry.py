@@ -131,6 +131,61 @@ LLM_PRESETS: list[ModelPreset] = [
     ModelPreset(
         "gpt-oss-20b", "openai/gpt-oss-20b", "gpt-oss", "llm", "macOS", "none", "bfloat16", 32768
     ),
+    ModelPreset(
+        "gemma-4-e2b-it",
+        "google/gemma-4-E2B-it",
+        "gemma4",
+        "llm",
+        "macOS",
+        "none",
+        "bfloat16",
+        131072,
+        compression_config="models/gemma4/gemma4_4bit_minval.yaml",
+    ),
+    ModelPreset(
+        "gemma-4-e4b-it",
+        "google/gemma-4-E4B-it",
+        "gemma4",
+        "llm",
+        "macOS",
+        "none",
+        "bfloat16",
+        131072,
+        compression_config="models/gemma4/gemma4_4bit_minval.yaml",
+    ),
+    ModelPreset(
+        "gemma-4-12b-it",
+        "google/gemma-4-12B-it",
+        "gemma4_unified",
+        "llm",
+        "macOS",
+        "none",
+        "bfloat16",
+        131072,
+        compression_config="models/gemma4/gemma4_4bit_minval.yaml",
+    ),
+    ModelPreset(
+        "gemma-4-31b-it",
+        "google/gemma-4-31B-it",
+        "gemma4_unified",
+        "llm",
+        "macOS",
+        "none",
+        "bfloat16",
+        131072,
+        compression_config="models/gemma4/gemma4_4bit_minval.yaml",
+    ),
+    ModelPreset(
+        "gemma-4-26B-A4B-it",
+        "google/gemma-4-26B-A4B-it",
+        "gemma4",
+        "llm",
+        "macOS",
+        "none",
+        "bfloat16",
+        131072,
+        compression_config="models/gemma4/gemma4_4bit_minval.yaml",
+    ),
     # --- iOS (compression = palettized) ---
     ModelPreset(
         "qwen3-0.6b",
@@ -211,6 +266,27 @@ DIFFUSION_PRESETS: list[ModelPreset] = [
         "float16",
         None,
         notes="4bit recommended; use --compression none for full precision",
+    ),
+]
+
+# ---------------------------------------------------------------------------
+# VLM presets
+# ---------------------------------------------------------------------------
+
+VLM_PRESETS: list[ModelPreset] = [
+    # Gemma 4 E2B (Gemma 3n family) vision-language export. Reuses the text
+    # decoder's dynamic dual-cache + PLE `main` graph (see models/gemma4/) plus
+    # a vision tower, exported via coreai_models.vlm.gemma4.
+    ModelPreset(
+        "gemma4-e2b-vlm",
+        "google/gemma-4-E2B-it",
+        "gemma4",
+        "vlm",
+        "macOS",
+        "none",
+        "bfloat16",
+        32768,
+        compression_config="models/gemma4/gemma4_4bit_minval.yaml",
     ),
 ]
 
@@ -346,12 +422,12 @@ UTILITY_PRESETS: list[UtilityModel] = [
 # Lookups
 # ---------------------------------------------------------------------------
 
-KNOWN_TYPES = ("llm", "diffusion", "utility")
+KNOWN_TYPES = ("llm", "diffusion", "vlm", "utility")
 KNOWN_VARIANTS = ("macOS", "iOS")
 
 
 def all_presets() -> list[ModelPreset]:
-    return LLM_PRESETS + DIFFUSION_PRESETS
+    return LLM_PRESETS + DIFFUSION_PRESETS + VLM_PRESETS
 
 
 def all_utility_models() -> list[UtilityModel]:
@@ -363,6 +439,8 @@ def presets_for_type(model_type: str) -> list[ModelPreset]:
         return LLM_PRESETS
     if model_type == "diffusion":
         return DIFFUSION_PRESETS
+    if model_type == "vlm":
+        return VLM_PRESETS
     if model_type == "utility":
         raise ValueError(
             "Use all_utility_models() for utility type — UtilityModel is a different schema."

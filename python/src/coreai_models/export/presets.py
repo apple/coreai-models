@@ -33,6 +33,8 @@ _TORCH_MODULE_EXCLUSIONS = {
     "coreai_models.primitives.macos.rope.RoPE": None,
     "coreai_models.primitives.macos.rms_norm.RMSNorm": None,
     "coreai_models.primitives.macos.rms_norm.RMSNormPlusOne": None,
+    "coreai_models.models.macos.gemma4_text.Embedding": None,
+    "coreai_models.macos.gemma4_text.MoERouter": None,
 }
 
 # Embedding modules excluded from iOS palettization.
@@ -52,10 +54,10 @@ _TORCH_MOE_SWITCH_LINEAR_4BIT = {
         "module_state_spec": {
             "weight": {
                 "dtype": "int4",
-                "qscheme": "symmetric_with_clipping",
+                "qscheme": "symmetric",
                 "granularity": {
                     "type": "per_block",
-                    "block_size": [1, 1, 1, 32],
+                    "block_size": [1, 1, 1, 8],
                     "axis": None,
                 },
             },
@@ -64,6 +66,26 @@ _TORCH_MOE_SWITCH_LINEAR_4BIT = {
         "op_output_spec": None,
     },
 }
+
+TORCH_RELAXED_EMBEDDING_INT8_QUANTIZATION = {
+    "torch.nn.modules.sparse.Embedding": {
+        "module_state_spec": {
+            "weight": {
+                "dtype": "int8",
+                "qscheme": "symmetric",
+                "granularity": {
+                    "type": "per_block",
+                    "block_size": [1, 32],
+                    "axis": None,
+                },
+            },
+        },
+        "op_input_spec": None,
+        "op_output_spec": None,
+    },
+}
+
+# _TORCH_RELAXED_EMBEDDING_INT8_QUANTIZATION = {"torch.nn.modules.sparse.Embedding": None}
 
 # Combined exclusions + MoE override for INT4 presets. Safe to apply on
 # non-MoE models (no `SwitchLinear` instances → entry is a no-op).
@@ -107,6 +129,29 @@ MACOS_PRESETS: dict[str, dict[str, Any]] = {
         },
         "suffix": "4bit",
         "description": "INT4 symmetric per-block weight quantization (torch pre-export)",
+    },
+    "8bit": {
+        "torch_quantization_config": {
+            "execution_mode": "eager",
+            "global_config": {
+                "op_state_spec": {
+                    "weight": {
+                        "dtype": "int8",
+                        "qscheme": "symmetric_with_clipping",
+                        "granularity": {
+                            "type": "per_block",
+                            "block_size": 32,
+                            "axis": 1,
+                        },
+                    }
+                },
+                "op_input_spec": None,
+                "op_output_spec": None,
+            },
+            "module_type_configs": _TORCH_MODULE_CONFIGS_4BIT,
+        },
+        "suffix": "8bit",
+        "description": "INT8 symmetric per-block weight quantization (torch pre-export)",
     },
 }
 
