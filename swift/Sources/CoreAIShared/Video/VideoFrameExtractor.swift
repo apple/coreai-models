@@ -49,31 +49,32 @@ struct VideoFrameExtractor {
             CMTime(seconds: $0, preferredTimescale: 600)
         }
 
-        let seq = VideoFrameSequence(stream: AsyncThrowingStream<VideoFrame, Error> { continuation in
-            Task {
-                let asset = AVURLAsset(url: url)
-                let generator = AVAssetImageGenerator(asset: asset)
-                generator.appliesPreferredTrackTransform = true
-                generator.requestedTimeToleranceBefore = CMTime(seconds: 0.1, preferredTimescale: 600)
-                generator.requestedTimeToleranceAfter = CMTime(seconds: 0.1, preferredTimescale: 600)
+        let seq = VideoFrameSequence(
+            stream: AsyncThrowingStream<VideoFrame, Error> { continuation in
+                Task {
+                    let asset = AVURLAsset(url: url)
+                    let generator = AVAssetImageGenerator(asset: asset)
+                    generator.appliesPreferredTrackTransform = true
+                    generator.requestedTimeToleranceBefore = CMTime(seconds: 0.1, preferredTimescale: 600)
+                    generator.requestedTimeToleranceAfter = CMTime(seconds: 0.1, preferredTimescale: 600)
 
-                for await result in generator.images(for: cmTimes) {
-                    do {
-                        let image = try result.image
-                        let actualSeconds = CMTimeGetSeconds(try result.actualTime)
-                        continuation.yield(VideoFrame(image: image, timestamp: actualSeconds))
-                    } catch {
-                        if skipErrors {
-                            continue
+                    for await result in generator.images(for: cmTimes) {
+                        do {
+                            let image = try result.image
+                            let actualSeconds = CMTimeGetSeconds(try result.actualTime)
+                            continuation.yield(VideoFrame(image: image, timestamp: actualSeconds))
+                        } catch {
+                            if skipErrors {
+                                continue
+                            }
+                            continuation.finish(
+                                throwing: VideoInputError.frameExtractionFailed(underlying: error))
+                            return
                         }
-                        continuation.finish(
-                            throwing: VideoInputError.frameExtractionFailed(underlying: error))
-                        return
                     }
+                    continuation.finish()
                 }
-                continuation.finish()
-            }
-        })
+            })
 
         return (count: count, duration: duration, frames: seq)
     }
