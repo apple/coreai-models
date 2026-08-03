@@ -48,16 +48,6 @@ public struct FixedMTLBufferState {
         get { bindings[index] }
     }
 
-    /// Insert all states into AsyncMutableViews for pipelined encoding.
-    public func insertAll(into views: inout InferenceFunction.AsyncMutableViews) {
-        for (name, buffer, scalarType, shape, strides) in bindings {
-            var value = unsafe InferenceFunction.AsyncMutableValue(
-                unsafeBuffer: buffer, byteOffset: 0,
-                scalarType: scalarType, shape: shape, strides: strides)
-            views.insert(&value, for: name)
-        }
-    }
-
     /// Zero all state buffers. Caller must ensure no in-flight GPU work references these.
     public mutating func reset() {
         for (_, buffer, _, _, _) in bindings {

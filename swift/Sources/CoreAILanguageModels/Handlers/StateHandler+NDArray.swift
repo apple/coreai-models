@@ -176,7 +176,7 @@ public struct GrowingNDArrayState: SyncStateHandler {
 // MARK: - Shared Utilities
 
 /// Zero-initialize an NDArray, dispatching on scalar type.
-private func zeroFillNDArray(_ array: inout NDArray) {
+func zeroFillNDArray(_ array: inout NDArray) {
     let count = array.shape.reduce(1, *)
     switch array.scalarType {
     case .float16, .bfloat16:
