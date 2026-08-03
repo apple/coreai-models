@@ -144,6 +144,57 @@ enum MPSGraphSamplerFactory {
     }
 }
 
+// MARK: - Bitmask Expansion Helper
+
+/// Builds the MPSGraph subgraph that expands a packed Int32 bitmask into a Float16 logits mask.
+///
+/// The bitmask format matches xgrammar: each Int32 word covers 32 token IDs,
+/// bit `i%32` in word `i/32` = 1 means token `i` is allowed.
+///
+/// Returns the masked logits tensor `[1, vocabSize]` ready for topK or argmax.
+private func buildBitmaskExpansionGraph(
+    graph: MPSGraph,
+    logits: MPSGraphTensor,
+    bitmaskPlaceholder: MPSGraphTensor,
+    vocabSize: Int,
+    bitmaskSize: Int
+) -> MPSGraphTensor {
+    // Reshape bitmask for broadcast: [bitmaskSize] -> [bitmaskSize, 1]
+    let bitmask2D = graph.reshape(bitmaskPlaceholder, shape: [bitmaskSize as NSNumber, 1], name: "bitmask_2d")
+
+    // Bit position indices: [0, 1, 2, ..., 31] shaped [1, 32]
+    var bitIndicesData = (0..<32).map { Int32($0) }
+    let bitIndices = bitIndicesData.withUnsafeMutableBufferPointer { buf in
+        graph.constant(
+            Data(buffer: buf),
+            shape: [1, 32],
+            dataType: .int32
+        )
+    }
+
+    // Bit masks: [1, 2, 4, ..., 2^31] = 1 << bitIndices
+    let one = graph.constant(1, dataType: .int32)
+    let bitMasks = graph.bitwiseLeftShift(one, bitIndices, name: "bit_masks")
+
+    // AND: [bitmaskSize, 1] & [1, 32] -> [bitmaskSize, 32] (broadcasts)
+    let andResult = graph.bitwiseAND(bitmask2D, bitMasks, name: "and_result")
+
+    // Non-zero check -> bool mask
+    let zero = graph.constant(0, dataType: .int32)
+    let boolMask = graph.notEqual(andResult, zero, name: "bool_mask")
+
+    // Flatten [bitmaskSize, 32] -> [bitmaskSize * 32], slice to [vocabSize]
+    let flat = graph.reshape(boolMask, shape: [bitmaskSize * 32 as NSNumber], name: "flat_mask")
+    let sliced = graph.sliceTensor(flat, dimension: 0, start: 0, length: vocabSize, name: "sliced_mask")
+
+    // Reshape to [1, vocabSize] to match logits
+    let predicate = graph.reshape(sliced, shape: [1, vocabSize as NSNumber], name: "predicate")
+
+    // Apply mask: select(allowed → logits, blocked → -65504)
+    let negInf = graph.constant(-65504.0, shape: [1, vocabSize as NSNumber], dataType: .float16)
+    return graph.select(predicate: predicate, trueTensor: logits, falseTensor: negInf, name: "masked_logits")
+}
+
 // MARK: - MPSGraph Argmax Sampler
 
 /// MPSGraph-based argmax sampler using Apple's optimized reductionArgMaximum.
@@ -184,14 +235,26 @@ final class MPSGraphArgmaxSampler: @unchecked Sendable {
     private var cachedInputBuffer: MTLBuffer?
     private var cachedOutputBuffer: MTLBuffer?
 
+    // Constrained sampling — compiled lazily on first applyBitmask: true call.
+    private var constrainedExecutable: MPSGraphExecutable?
+    private var constrainedBitmaskBuffer: MTLBuffer?
+    private var constrainedBitmaskData: MPSGraphTensorData?
+
+    /// Number of Int32 words in the bitmask.
+    let bitmaskSize: Int
+
     /// Initialize the MPSGraph argmax sampler.
     /// - Parameters:
     ///   - device: Metal device
     ///   - vocabSize: Vocabulary size (fixed for compilation)
     init(device: MTLDevice, vocabSize: Int) throws {
+        guard vocabSize > 0 else {
+            throw MPSGraphSamplerError.graphCompilationFailed
+        }
         self.device = device
         self.mpsDevice = MPSGraphDevice(mtlDevice: device)
         self.vocabSize = vocabSize
+        self.bitmaskSize = (vocabSize + 31) / 32
 
         // Build the argmax graph
         let graph = MPSGraph()
@@ -242,6 +305,144 @@ final class MPSGraphArgmaxSampler: @unchecked Sendable {
             targetOperations: nil,
             compilationDescriptor: compilationDescriptor
         )
+    }
+
+    // MARK: - Constrained Sampling (Lazy)
+
+    /// Returns the bitmask buffer, allocating it on first access.
+    /// The caller writes the xgrammar bitmask into this buffer before calling
+    /// `encode(..., applyBitmask: true)`.
+    var bitmaskBuffer: MTLBuffer {
+        get throws {
+            if let buf = constrainedBitmaskBuffer { return buf }
+            let byteCount = max(bitmaskSize * MemoryLayout<Int32>.size, 64)
+            guard let buf = device.makeBuffer(
+                length: byteCount, options: .storageModeShared
+            ) else {
+                throw MPSGraphSamplerError.bufferAllocationFailed
+            }
+            constrainedBitmaskBuffer = buf
+            constrainedBitmaskData = MPSGraphTensorData(
+                buf, shape: [bitmaskSize as NSNumber], dataType: .int32)
+            return buf
+        }
+    }
+
+    /// Lazily compile the constrained graph and return (executable, bitmaskData).
+    private func ensureConstrainedResources() throws -> (MPSGraphExecutable, MPSGraphTensorData) {
+        if let exec = constrainedExecutable, let data = constrainedBitmaskData {
+            return (exec, data)
+        }
+
+        let _ = try bitmaskBuffer
+
+        let cGraph = MPSGraph()
+        let cLogits = cGraph.placeholder(
+            shape: [1, vocabSize as NSNumber], dataType: .float16, name: "logits")
+        let cBitmask = cGraph.placeholder(
+            shape: [bitmaskSize as NSNumber], dataType: .int32, name: "bitmask")
+
+        let maskedLogits = buildBitmaskExpansionGraph(
+            graph: cGraph, logits: cLogits, bitmaskPlaceholder: cBitmask,
+            vocabSize: vocabSize, bitmaskSize: bitmaskSize)
+
+        let cArgmax = cGraph.reductionArgMaximum(with: maskedLogits, axis: 1, name: "argmax")
+        let cOutput = cGraph.cast(cArgmax, to: .int32, name: "token_id")
+
+        let cFeeds: [MPSGraphTensor: MPSGraphShapedType] = [
+            cLogits: MPSGraphShapedType(shape: [1, vocabSize as NSNumber], dataType: .float16),
+            cBitmask: MPSGraphShapedType(shape: [bitmaskSize as NSNumber], dataType: .int32),
+        ]
+        let desc = MPSGraphCompilationDescriptor()
+        desc.optimizationLevel = .level0
+
+        let exec = cGraph.compile(
+            with: mpsDevice, feeds: cFeeds,
+            targetTensors: [cOutput], targetOperations: nil,
+            compilationDescriptor: desc)
+        constrainedExecutable = exec
+        return (exec, constrainedBitmaskData!)
+    }
+
+    /// Encode argmax sampling with optional bitmask constraint.
+    ///
+    /// When `applyBitmask` is true, the bitmask in `bitmaskBuffer` is applied to
+    /// logits before argmax — blocked tokens get -65504 and will never be selected.
+    /// The caller must fill `bitmaskBuffer` before calling this.
+    func encode(
+        to queue: MTLCommandQueue,
+        logitsBuffer: MTLBuffer,
+        logitsOffset: Int,
+        outputBuffer: MTLBuffer,
+        outputOffset: Int,
+        applyBitmask: Bool,
+        completion: @escaping (Int32) -> Void
+    ) {
+        if applyBitmask {
+            guard let (constrained, bitmaskTensorData) = try? ensureConstrainedResources() else {
+                completion(0)
+                return
+            }
+            let inputData = MPSGraphTensorData(
+                logitsBuffer, shape: [1, vocabSize as NSNumber], dataType: .float16)
+            let outputData = MPSGraphTensorData(
+                outputBuffer, shape: [1 as NSNumber], dataType: .int32)
+            let execDesc = MPSGraphExecutableExecutionDescriptor()
+            execDesc.completionHandler = { [outputBuffer, outputOffset] (_, error) in
+                if let error = error {
+                    print("MPSGraph constrained argmax error: \(error)")
+                    completion(0)
+                    return
+                }
+                let result = outputBuffer.contents()
+                    .advanced(by: outputOffset)
+                    .assumingMemoryBound(to: Int32.self).pointee
+                completion(result)
+            }
+            constrained.runAsync(
+                with: queue, inputs: [inputData, bitmaskTensorData],
+                results: [outputData], executionDescriptor: execDesc)
+        } else {
+            encode(to: queue, logitsBuffer: logitsBuffer, logitsOffset: logitsOffset,
+                   outputBuffer: outputBuffer, outputOffset: outputOffset,
+                   completion: completion)
+        }
+    }
+
+    /// Encode argmax with slice support and optional bitmask.
+    func encodeWithSlice(
+        to queue: MTLCommandQueue,
+        logitsBuffer: MTLBuffer,
+        queryLength: Int,
+        outputBuffer: MTLBuffer,
+        outputOffset: Int,
+        applyBitmask: Bool,
+        completion: @escaping (Int32) -> Void
+    ) {
+        if queryLength == 1 {
+            encode(to: queue, logitsBuffer: logitsBuffer, logitsOffset: 0,
+                   outputBuffer: outputBuffer, outputOffset: outputOffset,
+                   applyBitmask: applyBitmask, completion: completion)
+            return
+        }
+        // For prefill with bitmask, slice last token then apply constrained path
+        let logitsOffset = (queryLength - 1) * vocabSize * MemoryLayout<UInt16>.size
+        let sliceSize = vocabSize * MemoryLayout<UInt16>.size
+        guard let tempBuffer = device.makeBuffer(length: sliceSize, options: .storageModeShared),
+              let blitCmdBuffer = queue.makeCommandBuffer(),
+              let blitEncoder = blitCmdBuffer.makeBlitCommandEncoder()
+        else {
+            completion(0)
+            return
+        }
+        blitEncoder.copy(from: logitsBuffer, sourceOffset: logitsOffset,
+                         to: tempBuffer, destinationOffset: 0, size: sliceSize)
+        blitEncoder.endEncoding()
+        blitCmdBuffer.commit()
+
+        encode(to: queue, logitsBuffer: tempBuffer, logitsOffset: 0,
+               outputBuffer: outputBuffer, outputOffset: outputOffset,
+               applyBitmask: applyBitmask, completion: completion)
     }
 
     /// Encode argmax sampling.
@@ -497,6 +698,14 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
     private let topPData: MPSGraphTensorData
     private let minPData: MPSGraphTensorData
 
+    // Constrained sampling — compiled lazily on first applyBitmask: true call.
+    private var constrainedExecutable: MPSGraphExecutable?
+    private var constrainedBitmaskBuffer: MTLBuffer?
+    private var constrainedBitmaskData: MPSGraphTensorData?
+
+    /// Number of Int32 words in the bitmask.
+    let bitmaskSize: Int
+
     /// Testing only: Override random value for deterministic tests.
     var testingOnlyRandomOverride: Float?
 
@@ -518,6 +727,7 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
         self.temperature = temperature
         self.topP = topP
         self.minP = minP
+        self.bitmaskSize = (vocabSize + 31) / 32
 
         // Pre-allocate buffers
         guard let randomBuffer = device.makeBuffer(length: MemoryLayout<Float>.size, options: .storageModeShared),
@@ -677,6 +887,179 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
             shape: [1 as NSNumber],
             dataType: .float32
         )
+    }
+
+    // MARK: - Constrained Sampling (Lazy)
+
+    /// Returns the bitmask buffer, allocating it on first access.
+    var bitmaskBuffer: MTLBuffer {
+        get throws {
+            if let buf = constrainedBitmaskBuffer { return buf }
+            guard let buf = device.makeBuffer(
+                length: bitmaskSize * MemoryLayout<Int32>.size,
+                options: .storageModeShared
+            ) else {
+                throw MPSGraphSamplerError.bufferAllocationFailed
+            }
+            constrainedBitmaskBuffer = buf
+            constrainedBitmaskData = MPSGraphTensorData(
+                buf, shape: [bitmaskSize as NSNumber], dataType: .int32)
+            return buf
+        }
+    }
+
+    /// Lazily compile the constrained composite graph.
+    private func ensureConstrainedResources() throws -> (MPSGraphExecutable, MPSGraphTensorData) {
+        if let exec = constrainedExecutable, let data = constrainedBitmaskData {
+            return (exec, data)
+        }
+
+        let _ = try bitmaskBuffer
+
+        let cGraph = MPSGraph()
+        let cLogits = cGraph.placeholder(shape: [1, vocabSize as NSNumber], dataType: .float16, name: "logits")
+        let cTemp = cGraph.placeholder(shape: [1 as NSNumber], dataType: .float32, name: "temperature")
+        let cRandom = cGraph.placeholder(shape: [1 as NSNumber], dataType: .float32, name: "random")
+        let cTopP = cGraph.placeholder(shape: [1 as NSNumber], dataType: .float32, name: "topP")
+        let cMinP = cGraph.placeholder(shape: [1 as NSNumber], dataType: .float32, name: "minP")
+        let cBitmask = cGraph.placeholder(shape: [bitmaskSize as NSNumber], dataType: .int32, name: "bitmask")
+
+        let cMaskedLogits = buildBitmaskExpansionGraph(
+            graph: cGraph, logits: cLogits, bitmaskPlaceholder: cBitmask,
+            vocabSize: vocabSize, bitmaskSize: bitmaskSize)
+
+        let cLogitsF32 = cGraph.cast(cMaskedLogits, to: .float32, name: "logits_f32")
+        let cTopK = cGraph.topK(cLogitsF32, k: k, name: "topk")
+        let cScaled = cGraph.division(cTopK[0], cTemp, name: "scaled")
+        let cProbs = cGraph.softMax(with: cScaled, axis: 1, name: "probs")
+
+        let cMaxProb = cGraph.sliceTensor(cProbs, dimension: 1, start: 0, length: 1, name: "max_prob")
+        let cMinPThreshold = cGraph.multiplication(cMinP, cMaxProb, name: "minp_threshold")
+        let cMinPMask = cGraph.greaterThanOrEqualTo(cProbs, cMinPThreshold, name: "minp_mask")
+
+        let cExclCumsum = cGraph.cumulativeSum(cProbs, axis: 1, exclusive: true, reverse: false, name: "excl_cumsum")
+        let cTopPMask = cGraph.lessThan(cExclCumsum, cTopP, name: "topp_mask")
+
+        let cCombinedMask = cGraph.logicalAND(cMinPMask, cTopPMask, name: "combined_mask")
+        let cMaskF = cGraph.cast(cCombinedMask, to: .float32, name: "mask_float")
+        let cMaskedProbs = cGraph.multiplication(cProbs, cMaskF, name: "masked_probs")
+        let cSumMasked = cGraph.reductionSum(with: cMaskedProbs, axis: 1, name: "sum_masked")
+        let cEpsilon = cGraph.constant(1e-10, dataType: .float32)
+        let cSafeDenom = cGraph.maximum(cSumMasked, cEpsilon, name: "safe_denom")
+        let cNormProbs = cGraph.division(cMaskedProbs, cSafeDenom, name: "normalized_probs")
+
+        let cCumsum = cGraph.cumulativeSum(cNormProbs, axis: 1, exclusive: false, reverse: false, name: "cumsum")
+        let cSelMask = cGraph.greaterThanOrEqualTo(cCumsum, cRandom, name: "selection_mask")
+        let cSelMaskF = cGraph.cast(cSelMask, to: .float32, name: "selection_mask_float")
+        let cSelIdx = cGraph.reductionArgMaximum(with: cSelMaskF, axis: 1, name: "selected_idx")
+        let cSelI32 = cGraph.cast(cSelIdx, to: .int32, name: "selected_idx_i32")
+        let cIndFlat = cGraph.reshape(cTopK[1], shape: [k as NSNumber], name: "indices_flat")
+        let cSelFlat = cGraph.reshape(cSelI32, shape: [1 as NSNumber], name: "selected_flat")
+        let cOutput = cGraph.gatherAlongAxis(0, updates: cIndFlat, indices: cSelFlat, name: "token_id")
+
+        let cFeeds: [MPSGraphTensor: MPSGraphShapedType] = [
+            cLogits: MPSGraphShapedType(shape: [1, vocabSize as NSNumber], dataType: .float16),
+            cTemp: MPSGraphShapedType(shape: [1 as NSNumber], dataType: .float32),
+            cRandom: MPSGraphShapedType(shape: [1 as NSNumber], dataType: .float32),
+            cTopP: MPSGraphShapedType(shape: [1 as NSNumber], dataType: .float32),
+            cMinP: MPSGraphShapedType(shape: [1 as NSNumber], dataType: .float32),
+            cBitmask: MPSGraphShapedType(shape: [bitmaskSize as NSNumber], dataType: .int32),
+        ]
+        let desc = MPSGraphCompilationDescriptor()
+        desc.optimizationLevel = .level0
+
+        let exec = cGraph.compile(
+            with: mpsDevice, feeds: cFeeds,
+            targetTensors: [cOutput], targetOperations: nil,
+            compilationDescriptor: desc)
+        constrainedExecutable = exec
+        return (exec, constrainedBitmaskData!)
+    }
+
+    /// Encode composite sampling with optional bitmask constraint.
+    ///
+    /// When `applyBitmask` is true, the bitmask in `bitmaskBuffer` masks logits
+    /// before topK. The caller must fill `bitmaskBuffer` before calling this.
+    func encode(
+        to queue: MTLCommandQueue,
+        logitsBuffer: MTLBuffer,
+        logitsOffset: Int,
+        outputBuffer: MTLBuffer,
+        outputOffset: Int,
+        applyBitmask: Bool,
+        completion: @escaping (Int32) -> Void
+    ) {
+        if applyBitmask {
+            guard let (constrained, bitmaskTensorData) = try? ensureConstrainedResources() else {
+                completion(0)
+                return
+            }
+            temperatureBuffer.contents().assumingMemoryBound(to: Float.self).pointee = max(temperature, 0.01)
+            topPBuffer.contents().assumingMemoryBound(to: Float.self).pointee = topP
+            minPBuffer.contents().assumingMemoryBound(to: Float.self).pointee = minP
+            let randomValue = testingOnlyRandomOverride ?? Float.random(in: 0..<1)
+            randomBuffer.contents().assumingMemoryBound(to: Float.self).pointee = randomValue
+
+            let logitsData = MPSGraphTensorData(
+                logitsBuffer, shape: [1, vocabSize as NSNumber], dataType: .float16)
+            let outputData = MPSGraphTensorData(
+                outputBuffer, shape: [1 as NSNumber], dataType: .int32)
+            let execDesc = MPSGraphExecutableExecutionDescriptor()
+            execDesc.completionHandler = { [outputBuffer, outputOffset] (_, error) in
+                if let error = error {
+                    print("MPSGraph constrained composite error: \(error)")
+                    completion(0)
+                    return
+                }
+                let result = outputBuffer.contents()
+                    .advanced(by: outputOffset)
+                    .assumingMemoryBound(to: Int32.self).pointee
+                completion(result)
+            }
+            constrained.runAsync(
+                with: queue,
+                inputs: [logitsData, temperatureData, randomData, topPData, minPData, bitmaskTensorData],
+                results: [outputData], executionDescriptor: execDesc)
+        } else {
+            encode(to: queue, logitsBuffer: logitsBuffer, logitsOffset: logitsOffset,
+                   outputBuffer: outputBuffer, outputOffset: outputOffset,
+                   completion: completion)
+        }
+    }
+
+    /// Encode composite sampling with slice and optional bitmask.
+    func encodeWithSlice(
+        to queue: MTLCommandQueue,
+        logitsBuffer: MTLBuffer,
+        queryLength: Int,
+        outputBuffer: MTLBuffer,
+        outputOffset: Int,
+        applyBitmask: Bool,
+        completion: @escaping (Int32) -> Void
+    ) {
+        if queryLength == 1 {
+            encode(to: queue, logitsBuffer: logitsBuffer, logitsOffset: 0,
+                   outputBuffer: outputBuffer, outputOffset: outputOffset,
+                   applyBitmask: applyBitmask, completion: completion)
+            return
+        }
+        let logitsOffset = (queryLength - 1) * vocabSize * MemoryLayout<UInt16>.size
+        let sliceSize = vocabSize * MemoryLayout<UInt16>.size
+        guard let tempBuffer = device.makeBuffer(length: sliceSize, options: .storageModeShared),
+              let blitCmdBuffer = queue.makeCommandBuffer(),
+              let blitEncoder = blitCmdBuffer.makeBlitCommandEncoder()
+        else {
+            completion(0)
+            return
+        }
+        blitEncoder.copy(from: logitsBuffer, sourceOffset: logitsOffset,
+                         to: tempBuffer, destinationOffset: 0, size: sliceSize)
+        blitEncoder.endEncoding()
+        blitCmdBuffer.commit()
+
+        encode(to: queue, logitsBuffer: tempBuffer, logitsOffset: 0,
+               outputBuffer: outputBuffer, outputOffset: outputOffset,
+               applyBitmask: applyBitmask, completion: completion)
     }
 
     /// Encode composite sampling asynchronously (protocol conformance).
