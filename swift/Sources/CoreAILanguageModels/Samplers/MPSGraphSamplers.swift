@@ -316,9 +316,11 @@ final class MPSGraphArgmaxSampler: @unchecked Sendable {
         get throws {
             if let buf = constrainedBitmaskBuffer { return buf }
             let byteCount = max(bitmaskSize * MemoryLayout<Int32>.size, 64)
-            guard let buf = device.makeBuffer(
-                length: byteCount, options: .storageModeShared
-            ) else {
+            guard
+                let buf = device.makeBuffer(
+                    length: byteCount, options: .storageModeShared
+                )
+            else {
                 throw MPSGraphSamplerError.bufferAllocationFailed
             }
             constrainedBitmaskBuffer = buf
@@ -403,9 +405,10 @@ final class MPSGraphArgmaxSampler: @unchecked Sendable {
                 with: queue, inputs: [inputData, bitmaskTensorData],
                 results: [outputData], executionDescriptor: execDesc)
         } else {
-            encode(to: queue, logitsBuffer: logitsBuffer, logitsOffset: logitsOffset,
-                   outputBuffer: outputBuffer, outputOffset: outputOffset,
-                   completion: completion)
+            encode(
+                to: queue, logitsBuffer: logitsBuffer, logitsOffset: logitsOffset,
+                outputBuffer: outputBuffer, outputOffset: outputOffset,
+                completion: completion)
         }
     }
 
@@ -420,29 +423,32 @@ final class MPSGraphArgmaxSampler: @unchecked Sendable {
         completion: @escaping (Int32) -> Void
     ) {
         if queryLength == 1 {
-            encode(to: queue, logitsBuffer: logitsBuffer, logitsOffset: 0,
-                   outputBuffer: outputBuffer, outputOffset: outputOffset,
-                   applyBitmask: applyBitmask, completion: completion)
+            encode(
+                to: queue, logitsBuffer: logitsBuffer, logitsOffset: 0,
+                outputBuffer: outputBuffer, outputOffset: outputOffset,
+                applyBitmask: applyBitmask, completion: completion)
             return
         }
         // For prefill with bitmask, slice last token then apply constrained path
         let logitsOffset = (queryLength - 1) * vocabSize * MemoryLayout<UInt16>.size
         let sliceSize = vocabSize * MemoryLayout<UInt16>.size
         guard let tempBuffer = device.makeBuffer(length: sliceSize, options: .storageModeShared),
-              let blitCmdBuffer = queue.makeCommandBuffer(),
-              let blitEncoder = blitCmdBuffer.makeBlitCommandEncoder()
+            let blitCmdBuffer = queue.makeCommandBuffer(),
+            let blitEncoder = blitCmdBuffer.makeBlitCommandEncoder()
         else {
             completion(0)
             return
         }
-        blitEncoder.copy(from: logitsBuffer, sourceOffset: logitsOffset,
-                         to: tempBuffer, destinationOffset: 0, size: sliceSize)
+        blitEncoder.copy(
+            from: logitsBuffer, sourceOffset: logitsOffset,
+            to: tempBuffer, destinationOffset: 0, size: sliceSize)
         blitEncoder.endEncoding()
         blitCmdBuffer.commit()
 
-        encode(to: queue, logitsBuffer: tempBuffer, logitsOffset: 0,
-               outputBuffer: outputBuffer, outputOffset: outputOffset,
-               applyBitmask: applyBitmask, completion: completion)
+        encode(
+            to: queue, logitsBuffer: tempBuffer, logitsOffset: 0,
+            outputBuffer: outputBuffer, outputOffset: outputOffset,
+            applyBitmask: applyBitmask, completion: completion)
     }
 
     /// Encode argmax sampling.
@@ -895,10 +901,12 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
     var bitmaskBuffer: MTLBuffer {
         get throws {
             if let buf = constrainedBitmaskBuffer { return buf }
-            guard let buf = device.makeBuffer(
-                length: bitmaskSize * MemoryLayout<Int32>.size,
-                options: .storageModeShared
-            ) else {
+            guard
+                let buf = device.makeBuffer(
+                    length: bitmaskSize * MemoryLayout<Int32>.size,
+                    options: .storageModeShared
+                )
+            else {
                 throw MPSGraphSamplerError.bufferAllocationFailed
             }
             constrainedBitmaskBuffer = buf
@@ -1021,9 +1029,10 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
                 inputs: [logitsData, temperatureData, randomData, topPData, minPData, bitmaskTensorData],
                 results: [outputData], executionDescriptor: execDesc)
         } else {
-            encode(to: queue, logitsBuffer: logitsBuffer, logitsOffset: logitsOffset,
-                   outputBuffer: outputBuffer, outputOffset: outputOffset,
-                   completion: completion)
+            encode(
+                to: queue, logitsBuffer: logitsBuffer, logitsOffset: logitsOffset,
+                outputBuffer: outputBuffer, outputOffset: outputOffset,
+                completion: completion)
         }
     }
 
@@ -1038,28 +1047,31 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
         completion: @escaping (Int32) -> Void
     ) {
         if queryLength == 1 {
-            encode(to: queue, logitsBuffer: logitsBuffer, logitsOffset: 0,
-                   outputBuffer: outputBuffer, outputOffset: outputOffset,
-                   applyBitmask: applyBitmask, completion: completion)
+            encode(
+                to: queue, logitsBuffer: logitsBuffer, logitsOffset: 0,
+                outputBuffer: outputBuffer, outputOffset: outputOffset,
+                applyBitmask: applyBitmask, completion: completion)
             return
         }
         let logitsOffset = (queryLength - 1) * vocabSize * MemoryLayout<UInt16>.size
         let sliceSize = vocabSize * MemoryLayout<UInt16>.size
         guard let tempBuffer = device.makeBuffer(length: sliceSize, options: .storageModeShared),
-              let blitCmdBuffer = queue.makeCommandBuffer(),
-              let blitEncoder = blitCmdBuffer.makeBlitCommandEncoder()
+            let blitCmdBuffer = queue.makeCommandBuffer(),
+            let blitEncoder = blitCmdBuffer.makeBlitCommandEncoder()
         else {
             completion(0)
             return
         }
-        blitEncoder.copy(from: logitsBuffer, sourceOffset: logitsOffset,
-                         to: tempBuffer, destinationOffset: 0, size: sliceSize)
+        blitEncoder.copy(
+            from: logitsBuffer, sourceOffset: logitsOffset,
+            to: tempBuffer, destinationOffset: 0, size: sliceSize)
         blitEncoder.endEncoding()
         blitCmdBuffer.commit()
 
-        encode(to: queue, logitsBuffer: tempBuffer, logitsOffset: 0,
-               outputBuffer: outputBuffer, outputOffset: outputOffset,
-               applyBitmask: applyBitmask, completion: completion)
+        encode(
+            to: queue, logitsBuffer: tempBuffer, logitsOffset: 0,
+            outputBuffer: outputBuffer, outputOffset: outputOffset,
+            applyBitmask: applyBitmask, completion: completion)
     }
 
     /// Encode composite sampling asynchronously (protocol conformance).
