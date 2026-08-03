@@ -15,36 +15,32 @@ import Foundation
 /// step's input token — i.e. the previous prediction — is non-blank, matching the HF
 /// `ParakeetTDTDecoderCache.update(..., mask=~blank_mask)` semantics.
 public struct ParakeetTDTDecoder: SpeechDecoder {
-    public init() {}
+    /// The `decoder_step` graph plus the descriptors its buffers are built from.
+    private struct StepGraph {
+        let fn: InferenceFunction
+        let inputIds: NDArrayDescriptor
+        let hiddenIn: NDArrayDescriptor
+        let cellIn: NDArrayDescriptor
+        let decoderOut: NDArrayDescriptor
+        let newHidden: NDArrayDescriptor
+        let newCell: NDArrayDescriptor
+    }
 
-    public func decode(
-        encoderOutput: NDArray,
-        encoderOutputShape: [Int],
-        validEncoderFrames: Int,
-        resources: DecoderResources
-    ) async throws -> (tokens: [Int32], stats: DecodeStats) {
-        guard case .parakeetTDT(let decoderStep, let joint, let cfg) = resources else {
-            throw SpeechError.incompatibleResources("ParakeetTDTDecoder requires .parakeetTDT resources")
-        }
+    /// The `joint` graph plus the descriptors its buffers are built from.
+    private struct JointGraph {
+        let fn: InferenceFunction
+        let decoderIn: NDArrayDescriptor
+        let encoderIn: NDArrayDescriptor
+        let logits: NDArrayDescriptor
+    }
 
-        guard encoderOutputShape.count == 3 else {
-            throw SpeechError.missingModel(
-                "Parakeet encoder must output rank-3 [B, T, H], got \(encoderOutputShape)")
-        }
-        let tEnc = encoderOutputShape[1]
-        let hidden = cfg.decoderHiddenSize
-        guard encoderOutputShape[0] == 1 && encoderOutputShape[2] == hidden else {
-            throw SpeechError.missingModel(
-                "Encoder output shape \(encoderOutputShape) doesn't match config (B=1, H=\(hidden))")
-        }
-        if tEnc == 0 { return (tokens: [], stats: DecodeStats(stepTimesMs: [])) }
+    /// Loaded once at init and reused across every `decode` call — the graphs and
+    /// their descriptors are shape-independent, so only `resolvingDynamicDimensions`
+    /// belongs on the per-transcription path.
+    private let stepGraph: StepGraph
+    private let jointGraph: JointGraph
 
-        // For a static (padded) encoder the tail frames are zero-padding; decoding
-        // them yields spurious tokens (trailing periods). Cap the loop at the number
-        // of frames that carry real audio. Dynamic exports pass tEnc, so cap == tEnc.
-        let cap = max(1, min(tEnc, validEncoderFrames))
-
-        // Resolve descriptors for the two callable graphs.
+    public init(decoderStep: AIModel, joint: AIModel) throws {
         guard let stepFn = try decoderStep.loadFunction(named: "main") else {
             throw SpeechError.missingModel("No 'main' function in decoder_step")
         }
@@ -71,9 +67,45 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
             case .ndArray(let logitsDesc) = jointDesc.outputDescriptor(of: "logits")
         else { throw SpeechError.missingModel("Unexpected joint descriptors") }
 
+        self.stepGraph = StepGraph(
+            fn: stepFn, inputIds: inputIdsDesc, hiddenIn: hiddenInDesc, cellIn: cellInDesc,
+            decoderOut: decoderOutDesc, newHidden: newHiddenDesc, newCell: newCellDesc)
+        self.jointGraph = JointGraph(
+            fn: jointFn, decoderIn: jointDecDesc, encoderIn: jointEncDesc, logits: logitsDesc)
+    }
+
+    public func decode(
+        encoderOutput: NDArray,
+        encoderOutputShape: [Int],
+        validEncoderFrames: Int,
+        resources: DecoderResources
+    ) async throws -> (tokens: [Int32], stats: DecodeStats) {
+        // Only the config is read from `resources`; the two graphs come from the same
+        // models this decoder was initialized with, already loaded in `init`.
+        guard case .parakeetTDT(_, _, let cfg) = resources else {
+            throw SpeechError.incompatibleResources("ParakeetTDTDecoder requires .parakeetTDT resources")
+        }
+
+        guard encoderOutputShape.count == 3 else {
+            throw SpeechError.missingModel(
+                "Parakeet encoder must output rank-3 [B, T, H], got \(encoderOutputShape)")
+        }
+        let tEnc = encoderOutputShape[1]
+        let hidden = cfg.decoderHiddenSize
+        guard encoderOutputShape[0] == 1 && encoderOutputShape[2] == hidden else {
+            throw SpeechError.missingModel(
+                "Encoder output shape \(encoderOutputShape) doesn't match config (B=1, H=\(hidden))")
+        }
+        if tEnc == 0 { return (tokens: [], stats: DecodeStats(stepTimesMs: [])) }
+
+        // For a static (padded) encoder the tail frames are zero-padding; decoding
+        // them yields spurious tokens (trailing periods). Cap the loop at the number
+        // of frames that carry real audio. Dynamic exports pass tEnc, so cap == tEnc.
+        let cap = max(1, min(tEnc, validEncoderFrames))
+
         let lstmShape = [cfg.numDecoderLayers, 1, hidden]
         let lstmCount = cfg.numDecoderLayers * hidden
-        let logitsSize = logitsDesc.shape.last!  // vocab + |durations|
+        let logitsSize = jointGraph.logits.shape.last!  // vocab + |durations|
 
         // Pull the full encoder output once; slice frame-by-frame in pure Swift.
         // flattenAsFloat inspects the array's own scalar type, so this reads an
@@ -81,16 +113,16 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
         let encFlat = flattenAsFloat(encoderOutput)
 
         // Persistent buffers (reused across all steps).
-        var inputIds = NDArray(descriptor: inputIdsDesc.resolvingDynamicDimensions([1, 1]))
-        var hIn = NDArray(descriptor: hiddenInDesc.resolvingDynamicDimensions(lstmShape))
-        var cIn = NDArray(descriptor: cellInDesc.resolvingDynamicDimensions(lstmShape))
-        var decOut = NDArray(descriptor: decoderOutDesc.resolvingDynamicDimensions([1, 1, hidden]))
-        var hOut = NDArray(descriptor: newHiddenDesc.resolvingDynamicDimensions(lstmShape))
-        var cOut = NDArray(descriptor: newCellDesc.resolvingDynamicDimensions(lstmShape))
+        var inputIds = NDArray(descriptor: stepGraph.inputIds.resolvingDynamicDimensions([1, 1]))
+        var hIn = NDArray(descriptor: stepGraph.hiddenIn.resolvingDynamicDimensions(lstmShape))
+        var cIn = NDArray(descriptor: stepGraph.cellIn.resolvingDynamicDimensions(lstmShape))
+        var decOut = NDArray(descriptor: stepGraph.decoderOut.resolvingDynamicDimensions([1, 1, hidden]))
+        var hOut = NDArray(descriptor: stepGraph.newHidden.resolvingDynamicDimensions(lstmShape))
+        var cOut = NDArray(descriptor: stepGraph.newCell.resolvingDynamicDimensions(lstmShape))
 
-        var jointDecIn = NDArray(descriptor: jointDecDesc.resolvingDynamicDimensions([1, 1, hidden]))
-        var jointEncIn = NDArray(descriptor: jointEncDesc.resolvingDynamicDimensions([1, 1, hidden]))
-        var logits = NDArray(descriptor: logitsDesc.resolvingDynamicDimensions([1, 1, logitsSize]))
+        var jointDecIn = NDArray(descriptor: jointGraph.decoderIn.resolvingDynamicDimensions([1, 1, hidden]))
+        var jointEncIn = NDArray(descriptor: jointGraph.encoderIn.resolvingDynamicDimensions([1, 1, hidden]))
+        var logits = NDArray(descriptor: jointGraph.logits.resolvingDynamicDimensions([1, 1, logitsSize]))
 
         // Swift-side LSTM state — zero-seeded, only advanced on non-blank emissions.
         var hState = [Float](repeating: 0, count: lstmCount)
@@ -125,7 +157,7 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
                     stepOut.insert(&decOut, for: "decoder_output")
                     stepOut.insert(&hOut, for: "new_hidden_state")
                     stepOut.insert(&cOut, for: "new_cell_state")
-                    _ = try await stepFn.run(
+                    _ = try await stepGraph.fn.run(
                         inputs: [
                             "input_ids": inputIds,
                             "hidden_state": hIn,
@@ -153,7 +185,7 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
 
                 var jointOutViews = InferenceFunction.MutableViews()
                 jointOutViews.insert(&logits, for: "logits")
-                _ = try await jointFn.run(
+                _ = try await jointGraph.fn.run(
                     inputs: [
                         "decoder_hidden_states": jointDecIn,
                         "encoder_hidden_states": jointEncIn,

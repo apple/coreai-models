@@ -123,11 +123,27 @@ public enum MelSpectrogram {
         return count / config.hopLength  // dynamic: all real
     }
 
-    public static func fromFile(_ url: URL, config: MelConfig = .whisper) throws -> [Float] {
-        return fromPCM(try loadAndResample(url, targetSampleRate: config.sampleRate), config: config)
+    public static func fromFile(
+        _ url: URL, config: MelConfig = .whisper, basis: Basis? = nil
+    ) throws -> [Float] {
+        return fromPCM(
+            try loadAndResample(url, targetSampleRate: config.sampleRate), config: config, basis: basis)
     }
 
-    public static func fromPCM(_ raw: [Float], config: MelConfig = .whisper) -> [Float] {
+    /// Computes the log-mel spectrogram for `raw`.
+    ///
+    /// Pass a `Basis` built once for `config` to keep the window/DFT/filterbank
+    /// construction off this path. Omitting it rebuilds the basis per call.
+    public static func fromPCM(
+        _ raw: [Float], config: MelConfig = .whisper, basis: Basis? = nil
+    ) -> [Float] {
+        let basis = basis ?? Basis(config: config)
+        precondition(
+            basis.nFFT == config.nFFT && basis.winLength == config.winLength
+                && basis.nMelBins == config.nMelBins,
+            "MelSpectrogram.Basis was built for a different MelConfig "
+                + "(basis nFFT=\(basis.nFFT) winLength=\(basis.winLength) nMelBins=\(basis.nMelBins))")
+
         let preemph = applyPreemphasis(raw, alpha: config.preemphasis)
         let (audio, validFrames) = padToFrameGrid(preemph, config: config)
         // For static configs totalFrames == nFrames (the full traced shape, which
@@ -138,10 +154,13 @@ public enum MelSpectrogram {
         let pad = config.nFFT / 2
         let padded = padAudio(audio, pad: pad, mode: config.padMode)
 
-        let window = hannWindow(size: config.winLength)
+        // Bind to locals so the frame loop below indexes arrays directly rather than
+        // re-reading struct properties on every iteration.
+        let window = basis.window
+        let cosBasis = basis.cosBasis
+        let sinBasis = basis.sinBasis
+        let filterbank = basis.filterbank
         let frameOffset = (config.nFFT - config.winLength) / 2
-        let (cosBasis, sinBasis) = dftBasis(nFFT: config.nFFT)
-        let filterbank = melFilterbank(config: config)
         let nFreqs = config.nFFT / 2 + 1
 
         var windowed = [Float](repeating: 0, count: config.winLength)
@@ -379,6 +398,35 @@ public enum MelSpectrogram {
     }
 
     // MARK: Precomputed basis
+
+    /// The window, DFT basis, and mel filterbank — everything in the mel pipeline
+    /// that depends only on `MelConfig`.
+    ///
+    /// Split out so a caller transcribing repeatedly can build it once and hand it to
+    /// `fromPCM`, rather than reconstructing identical tables on every call. The DFT
+    /// basis is the bulk of it: `2 × (nFFT/2 + 1) × nFFT` floats, each a `cos`/`sin`.
+    public struct Basis: Sendable {
+        let window: [Float]
+        let cosBasis: [Float]
+        let sinBasis: [Float]
+        let filterbank: [Float]
+
+        // Retained so `fromPCM` can check the basis it was handed matches its config.
+        let nFFT: Int
+        let winLength: Int
+        let nMelBins: Int
+
+        public init(config: MelConfig) {
+            let (cos, sin) = MelSpectrogram.dftBasis(nFFT: config.nFFT)
+            self.window = MelSpectrogram.hannWindow(size: config.winLength)
+            self.cosBasis = cos
+            self.sinBasis = sin
+            self.filterbank = MelSpectrogram.melFilterbank(config: config)
+            self.nFFT = config.nFFT
+            self.winLength = config.winLength
+            self.nMelBins = config.nMelBins
+        }
+    }
 
     private static func hannWindow(size: Int) -> [Float] {
         (0..<size).map { Float(0.5 * (1 - cos(2 * Double.pi * Double($0) / Double(size - 1)))) }

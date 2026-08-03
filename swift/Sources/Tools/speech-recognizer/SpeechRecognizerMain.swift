@@ -19,10 +19,10 @@ struct SpeechRecognizer: AsyncParsableCommand {
         abstract: "Transcribe audio using a CoreAI speech model bundle"
     )
 
-    @Argument(help: "Bundle dir (metadata.json + .aimodel assets) or single .aimodel (legacy)")
-    var modelPath: String
+    @Option(help: "Bundle dir (metadata.json + .aimodel assets) or single .aimodel (legacy)")
+    var model: String
 
-    @Argument(help: "Audio file (wav, flac, m4a, …). Omit for latency benchmarking with silence.")
+    @Option(help: "Audio file (wav, flac, m4a, …). Omit for latency benchmarking with silence.")
     var audioPath: String?
 
     @Flag(
@@ -38,14 +38,14 @@ struct SpeechRecognizer: AsyncParsableCommand {
     var verbose = false
 
     func run() async throws {
-        let bundleURL = URL(fileURLWithPath: modelPath)
+        let bundleURL = URL(fileURLWithPath: model)
         if clearCoreAICache {
             try clearCache(bundleURL: bundleURL)
         }
         if FileManager.default.fileExists(atPath: bundleURL.appending(path: "metadata.json").path) {
             try await runBundle(bundleURL: bundleURL, audioPath: audioPath, warmup: warmup, verbose: verbose)
         } else {
-            try await runLegacy(modelPath: modelPath, audioPath: audioPath, warmup: warmup)
+            try await runLegacy(model: model, audioPath: audioPath, warmup: warmup)
         }
     }
 
@@ -126,10 +126,10 @@ func runBundle(bundleURL: URL, audioPath: String?, warmup: Bool, verbose: Bool) 
 
 // MARK: - Legacy monolithic model
 
-func runLegacy(modelPath: String, audioPath: String?, warmup: Bool) async throws {
+func runLegacy(model: String, audioPath: String?, warmup: Bool) async throws {
     print("Format: legacy (monolithic, no KV cache)")
 
-    let modelURL = URL(fileURLWithPath: modelPath)
+    let modelURL = URL(fileURLWithPath: model)
     // Detect an existing cached specialization before loading. Only inspects the cache; never
     // specializes. The legacy path loads via `AIModel(contentsOf:)`, which uses `.default` options.
     let cacheHit = PreparedModel.isCached(at: modelURL, options: .default)

@@ -22,19 +22,54 @@ public actor SpeechRecognitionModel {
     private let melConfig: MelConfig
     private let resources: DecoderResources
 
+    /// Encoder function and its input descriptors, resolved once at init. These are
+    /// shape-independent, so caching them keeps `loadFunction`/descriptor lookups off
+    /// the per-transcription path; only `resolvingDynamicDimensions` is per-call.
+    private let encoderFunction: InferenceFunction
+    private let melInputDescriptor: NDArrayDescriptor
+    /// Non-nil only for bundles exported with the optional `attention_mask` input.
+    private let maskInputDescriptor: NDArrayDescriptor?
+
+    /// Mel window/DFT/filterbank, built once for `melConfig`. Derived purely from the
+    /// config, so rebuilding it on every transcription is wasted work.
+    private let melBasis: MelSpectrogram.Basis
+
     public init(resourcesAt url: URL) async throws {
         self.bundle = try await SpeechRecognitionBundle(at: url)
+        let encoder: AIModel
         switch bundle.kind {
         case .whisper(let assets):
             self.decoder = WhisperDecoder()
             self.melConfig = assets.melConfig
             self.resources = .whisper(decoder: assets.decoder, generationConfig: assets.generationConfig)
+            encoder = assets.encoder
         case .parakeetTDT(let assets):
-            self.decoder = ParakeetTDTDecoder()
+            self.decoder = try ParakeetTDTDecoder(decoderStep: assets.decoderStep, joint: assets.joint)
             self.melConfig = assets.melConfig
             self.resources = .parakeetTDT(
                 decoderStep: assets.decoderStep, joint: assets.joint, config: assets.config)
+            encoder = assets.encoder
         }
+        self.melBasis = MelSpectrogram.Basis(config: self.melConfig)
+
+        guard let fn = try encoder.loadFunction(named: "main") else {
+            throw SpeechError.missingModel("No 'main' function in encoder")
+        }
+        guard let encDesc = encoder.functionDescriptor(for: "main") else {
+            throw SpeechError.missingModel("No 'main' descriptor in encoder")
+        }
+        guard case .ndArray(let melNDDesc) = encDesc.inputDescriptor(of: "input_features")
+        else { throw SpeechError.missingModel("Unexpected encoder input descriptor") }
+        self.encoderFunction = fn
+        self.melInputDescriptor = melNDDesc
+        if encDesc.inputNames.contains("attention_mask"),
+            case .ndArray(let maskDesc) = encDesc.inputDescriptor(of: "attention_mask")
+        {
+            self.maskInputDescriptor = maskDesc
+        } else {
+            self.maskInputDescriptor = nil
+        }
+
         try await warmUp()
     }
 
@@ -70,13 +105,6 @@ public actor SpeechRecognitionModel {
 
     // MARK: - Internals
 
-    private var encoder: AIModel {
-        switch bundle.kind {
-        case .whisper(let a): return a.encoder
-        case .parakeetTDT(let a): return a.encoder
-        }
-    }
-
     private func warmUp() async throws {
         switch bundle.kind {
         case .whisper:
@@ -93,19 +121,11 @@ public actor SpeechRecognitionModel {
 
     /// Run the encoder over PCM and return the encoder hidden states + concrete shape.
     private func runEncoder(pcm: [Float]) async throws -> (NDArray, [Int]) {
-        guard let fn = try encoder.loadFunction(named: "main") else {
-            throw SpeechError.missingModel("No 'main' function in encoder")
-        }
-        guard let encDesc = encoder.functionDescriptor(for: "main") else {
-            throw SpeechError.missingModel("No 'main' descriptor in encoder")
-        }
-        guard case .ndArray(let melNDDesc) = encDesc.inputDescriptor(of: "input_features")
-        else { throw SpeechError.missingModel("Unexpected encoder input descriptor") }
-        let start = SuspendingClock().now
-        let mel = MelSpectrogram.fromPCM(pcm, config: melConfig)
+        let start = ContinuousClock.now
+        let mel = MelSpectrogram.fromPCM(pcm, config: melConfig, basis: melBasis)
         let nFrames = MelSpectrogram.frameCount(forPCMLength: pcm.count, config: melConfig)
         let inputShape = encoderInputShape(nFrames: nFrames)
-        var melArray = NDArray(descriptor: melNDDesc.resolvingDynamicDimensions(inputShape))
+        var melArray = NDArray(descriptor: melInputDescriptor.resolvingDynamicDimensions(inputShape))
         fillFloatNDArray(&melArray, with: mel)
 
         // Attention mask (B, T_audio): true for real-audio frames, false for the
@@ -113,21 +133,19 @@ public actor SpeechRecognitionModel {
         // frame). Lets the encoder exclude padding from self-attention and the conv
         // modules, matching HF. Guarded so bundles exported without the input still run.
         var inputs: [String: NDArray] = ["input_features": melArray]
-        if encDesc.inputNames.contains("attention_mask"),
-            case .ndArray(let maskDesc) = encDesc.inputDescriptor(of: "attention_mask")
-        {
+        if let maskDesc = maskInputDescriptor {
             let validFrames = min(
                 MelSpectrogram.validFrameCount(forPCMLength: pcm.count, config: melConfig), nFrames)
             var maskArray = NDArray(descriptor: maskDesc.resolvingDynamicDimensions([1, nFrames]))
             fillNDArray(&maskArray, as: Bool.self, count: nFrames) { $0 < validFrames }
             inputs["attention_mask"] = maskArray
         }
-        let preprocessDuration = SuspendingClock().now - start
-        CLILogger.log("The preprocessing took \(preprocessDuration)", level: 2)
-        let startEncode = SuspendingClock().now
-        var outputs = try await fn.run(inputs: inputs)
-        let encodeDuration = SuspendingClock().now - startEncode
-        CLILogger.log("The encoding took \(encodeDuration)", level: 2)
+        let preprocessDuration = ContinuousClock.now - start
+        CLILogger.log("The preprocessing took \(preprocessDuration.inMilliseconds) ms", level: 1)
+        let startEncode = ContinuousClock.now
+        var outputs = try await encoderFunction.run(inputs: inputs)
+        let encodeDuration = ContinuousClock.now - startEncode
+        CLILogger.log("The encoding took \(encodeDuration.inMilliseconds) ms", level: 1)
         guard let encOut = outputs.remove("encoder_hidden_states")?.ndArray else {
             throw SpeechError.missingModel("Encoder did not produce 'encoder_hidden_states'")
         }

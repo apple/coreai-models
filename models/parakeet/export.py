@@ -127,7 +127,7 @@ def _audio_features(
     sample_rate = processor.feature_extractor.sampling_rate
     dummy_audio = np.random.randn(int(sample_rate * seconds)).astype(np.float32)
     features = processor.feature_extractor(dummy_audio, sampling_rate=sample_rate)
-    return torch.tensor(features["input_features"]).to(dtype)
+    return features["input_features"].to(dtype).detach().clone()
 
 
 def _decoder_step_inputs(
@@ -175,15 +175,17 @@ def _convert(
     example_inputs: dict[str, torch.Tensor],
     input_names: list[str],
     output_names: list[str],
+    dtype: torch.dtype,
     dynamic_shapes: dict | None = None,
 ):
     module.eval()
-    exported = torch.export.export(
-        module,
-        args=(),
-        kwargs=example_inputs,
-        dynamic_shapes=dynamic_shapes,
-    )
+    with torch.autocast(device_type="cpu", dtype=dtype):
+        exported = torch.export.export(
+            module,
+            args=(),
+            kwargs=example_inputs,
+            dynamic_shapes=dynamic_shapes,
+        )
     exported = exported.run_decompositions(get_decomp_table())
     converter = TorchConverter().add_exported_program(
         exported_program=exported,
@@ -297,9 +299,10 @@ def create_parakeet(
     audio_seconds: float,
 ):
     print(f"[INFO] Sourcing {model_name}...")
-    model = transformers.AutoModelForTDT.from_pretrained(model_name)
+    model = transformers.AutoModelForTDT.from_pretrained(
+        model_name, dtype=dtype, use_safetensors=True
+    )
     model.eval()
-    model.to(dtype)
     config = model.config
     print(
         f"[INFO] Loaded ParakeetForTDT — encoder hidden={config.encoder_config.hidden_size}, "
@@ -323,6 +326,7 @@ def create_parakeet(
         encoder_inputs,
         input_names=["input_features", "attention_mask"],
         output_names=["encoder_hidden_states"],
+        dtype=dtype,
         dynamic_shapes=_encoder_dynamic_shapes() if dynamic else None,
     )
     _save_program(encoder_program, assets[ENCODER_GRAPH], ENCODER_GRAPH)
@@ -333,6 +337,7 @@ def create_parakeet(
         _decoder_step_inputs(config, dtype),
         input_names=["input_ids", "hidden_state", "cell_state"],
         output_names=["decoder_output", "new_hidden_state", "new_cell_state"],
+        dtype=dtype,
     )
     _save_program(decoder_program, assets[DECODER_STEP_GRAPH], DECODER_STEP_GRAPH)
 
@@ -342,6 +347,7 @@ def create_parakeet(
         _joint_inputs(config, dtype),
         input_names=["decoder_hidden_states", "encoder_hidden_states"],
         output_names=["logits"],
+        dtype=dtype,
     )
     _save_program(joint_program, assets[JOINT_GRAPH], JOINT_GRAPH)
 
