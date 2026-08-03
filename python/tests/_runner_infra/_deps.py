@@ -51,11 +51,15 @@ def _hf_hub_reachable(model_id: str = "yujiepan/qwen3-tiny-random") -> bool:
     Used as an opt-in gate for tests that call ``Model.from_hf(...)``. Any
     exception (proxy block, DNS failure, timeout, missing dep) is treated as
     "not reachable" so the test is skipped rather than failing.
+
+    Also verifies the model's config.json is downloadable — model_info()
+    can succeed while actual file downloads are blocked by proxy/firewall.
     """
     try:
         import huggingface_hub
 
         huggingface_hub.HfApi().model_info(model_id, timeout=2)
+        huggingface_hub.hf_hub_download(model_id, "config.json", timeout=5)
         return True
     except Exception:
         return False

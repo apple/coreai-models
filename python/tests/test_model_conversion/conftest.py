@@ -12,7 +12,9 @@ parity with HF eager. ``disable_hf_impl_for_coreai`` is the per-test
 opt-out for Core AI-export tests where the HF impl decomposes into where-ops
 the Core AI runtime can't lower.
 
-Also applies ``pytest.mark.flaky(reruns=5)`` to every test in this tree.
+Also applies ``pytest.mark.flaky(reruns=5)`` to every test in this tree
+and skips all tests when the HuggingFace Hub is unreachable (every test
+in this directory calls ``from_pretrained``).
 """
 
 import os
@@ -20,11 +22,20 @@ from collections.abc import Iterator
 
 import pytest
 
+from tests._runner_infra._deps import _hf_hub_reachable
+
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
     """Apply flaky marker to all tests in this directory and subdirectories."""
     for item in items:
         item.add_marker(pytest.mark.flaky(reruns=5))
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _skip_conversion_tests_if_offline() -> None:
+    """Skip all model conversion tests when HF Hub is unreachable."""
+    if not _hf_hub_reachable():
+        pytest.skip("HuggingFace Hub unreachable; skipping model conversion tests")
 
 
 @pytest.fixture(autouse=True, scope="module")
