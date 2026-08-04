@@ -376,7 +376,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             cacheHit = PreparedModel.isCached(at: languageModelURL)
         }
 
-        let assetLabel = try modelAssetTypeLabel(for: bundle.modelAssetPath)
+        let assetLabel = try modelAssetTypeLabel(for: languageModelURL.pathExtension)
         if !CLILogger.isVerbose {
             print("\n⏳ Preparing AI asset from \(assetLabel)...", terminator: "")
             fflush(stdout)
@@ -1075,8 +1075,8 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
 
     // MARK: - Asset Type Label
 
-    private func modelAssetTypeLabel(for path: String) throws -> String {
-        switch URL(fileURLWithPath: path).pathExtension.lowercased() {
+    private func modelAssetTypeLabel(for ext: String) throws -> String {
+        switch ext.lowercased() {
         case "aimodelc": return "compiled"
         case "aimodel": return "source"
         default:

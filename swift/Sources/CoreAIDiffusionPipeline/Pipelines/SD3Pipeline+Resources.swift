@@ -4,6 +4,7 @@
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
 import CoreAI
+import CoreAIShared
 import Foundation
 
 extension SD3Pipeline {
@@ -29,13 +30,13 @@ extension SD3Pipeline {
         }
 
         let transformer = CoreAIDiffusionModelFunction(
-            modelURL: url.appendingPathComponent(transformerPath))
+            modelURL: ModelBundle.resolveAssetURL(transformerPath, in: url))
         let textEncoder = CoreAIDiffusionModelFunction(
-            modelURL: url.appendingPathComponent(textEncoderPath))
+            modelURL: ModelBundle.resolveAssetURL(textEncoderPath, in: url))
         let textEncoder2 = CoreAIDiffusionModelFunction(
-            modelURL: url.appendingPathComponent(textEncoder2Path))
+            modelURL: ModelBundle.resolveAssetURL(textEncoder2Path, in: url))
         let decoder = CoreAIDiffusionModelFunction(
-            modelURL: url.appendingPathComponent(decoderPath))
+            modelURL: ModelBundle.resolveAssetURL(decoderPath, in: url))
 
         let tokenizer = try Self.loadBPETokenizer(
             at: url.appendingPathComponent("tokenizer"))
