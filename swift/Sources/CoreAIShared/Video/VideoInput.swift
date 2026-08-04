@@ -6,10 +6,11 @@
 import CoreGraphics
 import Foundation
 
-/// A frame produced by video extraction: the decoded image and its timestamp.
+/// A frame produced by video extraction: the decoded image and its position.
 public struct VideoFrame: Sendable {
     public let image: CGImage
-    public let timestamp: Double
+    /// Frame index (0-based ordinal within the extraction sequence).
+    public let index: Int
 }
 
 /// Concrete, Sendable async sequence of video frames.
@@ -37,6 +38,9 @@ public struct VideoFrameSequence: AsyncSequence, Sendable {
         }
     }
 }
+
+/// Default number of frames sampled from a video when no explicit count is provided.
+public let defaultVideoFrameCount = 8
 
 /// Extracted video frames ready for vision encoding.
 ///
@@ -71,7 +75,7 @@ public struct VideoInput: Sendable {
     /// - Throws: ``VideoInputError`` if the file cannot be read or has no video track.
     public static func fromURL(
         _ url: URL,
-        sampling: FrameSamplingStrategy = .uniform(count: 8),
+        sampling: FrameSamplingStrategy = .uniform(count: defaultVideoFrameCount),
         skipErrors: Bool = false
     ) async throws -> VideoInput {
         let (count, duration, frames) = try await VideoFrameExtractor.extractFrames(
@@ -80,16 +84,13 @@ public struct VideoInput: Sendable {
     }
 
     /// Wrap pre-extracted frames (e.g. from camera capture).
-    ///
-    /// Timestamps are assigned as 0-based indices since the source
-    /// may not have meaningful timing information.
     public static func fromFrames(
         _ images: [CGImage]
     ) -> VideoInput {
         let count = images.count
         let stream = AsyncThrowingStream<VideoFrame, Error> { continuation in
             for (i, image) in images.enumerated() {
-                continuation.yield(VideoFrame(image: image, timestamp: Double(i)))
+                continuation.yield(VideoFrame(image: image, index: i))
             }
             continuation.finish()
         }

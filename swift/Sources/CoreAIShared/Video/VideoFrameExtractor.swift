@@ -58,11 +58,12 @@ struct VideoFrameExtractor {
                     generator.requestedTimeToleranceBefore = CMTime(seconds: 0.1, preferredTimescale: 600)
                     generator.requestedTimeToleranceAfter = CMTime(seconds: 0.1, preferredTimescale: 600)
 
+                    var frameIndex = 0
                     for await result in generator.images(for: cmTimes) {
                         do {
                             let image = try result.image
-                            let actualSeconds = CMTimeGetSeconds(try result.actualTime)
-                            continuation.yield(VideoFrame(image: image, timestamp: actualSeconds))
+                            continuation.yield(VideoFrame(image: image, index: frameIndex))
+                            frameIndex += 1
                         } catch {
                             if skipErrors {
                                 continue

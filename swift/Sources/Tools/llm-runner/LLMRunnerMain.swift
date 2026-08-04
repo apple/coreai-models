@@ -50,9 +50,17 @@ enum ImageInfoMode: String, ExpressibleByArgument, Sendable {
     case auto
 }
 
+/// CLI adapter for ``FrameSamplingStrategy``.
 enum VideoSamplingMode: String, ExpressibleByArgument, Sendable {
     case uniform
     case fps
+
+    func strategy(frameCount: Int) -> FrameSamplingStrategy {
+        switch self {
+        case .uniform: .uniform(count: frameCount)
+        case .fps: .fps(rate: 1.0, maxFrames: frameCount)
+        }
+    }
 }
 
 @main
@@ -208,8 +216,8 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
 
     @Option(
         name: .customLong("video-frames"),
-        help: "Number of frames to extract from video (default: 8)")
-    var videoFrames: Int = 8
+        help: "Number of frames to extract from video (default: \(defaultVideoFrameCount))")
+    var videoFrames: Int = defaultVideoFrameCount
 
     @Option(
         name: .customLong("video-sampling"),
@@ -982,13 +990,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             throw ExitCode.failure
         }
 
-        let sampling: FrameSamplingStrategy
-        switch videoSampling {
-        case .fps:
-            sampling = .fps(rate: 1.0, maxFrames: videoFrames)
-        case .uniform:
-            sampling = .uniform(count: videoFrames)
-        }
+        let sampling = videoSampling.strategy(frameCount: videoFrames)
 
         if !CLILogger.isVerbose {
             print("Generating...")

@@ -13,6 +13,7 @@ public enum FrameSamplingStrategy: Sendable {
     case fps(rate: Double, maxFrames: Int)
 
     /// Compute frame timestamps for a video with the given duration and frame rate.
+    /// Each timestamp targets the midpoint of its sampling interval.
     ///
     /// - Parameters:
     ///   - duration: Video duration in seconds.
