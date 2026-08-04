@@ -34,6 +34,37 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
         let logits: NDArrayDescriptor
     }
 
+    /// Every NDArray a decode call needs, allocated once up front and rewritten in
+    /// place on each step rather than reallocated per emission.
+    private struct Buffers {
+        var inputIds: NDArray
+        var hIn: NDArray
+        var cIn: NDArray
+        var decOut: NDArray
+        var hOut: NDArray
+        var cOut: NDArray
+        var jointDecIn: NDArray
+        var jointEncIn: NDArray
+        var logits: NDArray
+
+        init(
+            step: StepGraph, joint: JointGraph,
+            lstmShape: [Int], hidden: Int, logitsSize: Int
+        ) {
+            inputIds = NDArray(descriptor: step.inputIds.resolvingDynamicDimensions([1, 1]))
+            hIn = NDArray(descriptor: step.hiddenIn.resolvingDynamicDimensions(lstmShape))
+            cIn = NDArray(descriptor: step.cellIn.resolvingDynamicDimensions(lstmShape))
+            decOut = NDArray(descriptor: step.decoderOut.resolvingDynamicDimensions([1, 1, hidden]))
+            hOut = NDArray(descriptor: step.newHidden.resolvingDynamicDimensions(lstmShape))
+            cOut = NDArray(descriptor: step.newCell.resolvingDynamicDimensions(lstmShape))
+            jointDecIn = NDArray(
+                descriptor: joint.decoderIn.resolvingDynamicDimensions([1, 1, hidden]))
+            jointEncIn = NDArray(
+                descriptor: joint.encoderIn.resolvingDynamicDimensions([1, 1, hidden]))
+            logits = NDArray(descriptor: joint.logits.resolvingDynamicDimensions([1, 1, logitsSize]))
+        }
+    }
+
     /// Loaded once at init and reused across every `decode` call — the graphs and
     /// their descriptors are shape-independent, so only `resolvingDynamicDimensions`
     /// belongs on the per-transcription path.
@@ -85,44 +116,53 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
         guard case .parakeetTDT(_, _, let cfg) = resources else {
             throw SpeechError.incompatibleResources("ParakeetTDTDecoder requires .parakeetTDT resources")
         }
+        let hidden = cfg.decoderHiddenSize
+        let vocabSize = cfg.vocabSize
 
         guard encoderOutputShape.count == 3 else {
             throw SpeechError.missingModel(
                 "Parakeet encoder must output rank-3 [B, T, H], got \(encoderOutputShape)")
         }
-        let tEnc = encoderOutputShape[1]
-        let hidden = cfg.decoderHiddenSize
         guard encoderOutputShape[0] == 1 && encoderOutputShape[2] == hidden else {
             throw SpeechError.missingModel(
                 "Encoder output shape \(encoderOutputShape) doesn't match config (B=1, H=\(hidden))")
         }
+        // The token argmax scans `0..<vocabSize`, so a blank id outside that range could
+        // never win: `isBlank` would never fire, every frame's argmax would be emitted as
+        // a real token, and the blank-skip path would be dead code. The loop's blank
+        // bookkeeping rests on blank being a producible, unshared id — check it here
+        // rather than silently degrading to a garbage transcript.
+        guard cfg.blankTokenId >= 0, Int(cfg.blankTokenId) < vocabSize else {
+            throw SpeechError.missingModel(
+                "blank_token_id \(cfg.blankTokenId) is outside the vocab range 0..<\(vocabSize)")
+        }
+        // The joint emits `[vocab | durations]` along its last axis; both argmaxes below
+        // index that layout directly, so a mismatch would read duration logits out of the
+        // vocab range (or off the end of the row).
+        let logitsSize = jointGraph.logits.shape.last!
+        guard logitsSize == vocabSize + cfg.durations.count else {
+            throw SpeechError.missingModel(
+                "Joint logits width \(logitsSize) doesn't match vocab \(vocabSize) + "
+                    + "\(cfg.durations.count) durations")
+        }
+
+        let tEnc = encoderOutputShape[1]
         if tEnc == 0 { return (tokens: [], stats: DecodeStats(stepTimesMs: [])) }
 
         // For a static (padded) encoder the tail frames are zero-padding; decoding
         // them yields spurious tokens (trailing periods). Cap the loop at the number
         // of frames that carry real audio. Dynamic exports pass tEnc, so cap == tEnc.
         let cap = max(1, min(tEnc, validEncoderFrames))
-
         let lstmShape = [cfg.numDecoderLayers, 1, hidden]
         let lstmCount = cfg.numDecoderLayers * hidden
-        let logitsSize = jointGraph.logits.shape.last!  // vocab + |durations|
 
         // Pull the full encoder output once; slice frame-by-frame in pure Swift.
         // flattenAsFloat inspects the array's own scalar type, so this reads an
         // f16 encoder output correctly (a raw `as: Float.self` read would not).
         let encFlat = flattenAsFloat(encoderOutput)
-
-        // Persistent buffers (reused across all steps).
-        var inputIds = NDArray(descriptor: stepGraph.inputIds.resolvingDynamicDimensions([1, 1]))
-        var hIn = NDArray(descriptor: stepGraph.hiddenIn.resolvingDynamicDimensions(lstmShape))
-        var cIn = NDArray(descriptor: stepGraph.cellIn.resolvingDynamicDimensions(lstmShape))
-        var decOut = NDArray(descriptor: stepGraph.decoderOut.resolvingDynamicDimensions([1, 1, hidden]))
-        var hOut = NDArray(descriptor: stepGraph.newHidden.resolvingDynamicDimensions(lstmShape))
-        var cOut = NDArray(descriptor: stepGraph.newCell.resolvingDynamicDimensions(lstmShape))
-
-        var jointDecIn = NDArray(descriptor: jointGraph.decoderIn.resolvingDynamicDimensions([1, 1, hidden]))
-        var jointEncIn = NDArray(descriptor: jointGraph.encoderIn.resolvingDynamicDimensions([1, 1, hidden]))
-        var logits = NDArray(descriptor: jointGraph.logits.resolvingDynamicDimensions([1, 1, logitsSize]))
+        var buffers = Buffers(
+            step: stepGraph, joint: jointGraph,
+            lstmShape: lstmShape, hidden: hidden, logitsSize: logitsSize)
 
         // Swift-side LSTM state — zero-seeded, only advanced on non-blank emissions.
         var hState = [Float](repeating: 0, count: lstmCount)
@@ -134,80 +174,48 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
         var firstStep = true
         var cachedDecBuf: [Float]? = nil  // last decoder output; reused on blank-input frames
         let emitCap = cap * cfg.maxSymbolsPerStep
-        let vocabSize = cfg.vocabSize
 
         var stepTimesMs: [Double] = []
         while frame < cap && emitted.count < emitCap {
             let t0 = ContinuousClock.now
             var advance = 0
             for _ in 0..<cfg.maxSymbolsPerStep {
+                // Exactly "the previous step predicted blank", not a proxy for it:
+                // `lastToken` is assigned from *every* prediction below (blanks included),
+                // `isBlank` is this same comparison, and `blank_token_id` is guaranteed
+                // above to be a value no real token can take. `firstStep` covers the SOS
+                // case, where there is no previous step to have emitted anything.
                 let wasInputBlank = (lastToken == cfg.blankTokenId)
 
                 // HF blank-skip: when the cache is warm and the input is blank, reuse the
                 // last cached decoder output without re-running the LSTM step.
                 let decBuf: [Float]
-                if !firstStep && wasInputBlank, let cached = cachedDecBuf {
+                if !firstStep, wasInputBlank, let cached = cachedDecBuf {
                     decBuf = cached
                 } else {
-                    fillNDArray(&inputIds, as: Int32.self, with: [lastToken])
-                    fillFloatNDArray(&hIn, with: hState)
-                    fillFloatNDArray(&cIn, with: cState)
-
-                    var stepOut = InferenceFunction.MutableViews()
-                    stepOut.insert(&decOut, for: "decoder_output")
-                    stepOut.insert(&hOut, for: "new_hidden_state")
-                    stepOut.insert(&cOut, for: "new_cell_state")
-                    _ = try await stepGraph.fn.run(
-                        inputs: [
-                            "input_ids": inputIds,
-                            "hidden_state": hIn,
-                            "cell_state": cIn,
-                        ],
-                        states: InferenceFunction.MutableViews(),
-                        outputViews: consume stepOut)
-
-                    decBuf = flattenAsFloat(decOut)
+                    let stepped = try await runDecoderStep(
+                        token: lastToken, hState: hState, cState: cState, buffers: &buffers)
+                    decBuf = stepped.decoderOutput
                     cachedDecBuf = decBuf
 
                     // LSTM-state update rule: always on the very first call; afterwards only
                     // when the input was non-blank (matches HF cache.update mask=~blank_mask).
                     if firstStep || !wasInputBlank {
-                        hState = flattenAsFloat(hOut)
-                        cState = flattenAsFloat(cOut)
+                        hState = stepped.newHidden
+                        cState = stepped.newCell
                     }
                     firstStep = false
                 }
 
                 // Joint(decoder_output, encoder[:, frame:frame+1, :]).
-                fillFloatNDArray(&jointDecIn, with: decBuf)
                 let encOffset = frame * hidden
-                fillFloatNDArray(&jointEncIn, with: encFlat[encOffset..<encOffset + hidden])
+                let logitsFlat = try await runJoint(
+                    decoderOutput: decBuf,
+                    encoderFrame: encFlat[encOffset..<encOffset + hidden],
+                    buffers: &buffers)
 
-                var jointOutViews = InferenceFunction.MutableViews()
-                jointOutViews.insert(&logits, for: "logits")
-                _ = try await jointGraph.fn.run(
-                    inputs: [
-                        "decoder_hidden_states": jointDecIn,
-                        "encoder_hidden_states": jointEncIn,
-                    ],
-                    states: InferenceFunction.MutableViews(),
-                    outputViews: consume jointOutViews)
-
-                // Argmax over [vocab] and [durations] sub-ranges.
-                let logitsFlat = flattenAsFloat(logits)
-                var bestTok: Int32 = 0
-                var bestTokVal: Float = -.infinity
-                for i in 0..<vocabSize where logitsFlat[i] > bestTokVal {
-                    bestTokVal = logitsFlat[i]
-                    bestTok = Int32(i)
-                }
-                var bestDurIdx = 0
-                var bestDurVal: Float = -.infinity
-                for i in 0..<cfg.durations.count where logitsFlat[vocabSize + i] > bestDurVal {
-                    bestDurVal = logitsFlat[vocabSize + i]
-                    bestDurIdx = i
-                }
-                let dur = cfg.durations[bestDurIdx]
+                let bestTok = Int32(argmax(logitsFlat, in: 0..<vocabSize))
+                let dur = cfg.durations[argmax(logitsFlat, in: vocabSize..<logitsSize)]
                 let isBlank = (bestTok == cfg.blankTokenId)
 
                 if !isBlank {
@@ -242,5 +250,73 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
         }
 
         return (tokens: emitted, stats: DecodeStats(stepTimesMs: stepTimesMs))
+    }
+
+    // MARK: - Graph invocations
+
+    /// One LSTM step: feed `token` at (`hState`, `cState`) and return the decoder output
+    /// alongside the resulting state.
+    ///
+    /// Returning the new state rather than storing it keeps the decision of *whether* to
+    /// adopt it — the HF `mask=~blank_mask` rule — at the call site with the blank
+    /// bookkeeping it depends on.
+    private func runDecoderStep(
+        token: Int32, hState: [Float], cState: [Float], buffers: inout Buffers
+    ) async throws -> (decoderOutput: [Float], newHidden: [Float], newCell: [Float]) {
+        fillNDArray(&buffers.inputIds, as: Int32.self, with: [token])
+        fillFloatNDArray(&buffers.hIn, with: hState)
+        fillFloatNDArray(&buffers.cIn, with: cState)
+
+        var stepOut = InferenceFunction.MutableViews()
+        stepOut.insert(&buffers.decOut, for: "decoder_output")
+        stepOut.insert(&buffers.hOut, for: "new_hidden_state")
+        stepOut.insert(&buffers.cOut, for: "new_cell_state")
+        _ = try await stepGraph.fn.run(
+            inputs: [
+                "input_ids": buffers.inputIds,
+                "hidden_state": buffers.hIn,
+                "cell_state": buffers.cIn,
+            ],
+            states: InferenceFunction.MutableViews(),
+            outputViews: consume stepOut)
+
+        return (
+            decoderOutput: flattenAsFloat(buffers.decOut),
+            newHidden: flattenAsFloat(buffers.hOut),
+            newCell: flattenAsFloat(buffers.cOut)
+        )
+    }
+
+    /// `joint(decoder_output, encoder_frame)` → the flattened `[vocab | durations]` row.
+    private func runJoint(
+        decoderOutput: [Float], encoderFrame: ArraySlice<Float>, buffers: inout Buffers
+    ) async throws -> [Float] {
+        fillFloatNDArray(&buffers.jointDecIn, with: decoderOutput)
+        fillFloatNDArray(&buffers.jointEncIn, with: encoderFrame)
+
+        var jointOut = InferenceFunction.MutableViews()
+        jointOut.insert(&buffers.logits, for: "logits")
+        _ = try await jointGraph.fn.run(
+            inputs: [
+                "decoder_hidden_states": buffers.jointDecIn,
+                "encoder_hidden_states": buffers.jointEncIn,
+            ],
+            states: InferenceFunction.MutableViews(),
+            outputViews: consume jointOut)
+
+        return flattenAsFloat(buffers.logits)
+    }
+
+    /// Index of the largest value in `values[range]`, relative to `range.lowerBound`.
+    /// Ties go to the lowest index, and an all-`-infinity` range yields 0 — matching the
+    /// hand-rolled scans this replaces.
+    private func argmax(_ values: [Float], in range: Range<Int>) -> Int {
+        var best = range.lowerBound
+        var bestVal: Float = -.infinity
+        for i in range where values[i] > bestVal {
+            bestVal = values[i]
+            best = i
+        }
+        return best - range.lowerBound
     }
 }

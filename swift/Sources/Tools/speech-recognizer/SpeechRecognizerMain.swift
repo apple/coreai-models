@@ -70,16 +70,17 @@ struct SpeechRecognizer: AsyncParsableCommand {
 // MARK: - Split bundle via CoreAISpeech
 
 func runBundle(bundleURL: URL, audioPath: String?, warmup: Bool, verbose: Bool) async throws {
-    print("Format: split (encoder + decoder, KV cache)")
-
+    // The architecture is printed after loading, once the bundle has reported it.
     // Detect an existing cached specialization before loading so we can annotate the load time
-    // below. Only inspects the cache; never specializes. `SpeechBundle` loads each asset via
-    // `AIModel(contentsOf:)`, which uses `.default` options — match that, and require both.
-    let encoderURL = bundleURL.appending(path: "encoder.aimodel")
-    let decoderURL = bundleURL.appending(path: "decoder.aimodel")
+    // below. Only inspects the cache; never specializes. Components are discovered by scanning
+    // rather than by hardcoded filenames — a Parakeet bundle prefixes each asset with the
+    // variant name — via the same helper `--clear-coreai-cache` uses. `SpeechRecognitionBundle`
+    // loads each asset with `AIModel(contentsOf:)`, which uses `.default` options: match that,
+    // and require every component.
+    let assetURLs = (try? PreparedModel.modelAssetURLs(at: bundleURL)) ?? []
     let cacheHit =
-        PreparedModel.isCached(at: encoderURL, options: .default)
-        && PreparedModel.isCached(at: decoderURL, options: .default)
+        !assetURLs.isEmpty
+        && assetURLs.allSatisfy { PreparedModel.isCached(at: $0, options: .default) }
 
     print("⏳ Preparing AI asset...", terminator: "")
     fflush(stdout)
@@ -137,14 +138,19 @@ func runLegacy(model: String, audioPath: String?, warmup: Bool) async throws {
     print("Format: legacy (monolithic, no KV cache)")
 
     let modelURL = URL(fileURLWithPath: model)
+    // TODO: Pinned to CPU because the monolithic f16 Whisper export decodes incorrectly on the
+    // default compute path — it logs repeated "ANE I/O op can only do F16 MemRef <-> F32 Tensor
+    // cast" warnings and the greedy loop hits EOT after 2 steps, transcribing jfk.wav as "you"
+    // instead of the full sentence. Drop this once the f16 export (or the ANE cast path) is fixed.
+    let options = SpecializationOptions(preferredComputeUnitKind: .cpu)
     // Detect an existing cached specialization before loading. Only inspects the cache; never
-    // specializes. The legacy path loads via `AIModel(contentsOf:)`, which uses `.default` options.
-    let cacheHit = PreparedModel.isCached(at: modelURL, options: .default)
+    // specializes. Probed with the same options the load uses: cache entries are keyed by them,
+    // so probing `.default` against a non-default load always reports a miss.
+    let cacheHit = PreparedModel.isCached(at: modelURL, options: options)
 
     print("⏳ Preparing AI asset...", terminator: "")
     fflush(stdout)
     let loadStart = ContinuousClock.now
-    let options = SpecializationOptions(preferredComputeUnitKind: .cpu)
     let model = try await AIModel(contentsOf: modelURL, options: options)
     let loadElapsed = ContinuousClock.now - loadStart
     print(" done in \(String(format: "%.3f", loadElapsed.inSeconds))s\(cacheHit ? " (cache hit)" : "")")
@@ -249,10 +255,8 @@ func runLegacy(model: String, audioPath: String?, warmup: Bool) async throws {
 
     print("\n── Transcription ──────────────────────────────────────────────────────")
     #if os(macOS)
-    let cacheBase = FileManager.default.homeDirectoryForCurrentUser
-        .appending(path: ".cache/huggingface/hub/models--openai--whisper-large-v3-turbo/snapshots")
-    if let snap = try? FileManager.default.contentsOfDirectory(atPath: cacheBase.path).first,
-        let tok = try? await AutoTokenizer.from(modelFolder: cacheBase.appending(path: snap))
+    if let snapshot = huggingFaceCacheSnapshot(forModelName: "openai/whisper-large-v3-turbo"),
+        let tok = try? await AutoTokenizer.from(modelFolder: snapshot)
     {
         let ids = tokens.filter { $0 < config.eotToken }.map { Int($0) }
         print("  \(tok.decode(tokens: ids).trimmingCharacters(in: .whitespaces))")

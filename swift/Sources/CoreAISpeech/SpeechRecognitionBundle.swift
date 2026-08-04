@@ -169,17 +169,10 @@ public struct SpeechRecognitionBundle: Sendable {
         //    Only meaningful on macOS — iOS has no user HF cache directory and
         //    `homeDirectoryForCurrentUser` is unavailable there.
         #if os(macOS)
-        if let name = config.tokenizerName {
-            let cacheRoot = FileManager.default.homeDirectoryForCurrentUser
-                .appending(path: ".cache/huggingface/hub")
-            let folderName = "models--" + name.replacingOccurrences(of: "/", with: "--")
-            let snapshotsDir = cacheRoot.appending(path: "\(folderName)/snapshots")
-            if let snapshot = try? FileManager.default.contentsOfDirectory(
-                atPath: snapshotsDir.path
-            ).first {
-                return try? await AutoTokenizer.from(
-                    modelFolder: snapshotsDir.appending(path: snapshot))
-            }
+        if let name = config.tokenizerName,
+            let snapshot = huggingFaceCacheSnapshot(forModelName: name)
+        {
+            return try? await AutoTokenizer.from(modelFolder: snapshot)
         }
         #endif
         return nil
@@ -199,6 +192,39 @@ public struct SpeechRecognitionBundle: Sendable {
         return nil
     }
 }
+
+// MARK: - Hugging Face cache
+
+#if os(macOS)
+/// Locate the snapshot directory for `name` in the local Hugging Face hub cache,
+/// e.g. `~/.cache/huggingface/hub/models--openai--whisper-large-v3-turbo/snapshots/<rev>`.
+///
+/// Resolves the revision through the cache's own `refs/main` pointer, which names the
+/// commit `huggingface_hub` last checked out. Only if that is missing does it fall back
+/// to scanning: snapshot directories are named by commit hash, so no ordering over them
+/// means "newest" — sorting merely makes the pick reproducible instead of leaving it to
+/// `contentsOfDirectory`'s unspecified order.
+///
+/// Returns nil if the repo isn't cached. macOS-only: iOS has no user-level HF cache and
+/// `homeDirectoryForCurrentUser` is unavailable there.
+public func huggingFaceCacheSnapshot(forModelName name: String) -> URL? {
+    let fm = FileManager.default
+    let repoDir = fm.homeDirectoryForCurrentUser
+        .appending(path: ".cache/huggingface/hub")
+        .appending(path: "models--" + name.replacingOccurrences(of: "/", with: "--"))
+    let snapshotsDir = repoDir.appending(path: "snapshots")
+
+    if let ref = try? String(contentsOf: repoDir.appending(path: "refs/main"), encoding: .utf8) {
+        let revision = ref.trimmingCharacters(in: .whitespacesAndNewlines)
+        let pinned = snapshotsDir.appending(path: revision)
+        if !revision.isEmpty, fm.fileExists(atPath: pinned.path) { return pinned }
+    }
+    guard let entries = try? fm.contentsOfDirectory(atPath: snapshotsDir.path),
+        let newest = entries.filter({ !$0.hasPrefix(".") }).sorted().last
+    else { return nil }
+    return snapshotsDir.appending(path: newest)
+}
+#endif
 
 // MARK: - GenerationConfig (Whisper)
 

@@ -395,6 +395,16 @@ public enum MelSpectrogram {
         layout: MelConfig.Layout
     ) {
         let count = validFrames * nMelBins
+        // Flat index of mel bin `b` at time step `t`. `totalFrames` may exceed
+        // `validFrames` (a static window's zero-padded tail, or the dynamic path's single
+        // trailing zero frame), and for channelMajor that padding sits *between* bins:
+        // bin b occupies b*totalFrames..<(b+1)*totalFrames. So the valid entries are not
+        // the first `count` elements of the array, and every statistic below has to walk
+        // them by index rather than linearly.
+        let totalFrames = mel.count / nMelBins
+        func index(_ t: Int, _ b: Int) -> Int {
+            (layout == .timeMajor) ? (t * nMelBins + b) : (b * totalFrames + t)
+        }
         switch normalization {
         case .whisperLogClip:
             // Whisper fills its entire fixed window (see `framesToCompute`), so every
@@ -404,44 +414,46 @@ public enum MelSpectrogram {
             let maxVal = mel.max() ?? 0
             for i in 0..<mel.count { mel[i] = (max(mel[i], maxVal - 8) + 4) / 4 }
         case .perInstanceMeanStd:
+            // One mean/std over every valid entry of every bin.
             if count == 0 { return }
             var sum: Float = 0
-            for i in 0..<count { sum += mel[i] }
+            for b in 0..<nMelBins {
+                for t in 0..<validFrames { sum += mel[index(t, b)] }
+            }
             let mean = sum / Float(count)
             var sqSum: Float = 0
-            for i in 0..<count {
-                let d = mel[i] - mean
-                sqSum += d * d
+            for b in 0..<nMelBins {
+                for t in 0..<validFrames {
+                    let d = mel[index(t, b)] - mean
+                    sqSum += d * d
+                }
             }
             let std = sqrt(sqSum / Float(count))
             let denom = max(std, 1e-5)
-            for i in 0..<count { mel[i] = (mel[i] - mean) / denom }
+            for b in 0..<nMelBins {
+                for t in 0..<validFrames {
+                    let i = index(t, b)
+                    mel[i] = (mel[i] - mean) / denom
+                }
+            }
         case .perBinMeanStd:
             // NeMo `per_feature`: normalize each mel bin independently over time.
             // Bessel-corrected std (divide by validFrames−1).
             if validFrames < 2 { return }
-            // totalFrames may be validFrames+1 (trailing zero frame). For channelMajor the
-            // stride between successive time steps within one bin is 1, but the bin-start
-            // offset depends on the full (possibly padded) frame count stored in the array.
-            let totalFrames = mel.count / nMelBins  // actual allocation width per bin
             for b in 0..<nMelBins {
                 var sum: Float = 0
-                for t in 0..<validFrames {
-                    let idx = (layout == .timeMajor) ? (t * nMelBins + b) : (b * totalFrames + t)
-                    sum += mel[idx]
-                }
+                for t in 0..<validFrames { sum += mel[index(t, b)] }
                 let mean = sum / Float(validFrames)
                 var sqSum: Float = 0
                 for t in 0..<validFrames {
-                    let idx = (layout == .timeMajor) ? (t * nMelBins + b) : (b * totalFrames + t)
-                    let d = mel[idx] - mean
+                    let d = mel[index(t, b)] - mean
                     sqSum += d * d
                 }
                 let std = sqrt(sqSum / Float(validFrames - 1))
                 let denom = std + 1e-5  // HF adds EPSILON inside the divide (not a clamp)
                 for t in 0..<validFrames {
-                    let idx = (layout == .timeMajor) ? (t * nMelBins + b) : (b * totalFrames + t)
-                    mel[idx] = (mel[idx] - mean) / denom
+                    let i = index(t, b)
+                    mel[i] = (mel[i] - mean) / denom
                 }
             }
         // Trailing entries beyond validFrames (if any) stay zero.
