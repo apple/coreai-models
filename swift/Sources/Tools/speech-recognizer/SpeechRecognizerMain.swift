@@ -42,7 +42,14 @@ struct SpeechRecognizer: AsyncParsableCommand {
         if clearCoreAICache {
             try clearCache(bundleURL: bundleURL)
         }
-        if FileManager.default.fileExists(atPath: bundleURL.appending(path: "metadata.json").path) {
+        // A single asset is identified by its extension; a bundle by carrying
+        // metadata.json. Both contain a metadata.json, so the extension has to be
+        // checked first or `.aimodel` assets get misrouted to the bundle path.
+        let assetExtensions: Set<String> = ["aimodel", "aimodelc"]
+        let isBundle =
+            !assetExtensions.contains(bundleURL.pathExtension)
+            && FileManager.default.fileExists(atPath: bundleURL.appending(path: "metadata.json").path)
+        if isBundle {
             try await runBundle(bundleURL: bundleURL, audioPath: audioPath, warmup: warmup, verbose: verbose)
         } else {
             try await runLegacy(model: model, audioPath: audioPath, warmup: warmup)
@@ -137,7 +144,8 @@ func runLegacy(model: String, audioPath: String?, warmup: Bool) async throws {
     print("⏳ Preparing AI asset...", terminator: "")
     fflush(stdout)
     let loadStart = ContinuousClock.now
-    let model = try await AIModel(contentsOf: modelURL)
+    let options = SpecializationOptions(preferredComputeUnitKind: .cpu)
+    let model = try await AIModel(contentsOf: modelURL, options: options)
     let loadElapsed = ContinuousClock.now - loadStart
     print(" done in \(String(format: "%.3f", loadElapsed.inSeconds))s\(cacheHit ? " (cache hit)" : "")")
     guard let fn = try model.loadFunction(named: "main")
@@ -162,10 +170,12 @@ func runLegacy(model: String, audioPath: String?, warmup: Bool) async throws {
             URL(fileURLWithPath: path), targetSampleRate: 16_000)
         let floats = MelSpectrogram.fromPCM(pcm)
         melArray = NDArray(descriptor: melNDDesc.resolvingDynamicDimensions([1, 128, 3000]))
-        fillNDArray(&melArray, as: Float.self, with: floats)
+        // `fillFloatNDArray`, not `fillNDArray(as: Float.self,…)`: an f16 export's
+        // `input_features` is an f16 tensor, and the strict variant traps on it.
+        fillFloatNDArray(&melArray, with: floats)
     } else {
         melArray = NDArray(descriptor: melNDDesc.resolvingDynamicDimensions([1, 128, 3000]))
-        fillNDArray(&melArray, as: Float.self, count: 128 * 3000) { _ in 0.0 }
+        fillFloatNDArray(&melArray, with: [Float](repeating: 0, count: 128 * 3000))
     }
 
     // Warmup

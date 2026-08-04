@@ -171,6 +171,35 @@ public enum MelSpectrogram {
         var melFrame = [Float](repeating: 0, count: config.nMelBins)
         var mel = [Float](repeating: 0, count: config.nMelBins * totalFrames)
 
+        // Split-complex scratch for the FFT path. Raw buffers rather than Arrays so the
+        // frame loop can hand vDSP a `DSPSplitComplex` without re-entering a
+        // `withUnsafeMutableBufferPointer` closure on every frame.
+        let half = max(config.nFFT / 2, 1)
+        let fftReal = UnsafeMutablePointer<Float>.allocate(capacity: half)
+        let fftImag = UnsafeMutablePointer<Float>.allocate(capacity: half)
+        fftReal.initialize(repeating: 0, count: half)
+        fftImag.initialize(repeating: 0, count: half)
+        defer {
+            fftReal.deallocate()
+            fftImag.deallocate()
+        }
+        var split = DSPSplitComplex(realp: fftReal, imagp: fftImag)
+
+        // The radix-2 setup for this frame size, when the size supports one. `Basis`
+        // already validated that nFFT is a power of two, so a nil here is an allocation
+        // failure for a table of nFFT constants — not a recoverable condition, and the
+        // dense tables were deliberately not built for this config.
+        let fftPlan: (setup: FFTSetup, log2n: vDSP_Length)?
+        if let log2n = basis.log2n {
+            guard let setup = vDSP_create_fftsetup(log2n, FFTRadix(kFFTRadix2)) else {
+                preconditionFailure("vDSP_create_fftsetup failed for nFFT=\(config.nFFT)")
+            }
+            fftPlan = (setup, log2n)
+        } else {
+            fftPlan = nil
+        }
+        defer { vDSP_destroy_fftsetup(fftPlan?.setup) }
+
         let logFloor: Float = 1e-10
         // Whisper clamps the mel floor then takes log10 (OpenAI convention); Parakeet/NeMo
         // adds a small guard *inside* a natural log — HF ParakeetFeatureExtractor uses
@@ -197,15 +226,36 @@ public enum MelSpectrogram {
             // Place the windowed slice into a zero-padded nFFT buffer.
             for i in 0..<config.nFFT { frame[i] = 0 }
             for i in 0..<config.winLength { frame[frameOffset + i] = windowed[i] }
-            cblas_sgemv(
-                CblasRowMajor, CblasNoTrans,
-                Int32(nFreqs), Int32(config.nFFT), 1.0, cosBasis, Int32(config.nFFT),
-                frame, 1, 0.0, &yReal, 1)
-            cblas_sgemv(
-                CblasRowMajor, CblasNoTrans,
-                Int32(nFreqs), Int32(config.nFFT), 1.0, sinBasis, Int32(config.nFFT),
-                frame, 1, 0.0, &yImag, 1)
-            vDSP_vmma(yReal, 1, yReal, 1, yImag, 1, yImag, 1, &powerSpec, 1, vDSP_Length(nFreqs))
+            if let fftPlan {
+                // Real-to-complex FFT. vDSP takes the frame deinterleaved into the
+                // split-complex halves (even samples → realp, odd → imagp).
+                frame.withUnsafeBufferPointer { p in
+                    p.baseAddress!.withMemoryRebound(to: DSPComplex.self, capacity: half) { c in
+                        vDSP_ctoz(c, 2, &split, 1, vDSP_Length(half))
+                    }
+                }
+                vDSP_fft_zrip(fftPlan.setup, &split, 1, fftPlan.log2n, FFTDirection(FFT_FORWARD))
+                // zrip scales its output by 2, and packs the two purely-real bins into
+                // element 0: realp[0] = 2·X[0], imagp[0] = 2·X[nFFT/2]. Undo both so
+                // powerSpec holds |X[k]|², matching the dense path below.
+                powerSpec[0] = 0.25 * fftReal[0] * fftReal[0]
+                powerSpec[half] = 0.25 * fftImag[0] * fftImag[0]
+                for k in 1..<half {
+                    powerSpec[k] = 0.25 * (fftReal[k] * fftReal[k] + fftImag[k] * fftImag[k])
+                }
+            } else {
+                // No radix-2 FFT for this nFFT (e.g. Whisper's 400 = 2⁴·5²) — evaluate
+                // the DFT as a dense matrix-vector product against the cos/sin tables.
+                cblas_sgemv(
+                    CblasRowMajor, CblasNoTrans,
+                    Int32(nFreqs), Int32(config.nFFT), 1.0, cosBasis, Int32(config.nFFT),
+                    frame, 1, 0.0, &yReal, 1)
+                cblas_sgemv(
+                    CblasRowMajor, CblasNoTrans,
+                    Int32(nFreqs), Int32(config.nFFT), 1.0, sinBasis, Int32(config.nFFT),
+                    frame, 1, 0.0, &yImag, 1)
+                vDSP_vmma(yReal, 1, yReal, 1, yImag, 1, yImag, 1, &powerSpec, 1, vDSP_Length(nFreqs))
+            }
             cblas_sgemv(
                 CblasRowMajor, CblasNoTrans,
                 Int32(config.nMelBins), Int32(nFreqs), 1.0, filterbank, Int32(nFreqs),
@@ -222,6 +272,7 @@ public enum MelSpectrogram {
         normalize(
             &mel, normalization: config.normalization,
             validFrames: validFrames, nMelBins: config.nMelBins, layout: config.layout)
+
         return mel
     }
 
@@ -403,13 +454,22 @@ public enum MelSpectrogram {
     /// that depends only on `MelConfig`.
     ///
     /// Split out so a caller transcribing repeatedly can build it once and hand it to
-    /// `fromPCM`, rather than reconstructing identical tables on every call. The DFT
-    /// basis is the bulk of it: `2 × (nFFT/2 + 1) × nFFT` floats, each a `cos`/`sin`.
+    /// `fromPCM`, rather than reconstructing identical tables on every call.
     public struct Basis: Sendable {
         let window: [Float]
+        let filterbank: [Float]
+
+        /// `log2(nFFT)` when `nFFT` is a power of two — the sizes `kFFTRadix2` handles. In
+        /// that case the STFT runs as an FFT and `cosBasis`/`sinBasis` stay empty;
+        /// otherwise this is nil and the dense tables below are built and used.
+        ///
+        /// Only the exponent is stored, not a vDSP setup: the setup is an opaque pointer
+        /// needing manual destruction, which would make `Basis` a reference type carrying
+        /// lifetime and concurrency annotations. `fromPCM` creates one per call instead —
+        /// it prepares a table of `nFFT` constants, far below one frame's work.
+        let log2n: vDSP_Length?
         let cosBasis: [Float]
         let sinBasis: [Float]
-        let filterbank: [Float]
 
         // Retained so `fromPCM` can check the basis it was handed matches its config.
         let nFFT: Int
@@ -417,11 +477,18 @@ public enum MelSpectrogram {
         let nMelBins: Int
 
         public init(config: MelConfig) {
-            let (cos, sin) = MelSpectrogram.dftBasis(nFFT: config.nFFT)
             self.window = MelSpectrogram.hannWindow(size: config.winLength)
-            self.cosBasis = cos
-            self.sinBasis = sin
             self.filterbank = MelSpectrogram.melFilterbank(config: config)
+            if config.nFFT > 1, config.nFFT & (config.nFFT - 1) == 0 {
+                self.log2n = vDSP_Length(config.nFFT.trailingZeroBitCount)
+                self.cosBasis = []
+                self.sinBasis = []
+            } else {
+                self.log2n = nil
+                let (cos, sin) = MelSpectrogram.dftBasis(nFFT: config.nFFT)
+                self.cosBasis = cos
+                self.sinBasis = sin
+            }
             self.nFFT = config.nFFT
             self.winLength = config.winLength
             self.nMelBins = config.nMelBins
@@ -438,9 +505,13 @@ public enum MelSpectrogram {
         var sin = [Float](repeating: 0, count: nFreqs * nFFT)
         for k in 0..<nFreqs {
             for n in 0..<nFFT {
-                let angle = 2 * Float.pi * Float(k) * Float(n) / Float(nFFT)
-                cos[k * nFFT + n] = Foundation.cos(angle)
-                sin[k * nFFT + n] = -Foundation.sin(angle)
+                // Reduce k·n modulo nFFT before scaling, and evaluate in Double: the
+                // basis is periodic in k·n, but forming 2π·k·n/nFFT directly pushes the
+                // angle into the thousands of radians where Float's absolute error
+                // (~1e-4 rad) shows up in the resulting power spectrum.
+                let angle = 2 * Double.pi * Double((k * n) % nFFT) / Double(nFFT)
+                cos[k * nFFT + n] = Float(Foundation.cos(angle))
+                sin[k * nFFT + n] = Float(-Foundation.sin(angle))
             }
         }
         return (cos, sin)

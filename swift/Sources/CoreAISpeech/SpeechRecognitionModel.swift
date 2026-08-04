@@ -85,8 +85,19 @@ public actor SpeechRecognitionModel {
 
     /// Warm the encoder and decoder for a specific PCM sample count so MPSGraph
     /// compiles and caches graphs for that input shape before real audio arrives.
+    ///
+    /// The encoder runs at the full `sampleCount`, since its graph is compiled per input
+    /// shape and that is the compilation worth paying for up front. The decoder graphs are
+    /// shape-static, so the frame loop is capped at one frame rather than decoding the
+    /// whole silence buffer — one pass compiles the same graphs.
     public func prewarm(sampleCount: Int) async throws {
-        _ = try await decodeAudio(pcm: [Float](repeating: 0, count: sampleCount))
+        let (encOut, encShape) = try await runEncoder(
+            pcm: [Float](repeating: 0, count: sampleCount))
+        _ = try await decoder.decode(
+            encoderOutput: encOut,
+            encoderOutputShape: encShape,
+            validEncoderFrames: 1,
+            resources: resources)
     }
 
     // MARK: - Transcription

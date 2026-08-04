@@ -82,8 +82,11 @@ public struct WhisperDecoder: SpeechDecoder {
         var valueCache = NDArray(descriptor: valCacheNDDesc.resolvingDynamicDimensions(vcShape))
 
         var encHSArray = NDArray(descriptor: encHSNDDesc.resolvingDynamicDimensions(encoderOutputShape))
-        let encFlat = readNDArray(encoderOutput, as: Float.self, count: encoderOutputShape.reduce(1, *))
-        fillNDArray(&encHSArray, as: Float.self, with: encFlat)
+        // Both sides dispatch on the array's own scalar type: an f16 export hands back an
+        // f16 encoder output and expects an f16 `encoder_hidden_states`, so reading or
+        // filling these as `Float` would trap on the scalar-type check.
+        let encFlat = flattenAsFloat(encoderOutput)
+        fillFloatNDArray(&encHSArray, with: encFlat)
 
         var logitsArray = NDArray(descriptor: logitsNDDesc.resolvingDynamicDimensions([1, 1, vocabSize]))
 
