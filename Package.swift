@@ -34,6 +34,10 @@ let package = Package(
             targets: ["CoreAISpeech"]
         ),
         .library(
+            name: "CoreAIVideoPipeline",
+            targets: ["CoreAIVideoPipeline"]
+        ),
+        .library(
             name: "CoreAIObjectDetection",
             targets: [
                 "CoreAIObjectDetector"
@@ -115,6 +119,20 @@ let package = Package(
             ]
         ),
 
+        // Video Pipeline
+        .target(
+            name: "CoreAIVideoPipeline",
+            dependencies: [
+                "CoreAIDiffusionPipeline",
+                "CoreAIShared",
+                .product(name: "Transformers", package: "swift-transformers"),
+            ],
+            path: "swift/Sources/CoreAIVideoPipeline",
+            swiftSettings: [
+                .enableUpcomingFeature("MemberImportVisibility")
+            ]
+        ),
+
         // CXGrammar C bridge
         .target(
             name: "CXGrammar",
@@ -183,6 +201,18 @@ let package = Package(
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ],
             path: "swift/Sources/Tools/speech-runner",
+            swiftSettings: [
+                .enableUpcomingFeature("MemberImportVisibility")
+            ]
+        ),
+        .executableTarget(
+            name: "video-runner",
+            dependencies: [
+                "CoreAIVideoPipeline",
+                "CoreAIShared",
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+            ],
+            path: "swift/Sources/Tools/video-runner",
             swiftSettings: [
                 .enableUpcomingFeature("MemberImportVisibility")
             ]

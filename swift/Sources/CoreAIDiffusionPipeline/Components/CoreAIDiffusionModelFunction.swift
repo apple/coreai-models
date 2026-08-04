@@ -56,14 +56,24 @@ public actor CoreAIDiffusionModelFunction {
             #if !((os(macOS) || targetEnvironment(macCatalyst)) && arch(x86_64))
             case .float16:
                 let view = array.mutableView(as: Float16.self)
-                view.withUnsafeMutablePointer { ptr, _, _ in
-                    for j in 0..<data.count { ptr[j] = Float16(data[j]) }
+                view.withUnsafeMutablePointer { ptr, shape, strides in
+                    Self.fillStrided(ptr, data: data, shape: shape, strides: strides) { Float16($0) }
+                }
+            case .bfloat16:
+                array.mutableRawView().withUnsafeMutableBytes { ptr, shape, strides in
+                    let dst = ptr.assumingMemoryBound(to: UInt16.self)
+                    Self.fillStrided(dst, data: data, shape: shape, strides: strides) { val in
+                        let bits = val.bitPattern
+                        let lsb = (bits >> 16) & 1
+                        let rounded = bits &+ 0x7FFF &+ lsb
+                        return UInt16(truncatingIfNeeded: rounded >> 16)
+                    }
                 }
             #endif
             case .float32:
                 let view = array.mutableView(as: Float.self)
-                view.withUnsafeMutablePointer { ptr, _, _ in
-                    for j in 0..<data.count { ptr[j] = data[j] }
+                view.withUnsafeMutablePointer { ptr, shape, strides in
+                    Self.fillStrided(ptr, data: data, shape: shape, strides: strides) { $0 }
                 }
             default:
                 throw CoreAIDiffusionError.unsupportedInputScalarType(resolved.scalarType)
@@ -161,17 +171,26 @@ public actor CoreAIDiffusionModelFunction {
         switch array.scalarType {
         #if !((os(macOS) || targetEnvironment(macCatalyst)) && arch(x86_64))
         case .float16:
-            array.view(as: Float16.self).withUnsafePointer { ptr, shape, _ in
+            array.view(as: Float16.self).withUnsafePointer { ptr, shape, strides in
                 let count = (0..<shape.count).reduce(1) { $0 * shape[$1] }
                 result.reserveCapacity(count)
-                for i in 0..<count { result.append(Float(ptr[i])) }
+                Self.readStrided(ptr, into: &result, shape: shape, strides: strides) { Float($0) }
+            }
+        case .bfloat16:
+            array.rawView().withUnsafeBytes { ptr, shape, strides in
+                let count = (0..<shape.count).reduce(1) { $0 * shape[$1] }
+                result.reserveCapacity(count)
+                let src = ptr.assumingMemoryBound(to: UInt16.self)
+                Self.readStrided(src, into: &result, shape: shape, strides: strides) { bits in
+                    Float(bitPattern: UInt32(bits) << 16)
+                }
             }
         #endif
         case .float32:
-            array.view(as: Float.self).withUnsafePointer { ptr, shape, _ in
+            array.view(as: Float.self).withUnsafePointer { ptr, shape, strides in
                 let count = (0..<shape.count).reduce(1) { $0 * shape[$1] }
                 result.reserveCapacity(count)
-                for i in 0..<count { result.append(ptr[i]) }
+                Self.readStrided(ptr, into: &result, shape: shape, strides: strides) { $0 }
             }
         default:
             throw CoreAIDiffusionError.unsupportedOutputScalarType(array.scalarType)
@@ -214,6 +233,65 @@ public actor CoreAIDiffusionModelFunction {
         }
         let dim = desc.shape[1]
         return dim > 0 ? dim : nil
+    }
+
+    // MARK: - Stride-aware fill/read helpers
+
+    /// Fill an NDArray buffer respecting non-contiguous strides.
+    private static func fillStrided<T>(
+        _ ptr: UnsafeMutablePointer<T>,
+        data: [Float],
+        shape: Span<Int>,
+        strides: Span<Int>,
+        convert: (Float) -> T
+    ) {
+        let ndim = shape.count
+        if ndim <= 1 {
+            for j in 0..<data.count { ptr[j] = convert(data[j]) }
+            return
+        }
+        var indices = [Int](repeating: 0, count: ndim)
+        for j in 0..<data.count {
+            var offset = 0
+            for d in 0..<ndim { offset += indices[d] * strides[d] }
+            ptr[offset] = convert(data[j])
+            var d = ndim - 1
+            while d >= 0 {
+                indices[d] += 1
+                if indices[d] < shape[d] { break }
+                indices[d] = 0
+                d -= 1
+            }
+        }
+    }
+
+    /// Read from an NDArray buffer respecting non-contiguous strides.
+    private static func readStrided<T>(
+        _ ptr: UnsafePointer<T>,
+        into result: inout [Float],
+        shape: Span<Int>,
+        strides: Span<Int>,
+        convert: (T) -> Float
+    ) {
+        let ndim = shape.count
+        let count = (0..<ndim).reduce(1) { $0 * shape[$1] }
+        if ndim <= 1 {
+            for i in 0..<count { result.append(convert(ptr[i])) }
+            return
+        }
+        var indices = [Int](repeating: 0, count: ndim)
+        for _ in 0..<count {
+            var offset = 0
+            for d in 0..<ndim { offset += indices[d] * strides[d] }
+            result.append(convert(ptr[offset]))
+            var d = ndim - 1
+            while d >= 0 {
+                indices[d] += 1
+                if indices[d] < shape[d] { break }
+                indices[d] = 0
+                d -= 1
+            }
+        }
     }
 }
 
