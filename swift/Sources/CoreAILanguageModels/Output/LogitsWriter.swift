@@ -308,31 +308,28 @@ public struct LogitsWriter {
     /// Handle all logits output based on provided options
     /// - Parameters:
     ///   - logits: Array of logits for each generated token
-    ///   - generatedText: The generated text
+    ///   - generatedTokenIds: Token IDs produced during generation (one per logits vector)
     ///   - tokenizer: Tokenizer for decoding token IDs
     ///   - saveLogitsLength: Specifies whether to save top-K or full logits
     ///   - saveJsonPath: Optional path to save logits as JSON
     ///   - printToConsole: Whether to print top-5 to console
     public static func handleOutput<T: BinaryFloatingPoint>(
         logits: [[T]],
-        generatedText: String,
+        generatedTokenIds: [Int],
         tokenizer: any Tokenizer,
         saveLogitsLength: LogitsLength,
         saveJsonPath: String?,
         printToConsole: Bool
     ) throws {
-        // Decode generated text to get token IDs
-        let generatedTokens = tokenizer.encode(text: generatedText)
-
         // Token count must match logits count - each generation step produces one token and one logits vector
-        guard generatedTokens.count == logits.count else {
+        guard generatedTokenIds.count == logits.count else {
             throw LogitsWriterError.tokenCountMismatch(
-                tokenCount: generatedTokens.count,
+                tokenCount: generatedTokenIds.count,
                 logitsCount: logits.count
             )
         }
 
-        let tokenCount = generatedTokens.count
+        let tokenCount = generatedTokenIds.count
 
         // Only build top-K array if we need it for printing or saving top-K
         let needsTopKArray = printToConsole || !saveLogitsLength.isFull
@@ -343,7 +340,7 @@ public struct LogitsWriter {
             if let jsonPath = saveJsonPath {
                 try saveFullJSON(
                     logits: logits,
-                    generatedTokens: generatedTokens,
+                    generatedTokens: generatedTokenIds,
                     tokenizer: tokenizer,
                     path: jsonPath
                 )
@@ -355,8 +352,8 @@ public struct LogitsWriter {
         let topK = saveLogitsLength.topKForConsole
         for index in 0..<tokenCount {
             let logitVector = logits[index]
-            let tokenId = Int32(generatedTokens[index])
-            let tokenText = tokenizer.decode(tokens: [generatedTokens[index]])
+            let tokenId = Int32(generatedTokenIds[index])
+            let tokenText = tokenizer.decode(tokens: [generatedTokenIds[index]])
 
             // Extract top-K logits
             let topLogits = extractTopK(

@@ -637,6 +637,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             let needsLogits = saveLogits != nil || printLogits
             let generatedText: String
             var allLogits: [[LogitsScalarType]] = []
+            var allTokenIds: [Int] = []
 
             if needsLogits {
                 // Generate with logits
@@ -646,6 +647,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
                     stopSequences: stopSequences
                 )
                 generatedText = result.text
+                allTokenIds = result.tokenIds
                 allLogits = result.logits
             } else {
                 // Standard generation without logits
@@ -681,7 +683,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             if needsLogits && !allLogits.isEmpty {
                 try LogitsWriter.handleOutput(
                     logits: allLogits,
-                    generatedText: generatedOnly,
+                    generatedTokenIds: allTokenIds,
                     tokenizer: tokenizer,
                     saveLogitsLength: saveLogitsLength,
                     saveJsonPath: saveLogits,
