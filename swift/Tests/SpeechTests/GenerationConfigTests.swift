@@ -43,7 +43,7 @@ struct GenerationConfigTests {
     @Test("Falls back to Whisper defaults when forced_decoder_ids has wrong format")
     func fallbackOnWrongFormat() throws {
         let json: [String: Any] = [
-            "forced_decoder_ids": [50258, 50259, 50360],  // flat array, not pairs
+            "forced_decoder_ids": [50258, 50259, 50360]  // flat array, not pairs
         ]
         let data = try JSONSerialization.data(withJSONObject: json)
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("gen_config3.json")
@@ -57,7 +57,7 @@ struct GenerationConfigTests {
     @Test("Skips null token IDs in forced_decoder_ids pairs")
     func skipsNullTokenIds() throws {
         let json: [String: Any] = [
-            "forced_decoder_ids": [[1, NSNull()], [2, 50360], [3, 50364]],
+            "forced_decoder_ids": [[1, NSNull()], [2, 50360], [3, 50364]]
         ]
         let data = try JSONSerialization.data(withJSONObject: json)
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("gen_config4.json")
@@ -71,7 +71,7 @@ struct GenerationConfigTests {
     @Test("Handles out-of-order positions")
     func outOfOrderPositions() throws {
         let json: [String: Any] = [
-            "forced_decoder_ids": [[3, 50360], [1, 50258], [2, 50259]],
+            "forced_decoder_ids": [[3, 50360], [1, 50258], [2, 50259]]
         ]
         let data = try JSONSerialization.data(withJSONObject: json)
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("gen_config5.json")
