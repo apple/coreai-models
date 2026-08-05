@@ -104,33 +104,6 @@ public struct PreparedModel: Sendable {
     /// Detected model structure (chunked/static vs dynamic).
     public let structure: ModelStructure
 
-    // MARK: - Core AI Model URL Resolution
-
-    /// If `url` is already `.aimodel`, returns it unchanged. Otherwise looks for
-    /// a sibling `.aimodel` directory with the same base name.
-    public static func resolveCoreAIModelURL(from url: URL) -> URL {
-        let ext = url.pathExtension
-
-        // Already a Core AI format
-        if ext == "aimodel" {
-            return url
-        }
-
-        // Check for sibling Core AI model directory
-        let parentDir = url.deletingLastPathComponent()
-        let baseName = url.deletingPathExtension().lastPathComponent
-
-        let candidate = parentDir.appendingPathComponent("\(baseName).aimodel")
-        if FileManager.default.fileExists(atPath: candidate.path) {
-            CLILogger.log(
-                "  - Resolved CoreAI model path: \(url.lastPathComponent) → \(candidate.lastPathComponent)")
-            return candidate
-        }
-
-        // Fall through to original URL (AIModel may still handle it)
-        return url
-    }
-
     // MARK: - Cache Inspection
 
     /// File extensions that identify a Core AI model asset (source or compiled).
@@ -175,8 +148,7 @@ public struct PreparedModel: Sendable {
     public static func clearCache(at url: URL) throws -> [URL] {
         let assetURLs = try modelAssetURLs(at: url)
         for assetURL in assetURLs {
-            let coreaiURL = resolveCoreAIModelURL(from: assetURL)
-            try AIModelCache.default.deleteEntries(for: coreaiURL)
+            try AIModelCache.default.deleteEntries(for: assetURL)
         }
         return assetURLs
     }
@@ -192,9 +164,8 @@ public struct PreparedModel: Sendable {
     ///   the ``isCached(at:)`` overload; callers that load via `AIModel(contentsOf:)` or a custom
     ///   `SpecializationOptions` must pass the same value here.
     public static func isCached(at url: URL, options: SpecializationOptions) -> Bool {
-        let coreaiURL = resolveCoreAIModelURL(from: url)
         do {
-            return try AIModelCache.default.model(for: coreaiURL, options: options) != nil
+            return try AIModelCache.default.model(for: url, options: options) != nil
         } catch {
             return false
         }
@@ -206,9 +177,8 @@ public struct PreparedModel: Sendable {
     /// Use this only for models loaded through ``prepare(at:)``. For other loaders, use
     /// ``isCached(at:options:)`` with the matching options.
     public static func isCached(at url: URL) -> Bool {
-        let coreaiURL = resolveCoreAIModelURL(from: url)
-        let options = probeStructure(at: coreaiURL).specializationOptions
-        return isCached(at: coreaiURL, options: options)
+        let options = probeStructure(at: url).specializationOptions
+        return isCached(at: url, options: options)
     }
 
     // MARK: - Asset Preparation
@@ -219,7 +189,7 @@ public struct PreparedModel: Sendable {
     /// dynamic models prefer GPU with frequent reshapes; chunked-static models prefer Neural Engine.
     ///
     /// - Parameters:
-    ///   - url: URL to the model asset (`.aimodel` bundle)
+    ///   - url: URL to the model asset (`.aimodel` or `.aimodelc` bundle)
     /// - Returns: Prepared asset with compiled library and detected structure
     /// - Throws: Error from `AIModel` if loading or specialization fails
     public static func prepare(

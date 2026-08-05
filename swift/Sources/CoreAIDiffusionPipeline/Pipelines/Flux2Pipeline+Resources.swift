@@ -4,6 +4,7 @@
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
 import CoreAI
+import CoreAIShared
 import Foundation
 import Tokenizers
 
@@ -114,15 +115,9 @@ extension Flux2Pipeline {
 
     /// Resolve an asset name to a filename, checking for .aimodel or .aimodelc.
     private static func resolveAsset(at url: URL, name: String) -> String? {
-        let fm = FileManager.default
-        let aimodel = "\(name).aimodel"
-        let aimodelc = "\(name).aimodelc"
-        if fm.fileExists(atPath: url.appendingPathComponent(aimodel).path) {
-            return aimodel
-        } else if fm.fileExists(atPath: url.appendingPathComponent(aimodelc).path) {
-            return aimodelc
-        }
-        return nil
+        let resolved = ModelBundle.resolveAssetURL("\(name).aimodel", in: url)
+        guard FileManager.default.fileExists(atPath: resolved.path) else { return nil }
+        return resolved.lastPathComponent
     }
 
     /// Probe available assets and pick the highest quality mode.
