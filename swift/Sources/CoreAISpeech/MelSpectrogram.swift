@@ -18,8 +18,6 @@ public struct MelConfig: Sendable {
     public let nMelBins: Int
     public let nFrames: Int
 
-    public var nSamples: Int { Int(sampleRate) * (nFrames * hopLength / Int(sampleRate / 100)) }
-
     /// Whisper / Parakeet shared parameters.
     public static let whisper = MelConfig(
         sampleRate: 16_000, nFFT: 400, hopLength: 160, nMelBins: 128, nFrames: 3_000)
