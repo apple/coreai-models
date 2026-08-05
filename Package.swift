@@ -266,6 +266,11 @@ let package = Package(
                 .linkedLibrary("c++")
             ]
         ),
+        .testTarget(
+            name: "SpeechTests",
+            dependencies: ["CoreAISpeech"],
+            path: "swift/Tests/SpeechTests"
+        ),
     ],
     swiftLanguageModes: [.v6],
     cxxLanguageStandard: .cxx17

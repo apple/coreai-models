@@ -100,7 +100,20 @@ public struct GenerationConfig: Sendable {
     init(from url: URL) throws {
         let data = try Data(contentsOf: url)
         let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
-        forcedPrefix = (json["forced_decoder_ids"] as? [Int]).map { $0.map { Int32($0) } } ?? Self.whisper.forcedPrefix
+        if let rawPairs = json["forced_decoder_ids"] as? [[Any]] {
+            // HF format: [[position, token_id], ...] where token_id can be null
+            var tokens: [(pos: Int, id: Int32)] = []
+            for pair in rawPairs {
+                guard pair.count >= 2,
+                    let pos = pair[0] as? Int,
+                    let id = pair[1] as? Int
+                else { continue }
+                tokens.append((pos: pos, id: Int32(id)))
+            }
+            forcedPrefix = tokens.sorted { $0.pos < $1.pos }.map(\.id)
+        } else {
+            forcedPrefix = Self.whisper.forcedPrefix
+        }
         eotToken = (json["eos_token_id"] as? Int).map { Int32($0) } ?? Self.whisper.eotToken
         maxDecodeSteps = (json["max_new_tokens"] as? Int) ?? Self.whisper.maxDecodeSteps
         tokenizerName = json["tokenizer_name"] as? String ?? Self.whisper.tokenizerName
