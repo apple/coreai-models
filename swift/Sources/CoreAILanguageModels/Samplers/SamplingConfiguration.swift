@@ -226,6 +226,14 @@ public struct SamplingConfiguration: Sendable, Equatable, Hashable {
     ///
     /// - Returns: A new configuration with redundant settings removed.
     public func normalized() -> SamplingConfiguration {
+        // topK=1 with temperature>0 is equivalent to greedy — promote it
+        if let k = topK, k == 1, temperature > 0 {
+            CLILogger.log(
+                "⚠️ SamplingConfiguration: topK=1 normalized to greedy (temperature=0)",
+                component: "Sampling")
+            return .greedy
+        }
+
         let effectiveTopK: Int?
         let effectiveTopP: Double?
         let effectiveMinP: Double?
