@@ -4,6 +4,7 @@
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
 import CoreAI
+import CoreAIShared
 import Foundation
 
 /// Loaded diffusion pipeline components backed by Core AI model functions.
@@ -51,14 +52,14 @@ extension PipelineDescriptor {
 
         // Create model functions
         let unetFunction = CoreAIDiffusionModelFunction(
-            modelURL: baseURL.appendingPathComponent(unetPath))
+            modelURL: ModelBundle.resolveAssetURL(unetPath, in: baseURL))
         let decoderFunction = CoreAIDiffusionModelFunction(
-            modelURL: baseURL.appendingPathComponent(decoderPath))
+            modelURL: ModelBundle.resolveAssetURL(decoderPath, in: baseURL))
 
         let encoderFunction: CoreAIDiffusionModelFunction?
         if let encoderPath = components.vaeEncoder {
             encoderFunction = CoreAIDiffusionModelFunction(
-                modelURL: baseURL.appendingPathComponent(encoderPath))
+                modelURL: ModelBundle.resolveAssetURL(encoderPath, in: baseURL))
         } else {
             encoderFunction = nil
         }
@@ -108,7 +109,7 @@ extension PipelineDescriptor {
         let textEncoderFunction: CoreAIDiffusionModelFunction
         if let tePath = components.textEncoder {
             textEncoderFunction = CoreAIDiffusionModelFunction(
-                modelURL: baseURL.appendingPathComponent(tePath))
+                modelURL: ModelBundle.resolveAssetURL(tePath, in: baseURL))
         } else {
             throw PipelineLoadError.missingComponent("text_encoder")
         }

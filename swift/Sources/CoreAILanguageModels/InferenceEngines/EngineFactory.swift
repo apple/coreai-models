@@ -25,7 +25,7 @@ public struct EngineFactory: Sendable {
     ///
     /// - Parameters:
     ///   - config: The JSON model configuration as raw data.
-    ///   - modelURL: The location of the model asset on disk.
+    ///   - modelURL: The location of the CoreAI model asset (`.aimodel` or `.aimodelc`).
     ///   - options: The engine options, including an optional variant override and KV cache
     ///     settings. Defaults to a value with auto-detection enabled and the `.auto` KV cache
     ///     strategy.
@@ -45,15 +45,12 @@ public struct EngineFactory: Sendable {
             CLILogger.log("  - kvCacheSize: \(size) (override)")
         }
 
-        // Step 2: Resolve model URL for Core AI path
-        let coreAIModelURL = PreparedModel.resolveCoreAIModelURL(from: modelURL)
-
-        // Step 3: Prepare model asset via Core AI
-        let preparedModel = try await PreparedModel.prepare(at: coreAIModelURL)
+        // Step 2: Prepare model asset via Core AI
+        let preparedModel = try await PreparedModel.prepare(at: modelURL)
 
         CLILogger.log("  - structure: \(preparedModel.structure.description)")
 
-        // Step 4: Resolve variant with structure detection
+        // Step 3: Resolve variant with structure detection
         let variant = try resolveVariant(
             override: options.variant,
             detectedStructure: preparedModel.structure
@@ -61,7 +58,7 @@ public struct EngineFactory: Sendable {
 
         CLILogger.log("  - resolved variant: \(variant.rawValue)")
 
-        // Step 5: Instantiate the appropriate engine
+        // Step 4: Instantiate the appropriate engine
         return try await selectEngine(
             variant: variant,
             config: parsedConfig,

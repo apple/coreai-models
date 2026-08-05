@@ -48,9 +48,10 @@ public struct ModelBundle: Sendable {
     }
 
     /// Resolve a component's URL within the bundle by role key.
+    /// Falls back to `.aimodelc` if the declared `.aimodel` path doesn't exist on disk.
     public func modelURL(for key: String) -> URL? {
         guard let path = assets[key] else { return nil }
-        return bundlePath.appending(path: path)
+        return Self.resolveAssetURL(path, in: bundlePath)
     }
 
     /// Required-component variant — throws `BundleError.missingField` if absent.
@@ -61,13 +62,27 @@ public struct ModelBundle: Sendable {
         return url
     }
 
+    /// Resolve an asset path against a directory, falling back from `.aimodel` to `.aimodelc`.
+    ///
+    /// When `coreai-build compile` produces a compiled `.aimodelc` from a source `.aimodel`,
+    /// metadata.json still references the original name. This finds the compiled variant
+    /// so users don't need to hand-edit metadata.json after compilation.
+    public static func resolveAssetURL(_ path: String, in directory: URL) -> URL {
+        let url = directory.appending(path: path)
+        if FileManager.default.fileExists(atPath: url.path) { return url }
+        if path.hasSuffix(".aimodel") {
+            let compiled = directory.appending(path: path + "c")
+            if FileManager.default.fileExists(atPath: compiled.path) { return compiled }
+        }
+        return url
+    }
+
     /// Verify all declared assets exist on disk. Throws `BundleError.missingAsset`
     /// with guidance if a component is missing (e.g. after manual compilation).
     public func verify() throws {
-        let fm = FileManager.default
         for (key, filename) in assets {
-            let url = bundlePath.appending(path: filename)
-            if !fm.fileExists(atPath: url.path) {
+            let url = Self.resolveAssetURL(filename, in: bundlePath)
+            if !FileManager.default.fileExists(atPath: url.path) {
                 throw BundleError.missingAsset(key: key, path: url)
             }
         }
