@@ -37,6 +37,7 @@ public struct Flux2Pipeline: DiffusionPipeline {
     private static let latentChannels = 128
     private static let textSeqLen = 512
     private static let defaultRopeTheta: Float = 2000.0
+    private static let qwen3PadTokenId = 151643
 
     /// FLUX.2 flow-matching timestep shift.
     ///
@@ -113,6 +114,12 @@ public struct Flux2Pipeline: DiffusionPipeline {
         self.batchNormMean = batchNormMean
         self.batchNormVar = batchNormVar
         self.batchNormEps = batchNormEps
+
+        if tokenizer.convertTokenToId("<|endoftext|>") == nil {
+            CLILogger.log(
+                "⚠️ Flux2Pipeline: tokenizer has no <|endoftext|> token, using Qwen3 fallback pad ID",
+                component: "Diffusion")
+        }
     }
 
     // MARK: - ResourceManaging
@@ -353,7 +360,7 @@ public struct Flux2Pipeline: DiffusionPipeline {
         // (diffusers 0.37.1, pipeline_flux2_klein.py `_get_qwen3_prompt_embeds`),
         // which uses pad_token. These ~490 padding tokens are fed to the DiT
         // UNMASKED, so the id must match the reference exactly.
-        let padTokenId = tokenizer.convertTokenToId("<|endoftext|>") ?? 151643
+        let padTokenId = tokenizer.convertTokenToId("<|endoftext|>") ?? Self.qwen3PadTokenId
 
         while ids.count < seqLen {
             ids.append(padTokenId)

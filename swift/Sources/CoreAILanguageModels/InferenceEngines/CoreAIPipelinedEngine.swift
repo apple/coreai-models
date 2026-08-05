@@ -688,6 +688,7 @@ private struct EngineImpl: ~Copyable {
     // MARK: - Sampler
 
     private mutating func getOrCreateSampler(for config: SamplingConfiguration) throws -> any MPSGraphSampler {
+        let config = config.normalized()
         let temperature = config.temperature
 
         if let existingSampler = cachedSampler, let existingTemp = cachedSamplerTemperature {
