@@ -118,33 +118,9 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
         }
         let hidden = cfg.decoderHiddenSize
         let vocabSize = cfg.vocabSize
-
-        guard encoderOutputShape.count == 3 else {
-            throw SpeechError.missingModel(
-                "Parakeet encoder must output rank-3 [B, T, H], got \(encoderOutputShape)")
-        }
-        guard encoderOutputShape[0] == 1 && encoderOutputShape[2] == hidden else {
-            throw SpeechError.missingModel(
-                "Encoder output shape \(encoderOutputShape) doesn't match config (B=1, H=\(hidden))")
-        }
-        // The token argmax scans `0..<vocabSize`, so a blank id outside that range could
-        // never win: `isBlank` would never fire, every frame's argmax would be emitted as
-        // a real token, and the blank-skip path would be dead code. The loop's blank
-        // bookkeeping rests on blank being a producible, unshared id — check it here
-        // rather than silently degrading to a garbage transcript.
-        guard cfg.blankTokenId >= 0, Int(cfg.blankTokenId) < vocabSize else {
-            throw SpeechError.missingModel(
-                "blank_token_id \(cfg.blankTokenId) is outside the vocab range 0..<\(vocabSize)")
-        }
-        // The joint emits `[vocab | durations]` along its last axis; both argmaxes below
-        // index that layout directly, so a mismatch would read duration logits out of the
-        // vocab range (or off the end of the row).
         let logitsSize = jointGraph.logits.shape.last!
-        guard logitsSize == vocabSize + cfg.durations.count else {
-            throw SpeechError.missingModel(
-                "Joint logits width \(logitsSize) doesn't match vocab \(vocabSize) + "
-                    + "\(cfg.durations.count) durations")
-        }
+        try Self.validate(
+            encoderOutputShape: encoderOutputShape, logitsSize: logitsSize, config: cfg)
 
         let tEnc = encoderOutputShape[1]
         if tEnc == 0 { return (tokens: [], stats: DecodeStats(stepTimesMs: [])) }
@@ -176,9 +152,14 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
         let emitCap = cap * cfg.maxSymbolsPerStep
 
         var stepTimesMs: [Double] = []
+        var coverage = DecodeStats.Coverage()
+        var capturedStep: (decoderOutput: [Float], newHidden: [Float], newCell: [Float])?
+        var capturedLogits: [Float]?
+
         while frame < cap && emitted.count < emitCap {
             let t0 = ContinuousClock.now
             var advance = 0
+            let emittedAtStepStart = emitted.count
             for _ in 0..<cfg.maxSymbolsPerStep {
                 // Exactly "the previous step predicted blank", not a proxy for it:
                 // `lastToken` is assigned from *every* prediction below (blanks included),
@@ -192,17 +173,22 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
                 let decBuf: [Float]
                 if !firstStep, wasInputBlank, let cached = cachedDecBuf {
                     decBuf = cached
+                    coverage.blankSkipReuses += 1
                 } else {
                     let stepped = try await runDecoderStep(
                         token: lastToken, hState: hState, cState: cState, buffers: &buffers)
                     decBuf = stepped.decoderOutput
                     cachedDecBuf = decBuf
+                    if capturedStep == nil { capturedStep = stepped }
 
                     // LSTM-state update rule: always on the very first call; afterwards only
                     // when the input was non-blank (matches HF cache.update mask=~blank_mask).
                     if firstStep || !wasInputBlank {
                         hState = stepped.newHidden
                         cState = stepped.newCell
+                        coverage.lstmStateAdvances += 1
+                    } else {
+                        coverage.lstmStateHelds += 1
                     }
                     firstStep = false
                 }
@@ -213,9 +199,10 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
                     decoderOutput: decBuf,
                     encoderFrame: encFlat[encOffset..<encOffset + hidden],
                     buffers: &buffers)
+                if capturedLogits == nil { capturedLogits = logitsFlat }
 
-                let bestTok = Int32(argmax(logitsFlat, in: 0..<vocabSize))
-                let dur = cfg.durations[argmax(logitsFlat, in: vocabSize..<logitsSize)]
+                let bestTok = Int32(Self.argmax(logitsFlat, in: 0..<vocabSize))
+                let dur = cfg.durations[Self.argmax(logitsFlat, in: vocabSize..<logitsSize)]
                 let isBlank = (bestTok == cfg.blankTokenId)
 
                 if !isBlank {
@@ -233,23 +220,79 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
                 // inner loop re-runs the joint on the same frame with the same (cached)
                 // decoder output until maxSymbolsPerStep is exhausted.
                 if isBlank && dur == 0 {
+                    coverage.blankZeroDurationBreaks += 1
                     advance = 1
                     break
                 }
 
                 if dur > 0 {
+                    coverage.positiveDurationBreaks += 1
                     advance = dur
                     break
                 }
             }
             // No duration > 0 was selected within max_symbols_per_step — force one frame
             // forward to guarantee outer-loop progress.
-            if advance == 0 { advance = 1 }
+            if advance == 0 {
+                coverage.symbolCapExhaustions += 1
+                advance = 1
+            }
+            switch emitted.count - emittedAtStepStart {
+            case 0: coverage.blankOnlySteps += 1
+            case 1: break
+            default: coverage.multiTokenSteps += 1
+            }
             stepTimesMs.append((ContinuousClock.now - t0).inMilliseconds)
             frame += advance
         }
 
-        return (tokens: emitted, stats: DecodeStats(stepTimesMs: stepTimesMs))
+        var capture: DecodeStats.FirstStep?
+        if let step = capturedStep, let logits = capturedLogits {
+            capture = DecodeStats.FirstStep(
+                decoderOutput: step.decoderOutput, newHiddenState: step.newHidden,
+                newCellState: step.newCell, jointLogits: logits)
+        }
+        return (
+            tokens: emitted,
+            stats: DecodeStats(
+                stepTimesMs: stepTimesMs, coverage: coverage, firstStep: capture)
+        )
+    }
+
+    /// Preconditions the decode loop's arithmetic depends on.
+    ///
+    /// Extracted from `decode` so it can be tested: the initializer needs two loaded `AIModel`s,
+    /// so guards left inline would be unreachable without model assets on disk.
+    package static func validate(
+        encoderOutputShape: [Int], logitsSize: Int, config: ParakeetTDTConfig
+    ) throws {
+        guard encoderOutputShape.count == 3 else {
+            throw SpeechError.missingModel(
+                "Parakeet encoder must output rank-3 [B, T, H], got \(encoderOutputShape)")
+        }
+        guard encoderOutputShape[0] == 1 && encoderOutputShape[2] == config.decoderHiddenSize else {
+            throw SpeechError.missingModel(
+                "Encoder output shape \(encoderOutputShape) doesn't match config "
+                    + "(B=1, H=\(config.decoderHiddenSize))")
+        }
+        // The token argmax scans `0..<vocabSize`, so a blank id outside that range could
+        // never win: `isBlank` would never fire, every frame's argmax would be emitted as
+        // a real token, and the blank-skip path would be dead code. The loop's blank
+        // bookkeeping rests on blank being a producible, unshared id — check it here
+        // rather than silently degrading to a garbage transcript.
+        guard config.blankTokenId >= 0, Int(config.blankTokenId) < config.vocabSize else {
+            throw SpeechError.missingModel(
+                "blank_token_id \(config.blankTokenId) is outside the vocab range "
+                    + "0..<\(config.vocabSize)")
+        }
+        // The joint emits `[vocab | durations]` along its last axis; both argmaxes in the loop
+        // index that layout directly, so a mismatch would read duration logits out of the
+        // vocab range (or off the end of the row).
+        guard logitsSize == config.vocabSize + config.durations.count else {
+            throw SpeechError.missingModel(
+                "Joint logits width \(logitsSize) doesn't match vocab \(config.vocabSize) + "
+                    + "\(config.durations.count) durations")
+        }
     }
 
     // MARK: - Graph invocations
@@ -310,7 +353,11 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
     /// Index of the largest value in `values[range]`, relative to `range.lowerBound`.
     /// Ties go to the lowest index, and an all-`-infinity` range yields 0 — matching the
     /// hand-rolled scans this replaces.
-    private func argmax(_ values: [Float], in range: Range<Int>) -> Int {
+    ///
+    /// `static` because it reads no instance state, which also lets it be unit-tested: the
+    /// initializer needs two loaded `AIModel`s, so an instance method here would be reachable
+    /// only with model assets on disk.
+    package static func argmax(_ values: [Float], in range: Range<Int>) -> Int {
         var best = range.lowerBound
         var bestVal: Float = -.infinity
         for i in range where values[i] > bestVal {

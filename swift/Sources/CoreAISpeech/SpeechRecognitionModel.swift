@@ -83,6 +83,18 @@ public actor SpeechRecognitionModel {
 
     public var sampleRate: Double { melConfig.sampleRate }
 
+    /// The mel features this model would hand its encoder for `pcm`, with the shape
+    /// the encoder expects them in.
+    ///
+    /// The transcription path computes these internally; this exposes them so a
+    /// verification harness can compare the Swift front-end against a reference
+    /// implementation without re-deriving the bundle's `MelConfig`.
+    public func melFeatures(pcm: [Float]) -> (values: [Float], shape: [Int]) {
+        let mel = MelSpectrogram.fromPCM(pcm, config: melConfig, basis: melBasis)
+        let nFrames = MelSpectrogram.frameCount(forPCMLength: pcm.count, config: melConfig)
+        return (mel, encoderInputShape(nFrames: nFrames))
+    }
+
     /// Warm the encoder and decoder for a specific PCM sample count so MPSGraph
     /// compiles and caches graphs for that input shape before real audio arrives.
     ///
@@ -112,6 +124,52 @@ public actor SpeechRecognitionModel {
     public func transcribe(pcm: [Float]) async throws -> (String, DecodeStats) {
         let (tokens, stats) = try await decodeAudio(pcm: pcm)
         return try (detokenize(tokens), stats)
+    }
+
+    // MARK: - Parity Testing
+
+    /// Intermediates from one transcription, for stage-by-stage parity checking.
+    ///
+    /// `transcribe` returns only text, which is a weak signal: a front-end error large
+    /// enough to shift every mel bin can still detokenize to the correct sentence. These
+    /// are the values a reference implementation can actually be compared against.
+    public struct StageCapture: Sendable {
+        public let mel: [Float]
+        public let melShape: [Int]
+        public let encoderHiddenStates: [Float]
+        public let encoderShape: [Int]
+        /// Emitted tokens, before detokenization — blanks already filtered for TDT.
+        public let tokens: [Int32]
+        public let text: String
+        /// Leading encoder frames treated as real audio (== `encoderShape[1]` when dynamic).
+        public let validEncoderFrames: Int
+        /// Decode-loop branch counts and first-step tensors for this transcription.
+        public let stats: DecodeStats
+    }
+
+    /// Transcribe `pcm`, returning each stage's output alongside the text.
+    ///
+    /// Recomputes the mel separately from `runEncoder`'s internal copy so the encoder
+    /// path stays untouched; that costs one extra front-end pass, which is irrelevant
+    /// on a verification path.
+    public func transcribeCapturingStages(pcm: [Float]) async throws -> StageCapture {
+        let (melValues, melShape) = melFeatures(pcm: pcm)
+        let (encOut, encShape) = try await runEncoder(pcm: pcm)
+        let validEnc = validEncoderFrames(pcmCount: pcm.count, tEnc: encShape[1])
+        // Copy the encoder output out *before* decoding. `decode` issues ~2 graph runs
+        // per emitted token, and reading `encOut` afterwards would report whatever those
+        // left in the buffer if the runtime recycles output storage.
+        let encoderValues = flattenAsFloat(encOut)
+        let (tokens, stats) = try await decoder.decode(
+            encoderOutput: encOut,
+            encoderOutputShape: encShape,
+            validEncoderFrames: validEnc,
+            resources: resources)
+        return StageCapture(
+            mel: melValues, melShape: melShape,
+            encoderHiddenStates: encoderValues, encoderShape: encShape,
+            tokens: tokens, text: try detokenize(tokens), validEncoderFrames: validEnc,
+            stats: stats)
     }
 
     // MARK: - Internals
@@ -164,9 +222,18 @@ public actor SpeechRecognitionModel {
     }
 
     private func encoderInputShape(nFrames: Int) -> [Int] {
-        switch melConfig.layout {
-        case .channelMajor: return [1, melConfig.nMelBins, nFrames]
-        case .timeMajor: return [1, nFrames, melConfig.nMelBins]
+        Self.encoderInputShape(nFrames: nFrames, config: melConfig)
+    }
+
+    /// The encoder's `input_features` shape for `nFrames` mel frames, in the config's layout.
+    ///
+    /// `static` and `MelConfig`-parameterized so it can be unit-tested: the actor's only
+    /// initializer loads a bundle and warms the graphs, so an instance method here would be
+    /// unreachable without model assets on disk.
+    package static func encoderInputShape(nFrames: Int, config: MelConfig) -> [Int] {
+        switch config.layout {
+        case .channelMajor: return [1, config.nMelBins, nFrames]
+        case .timeMajor: return [1, nFrames, config.nMelBins]
         }
     }
 
@@ -177,25 +244,32 @@ public actor SpeechRecognitionModel {
 
     private func decodeAudio(pcm: [Float]) async throws -> ([Int32], DecodeStats) {
         let (encOut, encShape) = try await runEncoder(pcm: pcm)
-        let tEnc = encShape[1]
-        // Exclude a static window's zero-padded tail: decode only the encoder frames
-        // that carry real audio. Estimated proportionally from the mel valid/total
-        // ratio and the encoder's actual output length (robust to conv edge effects).
-        // Round to nearest so the boundary frame is kept only when it's majority real
-        // audio — this drops the mostly-padding tail frame (a spurious trailing period)
-        // while keeping the final token. Dynamic exports have no padding (validEnc == tEnc).
-        let validEnc: Int
-        if let total = melConfig.nFrames {
-            let validMel = MelSpectrogram.validFrameCount(forPCMLength: pcm.count, config: melConfig)
-            validEnc = min(tEnc, max(1, Int((Double(validMel) / Double(total) * Double(tEnc)).rounded())))
-        } else {
-            validEnc = tEnc
-        }
         return try await decoder.decode(
             encoderOutput: encOut,
             encoderOutputShape: encShape,
-            validEncoderFrames: validEnc,
+            validEncoderFrames: validEncoderFrames(pcmCount: pcm.count, tEnc: encShape[1]),
             resources: resources)
+    }
+
+    /// How many leading encoder frames carry real audio.
+    ///
+    /// Excludes a static window's zero-padded tail: decode only the encoder frames
+    /// that carry real audio. Estimated proportionally from the mel valid/total ratio
+    /// and the encoder's actual output length (robust to conv edge effects). Rounds to
+    /// nearest so the boundary frame is kept only when it's majority real audio — this
+    /// drops the mostly-padding tail frame (a spurious trailing period) while keeping
+    /// the final token. Dynamic exports have no padding, so this returns `tEnc`.
+    ///
+    /// `static` and `MelConfig`-parameterized so the rounding heuristic can be unit-tested;
+    /// the actor cannot be constructed without model assets.
+    package static func validEncoderFrames(pcmCount: Int, tEnc: Int, config: MelConfig) -> Int {
+        guard let total = config.nFrames else { return tEnc }
+        let validMel = MelSpectrogram.validFrameCount(forPCMLength: pcmCount, config: config)
+        return min(tEnc, max(1, Int((Double(validMel) / Double(total) * Double(tEnc)).rounded())))
+    }
+
+    private func validEncoderFrames(pcmCount: Int, tEnc: Int) -> Int {
+        Self.validEncoderFrames(pcmCount: pcmCount, tEnc: tEnc, config: melConfig)
     }
 
     private func detokenize(_ tokens: [Int32]) throws -> String {

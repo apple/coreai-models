@@ -268,7 +268,10 @@ let package = Package(
         ),
         .testTarget(
             name: "SpeechTests",
-            dependencies: ["CoreAISpeech"],
+            dependencies: [
+                "CoreAISpeech",
+                "TestUtilities",
+            ],
             path: "swift/Tests/SpeechTests"
         ),
     ],

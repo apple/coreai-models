@@ -20,7 +20,7 @@ struct SpeechRecognizer: AsyncParsableCommand {
     )
 
     @Option(help: "Bundle dir (metadata.json + .aimodel assets) or single .aimodel (legacy)")
-    var model: String
+    var model: String?
 
     @Option(help: "Audio file (wav, flac, m4a, …). Omit for latency benchmarking with silence.")
     var audioPath: String?
@@ -37,7 +37,72 @@ struct SpeechRecognizer: AsyncParsableCommand {
     @Flag(name: .long, help: "Print verbose debug output")
     var verbose = false
 
+    @Option(
+        help:
+            "Write the computed mel features to this path as raw little-endian f32, plus a <path>.json sidecar with the shape. For front-end parity checks."
+    )
+    var dumpMel: String?
+
+    @Option(
+        name: .customLong("parity-test"),
+        help:
+            "Path to a directory of PyTorch reference traces (audio.wav, meta.json, ref_*.npy). Compares the runtime's own mel / encoder / tokens / transcript against them and exits non-zero on failure."
+    )
+    var parityTest: String?
+
+    @Option(help: "Minimum PSNR (dB) per tensor in --parity-test mode.")
+    var psnrFloor: Double = 29.5
+
+    @Option(
+        help:
+            "Minimum PSNR (dB) for the mel front-end in --parity-test mode. Tighter than --psnr-floor: the front-end is deterministic CPU arithmetic, so it agrees with the reference to ~100 dB."
+    )
+    var melPsnrFloor: Double = 80.0
+
+    @Option(
+        help:
+            "Minimum PSNR (dB) for the mel front-end in --parity-test mode when the input had to be resampled. The runtime resamples with AVAudioConverter and the reference with soxr_hq; their anti-aliasing filters differ in the transition band, so exact parity is not available. 30 dB separates AVAudioConverter and other correct resamplers (scipy resample_poly, soxr_vhq) from degraded ones (soxr_lq and below)."
+    )
+    var resampledMelPsnrFloor: Double = 30.0
+
+    @Option(
+        help:
+            "Minimum PSNR (dB) for the encoder in --parity-test mode when the input had to be resampled. Lower than the mel floor: the encoder compounds the front-end difference through the conformer stack."
+    )
+    var resampledEncoderPsnrFloor: Double = 25.0
+
+    @Option(
+        help:
+            "Minimum cosine similarity per tensor in --parity-test mode when the input had to be resampled."
+    )
+    var resampledCosineFloor: Double = 0.95
+
+    @Option(help: "Minimum cosine similarity per tensor in --parity-test mode. Not applied to resampled traces.")
+    var cosineFloor: Double = 0.999
+
+    func validate() throws {
+        if parityTest == nil && model == nil {
+            throw ValidationError("--model is required (unless --parity-test is set).")
+        }
+    }
+
     func run() async throws {
+        if let parityTest {
+            try await SpeechParityTest(
+                directory: URL(fileURLWithPath: parityTest),
+                modelPath: model,
+                psnrFloor: psnrFloor,
+                melPsnrFloor: melPsnrFloor,
+                resampledMelPsnrFloor: resampledMelPsnrFloor,
+                resampledEncoderPsnrFloor: resampledEncoderPsnrFloor,
+                resampledCosineFloor: resampledCosineFloor,
+                cosineFloor: cosineFloor
+            ).run()
+            return
+        }
+        guard let model else {
+            throw ValidationError("--model is required.")
+        }
         let bundleURL = URL(fileURLWithPath: model)
         if clearCoreAICache {
             try clearCache(bundleURL: bundleURL)
@@ -50,7 +115,9 @@ struct SpeechRecognizer: AsyncParsableCommand {
             !assetExtensions.contains(bundleURL.pathExtension)
             && FileManager.default.fileExists(atPath: bundleURL.appending(path: "metadata.json").path)
         if isBundle {
-            try await runBundle(bundleURL: bundleURL, audioPath: audioPath, warmup: warmup, verbose: verbose)
+            try await runBundle(
+                bundleURL: bundleURL, audioPath: audioPath, warmup: warmup, verbose: verbose,
+                dumpMel: dumpMel)
         } else {
             try await runLegacy(model: model, audioPath: audioPath, warmup: warmup)
         }
@@ -69,7 +136,9 @@ struct SpeechRecognizer: AsyncParsableCommand {
 
 // MARK: - Split bundle via CoreAISpeech
 
-func runBundle(bundleURL: URL, audioPath: String?, warmup: Bool, verbose: Bool) async throws {
+func runBundle(
+    bundleURL: URL, audioPath: String?, warmup: Bool, verbose: Bool, dumpMel: String? = nil
+) async throws {
     // The architecture is printed after loading, once the bundle has reported it.
     // Detect an existing cached specialization before loading so we can annotate the load time
     // below. Only inspects the cache; never specializes. Components are discovered by scanning
@@ -108,6 +177,16 @@ func runBundle(bundleURL: URL, audioPath: String?, warmup: Bool, verbose: Bool) 
         pcm = [Float](repeating: 0, count: 480_000)
     }
 
+    if let dumpMel {
+        let (values, shape) = await model.melFeatures(pcm: pcm)
+        let url = URL(fileURLWithPath: dumpMel)
+        try values.withUnsafeBufferPointer { Data(buffer: $0) }.write(to: url)
+        try JSONSerialization
+            .data(withJSONObject: ["shape": shape], options: [.prettyPrinted])
+            .write(to: URL(fileURLWithPath: dumpMel + ".json"))
+        print("Wrote mel \(shape) (\(values.count) floats) to \(dumpMel)")
+    }
+
     if warmup {
         print("Warming up…")
         try await model.prewarm(sampleCount: pcm.count)
@@ -138,10 +217,8 @@ func runLegacy(model: String, audioPath: String?, warmup: Bool) async throws {
     print("Format: legacy (monolithic, no KV cache)")
 
     let modelURL = URL(fileURLWithPath: model)
-    // TODO: Pinned to CPU because the monolithic f16 Whisper export decodes incorrectly on the
-    // default compute path — it logs repeated "ANE I/O op can only do F16 MemRef <-> F32 Tensor
-    // cast" warnings and the greedy loop hits EOT after 2 steps, transcribing jfk.wav as "you"
-    // instead of the full sentence. Drop this once the f16 export (or the ANE cast path) is fixed.
+    // TODO: Pinned to CPU because the monolithic f16/f32 Whisper export decodes incorrectly on the
+    // default compute path
     let options = SpecializationOptions(preferredComputeUnitKind: .cpu)
     // Detect an existing cached specialization before loading. Only inspects the cache; never
     // specializes. Probed with the same options the load uses: cache entries are keyed by them,

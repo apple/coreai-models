@@ -63,7 +63,8 @@ public struct MelConfig: Sendable {
         sampleRate: Double, nFFT: Int, winLength: Int, hopLength: Int,
         nMelBins: Int, nFrames: Int?, preemphasis: Float?,
         normalization: Normalization, layout: Layout,
-        padMode: PadMode, melScale: MelScale
+        padMode: PadMode, melScale: MelScale,
+        windowPeriodicity: WindowPeriodicity = .symmetric
     ) {
         self.sampleRate = sampleRate
         self.nFFT = nFFT
@@ -76,16 +77,34 @@ public struct MelConfig: Sendable {
         self.layout = layout
         self.padMode = padMode
         self.melScale = melScale
+        self.windowPeriodicity = windowPeriodicity
     }
 
     public let melScale: MelScale
 
+    /// Which Hann window convention to build.
+    ///
+    /// `torch.hann_window(N)` defaults to `periodic: true`, dividing by `N`; passing
+    /// `periodic: false` divides by `N - 1`. HF's Whisper extractor calls it bare and so
+    /// gets the periodic form, while Parakeet's passes `periodic=False`. The two differ
+    /// by one sample of taper — small, but applied identically to every frame.
+    public enum WindowPeriodicity: Sendable {
+        case periodic
+        case symmetric
+    }
+    public let windowPeriodicity: WindowPeriodicity
+
     /// Whisper v3-turbo parameters.
+    ///
+    /// Slaney mel scale, not HTK: HF's `WhisperFeatureExtractor` builds its filterbank
+    /// with `mel_scale="slaney"`, and reference OpenAI Whisper takes librosa's default
+    /// (`htk=False`), which is also Slaney. The two scales place every filter
+    /// differently, so HTK here shifts the whole spectrogram.
     public static let whisper = MelConfig(
         sampleRate: 16_000, nFFT: 400, winLength: 400, hopLength: 160,
         nMelBins: 128, nFrames: 3_000, preemphasis: nil,
         normalization: .whisperLogClip, layout: .channelMajor,
-        padMode: .reflect, melScale: .htk)
+        padMode: .reflect, melScale: .slaney, windowPeriodicity: .periodic)
 
     /// Parakeet TDT v3 parameters. Matches HF `ParakeetFeatureExtractor`: Slaney mel scale,
     /// per-mel-bin Bessel-corrected normalization (NeMo `per_feature`), zero-pad boundary,
@@ -95,7 +114,21 @@ public struct MelConfig: Sendable {
         sampleRate: 16_000, nFFT: 512, winLength: 400, hopLength: 160,
         nMelBins: 128, nFrames: nil, preemphasis: 0.97,
         normalization: .perBinMeanStd, layout: .timeMajor,
-        padMode: .constant, melScale: .slaney)
+        padMode: .constant, melScale: .slaney, windowPeriodicity: .symmetric)
+
+    /// A copy of this config with `nFrames` replaced.
+    ///
+    /// Exists so callers baking a traced frame count into a preset cannot silently drop a field:
+    /// the previous open-coded rebuild listed eleven of twelve properties and omitted
+    /// `windowPeriodicity`, which then fell back to the initializer default. That happened to match
+    /// the preset, so static and dynamic exports agreed by luck rather than by construction.
+    package func withNFrames(_ nFrames: Int?) -> MelConfig {
+        MelConfig(
+            sampleRate: sampleRate, nFFT: nFFT, winLength: winLength, hopLength: hopLength,
+            nMelBins: nMelBins, nFrames: nFrames, preemphasis: preemphasis,
+            normalization: normalization, layout: layout,
+            padMode: padMode, melScale: melScale, windowPeriodicity: windowPeriodicity)
+    }
 }
 
 // MARK: - MelSpectrogram
@@ -218,9 +251,16 @@ public enum MelSpectrogram {
             let offset = t * config.hopLength
             // Multiply the window straight out of `padded` via a base-pointer offset —
             // avoids allocating an `Array` slice on every frame in this hot loop.
+            //
+            // `+ frameOffset` matters when winLength < nFFT (Parakeet: 400 in 512).
+            // torch.stft pads the window to nFFT *centred* and multiplies the whole
+            // nFFT-sample frame, so the taper lands on padded[offset+frameOffset...],
+            // not padded[offset...]. Reading from `offset` here would window audio
+            // `frameOffset` samples early while still writing it to the centred slot
+            // below — a sub-hop misalignment that survives into every mel bin.
             padded.withUnsafeBufferPointer { p in
                 vDSP_vmul(
-                    p.baseAddress! + offset, 1,
+                    p.baseAddress! + offset + frameOffset, 1,
                     window, 1, &windowed, 1, vDSP_Length(config.winLength))
             }
             // Place the windowed slice into a zero-padded nFFT buffer.
@@ -289,15 +329,7 @@ public enum MelSpectrogram {
         // is valid.)
         let processing = file.processingFormat
         if processing.channelCount == 1 && processing.sampleRate == targetSampleRate {
-            guard
-                let buf = AVAudioPCMBuffer(
-                    pcmFormat: processing, frameCapacity: AVAudioFrameCount(file.length))
-            else { throw SpeechError.invalidAudio("Cannot allocate read buffer for \(url.lastPathComponent)") }
-            try file.read(into: buf)
-            guard let ch = buf.floatChannelData else {
-                throw SpeechError.invalidAudio("Expected float samples reading \(url.lastPathComponent)")
-            }
-            return Array(UnsafeBufferPointer(start: ch[0], count: Int(buf.frameLength)))
+            return try readAllSamples(file)
         }
 
         let fmt = AVAudioFormat(
@@ -311,21 +343,42 @@ public enum MelSpectrogram {
         let cap = AVAudioFrameCount(
             ceil(Double(file.length) * targetSampleRate / file.processingFormat.sampleRate) + 1)
         let out = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: cap)!
-        var fed = false
+        var readError: Error?
         var err: NSError?
         conv.convert(to: out, error: &err) { _, status in
-            guard !fed else {
+            // Feed successive chunks: one read is not guaranteed to return the whole
+            // file (see `readAllSamples`), and stopping after the first would hand the
+            // converter a truncated signal.
+            guard file.framePosition < file.length else {
                 status.pointee = .endOfStream
                 return nil
             }
-            fed = true
-            let buf = AVAudioPCMBuffer(
-                pcmFormat: file.processingFormat,
-                frameCapacity: AVAudioFrameCount(file.length))!
-            try? file.read(into: buf)
-            status.pointee = buf.frameLength > 0 ? .haveData : .endOfStream
+            let remaining = min(Int64(readChunkFrames), file.length - file.framePosition)
+            guard
+                let buf = AVAudioPCMBuffer(
+                    pcmFormat: file.processingFormat,
+                    frameCapacity: AVAudioFrameCount(remaining))
+            else {
+                status.pointee = .endOfStream
+                return nil
+            }
+            do {
+                try file.read(into: buf, frameCount: AVAudioFrameCount(remaining))
+            } catch {
+                // Surface the failure instead of silently ending the stream, which
+                // would look like a short file rather than an error.
+                readError = error
+                status.pointee = .endOfStream
+                return nil
+            }
+            guard buf.frameLength > 0 else {
+                status.pointee = .endOfStream
+                return nil
+            }
+            status.pointee = .haveData
             return buf
         }
+        if let readError { throw readError }
         if let e = err { throw SpeechError.invalidAudio(e.localizedDescription) }
         return Array(
             UnsafeBufferPointer(
@@ -333,9 +386,46 @@ public enum MelSpectrogram {
                 count: Int(out.frameLength)))
     }
 
+    /// Frames per `AVAudioFile.read` call. Any value works; this just bounds the
+    /// scratch buffer while keeping the number of reads small.
+    package static let readChunkFrames: AVAudioFrameCount = 1 << 16
+
+    /// Read an entire mono float file into `[Float]`.
+    ///
+    /// `AVAudioFile.read(into:)` reads *up to* the buffer's capacity and may stop early
+    /// at an internal packet boundary — a float32 WAV comes back several hundred frames
+    /// short of its length, silently truncating the audio and shifting every later mel
+    /// frame. Reading in a loop and accumulating is format-agnostic. Note
+    /// `read(into:frameCount:)` fills from the start of the buffer rather than
+    /// appending, so the samples are copied out after each call.
+    private static func readAllSamples(_ file: AVAudioFile) throws -> [Float] {
+        guard
+            let buf = AVAudioPCMBuffer(
+                pcmFormat: file.processingFormat, frameCapacity: readChunkFrames)
+        else {
+            throw SpeechError.invalidAudio("Cannot allocate read buffer for \(file.url.lastPathComponent)")
+        }
+        var samples = [Float]()
+        samples.reserveCapacity(Int(file.length))
+        // Bound by framePosition/length rather than reading until failure: a read that
+        // runs past the end throws eofErr (OSStatus -39) instead of returning zero
+        // frames, so "loop until empty" would surface as an error on every file.
+        while file.framePosition < file.length {
+            let remaining = min(Int64(readChunkFrames), file.length - file.framePosition)
+            try file.read(into: buf, frameCount: AVAudioFrameCount(remaining))
+            guard buf.frameLength > 0 else { break }
+            guard let ch = buf.floatChannelData else {
+                throw SpeechError.invalidAudio(
+                    "Expected float samples reading \(file.url.lastPathComponent)")
+            }
+            samples.append(contentsOf: UnsafeBufferPointer(start: ch[0], count: Int(buf.frameLength)))
+        }
+        return samples
+    }
+
     // MARK: Preprocessing
 
-    private static func applyPreemphasis(_ raw: [Float], alpha: Float?) -> [Float] {
+    package static func applyPreemphasis(_ raw: [Float], alpha: Float?) -> [Float] {
         guard let alpha, !raw.isEmpty else { return raw }
         var out = [Float](repeating: 0, count: raw.count)
         out[0] = raw[0]
@@ -343,7 +433,7 @@ public enum MelSpectrogram {
         return out
     }
 
-    private static func padToFrameGrid(_ raw: [Float], config: MelConfig) -> ([Float], Int) {
+    package static func padToFrameGrid(_ raw: [Float], config: MelConfig) -> ([Float], Int) {
         if let target = config.nFrames {
             // Static model: pad or truncate to exactly target frames.
             // validFrames = min(actual, target) so normalization only covers
@@ -362,18 +452,16 @@ public enum MelSpectrogram {
         // (torch.stft center=True semantics). We compute `validFrames = N//hop`
         // valid frames here; the caller appends a trailing zero frame to match
         // HF's tensor shape.
+        //
+        // The waveform is handed through whole. `validFrames` bounds how many frames
+        // are computed and normalized, not how much audio the STFT may read: rounding
+        // the input down to a whole number of hops would discard up to hopLength-1
+        // real samples, which the final frames' windows still reach into.
         let validFrames = raw.count / config.hopLength
-        let n = validFrames * config.hopLength
-        var audio = raw
-        if audio.count < n {
-            audio += [Float](repeating: 0, count: n - audio.count)
-        } else if audio.count > n {
-            audio = Array(audio.prefix(n))
-        }
-        return (audio, validFrames)
+        return (raw, validFrames)
     }
 
-    private static func padAudio(_ audio: [Float], pad: Int, mode: MelConfig.PadMode) -> [Float] {
+    package static func padAudio(_ audio: [Float], pad: Int, mode: MelConfig.PadMode) -> [Float] {
         let n = audio.count
         var padded = [Float](repeating: 0, count: n + 2 * pad)
         for i in 0..<n { padded[pad + i] = audio[i] }
@@ -387,7 +475,7 @@ public enum MelSpectrogram {
         return padded
     }
 
-    private static func normalize(
+    package static func normalize(
         _ mel: inout [Float],
         normalization: MelConfig.Normalization,
         validFrames: Int,
@@ -468,8 +556,8 @@ public enum MelSpectrogram {
     /// Split out so a caller transcribing repeatedly can build it once and hand it to
     /// `fromPCM`, rather than reconstructing identical tables on every call.
     public struct Basis: Sendable {
-        let window: [Float]
-        let filterbank: [Float]
+        package let window: [Float]
+        package let filterbank: [Float]
 
         /// `log2(nFFT)` when `nFFT` is a power of two — the sizes `kFFTRadix2` handles. In
         /// that case the STFT runs as an FFT and `cosBasis`/`sinBasis` stay empty;
@@ -479,17 +567,18 @@ public enum MelSpectrogram {
         /// needing manual destruction, which would make `Basis` a reference type carrying
         /// lifetime and concurrency annotations. `fromPCM` creates one per call instead —
         /// it prepares a table of `nFFT` constants, far below one frame's work.
-        let log2n: vDSP_Length?
-        let cosBasis: [Float]
-        let sinBasis: [Float]
+        package let log2n: vDSP_Length?
+        package let cosBasis: [Float]
+        package let sinBasis: [Float]
 
         // Retained so `fromPCM` can check the basis it was handed matches its config.
-        let nFFT: Int
-        let winLength: Int
-        let nMelBins: Int
+        package let nFFT: Int
+        package let winLength: Int
+        package let nMelBins: Int
 
         public init(config: MelConfig) {
-            self.window = MelSpectrogram.hannWindow(size: config.winLength)
+            self.window = MelSpectrogram.hannWindow(
+                size: config.winLength, periodicity: config.windowPeriodicity)
             self.filterbank = MelSpectrogram.melFilterbank(config: config)
             if config.nFFT > 1, config.nFFT & (config.nFFT - 1) == 0 {
                 self.log2n = vDSP_Length(config.nFFT.trailingZeroBitCount)
@@ -507,11 +596,14 @@ public enum MelSpectrogram {
         }
     }
 
-    private static func hannWindow(size: Int) -> [Float] {
-        (0..<size).map { Float(0.5 * (1 - cos(2 * Double.pi * Double($0) / Double(size - 1)))) }
+    package static func hannWindow(
+        size: Int, periodicity: MelConfig.WindowPeriodicity
+    ) -> [Float] {
+        let denom = Double(periodicity == .periodic ? size : size - 1)
+        return (0..<size).map { Float(0.5 * (1 - cos(2 * Double.pi * Double($0) / denom))) }
     }
 
-    private static func dftBasis(nFFT: Int) -> ([Float], [Float]) {
+    package static func dftBasis(nFFT: Int) -> ([Float], [Float]) {
         let nFreqs = nFFT / 2 + 1
         var cos = [Float](repeating: 0, count: nFreqs * nFFT)
         var sin = [Float](repeating: 0, count: nFreqs * nFFT)
@@ -529,7 +621,7 @@ public enum MelSpectrogram {
         return (cos, sin)
     }
 
-    private static func melFilterbank(config: MelConfig) -> [Float] {
+    package static func melFilterbank(config: MelConfig) -> [Float] {
         let nFreqs = config.nFFT / 2 + 1
         let fMax = Double(config.sampleRate) / 2
 

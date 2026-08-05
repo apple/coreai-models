@@ -17,9 +17,62 @@ public enum DecoderResources: Sendable {
 
 // MARK: - DecodeStats
 
-/// Per-step timing collected during the autoregressive decode loop.
+/// Per-step timing collected during the autoregressive decode loop, plus enough
+/// diagnostics to tell which branches of that loop an input actually reached.
 public struct DecodeStats: Sendable {
     public let stepTimesMs: [Double]
+
+    /// How often each branch of the TDT loop fired.
+    ///
+    /// The token sequence is a discrete, all-or-nothing check: argmax absorbs numeric
+    /// drift, so "tokens matched" says little about whether the blank-skip and duration
+    /// bookkeeping were exercised at all. These counts let a verification harness assert
+    /// that a given input reaches a given branch instead of assuming it does. Zero for
+    /// architectures without a transducer loop.
+    public struct Coverage: Sendable, Equatable {
+        /// Steps that reused the cached decoder output instead of re-running the LSTM.
+        public var blankSkipReuses = 0
+        /// Steps that ran the LSTM and adopted its new hidden/cell state.
+        public var lstmStateAdvances = 0
+        /// Steps that ran the LSTM but kept the previous state (input was blank).
+        public var lstmStateHelds = 0
+        /// `isBlank && dur == 0` — a blank choosing duration 0, forced forward one frame.
+        public var blankZeroDurationBreaks = 0
+        /// `dur > 0` — the ordinary exit from the inner symbol loop.
+        public var positiveDurationBreaks = 0
+        /// `maxSymbolsPerStep` exhausted without any duration > 0 being chosen.
+        public var symbolCapExhaustions = 0
+        /// Outer steps that emitted more than one non-blank token.
+        public var multiTokenSteps = 0
+        /// Outer steps that emitted no token at all.
+        public var blankOnlySteps = 0
+
+        public init() {}
+    }
+
+    public let coverage: Coverage
+
+    /// The first `decoder_step` and `joint` outputs of the decode.
+    ///
+    /// Retained so a harness can compare those graphs tensor-to-tensor as the runtime
+    /// actually drives them, rather than only through the token sequence. Costs one
+    /// retained copy of values already computed on that step.
+    public struct FirstStep: Sendable {
+        public let decoderOutput: [Float]
+        public let newHiddenState: [Float]
+        public let newCellState: [Float]
+        public let jointLogits: [Float]
+    }
+
+    public let firstStep: FirstStep?
+
+    public init(
+        stepTimesMs: [Double], coverage: Coverage = Coverage(), firstStep: FirstStep? = nil
+    ) {
+        self.stepTimesMs = stepTimesMs
+        self.coverage = coverage
+        self.firstStep = firstStep
+    }
 
     public var stepCount: Int { stepTimesMs.count }
     public var avgLatencyMs: Double {

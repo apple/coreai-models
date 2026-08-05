@@ -35,7 +35,7 @@ public struct SpeechRecognitionBundle: Sendable {
     /// Speech-recognizer architecture, read from the `architecture` field of the
     /// metadata's `config` block. Absent ⇒ `.whisper` (legacy bundles predate the
     /// field and only ever carried Whisper assets).
-    enum Architecture: String, Sendable, Decodable {
+    package enum Architecture: String, Sendable, Decodable {
         case whisper
         case parakeetTDT = "parakeet_tdt"
     }
@@ -89,7 +89,7 @@ public struct SpeechRecognitionBundle: Sendable {
 
     /// Read the speech architecture from the metadata's `config.architecture`
     /// field, defaulting to `.whisper` when the block or field is absent.
-    private static func architecture(from raw: Data) -> Architecture {
+    package static func architecture(from raw: Data) -> Architecture {
         struct Payload: Decodable {
             struct Config: Decodable { let architecture: Architecture? }
             let config: Config?
@@ -133,27 +133,20 @@ public struct SpeechRecognitionBundle: Sendable {
             case .ndArray(let nd) = desc.inputDescriptor(of: "input_features")
         {
             let tDim = MelConfig.parakeet.layout == .timeMajor ? 1 : 2
-            let dimVal = nd.shape[tDim]
-            if dimVal > 0 {
-                melConfig = MelConfig(
-                    sampleRate: MelConfig.parakeet.sampleRate,
-                    nFFT: MelConfig.parakeet.nFFT,
-                    winLength: MelConfig.parakeet.winLength,
-                    hopLength: MelConfig.parakeet.hopLength,
-                    nMelBins: MelConfig.parakeet.nMelBins,
-                    nFrames: dimVal,
-                    preemphasis: MelConfig.parakeet.preemphasis,
-                    normalization: MelConfig.parakeet.normalization,
-                    layout: MelConfig.parakeet.layout,
-                    padMode: MelConfig.parakeet.padMode,
-                    melScale: MelConfig.parakeet.melScale
-                )
-            }
+            melConfig = Self.melConfig(forEncoderTimeDim: nd.shape[tDim])
         }
 
         return ParakeetTDTAssets(
             encoder: encoder, decoderStep: decoderStep, joint: joint,
             config: config, melConfig: melConfig)
+    }
+
+    /// The mel config for an encoder whose time dimension is `dim`.
+    ///
+    /// A positive `dim` means a static export, so the traced frame count is baked in; a negative or
+    /// zero `dim` marks a dynamic axis and leaves `nFrames` nil.
+    package static func melConfig(forEncoderTimeDim dim: Int) -> MelConfig {
+        dim > 0 ? MelConfig.parakeet.withNFrames(dim) : .parakeet
     }
 
     // MARK: - Tokenizer loading
@@ -207,9 +200,17 @@ public struct SpeechRecognitionBundle: Sendable {
 ///
 /// Returns nil if the repo isn't cached. macOS-only: iOS has no user-level HF cache and
 /// `homeDirectoryForCurrentUser` is unavailable there.
-public func huggingFaceCacheSnapshot(forModelName name: String) -> URL? {
+///
+/// - Parameter root: the directory containing `.cache/huggingface/hub`. Defaults to the user's
+///   home directory; overridable so the resolution rules can be tested against a fixture tree
+///   instead of whatever happens to be in the developer's real cache.
+public func huggingFaceCacheSnapshot(
+    forModelName name: String,
+    root: URL = FileManager.default.homeDirectoryForCurrentUser
+) -> URL? {
     let fm = FileManager.default
-    let repoDir = fm.homeDirectoryForCurrentUser
+    let repoDir =
+        root
         .appending(path: ".cache/huggingface/hub")
         .appending(path: "models--" + name.replacingOccurrences(of: "/", with: "--"))
     let snapshotsDir = repoDir.appending(path: "snapshots")
