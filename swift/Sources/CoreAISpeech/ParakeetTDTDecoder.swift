@@ -12,7 +12,7 @@ import Foundation
 /// Drives the autoregressive (token, duration) loop in Swift, calling the exported
 /// `decoder_step` (single LSTM step) and `joint` graphs per emission. The LSTM
 /// hidden/cell state is owned here, seeded with zeros and only advanced when the
-/// step's input token — i.e. the previous prediction — is non-blank, matching the HF
+/// step's input symbol is non-blank, matching the HF
 /// `ParakeetTDTDecoderCache.update(..., mask=~blank_mask)` semantics.
 public struct ParakeetTDTDecoder: SpeechDecoder {
     /// The `decoder_step` graph plus the descriptors its buffers are built from.
@@ -140,15 +140,17 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
             step: stepGraph, joint: jointGraph,
             lstmShape: lstmShape, hidden: hidden, logitsSize: logitsSize)
 
-        // Swift-side LSTM state — zero-seeded, only advanced on non-blank emissions.
+        // Swift-side LSTM state — zero-seeded, advanced only on non-blank *input*.
         var hState = [Float](repeating: 0, count: lstmCount)
         var cState = [Float](repeating: 0, count: lstmCount)
 
-        var lastToken: Int32 = cfg.blankTokenId
+        // Previous iteration's symbol, blanks included — fed back as the next `input_ids`.
+        // Distinct from `emitted`, which keeps only the non-blank symbols.
+        var previousSymbol: Int32 = cfg.blankTokenId
         var emitted: [Int32] = []
         var frame = 0
         var firstStep = true
-        var cachedDecBuf: [Float]? = nil  // last decoder output; reused on blank-input frames
+        var cachedDecBuf: [Float]? = nil  // last decoder output; reused on blank-input iterations
         let emitCap = cap * cfg.maxSymbolsPerStep
 
         var stepTimesMs: [Double] = []
@@ -161,34 +163,33 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
             var advance = 0
             let emittedAtStepStart = emitted.count
             for _ in 0..<cfg.maxSymbolsPerStep {
-                // Exactly "the previous step predicted blank", not a proxy for it:
-                // `lastToken` is assigned from *every* prediction below (blanks included),
-                // `isBlank` is this same comparison, and `blank_token_id` is guaranteed
-                // above to be a value no real token can take. `firstStep` covers the SOS
-                // case, where there is no previous step to have emitted anything.
-                let wasInputBlank = (lastToken == cfg.blankTokenId)
+                // Per-iteration, not per-step: one step runs this loop up to
+                // `maxSymbolsPerStep` times, so the input here may be a symbol the same step
+                // just emitted. `firstStep` covers SOS.
+                let inputIsBlank = (previousSymbol == cfg.blankTokenId)
 
-                // HF blank-skip: when the cache is warm and the input is blank, reuse the
-                // last cached decoder output without re-running the LSTM step.
+                // Blank-skip (optimization): a blank input reproduces the last decoder
+                // output, since the state was held too.
                 let decBuf: [Float]
-                if !firstStep, wasInputBlank, let cached = cachedDecBuf {
+                if !firstStep, inputIsBlank, let cached = cachedDecBuf {
                     decBuf = cached
                     coverage.blankSkipReuses += 1
                 } else {
                     let stepped = try await runDecoderStep(
-                        token: lastToken, hState: hState, cState: cState, buffers: &buffers)
+                        token: previousSymbol, hState: hState, cState: cState,
+                        buffers: &buffers)
                     decBuf = stepped.decoderOutput
                     cachedDecBuf = decBuf
                     if capturedStep == nil { capturedStep = stepped }
 
-                    // LSTM-state update rule: always on the very first call; afterwards only
-                    // when the input was non-blank (matches HF cache.update mask=~blank_mask).
-                    if firstStep || !wasInputBlank {
+                    // Load-bearing: a blank carries no label, so the state must not absorb
+                    // it. Mirrors HF `cache.update(..., mask=~blank_mask)`. Blanks normally
+                    // never get here at all — they take the reuse branch above — but the
+                    // guard still has to hold if the cache is ever invalidated.
+                    if firstStep || !inputIsBlank {
                         hState = stepped.newHidden
                         cState = stepped.newCell
                         coverage.lstmStateAdvances += 1
-                    } else {
-                        coverage.lstmStateHelds += 1
                     }
                     firstStep = false
                 }
@@ -201,19 +202,17 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
                     buffers: &buffers)
                 if capturedLogits == nil { capturedLogits = logitsFlat }
 
-                let bestTok = Int32(Self.argmax(logitsFlat, in: 0..<vocabSize))
+                let symbol = Int32(Self.argmax(logitsFlat, in: 0..<vocabSize))
                 let dur = cfg.durations[Self.argmax(logitsFlat, in: vocabSize..<logitsSize)]
-                let isBlank = (bestTok == cfg.blankTokenId)
+                // Output-side counterpart to `inputIsBlank`; becomes it next iteration.
+                let isBlank = (symbol == cfg.blankTokenId)
 
                 if !isBlank {
-                    emitted.append(bestTok)
+                    emitted.append(symbol)
                 }
-                // HF appends *every* prediction — blanks included — to the sequence, and
-                // the next step's blank-skip test reads that last token. `emitted` is what
-                // filters blanks out of the transcript. Holding the last non-blank token
-                // here instead would keep re-feeding it to the LSTM and advance the state
-                // as if the label repeated.
-                lastToken = bestTok
+                // Carries blanks too, matching HF. Holding the last non-blank instead would
+                // re-feed it and advance the state as if the label repeated.
+                previousSymbol = symbol
 
                 // A blank that picks duration 0 still moves one frame forward, matching HF's
                 // `torch.where(blank_mask & (durations == 0), 1, durations)`. Without this the

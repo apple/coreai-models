@@ -246,7 +246,6 @@ struct SpeechParityTest {
         [
             ("blankSkipReuses", c.blankSkipReuses),
             ("lstmStateAdvances", c.lstmStateAdvances),
-            ("lstmStateHelds", c.lstmStateHelds),
             ("blankZeroDurationBreaks", c.blankZeroDurationBreaks),
             ("positiveDurationBreaks", c.positiveDurationBreaks),
             ("symbolCapExhaustions", c.symbolCapExhaustions),

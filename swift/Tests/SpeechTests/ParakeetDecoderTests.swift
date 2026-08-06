@@ -203,7 +203,6 @@ struct DecodeStatsTests {
         #expect(zero == DecodeStats.Coverage())
         #expect(zero.blankSkipReuses == 0)
         #expect(zero.lstmStateAdvances == 0)
-        #expect(zero.lstmStateHelds == 0)
         #expect(zero.blankZeroDurationBreaks == 0)
         #expect(zero.positiveDurationBreaks == 0)
         #expect(zero.symbolCapExhaustions == 0)

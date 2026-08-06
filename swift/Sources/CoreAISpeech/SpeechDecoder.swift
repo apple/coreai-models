@@ -30,12 +30,11 @@ public struct DecodeStats: Sendable {
     /// that a given input reaches a given branch instead of assuming it does. Zero for
     /// architectures without a transducer loop.
     public struct Coverage: Sendable, Equatable {
-        /// Steps that reused the cached decoder output instead of re-running the LSTM.
+        /// Inner-loop iterations that reused the cached decoder output instead of
+        /// re-running the LSTM. This is how a blank input avoids advancing the state.
         public var blankSkipReuses = 0
-        /// Steps that ran the LSTM and adopted its new hidden/cell state.
+        /// Iterations that ran the LSTM and adopted its new hidden/cell state.
         public var lstmStateAdvances = 0
-        /// Steps that ran the LSTM but kept the previous state (input was blank).
-        public var lstmStateHelds = 0
         /// `isBlank && dur == 0` — a blank choosing duration 0, forced forward one frame.
         public var blankZeroDurationBreaks = 0
         /// `dur > 0` — the ordinary exit from the inner symbol loop.
