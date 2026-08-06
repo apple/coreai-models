@@ -65,13 +65,14 @@ public class TextGenerator {
     ///   - prompt: Input text prompt
     ///   - maxTokens: Maximum number of tokens to generate
     ///   - stopSequences: Stop token sequences that halt generation. If nil, uses tokenizer's EOS tokens and common fallbacks.
-    /// - Returns: Tuple containing generated text and array of logits for each token
+    /// - Returns: Tuple containing generated text, token IDs, and array of logits for each token
     public func generateWithLogits(
         input: Input,
         maxTokens: Int = 50,
         stopSequences: StopSequences? = nil
-    ) async throws -> (text: String, logits: [[LogitsScalarType]]) {
+    ) async throws -> (text: String, tokenIds: [Int], logits: [[LogitsScalarType]]) {
         var textParts: [String] = []
+        var allTokenIds: [Int] = []
         var allLogits: [[LogitsScalarType]] = []
 
         // Use provided stop sequences, or create default ones from tokenizer
@@ -89,11 +90,12 @@ public class TextGenerator {
         for try await result in resultStream {
             textParts.append(result.text)
             if let logits = result.rawLogits {
+                allTokenIds.append(Int(result.tokenId))
                 allLogits.append(logits)
             }
         }
 
-        return (text: textParts.joined(), logits: allLogits)
+        return (text: textParts.joined(), tokenIds: allTokenIds, logits: allLogits)
     }
 
     /// Evaluate continuation probability (no generation)
