@@ -256,61 +256,15 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
             cachedLogitsBatchSize = batchSize
         }
 
-        // Build output backings (logits — written in-place)
-        var outputViews = InferenceFunction.MutableViews()
-        outputViews.insert(&logitsArray, for: logitsName)
-
-        // Build states and execute. MutableViews lifetime requires explicit local
-        // bindings — see StateHandler.swift for why this can't be abstracted.
-        var kv0 = kvCache[stateIndex: 0]
-        var kv1 = kvCache[stateIndex: 1]
-        if var handler = additionalStates {
-            switch handler.stateCount {
-            case 1:
-                var s0 = handler[stateIndex: 0]
-                var states = InferenceFunction.MutableViews()
-                states.insert(&kv0.array, for: kv0.name)
-                states.insert(&kv1.array, for: kv1.name)
-                states.insert(&s0.array, for: s0.name)
-                _ = try await function.run(
-                    inputs: [inputIdsName: inputIdsArray, positionIdsName: positionIds],
-                    states: consume states,
-                    outputViews: consume outputViews
-                )
-                handler[stateIndex: 0] = s0
-            case 2:
-                var s0 = handler[stateIndex: 0]
-                var s1 = handler[stateIndex: 1]
-                var states = InferenceFunction.MutableViews()
-                states.insert(&kv0.array, for: kv0.name)
-                states.insert(&kv1.array, for: kv1.name)
-                states.insert(&s0.array, for: s0.name)
-                states.insert(&s1.array, for: s1.name)
-                _ = try await function.run(
-                    inputs: [inputIdsName: inputIdsArray, positionIdsName: positionIds],
-                    states: consume states,
-                    outputViews: consume outputViews
-                )
-                handler[stateIndex: 0] = s0
-                handler[stateIndex: 1] = s1
-            default:
-                preconditionFailure(
-                    "Unsupported additional state count \(handler.stateCount). "
-                        + "Add a new case to handle \(handler.stateCount) states.")
-            }
-            additionalStates = handler
-        } else {
-            var states = InferenceFunction.MutableViews()
-            states.insert(&kv0.array, for: kv0.name)
-            states.insert(&kv1.array, for: kv1.name)
-            _ = try await function.run(
-                inputs: [inputIdsName: inputIdsArray, positionIdsName: positionIds],
-                states: consume states,
-                outputViews: consume outputViews
-            )
-        }
-        kvCache[stateIndex: 0] = kv0
-        kvCache[stateIndex: 1] = kv1
+        // Bind states, build output views, and execute
+        try await runWithStates(
+            function: function,
+            inputs: [inputIdsName: inputIdsArray, positionIdsName: positionIds],
+            primary: kvCache,
+            secondary: additionalStates,
+            outputArray: &logitsArray,
+            outputName: logitsName
+        )
 
         // Read logits from NDArray
         let totalLogits = batchSize * config.vocabSize

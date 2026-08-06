@@ -57,6 +57,7 @@ let package = Package(
             swiftSettings: [
                 .define("CXGRAMMAR_IMPORT"),
                 .enableUpcomingFeature("MemberImportVisibility"),
+                .enableExperimentalFeature("Lifetimes"),
             ],
             linkerSettings: [
                 .linkedLibrary("c++")
@@ -224,6 +225,9 @@ let package = Package(
             path: "swift/Tests/LanguageModelsTests",
             resources: [
                 .copy("Resources/MinimalTokenizer")
+            ],
+            swiftSettings: [
+                .enableExperimentalFeature("Lifetimes"),
             ],
             linkerSettings: [
                 .linkedLibrary("c++")
