@@ -253,8 +253,6 @@ func runLegacy(model: String, audioPath: String?, warmup: Bool) async throws {
             URL(fileURLWithPath: path), targetSampleRate: 16_000)
         let floats = MelSpectrogram.fromPCM(pcm)
         melArray = NDArray(descriptor: melNDDesc.resolvingDynamicDimensions([1, 128, 3000]))
-        // `fillFloatNDArray`, not `fillNDArray(as: Float.self,…)`: an f16 export's
-        // `input_features` is an f16 tensor, and the strict variant traps on it.
         fillFloatNDArray(&melArray, with: floats)
     } else {
         melArray = NDArray(descriptor: melNDDesc.resolvingDynamicDimensions([1, 128, 3000]))

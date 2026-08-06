@@ -27,9 +27,11 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
     }
 
     /// The `joint` graph plus the descriptors its buffers are built from.
+    ///
+    /// No `decoderIn`: the step graph's `decoder_output` buffer is handed to the joint
+    /// as `decoder_hidden_states` directly, so there's no second buffer to allocate.
     private struct JointGraph {
         let fn: InferenceFunction
-        let decoderIn: NDArrayDescriptor
         let encoderIn: NDArrayDescriptor
         let logits: NDArrayDescriptor
     }
@@ -38,12 +40,15 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
     /// place on each step rather than reallocated per emission.
     private struct Buffers {
         var inputIds: NDArray
+        /// LSTM state, double-buffered: a step reads `hIn`/`cIn` and writes `hOut`/`cOut`,
+        /// and the call site swaps each pair to adopt the new state.
         var hIn: NDArray
         var cIn: NDArray
-        var decOut: NDArray
         var hOut: NDArray
         var cOut: NDArray
-        var jointDecIn: NDArray
+        /// Doubles as the joint's `decoder_hidden_states` input: same `[1, 1, hidden]` shape,
+        /// same precision, so the step's output needs no copy to become the joint's input.
+        var decOut: NDArray
         var jointEncIn: NDArray
         var logits: NDArray
 
@@ -54,14 +59,18 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
             inputIds = NDArray(descriptor: step.inputIds.resolvingDynamicDimensions([1, 1]))
             hIn = NDArray(descriptor: step.hiddenIn.resolvingDynamicDimensions(lstmShape))
             cIn = NDArray(descriptor: step.cellIn.resolvingDynamicDimensions(lstmShape))
-            decOut = NDArray(descriptor: step.decoderOut.resolvingDynamicDimensions([1, 1, hidden]))
             hOut = NDArray(descriptor: step.newHidden.resolvingDynamicDimensions(lstmShape))
             cOut = NDArray(descriptor: step.newCell.resolvingDynamicDimensions(lstmShape))
-            jointDecIn = NDArray(
-                descriptor: joint.decoderIn.resolvingDynamicDimensions([1, 1, hidden]))
+            decOut = NDArray(descriptor: step.decoderOut.resolvingDynamicDimensions([1, 1, hidden]))
             jointEncIn = NDArray(
                 descriptor: joint.encoderIn.resolvingDynamicDimensions([1, 1, hidden]))
             logits = NDArray(descriptor: joint.logits.resolvingDynamicDimensions([1, 1, logitsSize]))
+
+            // The first step reads `hIn`/`cIn` before anything has written them, so seed the
+            // zero state here rather than relying on fresh-allocation contents.
+            let zeros = [Float](repeating: 0, count: lstmShape.reduce(1, *))
+            fillFloatNDArray(&hIn, with: zeros)
+            fillFloatNDArray(&cIn, with: zeros)
         }
     }
 
@@ -93,7 +102,7 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
             case .ndArray(let newCellDesc) = stepDesc.outputDescriptor(of: "new_cell_state")
         else { throw SpeechError.missingModel("Unexpected decoder_step descriptors") }
 
-        guard case .ndArray(let jointDecDesc) = jointDesc.inputDescriptor(of: "decoder_hidden_states"),
+        guard case .ndArray(_) = jointDesc.inputDescriptor(of: "decoder_hidden_states"),
             case .ndArray(let jointEncDesc) = jointDesc.inputDescriptor(of: "encoder_hidden_states"),
             case .ndArray(let logitsDesc) = jointDesc.outputDescriptor(of: "logits")
         else { throw SpeechError.missingModel("Unexpected joint descriptors") }
@@ -101,8 +110,7 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
         self.stepGraph = StepGraph(
             fn: stepFn, inputIds: inputIdsDesc, hiddenIn: hiddenInDesc, cellIn: cellInDesc,
             decoderOut: decoderOutDesc, newHidden: newHiddenDesc, newCell: newCellDesc)
-        self.jointGraph = JointGraph(
-            fn: jointFn, decoderIn: jointDecDesc, encoderIn: jointEncDesc, logits: logitsDesc)
+        self.jointGraph = JointGraph(fn: jointFn, encoderIn: jointEncDesc, logits: logitsDesc)
     }
 
     public func decode(
@@ -130,7 +138,6 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
         // of frames that carry real audio. Dynamic exports pass tEnc, so cap == tEnc.
         let cap = max(1, min(tEnc, validEncoderFrames))
         let lstmShape = [cfg.numDecoderLayers, 1, hidden]
-        let lstmCount = cfg.numDecoderLayers * hidden
 
         // Pull the full encoder output once; slice frame-by-frame in pure Swift.
         // flattenAsFloat inspects the array's own scalar type, so this reads an
@@ -140,17 +147,12 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
             step: stepGraph, joint: jointGraph,
             lstmShape: lstmShape, hidden: hidden, logitsSize: logitsSize)
 
-        // Swift-side LSTM state — zero-seeded, advanced only on non-blank *input*.
-        var hState = [Float](repeating: 0, count: lstmCount)
-        var cState = [Float](repeating: 0, count: lstmCount)
-
         // Previous iteration's symbol, blanks included — fed back as the next `input_ids`.
         // Distinct from `emitted`, which keeps only the non-blank symbols.
         var previousSymbol: Int32 = cfg.blankTokenId
         var emitted: [Int32] = []
         var frame = 0
         var firstStep = true
-        var cachedDecBuf: [Float]? = nil  // last decoder output; reused on blank-input iterations
         let emitCap = cap * cfg.maxSymbolsPerStep
 
         var stepTimesMs: [Double] = []
@@ -169,26 +171,32 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
                 let inputIsBlank = (previousSymbol == cfg.blankTokenId)
 
                 // Blank-skip (optimization): a blank input reproduces the last decoder
-                // output, since the state was held too.
-                let decBuf: [Float]
-                if !firstStep, inputIsBlank, let cached = cachedDecBuf {
-                    decBuf = cached
+                // output, since the state was held too — and `buffers.decOut` still holds
+                // it, because this branch doesn't run the step graph that would overwrite it.
+                if !firstStep, inputIsBlank {
                     coverage.blankSkipReuses += 1
                 } else {
-                    let stepped = try await runDecoderStep(
-                        token: previousSymbol, hState: hState, cState: cState,
-                        buffers: &buffers)
-                    decBuf = stepped.decoderOutput
-                    cachedDecBuf = decBuf
-                    if capturedStep == nil { capturedStep = stepped }
+                    try await runDecoderStep(token: previousSymbol, buffers: &buffers)
+
+                    // Parity capture only: gating on nil keeps the flattens to once per decode
+                    // instead of once per step, and reads `hOut`/`cOut` before the swap below.
+                    if capturedStep == nil {
+                        capturedStep = (
+                            decoderOutput: flattenAsFloat(buffers.decOut),
+                            newHidden: flattenAsFloat(buffers.hOut),
+                            newCell: flattenAsFloat(buffers.cOut)
+                        )
+                    }
 
                     // Load-bearing: a blank carries no label, so the state must not absorb
                     // it. Mirrors HF `cache.update(..., mask=~blank_mask)`. Blanks normally
                     // never get here at all — they take the reuse branch above — but the
-                    // guard still has to hold if the cache is ever invalidated.
+                    // guard still has to hold if that branch is ever changed. Not adopting
+                    // means not swapping: `hIn`/`cIn` keep the state the step ran from, and
+                    // the next step overwrites `hOut`/`cOut`.
                     if firstStep || !inputIsBlank {
-                        hState = stepped.newHidden
-                        cState = stepped.newCell
+                        swap(&buffers.hIn, &buffers.hOut)
+                        swap(&buffers.cIn, &buffers.cOut)
                         coverage.lstmStateAdvances += 1
                     }
                     firstStep = false
@@ -197,7 +205,6 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
                 // Joint(decoder_output, encoder[:, frame:frame+1, :]).
                 let encOffset = frame * hidden
                 let logitsFlat = try await runJoint(
-                    decoderOutput: decBuf,
                     encoderFrame: encFlat[encOffset..<encOffset + hidden],
                     buffers: &buffers)
                 if capturedLogits == nil { capturedLogits = logitsFlat }
@@ -296,18 +303,14 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
 
     // MARK: - Graph invocations
 
-    /// One LSTM step: feed `token` at (`hState`, `cState`) and return the decoder output
-    /// alongside the resulting state.
+    /// One LSTM step: feed `token` at the state in `buffers.hIn`/`cIn`, leaving the decoder
+    /// output in `buffers.decOut` and the resulting state in `buffers.hOut`/`cOut`.
     ///
-    /// Returning the new state rather than storing it keeps the decision of *whether* to
-    /// adopt it — the HF `mask=~blank_mask` rule — at the call site with the blank
-    /// bookkeeping it depends on.
-    private func runDecoderStep(
-        token: Int32, hState: [Float], cState: [Float], buffers: inout Buffers
-    ) async throws -> (decoderOutput: [Float], newHidden: [Float], newCell: [Float]) {
+    /// Writing the new state to the output buffers rather than adopting it keeps the decision
+    /// of *whether* to adopt — the HF `mask=~blank_mask` rule — at the call site with the
+    /// blank bookkeeping it depends on. The call site adopts by swapping the buffer pairs.
+    private func runDecoderStep(token: Int32, buffers: inout Buffers) async throws {
         fillNDArray(&buffers.inputIds, as: Int32.self, with: [token])
-        fillFloatNDArray(&buffers.hIn, with: hState)
-        fillFloatNDArray(&buffers.cIn, with: cState)
 
         var stepOut = InferenceFunction.MutableViews()
         stepOut.insert(&buffers.decOut, for: "decoder_output")
@@ -321,26 +324,22 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
             ],
             states: InferenceFunction.MutableViews(),
             outputViews: consume stepOut)
-
-        return (
-            decoderOutput: flattenAsFloat(buffers.decOut),
-            newHidden: flattenAsFloat(buffers.hOut),
-            newCell: flattenAsFloat(buffers.cOut)
-        )
     }
 
     /// `joint(decoder_output, encoder_frame)` → the flattened `[vocab | durations]` row.
+    ///
+    /// The decoder side comes straight from `buffers.decOut`, whether the last step wrote it
+    /// or the blank-skip branch left it in place.
     private func runJoint(
-        decoderOutput: [Float], encoderFrame: ArraySlice<Float>, buffers: inout Buffers
+        encoderFrame: ArraySlice<Float>, buffers: inout Buffers
     ) async throws -> [Float] {
-        fillFloatNDArray(&buffers.jointDecIn, with: decoderOutput)
         fillFloatNDArray(&buffers.jointEncIn, with: encoderFrame)
 
         var jointOut = InferenceFunction.MutableViews()
         jointOut.insert(&buffers.logits, for: "logits")
         _ = try await jointGraph.fn.run(
             inputs: [
-                "decoder_hidden_states": buffers.jointDecIn,
+                "decoder_hidden_states": buffers.decOut,
                 "encoder_hidden_states": buffers.jointEncIn,
             ],
             states: InferenceFunction.MutableViews(),

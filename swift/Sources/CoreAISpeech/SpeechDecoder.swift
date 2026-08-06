@@ -120,7 +120,7 @@ public struct WhisperDecoder: SpeechDecoder {
 
         guard case .ndArray(let inputIdsNDDesc) = decDesc.inputDescriptor(of: "input_ids"),
             case .ndArray(let posIdsNDDesc) = decDesc.inputDescriptor(of: "position_ids"),
-            case .ndArray(let encHSNDDesc) = decDesc.inputDescriptor(of: "encoder_hidden_states"),
+            case .ndArray(_) = decDesc.inputDescriptor(of: "encoder_hidden_states"),
             case .ndArray(let keyCacheNDDesc) = decDesc.stateDescriptor(of: "keyCache"),
             case .ndArray(let valCacheNDDesc) = decDesc.stateDescriptor(of: "valueCache"),
             case .ndArray(let logitsNDDesc) = decDesc.outputDescriptor(of: "logits")
@@ -132,14 +132,6 @@ public struct WhisperDecoder: SpeechDecoder {
         let vcShape = valCacheNDDesc.shape.map { $0 < 0 ? maxTargetPos : $0 }
         var keyCache = NDArray(descriptor: keyCacheNDDesc.resolvingDynamicDimensions(kcShape))
         var valueCache = NDArray(descriptor: valCacheNDDesc.resolvingDynamicDimensions(vcShape))
-
-        var encHSArray = NDArray(descriptor: encHSNDDesc.resolvingDynamicDimensions(encoderOutputShape))
-        // Both sides dispatch on the array's own scalar type: an f16 export hands back an
-        // f16 encoder output and expects an f16 `encoder_hidden_states`, so reading or
-        // filling these as `Float` would trap on the scalar-type check.
-        let encFlat = flattenAsFloat(encoderOutput)
-        fillFloatNDArray(&encHSArray, with: encFlat)
-
         var logitsArray = NDArray(descriptor: logitsNDDesc.resolvingDynamicDimensions([1, 1, vocabSize]))
 
         func step(_ tok: Int32, pos: Int) async throws {
@@ -155,7 +147,7 @@ public struct WhisperDecoder: SpeechDecoder {
             _ = try await decFn.run(
                 inputs: [
                     "input_ids": ids, "position_ids": posIds,
-                    "encoder_hidden_states": encHSArray,
+                    "encoder_hidden_states": encoderOutput,
                 ],
                 states: consume st, outputViews: consume out)
         }
