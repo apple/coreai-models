@@ -27,7 +27,16 @@ public struct CIEnvironment {
 /// - encode("hello") → [104, 101, 108, 108, 111] (UTF-8 bytes)
 /// - decode([104, 101, 108, 108, 111]) → "hello"
 public struct MockTokenizer: Tokenizer, Sendable {
-    public init() {}
+    /// Optional explicit vocabulary for multi-character (special) tokens.
+    /// When non-empty it becomes authoritative for `convertTokenToId`: known
+    /// tokens map to their listed ID and unknown tokens return `nil`, instead of
+    /// the default first-UTF-8-byte behaviour (which collides for tokens sharing
+    /// a leading character, e.g. `<eos>` and `<end_of_turn>`).
+    public let vocab: [String: Int]
+
+    public init(vocab: [String: Int] = [:]) {
+        self.vocab = vocab
+    }
 
     public var bosToken: String? { nil }
     public var bosTokenId: Int? { nil }
@@ -62,7 +71,8 @@ public struct MockTokenizer: Tokenizer, Sendable {
     }
 
     public func convertTokenToId(_ token: String) -> Int? {
-        token.utf8.first.map { Int($0) }
+        if !vocab.isEmpty { return vocab[token] }
+        return token.utf8.first.map { Int($0) }
     }
 
     public func convertTokensToIds(_ tokens: [String]) -> [Int?] {
