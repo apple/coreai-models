@@ -14,7 +14,7 @@ struct FrameSamplingStrategyTests {
     @Test("Uniform sampling with 8 frames from 30fps 10s video")
     func uniformSamplingBasic() {
         let timestamps = FrameSamplingStrategy.uniform(count: 8)
-            .timestamps(forDuration: 10.0, videoFrameRate: 30.0)
+            .sampleTimes(forDuration: 10.0, videoFrameRate: 30.0)
         #expect(timestamps.count == 8)
         // Frames should be evenly spaced
         for i in 1..<timestamps.count {
@@ -29,7 +29,7 @@ struct FrameSamplingStrategyTests {
     @Test("Uniform sampling with single frame returns midpoint")
     func uniformSamplingSingleFrame() {
         let timestamps = FrameSamplingStrategy.uniform(count: 1)
-            .timestamps(forDuration: 10.0, videoFrameRate: 30.0)
+            .sampleTimes(forDuration: 10.0, videoFrameRate: 30.0)
         #expect(timestamps.count == 1)
         #expect(timestamps[0] == 5.0)
     }
@@ -38,35 +38,35 @@ struct FrameSamplingStrategyTests {
     func uniformSamplingMoreThanAvailable() {
         // 5 frames total at 1fps for 5 seconds
         let timestamps = FrameSamplingStrategy.uniform(count: 16)
-            .timestamps(forDuration: 5.0, videoFrameRate: 1.0)
+            .sampleTimes(forDuration: 5.0, videoFrameRate: 1.0)
         #expect(timestamps.count == 5)
     }
 
     @Test("Uniform sampling with zero count gives 1 frame")
     func uniformSamplingZeroCount() {
         let timestamps = FrameSamplingStrategy.uniform(count: 0)
-            .timestamps(forDuration: 10.0, videoFrameRate: 30.0)
+            .sampleTimes(forDuration: 10.0, videoFrameRate: 30.0)
         #expect(timestamps.count == 1)
     }
 
     @Test("Uniform sampling with zero duration returns empty")
     func uniformSamplingZeroDuration() {
         let timestamps = FrameSamplingStrategy.uniform(count: 8)
-            .timestamps(forDuration: 0.0, videoFrameRate: 30.0)
+            .sampleTimes(forDuration: 0.0, videoFrameRate: 30.0)
         #expect(timestamps.isEmpty)
     }
 
     @Test("Uniform sampling with negative duration returns empty")
     func uniformSamplingNegativeDuration() {
         let timestamps = FrameSamplingStrategy.uniform(count: 8)
-            .timestamps(forDuration: -5.0, videoFrameRate: 30.0)
+            .sampleTimes(forDuration: -5.0, videoFrameRate: 30.0)
         #expect(timestamps.isEmpty)
     }
 
     @Test("FPS-based sampling at 1fps from 10s video")
     func fpsSampling() {
         let timestamps = FrameSamplingStrategy.fps(rate: 1.0, maxFrames: 20)
-            .timestamps(forDuration: 10.0, videoFrameRate: 30.0)
+            .sampleTimes(forDuration: 10.0, videoFrameRate: 30.0)
         #expect(timestamps.count == 10)
         for t in timestamps {
             #expect(t >= 0 && t < 10.0)
@@ -76,35 +76,35 @@ struct FrameSamplingStrategyTests {
     @Test("FPS-based sampling caps at maxFrames")
     func fpsSamplingCapped() {
         let timestamps = FrameSamplingStrategy.fps(rate: 1.0, maxFrames: 5)
-            .timestamps(forDuration: 60.0, videoFrameRate: 30.0)
+            .sampleTimes(forDuration: 60.0, videoFrameRate: 30.0)
         #expect(timestamps.count == 5)
     }
 
     @Test("FPS-based sampling at 2fps")
     func fpsSamplingHighRate() {
         let timestamps = FrameSamplingStrategy.fps(rate: 2.0, maxFrames: 100)
-            .timestamps(forDuration: 5.0, videoFrameRate: 30.0)
+            .sampleTimes(forDuration: 5.0, videoFrameRate: 30.0)
         #expect(timestamps.count == 10)
     }
 
     @Test("FPS-based sampling with zero rate returns empty")
     func fpsSamplingZeroRate() {
         let timestamps = FrameSamplingStrategy.fps(rate: 0.0, maxFrames: 10)
-            .timestamps(forDuration: 10.0, videoFrameRate: 30.0)
+            .sampleTimes(forDuration: 10.0, videoFrameRate: 30.0)
         #expect(timestamps.isEmpty)
     }
 
     @Test("FPS-based sampling with zero maxFrames returns empty")
     func fpsSamplingZeroMaxFrames() {
         let timestamps = FrameSamplingStrategy.fps(rate: 1.0, maxFrames: 0)
-            .timestamps(forDuration: 10.0, videoFrameRate: 30.0)
+            .sampleTimes(forDuration: 10.0, videoFrameRate: 30.0)
         #expect(timestamps.isEmpty)
     }
 
     @Test("FPS-based sampling short video returns at least 1 frame")
     func fpsSamplingShortVideo() {
         let timestamps = FrameSamplingStrategy.fps(rate: 1.0, maxFrames: 10)
-            .timestamps(forDuration: 0.5, videoFrameRate: 30.0)
+            .sampleTimes(forDuration: 0.5, videoFrameRate: 30.0)
         // 0.5s video at 1fps: interval center at 0.5 is outside, fallback gives 1 frame
         #expect(timestamps.count == 1)
     }

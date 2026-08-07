@@ -50,15 +50,12 @@ enum ImageInfoMode: String, ExpressibleByArgument, Sendable {
     case auto
 }
 
-/// CLI adapter for ``FrameSamplingStrategy``.
-enum VideoSamplingMode: String, ExpressibleByArgument, Sendable {
-    case uniform
-    case fps
-
-    func strategy(frameCount: Int) -> FrameSamplingStrategy {
-        switch self {
-        case .uniform: .uniform(count: frameCount)
-        case .fps: .fps(rate: 1.0, maxFrames: frameCount)
+extension FrameSamplingStrategy: ExpressibleByArgument {
+    public init?(argument: String) {
+        switch argument.lowercased() {
+        case "uniform": self = .uniform(count: defaultVideoFrameCount)
+        case "fps": self = .fps(rate: 1.0, maxFrames: defaultVideoFrameCount)
+        default: return nil
         }
     }
 }
@@ -222,7 +219,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     @Option(
         name: .customLong("video-sampling"),
         help: "Video frame sampling: uniform (default) or fps")
-    var videoSampling: VideoSamplingMode = .uniform
+    var videoSampling: FrameSamplingStrategy = .uniform(count: defaultVideoFrameCount)
 
     @Flag(
         name: .customLong("clear-coreai-cache"),
@@ -990,7 +987,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             throw ExitCode.failure
         }
 
-        let sampling = videoSampling.strategy(frameCount: videoFrames)
+        let sampling = videoSampling.withFrameCount(videoFrames)
 
         if !CLILogger.isVerbose {
             print("Generating...")

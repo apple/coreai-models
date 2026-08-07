@@ -39,13 +39,13 @@ struct VideoFrameExtractor {
             throw VideoInputError.invalidVideo("Video has invalid frame rate")
         }
 
-        let timestamps = sampling.timestamps(forDuration: duration, videoFrameRate: frameRate)
-        guard !timestamps.isEmpty else {
+        let sampleTimes = sampling.sampleTimes(forDuration: duration, videoFrameRate: frameRate)
+        guard !sampleTimes.isEmpty else {
             throw VideoInputError.invalidVideo("No frames to extract")
         }
 
-        let count = timestamps.count
-        let cmTimes = timestamps.map {
+        let count = sampleTimes.count
+        let cmTimes = sampleTimes.map {
             CMTime(seconds: $0, preferredTimescale: 600)
         }
 

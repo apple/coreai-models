@@ -183,7 +183,10 @@ public struct VisionConfig: Codable, Sendable, Equatable {
     /// Whether to include original image dimensions in the text prompt. Defaults to false.
     public let includeImageInfo: Bool
 
-    /// Maximum number of video frames the model supports. Nil = image-only model.
+    /// Whether this model supports video (multi-frame) input.
+    public var supportsVideo: Bool { maxVideoFrames != nil }
+
+    /// Maximum number of video frames for multi-frame models. Nil for image-only models.
     public let maxVideoFrames: Int?
 
     /// Visual tokens produced per frame. Nil defaults to `imageTokenCount`.

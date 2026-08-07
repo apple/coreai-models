@@ -12,14 +12,22 @@ public enum FrameSamplingStrategy: Sendable {
     /// One frame every `rate` seconds, capped at `maxFrames`.
     case fps(rate: Double, maxFrames: Int)
 
-    /// Compute frame timestamps for a video with the given duration and frame rate.
-    /// Each timestamp targets the midpoint of its sampling interval.
+    /// Return the same strategy with the frame count overridden.
+    public func withFrameCount(_ count: Int) -> FrameSamplingStrategy {
+        switch self {
+        case .uniform: .uniform(count: count)
+        case .fps(let rate, _): .fps(rate: rate, maxFrames: count)
+        }
+    }
+
+    /// Compute sample times (in seconds) for a video of the given duration.
+    /// Each time targets the midpoint of its sampling interval.
     ///
     /// - Parameters:
     ///   - duration: Video duration in seconds.
     ///   - videoFrameRate: Native frame rate of the video (e.g. 30.0).
-    /// - Returns: Array of timestamps in seconds.
-    public func timestamps(forDuration duration: Double, videoFrameRate: Double) -> [Double] {
+    /// - Returns: Array of sample times in seconds.
+    public func sampleTimes(forDuration duration: Double, videoFrameRate: Double) -> [Double] {
         guard duration > 0, videoFrameRate > 0 else { return [] }
 
         let totalFrames = Int(duration * videoFrameRate)
