@@ -15,13 +15,13 @@ import CoreAI
 @Suite("Multimodal types")
 struct MultimodalTypeTests {
     #if canImport(CoreAI)
-    @Test("EmbeddedInput wraps NDArray with positions")
+    @Test("InputEmbeddings wraps NDArray with positions")
     func embeddedInputBasics() throws {
         let embeddings = NDArray(
             shape: [1, 256, 2048],
             scalarType: .float16
         )
-        let input = try EmbeddedInput(
+        let input = try InputEmbeddings(
             embeddings: embeddings,
             embeddingPositions: 5..<261
         )

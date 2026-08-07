@@ -1017,7 +1017,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
 
     private func runVLMGeneration(
         vlmEngine: any MultimodalInferenceEngine,
-        embeddedInput: EmbeddedInput,
+        embeddedInput: InputEmbeddings,
         visionConfig: VisionConfig,
         tokenizer: any Tokenizer,
         samplingConfiguration: SamplingConfiguration,
