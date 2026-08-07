@@ -4,6 +4,7 @@
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
 import CoreAIShared
+import CoreGraphics
 import Foundation
 import Synchronization
 
@@ -294,27 +295,36 @@ public enum InferenceRuntimeError: Error, LocalizedError {
 ///
 /// The typical flow:
 /// 1. `encodeImage(at:)` — preprocess + run vision encoder, return embeddings
-/// 2. `generate(with: EmbeddedInput, ...)` — scatter-merge embeddings into
+/// 2. `generate(with: InputEmbeddings, ...)` — scatter-merge embeddings into
 ///    token sequence and run prefill + decode
 ///
 /// The caller owns the embeddings and decides caching strategy.
 public protocol MultimodalInferenceEngine: InferenceEngine {
     /// Encode an image into embeddings suitable for injection into the VLM.
     /// Returns the embedded representation — caller decides whether to cache.
-    func encodeImage(at url: URL) async throws -> EmbeddedInput
+    func encodeImage(at url: URL) async throws -> InputEmbeddings
+
+    /// Encode a CGImage into embeddings.
+    func encodeImage(cgImage: CGImage) async throws -> InputEmbeddings
+
+    /// Encode video frames into concatenated embeddings for injection into the VLM.
+    ///
+    /// Default implementation encodes each frame independently through `encodeImage(cgImage:)`
+    /// and concatenates embeddings along the sequence dimension.
+    func encodeVideo(_ video: VideoInput) async throws -> InputEmbeddings
 
     /// Generate tokens from a token sequence with embedded image regions.
     /// The engine scatter-merges `input.embeddingPositions` with the embedded data
     /// during prefill, then continues standard autoregressive decode.
     func generate(
-        with input: EmbeddedInput,
+        with input: InputEmbeddings,
         tokens: [TokenId],
         samplingConfiguration: SamplingConfiguration,
         inferenceOptions: InferenceOptions
     ) async throws -> OutputSequence
 }
 
-// TODO: Multi-turn — caller can cache EmbeddedInput across turns and pass it
+// TODO: Multi-turn — caller can cache InputEmbeddings across turns and pass it
 // again with the accumulated token context. Engine keeps image in KV cache
 // via reset(to:) preserving the prefill portion.
 

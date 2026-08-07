@@ -11,7 +11,7 @@ import Foundation
 /// Used by multimodal engines to pass vision/audio embeddings into the
 /// language model. The engine performs scatter-merge: replacing placeholder
 /// token positions with these embeddings before the first forward pass.
-public struct EmbeddedInput: Sendable {
+public struct InputEmbeddings: Sendable {
     /// The embedding tensor, shape [batch, seq_len, hidden_dim].
     /// Scalar type matches the LLM's expected input (float16, bFloat16, etc.).
     public let embeddings: NDArray
@@ -22,7 +22,7 @@ public struct EmbeddedInput: Sendable {
     public init(embeddings: NDArray, embeddingPositions: Range<Int>) throws {
         guard embeddings.shape.count == 3 else {
             throw InferenceRuntimeError.invalidArgument(
-                "EmbeddedInput requires 3D embeddings [batch, seq_len, hidden_dim], "
+                "InputEmbeddings requires 3D embeddings [batch, seq_len, hidden_dim], "
                     + "got shape with \(embeddings.shape.count) dimensions")
         }
         self.embeddings = embeddings
