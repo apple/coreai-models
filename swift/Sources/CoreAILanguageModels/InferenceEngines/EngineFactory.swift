@@ -203,7 +203,8 @@ public struct EngineFactory: Sendable {
             CLILogger.log("Creating static-shape engine")
             return try await StaticShapeEngine(
                 configuration: modelConfig,
-                preparedModel: preparedModel
+                preparedModel: preparedModel,
+                bundleURL: modelURL
             )
 
         case .sequential:
