@@ -227,7 +227,7 @@ let package = Package(
                 .copy("Resources/MinimalTokenizer")
             ],
             swiftSettings: [
-                .enableExperimentalFeature("Lifetimes"),
+                .enableExperimentalFeature("Lifetimes")
             ],
             linkerSettings: [
                 .linkedLibrary("c++")
