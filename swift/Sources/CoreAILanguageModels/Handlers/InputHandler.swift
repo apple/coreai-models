@@ -18,6 +18,9 @@ public struct InputContext: Sendable {
     public let batchSize: Int
     /// Sliding window size (nil for models without sliding attention).
     public let slidingWindow: Int?
+    /// The active graph's input descriptors, keyed by input name. Lets a handler size its
+    /// own output buffer to the running bucket. Empty for engines that don't vary by bucket.
+    public let descriptors: [String: NDArrayDescriptor]
 
     /// For dynamic-shape engines (Sequential, Pipelined).
     /// alignedStep = processedTokenCount, batchSize = tokens.count.
@@ -30,7 +33,8 @@ public struct InputContext: Sendable {
             processedTokenCount: processedTokenCount,
             alignedStep: processedTokenCount,
             batchSize: tokens.count,
-            slidingWindow: nil)
+            slidingWindow: nil,
+            descriptors: [:])
     }
 
     /// For static-shape engines. Batch is fixed-size and aligned.
@@ -38,14 +42,16 @@ public struct InputContext: Sendable {
         tokens: ArraySlice<Int32>,
         alignedStep: Int,
         batchSize: Int,
-        slidingWindow: Int?
+        slidingWindow: Int?,
+        descriptors: [String: NDArrayDescriptor] = [:]
     ) -> InputContext {
         InputContext(
             tokens: tokens,
             processedTokenCount: alignedStep,
             alignedStep: alignedStep,
             batchSize: batchSize,
-            slidingWindow: slidingWindow)
+            slidingWindow: slidingWindow,
+            descriptors: descriptors)
     }
 }
 
