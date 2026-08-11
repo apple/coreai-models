@@ -43,7 +43,7 @@ let package = Package(
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.2.0"),
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.1.0"),
-        .package(url: "https://github.com/mlc-ai/xgrammar", branch: "main"),
+        .package(url: "https://github.com/mlc-ai/xgrammar", exact: "0.2.2"),
     ],
     targets: [
         .target(
