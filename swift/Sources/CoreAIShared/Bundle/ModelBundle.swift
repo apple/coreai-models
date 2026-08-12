@@ -90,7 +90,7 @@ public struct ModelBundle: Sendable {
 
     // MARK: - Errors
 
-    public enum BundleError: Error, CustomStringConvertible {
+    public enum BundleError: Error, CustomStringConvertible, LocalizedError {
         case missingMetadata(URL)
         case malformedMetadata(URL, underlying: Error)
         case unsupportedVersion(String)
@@ -124,6 +124,11 @@ public struct ModelBundle: Sendable {
                     """
             }
         }
+
+        /// Without this, `error.localizedDescription` — what a SwiftUI host app naturally
+        /// shows a user — bridges through `NSError` and yields "The operation couldn't be
+        /// completed. (CoreAIShared.BundleError error 2.)", discarding every message above.
+        public var errorDescription: String? { description }
     }
 
     // MARK: - Initialization

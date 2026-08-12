@@ -37,6 +37,35 @@ struct SpeechRecognizer: AsyncParsableCommand {
     @Flag(name: .long, help: "Print verbose debug output")
     var verbose = false
 
+    @Flag(name: .long, help: "Transcribe incrementally through the streaming API.")
+    var stream = false
+
+    @Flag(
+        name: .long,
+        help: "In --stream mode, pace file input at 1x so reported latency is realistic.")
+    var realtime = false
+
+    @Flag(
+        name: .long,
+        help: """
+            Chunk the encoder but decode once at the end. Isolates encoder-context \
+            truncation from decoder-state-carry bugs: --simulated and plain --stream \
+            should agree exactly.
+            """)
+    var simulated = false
+
+    @Option(help: "Streaming chunk size in encoder frames (1 frame = 80 ms).")
+    var chunkFrames: Int?
+
+    @Option(help: "Streaming right context in encoder frames.")
+    var rightContextFrames: Int?
+
+    @Option(help: "Streaming left context in encoder frames.")
+    var leftContextFrames: Int?
+
+    @Option(help: "Silent encoder frames before a segment is finalized.")
+    var endpointFrames: Int?
+
     @Option(
         help:
             "Write the computed mel features to this path as raw little-endian f32, plus a <path>.json sidecar with the shape. For front-end parity checks."
@@ -84,6 +113,40 @@ struct SpeechRecognizer: AsyncParsableCommand {
         if parityTest == nil && model == nil {
             throw ValidationError("--model is required (unless --parity-test is set).")
         }
+        if stream && audioPath == nil {
+            throw ValidationError(
+                "--stream needs --audio-path. This repo does not capture audio; a host app "
+                    + "owns the microphone and pushes PCM into the streaming API.")
+        }
+        // Flags that only mean anything on the streaming path. Accepting and ignoring them
+        // is worst for --simulated: its whole job is to be diffed against plain --stream,
+        // so dropping it silently turns a missed bug into a false "IDENTICAL" pass.
+        let streamingOnly: [String] = [
+            realtime ? "--realtime" : nil,
+            simulated ? "--simulated" : nil,
+            chunkFrames != nil ? "--chunk-frames" : nil,
+            rightContextFrames != nil ? "--right-context-frames" : nil,
+            leftContextFrames != nil ? "--left-context-frames" : nil,
+            endpointFrames != nil ? "--endpoint-frames" : nil,
+        ].compactMap { $0 }
+        if !stream, !streamingOnly.isEmpty {
+            throw ValidationError(
+                "\(streamingOnly.joined(separator: ", ")) "
+                    + "\(streamingOnly.count == 1 ? "requires" : "require") --stream.")
+        }
+        // The reverse case. Streaming traces one fixed window, so `init` has already
+        // compiled the encoder at exactly the shape every hop uses — there is nothing for
+        // --warmup to do. And --dump-mel has no single answer under chunking.
+        if stream, warmup {
+            throw ValidationError(
+                "--warmup does not apply to --stream: the window is one fixed shape, so the "
+                    + "encoder is already compiled at that shape when the model loads.")
+        }
+        if stream, dumpMel != nil {
+            throw ValidationError(
+                "--dump-mel does not apply to --stream: there is one mel window per hop, "
+                    + "not one per run. Use it without --stream for front-end parity checks.")
+        }
     }
 
     func run() async throws {
@@ -114,10 +177,20 @@ struct SpeechRecognizer: AsyncParsableCommand {
         let isBundle =
             !assetExtensions.contains(bundleURL.pathExtension)
             && FileManager.default.fileExists(atPath: bundleURL.appending(path: "metadata.json").path)
-        if isBundle {
+        if isBundle, stream, let audioPath {
+            try await runStreaming(
+                bundleURL: bundleURL, audioPath: audioPath,
+                chunkFrames: chunkFrames, rightContextFrames: rightContextFrames,
+                leftContextFrames: leftContextFrames, endpointFrames: endpointFrames,
+                realtime: realtime, simulated: simulated, verbose: verbose)
+        } else if isBundle {
             try await runBundle(
                 bundleURL: bundleURL, audioPath: audioPath, warmup: warmup, verbose: verbose,
                 dumpMel: dumpMel)
+        } else if stream {
+            throw ValidationError(
+                "--stream needs a Parakeet TDT bundle directory. A single .aimodel is the "
+                    + "legacy Whisper layout, which has no chunked path.")
         } else {
             try await runLegacy(model: model, audioPath: audioPath, warmup: warmup)
         }

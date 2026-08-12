@@ -120,14 +120,67 @@ class ParakeetJointModule(torch.nn.Module):
         )
 
 
+def _audio_features_samples(
+    model_name: str, dtype: torch.dtype, num_samples: int
+) -> torch.Tensor:
+    processor = transformers.AutoProcessor.from_pretrained(model_name)
+    sample_rate = processor.feature_extractor.sampling_rate
+    dummy_audio = np.random.randn(num_samples).astype(np.float32)
+    features = processor.feature_extractor(dummy_audio, sampling_rate=sample_rate)
+    return features["input_features"].to(dtype).detach().clone()
+
+
 def _audio_features(
     model_name: str, dtype: torch.dtype, seconds: float
 ) -> torch.Tensor:
     processor = transformers.AutoProcessor.from_pretrained(model_name)
     sample_rate = processor.feature_extractor.sampling_rate
-    dummy_audio = np.random.randn(int(sample_rate * seconds)).astype(np.float32)
-    features = processor.feature_extractor(dummy_audio, sampling_rate=sample_rate)
-    return features["input_features"].to(dtype).detach().clone()
+    return _audio_features_samples(model_name, dtype, int(sample_rate * seconds))
+
+
+def _streaming_geometry(
+    model_name: str,
+    config: "transformers.ParakeetTDTConfig",
+    left: int,
+    chunk: int,
+    right: int,
+) -> dict:
+    """Window geometry for a streaming encoder export, in exact integers.
+
+    Everything hangs off one rule: make the PCM window a whole number of encoder
+    frames. The feature extractor emits `1 + N/hop` frames (torch.stft
+    center=True), and the FastConformer subsampling stack is three stride-2
+    kernel-3 pad-1 convs, i.e. `ceil(L/8)`. So a window of `W * hop * subsampling`
+    samples gives `8W + 1` mel frames and `W + 1` encoder frames, of which `W` are
+    fully backed by real audio and the last covers the zero-padded remainder.
+
+    Deriving the sample count from `seconds` instead would be lossy at exactly the
+    lengths we care about: `16000 * 6.4 == 102400.00000000001`.
+    """
+    processor = transformers.AutoProcessor.from_pretrained(model_name)
+    extractor = processor.feature_extractor
+    sample_rate = extractor.sampling_rate
+    hop_length = extractor.hop_length
+    subsampling = config.encoder_config.subsampling_factor
+
+    usable = left + chunk + right
+    samples_per_encoder_frame = hop_length * subsampling
+    window_samples = usable * samples_per_encoder_frame
+    return {
+        "left_context_encoder_frames": left,
+        "chunk_encoder_frames": chunk,
+        "right_context_encoder_frames": right,
+        "usable_encoder_frames": usable,
+        "window_encoder_frames": usable + 1,
+        "window_mel_frames": usable * subsampling + 1,
+        "valid_window_mel_frames": usable * subsampling,
+        "window_sample_count": window_samples,
+        "samples_per_encoder_frame": samples_per_encoder_frame,
+        "seconds_per_encoder_frame": samples_per_encoder_frame / sample_rate,
+        "sample_rate": sample_rate,
+        "hop_length": hop_length,
+        "subsampling_factor": subsampling,
+    }
 
 
 def _decoder_step_inputs(
@@ -205,17 +258,31 @@ def _default_output_dir() -> str:
     return str(Path(__file__).resolve().parents[2] / "exports")
 
 
-def _variant_name(model_name: str, dtype: torch.dtype, dynamic: bool) -> str:
+def _variant_name(
+    model_name: str,
+    dtype: torch.dtype,
+    dynamic: bool,
+    streaming: dict | None = None,
+) -> str:
     safe_name = Path(model_name).name
     dtype_name = str(dtype).split(".")[-1]
-    static_or_dynamic = "dynamic" if dynamic else "static"
-    return f"{safe_name}_{dtype_name}_{static_or_dynamic}"
+    if streaming is not None:
+        # The usable frame count is what distinguishes one streaming window from
+        # another, so it belongs in the name.
+        kind = f"streaming{streaming['usable_encoder_frames']}"
+    else:
+        kind = "dynamic" if dynamic else "static"
+    return f"{safe_name}_{dtype_name}_{kind}"
 
 
 def _bundle_paths(
-    output_dir: str, model_name: str, dtype: torch.dtype, dynamic: bool
+    output_dir: str,
+    model_name: str,
+    dtype: torch.dtype,
+    dynamic: bool,
+    streaming: dict | None = None,
 ) -> tuple[Path, dict[str, Path]]:
-    variant = _variant_name(model_name, dtype, dynamic)
+    variant = _variant_name(model_name, dtype, dynamic, streaming)
     bundle_dir = Path(output_dir) / variant
     assets = {
         ENCODER_GRAPH: bundle_dir / f"{variant}_{ENCODER_GRAPH}.aimodel",
@@ -268,6 +335,7 @@ def _write_bundle_metadata(
     variant: str,
     config: "transformers.ParakeetTDTConfig",
     assets: dict[str, Path],
+    streaming: dict | None = None,
 ) -> None:
     metadata = {
         "metadata_version": "0.2",
@@ -288,6 +356,11 @@ def _write_bundle_metadata(
             },
         },
     }
+    if streaming is not None:
+        # A sibling of `config`, not a member of it, so ParakeetTDTConfig.decode on
+        # the Swift side is untouched and existing bundles keep decoding. Note
+        # metadata_version stays "0.2": ModelBundle hard-rejects anything else.
+        metadata["streaming"] = streaming
     metadata_path = bundle_dir / "metadata.json"
     with open(metadata_path, "w") as f:
         json.dump(metadata, f, indent=2)
@@ -302,6 +375,10 @@ def create_parakeet(
     dynamic: bool,
     audio_seconds: float,
     include_debug_info: bool,
+    streaming: bool = False,
+    left_context_frames: int = 126,
+    chunk_frames: int = 12,
+    right_context_frames: int = 12,
 ):
     print(f"[INFO] Sourcing {model_name}...")
     model = transformers.AutoModelForTDT.from_pretrained(
@@ -315,17 +392,60 @@ def create_parakeet(
         f"durations={list(config.durations)}."
     )
 
-    bundle_dir, assets = _bundle_paths(output_dir, model_name, dtype, dynamic)
+    geometry = None
+    if streaming:
+        geometry = _streaming_geometry(
+            model_name, config, left_context_frames, chunk_frames, right_context_frames
+        )
+        print(
+            f"[INFO] Streaming window: left {geometry['left_context_encoder_frames']} / "
+            f"chunk {geometry['chunk_encoder_frames']} / "
+            f"right {geometry['right_context_encoder_frames']} encoder frames "
+            f"({geometry['usable_encoder_frames']} usable) = "
+            f"{geometry['window_sample_count']} samples "
+            f"({geometry['window_sample_count'] / geometry['sample_rate']:.2f} s), "
+            f"{geometry['window_mel_frames']} mel frames. Theoretical latency "
+            f"{(geometry['chunk_encoder_frames'] + geometry['right_context_encoder_frames']) * geometry['seconds_per_encoder_frame']:.2f} s."
+        )
+
+    bundle_dir, assets = _bundle_paths(output_dir, model_name, dtype, dynamic, geometry)
     _prepare_bundle_dir(bundle_dir, overwrite)
 
     print(f"[INFO] Exporting {ENCODER_GRAPH} graph...")
-    encoder_features = _audio_features(model_name, dtype, audio_seconds)
+    if geometry is not None:
+        encoder_features = _audio_features_samples(
+            model_name, dtype, geometry["window_sample_count"]
+        )
+        if encoder_features.shape[1] != geometry["window_mel_frames"]:
+            raise ValueError(
+                f"streaming geometry mismatch: {geometry['window_sample_count']} samples "
+                f"produced {encoder_features.shape[1]} mel frames, expected "
+                f"{geometry['window_mel_frames']}"
+            )
+    else:
+        encoder_features = _audio_features(model_name, dtype, audio_seconds)
     encoder_inputs = {
         "input_features": encoder_features,
         # All-valid mask for the trace; the Swift runtime supplies the real
         # per-frame mask (1 for real audio, 0 for the static window's padding).
         "attention_mask": torch.ones(encoder_features.shape[:2], dtype=torch.bool),
     }
+    if geometry is not None:
+        # Catch an arithmetic error here in Python rather than six files later in
+        # Swift: a one-frame slice error is 80 ms of audio and would drop or
+        # duplicate words at every chunk boundary. Costs one forward pass.
+        with torch.no_grad():
+            probe = ParakeetEncoderModule(model)(**encoder_inputs)
+        if probe.shape[1] != geometry["window_encoder_frames"]:
+            raise ValueError(
+                f"streaming geometry mismatch: traced encoder emits {probe.shape[1]} "
+                f"frames, expected {geometry['window_encoder_frames']}"
+            )
+        print(
+            f"[INFO] Verified encoder emits {probe.shape[1]} frames "
+            f"({geometry['usable_encoder_frames']} usable + 1 padding boundary)."
+        )
+
     encoder_program = _convert(
         ParakeetEncoderModule(model),
         encoder_inputs,
@@ -361,7 +481,11 @@ def create_parakeet(
 
     _write_processor(bundle_dir / "processor", model_name)
     _write_bundle_metadata(
-        bundle_dir, _variant_name(model_name, dtype, dynamic), config, assets
+        bundle_dir,
+        _variant_name(model_name, dtype, dynamic, geometry),
+        config,
+        assets,
+        geometry,
     )
     print(f"[INFO] Successfully created Parakeet TDT bundle at {bundle_dir}.")
 
@@ -396,10 +520,44 @@ def main():
         action="store_true",
         help="Overwrite an existing bundle at the output path.",
     )
-    parser.add_argument(
+    shape_group = parser.add_mutually_exclusive_group()
+    shape_group.add_argument(
         "--dynamic",
         action="store_true",
         help="Export the encoder with dynamic audio length (decoder/joint stay static).",
+    )
+    shape_group.add_argument(
+        "--streaming",
+        action="store_true",
+        help=(
+            "Export a fixed streaming window sized from --left/--chunk/"
+            "--right-context-frames, and record the geometry in metadata.json. "
+            "Ignores --audio-seconds."
+        ),
+    )
+    parser.add_argument(
+        "--chunk-frames",
+        type=int,
+        default=12,
+        help=(
+            "Encoder frames consumed per streaming hop (1 frame = 80 ms). Sets the "
+            "emission cadence. Below ~12 quality falls off sharply."
+        ),
+    )
+    parser.add_argument(
+        "--right-context-frames",
+        type=int,
+        default=12,
+        help=(
+            "Encoder frames of lookahead. Theoretical latency is "
+            "(chunk + right) x 80 ms. Must be >= max(durations)."
+        ),
+    )
+    parser.add_argument(
+        "--left-context-frames",
+        type=int,
+        default=126,
+        help="Encoder frames of past context. Improves quality at no latency cost.",
     )
     parser.add_argument(
         "--audio-seconds",
@@ -432,6 +590,10 @@ def main():
         args.dynamic,
         args.audio_seconds,
         args.include_debug_info,
+        args.streaming,
+        args.left_context_frames,
+        args.chunk_frames,
+        args.right_context_frames,
     )
 
 

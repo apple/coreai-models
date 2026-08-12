@@ -53,6 +53,9 @@ public struct SpeechRecognitionBundle: Sendable {
         public let joint: AIModel
         public let config: ParakeetTDTConfig
         public let melConfig: MelConfig
+        /// Non-nil only for bundles from `export.py --streaming`, which record the
+        /// window geometry they were traced for.
+        public let streamingConfig: StreamingConfig?
     }
 
     public init(at url: URL) async throws {
@@ -136,9 +139,18 @@ public struct SpeechRecognitionBundle: Sendable {
             melConfig = Self.melConfig(forEncoderTimeDim: nd.shape[tDim])
         }
 
+        // A streaming export records its geometry; cross-check it against the graph
+        // rather than trusting the JSON, since a one-frame disagreement would misalign
+        // every chunk boundary.
+        let streamingConfig = StreamingConfig.decode(fromMetadata: bundle.raw)
+        if let streamingConfig {
+            try streamingConfig.validate(
+                maxDuration: config.durations.max() ?? 0, encoderMelFrames: melConfig.nFrames)
+        }
+
         return ParakeetTDTAssets(
             encoder: encoder, decoderStep: decoderStep, joint: joint,
-            config: config, melConfig: melConfig)
+            config: config, melConfig: melConfig, streamingConfig: streamingConfig)
     }
 
     /// The mel config for an encoder whose time dimension is `dim`.
@@ -360,11 +372,12 @@ public struct ParakeetTDTConfig: Sendable {
 
 // MARK: - SpeechError
 
-public enum SpeechError: Error, CustomStringConvertible {
+public enum SpeechError: Error, CustomStringConvertible, LocalizedError {
     case missingModel(String)
     case missingTokenizer
     case invalidAudio(String)
     case incompatibleResources(String)
+    case invalidStreamingConfig(String)
 
     public var description: String {
         switch self {
@@ -373,6 +386,15 @@ public enum SpeechError: Error, CustomStringConvertible {
             return "Tokenizer not found — ensure the model bundle includes a tokenizer or the HF cache is populated"
         case .invalidAudio(let msg): return "Invalid audio: \(msg)"
         case .incompatibleResources(let msg): return "Incompatible decoder resources: \(msg)"
+        case .invalidStreamingConfig(let msg): return "Invalid streaming config: \(msg)"
         }
     }
+
+    /// Without this, `error.localizedDescription` — what a SwiftUI host app naturally
+    /// shows a user — bridges through `NSError` and yields "The operation couldn't be
+    /// completed. (CoreAISpeech.SpeechError error 3.)", discarding every message above.
+    /// The number is not even the declaration index: cases carrying a payload are
+    /// numbered before those without, so `invalidStreamingConfig` is 3 and
+    /// `missingTokenizer` is 4.
+    public var errorDescription: String? { description }
 }

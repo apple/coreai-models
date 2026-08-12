@@ -17,10 +17,17 @@ import Tokenizers
 /// auto-detected from the bundle's metadata.json (or the legacy
 /// encoder/decoder filename convention for Whisper).
 public actor SpeechRecognitionModel {
-    private let bundle: SpeechRecognitionBundle
-    private let decoder: any SpeechDecoder
-    private let melConfig: MelConfig
+    package let bundle: SpeechRecognitionBundle
+    package let decoder: any SpeechDecoder
+    package let melConfig: MelConfig
     private let resources: DecoderResources
+    /// Non-nil for Parakeet bundles. Streaming geometry and the exact
+    /// `ceil(validMel / subsampling)` frame rule are both derived from it.
+    package let tdtConfig: ParakeetTDTConfig?
+    /// Streaming session state, non-nil between `startStream` and `finishStream`.
+    package var streaming: StreamingSessionState?
+    /// Window geometry recorded by a `--streaming` export. Authoritative when present.
+    package let bundleStreamingConfig: StreamingConfig?
 
     /// Encoder function and its input descriptors, resolved once at init. These are
     /// shape-independent, so caching them keeps `loadFunction`/descriptor lookups off
@@ -40,11 +47,15 @@ public actor SpeechRecognitionModel {
         switch bundle.kind {
         case .whisper(let assets):
             self.decoder = WhisperDecoder()
+            self.tdtConfig = nil
+            self.bundleStreamingConfig = nil
             self.melConfig = assets.melConfig
             self.resources = .whisper(decoder: assets.decoder, generationConfig: assets.generationConfig)
             encoder = assets.encoder
         case .parakeetTDT(let assets):
             self.decoder = try ParakeetTDTDecoder(decoderStep: assets.decoderStep, joint: assets.joint)
+            self.tdtConfig = assets.config
+            self.bundleStreamingConfig = assets.streamingConfig
             self.melConfig = assets.melConfig
             self.resources = .parakeetTDT(
                 decoderStep: assets.decoderStep, joint: assets.joint, config: assets.config)
@@ -103,7 +114,7 @@ public actor SpeechRecognitionModel {
     /// shape-static, so the frame loop is capped at one frame rather than decoding the
     /// whole silence buffer — one pass compiles the same graphs.
     public func prewarm(sampleCount: Int) async throws {
-        let (encOut, encShape) = try await runEncoder(
+        let (encOut, encShape, _) = try await runEncoder(
             pcm: [Float](repeating: 0, count: sampleCount))
         _ = try await decoder.decode(
             encoderOutput: encOut,
@@ -154,7 +165,7 @@ public actor SpeechRecognitionModel {
     /// on a verification path.
     public func transcribeCapturingStages(pcm: [Float]) async throws -> StageCapture {
         let (melValues, melShape) = melFeatures(pcm: pcm)
-        let (encOut, encShape) = try await runEncoder(pcm: pcm)
+        let (encOut, encShape, _) = try await runEncoder(pcm: pcm)
         let validEnc = validEncoderFrames(pcmCount: pcm.count, tEnc: encShape[1])
         // Copy the encoder output out *before* decoding. `decode` issues ~2 graph runs
         // per emitted token, and reading `encOut` afterwards would report whatever those
@@ -189,7 +200,15 @@ public actor SpeechRecognitionModel {
     }
 
     /// Run the encoder over PCM and return the encoder hidden states + concrete shape.
-    private func runEncoder(pcm: [Float]) async throws -> (NDArray, [Int]) {
+    ///
+    /// Also returns the exact number of leading encoder frames that carry real audio.
+    ///
+    /// Pass only real samples: `fromPCM` pads up to the traced window itself, and
+    /// `padToFrameGrid` derives the valid-frame count from `pcm.count`. Handing it a
+    /// pre-zero-padded buffer would make the per-bin normalization statistics include the
+    /// padding, which wrecks the transcript when the real audio is a small fraction of the
+    /// window — as it is on a streaming session's first hops.
+    package func runEncoder(pcm: [Float]) async throws -> (NDArray, [Int], Int) {
         let start = ContinuousClock.now
         let mel = MelSpectrogram.fromPCM(pcm, config: melConfig, basis: melBasis)
         let nFrames = MelSpectrogram.frameCount(forPCMLength: pcm.count, config: melConfig)
@@ -197,16 +216,17 @@ public actor SpeechRecognitionModel {
         var melArray = NDArray(descriptor: melInputDescriptor.resolvingDynamicDimensions(inputShape))
         fillFloatNDArray(&melArray, with: mel)
 
+        let validMelFrames = min(
+            MelSpectrogram.validFrameCount(forPCMLength: pcm.count, config: melConfig), nFrames)
+
         // Attention mask (B, T_audio): true for real-audio frames, false for the
         // static window's zero-padding tail (and the dynamic path's trailing zero
         // frame). Lets the encoder exclude padding from self-attention and the conv
         // modules, matching HF. Guarded so bundles exported without the input still run.
         var inputs: [String: NDArray] = ["input_features": melArray]
         if let maskDesc = maskInputDescriptor {
-            let validFrames = min(
-                MelSpectrogram.validFrameCount(forPCMLength: pcm.count, config: melConfig), nFrames)
             var maskArray = NDArray(descriptor: maskDesc.resolvingDynamicDimensions([1, nFrames]))
-            fillNDArray(&maskArray, as: Bool.self, count: nFrames) { $0 < validFrames }
+            fillNDArray(&maskArray, as: Bool.self, count: nFrames) { $0 < validMelFrames }
             inputs["attention_mask"] = maskArray
         }
         let preprocessDuration = ContinuousClock.now - start
@@ -218,7 +238,13 @@ public actor SpeechRecognitionModel {
         guard let encOut = outputs.remove("encoder_hidden_states")?.ndArray else {
             throw SpeechError.missingModel("Encoder did not produce 'encoder_hidden_states'")
         }
-        return (encOut, encOut.shape)
+        // Exact, not the proportional heuristic: the streaming path slices against this.
+        let validEnc = min(
+            encOut.shape[1],
+            encoderFrameCount(
+                melFrames: validMelFrames,
+                subsamplingFactor: tdtConfig?.encoderSubsamplingFactor ?? 1))
+        return (encOut, encOut.shape, validEnc)
     }
 
     private func encoderInputShape(nFrames: Int) -> [Int] {
@@ -243,7 +269,7 @@ public actor SpeechRecognitionModel {
     }
 
     private func decodeAudio(pcm: [Float]) async throws -> ([Int32], DecodeStats) {
-        let (encOut, encShape) = try await runEncoder(pcm: pcm)
+        let (encOut, encShape, _) = try await runEncoder(pcm: pcm)
         return try await decoder.decode(
             encoderOutput: encOut,
             encoderOutputShape: encShape,
@@ -272,7 +298,7 @@ public actor SpeechRecognitionModel {
         Self.validEncoderFrames(pcmCount: pcmCount, tEnc: tEnc, config: melConfig)
     }
 
-    private func detokenize(_ tokens: [Int32]) throws -> String {
+    package func detokenize(_ tokens: [Int32]) throws -> String {
         guard let tokenizer = bundle.tokenizer else { throw SpeechError.missingTokenizer }
         let ids: [Int]
         switch bundle.kind {
