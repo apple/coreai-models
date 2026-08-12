@@ -46,27 +46,19 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     // Largest query length across all extend functions — used as prefill threshold.
     private let maxQueryLength: Int
 
-    // Generic persistent state (KV + any hybrid/sliding states), discovered by name from the
-    // descriptor and zero-initialized. No hardcoded KV contract, no per-model state properties.
-    //
-    // Each static graph is compiled with its own per-ctx sequence strides, so a state buffer
-    // MUST be physically laid out for the exact bucket the running graph expects — a max-ctx
-    // allocation viewed through a slice hands the smaller-bucket graph the wrong stride and
-    // corrupts the cache. We therefore RIGHT-SIZE the ctx-scaled states (e.g. the global KV
-    // cache) to the running bucket and grow+re-lay-out on a bucket crossing (`ensureStateCtx`).
-    // States whose descriptor is constant across buckets (e.g. a fixed sliding-window ring)
-    // are allocated once and never re-laid-out.
+    // The persistent state values (KV and any hybrid/sliding states) used by this engine.
+    // They may be reallocated over the engine's lifetime as the context grows — see
+    // `growStatesIfNeeded(for:)` for this engine's sizing strategy.
     private var stateHandler: FixedNDArrayState
     private let stateNames: [String]
-    // ctx bucket -> that bucket's (name, descriptor) list, for re-allocation on crossing.
+    // Per-ctx-bucket state descriptors, used to (re)allocate the state values.
     private let stateDescriptorsByCtx: [Int: [(name: String, descriptor: NDArrayDescriptor)]]
-    // States whose sequence extent scales with the ctx bucket (must be re-laid-out on grow).
+    // States whose size grows with the context (reallocated on growth); the rest are fixed.
     private let ctxScaledStateNames: Set<String>
-    // The ctx bucket the state buffers are currently laid out for.
+    // The context length the state values are currently sized for.
     private var currentStateCtx: Int
 
-    // Model-specific input preparation (embedding gather, position ids, causal mask, step, and
-    // profile extras like PLE / dual-RoPE / sliding-ring). The engine never learns an input name.
+    // The handlers that produce/populate the model inputs.
     private let providers: [any SyncInputHandler]
     private let profileName: String
 
@@ -183,7 +175,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         }
         self.ctxScaledStateNames = ctxScaled
 
-        // Allocate at the smallest bucket; ctx-scaled states grow on demand via ensureStateCtx.
+        // Allocate at the smallest bucket; ctx-scaled states grow on demand via growStatesIfNeeded(for:).
         self.stateHandler = FixedNDArrayState(states: smallDescs)
         self.stateNames = smallDescs.map(\.name)
         self.currentStateCtx = smallestCtx
@@ -204,12 +196,11 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         CLILogger.log("Engine initialized (profile: \(profileName), \(providers.count) input providers)")
     }
 
-    /// Ensure the ctx-scaled state buffers are physically laid out for context bucket `ctx`,
-    /// growing + re-laying-out the written prefix when a decode step crosses into a larger
-    /// bucket. Fixed states (constant descriptor across buckets, e.g. a sliding-window ring)
-    /// are carried over verbatim. No-op when already laid out for `ctx`.
-    private func ensureStateCtx(_ ctx: Int) throws {
-        guard ctx != currentStateCtx, ctxScaledStateNames.isEmpty == false else { return }
+    /// Grow the context-scaled state values to fit context length `ctx`, copying the written
+    /// prefix into the larger layout. Fixed-size states are reused as-is. No-op when the state
+    /// values already fit `ctx` (or the model has no context-scaled states).
+    private func growStatesIfNeeded(for ctx: Int) throws {
+        guard ctx != currentStateCtx, !ctxScaledStateNames.isEmpty else { return }
         guard let targetDescs = stateDescriptorsByCtx[ctx] else {
             throw InferenceRuntimeError.invalidState(
                 "No state descriptors for ctx bucket \(ctx) (ladder: \(stateDescriptorsByCtx.keys.sorted()))")
@@ -218,21 +209,20 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         var new = FixedNDArrayState(states: targetDescs)
         let copyPositions = min(processedTokenCount, currentStateCtx)
         for i in stateNames.indices {
-            let name = stateNames[i]
-            var dst = new[stateIndex: i]
-            let src = old[stateIndex: i]
-            if ctxScaledStateNames.contains(name) {
-                // Grow: copy the written sequence prefix into the larger layout.
-                Self.copyStatePrefix(from: src.array, to: &dst.array, copyPositions: copyPositions)
+            if ctxScaledStateNames.contains(stateNames[i]) {
+                var dst = new[stateIndex: i]
+                Self.copyStatePrefix(
+                    from: old[stateIndex: i].array, to: &dst.array, copyPositions: copyPositions)
+                new[stateIndex: i] = dst
             } else {
-                // Fixed: identical shape across buckets — carry the whole buffer over.
-                Self.copyStatePrefix(from: src.array, to: &dst.array, copyPositions: nil)
+                // Fixed-size state: reuse the existing buffer as-is (no realloc/copy).
+                new[stateIndex: i] = old[stateIndex: i]
             }
-            new[stateIndex: i] = dst
         }
         stateHandler = new
+        let previousCtx = currentStateCtx
         currentStateCtx = ctx
-        CLILogger.log("State caches re-laid-out: ctx \(currentStateCtx) → \(ctx) (copied \(copyPositions) positions)")
+        CLILogger.log("State values grown: ctx \(previousCtx) → \(ctx) (copied \(copyPositions) positions)")
     }
 
     /// Copy a state buffer's written sequence prefix from `src` into the (larger) `dst` layout.
@@ -256,6 +246,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         let dstGroupStride = dstSeq * factor
         let runElems = copySeq * factor
 
+        // TODO(rdar://…): replace with a first-party NDArray view-to-view copy API once exposed.
         func run<T: BitwiseCopyable>(_ type: T.Type) {
             let srcView = src.view(as: T.self)
             var dstView = dst.mutableView(as: T.self)
@@ -589,7 +580,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
             // Right-size the state caches to this graph's ctx bucket, then bind full buffers
             // by name. Because the buffers are laid out for the exact running bucket, no
             // slicing is needed — the graph's compiled per-ctx strides match the allocation.
-            try ensureStateCtx((try? contextLength(of: graphName)) ?? currentStateCtx)
+            try growStatesIfNeeded(for: (try? contextLength(of: graphName)) ?? currentStateCtx)
             // Local ref binding so the borrow spans the run() call (bind ties `states`'
             // lifetime to the handler; a stored-property borrow would end at the call).
             let handler = stateHandler

@@ -9,9 +9,10 @@ import Foundation
 
 // MARK: - Static Model Profile
 
-/// A model family's contribution to the static-shape engine: the extra input providers it
-/// needs beyond the universal decoder set. Selected as *data* from the descriptor's declared
-/// inputs/states — no per-model engine subclass, no `matches(model:)` returning an engine.
+/// The set of input handlers a model needs, chosen from the model's declared graph inputs/states.
+/// A standard decoder needs the base set (token embeddings, position ids, causal mask); models
+/// with extra inputs (RoPE tables, per-layer embeddings, a sliding-window mask) add handlers for
+/// those. Selected as *data* from the descriptor — no per-model engine subclass.
 struct StaticModelProfile {
     let name: String
     let extraHandlers: [any SyncInputHandler]
@@ -146,7 +147,7 @@ struct StaticBundleMetadata {
 
 /// `ssm_update_flag` — 1.0 on genuinely-new positions, 0.0 on re-sent/padding, so the DeltaNet
 /// recurrence treats re-sent tokens as exact no-ops. (fp16, one element per block column.)
-final class SSMUpdateFlagProvider: SyncInputHandler {
+struct SSMUpdateFlagProvider: SyncInputHandler {
     private let name: String
     var inputNames: [String] { [name] }
     init(name: String) { self.name = name }
@@ -170,7 +171,7 @@ final class SSMUpdateFlagProvider: SyncInputHandler {
 
 /// `sliding_in_step` — Int32 ring-write offset (`alignedStep % ringDepth`) so the graph needs
 /// no in-graph remainder op.
-final class SlidingStepProvider: SyncInputHandler {
+struct SlidingStepProvider: SyncInputHandler {
     private let ringDepth: Int
     var inputNames: [String] { ["sliding_in_step"] }
     init(ringDepth: Int) { self.ringDepth = ringDepth }
@@ -188,7 +189,7 @@ final class SlidingStepProvider: SyncInputHandler {
 
 /// `sliding_causal_mask` — like the causal mask but windowed to the last `window` keys and
 /// indexed into the ring by `pos % ringDepth`.
-final class SlidingMaskProvider: SyncInputHandler {
+struct SlidingMaskProvider: SyncInputHandler {
     private let ringDepth: Int
     private let window: Int
     var inputNames: [String] { ["sliding_causal_mask"] }
@@ -232,7 +233,7 @@ final class SlidingMaskProvider: SyncInputHandler {
 /// Sliding sub-range `[0, slidingHeadDim)` = GPT-NeoX full rotary (freqs repeated in two halves).
 /// Global sub-range = partial rotary: only the first `floor(partialRotaryFactor·globalHeadDim/2)`
 /// frequency pairs rotate; the rest are NoPE (θ = 0 ⇒ cos = 1, sin = 0).
-final class RoPEProvider: SyncInputHandler {
+struct RoPEProvider: SyncInputHandler {
     private let theta: [Double]  // per-output-dim angular frequency; length = width
     var inputNames: [String] { ["rope_cos", "rope_sin"] }
 
@@ -296,7 +297,7 @@ final class RoPEProvider: SyncInputHandler {
 }
 
 /// `ple_embeddings` — per-layer embedding INT8 rows, gathered per token from an mmap'd sidecar.
-final class PLEProvider: SyncInputHandler {
+struct PLEProvider: SyncInputHandler {
     private let table: PerLayerEmbeddings
     var inputNames: [String] { ["ple_embeddings"] }
     init(table: PerLayerEmbeddings) { self.table = table }
@@ -310,7 +311,7 @@ final class PLEProvider: SyncInputHandler {
 
 /// mmap'd per-layer embedding table (`*_ple.safetensors`, INT8 `[vocab, rowWidth]`), with a
 /// row-major gather. Bounds-checked so no token id can index past the mapping.
-final class PerLayerEmbeddings {
+struct PerLayerEmbeddings {
     private let data: Data
     private let dataStart: Int
     let vocabSize: Int

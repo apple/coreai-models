@@ -16,7 +16,7 @@ import Foundation
 // handler for `transformer_input`.
 
 /// `position_ids` — absolute UInt16 positions across the aligned block.
-final class PositionIdsProvider: SyncInputHandler {
+struct PositionIdsProvider: SyncInputHandler {
     private let name: String
     var inputNames: [String] { [name] }
     init(name: String) { self.name = name }
@@ -37,7 +37,7 @@ final class PositionIdsProvider: SyncInputHandler {
 }
 
 /// `causal_mask` — `-40000` fill, unmask `0...min(queryPos, ctx-1)`.
-final class CausalMaskProvider: SyncInputHandler {
+struct CausalMaskProvider: SyncInputHandler {
     private let name: String
     var inputNames: [String] { [name] }
     init(name: String) { self.name = name }
@@ -55,7 +55,7 @@ final class CausalMaskProvider: SyncInputHandler {
 }
 
 /// `in_step` — Int32 scalar block-start / KV write offset.
-final class StepProvider: SyncInputHandler {
+struct StepProvider: SyncInputHandler {
     private let name: String
     var inputNames: [String] { [name] }
     init(name: String) { self.name = name }
