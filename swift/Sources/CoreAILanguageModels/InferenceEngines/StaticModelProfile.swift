@@ -51,7 +51,7 @@ struct StaticModelProfile {
         let inputs = Set(desc.inputNames)
         let states = Set(desc.stateNames)
 
-        // Gemma4: PLE + dual-RoPE + sliding-window KV cache.
+        // Models with per-layer embeddings + dual-RoPE + a sliding-window KV cache.
         if inputs.contains("ple_embeddings") || inputs.contains("rope_cos")
             || states.contains("sliding_key_cache")
         {
@@ -78,13 +78,13 @@ struct StaticModelProfile {
                         ringDepth: slidingRingDepth(descriptor: desc),
                         window: meta?.slidingWindow ?? 0))
             }
-            return StaticModelProfile(name: "gemma4", extraHandlers: extras)
+            return StaticModelProfile(name: "ple-dual-rope-sliding", extraHandlers: extras)
         }
 
-        // Qwen3.5 hybrid: DeltaNet SSM update flag (conv/recurrent states handled generically).
+        // Hybrid models with a DeltaNet/SSM update flag (conv/recurrent states handled generically).
         if inputs.contains("ssm_update_flag") {
             return StaticModelProfile(
-                name: "qwen3.5-hybrid",
+                name: "ssm-hybrid",
                 extraHandlers: [SSMUpdateFlagProvider(name: "ssm_update_flag")])
         }
 
@@ -116,33 +116,16 @@ struct StaticBundleMetadata {
     let slidingWindow: Int?
 
     static func load(bundleURL: URL) -> StaticBundleMetadata? {
-        // metadata.json sits beside the .aimodel. Try the dir + its parent, then scan for it.
-        var candidates = [
-            bundleURL.appendingPathComponent("metadata.json"),
-            bundleURL.deletingLastPathComponent().appendingPathComponent("metadata.json"),
-        ]
-        for dir in [bundleURL, bundleURL.deletingLastPathComponent()] {
-            let items =
-                (try? FileManager.default.contentsOfDirectory(
-                    at: dir, includingPropertiesForKeys: nil)) ?? []
-            candidates.append(contentsOf: items.filter { $0.lastPathComponent == "metadata.json" })
-        }
-        // A model bundle has TWO metadata.json files: the bundle *manifest* (with the
-        // `language` block we need) beside the .aimodel, and the .aimodel's own internal
-        // metadata (assetVersion/creationDate/producer, no `language`). When `bundleURL`
-        // is the .aimodel path, `bundleURL/metadata.json` resolves to the internal one
-        // first — so pick the first candidate whose JSON actually carries a `language`
-        // block rather than the first that merely exists.
-        var lang: [String: Any]? = nil
-        for url in candidates where FileManager.default.fileExists(atPath: url.path) {
-            guard let data = try? Data(contentsOf: url),
-                let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                let l = json["language"] as? [String: Any]
-            else { continue }
-            lang = l
-            break
-        }
-        guard let lang else { return nil }
+        // `ModelBundle` resolves the manifest metadata.json (handling the .aimodel's own internal
+        // metadata) and preserves its raw bytes. `bundleURL` may be the bundle dir or the .aimodel
+        // inside it, so try both. We read `rope`/`sliding_window` from the raw bytes because they
+        // aren't part of the typed `LanguageConfig`.
+        guard
+            let bundle = (try? ModelBundle(at: bundleURL))
+                ?? (try? ModelBundle(at: bundleURL.deletingLastPathComponent())),
+            let json = try? JSONSerialization.jsonObject(with: bundle.raw) as? [String: Any],
+            let lang = json["language"] as? [String: Any]
+        else { return nil }
 
         var rope: RoPE? = nil
         if let r = lang["rope"] as? [String: Any] {
@@ -159,7 +142,7 @@ struct StaticBundleMetadata {
     }
 }
 
-// MARK: - Qwen3.5 hybrid provider
+// MARK: - SSM / hybrid provider
 
 /// `ssm_update_flag` — 1.0 on genuinely-new positions, 0.0 on re-sent/padding, so the DeltaNet
 /// recurrence treats re-sent tokens as exact no-ops. (fp16, one element per block column.)
@@ -183,7 +166,7 @@ final class SSMUpdateFlagProvider: SyncInputHandler {
     }
 }
 
-// MARK: - Gemma4 providers
+// MARK: - Providers for PLE / dual-RoPE / sliding-window models
 
 /// `sliding_in_step` — Int32 ring-write offset (`alignedStep % ringDepth`) so the graph needs
 /// no in-graph remainder op.
@@ -242,7 +225,7 @@ final class SlidingMaskProvider: SyncInputHandler {
     }
 }
 
-/// `rope_cos` / `rope_sin` — Gemma4 dual RoPE, precomputed on host and passed as inputs (lets
+/// `rope_cos` / `rope_sin` — dual RoPE, precomputed on host and passed as inputs (lets
 /// the model exceed the ANE 16-bit position-id limit). The per-dim theta vector is computed once;
 /// per step we fill `cos(pos·θ)` / `sin(pos·θ)` for each block position.
 ///

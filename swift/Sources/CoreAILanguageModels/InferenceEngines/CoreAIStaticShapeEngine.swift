@@ -19,6 +19,11 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     private static let logitsOutputName = "out_logits"
     private static let keyCacheName = "key_cache"
     private static let valueCacheName = "value_cache"
+    // Engine-produced I/O names (embedding gather needs the model's gather graph, so these
+    // aren't `SyncInputHandler`s). `transformerInputToken` is a substring: the declared name
+    // may be prefixed (e.g. `out_transformer_input`).
+    private static let embeddingTableName = "embedding_table"
+    private static let transformerInputToken = "transformer_input"
 
     public var vocabSize: Int { config.vocabSize }
 
@@ -59,8 +64,6 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     private let ctxScaledStateNames: Set<String>
     // The ctx bucket the state buffers are currently laid out for.
     private var currentStateCtx: Int
-    // Sorted ascending ctx buckets available in the model.
-    private let stateCtxLadder: [Int]
 
     // Model-specific input preparation (embedding gather, position ids, causal mask, step, and
     // profile extras like PLE / dual-RoPE / sliding-ring). The engine never learns an input name.
@@ -162,15 +165,13 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         guard !descriptorsByCtx.isEmpty else {
             throw InferenceRuntimeError.invalidState("No extend function to size the state caches from")
         }
-        let ctxLadder = descriptorsByCtx.keys.sorted()
-        self.stateCtxLadder = ctxLadder
         self.stateDescriptorsByCtx = descriptorsByCtx
 
         // Classify each state as ctx-scaled (its sequence extent changes across buckets → must
         // be re-laid-out on a bucket crossing) or fixed (constant across buckets → allocated
         // once). Derived by comparing the smallest and largest bucket's descriptor for each state.
-        let smallestCtx = ctxLadder.first!
-        let largestCtx = ctxLadder.last!
+        let smallestCtx = descriptorsByCtx.keys.min()!
+        let largestCtx = descriptorsByCtx.keys.max()!
         var ctxScaled: Set<String> = []
         let smallDescs = descriptorsByCtx[smallestCtx]!
         let largeDescs = Dictionary(
@@ -211,7 +212,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         guard ctx != currentStateCtx, ctxScaledStateNames.isEmpty == false else { return }
         guard let targetDescs = stateDescriptorsByCtx[ctx] else {
             throw InferenceRuntimeError.invalidState(
-                "No state descriptors for ctx bucket \(ctx) (ladder: \(stateCtxLadder))")
+                "No state descriptors for ctx bucket \(ctx) (ladder: \(stateDescriptorsByCtx.keys.sorted()))")
         }
         let old = stateHandler
         var new = FixedNDArrayState(states: targetDescs)
@@ -271,7 +272,10 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         case .float16, .bfloat16: run(Float16.self)
         case .float32: run(Float.self)
         case .int8: run(Int8.self)
-        default: run(Float16.self)
+        default:
+            preconditionFailure(
+                "State cache re-layout: unsupported scalar type \(src.scalarType). "
+                    + "KV caches are fp16/bf16/fp32/int8; add the type here if a new one is introduced.")
         }
     }
 
@@ -287,7 +291,9 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
             }
         }
         // Engine-produced inputs (embedding gather needs the model's gather graph).
-        let engineProduced = declared.filter { $0.contains("transformer_input") || $0 == "embedding_table" }
+        let engineProduced = declared.filter {
+            $0.contains(Self.transformerInputToken) || $0 == Self.embeddingTableName
+        }
         var produced = providers.reduce(into: Set<String>()) { $0.formUnion($1.inputNames) }
         produced.formUnion(engineProduced)
         let uncovered = declared.subtracting(produced)
@@ -341,7 +347,9 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
             throw InferenceRuntimeError.invalidState("Cannot load 'load_embeddings'")
         }
 
-        guard case .ndArray(let embeddingDesc) = embeddingFunction.descriptor.outputDescriptor(of: "embedding_table")
+        guard
+            case .ndArray(let embeddingDesc) = embeddingFunction.descriptor.outputDescriptor(
+                of: Self.embeddingTableName)
         else {
             throw InferenceRuntimeError.invalidState(
                 "load_embeddings has no 'embedding_table' ndArray output descriptor")
@@ -349,7 +357,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         var embeddingArray = NDArray(descriptor: embeddingDesc)
 
         var outputViews = InferenceFunction.MutableViews()
-        outputViews.insert(&embeddingArray, for: "embedding_table")
+        outputViews.insert(&embeddingArray, for: Self.embeddingTableName)
 
         _ = try await embeddingFunction.run(
             inputs: [:],
@@ -383,7 +391,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     /// `transformer_input` descriptor's sequence dimension.
     private func queryLength(of functionName: String) throws -> Int {
         let desc = try functionDescriptor(for: functionName)
-        if let txName = desc.inputNames.first(where: { $0.contains("transformer_input") }),
+        if let txName = desc.inputNames.first(where: { $0.contains(Self.transformerInputToken) }),
             case .ndArray(let nd) = desc.inputDescriptor(of: txName), nd.shape.count >= 2
         {
             return nd.shape[1]
@@ -518,6 +526,8 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         var currentPosition = processedTokenCount
 
         if processedTokenCount == 0 {
+            // Fresh sequence (no prefix reuse): zero the state caches so no KV from a prior
+            // generation leaks into this one.
             stateHandler.reset()
         }
 
@@ -556,8 +566,8 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
 
             var inputs: [String: NDArray] = [:]
             // Embedding gather is engine-produced (needs the model's gather graph).
-            if let txName = desc.inputNames.first(where: { $0.contains("transformer_input") }) {
-                if graphInputs.contains("embedding_table") { inputs["embedding_table"] = embeddingTable }
+            if let txName = desc.inputNames.first(where: { $0.contains(Self.transformerInputToken) }) {
+                if graphInputs.contains(Self.embeddingTableName) { inputs[Self.embeddingTableName] = embeddingTable }
                 guard let gathered = try await runGather(tokenIDs: Array(ctx.tokens), batchSize: batchSize) else {
                     throw InferenceRuntimeError.invalidState(
                         "Embedding gather returned no output for batch \(batchSize)")
@@ -650,7 +660,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         }
 
         var inputs: [String: NDArray] = [tokenInputName: tokenArray]
-        inputs["embedding_table"] = embeddingTable
+        inputs[Self.embeddingTableName] = embeddingTable
 
         var outputs = try await fn.run(
             inputs: inputs,
