@@ -10,10 +10,10 @@ Exports a PyTorch LLM model to a Core AI AIProgram via:
 torch.export -> decompose -> defunctionalize -> TorchConverter -> optimize.
 """
 
+import itertools
 import logging
 
 import coreai_torch
-import coreai_torch.composite_ops
 import torch
 from coreai.authoring import AIProgram
 
@@ -24,6 +24,11 @@ from coreai_models.export._constants import (
     TRACE_KV_CACHE_SEQ_LEN,
     VALUE_CACHE_NAME,
 )
+from coreai_models.export.externalize import (
+    EXTERNALIZE_SPECS,
+    restore_externalized,
+    subexport_and_restore,
+)
 from coreai_models.export.mlir_ops import (
     register_custom_torch_lowering,
     remove_functionalization,
@@ -32,35 +37,17 @@ from coreai_models.primitives.macos.cache import KVCache
 
 logger = logging.getLogger(__name__)
 
-# Composite ops that are externalized (kept as named composites in the MLIR graph
-# rather than being inlined/decomposed).
-_EXTERNALIZE_SPECS = [
-    coreai_torch.ExternalizeSpec(
-        target_class=coreai_torch.composite_ops.GatherMM,
-        composite_op_name="gather_mm",
-        composite_attrs=["num_batch_axes"],
-    ),
-    coreai_torch.ExternalizeSpec(
-        target_class=coreai_torch.composite_ops.RMSNormImpl,
-        composite_op_name="rms_norm",
-        composite_attrs=["axes", "eps"],
-    ),
-    coreai_torch.ExternalizeSpec(
-        target_class=coreai_torch.composite_ops.RoPE,
-        composite_op_name="rope",
-        composite_attrs=["scale", "base", "dims", "interleaved"],
-    ),
-    coreai_torch.ExternalizeSpec(
-        target_class=coreai_torch.composite_ops.SDPA,
-        composite_op_name="scaled_dot_product_attention",
-        composite_attrs=["scale", "is_causal", "window_size"],
-    ),
-    coreai_torch.ExternalizeSpec(
-        target_class=coreai_torch.composite_ops.GatedDeltaUpdate,
-        composite_op_name="gated_delta_update",
-        composite_attrs=[],
-    ),
-]
+
+def _resolve_target_dtype(model: torch.nn.Module) -> torch.dtype:
+    """Return the first floating-point parameter or buffer dtype.
+
+    Skips non-float tensors: after graph-mode quantization the module holds packed
+    integer weights, and picking one would build the KV cache in the wrong dtype.
+    """
+    for tensor in itertools.chain(model.parameters(), model.buffers()):
+        if tensor.is_floating_point():
+            return tensor.dtype
+    raise ValueError("Model has no floating-point parameters or buffers.")
 
 
 def _build_reference_inputs(
@@ -131,6 +118,7 @@ def export_to_coreai(
     input_names: tuple[str, ...] | None = None,
     output_names: tuple[str, ...] | None = None,
     state_names: tuple[str, ...] | None = None,
+    externalized_model: torch.nn.Module | None = None,
 ) -> AIProgram:
     """Export a stateful macOS model to a AIProgram.
 
@@ -157,6 +145,9 @@ def export_to_coreai(
         state_names: Names of inputs that are state (i.e. mutated in place by
             the forward pass and surfaced via the runtime ``state=`` kwarg
             rather than as regular inputs/outputs).
+        externalized_model: The eager module whose composite-op submodules were marked
+            by ``patch_model_for_externalization`` before ``model`` was produced.
+            Required in case of graph-mode quantization.
 
     Returns:
         A AIProgram ready for optimization and compilation.
@@ -169,12 +160,19 @@ def export_to_coreai(
         state_names_set = set(state_names or ())
         input_names = tuple(k for k in reference_inputs if k not in state_names_set)
 
-    def export_fn(module: torch.nn.Module) -> torch.export.ExportedProgram:
+    def export_fn(
+        module: torch.nn.Module, pass_inputs_as_kwargs: bool = True
+    ) -> torch.export.ExportedProgram:
+        # A module unlifted from an ExportedProgram only accepts the calling convention
+        # it was captured with, and graph-mode compression captures positionally.
+        # `reference_inputs` is insertion-ordered to match the forward signature.
+        export_args = () if pass_inputs_as_kwargs else tuple(reference_inputs.values())
+        export_kwargs = reference_inputs if pass_inputs_as_kwargs else None
         with torch.no_grad():
             aten_exported_program = torch.export.export(
                 module,
-                args=(),
-                kwargs=reference_inputs,
+                args=export_args,
+                kwargs=export_kwargs,
                 dynamic_shapes=dynamic_shapes,
             )
         coreai_decomp_table = coreai_torch.get_decomp_table()
@@ -182,16 +180,38 @@ def export_to_coreai(
         remove_functionalization(coreaten_exported_program)
         return coreaten_exported_program
 
-    model.eval()
     converter = coreai_torch.TorchConverter()
-    converter.add_pytorch_module(
-        model,
-        export_fn=export_fn,
-        externalize_modules=_EXTERNALIZE_SPECS,
-        input_names=input_names,
-        output_names=output_names,
-        state_names=state_names,
-    )
+
+    if externalized_model is None:
+        if isinstance(model, torch.fx.GraphModule):
+            raise ValueError(
+                "A flattened torch.fx.GraphModule needs an externalized_model handle. "
+                "Call patch_model_for_externalization on the model before quantization."
+            )
+        model.eval()
+        converter.add_pytorch_module(
+            model,
+            export_fn=export_fn,
+            externalize_modules=EXTERNALIZE_SPECS,
+            input_names=input_names,
+            output_names=output_names,
+            state_names=state_names,
+        )
+    else:
+        try:
+            exported_program = export_fn(model, pass_inputs_as_kwargs=False)
+            externalized_programs = subexport_and_restore(externalized_model, exported_program)
+        finally:
+            restore_externalized(externalized_model)
+
+        converter.add_exported_program(
+            exported_program,
+            input_names=input_names,
+            output_names=output_names,
+            state_names=state_names,
+            _externalized_exported_programs=externalized_programs,  # type: ignore[call-arg]
+        )
+
     register_custom_torch_lowering(converter)
     return converter.to_coreai()
 
@@ -200,6 +220,7 @@ def export_macos_model(
     model: torch.nn.Module,
     config,
     export_config,
+    externalized_model: torch.nn.Module | None = None,
 ) -> AIProgram:
     """Export a macOS model to a AIProgram.
 
@@ -212,6 +233,9 @@ def export_macos_model(
         model: A loaded PyTorch model (already in the correct dtype).
         config: HuggingFace model config (used for cache dimensions, vocab size, etc.).
         export_config: An ExportConfig instance (used for max_context_length, etc.).
+        externalized_model: The eager module marked by
+            ``patch_model_for_externalization`` before ``model`` was produced.
+            See ``export_to_coreai``.
 
     Returns:
         An optimized AIProgram ready for MLIR quantization and compilation.
@@ -221,7 +245,7 @@ def export_macos_model(
         max_context_length = getattr(config, "max_position_embeddings", 2048)
 
     # Determine target dtype from the model parameters
-    target_dtype = next(model.parameters()).dtype
+    target_dtype = _resolve_target_dtype(model)
 
     logger.info(
         f"Exporting macOS model (dtype={target_dtype}, max_context_length={max_context_length})"
@@ -243,6 +267,7 @@ def export_macos_model(
         input_names=input_names,
         output_names=output_names,
         state_names=state_names,
+        externalized_model=externalized_model,
     )
 
     logger.info("Optimizing AIProgram...")

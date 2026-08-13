@@ -22,6 +22,7 @@ from typing import Any, Literal
 
 import torch
 from coreai_opt.palettization.config.palettization_config import KMeansPalettizerConfig
+from coreai_opt.quantization import ExecutionMode
 from transformers import AutoConfig, AutoTokenizer
 
 from coreai_models.export._constants import (
@@ -35,6 +36,10 @@ from coreai_models.export.compression import (
     get_c4,
     palettize_pytorch_model,
     quantize_pytorch_model,
+)
+from coreai_models.export.externalize import (
+    patch_model_for_externalization,
+    restore_externalized,
 )
 from coreai_models.export.ios import export_ios_model
 from coreai_models.export.macos import export_macos_model
@@ -62,6 +67,7 @@ class ExportConfig:
     output_name: str | None = None
     num_layers: int | None = None
     overwrite: bool = False
+    quantization_mode: Literal["eager", "graph"] | None = None
     # iOS only. When True, embedding table is not quantized to int8.
     disable_embedding_quantization: bool = False
     # Optional prebuilt coreai-opt config (KMeansPalettizerConfig or
@@ -69,10 +75,22 @@ class ExportConfig:
     # uses this directly and ignores `compression` for config resolution
     compression_config_object: Any = field(default=None, repr=False)
 
+    def __post_init__(self) -> None:
+        if self.quantization_mode == "graph" and self.variant != "macOS":
+            raise ValueError(
+                f"quantization_mode='graph' is macOS only (got variant '{self.variant}')."
+            )
 
-def _generate_output_name(config: ExportConfig) -> str:
-    """Generate a filesystem-safe output name from config."""
+
+def _generate_output_name(config: ExportConfig, execution_mode: str | None = None) -> str:
+    """Generate a filesystem-safe output name from config.
+
+    ``execution_mode`` is the mode quantization actually ran in, which may come from
+    the preset rather than ``config.quantization_mode``. Graph-mode exports get their
+    own name so they sit alongside eager ones.
+    """
     variant_suffix = "_dynamic" if config.variant == "macOS" else "_static"
+    mode_suffix = "_graph" if execution_mode == ExecutionMode.GRAPH else ""
     short_name = config.hf_model_id.split("/")[-1]
     base = re.sub(r"[^a-z0-9]+", "_", short_name.lower()).strip("_")
     # YAML-driven exports: `compression` is the YAML stem, which by convention
@@ -82,9 +100,9 @@ def _generate_output_name(config: ExportConfig) -> str:
     if config.compression_config_object is not None:
         stem = config.compression
         suffix = stem if stem == base or stem.startswith(f"{base}_") else f"{base}_{stem}"
-        return f"{suffix}{variant_suffix}"
+        return f"{suffix}{variant_suffix}{mode_suffix}"
     suffix = f"{base}_{config.compression}" if config.compression != "none" else base
-    return f"{suffix}{variant_suffix}"
+    return f"{suffix}{variant_suffix}{mode_suffix}"
 
 
 def _resolve_precision(precision_str: str) -> torch.dtype:
@@ -238,6 +256,10 @@ async def _async_export_model(config: ExportConfig) -> str:
         )
         vocab_size = hf_config.vocab_size
         batch_size = 1
+        # Set when composite ops are marked for externalization before quantization.
+        externalized_model: torch.nn.Module | None = None
+        # The mode quantization actually ran in. Stays None when there is none to run.
+        execution_mode: ExecutionMode | None = None
         if torch_quantization_config is not None:
             logger.info(f"Applying pre-export torch quantization (preset={config.compression})")
 
@@ -271,12 +293,6 @@ async def _async_export_model(config: ExportConfig) -> str:
                 tokenizer = AutoTokenizer.from_pretrained(config.hf_model_id)
                 return get_c4(tokenizer)
 
-            quantizer_mmap_dir: str | None = None
-            if use_memory_efficient:
-                assert temp_dir is not None
-                quantizer_mmap_dir = os.path.join(temp_dir, "quantized")
-                os.makedirs(quantizer_mmap_dir, exist_ok=True)
-
             # Pass-through prebuilt QuantizerConfig objects.
             # copy dicts so we don't mutate the shared preset.
             quant_cfg = (
@@ -284,14 +300,53 @@ async def _async_export_model(config: ExportConfig) -> str:
                 if not isinstance(torch_quantization_config, dict)
                 else dict(torch_quantization_config)
             )
-            model = quantize_pytorch_model(
-                model,
-                quantization_inputs,
-                quantization_dynamic_shapes,
-                quant_cfg,
-                calibration_data_fn=get_calibration_data,
-                mmap_dir=quantizer_mmap_dir,
+
+            # The preset or YAML is the source of truth; `--quantization-mode` overrides
+            # it only when given.
+            if config.quantization_mode is not None:
+                if isinstance(quant_cfg, dict):
+                    quant_cfg["execution_mode"] = config.quantization_mode
+                else:
+                    quant_cfg.execution_mode = ExecutionMode(config.quantization_mode)
+            elif isinstance(quant_cfg, dict) and "execution_mode" not in quant_cfg:
+                raise ValueError(
+                    f"Compression config '{config.compression}' does not set "
+                    "'execution_mode'. Set it there, or pass --quantization-mode "
+                    "{eager,graph}."
+                )
+
+            execution_mode = ExecutionMode(
+                quant_cfg["execution_mode"]
+                if isinstance(quant_cfg, dict)
+                else quant_cfg.execution_mode
             )
+            graph_mode = execution_mode == ExecutionMode.GRAPH
+
+            quantizer_mmap_dir: str | None = None
+            # coreai-opt only supports mmap-backed finalization in eager mode.
+            if use_memory_efficient and not graph_mode:
+                assert temp_dir is not None
+                quantizer_mmap_dir = os.path.join(temp_dir, "quantized")
+                os.makedirs(quantizer_mmap_dir, exist_ok=True)
+
+            if graph_mode:
+                externalized_model = patch_model_for_externalization(model)
+
+            try:
+                model = quantize_pytorch_model(
+                    model,
+                    quantization_inputs,
+                    quantization_dynamic_shapes,
+                    quant_cfg,
+                    calibration_data_fn=get_calibration_data,
+                    mmap_dir=quantizer_mmap_dir,
+                )
+            except Exception:
+                # The marks outlive quantization, so drop them if no export
+                # can consume them.
+                if graph_mode:
+                    restore_externalized(externalized_model)
+                raise
         if torch_palettization_config is not None:
             assert config.variant == "iOS", "palettization is only supported for iOS variant."
 
@@ -326,10 +381,17 @@ async def _async_export_model(config: ExportConfig) -> str:
             model = palettize_pytorch_model(model, palettization_inputs, torch_palettization_config)
 
         # ---- 4. Variant-specific export ----
-        if config.variant == "macOS":
-            coreai_program = export_macos_model(model, hf_config, config)
-        else:
-            coreai_program = await export_ios_model(model, hf_config, config)
+        try:
+            if config.variant == "macOS":
+                coreai_program = export_macos_model(
+                    model, hf_config, config, externalized_model=externalized_model
+                )
+            else:
+                coreai_program = await export_ios_model(model, hf_config, config)
+        finally:
+            if graph_mode:
+                # in case of export failure
+                restore_externalized(externalized_model)
 
         del model
 
@@ -337,7 +399,7 @@ async def _async_export_model(config: ExportConfig) -> str:
         output_dir = Path(config.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        output_name = config.output_name or _generate_output_name(config)
+        output_name = config.output_name or _generate_output_name(config, execution_mode)
         bundle_path = output_dir / output_name
         bundle_path.mkdir(parents=True, exist_ok=True)
         aimodel_path = bundle_path / f"{output_name}.aimodel"
