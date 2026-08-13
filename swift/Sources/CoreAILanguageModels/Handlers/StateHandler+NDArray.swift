@@ -11,56 +11,63 @@ import Darwin
 
 /// Fixed-size state for non-truncatable persistent states.
 /// Allocated at full size on init, zero-initialized. No capacity management needed.
-public struct FixedNDArrayState: SyncStateHandler {
+public final class FixedNDArrayState: SyncStateHandler {
     public let stateNames: [String]
     public let supportsTruncation: Bool = false
     public let currentCapacity: Int = .max
     public var stateCount: Int { arrays.count }
 
-    private var arrays: [(name: String, array: NDArray)]
+    private var arrays: [String: NDArray]
 
     public init(states: [(name: String, descriptor: NDArrayDescriptor)]) {
-        var arrays: [(String, NDArray)] = []
+        var arrays: [String: NDArray] = [:]
         for (name, desc) in states {
             var array = NDArray(descriptor: desc)
             zeroFillNDArray(&array)
-            arrays.append((name, array))
+            arrays[name] = array
         }
         self.arrays = arrays
         self.stateNames = states.map(\.name)
     }
 
-    public mutating func ensureCapacity(forContextLength contextLength: Int) throws -> Bool {
+    public func ensureCapacity(forContextLength contextLength: Int) throws -> Bool {
         false
     }
 
     public subscript(stateIndex index: Int) -> (name: String, array: NDArray) {
-        get { arrays[index] }
-        set { arrays[index] = newValue }
+        get { (stateNames[index], arrays[stateNames[index]]!) }
+        set { arrays[stateNames[index]] = newValue.array }
     }
 
-    public mutating func reset() {
-        for i in arrays.indices {
-            zeroFillNDArray(&arrays[i].array)
+    @_lifetime(views: borrow self)
+    public func bind(into views: inout InferenceFunction.MutableViews) {
+        for name in stateNames {
+            let view = _overrideLifetime(arrays[name]!.mutableRawView(), borrowing: Void())
+            views.insert(view, for: name)
         }
     }
 
-    public mutating func truncate(to tokenCount: Int) {
+    public func reset() {
+        for name in stateNames {
+            zeroFillNDArray(&arrays[name]!)
+        }
+    }
+
+    public func truncate(to tokenCount: Int) {
         preconditionFailure("truncate(to:) called on non-truncatable FixedNDArrayState")
     }
 }
 
 // MARK: - Growing NDArray State
 
-/// Dynamically-growing KV cache state. Starts small and doubles capacity
-/// when more context is needed.
-public struct GrowingNDArrayState: SyncStateHandler {
+/// Dynamically-growing KV cache state. Starts small and doubles capacity.
+public final class GrowingNDArrayState: SyncStateHandler {
     public let stateNames: [String]
     public let supportsTruncation: Bool = true
     public private(set) var currentCapacity: Int
     public var stateCount: Int { arrays.count }
 
-    private var arrays: [(name: String, array: NDArray)]
+    private var arrays: [String: NDArray]
     private let descriptors: [NDArrayDescriptor]
     private let maxCapacity: Int
     private let sequenceDimIndex: Int
@@ -80,16 +87,16 @@ public struct GrowingNDArrayState: SyncStateHandler {
         let capacity = min(initialCapacity, maxCapacity)
         self.currentCapacity = capacity
 
-        var arrays: [(String, NDArray)] = []
+        var arrays: [String: NDArray] = [:]
         for (name, desc) in states {
             let resolved = desc.resolvingDynamicDimensions(
                 desc.shape.map { $0 < 0 ? capacity : $0 })
-            arrays.append((name, NDArray(descriptor: resolved)))
+            arrays[name] = NDArray(descriptor: resolved)
         }
         self.arrays = arrays
     }
 
-    public mutating func ensureCapacity(forContextLength contextLength: Int) throws -> Bool {
+    public func ensureCapacity(forContextLength contextLength: Int) throws -> Bool {
         guard contextLength > currentCapacity else { return false }
         guard contextLength <= maxCapacity else {
             throw InferenceRuntimeError.invalidState(
@@ -101,16 +108,14 @@ public struct GrowingNDArrayState: SyncStateHandler {
             newCapacity = min(newCapacity * 2, maxCapacity)
         }
 
-        for i in arrays.indices {
+        for (i, name) in stateNames.enumerated() {
             let desc = descriptors[i]
             let newShape = desc.shape.map { $0 < 0 ? newCapacity : $0 }
             let resolvedDesc = desc.resolvingDynamicDimensions(newShape)
             var newArray = NDArray(descriptor: resolvedDesc)
-            // Force backing allocation before copy
             _ = newArray.mutableRawView()
-
-            copyCache(from: arrays[i].array, to: &newArray, sequenceDim: sequenceDimIndex)
-            arrays[i].array = newArray
+            copyCache(from: arrays[name]!, to: &newArray, sequenceDim: sequenceDimIndex)
+            arrays[name] = newArray
         }
 
         currentCapacity = newCapacity
@@ -118,20 +123,25 @@ public struct GrowingNDArrayState: SyncStateHandler {
     }
 
     public subscript(stateIndex index: Int) -> (name: String, array: NDArray) {
-        get { arrays[index] }
-        set { arrays[index] = newValue }
+        get { (stateNames[index], arrays[stateNames[index]]!) }
+        set { arrays[stateNames[index]] = newValue.array }
     }
 
-    public mutating func reset() {
-        for i in arrays.indices {
-            zeroFillNDArray(&arrays[i].array)
+    @_lifetime(views: borrow self)
+    public func bind(into views: inout InferenceFunction.MutableViews) {
+        for name in stateNames {
+            let view = _overrideLifetime(arrays[name]!.mutableRawView(), borrowing: Void())
+            views.insert(view, for: name)
         }
     }
 
-    public mutating func truncate(to tokenCount: Int) {
-        // KV cache truncation is a no-op on the backing storage.
-        // The causal mask hides positions beyond processedTokenCount.
+    public func reset() {
+        for name in stateNames {
+            zeroFillNDArray(&arrays[name]!)
+        }
     }
+
+    public func truncate(to tokenCount: Int) {}
 
     // MARK: - Private
 
@@ -175,7 +185,6 @@ public struct GrowingNDArrayState: SyncStateHandler {
 
 // MARK: - Shared Utilities
 
-/// Zero-initialize an NDArray, dispatching on scalar type.
 func zeroFillNDArray(_ array: inout NDArray) {
     let count = array.shape.reduce(1, *)
     switch array.scalarType {

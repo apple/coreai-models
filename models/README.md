@@ -149,6 +149,7 @@ uv run models/<name>/export.py
 ### Audio Models
 
 - [CLAP](clap)
+- [Parakeet TDT](parakeet)
 - [Wav2Vec 2.0](wav2vec2)
 - [Whisper](whisper)
 

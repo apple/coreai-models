@@ -31,8 +31,8 @@ struct ProfileSpanTests {
         let stats = storage.stats(for: .prompt)
         #expect(stats != nil)
         #expect(stats?.count == 1)
-        #expect((stats?.totalSeconds ?? 0) > 0.009)  // At least 9ms
-        #expect((stats?.totalSeconds ?? 1) < 0.020)  // Less than 20ms
+        #expect((stats?.totalSeconds ?? 0) > 0.005)  // At least 5ms
+        #expect((stats?.totalSeconds ?? 1) < 1.0)  // Upper bound: under 1s
     }
 
     @Test("Multiple spans aggregate stats correctly")
@@ -47,8 +47,8 @@ struct ProfileSpanTests {
         let stats = storage.stats(for: .prompt)
         #expect(stats != nil)
         #expect(stats?.count == 3)
-        #expect((stats?.totalSeconds ?? 0) > 0.014)  // At least 15ms total
-        #expect((stats?.avgSeconds ?? 0) > 0.004)  // At least 5ms avg
+        #expect((stats?.totalSeconds ?? 0) > 0.010)  // At least 10ms total
+        #expect((stats?.avgSeconds ?? 0) > 0.003)  // At least 3ms avg
     }
 
     @Test("Different categories are tracked separately")

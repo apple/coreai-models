@@ -11,15 +11,18 @@ using the coreai-opt library, including calibration data preparation.
 """
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 import torch
 import torch.nn as nn
 
-from coreai_models.export._constants import (
+from coreai_models._constants import (
+    MAIN_GRAPH_NAME,
     QUANT_TRACE_OFFSET,
     QUANT_TRACE_QUERY_LEN,
+    TRACE_KV_CACHE_SEQ_LEN,
 )
+from coreai_models.models.base import BaseForCausalLM, TraceSpec
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +103,8 @@ def quantize_pytorch_model(
     inputs: tuple,
     dynamic_shapes: dict,
     quantization_config: dict,
+    cache_seq_len: int,
+    state_indices: Sequence[int],
     calibration_data_fn: Callable[[], list] | None = None,
     export_backend: object | None = None,
     mmap_dir: str | None = None,
@@ -119,6 +124,10 @@ def quantize_pytorch_model(
             coreai-opt expects under `quantization_config`. Includes a
             `calibrate_activations` key (popped here before constructing the
             coreai-opt config).
+        cache_seq_len: Sequence-dim length the caches in ``inputs`` were traced at,
+            used to bound the calibration query length.
+        state_indices: Positions in ``inputs`` that are state and must be reset
+            between calibration samples.
         calibration_data_fn: Optional function that returns calibration data samples.
             Required when calibrate_activations is enabled.
         export_backend: Backend for the finalized quantized model.
@@ -142,7 +151,11 @@ def quantize_pytorch_model(
 
     # When doing activation quantization, run real calibration data through the
     # prepared model so the activation observers see representative ranges.
-    # `inputs` follows the model forward contract: (input_ids, position_ids, k_cache, v_cache).
+    #
+    # `inputs[0]` must be input_ids and `inputs[1]` position_ids -- token-based
+    # calibration cannot do anything else. Which of the rest are state comes from
+    # `state_indices`; a non-state input keeps its traced tensor, which is only correct
+    # if its shape does not depend on query length.
     if run_calibration:
         if calibration_data_fn is None:
             raise ValueError(
@@ -151,9 +164,21 @@ def quantize_pytorch_model(
         calibration_data = calibration_data_fn()
         device = next(model.parameters()).device
 
-        cache_seq_len = inputs[2].shape[-2]
-        # Match the dynamic-shape upper bound declared by the caller:
-        #   position_ids.shape[1] <= cache_seq_len - 1   (see pipeline.py `seq_pos` Dim)
+        reset_positions = set(state_indices)
+        for pos in reset_positions:
+            if pos < 2:
+                raise ValueError(
+                    "States cannot occupy the first two input positions. "
+                    "Those must be reserved for input_ids and position_ids"
+                )
+            if pos >= len(inputs):
+                raise IndexError(
+                    f"State index out of bounds, got {pos}, while the number of inputs is "
+                    f"{len(inputs)}"
+                )
+
+        # Match the caller's declared bound: position_ids.shape[1] <= cache_seq_len - 1
+        # (the `seq_pos` Dim in `BaseForCausalLM.build_dynamic_shapes`).
         # position_ids has length QUANT_TRACE_OFFSET + query_len, so:
         #   query_len <= cache_seq_len - QUANT_TRACE_OFFSET - 1
         max_calib_query_len = cache_seq_len - QUANT_TRACE_OFFSET - 1
@@ -162,16 +187,20 @@ def quantize_pytorch_model(
         min_calib_query_len = QUANT_TRACE_QUERY_LEN - QUANT_TRACE_OFFSET
 
         def _prep_calib_inputs(sample: torch.Tensor) -> tuple:
-            sample = sample[:, :max_calib_query_len].to(device)
-            position_ids = (
-                torch.arange(QUANT_TRACE_OFFSET + sample.shape[1], dtype=torch.int32)
+            prepared = list(inputs)
+            prepared[0] = sample[:, :max_calib_query_len].to(device)
+            prepared[1] = (
+                torch.arange(QUANT_TRACE_OFFSET + prepared[0].shape[1], dtype=torch.int32)
                 .unsqueeze(0)
                 .to(device)
             )
-            zero_cache = tuple(
-                torch.zeros(inp.shape, dtype=inp.dtype, device=device) for inp in inputs[2:]
-            )
-            return (sample, position_ids, *zero_cache)
+            for i in range(2, len(prepared)):
+                inp = inputs[i]
+                if i in reset_positions:
+                    prepared[i] = torch.zeros(inp.shape, dtype=inp.dtype, device=device)
+                elif isinstance(inp, torch.Tensor):
+                    prepared[i] = inp.to(device)
+            return tuple(prepared)
 
         calibration_data = [s for s in calibration_data if s.shape[1] >= min_calib_query_len]
         if not calibration_data:
@@ -201,6 +230,66 @@ def quantize_pytorch_model(
         finalized_model.eval()
 
     return finalized_model
+
+
+def quantize_for_export(
+    model: BaseForCausalLM,
+    config,
+    target_dtype: torch.dtype,
+    quantization_config: dict,
+    calibration_data_fn: Callable[[], list] | None = None,
+    mmap_dir: str | None = None,
+) -> nn.Module:
+    """Apply pre-export torch quantization using the model's own graph contract.
+
+    Builds the calibration trace from the export hooks rather than hardcoding a forward
+    signature, so a model with extra inputs or states calibrates without the caller
+    knowing about them, and activation calibration resets exactly the states.
+
+    Args:
+        model: The loaded model, in eval mode.
+        config: The config the model was built from.
+        target_dtype: Dtype for the trace's cache tensors.
+        quantization_config: Inner coreai-opt ``quantization_config`` dict.
+        calibration_data_fn: Calibration samples; required when the recipe enables
+            ``calibrate_activations``.
+        mmap_dir: Directory for the quantizer's disk checkpointing.
+    """
+    spec = TraceSpec(max_context_length=TRACE_KV_CACHE_SEQ_LEN)
+    reference_inputs = model.build_reference_inputs(config, target_dtype, spec)
+    dynamic_shapes = model.build_dynamic_shapes(config, spec)
+    # Same check the export path runs, so a bad contract fails identically on both.
+    model.validate_export_contract(reference_inputs, dynamic_shapes)
+
+    graph_inputs = reference_inputs[MAIN_GRAPH_NAME]
+    keys = list(graph_inputs)
+    if quantization_config.get("calibrate_activations") and keys[:2] != [
+        "input_ids",
+        "position_ids",
+    ]:
+        raise ValueError(
+            f"{type(model).__name__}: activation calibration feeds tokenized samples as "
+            f"input_ids and rebuilds position_ids, so those must be the first two "
+            f"parameters of forward; got {tuple(keys[:2])}."
+        )
+
+    # Which *positions* are state cannot be read off the contract: the name lists carry
+    # only relative order. So this assumes the declared inputs precede the states, which
+    # holds for the macOS graph -- the only graph calibration runs on. A model that
+    # interleaved a non-state parameter after a cache would need them passed in.
+    n_inputs = len(model.export_input_names()[MAIN_GRAPH_NAME])
+    state_indices = tuple(range(n_inputs, len(keys)))
+
+    return quantize_pytorch_model(
+        model,
+        model.reference_inputs_as_args(graph_inputs),
+        dynamic_shapes[MAIN_GRAPH_NAME],
+        quantization_config,
+        calibration_data_fn=calibration_data_fn,
+        mmap_dir=mmap_dir,
+        cache_seq_len=spec.cache_seq_len,
+        state_indices=state_indices,
+    )
 
 
 def palettize_pytorch_model(

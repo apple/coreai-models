@@ -134,7 +134,7 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
         // 3. Check added_tokens_decoder for turn-ending special tokens
         //    (e.g. Gemma's <end_of_turn> ID 106, Qwen's <|im_end|>)
         //    Only include tokens whose content matches known turn-ending patterns.
-        let turnEndPatterns = ["end_of_turn", "im_end", "eot_id", "endoftext"]
+        let turnEndPatterns = ["end_of_turn", "im_end", "eot_id", "endoftext", "eot_token"]
         if let addedTokens = json["added_tokens_decoder"] as? [String: Any] {
             for (idString, value) in addedTokens {
                 guard let dict = value as? [String: Any],
@@ -145,6 +145,18 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
                 let lower = content.lowercased()
                 if id != mainEos && turnEndPatterns.contains(where: { lower.contains($0) }) {
                     result.insert(id)
+                }
+            }
+        }
+
+        // 4. Check for turn-ending tokens in in top level of config
+        for turnEndPattern in turnEndPatterns {
+            if let eotToken = json[turnEndPattern] as? String {
+                if let id = tokenizer.convertTokenToId(eotToken) {
+                    let id32 = Int32(id)
+                    if id32 != mainEos {
+                        result.insert(id32)
+                    }
                 }
             }
         }

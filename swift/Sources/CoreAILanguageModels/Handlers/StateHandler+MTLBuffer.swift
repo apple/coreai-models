@@ -7,9 +7,9 @@ import CoreAI
 import CoreAIShared
 import Metal
 
-/// Fixed-size MTLBuffer state for non-truncatable persistent states.
+/// Fixed-size MTLBuffer state for non-truncatable persistent states (pipelined engine).
 /// Allocated once at init, zero-initialized, never grows.
-public struct FixedMTLBufferState {
+public final class FixedMTLBufferState {
     public let stateNames: [String]
     public var stateCount: Int { bindings.count }
 
@@ -29,7 +29,8 @@ public struct FixedMTLBufferState {
             let resolved = desc.resolvingDynamicDimensions(desc.shape)
             let strides = resolved.preferredStrides
             let byteCount = resolved.minimumByteCount
-            guard let buffer = device.makeBuffer(length: max(byteCount, 64), options: .storageModeShared) else {
+            guard let buffer = device.makeBuffer(length: max(byteCount, 64), options: .storageModeShared)
+            else {
                 throw InferenceRuntimeError.bufferAllocationFailed("\(name) (\(byteCount) bytes)")
             }
             memset(buffer.contents(), 0, buffer.length)
@@ -39,17 +40,21 @@ public struct FixedMTLBufferState {
         self.stateNames = states.map(\.name)
     }
 
-    /// Access a state binding by index for AsyncMutableValue construction.
-    /// The engine builds AsyncMutableValue views from these in the same scope as encode().
-    /// Note: MTLBuffer is a reference type — the returned buffer is shared, not copied.
-    public subscript(stateIndex index: Int) -> (
-        name: String, buffer: MTLBuffer, scalarType: NDArray.ScalarType, shape: [Int], strides: [Int]
-    ) {
-        get { bindings[index] }
+    /// Insert all managed states into async mutable views. MTLBuffer is a reference
+    /// type (no COW). Uses _overrideLifetime for disjoint element access in the loop.
+    @_lifetime(views: borrow self)
+    public func bind(into views: inout InferenceFunction.AsyncMutableViews) {
+        for binding in bindings {
+            var value = unsafe InferenceFunction.AsyncMutableValue(
+                unsafeBuffer: binding.buffer, byteOffset: 0,
+                scalarType: binding.scalarType, shape: binding.shape, strides: binding.strides)
+            views.insert(&value, for: binding.name)
+            views = unsafe _overrideLifetime(consume views, borrowing: self)
+        }
     }
 
     /// Zero all state buffers. Caller must ensure no in-flight GPU work references these.
-    public mutating func reset() {
+    public func reset() {
         for (_, buffer, _, _, _) in bindings {
             memset(buffer.contents(), 0, buffer.length)
         }
