@@ -82,15 +82,9 @@ class ExportConfig:
             )
 
 
-def _generate_output_name(config: ExportConfig, execution_mode: str | None = None) -> str:
-    """Generate a filesystem-safe output name from config.
-
-    ``execution_mode`` is the mode quantization actually ran in, which may come from
-    the preset rather than ``config.quantization_mode``. Graph-mode exports get their
-    own name so they sit alongside eager ones.
-    """
+def _generate_output_name(config: ExportConfig) -> str:
+    """Generate a filesystem-safe output name from config."""
     variant_suffix = "_dynamic" if config.variant == "macOS" else "_static"
-    mode_suffix = "_graph" if execution_mode == ExecutionMode.GRAPH else ""
     short_name = config.hf_model_id.split("/")[-1]
     base = re.sub(r"[^a-z0-9]+", "_", short_name.lower()).strip("_")
     # YAML-driven exports: `compression` is the YAML stem, which by convention
@@ -100,9 +94,9 @@ def _generate_output_name(config: ExportConfig, execution_mode: str | None = Non
     if config.compression_config_object is not None:
         stem = config.compression
         suffix = stem if stem == base or stem.startswith(f"{base}_") else f"{base}_{stem}"
-        return f"{suffix}{variant_suffix}{mode_suffix}"
+        return f"{suffix}{variant_suffix}"
     suffix = f"{base}_{config.compression}" if config.compression != "none" else base
-    return f"{suffix}{variant_suffix}{mode_suffix}"
+    return f"{suffix}{variant_suffix}"
 
 
 def _resolve_precision(precision_str: str) -> torch.dtype:
@@ -258,8 +252,6 @@ async def _async_export_model(config: ExportConfig) -> str:
         batch_size = 1
         # Set when composite ops are marked for externalization before quantization.
         externalized_model: torch.nn.Module | None = None
-        # The mode quantization actually ran in. Stays None when there is none to run.
-        execution_mode: ExecutionMode | None = None
         if torch_quantization_config is not None:
             logger.info(f"Applying pre-export torch quantization (preset={config.compression})")
 
@@ -389,9 +381,8 @@ async def _async_export_model(config: ExportConfig) -> str:
             else:
                 coreai_program = await export_ios_model(model, hf_config, config)
         finally:
-            if graph_mode:
-                # in case of export failure
-                restore_externalized(externalized_model)
+            # in case of export failure
+            restore_externalized(externalized_model)
 
         del model
 
@@ -399,7 +390,7 @@ async def _async_export_model(config: ExportConfig) -> str:
         output_dir = Path(config.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        output_name = config.output_name or _generate_output_name(config, execution_mode)
+        output_name = config.output_name or _generate_output_name(config)
         bundle_path = output_dir / output_name
         bundle_path.mkdir(parents=True, exist_ok=True)
         aimodel_path = bundle_path / f"{output_name}.aimodel"
