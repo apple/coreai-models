@@ -88,3 +88,75 @@ struct StateHandlerConformanceTests {
         let _: any SyncStateHandler.Type = FixedNDArrayState.self
     }
 }
+
+// MARK: - withBoundStates Tests
+
+/// Minimal state handler for testing the binding API.
+final class MockStateHandler: SyncStateHandler {
+    var stateNames: [String]
+    var stateCount: Int { arrays.count }
+    let currentCapacity: Int = .max
+    let supportsTruncation: Bool = false
+
+    private var arrays: [String: NDArray]
+
+    init(names: [String], shape: [Int], scalarType: NDArray.ScalarType = .float16) {
+        self.stateNames = names
+        self.arrays = Dictionary(
+            uniqueKeysWithValues: names.map { ($0, NDArray(shape: shape, scalarType: scalarType)) })
+    }
+
+    func ensureCapacity(forContextLength contextLength: Int) throws -> Bool { false }
+
+    subscript(stateIndex index: Int) -> (name: String, array: NDArray) {
+        get { (stateNames[index], arrays[stateNames[index]]!) }
+        set { arrays[stateNames[index]] = newValue.array }
+    }
+
+    @_lifetime(views: borrow self)
+    func bind(into views: inout InferenceFunction.MutableViews) {
+        for name in stateNames {
+            let view = _overrideLifetime(arrays[name]!.mutableRawView(), borrowing: Void())
+            views.insert(view, for: name)
+        }
+    }
+
+    func reset() {}
+    func truncate(to tokenCount: Int) {}
+}
+
+@Suite("bind(into:) Tests")
+struct BindTests {
+    @Test("binds 1 through 4 states into MutableViews")
+    func bindsVariousCounts() {
+        for count in 1...4 {
+            let names = (0..<count).map { "state_\($0)" }
+            let handler = MockStateHandler(names: names, shape: [1, 4])
+            var views = InferenceFunction.MutableViews()
+            handler.bind(into: &views)
+        }
+    }
+
+    @Test("preserves state data through bind")
+    func preservesData() {
+        let handler = MockStateHandler(names: ["s0"], shape: [1, 4], scalarType: .float32)
+        var state = handler[stateIndex: 0]
+        fillNDArray(&state.array, as: Float.self, count: 4) { Float($0 + 1) }
+        handler[stateIndex: 0] = state
+
+        var views = InferenceFunction.MutableViews()
+        handler.bind(into: &views)
+
+        let values = readNDArray(handler[stateIndex: 0].array, as: Float.self, count: 4)
+        #expect(values == [1.0, 2.0, 3.0, 4.0])
+    }
+
+    @Test("multiple handlers compose into single MutableViews")
+    func composesHandlers() {
+        let primary = MockStateHandler(names: ["kv0", "kv1"], shape: [1, 4])
+        let secondary = MockStateHandler(names: ["conv"], shape: [1, 4])
+        var views = InferenceFunction.MutableViews()
+        primary.bind(into: &views)
+        secondary.bind(into: &views)
+    }
+}

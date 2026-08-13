@@ -27,7 +27,7 @@ from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from coreai_models.export._constants import IOS_DEFAULT_MAX_CONTEXT_LENGTH
+from coreai_models._constants import IOS_DEFAULT_MAX_CONTEXT_LENGTH
 
 # ---------------------------------------------------------------------------
 # Data model

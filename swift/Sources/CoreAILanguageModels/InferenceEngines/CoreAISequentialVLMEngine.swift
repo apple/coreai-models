@@ -64,8 +64,8 @@ public struct VLMModelConfig: InferenceConfiguration, Codable, Sendable {
 ///
 /// ## Inference Flow
 ///
-/// 1. `encodeImage(at:)` — preprocess image, run vision encoder + projector, return `EmbeddedInput`
-/// 2. `generate(with: EmbeddedInput, tokens:, ...)` — embed tokens, scatter-merge with vision
+/// 1. `encodeImage(at:)` — preprocess image, run vision encoder + projector, return `InputEmbeddings`
+/// 2. `generate(with: InputEmbeddings, tokens:, ...)` — embed tokens, scatter-merge with vision
 ///    embeddings at placeholder positions, run LLM prefill, then standard autoregressive decode
 ///
 /// KV cache is managed identically to `CoreAISequentialEngine`: starts small and grows
@@ -341,11 +341,11 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
     /// 1. Load image, resize to `visionConfig.imageSize`, normalize channels
     /// 2. Run vision encoder (`encode_image`) to get patch features
     /// 3. Run projector (`project`) to map features to LLM hidden dimension
-    /// 4. Return as `EmbeddedInput` with placeholder token positions
+    /// 4. Return as `InputEmbeddings` with placeholder token positions
     ///
     /// - Parameter url: URL to the image file (JPEG, PNG, HEIC, etc.)
-    /// - Returns: `EmbeddedInput` containing projected embeddings and token positions
-    public func encodeImage(at url: URL) async throws -> EmbeddedInput {
+    /// - Returns: `InputEmbeddings` containing projected embeddings and token positions
+    public func encodeImage(at url: URL) async throws -> InputEmbeddings {
         guard let ciImage = CIImage(contentsOf: url) else {
             throw ImagePreprocessorError.loadFailed(url)
         }
@@ -355,7 +355,7 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
         return try await encodeImage(cgImage: cgImage)
     }
 
-    public func encodeImage(cgImage: CGImage) async throws -> EmbeddedInput {
+    public func encodeImage(cgImage: CGImage) async throws -> InputEmbeddings {
         let encodeSignpost = InstrumentsProfiler.beginCustomInterval(
             name: "CoreAIVLM EncodeImage",
             details: "cgImage"
@@ -386,9 +386,86 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
 
         CLILogger.log("VLM encodeImage complete: \(tokenCount) embedding tokens")
 
-        return try EmbeddedInput(
+        return try InputEmbeddings(
             embeddings: projectedEmbeddings,
             embeddingPositions: placeholderRange
+        )
+    }
+
+    // MARK: - Video Encoding (MultimodalInferenceEngine)
+
+    /// Encode video frames into concatenated embeddings.
+    ///
+    /// Each frame is processed independently through the vision encoder + projector.
+    /// Embeddings are concatenated along the sequence dimension to produce a single
+    /// `InputEmbeddings` with shape `[1, N * tokensPerFrame, hidden_dim]`.
+    ///
+    /// Frames are encoded sequentially because the GPU vision encoder cannot run
+    /// multiple inference calls concurrently on the same model function.
+    public func encodeVideo(_ video: VideoInput) async throws -> InputEmbeddings {
+        let tokensPerFrame = config.visionConfig.tokensPerFrame ?? config.visionConfig.imageTokenCount
+
+        var frameEmbeddings: [NDArray] = []
+        var frameIndex = 0
+
+        for try await frame in video.frames {
+            let chwPixels = try imagePreprocessor.preprocessCHW(
+                cgImage: frame.image, strategy: config.visionConfig.imageStrategy)
+            let encoderOutput = try await runVisionEncoder(pixels: chwPixels)
+            let projected =
+                visionProjectorFused ? encoderOutput : try await runProjector(encoderOutput: encoderOutput)
+            frameEmbeddings.append(projected)
+            frameIndex += 1
+            CLILogger.log("  - encoded video frame \(frameIndex)", level: 2)
+        }
+
+        guard !frameEmbeddings.isEmpty else {
+            throw InferenceRuntimeError.invalidArgument("encodeVideo: no frames in video input")
+        }
+
+        if frameEmbeddings.count == 1 {
+            CLILogger.log("VLM encodeVideo complete: 1 frame, \(tokensPerFrame) tokens")
+            return try InputEmbeddings(
+                embeddings: frameEmbeddings[0],
+                embeddingPositions: 0..<tokensPerFrame
+            )
+        }
+
+        let totalTokens = frameEmbeddings.count * tokensPerFrame
+        let hiddenDim = frameEmbeddings[0].shape[2]
+        let scalarType = frameEmbeddings[0].scalarType
+
+        var concatenated = NDArray(shape: [1, totalTokens, hiddenDim], scalarType: scalarType)
+        let elementsPerFrame = tokensPerFrame * hiddenDim
+
+        switch scalarType {
+        case .float16, .bfloat16:
+            var destView = concatenated.mutableView(as: Float16.self)
+            destView.withUnsafeMutablePointer { destPtr, _, _ in
+                for (i, embedding) in frameEmbeddings.enumerated() {
+                    embedding.view(as: Float16.self).withUnsafePointer { srcPtr, _, _ in
+                        (destPtr + i * elementsPerFrame).update(from: srcPtr, count: elementsPerFrame)
+                    }
+                }
+            }
+        case .float32:
+            var destView = concatenated.mutableView(as: Float.self)
+            destView.withUnsafeMutablePointer { destPtr, _, _ in
+                for (i, embedding) in frameEmbeddings.enumerated() {
+                    embedding.view(as: Float.self).withUnsafePointer { srcPtr, _, _ in
+                        (destPtr + i * elementsPerFrame).update(from: srcPtr, count: elementsPerFrame)
+                    }
+                }
+            }
+        default:
+            throw InferenceRuntimeError.invalidInputType(
+                "encodeVideo: unsupported embedding scalar type \(scalarType)")
+        }
+
+        CLILogger.log("VLM encodeVideo complete: \(frameEmbeddings.count) frames, \(totalTokens) tokens")
+        return try InputEmbeddings(
+            embeddings: concatenated,
+            embeddingPositions: 0..<totalTokens
         )
     }
 
@@ -554,18 +631,18 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
         var merged = textEmbeddings
         guard !imagePositions.isEmpty else { return merged }
 
-        let imageTokenCount = config.visionConfig.imageTokenCount
-        guard imagePositions.count == imageTokenCount else {
+        let expectedCount = imageEmbeddings.shape[1]
+        guard imagePositions.count == expectedCount else {
             throw InferenceRuntimeError.invalidArgument(
                 "scatterMerge: found \(imagePositions.count) image placeholder tokens, "
-                    + "expected \(imageTokenCount) from config. Check prompt template.")
+                    + "expected \(expectedCount) from embeddings. Check prompt template.")
         }
 
         let seqLen = textEmbeddings.shape[1]
         let imgSeqLen = imageEmbeddings.shape[1]
-        guard imgSeqLen >= imageTokenCount else {
+        guard imgSeqLen >= expectedCount else {
             throw InferenceRuntimeError.invalidArgument(
-                "scatterMerge: image embeddings have \(imgSeqLen) tokens, need \(imageTokenCount)")
+                "scatterMerge: image embeddings have \(imgSeqLen) tokens, need \(expectedCount)")
         }
 
         // Validate all positions are within bounds
@@ -694,7 +771,7 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
     ///   - tokens: Full token sequence including image placeholder tokens
     /// - Returns: Logits for the last token (shape: [vocabSize])
     private func vlmPrefill(
-        embeddedInput: EmbeddedInput,
+        embeddedInput: InputEmbeddings,
         tokens: [Int32]
     ) async throws -> [LogitsScalarType] {
         let prefillSignpost = InstrumentsProfiler.beginCustomInterval(
@@ -799,7 +876,7 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
     /// image embeddings at placeholder positions, then runs the LLM. Subsequent steps use
     /// standard token-by-token decode (embed_tokens -> main).
     public func generate(
-        with input: EmbeddedInput,
+        with input: InputEmbeddings,
         tokens: [TokenId],
         samplingConfiguration: SamplingConfiguration,
         inferenceOptions: InferenceOptions
@@ -951,7 +1028,7 @@ extension CoreAISequentialVLMEngine {
 
         let engine: CoreAISequentialVLMEngine
         let input: [CoreAISequentialVLMEngine.TokenId]
-        let embeddedInput: EmbeddedInput?
+        let embeddedInput: InputEmbeddings?
         let samplingConfiguration: SamplingConfiguration
         let inferenceOptions: InferenceOptions
         let generationToken: GenerationToken
@@ -994,7 +1071,7 @@ extension CoreAISequentialVLMEngine.GenerationSequence {
         private let generationToken: GenerationToken
 
         private var inputTokens: [CoreAISequentialVLMEngine.TokenId]
-        private var embeddedInput: EmbeddedInput?
+        private var embeddedInput: InputEmbeddings?
         private var step: Int = 0
         private var finished: Bool = false
         private var prefillDone: Bool = false
@@ -1002,7 +1079,7 @@ extension CoreAISequentialVLMEngine.GenerationSequence {
         init(
             engine: CoreAISequentialVLMEngine,
             input: [CoreAISequentialVLMEngine.TokenId],
-            embeddedInput: EmbeddedInput?,
+            embeddedInput: InputEmbeddings?,
             samplingConfiguration: SamplingConfiguration,
             inferenceOptions: InferenceOptions,
             stopReasonStore: StopReasonStore,

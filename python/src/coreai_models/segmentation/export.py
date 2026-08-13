@@ -25,7 +25,6 @@ import argparse
 import logging
 from pathlib import Path
 
-from coreai_models.model_registry import lookup_utility_model
 from coreai_models.segmentation.pipeline import (
     FullExportConfig,
     SegmentationExportConfig,
@@ -33,16 +32,12 @@ from coreai_models.segmentation.pipeline import (
     export_segmentation,
 )
 
+# Accepted ``--model`` spellings → canonical HF id. Doubles as the source of
+# truth for the flag's ``choices``, so adding an alias here is all it takes.
 _SUPPORTED = {
     "sam3": "facebook/sam3",
     "facebook/sam3": "facebook/sam3",
 }
-
-# Defaults that differ between the two export paths. Used only when
-# ``--image-size`` isn't passed explicitly so each mode picks the
-# resolution it was designed for.
-_LITE_DEFAULT_IMAGE_SIZE = 336
-_FULL_DEFAULT_IMAGE_SIZE = 1008
 
 
 def _find_repo_root() -> Path | None:
@@ -60,16 +55,12 @@ def _default_output_dir() -> str:
 
 
 def _resolve_hf_model_id(model: str) -> str:
-    """Accept registry short-name or HF id; reject anything else."""
-    if model in _SUPPORTED:
-        return _SUPPORTED[model]
-    preset = lookup_utility_model(model)
-    if preset is not None and preset.task == "segmentation" and preset.hf_id in _SUPPORTED:
-        return _SUPPORTED[preset.hf_id]
-    raise SystemExit(
-        f"Error: '{model}' is not a supported segmentation model. "
-        f"Supported: {sorted(set(_SUPPORTED.values()))}"
-    )
+    """Map an accepted ``--model`` value to its canonical HF id.
+
+    ``--model`` derives its ``choices`` from ``_SUPPORTED``, so argparse has
+    already rejected anything unknown by the time this runs.
+    """
+    return _SUPPORTED[model]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -84,7 +75,9 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "model",
+        "--model",
+        choices=sorted(_SUPPORTED),
+        default="facebook/sam3",
         help=(
             "Segmentation model. Either the registry short-name (e.g. 'sam3') "
             "or its HuggingFace id (e.g. 'facebook/sam3')."
@@ -118,11 +111,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=("Input resolution. Defaults to 336 (lite) or 1008 (--full). "),
     )
     # ---- Lite-only flags -------------------------------------------
+    # Mode-specific flags default to None rather than their real default so
+    # _warn_unused_flags can tell "user passed this" from "user left it alone",
+    # even when the value passed matches the default. Resolved in main().
     parser.add_argument(
         "--max-text-seq-len",
         type=int,
-        default=32,
-        help="(lite) Static text sequence length used at export time.",
+        default=None,
+        help="(lite) Static text sequence length used at export time. Default: 32.",
     )
     parser.add_argument(
         "--n-bits",
@@ -147,8 +143,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dtype",
         choices=["float16", "float32"],
-        default="float32",
-        help="(--full) Torch dtype to use for the model.",
+        default=None,
+        help="(--full) Torch dtype to use for the model. Default: float32.",
     )
     # ---- Shared flags ---------------------------------------------------
     parser.add_argument(
@@ -171,32 +167,40 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _resolve_image_size(args: argparse.Namespace) -> int:
+    """Pick the resolution each mode was designed for when --image-size is omitted.
+
+    Mode-specific flags default to None so ``_warn_unused_flags`` can detect
+    "passed" regardless of value; the real defaults live on the config
+    dataclasses. ``@dataclass`` leaves plain defaults as class attributes, so
+    they're readable without constructing a config.
+    """
     if args.image_size is not None:
         return args.image_size
-    return _FULL_DEFAULT_IMAGE_SIZE if args.full else _LITE_DEFAULT_IMAGE_SIZE
+    return FullExportConfig.image_size if args.full else SegmentationExportConfig.image_size
 
 
-def _warn_unused_flags(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+def _warn_unused_flags(args: argparse.Namespace) -> None:
     """Surface flags that don't apply to the chosen mode so users notice typos.
 
-    argparse can't natively express "this flag only applies when --full
-    is set" without subparsers, so we just check after parsing.
+    argparse can't natively express "this flag only applies when --full is set"
+    without subparsers. Every mode-specific flag defaults to ``None``, so "not
+    None" means the user passed it explicitly — including when the value they
+    passed happens to equal the mode's resolved default.
     """
-    parser_defaults = parser.parse_args([args.model])
     if args.full:
         # Lite-only flags shouldn't be set in full mode.
-        ignored = []
-        for name in ("max_text_seq_len", "n_bits", "group_size"):
-            if getattr(args, name) != getattr(parser_defaults, name):
-                ignored.append(name.replace("_", "-"))
+        ignored = [
+            name.replace("_", "-")
+            for name in ("max_text_seq_len", "n_bits", "group_size")
+            if getattr(args, name) is not None
+        ]
         if ignored:
             logging.warning(
                 "Ignoring lite-only flag(s) in full mode: %s",
                 ", ".join(f"--{n}" for n in ignored),
             )
-    else:
-        if args.dtype != parser_defaults.dtype:
-            logging.warning("Ignoring --dtype outside full mode (lite path is fp16).")
+    elif args.dtype is not None:
+        logging.warning("Ignoring --dtype outside full mode (lite path is fp16).")
 
 
 def main() -> None:
@@ -211,13 +215,13 @@ def main() -> None:
 
     hf_model_id = _resolve_hf_model_id(args.model)
     image_size = _resolve_image_size(args)
-    _warn_unused_flags(parser, args)
+    _warn_unused_flags(args)
 
     if args.full:
         config = FullExportConfig(
             hf_model_id=hf_model_id,
             image_size=image_size,
-            dtype=args.dtype,
+            dtype=args.dtype or FullExportConfig.dtype,
             output_dir=args.output_dir or _default_output_dir(),
             output_name=args.output_name,
             overwrite=args.overwrite,
@@ -249,7 +253,7 @@ def main() -> None:
         config = SegmentationExportConfig(
             hf_model_id=hf_model_id,
             image_size=image_size,
-            max_text_seq_len=args.max_text_seq_len,
+            max_text_seq_len=args.max_text_seq_len or defaults.max_text_seq_len,
             image_n_bits=image_n_bits,
             image_group_size=image_group_size,
             text_n_bits=text_n_bits,

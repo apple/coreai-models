@@ -39,18 +39,19 @@ uv run export.py --help
 
 **Options:**
 
-| Flag                   | Description                                    | Default                |
-|------------------------|------------------------------------------------|------------------------|
-| `--full`               | Export plain HF `Sam3Model` (no iOS targeting) | —                      |
-| `--output-dir`         | Output directory for the bundle                | `<repo-root>/exports/` |
-| `--output-name`        | Custom bundle directory name                   | derived                |
-| `--image-size`         | Input resolution (336 lite / 1008 full)        | `336` / `1008`         |
-| `--max-text-seq-len`   | (lite) Static text sequence length             | `32`                   |
-| `--n-bits`             | (lite) Uniform palettization bit-width override applied to BOTH encoders | asymmetric: image w4, text w6 |
-| `--group-size`         | (lite) Uniform palettization group-size override applied to BOTH encoders | asymmetric: image gs32, text gs8 |
-| `--dtype`              | (`--full`) Torch dtype: `float16` or `float32` | `float32`              |
-| `--overwrite`          | Overwrite existing bundle                      | —                      |
-| `--dry-run`            | Print resolved config and exit                 | —                      |
+| Flag                 | Description                                                               | Default                          |
+|----------------------|---------------------------------------------------------------------------|----------------------------------|
+| `--model`            | Model to export: `sam3` (shortname) or `facebook/sam3`                    | `facebook/sam3`                  |
+| `--full`             | Export plain HF `Sam3Model` (no iOS targeting)                            | —                                |
+| `--output-dir`       | Output directory for the bundle                                           | `<repo-root>/exports/`           |
+| `--output-name`      | Custom bundle directory name                                              | derived                          |
+| `--image-size`       | Input resolution (336 lite / 1008 full)                                   | `336` / `1008`                   |
+| `--max-text-seq-len` | (lite) Static text sequence length                                        | `32`                             |
+| `--n-bits`           | (lite) Uniform palettization bit-width override applied to BOTH encoders  | asymmetric: image w4, text w6    |
+| `--group-size`       | (lite) Uniform palettization group-size override applied to BOTH encoders | asymmetric: image gs32, text gs8 |
+| `--dtype`            | (`--full`) Torch dtype: `float16` or `float32`                            | `float32`                        |
+| `--overwrite`        | Overwrite existing bundle                                                 | —                                |
+| `--dry-run`          | Print resolved config and exit                                            | —                                |
 
 `image-size=336` is the resolution we recommend for iOS deployment.
 

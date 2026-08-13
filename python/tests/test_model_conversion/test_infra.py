@@ -17,9 +17,12 @@ from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3ForCausalLM as HFQwen3ForCausalLM,
 )
 
+from coreai_models._constants import (
+    IOS_DEFAULT_MAX_CONTEXT_LENGTH,
+    KEY_CACHE_INPUT_NAME,
+    VALUE_CACHE_INPUT_NAME,
+)
 from coreai_models.export import pipeline as export_pipeline
-from coreai_models.export._constants import IOS_DEFAULT_MAX_CONTEXT_LENGTH
-from coreai_models.export.ios import KEY_CACHE_INPUT_NAME, VALUE_CACHE_INPUT_NAME
 from coreai_models.export.pipeline import ExportConfig, _async_export_model
 
 

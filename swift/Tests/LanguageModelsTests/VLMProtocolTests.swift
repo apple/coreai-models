@@ -15,13 +15,13 @@ import CoreAI
 @Suite("Multimodal types")
 struct MultimodalTypeTests {
     #if canImport(CoreAI)
-    @Test("EmbeddedInput wraps NDArray with positions")
+    @Test("InputEmbeddings wraps NDArray with positions")
     func embeddedInputBasics() throws {
         let embeddings = NDArray(
             shape: [1, 256, 2048],
             scalarType: .float16
         )
-        let input = try EmbeddedInput(
+        let input = try InputEmbeddings(
             embeddings: embeddings,
             embeddingPositions: 5..<261
         )
@@ -74,5 +74,40 @@ struct MultimodalTypeTests {
             """
         let config = try JSONDecoder().decode(LanguageConfig.self, from: json.data(using: .utf8)!)
         #expect(config.vision == nil)
+    }
+
+    @Test("VisionConfig decodes with video fields")
+    func visionConfigWithVideoFields() throws {
+        let json = """
+            {
+                "image_size": 384,
+                "patch_size": 14,
+                "image_token_count": 729,
+                "image_token_id": 255999,
+                "max_video_frames": 16,
+                "tokens_per_frame": 729
+            }
+            """
+        let config = try JSONDecoder().decode(VisionConfig.self, from: json.data(using: .utf8)!)
+        #expect(config.maxVideoFrames == 16)
+        #expect(config.tokensPerFrame == 729)
+        #expect(config.imageSize == 384)
+    }
+
+    @Test("VisionConfig backwards compatible without video fields")
+    func visionConfigWithoutVideoFields() throws {
+        let json = """
+            {
+                "image_size": 896,
+                "patch_size": 14,
+                "image_token_count": 256,
+                "image_token_id": 255999
+            }
+            """
+        let config = try JSONDecoder().decode(VisionConfig.self, from: json.data(using: .utf8)!)
+        #expect(config.maxVideoFrames == nil)
+        #expect(config.tokensPerFrame == nil)
+        #expect(config.imageSize == 896)
+        #expect(config.imageTokenCount == 256)
     }
 }

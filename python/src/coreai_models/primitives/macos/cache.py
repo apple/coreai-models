@@ -36,15 +36,22 @@ class KVCache:
         cls,
         config,
         dtype: torch.dtype = torch.float32,
+        seq_len: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Create zero-initialized KV cache tensors from a model config.
 
+        Args:
+            config: Model config supplying the layer/head dimensions.
+            dtype: Cache dtype.
+            seq_len: Sequence-dim length; defaults to ``config.max_position_embeddings``.
+                Pass explicitly to build a trace-sized cache without mutating config.
+
         Returns:
-            (k_cache, v_cache) tensors of shape (n_layers, 1, n_kv_heads, max_seq_len, head_dim).
+            (k_cache, v_cache) of shape (n_layers, 1, n_kv_heads, max_seq_len, head_dim).
         """
         n_kv_heads = config.num_key_value_heads
         n_layers = config.num_hidden_layers
-        max_seq_len = config.max_position_embeddings
+        max_seq_len = config.max_position_embeddings if seq_len is None else seq_len
         if hasattr(config, "head_dim") and config.head_dim is not None:
             head_dim = config.head_dim
         else:

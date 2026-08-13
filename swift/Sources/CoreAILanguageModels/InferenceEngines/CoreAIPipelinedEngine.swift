@@ -845,70 +845,14 @@ private struct EngineImpl: ~Copyable {
 
         // Swift 6 lifetime safety: AsyncMutableViews uses @lifetime(self: &mutableValue)
         // on insert(), so all inserts + consume must be in the same scope without branching.
-        // We switch on state count to avoid the optional-chain branch that the checker rejects.
-        switch additionalStates?.stateCount ?? 0 {
-        case 1:
-            let extra0 = additionalStates![stateIndex: 0]
-            var extraState0 = unsafe InferenceFunction.AsyncMutableValue(
-                unsafeBuffer: extra0.buffer, byteOffset: 0,
-                scalarType: extra0.scalarType, shape: extra0.shape, strides: extra0.strides)
-            var asyncStates = InferenceFunction.AsyncMutableViews()
-            asyncStates.insert(&keyState, for: keyCacheName)
-            asyncStates.insert(&valState, for: valueCacheName)
-            asyncStates.insert(&extraState0, for: extra0.name)
-            var logitsOutput = unsafe InferenceFunction.AsyncMutableValue(
-                unsafeBuffer: logitsOutputBuffer, byteOffset: 0,
-                scalarType: .float16, shape: logitsShape, strides: logitsStrides)
-            var asyncOutputs = InferenceFunction.AsyncMutableViews()
-            asyncOutputs.insert(&logitsOutput, for: logitsOutputName)
-            let _ = try function.encode(
-                inputs: asyncInputs,
-                states: consume asyncStates,
-                outputViews: consume asyncOutputs,
-                to: computeStream
-            )
-        case 2:
-            let extra0 = additionalStates![stateIndex: 0]
-            let extra1 = additionalStates![stateIndex: 1]
-            var extraState0 = unsafe InferenceFunction.AsyncMutableValue(
-                unsafeBuffer: extra0.buffer, byteOffset: 0,
-                scalarType: extra0.scalarType, shape: extra0.shape, strides: extra0.strides)
-            var extraState1 = unsafe InferenceFunction.AsyncMutableValue(
-                unsafeBuffer: extra1.buffer, byteOffset: 0,
-                scalarType: extra1.scalarType, shape: extra1.shape, strides: extra1.strides)
-            var asyncStates = InferenceFunction.AsyncMutableViews()
-            asyncStates.insert(&keyState, for: keyCacheName)
-            asyncStates.insert(&valState, for: valueCacheName)
-            asyncStates.insert(&extraState0, for: extra0.name)
-            asyncStates.insert(&extraState1, for: extra1.name)
-            var logitsOutput = unsafe InferenceFunction.AsyncMutableValue(
-                unsafeBuffer: logitsOutputBuffer, byteOffset: 0,
-                scalarType: .float16, shape: logitsShape, strides: logitsStrides)
-            var asyncOutputs = InferenceFunction.AsyncMutableViews()
-            asyncOutputs.insert(&logitsOutput, for: logitsOutputName)
-            let _ = try function.encode(
-                inputs: asyncInputs,
-                states: consume asyncStates,
-                outputViews: consume asyncOutputs,
-                to: computeStream
-            )
-        default:
-            // case 0: no additional states
-            var asyncStates = InferenceFunction.AsyncMutableViews()
-            asyncStates.insert(&keyState, for: keyCacheName)
-            asyncStates.insert(&valState, for: valueCacheName)
-            var logitsOutput = unsafe InferenceFunction.AsyncMutableValue(
-                unsafeBuffer: logitsOutputBuffer, byteOffset: 0,
-                scalarType: .float16, shape: logitsShape, strides: logitsStrides)
-            var asyncOutputs = InferenceFunction.AsyncMutableViews()
-            asyncOutputs.insert(&logitsOutput, for: logitsOutputName)
-            let _ = try function.encode(
-                inputs: asyncInputs,
-                states: consume asyncStates,
-                outputViews: consume asyncOutputs,
-                to: computeStream
-            )
-        }
+        try encodeWithStates(
+            function: function, inputs: asyncInputs,
+            keyState: &keyState, keyCacheName: keyCacheName,
+            valState: &valState, valueCacheName: valueCacheName,
+            additionalStates: additionalStates,
+            logitsBuffer: logitsOutputBuffer, logitsName: logitsOutputName,
+            logitsShape: logitsShape, logitsStrides: logitsStrides,
+            computeStream: computeStream)
         logitsSpan.end()
 
         // GPU sampling via Metal queue
@@ -1188,68 +1132,14 @@ private struct EngineImpl: ~Copyable {
         let logitsShape = [1, queryLength, vocabSize]
         let logitsStrides = try resolvedStrides(descriptor: logitsBaseDesc, shape: logitsShape)
 
-        switch additionalStates?.stateCount ?? 0 {
-        case 1:
-            let extra0 = additionalStates![stateIndex: 0]
-            var extraState0 = unsafe InferenceFunction.AsyncMutableValue(
-                unsafeBuffer: extra0.buffer, byteOffset: 0,
-                scalarType: extra0.scalarType, shape: extra0.shape, strides: extra0.strides)
-            var asyncStates = InferenceFunction.AsyncMutableViews()
-            asyncStates.insert(&keyState, for: keyCacheName)
-            asyncStates.insert(&valState, for: valueCacheName)
-            asyncStates.insert(&extraState0, for: extra0.name)
-            var logitsOutput = unsafe InferenceFunction.AsyncMutableValue(
-                unsafeBuffer: logits.metalBuffer, byteOffset: 0,
-                scalarType: .float16, shape: logitsShape, strides: logitsStrides)
-            var asyncOutputs = InferenceFunction.AsyncMutableViews()
-            asyncOutputs.insert(&logitsOutput, for: logitsOutputName)
-            let _ = try function.encode(
-                inputs: asyncInputs,
-                states: consume asyncStates,
-                outputViews: consume asyncOutputs,
-                to: computeStream
-            )
-        case 2:
-            let extra0 = additionalStates![stateIndex: 0]
-            let extra1 = additionalStates![stateIndex: 1]
-            var extraState0 = unsafe InferenceFunction.AsyncMutableValue(
-                unsafeBuffer: extra0.buffer, byteOffset: 0,
-                scalarType: extra0.scalarType, shape: extra0.shape, strides: extra0.strides)
-            var extraState1 = unsafe InferenceFunction.AsyncMutableValue(
-                unsafeBuffer: extra1.buffer, byteOffset: 0,
-                scalarType: extra1.scalarType, shape: extra1.shape, strides: extra1.strides)
-            var asyncStates = InferenceFunction.AsyncMutableViews()
-            asyncStates.insert(&keyState, for: keyCacheName)
-            asyncStates.insert(&valState, for: valueCacheName)
-            asyncStates.insert(&extraState0, for: extra0.name)
-            asyncStates.insert(&extraState1, for: extra1.name)
-            var logitsOutput = unsafe InferenceFunction.AsyncMutableValue(
-                unsafeBuffer: logits.metalBuffer, byteOffset: 0,
-                scalarType: .float16, shape: logitsShape, strides: logitsStrides)
-            var asyncOutputs = InferenceFunction.AsyncMutableViews()
-            asyncOutputs.insert(&logitsOutput, for: logitsOutputName)
-            let _ = try function.encode(
-                inputs: asyncInputs,
-                states: consume asyncStates,
-                outputViews: consume asyncOutputs,
-                to: computeStream
-            )
-        default:
-            var asyncStates = InferenceFunction.AsyncMutableViews()
-            asyncStates.insert(&keyState, for: keyCacheName)
-            asyncStates.insert(&valState, for: valueCacheName)
-            var logitsOutput = unsafe InferenceFunction.AsyncMutableValue(
-                unsafeBuffer: logits.metalBuffer, byteOffset: 0,
-                scalarType: .float16, shape: logitsShape, strides: logitsStrides)
-            var asyncOutputs = InferenceFunction.AsyncMutableViews()
-            asyncOutputs.insert(&logitsOutput, for: logitsOutputName)
-            let _ = try function.encode(
-                inputs: asyncInputs,
-                states: consume asyncStates,
-                outputViews: consume asyncOutputs,
-                to: computeStream
-            )
-        }
+        try encodeWithStates(
+            function: function, inputs: asyncInputs,
+            keyState: &keyState, keyCacheName: keyCacheName,
+            valState: &valState, valueCacheName: valueCacheName,
+            additionalStates: additionalStates,
+            logitsBuffer: logits.metalBuffer, logitsName: logitsOutputName,
+            logitsShape: logitsShape, logitsStrides: logitsStrides,
+            computeStream: computeStream)
 
         processedTokenCount += queryLength
         step += 1
@@ -1341,68 +1231,14 @@ private struct EngineImpl: ~Copyable {
             let lShape = [1, shape, vocabSize]
             let lStrides = try resolvedStrides(descriptor: logitsBaseDesc, shape: lShape)
 
-            switch additionalStates?.stateCount ?? 0 {
-            case 1:
-                let extra0 = additionalStates![stateIndex: 0]
-                var extraState0 = unsafe InferenceFunction.AsyncMutableValue(
-                    unsafeBuffer: extra0.buffer, byteOffset: 0,
-                    scalarType: extra0.scalarType, shape: extra0.shape, strides: extra0.strides)
-                var asyncStates = InferenceFunction.AsyncMutableViews()
-                asyncStates.insert(&keyState, for: keyCacheName)
-                asyncStates.insert(&valState, for: valueCacheName)
-                asyncStates.insert(&extraState0, for: extra0.name)
-                var logitsOutput = unsafe InferenceFunction.AsyncMutableValue(
-                    unsafeBuffer: logits.metalBuffer, byteOffset: 0,
-                    scalarType: .float16, shape: lShape, strides: lStrides)
-                var asyncOutputs = InferenceFunction.AsyncMutableViews()
-                asyncOutputs.insert(&logitsOutput, for: logitsOutputName)
-                let _ = try function.encode(
-                    inputs: asyncInputs,
-                    states: consume asyncStates,
-                    outputViews: consume asyncOutputs,
-                    to: computeStream
-                )
-            case 2:
-                let extra0 = additionalStates![stateIndex: 0]
-                let extra1 = additionalStates![stateIndex: 1]
-                var extraState0 = unsafe InferenceFunction.AsyncMutableValue(
-                    unsafeBuffer: extra0.buffer, byteOffset: 0,
-                    scalarType: extra0.scalarType, shape: extra0.shape, strides: extra0.strides)
-                var extraState1 = unsafe InferenceFunction.AsyncMutableValue(
-                    unsafeBuffer: extra1.buffer, byteOffset: 0,
-                    scalarType: extra1.scalarType, shape: extra1.shape, strides: extra1.strides)
-                var asyncStates = InferenceFunction.AsyncMutableViews()
-                asyncStates.insert(&keyState, for: keyCacheName)
-                asyncStates.insert(&valState, for: valueCacheName)
-                asyncStates.insert(&extraState0, for: extra0.name)
-                asyncStates.insert(&extraState1, for: extra1.name)
-                var logitsOutput = unsafe InferenceFunction.AsyncMutableValue(
-                    unsafeBuffer: logits.metalBuffer, byteOffset: 0,
-                    scalarType: .float16, shape: lShape, strides: lStrides)
-                var asyncOutputs = InferenceFunction.AsyncMutableViews()
-                asyncOutputs.insert(&logitsOutput, for: logitsOutputName)
-                let _ = try function.encode(
-                    inputs: asyncInputs,
-                    states: consume asyncStates,
-                    outputViews: consume asyncOutputs,
-                    to: computeStream
-                )
-            default:
-                var asyncStates = InferenceFunction.AsyncMutableViews()
-                asyncStates.insert(&keyState, for: keyCacheName)
-                asyncStates.insert(&valState, for: valueCacheName)
-                var logitsOutput = unsafe InferenceFunction.AsyncMutableValue(
-                    unsafeBuffer: logits.metalBuffer, byteOffset: 0,
-                    scalarType: .float16, shape: lShape, strides: lStrides)
-                var asyncOutputs = InferenceFunction.AsyncMutableViews()
-                asyncOutputs.insert(&logitsOutput, for: logitsOutputName)
-                let _ = try function.encode(
-                    inputs: asyncInputs,
-                    states: consume asyncStates,
-                    outputViews: consume asyncOutputs,
-                    to: computeStream
-                )
-            }
+            try encodeWithStates(
+                function: function, inputs: asyncInputs,
+                keyState: &keyState, keyCacheName: keyCacheName,
+                valState: &valState, valueCacheName: valueCacheName,
+                additionalStates: additionalStates,
+                logitsBuffer: logits.metalBuffer, logitsName: logitsOutputName,
+                logitsShape: lShape, logitsStrides: lStrides,
+                computeStream: computeStream)
 
             // Warm up argmax kernel using pipeline-matched decode buffers
             let warmupLogitsBuffer = decodeLogitsBuffers[step % pipelineDepth]

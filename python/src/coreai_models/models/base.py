@@ -7,26 +7,100 @@
 
 import collections.abc
 import gc
+import inspect
 import json
 import os
 import re
 from abc import abstractmethod
 from collections.abc import Callable
+from dataclasses import dataclass
 from functools import wraps
-from typing import TypeVar, cast
+from typing import Any, TypeVar, cast
 
 import torch
+from coreai.authoring.types import AllocationType, HardwareConstraints
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from safetensors.torch import save_file
 from transformers import AutoConfig
 from transformers.modeling_utils import PreTrainedModel
-from typing_extensions import Self
+from typing_extensions import Self, override
 
+from coreai_models._constants import (
+    CAUSAL_MASK_INPUT_NAME,
+    EMBEDDING_TABLE_INPUT_NAME,
+    EXTEND_FUNCTION_NAME,
+    GATHER_EMBEDDINGS_FUNCTION_NAME,
+    GATHERED_EMBEDDINGS_OUTPUT_NAME,
+    IN_STEP_INPUT_NAME,
+    KEY_CACHE_INPUT_NAME,
+    KEY_CACHE_NAME,
+    KEY_CACHE_OUTPUT_NAME,
+    LOAD_EMBEDDINGS_FUNCTION_NAME,
+    LOAD_EMBEDDINGS_OUTPUT_NAME,
+    MAIN_GRAPH_NAME,
+    OUTPUT_LOGITS_NAME,
+    POSITION_IDS_INPUT_NAME,
+    QUANT_TRACE_OFFSET,
+    QUANT_TRACE_QUERY_LEN,
+    TOKEN_IDS_INPUT_NAME,
+    TRACE_KV_CACHE_SEQ_LEN,
+    TRANSFORMER_INPUT_NAME,
+    VALUE_CACHE_INPUT_NAME,
+    VALUE_CACHE_NAME,
+    VALUE_CACHE_OUTPUT_NAME,
+)
 from coreai_models.primitives.ios.embedding import GatherEmbeddings, LoadEmbeddings
 from coreai_models.primitives.macos.cache import KVCache
 
 T = TypeVar("T", bound="BaseForCausalLM")
+
+
+@dataclass(frozen=True)
+class TraceSpec:
+    """Shapes for one ``torch.export`` trace of a causal LM forward.
+
+    Passed to both ``build_reference_inputs`` and ``build_dynamic_shapes`` so the
+    tensors and their declared dims cannot disagree.
+
+    Attributes:
+        max_context_length: Upper bound for the dynamic seq/cache dims. Must be at
+            least ``query_len + 2``.
+        cache_seq_len: Length the caches are *traced* at, to bound peak trace memory.
+            Unrelated to the inference cache size. Must not exceed
+            ``max_context_length``.
+        query_len: Trace-time ``input_ids`` length.
+        offset: Already-cached positions, so ``position_ids`` is
+            ``query_len + offset`` long.
+    """
+
+    max_context_length: int
+    cache_seq_len: int = TRACE_KV_CACHE_SEQ_LEN
+    query_len: int = QUANT_TRACE_QUERY_LEN
+    offset: int = QUANT_TRACE_OFFSET
+
+    def __post_init__(self) -> None:
+        # Below this there is no legal `Dim(min=query_len, max=max_context_length - 1)`.
+        if self.max_context_length < self.query_len + 2:
+            raise ValueError(
+                f"max_context_length={self.max_context_length} is too small to trace: "
+                f"it must be at least query_len + 2 = {self.query_len + 2}."
+            )
+        if self.cache_seq_len > self.max_context_length:
+            raise ValueError(
+                "cache_seq_len must not be greater than max_context_length. Received "
+                f"cache_seq_len = {self.cache_seq_len}, "
+                f"max_context_length = {self.max_context_length}"
+            )
+
+    @property
+    def caches_are_static(self) -> bool:
+        """Whether the cache dims must be pinned rather than declared dynamic.
+
+        A cache traced at the full context has nowhere to grow, and ``Dim(min=max=n)``
+        is illegal anyway.
+        """
+        return self.cache_seq_len == self.max_context_length
 
 
 def _is_layer_key_beyond(key: str, num_layers: int) -> bool:
@@ -299,6 +373,164 @@ class BaseForCausalLM(torch.nn.Module):
             state_dict: The state dict from HuggingFace model (modified in-place)
         """
         ...
+
+    # ------------------------------------------------------------------
+    # Export contract
+    #
+    # Everything the exporters need to trace this model, keyed by graph name. A macOS
+    # model has one graph; iOS has several. These hooks supply only names and tensors;
+    # which callable each graph traces stays the exporter's business.
+    #
+    # Reference inputs bind to the traced signature, so they must be in its EXACT
+    # order. Names are looked up by name, so each list carries only the RELATIVE order
+    # of its own kind: for forward(input_ids, key_cache, position_ids, value_cache),
+    # input_names is (input_ids, position_ids) and state_names is (key_cache,
+    # value_cache).
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def export_input_names(cls) -> dict[str, tuple[str, ...]]:
+        """Graph input names per graph, in relative order among the non-state args."""
+        return {MAIN_GRAPH_NAME: ("input_ids", "position_ids")}
+
+    @classmethod
+    def export_state_names(cls) -> dict[str, tuple[str, ...]]:
+        """Runner-visible state names per graph, in relative order among the state args.
+
+        State args are mutated in place and surfaced through the runtime ``state=``
+        kwarg rather than as ordinary inputs/outputs.
+        """
+        return {MAIN_GRAPH_NAME: (KEY_CACHE_NAME, VALUE_CACHE_NAME)}
+
+    @classmethod
+    def export_output_names(cls) -> dict[str, tuple[str, ...]]:
+        """Graph output names per graph, in return order."""
+        return {MAIN_GRAPH_NAME: ("logits",)}
+
+    def build_reference_inputs(
+        self,
+        config,
+        target_dtype: torch.dtype,
+        spec: TraceSpec,
+    ) -> dict[str, dict[str, Any]]:
+        """Reference tensors to trace with, per graph, keyed by parameter name.
+
+        The inner dicts bind to the traced callable, so their keys must be its
+        parameters in *exact* signature order. Pass ``spec`` to
+        :meth:`build_dynamic_shapes` too, so the tensors and their dims cannot disagree.
+        """
+        input_ids = torch.randint(1, config.vocab_size, (1, spec.query_len), dtype=torch.int32)
+        position_ids = (
+            torch.arange(spec.query_len + spec.offset, dtype=torch.int32)
+            .unsqueeze(0)
+            .expand(1, spec.query_len + spec.offset)
+        )
+        k_cache, v_cache = KVCache.create_cache_tensors(
+            config, dtype=target_dtype, seq_len=spec.cache_seq_len
+        )
+        return {
+            MAIN_GRAPH_NAME: {
+                "input_ids": input_ids,
+                "position_ids": position_ids,
+                "k_cache": k_cache,
+                "v_cache": v_cache,
+            }
+        }
+
+    def build_dynamic_shapes(self, config, spec: TraceSpec) -> dict[str, Any]:
+        """``dynamic_shapes`` per graph, matching :meth:`build_reference_inputs`.
+
+        Keyed like the reference inputs; ``None`` pins that input to its traced shape.
+        """
+        max_ctx = spec.max_context_length
+        shapes: dict[str, Any] = {
+            "input_ids": {1: torch.export.Dim("seq_ids", max=max_ctx - 2)},
+            "position_ids": {1: torch.export.Dim("seq_pos", min=spec.query_len, max=max_ctx - 1)},
+        }
+        seq_dim = KVCache.seq_len_dim()
+        if spec.caches_are_static:
+            shapes["k_cache"] = None
+            shapes["v_cache"] = None
+        else:
+            shapes["k_cache"] = {
+                seq_dim: torch.export.Dim("k_seq_len", min=spec.cache_seq_len, max=max_ctx)
+            }
+            shapes["v_cache"] = {
+                seq_dim: torch.export.Dim("v_seq_len", min=spec.cache_seq_len, max=max_ctx)
+            }
+        return {MAIN_GRAPH_NAME: shapes}
+
+    def validate_export_contract(
+        self,
+        reference_inputs: dict[str, dict[str, Any]],
+        dynamic_shapes: dict[str, Any],
+    ) -> None:
+        """Check the five hooks agree with each other.
+
+        The converter compares name *counts* only, so it would accept a contract whose
+        graphs disagree. Called by the exporters before tracing.
+
+        Raises:
+            ValueError: On any disagreement between the hooks.
+        """
+        cls_name = type(self).__name__
+        inputs, states, outputs = (
+            self.export_input_names(),
+            self.export_state_names(),
+            self.export_output_names(),
+        )
+        named = {
+            "export_input_names": set(inputs),
+            "export_state_names": set(states),
+            "export_output_names": set(outputs),
+            "build_reference_inputs": set(reference_inputs),
+            "build_dynamic_shapes": set(dynamic_shapes),
+        }
+        graphs = named["export_input_names"]
+        for hook, keys in named.items():
+            if keys != graphs:
+                raise ValueError(
+                    f"{cls_name}: {hook} covers graphs {sorted(keys)} but "
+                    f"export_input_names covers {sorted(graphs)}. Every hook must "
+                    "describe the same graphs."
+                )
+
+        for graph in sorted(graphs):
+            refs = reference_inputs[graph]
+            declared = len(inputs[graph]) + len(states[graph])
+            if declared != len(refs):
+                raise ValueError(
+                    f"{cls_name}, graph {graph!r}: {len(inputs[graph])} input names + "
+                    f"{len(states[graph])} state names = {declared}, but "
+                    f"build_reference_inputs supplies {len(refs)} tensors "
+                    f"{tuple(refs)}."
+                )
+            shapes = dynamic_shapes[graph]
+            if shapes is not None and set(shapes) != set(refs):
+                raise ValueError(
+                    f"{cls_name}, graph {graph!r}: dynamic_shapes keys "
+                    f"{tuple(shapes)} do not match reference inputs {tuple(refs)}."
+                )
+
+    def reference_inputs_as_args(self, reference_inputs: dict[str, Any]) -> tuple[Any, ...]:
+        """One graph's reference inputs as positional args, validating the order.
+
+        For the coreai-opt quantizer, which takes a tuple rather than kwargs; a dict
+        ordered differently from the signature would silently bind the wrong tensors.
+
+        Raises:
+            ValueError: If the keys are not a contiguous in-order prefix of ``forward``.
+        """
+        params = list(inspect.signature(self.forward).parameters)
+        keys = list(reference_inputs)
+        if keys != params[: len(keys)]:
+            raise ValueError(
+                f"{type(self).__name__}.build_reference_inputs returned keys {keys}, "
+                f"which are not a contiguous in-order prefix of forward's parameters "
+                f"{params}. Positional conversion would bind tensors to the wrong "
+                f"parameters; fix the dict's insertion order or the signature."
+            )
+        return tuple(reference_inputs.values())
 
     @classmethod
     def _get_reauthored_config(
@@ -605,3 +837,234 @@ class BaseForCausalLMForiOS(BaseForCausalLM):
 
     def set_prefill_mode(self, prefill_mode: bool):
         self.extend.prefill_mode = prefill_mode
+
+    # ------------------------------------------------------------------
+    # Export contract
+    #
+    # iOS exports four entrypoints over three callables: the embedding-table loader,
+    # the token gather, and the transformer, the last traced twice with prefill off and
+    # on. The two transformer entrypoints have identical inputs, states and outputs, so
+    # the contract carries three entries and `export/ios.py` uses the transformer entry
+    # for both. Which callable each graph traces, and the prefill toggle between them,
+    # is the exporter's business.
+    #
+    # `model.forward` composes the three for eager use and is never exported, so the
+    # inherited single-graph defaults would describe the wrong graph entirely.
+    #
+    # iOS also needs two things macOS does not: the static shape ladder each graph is
+    # specialized over, and the layout constraints on the buffers it shares with the
+    # runner. Both are per-graph and shaped by this model's graphs, so they live here
+    # alongside the names.
+    # ------------------------------------------------------------------
+
+    #: Query length the iOS graphs are traced at.
+    IOS_QUERY_LEN = 8
+
+    #: Query lengths the graphs are specialized for.
+    IOS_STATIC_QUERY_LENS = (8, 16, 64)
+
+    #: Smallest cache length in the static ladder; it doubles up to the context.
+    IOS_STATIC_MIN_CACHE_LEN = 256
+
+    #: Interleave factor for the KV cache's embedding dim.
+    KV_CACHE_INTERLEAVE_FACTOR = 8
+
+    @classmethod
+    def _head_dim(cls, config) -> int:
+        """``config.head_dim`` when it is set, else derived from hidden size and heads."""
+        head_dim = getattr(config, "head_dim", None)
+        if not isinstance(head_dim, int):
+            head_dim = config.hidden_size // config.num_attention_heads
+        return head_dim
+
+    @classmethod
+    @override
+    def export_input_names(cls) -> dict[str, tuple[str, ...]]:
+        return {
+            LOAD_EMBEDDINGS_FUNCTION_NAME: (),
+            GATHER_EMBEDDINGS_FUNCTION_NAME: (
+                TOKEN_IDS_INPUT_NAME,
+                EMBEDDING_TABLE_INPUT_NAME,
+            ),
+            EXTEND_FUNCTION_NAME: (
+                TRANSFORMER_INPUT_NAME,
+                POSITION_IDS_INPUT_NAME,
+                IN_STEP_INPUT_NAME,
+                CAUSAL_MASK_INPUT_NAME,
+                EMBEDDING_TABLE_INPUT_NAME,
+            ),
+        }
+
+    @classmethod
+    @override
+    def export_state_names(cls) -> dict[str, tuple[str, ...]]:
+        return {
+            LOAD_EMBEDDINGS_FUNCTION_NAME: (),
+            GATHER_EMBEDDINGS_FUNCTION_NAME: (),
+            EXTEND_FUNCTION_NAME: (KEY_CACHE_INPUT_NAME, VALUE_CACHE_INPUT_NAME),
+        }
+
+    @classmethod
+    def export_state_output_names(cls) -> dict[str, tuple[str, ...]]:
+        """State output names per graph.
+
+        iOS names them because the hardware constraints attach to the mutated output as
+        well as the input; the macOS converter surfaces state in/out implicitly.
+        """
+        return {
+            LOAD_EMBEDDINGS_FUNCTION_NAME: (),
+            GATHER_EMBEDDINGS_FUNCTION_NAME: (),
+            EXTEND_FUNCTION_NAME: (KEY_CACHE_OUTPUT_NAME, VALUE_CACHE_OUTPUT_NAME),
+        }
+
+    @classmethod
+    @override
+    def export_output_names(cls) -> dict[str, tuple[str, ...]]:
+        return {
+            LOAD_EMBEDDINGS_FUNCTION_NAME: (LOAD_EMBEDDINGS_OUTPUT_NAME,),
+            GATHER_EMBEDDINGS_FUNCTION_NAME: (GATHERED_EMBEDDINGS_OUTPUT_NAME,),
+            EXTEND_FUNCTION_NAME: (OUTPUT_LOGITS_NAME,),
+        }
+
+    @override
+    def build_reference_inputs(
+        self,
+        config,
+        target_dtype: torch.dtype,
+        spec: TraceSpec,
+    ) -> dict[str, dict[str, Any]]:
+        max_ctx = spec.max_context_length
+        query_len = self.IOS_QUERY_LEN
+        head_dim = self._head_dim(config)
+
+        embedding_table = self.load_embeddings.embedding_table
+        input_ids = torch.randint(1, config.vocab_size, (1, query_len), dtype=torch.int32)
+        # One graph's reference input is produced by running another.
+        transformer_input = self.gather_embeddings(input_ids, embedding_table)
+
+        key_cache = torch.zeros(
+            config.num_hidden_layers,
+            1,
+            config.num_key_value_heads * head_dim,
+            1,
+            max_ctx,
+            dtype=torch.float16,
+        )
+
+        return {
+            LOAD_EMBEDDINGS_FUNCTION_NAME: {},
+            GATHER_EMBEDDINGS_FUNCTION_NAME: {
+                "input_ids": input_ids,
+                "embedding_table": embedding_table,
+            },
+            # Exact signature order of Qwen3Extend.forward and friends.
+            EXTEND_FUNCTION_NAME: {
+                "transformer_input": transformer_input,
+                "position_ids": torch.arange(query_len).to(torch.uint16).unsqueeze(0),
+                "in_step": torch.zeros((1,), dtype=torch.int32),
+                "causal_mask": torch.zeros(1, max_ctx, 1, query_len, dtype=torch.float16),
+                "key_cache": key_cache,
+                "value_cache": key_cache.clone(),
+                "embedding_table": embedding_table,
+            },
+        }
+
+    @override
+    def build_dynamic_shapes(self, config, spec: TraceSpec) -> dict[str, Any]:
+        max_ctx = spec.max_context_length
+        seq_len_dim = torch.export.Dim("seq_len", max=max_ctx)
+        cache_len_dim = torch.export.Dim("cache_len", max=max_ctx)
+        return {
+            LOAD_EMBEDDINGS_FUNCTION_NAME: {},
+            GATHER_EMBEDDINGS_FUNCTION_NAME: {
+                "input_ids": {1: seq_len_dim},
+                "embedding_table": None,
+            },
+            EXTEND_FUNCTION_NAME: {
+                "transformer_input": {1: seq_len_dim},
+                "position_ids": {1: seq_len_dim},
+                "in_step": None,
+                "causal_mask": {1: cache_len_dim, 3: seq_len_dim},
+                "key_cache": {4: cache_len_dim},
+                "value_cache": {4: cache_len_dim},
+                "embedding_table": None,
+            },
+        }
+
+    @classmethod
+    def export_static_shape_configs(
+        cls, config, max_context_length: int
+    ) -> dict[str, dict[str, dict[str, tuple[int, ...]]]]:
+        """Static shape specializations per graph, keyed like the name hooks.
+
+        iOS compiles for fixed shapes, so each graph is built once per shape it must
+        serve: the transformer over (cache length, query length), the gather over query
+        length alone. The inner keys are the specialization labels, quoted because that
+        is the form the compiler expects. An empty dict means no specialization.
+        """
+        kv_embed_size = config.num_key_value_heads * cls._head_dim(config)
+
+        transformer: dict[str, dict[str, tuple[int, ...]]] = {}
+        cache_len = cls.IOS_STATIC_MIN_CACHE_LEN
+        while cache_len <= max_context_length:
+            for q_len in cls.IOS_STATIC_QUERY_LENS:
+                transformer[f'"{cache_len}_{q_len}"'] = {
+                    TRANSFORMER_INPUT_NAME: (1, q_len, 1, config.hidden_size),
+                    POSITION_IDS_INPUT_NAME: (1, q_len),
+                    CAUSAL_MASK_INPUT_NAME: (1, cache_len, 1, q_len),
+                    KEY_CACHE_INPUT_NAME: (
+                        config.num_hidden_layers,
+                        1,
+                        kv_embed_size,
+                        1,
+                        cache_len,
+                    ),
+                    VALUE_CACHE_INPUT_NAME: (
+                        config.num_hidden_layers,
+                        1,
+                        kv_embed_size,
+                        1,
+                        cache_len,
+                    ),
+                }
+            cache_len *= 2
+
+        return {
+            LOAD_EMBEDDINGS_FUNCTION_NAME: {},
+            GATHER_EMBEDDINGS_FUNCTION_NAME: {
+                f'"{q}"': {TOKEN_IDS_INPUT_NAME: (1, q)} for q in cls.IOS_STATIC_QUERY_LENS
+            },
+            EXTEND_FUNCTION_NAME: transformer,
+        }
+
+    @classmethod
+    def export_hardware_constraints(
+        cls, max_context_length: int
+    ) -> dict[str, dict[str, HardwareConstraints]]:
+        """Per-input hardware constraints per graph, keyed like the name hooks.
+
+        These pin the layout of the buffers the runner shares with the compiled graphs,
+        so both sides agree. The caches are constrained on the mutated output as well as
+        the input, which is why :meth:`export_state_output_names` exists.
+        """
+        embedding_table = HardwareConstraints(
+            AllocationType.IOSurface, interleave=[8, 1, 1], alignments=[1, 1, 1, 1]
+        )
+        cache = HardwareConstraints(
+            AllocationType.IOSurface,
+            interleave=[1, 1, cls.KV_CACHE_INTERLEAVE_FACTOR, 1, 1],
+            alignments=[1, 1, 1, 1, cls.KV_CACHE_INTERLEAVE_FACTOR * max_context_length, 1],
+        )
+
+        transformer = {EMBEDDING_TABLE_INPUT_NAME: embedding_table}
+        for name in (
+            *cls.export_state_names()[EXTEND_FUNCTION_NAME],
+            *cls.export_state_output_names()[EXTEND_FUNCTION_NAME],
+        ):
+            transformer[name] = cache
+
+        return {
+            LOAD_EMBEDDINGS_FUNCTION_NAME: {EMBEDDING_TABLE_INPUT_NAME: embedding_table},
+            GATHER_EMBEDDINGS_FUNCTION_NAME: {EMBEDDING_TABLE_INPUT_NAME: embedding_table},
+            EXTEND_FUNCTION_NAME: transformer,
+        }

@@ -8,16 +8,13 @@ import CoreAI
 /// Persistent model state that the engine carries across inference steps.
 ///
 /// Each handler manages one or more named state tensors (e.g., key_cache + value_cache,
-/// or a single convolution_state). The engine owns an array of handlers and delegates
-/// all state lifecycle to them — allocation, growth, and reset.
+/// or a single convolution_state). The engine owns handlers and delegates all state
+/// lifecycle to them — allocation, growth, and reset.
 ///
-/// ## MutableViews Lifetime Constraint
-///
-/// `InferenceFunction.MutableViews.insert` creates a lifetime dependency on each `inout`
-/// variable. This means state binding CANNOT be abstracted into a method that takes
-/// `inout MutableViews` — the inserts must happen in the same scope as `function.run()`.
-/// Handlers therefore expose their arrays directly via subscript for the engine to bind.
-public protocol SyncStateHandler {
+/// Handlers are classes (AnyObject) so they own their NDArrays at refcount 1 —
+/// `bind(into:)` calls `mutableRawView()` without triggering COW. The loop uses
+/// `_overrideLifetime` to express disjoint element access to the compiler.
+public protocol SyncStateHandler: AnyObject {
     /// Names of the states managed by this handler.
     var stateNames: [String] { get }
 
@@ -35,18 +32,32 @@ public protocol SyncStateHandler {
 
     /// Ensure the state can accommodate `contextLength` tokens.
     /// Returns true if reallocation occurred.
-    mutating func ensureCapacity(forContextLength contextLength: Int) throws -> Bool
+    func ensureCapacity(forContextLength contextLength: Int) throws -> Bool
 
-    /// Access a state array by index for binding into MutableViews.
-    /// The engine calls this to get name + array pairs for insert.
+    /// Access a state array by name+index (value copy — use bind(into:) on hot paths).
     subscript(stateIndex index: Int) -> (name: String, array: NDArray) { get set }
 
+    /// Insert all managed states into `views`. Zero-copy: uses reference-backed
+    /// storage internally, so mutableRawView() never triggers COW.
+    @_lifetime(views: borrow self)
+    func bind(into views: inout InferenceFunction.MutableViews)
+
     /// Full reset — zero all backing storage, rewind to position 0.
-    mutating func reset()
+    func reset()
 
     /// Truncate to a given token position.
-    /// Only valid when `supportsTruncation == true`. For KV cache, this is a no-op
-    /// on the backing storage (causal mask handles visibility); the engine just
-    /// updates its processedTokenCount.
-    mutating func truncate(to tokenCount: Int)
+    func truncate(to tokenCount: Int)
+}
+
+// MARK: - Lifetime Helpers
+
+/// Detach lifetime dependencies from MutableViews so it can cross scope
+/// boundaries (closures, await). Caller must ensure inserted arrays remain valid.
+@inline(__always)
+@_unsafeNonescapableResult
+@_lifetime(immortal)
+func _unsafeEscapeMutableViews(
+    _ views: consuming InferenceFunction.MutableViews
+) -> InferenceFunction.MutableViews {
+    views
 }
