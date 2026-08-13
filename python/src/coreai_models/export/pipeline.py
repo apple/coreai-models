@@ -24,17 +24,15 @@ import torch
 from coreai_opt.palettization.config.palettization_config import KMeansPalettizerConfig
 from transformers import AutoConfig, AutoTokenizer
 
-from coreai_models.export._constants import (
+from coreai_models._constants import (
     IOS_DEFAULT_MAX_CONTEXT_LENGTH,
-    QUANT_TRACE_OFFSET,
-    QUANT_TRACE_QUERY_LEN,
     TRACE_KV_CACHE_SEQ_LEN,
 )
 from coreai_models.export.bundle import bundle_llm_asset
 from coreai_models.export.compression import (
     get_c4,
     palettize_pytorch_model,
-    quantize_pytorch_model,
+    quantize_for_export,
 )
 from coreai_models.export.ios import export_ios_model
 from coreai_models.export.macos import export_macos_model
@@ -44,7 +42,6 @@ from coreai_models.export.presets import (
     get_preset,
 )
 from coreai_models.models.registry import get_model_entry
-from coreai_models.primitives.macos.cache import KVCache
 
 logger = logging.getLogger(__name__)
 
@@ -241,32 +238,6 @@ async def _async_export_model(config: ExportConfig) -> str:
         if torch_quantization_config is not None:
             logger.info(f"Applying pre-export torch quantization (preset={config.compression})")
 
-            input_ids = torch.randint(
-                1, vocab_size, (batch_size, QUANT_TRACE_QUERY_LEN), dtype=torch.int32
-            )
-            position_ids = (
-                torch.arange(QUANT_TRACE_QUERY_LEN + QUANT_TRACE_OFFSET, dtype=torch.int32)
-                .unsqueeze(0)
-                .expand(batch_size, QUANT_TRACE_QUERY_LEN + QUANT_TRACE_OFFSET)
-            )
-
-            saved_max_pos = hf_config.max_position_embeddings
-            hf_config.max_position_embeddings = TRACE_KV_CACHE_SEQ_LEN
-            k_cache, v_cache = KVCache.create_cache_tensors(hf_config, dtype=target_dtype)
-            hf_config.max_position_embeddings = saved_max_pos
-
-            quantization_inputs = (input_ids, position_ids, k_cache, v_cache)
-            quantization_dynamic_shapes = {
-                "input_ids": {1: torch.export.Dim("seq_ids", max=TRACE_KV_CACHE_SEQ_LEN - 2)},
-                "position_ids": {
-                    1: torch.export.Dim(
-                        "seq_pos", min=QUANT_TRACE_QUERY_LEN, max=TRACE_KV_CACHE_SEQ_LEN - 1
-                    )
-                },
-                "k_cache": None,
-                "v_cache": None,
-            }
-
             def get_calibration_data():  # type: ignore[no-untyped-def]
                 tokenizer = AutoTokenizer.from_pretrained(config.hf_model_id)
                 return get_c4(tokenizer)
@@ -284,10 +255,10 @@ async def _async_export_model(config: ExportConfig) -> str:
                 if not isinstance(torch_quantization_config, dict)
                 else dict(torch_quantization_config)
             )
-            model = quantize_pytorch_model(
+            model = quantize_for_export(
                 model,
-                quantization_inputs,
-                quantization_dynamic_shapes,
+                hf_config,
+                target_dtype,
                 quant_cfg,
                 calibration_data_fn=get_calibration_data,
                 mmap_dir=quantizer_mmap_dir,

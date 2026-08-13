@@ -3,15 +3,21 @@
 # Use of this source code is governed by a BSD-3-clause license that can
 # be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
-"""Constants for the export pipeline."""
+"""Graph and runner contract constants.
+
+A leaf module: imported by both ``models/`` and ``export/``, imports nothing from
+either.
+"""
+
+# Graph name for a single-graph (macOS) export. iOS uses its own entrypoint names.
+MAIN_GRAPH_NAME = "main"
 
 # KV cache names used by the Swift runner
 KEY_CACHE_NAME = "keyCache"
 VALUE_CACHE_NAME = "valueCache"
 
-# Trace-time KV cache sequence length. Used only for export/quantization tracing
-# to bound peak memory; at inference the actual cache size is determined
-# dynamically.
+# Trace-time KV cache sequence length, to bound peak trace memory. At inference the
+# cache size is dynamic.
 TRACE_KV_CACHE_SEQ_LEN = 2048
 
 # Trace-time `input_ids` length and `position_ids` offset for export/quantization

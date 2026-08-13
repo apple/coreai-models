@@ -44,18 +44,12 @@ Usage:
     uv run models/sam3/export.py [--image-size N] [--n-bits N] [--output-dir PATH] ...
 """
 
-import sys
-
 
 def main() -> None:
     # Lazy import so the inline-script header parses cleanly even if the
     # workspace package isn't on sys.path yet (uv handles that before main()).
     from coreai_models.segmentation.export import main as segmentation_main
 
-    # The shared CLI takes a `model` positional. This script only handles SAM3,
-    # so inject "sam3" and forward any user-supplied flags untouched.
-    if len(sys.argv) == 1 or sys.argv[1].startswith("-"):
-        sys.argv.insert(1, "sam3")
     segmentation_main()
 
 

@@ -11,24 +11,19 @@ torch.export -> decompose -> defunctionalize -> TorchConverter -> optimize.
 """
 
 import logging
+from typing import Any
 
 import coreai_torch
 import coreai_torch.composite_ops
 import torch
 from coreai.authoring import AIProgram
 
-from coreai_models.export._constants import (
-    KEY_CACHE_NAME,
-    QUANT_TRACE_OFFSET,
-    QUANT_TRACE_QUERY_LEN,
-    TRACE_KV_CACHE_SEQ_LEN,
-    VALUE_CACHE_NAME,
-)
+from coreai_models._constants import MAIN_GRAPH_NAME, TRACE_KV_CACHE_SEQ_LEN
 from coreai_models.export.mlir_ops import (
     register_custom_torch_lowering,
     remove_functionalization,
 )
-from coreai_models.primitives.macos.cache import KVCache
+from coreai_models.models.base import BaseForCausalLM, TraceSpec
 
 logger = logging.getLogger(__name__)
 
@@ -64,69 +59,31 @@ _EXTERNALIZE_SPECS = [
 
 
 def _build_reference_inputs(
-    model: torch.nn.Module,
+    model: BaseForCausalLM,
     config,
     target_dtype: torch.dtype,
     max_context_length: int,
-) -> tuple[dict[str, torch.Tensor], dict]:
-    """Build reference inputs and dynamic shapes for macOS model export.
+) -> tuple[dict[str, Any], dict]:
+    """Reference inputs and dynamic shapes for macOS export.
 
-    Args:
-        model: The PyTorch model (used only to read config).
-        config: HuggingFace model config.
-        target_dtype: Data type for cache tensors.
-        max_context_length: Maximum context length for the model.
-
-    Returns:
-        Tuple of (reference_inputs dict, dynamic_shapes dict).
+    Thin wrapper over the model's export-contract hooks, where the per-model variation
+    lives. Returns ``(reference_inputs, dynamic_shapes)``.
     """
-    batch_size = 1
-    vocab_size = config.vocab_size
-
-    input_ids = torch.randint(1, vocab_size, (batch_size, QUANT_TRACE_QUERY_LEN), dtype=torch.int32)
-    position_ids = (
-        torch.arange(QUANT_TRACE_QUERY_LEN + QUANT_TRACE_OFFSET, dtype=torch.int32)
-        .unsqueeze(0)
-        .expand(batch_size, QUANT_TRACE_QUERY_LEN + QUANT_TRACE_OFFSET)
+    # The trace cache length only bounds peak memory, so cap it at the context it serves.
+    spec = TraceSpec(
+        max_context_length=max_context_length,
+        cache_seq_len=min(TRACE_KV_CACHE_SEQ_LEN, max_context_length),
     )
-
-    # Clamp `max_position_embeddings` so KVCache.create_cache_tensors doesn't
-    # allocate a full-context cache for huge models
-    saved_max_pos = config.max_position_embeddings
-    config.max_position_embeddings = TRACE_KV_CACHE_SEQ_LEN
-    k_cache, v_cache = KVCache.create_cache_tensors(config, dtype=target_dtype)
-    config.max_position_embeddings = saved_max_pos
-
-    reference_inputs = {
-        "input_ids": input_ids,
-        "position_ids": position_ids,
-        "k_cache": k_cache,
-        "v_cache": v_cache,
-    }
-
-    dynamic_shapes = {
-        "input_ids": {1: torch.export.Dim("seq_ids", max=max_context_length - 2)},
-        "position_ids": {
-            1: torch.export.Dim("seq_pos", min=QUANT_TRACE_QUERY_LEN, max=max_context_length - 1)
-        },
-        "k_cache": {
-            KVCache.seq_len_dim(): torch.export.Dim(
-                "k_seq_len", min=TRACE_KV_CACHE_SEQ_LEN, max=max_context_length
-            )
-        },
-        "v_cache": {
-            KVCache.seq_len_dim(): torch.export.Dim(
-                "v_seq_len", min=TRACE_KV_CACHE_SEQ_LEN, max=max_context_length
-            )
-        },
-    }
-
-    return reference_inputs, dynamic_shapes
+    reference_inputs = model.build_reference_inputs(config, target_dtype, spec)
+    dynamic_shapes = model.build_dynamic_shapes(config, spec)
+    model.validate_export_contract(reference_inputs, dynamic_shapes)
+    # A macOS model has exactly one graph.
+    return reference_inputs[MAIN_GRAPH_NAME], dynamic_shapes[MAIN_GRAPH_NAME]
 
 
 def export_to_coreai(
     model: torch.nn.Module,
-    reference_inputs: dict[str, torch.Tensor],
+    reference_inputs: dict[str, Any],
     dynamic_shapes: dict | None = None,
     input_names: tuple[str, ...] | None = None,
     output_names: tuple[str, ...] | None = None,
@@ -197,7 +154,7 @@ def export_to_coreai(
 
 
 def export_macos_model(
-    model: torch.nn.Module,
+    model: BaseForCausalLM,
     config,
     export_config,
 ) -> AIProgram:
@@ -209,7 +166,8 @@ def export_macos_model(
     3. Optimizes the resulting AIProgram
 
     Args:
-        model: A loaded PyTorch model (already in the correct dtype).
+        model: A loaded PyTorch model (already in the correct dtype). Its
+            export-contract hooks supply the graph's inputs, states, and names.
         config: HuggingFace model config (used for cache dimensions, vocab size, etc.).
         export_config: An ExportConfig instance (used for max_context_length, etc.).
 
@@ -231,18 +189,14 @@ def export_macos_model(
         model, config, target_dtype, max_context_length
     )
 
-    input_names = ("input_ids", "position_ids")
-    output_names = ("logits",)
-    state_names = (KEY_CACHE_NAME, VALUE_CACHE_NAME)
-
     logger.info("Exporting model to Core AI dialect...")
     coreai_program = export_to_coreai(
         model,
         reference_inputs,
         dynamic_shapes=dynamic_shapes,
-        input_names=input_names,
-        output_names=output_names,
-        state_names=state_names,
+        input_names=model.export_input_names()[MAIN_GRAPH_NAME],
+        output_names=model.export_output_names()[MAIN_GRAPH_NAME],
+        state_names=model.export_state_names()[MAIN_GRAPH_NAME],
     )
 
     logger.info("Optimizing AIProgram...")

@@ -957,20 +957,14 @@ class ForCausalLMTestBase:
         if activation_quantization:
             pytest.skip("Activation quantization temporarily disabled with eager mode quantization")
 
-        # We replicate the relevant parts of
-        # ``coreai_models.export.pipeline._async_export_model`` here:
-        # load HF -> apply torch quantization -> run macOS export. The output
-        # asset write is intentionally skipped; we only want to confirm
+        # Same building blocks as `_async_export_model`: load HF ->
+        # `quantize_for_export` -> `export_macos_model`. Calling those rather than
+        # reimplementing the calibration trace keeps this from drifting from
+        # production, as it had. The asset write is skipped; we only confirm
         # quantize + export produces a non-None AIProgram.
-        from coreai_models.export._constants import (
-            QUANT_TRACE_OFFSET,
-            QUANT_TRACE_QUERY_LEN,
-            TRACE_KV_CACHE_SEQ_LEN,
-        )
-        from coreai_models.export.compression import quantize_pytorch_model
+        from coreai_models.export.compression import quantize_for_export
         from coreai_models.export.macos import export_macos_model
         from coreai_models.export.pipeline import ExportConfig
-        from coreai_models.primitives.macos.cache import KVCache
 
         hf_config = transformers.AutoConfig.from_pretrained(self._toy_model_id)
         is_gemma = "gemma" in self._model_class.__name__.lower()
@@ -1034,39 +1028,12 @@ class ForCausalLMTestBase:
                 hf_state_dict_prefix=hf_state_dict_prefix,
             ).eval()
 
-            # Build calibration / trace inputs for quantization
-            vocab_size = getattr(hf_config, "vocab_size", 32000)
-            input_ids = torch.randint(1, vocab_size, (1, QUANT_TRACE_QUERY_LEN), dtype=torch.int32)
-            position_ids = (
-                torch.arange(QUANT_TRACE_QUERY_LEN + QUANT_TRACE_OFFSET, dtype=torch.int32)
-                .unsqueeze(0)
-                .expand(1, QUANT_TRACE_QUERY_LEN + QUANT_TRACE_OFFSET)
-            )
-            saved_max_pos = hf_config.max_position_embeddings
-            hf_config.max_position_embeddings = TRACE_KV_CACHE_SEQ_LEN
-            k_cache, v_cache = KVCache.create_cache_tensors(hf_config, dtype=target_dtype)
-            hf_config.max_position_embeddings = saved_max_pos
-
-            quantization_inputs = (input_ids, position_ids, k_cache, v_cache)
-            quantization_dynamic_shapes = {
-                "input_ids": {1: torch.export.Dim("seq_ids", max=max_context_length - 2)},
-                "position_ids": {
-                    1: torch.export.Dim(
-                        "seq_pos",
-                        min=QUANT_TRACE_QUERY_LEN,
-                        max=max_context_length - 1,
-                    )
-                },
-                "k_cache": None,
-                "v_cache": None,
-            }
-
             quantizer_mmap_dir = f"{tmpdir}/quantized"
             os.makedirs(quantizer_mmap_dir, exist_ok=True)
-            model = quantize_pytorch_model(
+            model = quantize_for_export(
                 model,
-                quantization_inputs,
-                quantization_dynamic_shapes,
+                hf_config,
+                target_dtype,
                 dict(torch_quantization_config),
                 calibration_data_fn=None,
                 mmap_dir=quantizer_mmap_dir,

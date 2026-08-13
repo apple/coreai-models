@@ -7,13 +7,15 @@
 
 import collections.abc
 import gc
+import inspect
 import json
 import os
 import re
 from abc import abstractmethod
 from collections.abc import Callable
+from dataclasses import dataclass
 from functools import wraps
-from typing import TypeVar, cast
+from typing import Any, NoReturn, TypeVar, cast
 
 import torch
 from huggingface_hub import snapshot_download
@@ -21,12 +23,67 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 from transformers import AutoConfig
 from transformers.modeling_utils import PreTrainedModel
-from typing_extensions import Self
+from typing_extensions import Self, override
 
+from coreai_models._constants import (
+    KEY_CACHE_NAME,
+    MAIN_GRAPH_NAME,
+    QUANT_TRACE_OFFSET,
+    QUANT_TRACE_QUERY_LEN,
+    TRACE_KV_CACHE_SEQ_LEN,
+    VALUE_CACHE_NAME,
+)
 from coreai_models.primitives.ios.embedding import GatherEmbeddings, LoadEmbeddings
 from coreai_models.primitives.macos.cache import KVCache
 
 T = TypeVar("T", bound="BaseForCausalLM")
+
+
+@dataclass(frozen=True)
+class TraceSpec:
+    """Shapes for one ``torch.export`` trace of a causal LM forward.
+
+    Passed to both ``build_reference_inputs`` and ``build_dynamic_shapes`` so the
+    tensors and their declared dims cannot disagree.
+
+    Attributes:
+        max_context_length: Upper bound for the dynamic seq/cache dims. Must be at
+            least ``query_len + 2``.
+        cache_seq_len: Length the caches are *traced* at, to bound peak trace memory.
+            Unrelated to the inference cache size. Must not exceed
+            ``max_context_length``.
+        query_len: Trace-time ``input_ids`` length.
+        offset: Already-cached positions, so ``position_ids`` is
+            ``query_len + offset`` long.
+    """
+
+    max_context_length: int
+    cache_seq_len: int = TRACE_KV_CACHE_SEQ_LEN
+    query_len: int = QUANT_TRACE_QUERY_LEN
+    offset: int = QUANT_TRACE_OFFSET
+
+    def __post_init__(self) -> None:
+        # Below this there is no legal `Dim(min=query_len, max=max_context_length - 1)`.
+        if self.max_context_length < self.query_len + 2:
+            raise ValueError(
+                f"max_context_length={self.max_context_length} is too small to trace: "
+                f"it must be at least query_len + 2 = {self.query_len + 2}."
+            )
+        if self.cache_seq_len > self.max_context_length:
+            raise ValueError(
+                "cache_seq_len must not be greater than max_context_length. Received "
+                f"cache_seq_len = {self.cache_seq_len}, "
+                f"max_context_length = {self.max_context_length}"
+            )
+
+    @property
+    def caches_are_static(self) -> bool:
+        """Whether the cache dims must be pinned rather than declared dynamic.
+
+        A cache traced at the full context has nowhere to grow, and ``Dim(min=max=n)``
+        is illegal anyway.
+        """
+        return self.cache_seq_len == self.max_context_length
 
 
 def _is_layer_key_beyond(key: str, num_layers: int) -> bool:
@@ -299,6 +356,164 @@ class BaseForCausalLM(torch.nn.Module):
             state_dict: The state dict from HuggingFace model (modified in-place)
         """
         ...
+
+    # ------------------------------------------------------------------
+    # Export contract
+    #
+    # Everything the exporters need to trace this model, keyed by graph name. A macOS
+    # model has one graph; iOS has several. These hooks supply only names and tensors;
+    # which callable each graph traces stays the exporter's business.
+    #
+    # Reference inputs bind to the traced signature, so they must be in its EXACT
+    # order. Names are looked up by name, so each list carries only the RELATIVE order
+    # of its own kind: for forward(input_ids, key_cache, position_ids, value_cache),
+    # input_names is (input_ids, position_ids) and state_names is (key_cache,
+    # value_cache).
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def export_input_names(cls) -> dict[str, tuple[str, ...]]:
+        """Graph input names per graph, in relative order among the non-state args."""
+        return {MAIN_GRAPH_NAME: ("input_ids", "position_ids")}
+
+    @classmethod
+    def export_state_names(cls) -> dict[str, tuple[str, ...]]:
+        """Runner-visible state names per graph, in relative order among the state args.
+
+        State args are mutated in place and surfaced through the runtime ``state=``
+        kwarg rather than as ordinary inputs/outputs.
+        """
+        return {MAIN_GRAPH_NAME: (KEY_CACHE_NAME, VALUE_CACHE_NAME)}
+
+    @classmethod
+    def export_output_names(cls) -> dict[str, tuple[str, ...]]:
+        """Graph output names per graph, in return order."""
+        return {MAIN_GRAPH_NAME: ("logits",)}
+
+    def build_reference_inputs(
+        self,
+        config,
+        target_dtype: torch.dtype,
+        spec: TraceSpec,
+    ) -> dict[str, dict[str, Any]]:
+        """Reference tensors to trace with, per graph, keyed by parameter name.
+
+        The inner dicts bind to the traced callable, so their keys must be its
+        parameters in *exact* signature order. Pass ``spec`` to
+        :meth:`build_dynamic_shapes` too, so the tensors and their dims cannot disagree.
+        """
+        input_ids = torch.randint(1, config.vocab_size, (1, spec.query_len), dtype=torch.int32)
+        position_ids = (
+            torch.arange(spec.query_len + spec.offset, dtype=torch.int32)
+            .unsqueeze(0)
+            .expand(1, spec.query_len + spec.offset)
+        )
+        k_cache, v_cache = KVCache.create_cache_tensors(
+            config, dtype=target_dtype, seq_len=spec.cache_seq_len
+        )
+        return {
+            MAIN_GRAPH_NAME: {
+                "input_ids": input_ids,
+                "position_ids": position_ids,
+                "k_cache": k_cache,
+                "v_cache": v_cache,
+            }
+        }
+
+    def build_dynamic_shapes(self, config, spec: TraceSpec) -> dict[str, Any]:
+        """``dynamic_shapes`` per graph, matching :meth:`build_reference_inputs`.
+
+        Keyed like the reference inputs; ``None`` pins that input to its traced shape.
+        """
+        max_ctx = spec.max_context_length
+        shapes: dict[str, Any] = {
+            "input_ids": {1: torch.export.Dim("seq_ids", max=max_ctx - 2)},
+            "position_ids": {1: torch.export.Dim("seq_pos", min=spec.query_len, max=max_ctx - 1)},
+        }
+        seq_dim = KVCache.seq_len_dim()
+        if spec.caches_are_static:
+            shapes["k_cache"] = None
+            shapes["v_cache"] = None
+        else:
+            shapes["k_cache"] = {
+                seq_dim: torch.export.Dim("k_seq_len", min=spec.cache_seq_len, max=max_ctx)
+            }
+            shapes["v_cache"] = {
+                seq_dim: torch.export.Dim("v_seq_len", min=spec.cache_seq_len, max=max_ctx)
+            }
+        return {MAIN_GRAPH_NAME: shapes}
+
+    def validate_export_contract(
+        self,
+        reference_inputs: dict[str, dict[str, Any]],
+        dynamic_shapes: dict[str, Any],
+    ) -> None:
+        """Check the five hooks agree with each other.
+
+        The converter compares name *counts* only, so it would accept a contract whose
+        graphs disagree. Called by the exporters before tracing.
+
+        Raises:
+            ValueError: On any disagreement between the hooks.
+        """
+        cls_name = type(self).__name__
+        inputs, states, outputs = (
+            self.export_input_names(),
+            self.export_state_names(),
+            self.export_output_names(),
+        )
+        named = {
+            "export_input_names": set(inputs),
+            "export_state_names": set(states),
+            "export_output_names": set(outputs),
+            "build_reference_inputs": set(reference_inputs),
+            "build_dynamic_shapes": set(dynamic_shapes),
+        }
+        graphs = named["export_input_names"]
+        for hook, keys in named.items():
+            if keys != graphs:
+                raise ValueError(
+                    f"{cls_name}: {hook} covers graphs {sorted(keys)} but "
+                    f"export_input_names covers {sorted(graphs)}. Every hook must "
+                    "describe the same graphs."
+                )
+
+        for graph in sorted(graphs):
+            refs = reference_inputs[graph]
+            declared = len(inputs[graph]) + len(states[graph])
+            if declared != len(refs):
+                raise ValueError(
+                    f"{cls_name}, graph {graph!r}: {len(inputs[graph])} input names + "
+                    f"{len(states[graph])} state names = {declared}, but "
+                    f"build_reference_inputs supplies {len(refs)} tensors "
+                    f"{tuple(refs)}."
+                )
+            shapes = dynamic_shapes[graph]
+            if shapes is not None and set(shapes) != set(refs):
+                raise ValueError(
+                    f"{cls_name}, graph {graph!r}: dynamic_shapes keys "
+                    f"{tuple(shapes)} do not match reference inputs {tuple(refs)}."
+                )
+
+    def reference_inputs_as_args(self, reference_inputs: dict[str, Any]) -> tuple[Any, ...]:
+        """One graph's reference inputs as positional args, validating the order.
+
+        For the coreai-opt quantizer, which takes a tuple rather than kwargs; a dict
+        ordered differently from the signature would silently bind the wrong tensors.
+
+        Raises:
+            ValueError: If the keys are not a contiguous in-order prefix of ``forward``.
+        """
+        params = list(inspect.signature(self.forward).parameters)
+        keys = list(reference_inputs)
+        if keys != params[: len(keys)]:
+            raise ValueError(
+                f"{type(self).__name__}.build_reference_inputs returned keys {keys}, "
+                f"which are not a contiguous in-order prefix of forward's parameters "
+                f"{params}. Positional conversion would bind tensors to the wrong "
+                f"parameters; fix the dict's insertion order or the signature."
+            )
+        return tuple(reference_inputs.values())
 
     @classmethod
     def _get_reauthored_config(
@@ -605,3 +820,48 @@ class BaseForCausalLMForiOS(BaseForCausalLM):
 
     def set_prefill_mode(self, prefill_mode: bool):
         self.extend.prefill_mode = prefill_mode
+
+    # ------------------------------------------------------------------
+    # Export contract -- not implemented for iOS
+    #
+    # The iOS graph matches the macOS defaults in no respect (different inputs, cache
+    # rank and output name -- see export/ios.py), and export_ios_model builds its own.
+    # Inheriting the defaults would report a plausible but wrong contract, and they are
+    # reachable: `--variant iOS --compression 4bit` resolves a macOS quantization preset
+    # and the quantize branch is not variant-gated.
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _export_contract_not_implemented(cls, hook: str) -> NoReturn:
+        raise NotImplementedError(
+            f"{cls.__name__}.{hook} is not yet implemented for iOS models: the iOS graph "
+            "has a different signature from the macOS one it would otherwise inherit."
+        )
+
+    @classmethod
+    @override
+    def export_input_names(cls) -> dict[str, tuple[str, ...]]:
+        cls._export_contract_not_implemented("export_input_names")
+
+    @classmethod
+    @override
+    def export_state_names(cls) -> dict[str, tuple[str, ...]]:
+        cls._export_contract_not_implemented("export_state_names")
+
+    @classmethod
+    @override
+    def export_output_names(cls) -> dict[str, tuple[str, ...]]:
+        cls._export_contract_not_implemented("export_output_names")
+
+    @override
+    def build_reference_inputs(
+        self,
+        config,
+        target_dtype: torch.dtype,
+        spec: TraceSpec,
+    ) -> dict[str, dict[str, Any]]:
+        self._export_contract_not_implemented("build_reference_inputs")
+
+    @override
+    def build_dynamic_shapes(self, config, spec: TraceSpec) -> dict[str, Any]:
+        self._export_contract_not_implemented("build_dynamic_shapes")
