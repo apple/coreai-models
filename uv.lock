@@ -241,6 +241,7 @@ dependencies = [
     { name = "rich" },
     { name = "safetensors" },
     { name = "sentencepiece" },
+    { name = "setuptools" },
     { name = "tokenizers" },
     { name = "torch" },
     { name = "tqdm" },
@@ -252,13 +253,14 @@ requires-dist = [
     { name = "accelerate", specifier = ">=1.12,<2.0" },
     { name = "coreai-core", specifier = "==1.0.0b2" },
     { name = "coreai-opt", specifier = "==0.2.1" },
-    { name = "coreai-torch", specifier = "==0.4.1" },
+    { name = "coreai-torch", git = "https://github.com/gokulkrishna98/coreai-torch.git?branch=dev%2Fgokul%2Fmodule-externalization-api" },
     { name = "diffusers", specifier = ">=0.37,<1.0" },
     { name = "huggingface-hub", specifier = ">=0.34,<1.0" },
     { name = "numpy", specifier = ">=2.2,<3.0" },
     { name = "rich", specifier = ">=14.0,<15.0" },
     { name = "safetensors", specifier = ">=0.5,<1.0" },
     { name = "sentencepiece", specifier = ">=0.2,<1.0" },
+    { name = "setuptools", specifier = ">=42" },
     { name = "tokenizers", specifier = ">=0.22,<1.0" },
     { name = "torch", specifier = "==2.9.0" },
     { name = "tqdm", specifier = ">=4.67,<5.0" },
@@ -287,7 +289,7 @@ wheels = [
 [[package]]
 name = "coreai-torch"
 version = "0.4.1"
-source = { registry = "https://pypi.org/simple" }
+source = { git = "https://github.com/gokulkrishna98/coreai-torch.git?branch=dev%2Fgokul%2Fmodule-externalization-api#67c610e25e6ec972db65ce4fe7865679f76e7a58" }
 dependencies = [
     { name = "coreai-core" },
     { name = "ml-dtypes" },
@@ -301,10 +303,6 @@ dependencies = [
     { name = "sympy" },
     { name = "torch" },
     { name = "typing-extensions" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/38/c1/0677a598a38c0c8a6af7156318015bcc2c8f4b59c68d091442690902459d/coreai_torch-0.4.1.tar.gz", hash = "sha256:2499429cc94f9e487122420b36b84c83b39a142505c4a54572572147bccc50fa", size = 212648, upload-time = "2026-07-01T23:11:02.067Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/53/bd/0f377299bfd8d29cb44f3e803dcdadcee345d047097de84ce64199579ed9/coreai_torch-0.4.1-py3-none-any.whl", hash = "sha256:e2aae98339413b62c03132363dc397936f2b0d90747766852390ba220d085f54", size = 199132, upload-time = "2026-07-01T23:11:00.783Z" },
 ]
 
 [[package]]
