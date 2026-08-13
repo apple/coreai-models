@@ -183,6 +183,10 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
         public private(set) var timeJump: Int = 0
 
         /// Consecutive encoder frames consumed without emitting anything, duration-weighted.
+        ///
+        /// Read by the streaming endpointer: a blank carrying duration 4 skips 320 ms in one
+        /// step, so a step count would under-measure silence by up to 4x, and a per-hop count
+        /// can only say "this whole chunk was quiet".
         public private(set) var silentFrames: Int = 0
 
         init(decoder: ParakeetTDTDecoder, config: ParakeetTDTConfig) {
@@ -199,6 +203,10 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
         }
 
         /// Start a new segment: zero the LSTM and re-seed SOS.
+        ///
+        /// Not called when a streaming segment is finalized — that is only a display
+        /// boundary, and resetting there cost ~3.8 s of dropped audio while the predictor
+        /// resynced. This is for a caller that wants a genuine hard reset.
         ///
         /// Deliberately leaves `timeJump` alone — it describes the audio timeline, which is
         /// continuous across a segment boundary, not the label history.
@@ -234,7 +242,7 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
         }
 
         /// As above, for a caller that already holds the encoder output as floats — e.g.
-        /// `--simulated`, which concatenates per-chunk encoder outputs and decodes once.
+        /// `--deferred-decode`, which concatenates per-chunk encoder outputs and decodes once.
         public func decodeFrames(
             encoderFlat: [Float],
             encoderOutputShape: [Int],

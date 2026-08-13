@@ -46,7 +46,7 @@ func runStreaming(
     leftContextFrames: Int?,
     endpointFrames: Int?,
     realtime: Bool,
-    simulated: Bool = false,
+    deferredDecode: Bool = false,
     verbose: Bool
 ) async throws {
     let start = ContinuousClock.now
@@ -65,7 +65,7 @@ func runStreaming(
     let url = URL(fileURLWithPath: audioPath)
     let pcm = try MelSpectrogram.loadAndResample(url, targetSampleRate: sampleRate)
 
-    let updates = try await model.startStream(config: config, simulated: simulated)
+    let updates = try await model.startStream(config: config, deferredDecode: deferredDecode)
     // Report what the session adopted, not what was asked for: a bundle not exported for
     // streaming has its own traced window, and left context is widened to fill it.
     let active = await model.activeStreamingConfig ?? config
@@ -91,7 +91,7 @@ func runStreaming(
         "Audio: \(pcm.count) samples "
             + "(\(String(format: "%.2f", Double(pcm.count) / sampleRate))s)"
             + (realtime ? " · paced at 1x" : " · as fast as possible")
-            + (simulated ? " · SIMULATED (decode deferred to end)" : ""))
+            + (deferredDecode ? " · DEFERRED DECODE (one pass at the end)" : ""))
     print("-- Streaming ----------------------------------------------------------")
 
     // Collect finalized segments off the update stream while the pusher runs.

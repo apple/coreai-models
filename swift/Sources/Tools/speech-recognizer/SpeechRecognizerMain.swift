@@ -49,10 +49,10 @@ struct SpeechRecognizer: AsyncParsableCommand {
         name: .long,
         help: """
             Chunk the encoder but decode once at the end. Isolates encoder-context \
-            truncation from decoder-state-carry bugs: --simulated and plain --stream \
-            should agree exactly.
+            truncation from decoder-state-carry bugs: --deferred-decode and plain --stream \
+            should agree exactly. For diagnostic purposes only.
             """)
-    var simulated = false
+    var deferredDecode = false
 
     @Option(help: "Streaming chunk size in encoder frames (1 frame = 80 ms).")
     var chunkFrames: Int?
@@ -119,11 +119,11 @@ struct SpeechRecognizer: AsyncParsableCommand {
                     + "owns the microphone and pushes PCM into the streaming API.")
         }
         // Flags that only mean anything on the streaming path. Accepting and ignoring them
-        // is worst for --simulated: its whole job is to be diffed against plain --stream,
-        // so dropping it silently turns a missed bug into a false "IDENTICAL" pass.
+        // is worst for --deferred-decode: its whole job is to be diffed against plain
+        // --stream, so dropping it silently turns a missed bug into a false "IDENTICAL" pass.
         let streamingOnly: [String] = [
             realtime ? "--realtime" : nil,
-            simulated ? "--simulated" : nil,
+            deferredDecode ? "--deferred-decode" : nil,
             chunkFrames != nil ? "--chunk-frames" : nil,
             rightContextFrames != nil ? "--right-context-frames" : nil,
             leftContextFrames != nil ? "--left-context-frames" : nil,
@@ -182,7 +182,7 @@ struct SpeechRecognizer: AsyncParsableCommand {
                 bundleURL: bundleURL, audioPath: audioPath,
                 chunkFrames: chunkFrames, rightContextFrames: rightContextFrames,
                 leftContextFrames: leftContextFrames, endpointFrames: endpointFrames,
-                realtime: realtime, simulated: simulated, verbose: verbose)
+                realtime: realtime, deferredDecode: deferredDecode, verbose: verbose)
         } else if isBundle {
             try await runBundle(
                 bundleURL: bundleURL, audioPath: audioPath, warmup: warmup, verbose: verbose,

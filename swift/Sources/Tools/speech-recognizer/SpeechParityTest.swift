@@ -128,15 +128,14 @@ struct SpeechParityTest {
         // derived from zero padding and is discarded before decoding, so including it
         // would score a region no output depends on.
         //
-        // `validEncoderFrames` is a proportional estimate rounded to nearest, so on a
-        // static export it can land one frame either side of the reference's count —
-        // that is the documented heuristic, and by design it drops a boundary frame that
-        // is mostly padding. Anything beyond one frame is drift worth failing on.
+        // `validEncoderFrames` derives the count from the subsampling arithmetic rather than
+        // estimating it, so it must match the reference exactly. This previously tolerated a
+        // one-frame difference to absorb a proportional estimate.
         if let ref = try? reference("ref_encoder_hidden_states.npy") {
             let hidden = capture.encoderShape.last ?? 1
             let valid = capture.validEncoderFrames
             let refFrames = ref.shape.count == 3 ? ref.shape[1] : 0
-            if abs(refFrames - valid) > 1 {
+            if refFrames != valid {
                 rows.append(
                     ParityRow(
                         name: "encoder_hidden_states",

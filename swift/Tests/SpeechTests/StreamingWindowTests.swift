@@ -220,31 +220,40 @@ struct StreamingFrameMathTests {
 
 @Suite("Endpoint detection")
 struct EndpointDetectorTests {
-    /// The bug this guards: a blank with duration 4 skips 320 ms of audio in one step, so
-    /// counting *steps* rather than frames would under-measure silence by up to 4×.
+    /// The bug this guards: the detector is fed the decoder's duration-weighted silence
+    /// count, so a blank with duration 4 contributes 4 frames rather than one step.
     @Test("Silence is measured in frames, not steps")
     func durationWeighted() {
-        var byFrames = EndpointDetector(silenceFrames: 10, maxSegmentFrames: 1_000)
+        var detector = EndpointDetector(silenceFrames: 10, maxSegmentFrames: 1_000)
         // Three silent chunks of 4 frames each = 12 frames > 10, so it fires on the third.
-        #expect(byFrames.observe(framesAdvanced: 4, emitted: false) == false)
-        #expect(byFrames.observe(framesAdvanced: 4, emitted: false) == false)
-        #expect(byFrames.observe(framesAdvanced: 4, emitted: false) == true)
-        #expect(byFrames.framesSinceEmission == 12)
+        #expect(detector.observe(framesAdvanced: 4, silentFrames: 4) == false)
+        #expect(detector.observe(framesAdvanced: 4, silentFrames: 8) == false)
+        #expect(detector.observe(framesAdvanced: 4, silentFrames: 12) == true)
+        #expect(detector.framesSinceEmission == 12)
+    }
 
-        // Counting steps would have needed ten chunks to reach the same threshold.
-        var single = EndpointDetector(silenceFrames: 10, maxSegmentFrames: 1_000)
-        for _ in 0..<9 { #expect(single.observe(framesAdvanced: 1, emitted: false) == false) }
-        #expect(single.observe(framesAdvanced: 1, emitted: false) == true)
+    /// The regression that motivated frame-granular silence: hops arrive a whole chunk at a
+    /// time, so accumulating `chunkFrames` per quiet hop made the default 12-frame chunk
+    /// cross a 10-frame threshold on the *first* quiet hop, endpointing mid-utterance and
+    /// fragmenting continuous speech.
+    @Test("A hop that emits late in its chunk is not an endpoint")
+    func partialEmissionWithinChunkIsNotSilence() {
+        var detector = EndpointDetector(silenceFrames: 10, maxSegmentFrames: 1_000)
+        // A 12-frame hop that emitted 9 frames in: only 3 frames of trailing silence.
+        #expect(detector.observe(framesAdvanced: 12, silentFrames: 3) == false)
+        // Another full chunk of audio, still emitting — silence stays short.
+        #expect(detector.observe(framesAdvanced: 12, silentFrames: 2) == false)
+        #expect(detector.segmentFrames == 24)
     }
 
     @Test("Any emission resets the silence run")
     func emissionResets() {
         var detector = EndpointDetector(silenceFrames: 10, maxSegmentFrames: 1_000)
-        #expect(detector.observe(framesAdvanced: 8, emitted: false) == false)
-        #expect(detector.observe(framesAdvanced: 2, emitted: true) == false)
+        #expect(detector.observe(framesAdvanced: 8, silentFrames: 8) == false)
+        #expect(detector.observe(framesAdvanced: 2, silentFrames: 0) == false)
         #expect(detector.framesSinceEmission == 0)
-        #expect(detector.observe(framesAdvanced: 9, emitted: false) == false)
-        #expect(detector.observe(framesAdvanced: 1, emitted: false) == true)
+        #expect(detector.observe(framesAdvanced: 9, silentFrames: 9) == false)
+        #expect(detector.observe(framesAdvanced: 1, silentFrames: 10) == true)
     }
 
     /// A hard cut at the cap lands mid-word: it splits one word's tokens across two
@@ -254,25 +263,25 @@ struct EndpointDetectorTests {
     func lengthCapWaitsForPause() {
         var detector = EndpointDetector(silenceFrames: 1_000, maxSegmentFrames: 20)
         // Well past the cap, but speech is continuous — must not fire.
-        #expect(detector.observe(framesAdvanced: 12, emitted: true) == false)
-        #expect(detector.observe(framesAdvanced: 12, emitted: true) == false)
+        #expect(detector.observe(framesAdvanced: 12, silentFrames: 0) == false)
+        #expect(detector.observe(framesAdvanced: 12, silentFrames: 0) == false)
         #expect(detector.segmentFrames == 24)
-        #expect(detector.observe(framesAdvanced: 12, emitted: true) == false)
-        // The first quiet chunk past the cap closes the segment.
-        #expect(detector.observe(framesAdvanced: 1, emitted: false) == true)
+        #expect(detector.observe(framesAdvanced: 12, silentFrames: 0) == false)
+        // The first quiet frame past the cap closes the segment.
+        #expect(detector.observe(framesAdvanced: 1, silentFrames: 1) == true)
     }
 
-    @Test("Under the cap, a single quiet chunk is not an endpoint")
+    @Test("Under the cap, a single quiet frame is not an endpoint")
     func underCapIgnoresBriefPause() {
         var detector = EndpointDetector(silenceFrames: 10, maxSegmentFrames: 1_000)
-        #expect(detector.observe(framesAdvanced: 1, emitted: false) == false)
-        #expect(detector.observe(framesAdvanced: 1, emitted: true) == false)
+        #expect(detector.observe(framesAdvanced: 1, silentFrames: 1) == false)
+        #expect(detector.observe(framesAdvanced: 1, silentFrames: 0) == false)
     }
 
     @Test("Reset clears both counters")
     func resetClears() {
         var detector = EndpointDetector(silenceFrames: 10, maxSegmentFrames: 20)
-        _ = detector.observe(framesAdvanced: 5, emitted: false)
+        _ = detector.observe(framesAdvanced: 5, silentFrames: 5)
         detector.reset()
         #expect(detector.framesSinceEmission == 0)
         #expect(detector.segmentFrames == 0)

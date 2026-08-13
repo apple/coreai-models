@@ -165,8 +165,7 @@ public actor SpeechRecognitionModel {
     /// on a verification path.
     public func transcribeCapturingStages(pcm: [Float]) async throws -> StageCapture {
         let (melValues, melShape) = melFeatures(pcm: pcm)
-        let (encOut, encShape, _) = try await runEncoder(pcm: pcm)
-        let validEnc = validEncoderFrames(pcmCount: pcm.count, tEnc: encShape[1])
+        let (encOut, encShape, validEnc) = try await runEncoder(pcm: pcm)
         // Copy the encoder output out *before* decoding. `decode` issues ~2 graph runs
         // per emitted token, and reading `encOut` afterwards would report whatever those
         // left in the buffer if the runtime recycles output storage.
@@ -203,11 +202,11 @@ public actor SpeechRecognitionModel {
     ///
     /// Also returns the exact number of leading encoder frames that carry real audio.
     ///
-    /// Pass only real samples: `fromPCM` pads up to the traced window itself, and
-    /// `padToFrameGrid` derives the valid-frame count from `pcm.count`. Handing it a
-    /// pre-zero-padded buffer would make the per-bin normalization statistics include the
-    /// padding, which wrecks the transcript when the real audio is a small fraction of the
-    /// window — as it is on a streaming session's first hops.
+    /// `fromPCM` pads up to the traced window itself and `padToFrameGrid` derives the
+    /// valid-frame count from `pcm.count`, so what a caller passes sets how far the mask and
+    /// the per-bin normalization statistics reach. Offline passes real samples only. The
+    /// streaming path deliberately zero-fills its ramp-up windows first, so that a frame's
+    /// representation does not shift as the window fills — see `runHopIfReady`.
     package func runEncoder(pcm: [Float]) async throws -> (NDArray, [Int], Int) {
         let start = ContinuousClock.now
         let mel = MelSpectrogram.fromPCM(pcm, config: melConfig, basis: melBasis)
@@ -238,12 +237,11 @@ public actor SpeechRecognitionModel {
         guard let encOut = outputs.remove("encoder_hidden_states")?.ndArray else {
             throw SpeechError.missingModel("Encoder did not produce 'encoder_hidden_states'")
         }
-        // Exact, not the proportional heuristic: the streaming path slices against this.
-        let validEnc = min(
-            encOut.shape[1],
-            encoderFrameCount(
-                melFrames: validMelFrames,
-                subsamplingFactor: tdtConfig?.encoderSubsamplingFactor ?? 1))
+        // How many leading frames real audio backs. Both the offline decode cap and the
+        // streaming path's frame slicing come from this one value.
+        let validEnc = Self.validEncoderFrames(
+            pcmCount: pcm.count, tEnc: encOut.shape[1], config: melConfig,
+            subsamplingFactor: tdtConfig?.encoderSubsamplingFactor ?? 1)
         return (encOut, encOut.shape, validEnc)
     }
 
@@ -269,33 +267,36 @@ public actor SpeechRecognitionModel {
     }
 
     private func decodeAudio(pcm: [Float]) async throws -> ([Int32], DecodeStats) {
-        let (encOut, encShape, _) = try await runEncoder(pcm: pcm)
+        let (encOut, encShape, validEnc) = try await runEncoder(pcm: pcm)
         return try await decoder.decode(
             encoderOutput: encOut,
             encoderOutputShape: encShape,
-            validEncoderFrames: validEncoderFrames(pcmCount: pcm.count, tEnc: encShape[1]),
+            validEncoderFrames: validEnc,
             resources: resources)
     }
 
     /// How many leading encoder frames carry real audio.
     ///
-    /// Excludes a static window's zero-padded tail: decode only the encoder frames
-    /// that carry real audio. Estimated proportionally from the mel valid/total ratio
-    /// and the encoder's actual output length (robust to conv edge effects). Rounds to
-    /// nearest so the boundary frame is kept only when it's majority real audio — this
-    /// drops the mostly-padding tail frame (a spurious trailing period) while keeping
-    /// the final token. Dynamic exports have no padding, so this returns `tEnc`.
+    /// Exact, not proportional. The FastConformer front end is a stack of stride-2 convs,
+    /// each mapping `T` to `(T - 1) / 2 + 1`, so applying that per stage to the *valid* mel
+    /// count yields the frame count backed by real audio — no ratio, no rounding. A
+    /// proportional estimate lands one frame low for ~25% of audio lengths against the
+    /// shipped geometry, which clips a trailing token.
     ///
-    /// `static` and `MelConfig`-parameterized so the rounding heuristic can be unit-tested;
-    /// the actor cannot be constructed without model assets.
-    package static func validEncoderFrames(pcmCount: Int, tEnc: Int, config: MelConfig) -> Int {
-        guard let total = config.nFrames else { return tEnc }
-        let validMel = MelSpectrogram.validFrameCount(forPCMLength: pcmCount, config: config)
-        return min(tEnc, max(1, Int((Double(validMel) / Double(total) * Double(tEnc)).rounded())))
-    }
-
-    private func validEncoderFrames(pcmCount: Int, tEnc: Int) -> Int {
-        Self.validEncoderFrames(pcmCount: pcmCount, tEnc: tEnc, config: melConfig)
+    /// Sub-hop audio yields 0 here; `ParakeetTDTDecoder.decode` floors its own cap at one
+    /// frame, so a tiny clip still decodes something.
+    ///
+    /// `static` and parameterized so it can be unit-tested — the actor cannot be constructed
+    /// without model assets. `runEncoder` is the only caller, so offline and streaming share
+    /// one definition rather than each deriving their own.
+    package static func validEncoderFrames(
+        pcmCount: Int, tEnc: Int, config: MelConfig, subsamplingFactor: Int
+    ) -> Int {
+        let frameCount = MelSpectrogram.frameCount(forPCMLength: pcmCount, config: config)
+        let validMel = min(
+            MelSpectrogram.validFrameCount(forPCMLength: pcmCount, config: config), frameCount)
+        return min(
+            tEnc, encoderFrameCount(melFrames: validMel, subsamplingFactor: subsamplingFactor))
     }
 
     package func detokenize(_ tokens: [Int32]) throws -> String {

@@ -490,6 +490,42 @@ def create_parakeet(
     print(f"[INFO] Successfully created Parakeet TDT bundle at {bundle_dir}.")
 
 
+_WINDOW_FLAGS = (
+    ("--chunk-frames", "chunk_frames"),
+    ("--right-context-frames", "right_context_frames"),
+    ("--left-context-frames", "left_context_frames"),
+)
+_AUDIO_SECONDS_FLAG = ("--audio-seconds", "audio_seconds")
+
+
+def _warn_ignored_shape_args(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> None:
+    """Warn about window flags the chosen shape mode never reads.
+
+    Each mode sizes the encoder trace a different way, and a flag belonging to
+    another one is otherwise dropped in silence — the wrong window only shows up
+    a full export later, in the bundle name.
+    """
+    if args.streaming:
+        candidates = [_AUDIO_SECONDS_FLAG]
+        reason = "--streaming sizes the window from the frame counts"
+    elif args.dynamic:
+        candidates = [_AUDIO_SECONDS_FLAG, *_WINDOW_FLAGS]
+        reason = "--dynamic leaves the encoder's time axis symbolic"
+    else:
+        candidates = list(_WINDOW_FLAGS)
+        reason = "the frame counts only apply with --streaming"
+
+    ignored = [
+        flag
+        for flag, dest in candidates
+        if getattr(args, dest) != parser.get_default(dest)
+    ]
+    if ignored:
+        print(f"[WARN] Ignoring {', '.join(ignored)} — {reason}.")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=(
@@ -541,7 +577,9 @@ def main():
         default=12,
         help=(
             "Encoder frames consumed per streaming hop (1 frame = 80 ms). Sets the "
-            "emission cadence. Below ~12 quality falls off sharply."
+            "emission cadence. Every hop re-encodes the whole window, so halving this "
+            "roughly doubles the encoder work per second of audio. Ignored unless "
+            "--streaming is set."
         ),
     )
     parser.add_argument(
@@ -550,14 +588,18 @@ def main():
         default=12,
         help=(
             "Encoder frames of lookahead. Theoretical latency is "
-            "(chunk + right) x 80 ms. Must be >= max(durations)."
+            "(chunk + right) x 80 ms. Must be >= max(durations). Ignored unless "
+            "--streaming is set."
         ),
     )
     parser.add_argument(
         "--left-context-frames",
         type=int,
         default=126,
-        help="Encoder frames of past context. Improves quality at no latency cost.",
+        help=(
+            "Encoder frames of past context. Improves quality at no latency cost. "
+            "Ignored unless --streaming is set."
+        ),
     )
     parser.add_argument(
         "--audio-seconds",
@@ -565,7 +607,7 @@ def main():
         default=5.0,
         help=(
             "Length (seconds) of dummy audio used to shape the encoder's static "
-            "trace. Ignored when --dynamic is set."
+            "trace. Ignored when --dynamic or --streaming is set."
         ),
     )
     parser.add_argument(
@@ -575,6 +617,7 @@ def main():
         "Default: off, which embeds minimum debug information and makes the exported asset smaller.",
     )
     args = parser.parse_args()
+    _warn_ignored_shape_args(parser, args)
 
     dtype = {
         "float16": torch.float16,
