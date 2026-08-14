@@ -434,7 +434,6 @@ extension CoreAIPipelinedEngine {
     }
 }
 
-
 // MARK: - Pipeline Depth Gate
 
 /// Bounds in-flight encode calls so MPSGraph's per-encode scratch
