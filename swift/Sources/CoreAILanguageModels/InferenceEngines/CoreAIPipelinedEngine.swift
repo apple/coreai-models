@@ -260,7 +260,7 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
         samplingConfiguration: SamplingConfiguration,
         maxTokens: Int,
         session: ConstrainedSessionHandle
-    ) throws -> AsyncThrowingStream<TokenId, Error> {
+    ) throws -> InferenceTokenSequence {
         if _generationTask.withLock({ $0 }) != nil || engineInUse.load(ordering: .acquiring) {
             throw InferenceRuntimeError.invalidState(
                 "generateConstrained called while a prior generation is still in flight — caller must drain first"
@@ -268,6 +268,7 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
         }
 
         let (stream, continuation) = AsyncThrowingStream<TokenId, Error>.makeStream()
+        let stopReasonStore = StopReasonStore()
 
         let session = session
         let isCancelled = Atomic<Bool>(false)
@@ -308,7 +309,7 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
         }
         _generationTask.withLock { $0 = task }
 
-        return stream
+        return InferenceTokenSequence(stream: stream, stopReasonStore: stopReasonStore)
     }
 
     /// Wait for any in-flight generate() Task to return the engine.

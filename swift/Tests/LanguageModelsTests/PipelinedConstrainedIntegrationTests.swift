@@ -95,12 +95,13 @@ final class MockConstrainedEngine: InferenceEngine, ConstrainedGenerationCapable
         samplingConfiguration: SamplingConfiguration,
         maxTokens: Int,
         session: ConstrainedSessionHandle
-    ) throws -> AsyncThrowingStream<TokenId, Error> {
+    ) throws -> InferenceTokenSequence {
         generateCallCount += 1
         let tokens = scriptedTokens
         let limit = min(tokens.count, maxTokens)
 
         let (stream, continuation) = AsyncThrowingStream<TokenId, Error>.makeStream()
+        let stopReasonStore = StopReasonStore()
 
         let task = Task {
             defer { self.storeConstrainedSessionForReuse(session) }
@@ -114,7 +115,7 @@ final class MockConstrainedEngine: InferenceEngine, ConstrainedGenerationCapable
         }
         _ = task
 
-        return stream
+        return InferenceTokenSequence(stream: stream, stopReasonStore: stopReasonStore)
     }
 
     func storeConstrainedSessionForReuse(_ handle: ConstrainedSessionHandle) {
