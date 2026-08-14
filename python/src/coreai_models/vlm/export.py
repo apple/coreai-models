@@ -641,7 +641,7 @@ async def export_vision_encoder(
     ).eval()
     del hf_model
 
-    grid_t = 1 if num_frames == 1 else num_frames // spec.temporal_patch_size
+    grid_t = wrapper.grid_t
     num_visual_tokens = spec.num_visual_tokens * grid_t
     if num_frames == 1:
         pixel_shape = (1, 3, spec.image_size, spec.image_size)
