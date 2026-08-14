@@ -46,7 +46,7 @@ struct MPSGraphArgmaxSamplerTests {
                 logitsOffset: 0,
                 outputBuffer: outputBuffer,
                 outputOffset: 0,
-                completion: { _ in
+                completion: { _, _ in
                     continuation.resume()
                 }
             )
@@ -79,7 +79,7 @@ struct MPSGraphArgmaxSamplerTests {
                 logitsOffset: 0,
                 outputBuffer: outputBuffer,
                 outputOffset: 0,
-                completion: { _ in
+                completion: { _, _ in
                     continuation.resume()
                 }
             )
@@ -117,7 +117,7 @@ struct MPSGraphArgmaxSamplerTests {
                 queryLength: queryLength,
                 outputBuffer: outputBuffer,
                 outputOffset: 0,
-                completion: { _ in
+                completion: { _, _ in
                     continuation.resume()
                 }
             )
@@ -146,7 +146,7 @@ struct MPSGraphArgmaxSamplerTests {
                     logitsOffset: 0,
                     outputBuffer: outputBuffer,
                     outputOffset: 0,
-                    completion: { _ in
+                    completion: { _, _ in
                         continuation.resume()
                     }
                 )
@@ -164,7 +164,7 @@ struct MPSGraphArgmaxSamplerTests {
                     logitsOffset: 0,
                     outputBuffer: outputBuffer,
                     outputOffset: 0,
-                    completion: { _ in
+                    completion: { _, _ in
                         continuation.resume()
                     }
                 )
@@ -203,7 +203,7 @@ struct MPSGraphArgmaxSamplerTests {
                 logitsOffset: 0,
                 outputBuffer: outputBuffer,
                 outputOffset: 0,
-                completion: { _ in
+                completion: { _, _ in
                     continuation.resume()
                 }
             )
@@ -224,7 +224,7 @@ struct MPSGraphArgmaxSamplerTests {
                 logitsOffset: 0,
                 outputBuffer: outputBuffer,
                 outputOffset: 0,
-                completion: { _ in
+                completion: { _, _ in
                     continuation.resume()
                 }
             )
@@ -277,7 +277,7 @@ struct MPSGraphCompositeSamplerTests {
                     logitsOffset: 0,
                     outputBuffer: outputBuffer,
                     outputOffset: 0,
-                    completion: { _ in
+                    completion: { _, _ in
                         continuation.resume()
                     }
                 )
@@ -327,7 +327,7 @@ struct MPSGraphCompositeSamplerTests {
                 logitsOffset: 0,
                 outputBuffer: outputBuffer,
                 outputOffset: 0,
-                completion: { _ in
+                completion: { _, _ in
                     continuation.resume()
                 }
             )
@@ -377,7 +377,7 @@ struct MPSGraphCompositeSamplerTests {
                     logitsOffset: 0,
                     outputBuffer: outputBuffer,
                     outputOffset: 0,
-                    completion: { _ in
+                    completion: { _, _ in
                         continuation.resume()
                     }
                 )
@@ -423,7 +423,7 @@ struct MPSGraphCompositeSamplerTests {
                     logitsOffset: 0,
                     outputBuffer: outputBuffer,
                     outputOffset: 0,
-                    completion: { _ in
+                    completion: { _, _ in
                         continuation.resume()
                     }
                 )
@@ -441,7 +441,7 @@ struct MPSGraphCompositeSamplerTests {
                     logitsOffset: 0,
                     outputBuffer: outputBuffer,
                     outputOffset: 0,
-                    completion: { _ in
+                    completion: { _, _ in
                         continuation.resume()
                     }
                 )
@@ -491,7 +491,7 @@ struct MPSGraphCompositeSamplerTests {
                 queryLength: queryLength,
                 outputBuffer: outputBuffer,
                 outputOffset: 0,
-                completion: { _ in
+                completion: { _, _ in
                     continuation.resume()
                 }
             )
@@ -543,7 +543,7 @@ struct MPSGraphTopPSamplerTests {
                     logitsOffset: 0,
                     outputBuffer: outputBuffer,
                     outputOffset: 0,
-                    completion: { _ in continuation.resume() }
+                    completion: { _, _ in continuation.resume() }
                 )
             }
             let result = outputBuffer.contents().assumingMemoryBound(to: Int32.self).pointee
@@ -581,7 +581,7 @@ struct MPSGraphTopPSamplerTests {
                 logitsOffset: 0,
                 outputBuffer: outputBuffer,
                 outputOffset: 0,
-                completion: { _ in continuation.resume() }
+                completion: { _, _ in continuation.resume() }
             )
         }
 
@@ -617,7 +617,7 @@ struct MPSGraphTopPSamplerTests {
                 logitsOffset: 0,
                 outputBuffer: outputBuffer,
                 outputOffset: 0,
-                completion: { _ in continuation.resume() }
+                completion: { _, _ in continuation.resume() }
             )
         }
 
@@ -666,7 +666,7 @@ struct MPSGraphMinPSamplerTests {
                     logitsOffset: 0,
                     outputBuffer: outputBuffer,
                     outputOffset: 0,
-                    completion: { _ in continuation.resume() }
+                    completion: { _, _ in continuation.resume() }
                 )
             }
             let result = outputBuffer.contents().assumingMemoryBound(to: Int32.self).pointee
@@ -708,7 +708,7 @@ struct MPSGraphMinPSamplerTests {
                     logitsOffset: 0,
                     outputBuffer: outputBuffer,
                     outputOffset: 0,
-                    completion: { _ in continuation.resume() }
+                    completion: { _, _ in continuation.resume() }
                 )
             }
             let result = outputBuffer.contents().assumingMemoryBound(to: Int32.self).pointee
@@ -755,7 +755,7 @@ struct MPSGraphMinPSamplerTests {
                     logitsOffset: 0,
                     outputBuffer: outputBuffer,
                     outputOffset: 0,
-                    completion: { _ in continuation.resume() }
+                    completion: { _, _ in continuation.resume() }
                 )
             }
             let result = outputBuffer.contents().assumingMemoryBound(to: Int32.self).pointee

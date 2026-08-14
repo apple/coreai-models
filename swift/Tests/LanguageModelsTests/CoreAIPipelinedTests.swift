@@ -481,7 +481,7 @@ struct GPUSamplerContinuationSyncTests {
                 logitsOffset: 0,
                 outputBuffer: outputBuffer,
                 outputOffset: 0,
-                completion: { nextToken in
+                completion: { nextToken, _ in
                     let task = Task {
                         for await _ in proceedStream { break }
                         continuation.yield(nextToken)
@@ -522,7 +522,7 @@ struct GPUSamplerContinuationSyncTests {
                 logitsOffset: 0,
                 outputBuffer: outputBuffer,
                 outputOffset: 0,
-                completion: { nextToken in
+                completion: { nextToken, _ in
                     continuation.yield(nextToken)
                     earlyDoneContinuation.yield(())
                 }
@@ -548,7 +548,7 @@ struct GPUSamplerContinuationSyncTests {
                 logitsOffset: 0,
                 outputBuffer: lastOutput,
                 outputOffset: 0,
-                completion: { nextToken in
+                completion: { nextToken, _ in
                     let task = Task {
                         for await _ in proceedStream { break }
                         continuation.yield(nextToken)
@@ -590,7 +590,7 @@ struct GPUSamplerContinuationSyncTests {
             logitsOffset: 0,
             outputBuffer: outputBuffer,
             outputOffset: 0,
-            completion: { nextToken in
+            completion: { nextToken, _ in
                 continuation.yield(nextToken)
             }
         )
@@ -631,7 +631,7 @@ struct GPUSamplerContinuationSyncTests {
                 logitsOffset: 0,
                 outputBuffer: outputBuffer,
                 outputOffset: 0,
-                completion: { nextToken in
+                completion: { nextToken, _ in
                     continuation.yield(nextToken)
                 }
             )

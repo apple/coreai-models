@@ -975,23 +975,27 @@ private struct EngineImpl: ~Copyable {
         let sampleSpan = InstrumentsProfiler.beginSampleEncoding(
             step: currentStep, strategy: samplerStrategy, temperature: samplerTemperature)
 
-        do {
-            let queue = pipelineQueue
-            let localInFlightGate = inFlightGate
-            let completionCallback: (Int32) -> Void = { nextToken in
-                // Release the pipeline slot acquired before encode. Happens on
-                // Metal's callback thread — PipelineGate.release() is thread-safe.
-                localInFlightGate.release()
-                InstrumentsProfiler.endCustomInterval(
-                    name: "CoreAIPipelinedEncodeNextStep",
-                    signpostID: encodeStepID,
-                    details: "token=\(nextToken)"
-                )
-                continuation.yield(nextToken)
+        let queue = pipelineQueue
+        let localInFlightGate = inFlightGate
+        let completionCallback: (Int32, Error?) -> Void = { nextToken, error in
+            // Release the pipeline slot acquired before encode. Happens on
+            // Metal's callback thread — PipelineGate.release() is thread-safe.
+            localInFlightGate.release()
+            InstrumentsProfiler.endCustomInterval(
+                name: "CoreAIPipelinedEncodeNextStep",
+                signpostID: encodeStepID,
+                details: "token=\(nextToken)"
+            )
+            if let error {
+                continuation.finish(throwing: error)
+                return
             }
+            continuation.yield(nextToken)
+        }
 
+        do {
             if queryLength == 1 {
-                localGPUSampler.encode(
+                try localGPUSampler.encode(
                     to: queue,
                     logitsBuffer: samplerLogitsBuffer,
                     logitsOffset: logitsOffset,
@@ -1009,6 +1013,15 @@ private struct EngineImpl: ~Copyable {
                     completion: completionCallback
                 )
             }
+        } catch {
+            localInFlightGate.release()
+            InstrumentsProfiler.endCustomInterval(
+                name: "CoreAIPipelinedEncodeNextStep",
+                signpostID: encodeStepID,
+                details: "error"
+            )
+            sampleSpan.end()
+            throw error
         }
 
         sampleSpan.end()
@@ -1222,8 +1235,12 @@ private struct EngineImpl: ~Copyable {
                     tokens: prefillTokens,
                     gpuSampler: gpuSampler,
                     applyBitmask: applyInitialMask
-                ) { token in
-                    cont.resume(returning: token)
+                ) { token, error in
+                    if let error = error {
+                        cont.resume(throwing: error)
+                    } else {
+                        cont.resume(returning: token)
+                    }
                 }
             } catch {
                 cont.resume(throwing: error)
@@ -1259,8 +1276,12 @@ private struct EngineImpl: ~Copyable {
                             tokens: [lastToken] + jumpTokens,
                             gpuSampler: gpuSampler,
                             applyBitmask: applyMaskAfterJump
-                        ) { token in
-                            cont.resume(returning: token)
+                        ) { token, error in
+                            if let error = error {
+                                cont.resume(throwing: error)
+                            } else {
+                                cont.resume(returning: token)
+                            }
                         }
                     } catch {
                         cont.resume(throwing: error)
@@ -1289,8 +1310,12 @@ private struct EngineImpl: ~Copyable {
                         tokens: [],
                         gpuSampler: gpuSampler,
                         applyBitmask: applyMask
-                    ) { token in
-                        cont.resume(returning: token)
+                    ) { token, error in
+                        if let error = error {
+                            cont.resume(throwing: error)
+                        } else {
+                            cont.resume(returning: token)
+                        }
                     }
                 } catch {
                     cont.resume(throwing: error)
@@ -1368,7 +1393,7 @@ private struct EngineImpl: ~Copyable {
         tokens: [Int32],
         gpuSampler: any MPSGraphSampler,
         applyBitmask: Bool,
-        completion: @escaping (Int32) -> Void
+        completion: @escaping (Int32, Error?) -> Void
     ) throws {
         let actualTokenCount = tokens.isEmpty ? 1 : tokens.count
         let queryLength = actualTokenCount
@@ -1459,7 +1484,7 @@ private struct EngineImpl: ~Copyable {
         let queue = pipelineQueue
 
         if queryLength == 1 {
-            gpuSampler.encode(
+            try gpuSampler.encode(
                 to: queue, logitsBuffer: logitsBuffer, logitsOffset: 0,
                 outputBuffer: outputBuffer, outputOffset: 0,
                 applyBitmask: applyBitmask, completion: completion
@@ -1673,14 +1698,20 @@ private struct EngineImpl: ~Copyable {
 
             do {
                 let queue = pipelineQueue
-                warmupSampler.encode(
+                var error: Error?
+                try warmupSampler.encode(
                     to: queue,
                     logitsBuffer: warmupLogitsBuffer,
                     logitsOffset: logitsOffset,
                     outputBuffer: warmupOutputBuffer,
                     outputOffset: 0,
-                    completion: { _ in }
+                    completion: { _, e in
+                        error = e
+                    }
                 )
+                if let error {
+                    throw error
+                }
             }
 
             step += 1

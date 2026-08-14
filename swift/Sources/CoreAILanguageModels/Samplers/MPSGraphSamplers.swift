@@ -61,8 +61,8 @@ protocol MPSGraphSampler: AnyObject, Sendable {
         outputBuffer: MTLBuffer,
         outputOffset: Int,
         applyBitmask: Bool,
-        completion: @escaping (Int32) -> Void
-    )
+        completion: @escaping (Int32, Error?) -> Void
+    ) throws
 
     /// Encode sampling with slice support for prefill.
     func encodeWithSlice(
@@ -71,7 +71,7 @@ protocol MPSGraphSampler: AnyObject, Sendable {
         queryLength: Int,
         outputBuffer: MTLBuffer,
         outputOffset: Int,
-        completion: @escaping (Int32) -> Void
+        completion: @escaping (Int32, Error?) -> Void
     )
 }
 
@@ -84,9 +84,9 @@ extension MPSGraphSampler {
         logitsOffset: Int,
         outputBuffer: MTLBuffer,
         outputOffset: Int,
-        completion: @escaping (Int32) -> Void
-    ) {
-        encode(
+        completion: @escaping (Int32, Error?) -> Void
+    ) throws {
+        try encode(
             to: queue, logitsBuffer: logitsBuffer, logitsOffset: logitsOffset,
             outputBuffer: outputBuffer, outputOffset: outputOffset,
             applyBitmask: false, completion: completion)
@@ -385,11 +385,11 @@ final class MPSGraphArgmaxSampler: @unchecked Sendable {
         outputBuffer: MTLBuffer,
         outputOffset: Int,
         applyBitmask: Bool,
-        completion: @escaping (Int32) -> Void
-    ) {
+        completion: @escaping (Int32, Error?) -> Void
+    ) throws {
         if applyBitmask {
             guard let (constrained, bitmaskTensorData) = try? ensureConstrainedResources() else {
-                completion(0)
+                completion(0, MPSGraphSamplerError.bufferAllocationFailed)
                 return
             }
             let inputData = MPSGraphTensorData(
@@ -399,14 +399,13 @@ final class MPSGraphArgmaxSampler: @unchecked Sendable {
             let execDesc = MPSGraphExecutableExecutionDescriptor()
             execDesc.completionHandler = { [outputBuffer, outputOffset] (_, error) in
                 if let error = error {
-                    print("MPSGraph constrained argmax error: \(error)")
-                    completion(0)
+                    completion(0, error)
                     return
                 }
                 let result = outputBuffer.contents()
                     .advanced(by: outputOffset)
                     .assumingMemoryBound(to: Int32.self).pointee
-                completion(result)
+                completion(result, nil)
             }
             constrained.runAsync(
                 with: queue, inputs: [inputData, bitmaskTensorData],
@@ -427,13 +426,17 @@ final class MPSGraphArgmaxSampler: @unchecked Sendable {
         outputBuffer: MTLBuffer,
         outputOffset: Int,
         applyBitmask: Bool,
-        completion: @escaping (Int32) -> Void
+        completion: @escaping (Int32, Error?) -> Void
     ) {
         if queryLength == 1 {
-            encode(
-                to: queue, logitsBuffer: logitsBuffer, logitsOffset: 0,
-                outputBuffer: outputBuffer, outputOffset: outputOffset,
-                applyBitmask: applyBitmask, completion: completion)
+            do {
+                try encode(
+                    to: queue, logitsBuffer: logitsBuffer, logitsOffset: 0,
+                    outputBuffer: outputBuffer, outputOffset: outputOffset,
+                    applyBitmask: applyBitmask, completion: completion)
+            } catch {
+                completion(0, error)
+            }
             return
         }
         // For prefill with bitmask, slice last token then apply constrained path
@@ -443,7 +446,7 @@ final class MPSGraphArgmaxSampler: @unchecked Sendable {
             let blitCmdBuffer = queue.makeCommandBuffer(),
             let blitEncoder = blitCmdBuffer.makeBlitCommandEncoder()
         else {
-            completion(0)
+            completion(0, MPSGraphSamplerError.bufferAllocationFailed)
             return
         }
         blitEncoder.copy(
@@ -452,10 +455,14 @@ final class MPSGraphArgmaxSampler: @unchecked Sendable {
         blitEncoder.endEncoding()
         blitCmdBuffer.commit()
 
-        encode(
-            to: queue, logitsBuffer: tempBuffer, logitsOffset: 0,
-            outputBuffer: outputBuffer, outputOffset: outputOffset,
-            applyBitmask: applyBitmask, completion: completion)
+        do {
+            try encode(
+                to: queue, logitsBuffer: tempBuffer, logitsOffset: 0,
+                outputBuffer: outputBuffer, outputOffset: outputOffset,
+                applyBitmask: applyBitmask, completion: completion)
+        } catch {
+            completion(0, error)
+        }
     }
 
     /// Encode argmax sampling.
@@ -476,7 +483,7 @@ final class MPSGraphArgmaxSampler: @unchecked Sendable {
         logitsOffset: Int,
         outputBuffer: MTLBuffer,
         outputOffset: Int,
-        completion: @escaping (Int32) -> Void
+        completion: @escaping (Int32, Error?) -> Void
     ) {
         // Reuse MPSGraphTensorData if buffers haven't changed (avoids object creation overhead)
         let inputData: MPSGraphTensorData
@@ -508,9 +515,8 @@ final class MPSGraphArgmaxSampler: @unchecked Sendable {
         // Reuse pre-allocated execution descriptor, update completion handler
         let execDescriptor = MPSGraphExecutableExecutionDescriptor()
         execDescriptor.completionHandler = { [outputBuffer, outputOffset] (resultsDictionary, error) in
-            if let error = error {
-                print("MPSGraph argmax error: \(error)")
-                completion(0)
+            if error != nil {
+                completion(0, error)
                 return
             }
 
@@ -519,7 +525,7 @@ final class MPSGraphArgmaxSampler: @unchecked Sendable {
                 .advanced(by: outputOffset)
                 .assumingMemoryBound(to: Int32.self)
                 .pointee
-            completion(result)
+            completion(result, nil)
         }
 
         executable.runAsync(
@@ -548,7 +554,7 @@ final class MPSGraphArgmaxSampler: @unchecked Sendable {
         queryLength: Int,
         outputBuffer: MTLBuffer,
         outputOffset: Int,
-        completion: @escaping (Int32) -> Void
+        completion: @escaping (Int32, Error?) -> Void
     ) {
         // Calculate offset to last token's logits
         let logitsOffset = (queryLength - 1) * vocabSize * MemoryLayout<UInt16>.size
@@ -573,19 +579,19 @@ final class MPSGraphArgmaxSampler: @unchecked Sendable {
         // Create a temporary buffer for the single token's logits
         let sliceSize = vocabSize * MemoryLayout<UInt16>.size
         guard let tempBuffer = device.makeBuffer(length: sliceSize, options: .storageModeShared) else {
-            completion(0)
+            completion(0, MPSGraphSamplerError.bufferAllocationFailed)
             return
         }
 
         // Step 1: Create and commit blit command buffer separately
         guard let blitCmdBuffer = queue.makeCommandBuffer() else {
-            completion(0)
+            completion(0, MPSGraphSamplerError.bufferAllocationFailed)
             return
         }
         blitCmdBuffer.label = "MPSGraph Argmax Blit"
 
         guard let blitEncoder = blitCmdBuffer.makeBlitCommandEncoder() else {
-            completion(0)
+            completion(0, MPSGraphSamplerError.bufferAllocationFailed)
             return
         }
         blitEncoder.copy(
@@ -611,12 +617,10 @@ final class MPSGraphArgmaxSampler: @unchecked Sendable {
             dataType: .int32
         )
 
-        // Set up execution descriptor with completion handler
         let execDescriptor = MPSGraphExecutableExecutionDescriptor()
         execDescriptor.completionHandler = { [outputBuffer, outputOffset] (_, error) in
-            if let error = error {
-                print("MPSGraph argmax error: \(error)")
-                completion(0)
+            if error != nil {
+                completion(0, error)
                 return
             }
 
@@ -624,7 +628,7 @@ final class MPSGraphArgmaxSampler: @unchecked Sendable {
                 .advanced(by: outputOffset)
                 .assumingMemoryBound(to: Int32.self)
                 .pointee
-            completion(result)
+            completion(result, nil)
         }
 
         // Run async - GPU naturally orders this after the blit due to queue ordering
@@ -1002,11 +1006,11 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
         outputBuffer: MTLBuffer,
         outputOffset: Int,
         applyBitmask: Bool,
-        completion: @escaping (Int32) -> Void
-    ) {
+        completion: @escaping (Int32, Error?) -> Void
+    ) throws {
         if applyBitmask {
             guard let (constrained, bitmaskTensorData) = try? ensureConstrainedResources() else {
-                completion(0)
+                completion(0, MPSGraphSamplerError.bufferAllocationFailed)
                 return
             }
             temperatureBuffer.contents().assumingMemoryBound(to: Float.self).pointee = max(temperature, 0.01)
@@ -1022,14 +1026,13 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
             let execDesc = MPSGraphExecutableExecutionDescriptor()
             execDesc.completionHandler = { [outputBuffer, outputOffset] (_, error) in
                 if let error = error {
-                    print("MPSGraph constrained composite error: \(error)")
-                    completion(0)
+                    completion(0, error)
                     return
                 }
                 let result = outputBuffer.contents()
                     .advanced(by: outputOffset)
                     .assumingMemoryBound(to: Int32.self).pointee
-                completion(result)
+                completion(result, nil)
             }
             constrained.runAsync(
                 with: queue,
@@ -1051,10 +1054,10 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
         outputBuffer: MTLBuffer,
         outputOffset: Int,
         applyBitmask: Bool,
-        completion: @escaping (Int32) -> Void
+        completion: @escaping (Int32, Error?) -> Void
     ) {
         if queryLength == 1 {
-            encode(
+            try? encode(
                 to: queue, logitsBuffer: logitsBuffer, logitsOffset: 0,
                 outputBuffer: outputBuffer, outputOffset: outputOffset,
                 applyBitmask: applyBitmask, completion: completion)
@@ -1066,7 +1069,7 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
             let blitCmdBuffer = queue.makeCommandBuffer(),
             let blitEncoder = blitCmdBuffer.makeBlitCommandEncoder()
         else {
-            completion(0)
+            completion(0, MPSGraphSamplerError.bufferAllocationFailed)
             return
         }
         blitEncoder.copy(
@@ -1075,7 +1078,7 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
         blitEncoder.endEncoding()
         blitCmdBuffer.commit()
 
-        encode(
+        try? encode(
             to: queue, logitsBuffer: tempBuffer, logitsOffset: 0,
             outputBuffer: outputBuffer, outputOffset: outputOffset,
             applyBitmask: applyBitmask, completion: completion)
@@ -1088,7 +1091,7 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
         logitsOffset: Int,
         outputBuffer: MTLBuffer,
         outputOffset: Int,
-        completion: @escaping (Int32) -> Void
+        completion: @escaping (Int32, Error?) -> Void
     ) {
         // Write runtime values to buffers
         temperatureBuffer.contents().assumingMemoryBound(to: Float.self).pointee = max(temperature, 0.01)
@@ -1125,13 +1128,10 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
             cachedOutputBuffer = outputBuffer
         }
 
-        // Per-call descriptor — reusing one across pipelined steps corrupts
-        // intermediate scratch buffers when multiple runAsync calls overlap.
         let desc = MPSGraphExecutableExecutionDescriptor()
         desc.completionHandler = { [outputBuffer, outputOffset] (_, error) in
-            if let error = error {
-                print("MPSGraph composite sampler error: \(error)")
-                completion(0)
+            if error != nil {
+                completion(0, error)
                 return
             }
 
@@ -1139,7 +1139,7 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
                 .advanced(by: outputOffset)
                 .assumingMemoryBound(to: Int32.self)
                 .pointee
-            completion(result)
+            completion(result, nil)
         }
 
         executable.runAsync(
@@ -1157,7 +1157,7 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
         queryLength: Int,
         outputBuffer: MTLBuffer,
         outputOffset: Int,
-        completion: @escaping (Int32) -> Void
+        completion: @escaping (Int32, Error?) -> Void
     ) {
         if queryLength == 1 {
             encode(
@@ -1175,18 +1175,18 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
         let sliceSize = vocabSize * MemoryLayout<UInt16>.size
 
         guard let tempBuffer = device.makeBuffer(length: sliceSize, options: .storageModeShared) else {
-            completion(0)
+            completion(0, MPSGraphSamplerError.bufferAllocationFailed)
             return
         }
 
         guard let blitCmdBuffer = queue.makeCommandBuffer() else {
-            completion(0)
+            completion(0, MPSGraphSamplerError.bufferAllocationFailed)
             return
         }
         blitCmdBuffer.label = "MPSGraph Composite Blit"
 
         guard let blitEncoder = blitCmdBuffer.makeBlitCommandEncoder() else {
-            completion(0)
+            completion(0, MPSGraphSamplerError.bufferAllocationFailed)
             return
         }
         blitEncoder.copy(
@@ -1211,9 +1211,8 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
 
         let prefillExecDescriptor = MPSGraphExecutableExecutionDescriptor()
         prefillExecDescriptor.completionHandler = { [outputBuffer, outputOffset] (_, error) in
-            if let error = error {
-                print("MPSGraph composite sampler error: \(error)")
-                completion(0)
+            if error != nil {
+                completion(0, error)
                 return
             }
 
@@ -1221,7 +1220,7 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
                 .advanced(by: outputOffset)
                 .assumingMemoryBound(to: Int32.self)
                 .pointee
-            completion(result)
+            completion(result, nil)
         }
 
         executable.runAsync(
