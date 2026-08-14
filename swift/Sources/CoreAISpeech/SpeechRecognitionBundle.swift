@@ -390,11 +390,7 @@ public enum SpeechError: Error, CustomStringConvertible, LocalizedError {
         }
     }
 
-    /// Without this, `error.localizedDescription` — what a SwiftUI host app naturally
-    /// shows a user — bridges through `NSError` and yields "The operation couldn't be
-    /// completed. (CoreAISpeech.SpeechError error 3.)", discarding every message above.
-    /// The number is not even the declaration index: cases carrying a payload are
-    /// numbered before those without, so `invalidStreamingConfig` is 3 and
-    /// `missingTokenizer` is 4.
+    /// Without this, `error.localizedDescription` — what a SwiftUI host app naturally shows a
+    /// user — bridges through `NSError` and reports an opaque error number instead.
     public var errorDescription: String? { description }
 }

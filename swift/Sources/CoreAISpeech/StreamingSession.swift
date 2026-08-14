@@ -264,7 +264,8 @@ extension SpeechRecognitionModel {
                 encoderFlat: session.aggregated,
                 encoderOutputShape: [1, session.aggregatedFrames, hidden],
                 frames: 0..<session.aggregatedFrames,
-                windowStartFrame: 0)
+                windowStartFrame: 0,
+                collectStats: false)
             session.segmentTokens = tokens
             session.segmentStartFrame = 0
         }
@@ -361,18 +362,18 @@ extension SpeechRecognitionModel {
             // Keep only the chunk's frames, exactly as the streaming path consumes them,
             // and defer all decoding to finishStream().
             let hidden = tdtConfig?.decoderHiddenSize ?? 0
-            let flat = flattenAsFloat(encOut)
             let lo = (lower - windowStartFrame) * hidden
             let hi = (upper - windowStartFrame) * hidden
-            session.aggregated.append(contentsOf: flat[lo..<hi])
+            session.aggregated.append(contentsOf: floatElements(encOut, in: lo..<hi))
             session.aggregatedFrames += upper - lower
             session.lastConsumedFrame = upper
         } else if lower < upper {
-            let (tokens, stats) = try await session.stream.decodeFrames(
+            let (tokens, _) = try await session.stream.decodeFrames(
                 encoderOutput: encOut,
                 encoderOutputShape: encShape,
                 frames: lower..<upper,
-                windowStartFrame: windowStartFrame)
+                windowStartFrame: windowStartFrame,
+                collectStats: false)
 
             if session.segmentTokens.isEmpty && !tokens.isEmpty {
                 session.segmentStartFrame = lower
@@ -382,7 +383,6 @@ extension SpeechRecognitionModel {
 
             let shouldEndpoint = session.endpoint.observe(
                 framesAdvanced: upper - lower, silentFrames: session.stream.silentFrames)
-            _ = stats
 
             if shouldEndpoint, !session.segmentTokens.isEmpty {
                 _ = try emit(session, final: true)

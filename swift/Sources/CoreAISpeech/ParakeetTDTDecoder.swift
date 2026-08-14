@@ -64,9 +64,6 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
         var decOut: NDArray
         var jointEncIn: NDArray
         var logits: NDArray
-        /// Zero LSTM state, kept so `resetState()` can re-seed without reallocating.
-        /// (`zeroFillNDArray` lives in CoreAILanguageModels, which this target can't import.)
-        let zeros: [Float]
 
         init(
             step: StepGraph, joint: JointGraph,
@@ -84,7 +81,7 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
 
             // The first step reads `hIn`/`cIn` before anything has written them, so seed the
             // zero state here rather than relying on fresh-allocation contents.
-            zeros = [Float](repeating: 0, count: lstmShape.reduce(1, *))
+            let zeros = [Float](repeating: 0, count: lstmShape.reduce(1, *))
             fillFloatNDArray(&hIn, with: zeros)
             fillFloatNDArray(&cIn, with: zeros)
         }
@@ -225,20 +222,34 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
         ///
         /// The loop body is the offline one verbatim; only the frame pointer's coordinate
         /// system (global rather than window-local) and the `timeJump` carry are new.
+        /// `collectStats` off skips the first-step tensor capture and the per-step timings,
+        /// which only the offline parity harness reads.
         public func decodeFrames(
             encoderOutput: NDArray,
             encoderOutputShape: [Int],
             frames: Range<Int>,
-            windowStartFrame: Int
+            windowStartFrame: Int,
+            collectStats: Bool = true
         ) async throws -> (tokens: [Int32], stats: DecodeStats) {
-            // Pull the window's encoder output once; slice frame-by-frame in pure Swift.
-            // flattenAsFloat inspects the array's own scalar type, so this reads an
-            // f16 encoder output correctly (a raw `as: Float.self` read would not).
-            try await decodeFrames(
-                encoderFlat: flattenAsFloat(encoderOutput),
-                encoderOutputShape: encoderOutputShape,
+            try ParakeetTDTDecoder.validate(
+                encoderOutputShape: encoderOutputShape, logitsSize: logitsSize, config: cfg)
+            try checkFrames(
+                frames, windowStartFrame: windowStartFrame,
+                windowEncoderFrames: encoderOutputShape[1])
+
+            // Convert only the frames this call reads. The window also carries the left and
+            // right context the loop never indexes — at the default geometry that is 12 frames
+            // of 151 — and `floatElements` inspects the array's own scalar type, so an f16
+            // encoder output reads correctly (a raw `as: Float.self` read would not).
+            let hidden = cfg.decoderHiddenSize
+            let lower = (frames.lowerBound - windowStartFrame) * hidden
+            let upper = (frames.upperBound - windowStartFrame) * hidden
+            return try await decodeFrames(
+                encoderFlat: floatElements(encoderOutput, in: lower..<upper),
+                encoderOutputShape: [1, frames.count, hidden],
                 frames: frames,
-                windowStartFrame: windowStartFrame)
+                windowStartFrame: frames.lowerBound,
+                collectStats: collectStats)
         }
 
         /// As above, for a caller that already holds the encoder output as floats — e.g.
@@ -247,17 +258,14 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
             encoderFlat: [Float],
             encoderOutputShape: [Int],
             frames: Range<Int>,
-            windowStartFrame: Int
+            windowStartFrame: Int,
+            collectStats: Bool = true
         ) async throws -> (tokens: [Int32], stats: DecodeStats) {
             try ParakeetTDTDecoder.validate(
                 encoderOutputShape: encoderOutputShape, logitsSize: logitsSize, config: cfg)
-            guard frames.lowerBound >= windowStartFrame,
-                frames.upperBound - windowStartFrame <= encoderOutputShape[1]
-            else {
-                throw SpeechError.invalidStreamingConfig(
-                    "frames \(frames) fall outside the window starting at \(windowStartFrame) "
-                        + "with \(encoderOutputShape[1]) encoder frames")
-            }
+            try checkFrames(
+                frames, windowStartFrame: windowStartFrame,
+                windowEncoderFrames: encoderOutputShape[1])
             if frames.isEmpty { return (tokens: [], stats: DecodeStats(stepTimesMs: [])) }
 
             let hidden = cfg.decoderHiddenSize
@@ -306,7 +314,7 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
 
                         // Parity capture only: gating on nil keeps the flattens to once per call
                         // instead of once per step, and reads `hOut`/`cOut` before the swap below.
-                        if capturedStep == nil {
+                        if collectStats, capturedStep == nil {
                             capturedStep = (
                                 decoderOutput: flattenAsFloat(buffers.decOut),
                                 newHidden: flattenAsFloat(buffers.hOut),
@@ -331,13 +339,17 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
                     // Joint(decoder_output, encoder[:, frame, :]) — `frame` is global, so it
                     // has to be rebased onto this window's local indexing.
                     let encOffset = (frame - windowStartFrame) * hidden
-                    let logitsFlat = try await decoder.runJoint(
+                    try await decoder.runJoint(
                         encoderFrame: encoderFlat[encOffset..<encOffset + hidden],
                         buffers: &buffers)
-                    if capturedLogits == nil { capturedLogits = logitsFlat }
+                    // Scanned in place: materializing the row would allocate and convert the
+                    // whole vocab per emitted symbol, only to read two argmaxes off it.
+                    if collectStats, capturedLogits == nil {
+                        capturedLogits = flattenAsFloat(buffers.logits)
+                    }
 
-                    let symbol = Int32(Self.argmax(logitsFlat, in: 0..<vocabSize))
-                    let dur = cfg.durations[Self.argmax(logitsFlat, in: vocabSize..<logitsSize)]
+                    let symbol = Int32(argmaxFloat(buffers.logits, in: 0..<vocabSize))
+                    let dur = cfg.durations[argmaxFloat(buffers.logits, in: vocabSize..<logitsSize)]
                     // Output-side counterpart to `inputIsBlank`; becomes it next iteration.
                     let isBlank = (symbol == cfg.blankTokenId)
 
@@ -379,7 +391,9 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
                 // Endpointing counts *frames of audio*, not steps: a blank with duration 4
                 // skips 320 ms in one step, so counting steps would under-measure silence 4×.
                 silentFrames = emittedThisStep == 0 ? silentFrames + advance : 0
-                stepTimesMs.append((ContinuousClock.now - t0).inMilliseconds)
+                if collectStats {
+                    stepTimesMs.append((ContinuousClock.now - t0).inMilliseconds)
+                }
                 frame += advance
             }
 
@@ -405,9 +419,17 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
             )
         }
 
-        /// Index of the largest value in `values[range]`, relative to `range.lowerBound`.
-        fileprivate static func argmax(_ values: [Float], in range: Range<Int>) -> Int {
-            ParakeetTDTDecoder.argmax(values, in: range)
+        /// Preconditions the frame arithmetic depends on, shared by both overloads.
+        private func checkFrames(
+            _ frames: Range<Int>, windowStartFrame: Int, windowEncoderFrames: Int
+        ) throws {
+            guard frames.lowerBound >= windowStartFrame,
+                frames.upperBound - windowStartFrame <= windowEncoderFrames
+            else {
+                throw SpeechError.invalidStreamingConfig(
+                    "frames \(frames) fall outside the window starting at \(windowStartFrame) "
+                        + "with \(windowEncoderFrames) encoder frames")
+            }
         }
     }
 
@@ -509,13 +531,14 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
             outputViews: consume stepOut)
     }
 
-    /// `joint(decoder_output, encoder_frame)` → the flattened `[vocab | durations]` row.
+    /// `joint(decoder_output, encoder_frame)`, leaving the `[vocab | durations]` row in
+    /// `buffers.logits` for the caller to scan in place.
     ///
     /// The decoder side comes straight from `buffers.decOut`, whether the last step wrote it
     /// or the blank-skip branch left it in place.
     private func runJoint(
         encoderFrame: ArraySlice<Float>, buffers: inout Buffers
-    ) async throws -> [Float] {
+    ) async throws {
         fillFloatNDArray(&buffers.jointEncIn, with: encoderFrame)
 
         var jointOut = InferenceFunction.MutableViews()
@@ -527,24 +550,5 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
             ],
             states: InferenceFunction.MutableViews(),
             outputViews: consume jointOut)
-
-        return flattenAsFloat(buffers.logits)
-    }
-
-    /// Index of the largest value in `values[range]`, relative to `range.lowerBound`.
-    /// Ties go to the lowest index, and an all-`-infinity` range yields 0 — matching the
-    /// hand-rolled scans this replaces.
-    ///
-    /// `static` because it reads no instance state, which also lets it be unit-tested: the
-    /// initializer needs two loaded `AIModel`s, so an instance method here would be reachable
-    /// only with model assets on disk.
-    package static func argmax(_ values: [Float], in range: Range<Int>) -> Int {
-        var best = range.lowerBound
-        var bestVal: Float = -.infinity
-        for i in range where values[i] > bestVal {
-            bestVal = values[i]
-            best = i
-        }
-        return best - range.lowerBound
     }
 }
