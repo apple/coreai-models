@@ -5,12 +5,11 @@
 
 import Tokenizers
 
-/// Thread-safe handle wrapping a `ConstrainedGenerationSession` for use across
-/// async boundaries and engine cache patterns.
+/// Single-owner handle wrapping a `ConstrainedGenerationSession`.
 ///
-/// The handle owns the mutable session and exposes a narrow API surface that the
-/// protocol (`ConstrainedGenerationCapable`) and strategy consume. Engines retain
-/// one cached handle and hand it out on checkout / accept it back on checkin.
+/// Not thread-safe — ownership transfers between the engine cache and the
+/// active generation task via the checkout/checkin pattern. Only one task
+/// holds the handle at a time; concurrent access is a programming error.
 package final class ConstrainedSessionHandle: @unchecked Sendable {
     /// Schema string is immutable after init — cached to avoid repeated access.
     let schema: String

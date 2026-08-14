@@ -16,6 +16,10 @@ import Tokenizers
 /// 1. Call `getOrCreateConstrainedSession` to obtain a handle (cached or fresh)
 /// 2. Pass the handle to `generateConstrained` which drives the GPU loop
 /// 3. The engine returns the handle to its internal cache after generation completes
+///
+/// Conformers must:
+/// - Honor `maxTokens` by finishing the stream within that limit
+/// - Return the session handle to cache in a `defer` block (even on error/cancellation)
 package protocol ConstrainedGenerationCapable: InferenceEngine {
     /// Obtain a constrained session handle, reusing a cached one if the schema matches.
     ///

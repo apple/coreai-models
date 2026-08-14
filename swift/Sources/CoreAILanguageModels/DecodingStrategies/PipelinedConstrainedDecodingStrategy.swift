@@ -9,6 +9,7 @@ import Synchronization
 import Tokenizers
 
 private let defaultMaxConstrainedTokens = 512
+private let maxConsecutiveDecodeFailures = 10
 
 private final class SingleUseFlag: Sendable {
     private let value = Atomic<Bool>(false)
@@ -59,11 +60,6 @@ public struct PipelinedConstrainedDecodingStrategy: DecodingStrategy {
         }
 
         let singleTokenStops = stopSequences.sequences.filter { $0.count == 1 }.map { $0[0] }
-        if stopSequences.sequences.contains(where: { $0.count > 1 }) {
-            CLILogger.log(
-                "Warning: Multi-token stop sequences not supported by xgrammar, using single-token stops only",
-                component: "PipelinedConstrained", level: 0)
-        }
         let stopTokenIds: [Int32]? = singleTokenStops.isEmpty ? nil : singleTokenStops
 
         let session = try constrainedEngine.getOrCreateConstrainedSession(
@@ -183,9 +179,12 @@ extension PipelinedConstrainedSequence {
             }
 
             do {
+                var consecutiveDecodeFailures = 0
                 while true {
                     try Task.checkCancellation()
 
+                    // Safe to copy: AsyncThrowingStream.AsyncIterator is a class-backed
+                    // reference type, so the copy shares the underlying stream state.
                     guard var iterator = self.innerIterator else {
                         finished = true
                         return nil
@@ -216,8 +215,15 @@ extension PipelinedConstrainedSequence {
                     let delta = String(fullDecode.dropFirst(common.count))
 
                     if delta.unicodeScalars.contains(where: { $0 == "\u{FFFD}" }) {
+                        consecutiveDecodeFailures += 1
+                        if consecutiveDecodeFailures >= maxConsecutiveDecodeFailures {
+                            throw InferenceRuntimeError.invalidState(
+                                "Decoding produced \(maxConsecutiveDecodeFailures) consecutive "
+                                    + "incomplete codepoints — generation stream is likely corrupted")
+                        }
                         continue
                     }
+                    consecutiveDecodeFailures = 0
 
                     previousDecodedText = fullDecode
 
