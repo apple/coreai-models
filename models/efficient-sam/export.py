@@ -132,6 +132,7 @@ def create_efficient_sam(
     dynamic: bool,
     num_queries: int,
     num_pts: int,
+    include_debug_info: bool,
 ):
     if dynamic and dtype == torch.float16:
         raise ValueError(
@@ -170,7 +171,10 @@ def create_efficient_sam(
     exported = exported.run_decompositions(get_decomp_table())
     print("[INFO] Model exported. Converting to Core AI...")
 
-    converter = TorchConverter().add_exported_program(
+    mode = (
+        TorchConverter.Mode.DEBUG if include_debug_info else TorchConverter.Mode.RELEASE
+    )
+    converter = TorchConverter(mode=mode).add_exported_program(
         exported_program=exported,
         input_names=["batched_images", "batched_points", "batched_point_labels"],
         output_names=["pred_masks", "iou_scores"],
@@ -242,6 +246,12 @@ def main():
             "bottom-right). Higher values support combined point+box prompts."
         ),
     )
+    parser.add_argument(
+        "--include-debug-info",
+        action="store_true",
+        help="Embed debug information in the exported .aimodel for debugging a conversion. "
+        "Default: off, which embeds minimum debug information and makes the exported asset smaller.",
+    )
     args = parser.parse_args()
 
     dtype = {
@@ -259,6 +269,7 @@ def main():
         args.dynamic,
         args.num_queries,
         args.num_pts,
+        args.include_debug_info,
     )
 
 

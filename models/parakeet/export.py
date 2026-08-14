@@ -176,6 +176,7 @@ def _convert(
     input_names: list[str],
     output_names: list[str],
     dtype: torch.dtype,
+    include_debug_info: bool,
     dynamic_shapes: dict | None = None,
 ):
     module.eval()
@@ -187,7 +188,10 @@ def _convert(
             dynamic_shapes=dynamic_shapes,
         )
     exported = exported.run_decompositions(get_decomp_table())
-    converter = TorchConverter().add_exported_program(
+    mode = (
+        TorchConverter.Mode.DEBUG if include_debug_info else TorchConverter.Mode.RELEASE
+    )
+    converter = TorchConverter(mode=mode).add_exported_program(
         exported_program=exported,
         input_names=input_names,
         output_names=output_names,
@@ -297,6 +301,7 @@ def create_parakeet(
     overwrite: bool,
     dynamic: bool,
     audio_seconds: float,
+    include_debug_info: bool,
 ):
     print(f"[INFO] Sourcing {model_name}...")
     model = transformers.AutoModelForTDT.from_pretrained(
@@ -327,6 +332,7 @@ def create_parakeet(
         input_names=["input_features", "attention_mask"],
         output_names=["encoder_hidden_states"],
         dtype=dtype,
+        include_debug_info=include_debug_info,
         dynamic_shapes=_encoder_dynamic_shapes() if dynamic else None,
     )
     _save_program(encoder_program, assets[ENCODER_GRAPH], ENCODER_GRAPH)
@@ -338,6 +344,7 @@ def create_parakeet(
         input_names=["input_ids", "hidden_state", "cell_state"],
         output_names=["decoder_output", "new_hidden_state", "new_cell_state"],
         dtype=dtype,
+        include_debug_info=include_debug_info,
     )
     _save_program(decoder_program, assets[DECODER_STEP_GRAPH], DECODER_STEP_GRAPH)
 
@@ -348,6 +355,7 @@ def create_parakeet(
         input_names=["decoder_hidden_states", "encoder_hidden_states"],
         output_names=["logits"],
         dtype=dtype,
+        include_debug_info=include_debug_info,
     )
     _save_program(joint_program, assets[JOINT_GRAPH], JOINT_GRAPH)
 
@@ -402,6 +410,12 @@ def main():
             "trace. Ignored when --dynamic is set."
         ),
     )
+    parser.add_argument(
+        "--include-debug-info",
+        action="store_true",
+        help="Embed debug information in the exported .aimodel for debugging a conversion. "
+        "Default: off, which embeds minimum debug information and makes the exported asset smaller.",
+    )
     args = parser.parse_args()
 
     dtype = {
@@ -417,6 +431,7 @@ def main():
         args.overwrite,
         args.dynamic,
         args.audio_seconds,
+        args.include_debug_info,
     )
 
 

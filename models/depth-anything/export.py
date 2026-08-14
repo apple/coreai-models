@@ -128,6 +128,7 @@ def create_depth_anything(
     model_name: str,
     dtype: torch.dtype,
     overwrite: bool,
+    include_debug_info: bool,
 ):
     print("[INFO] Sourcing model...")
     model = DepthAnythingModule(model_name)
@@ -145,7 +146,10 @@ def create_depth_anything(
     exported = exported.run_decompositions(get_decomp_table())
     print("[INFO] Model exported. Converting to Core AI...")
 
-    converter = TorchConverter().add_exported_program(
+    mode = (
+        TorchConverter.Mode.DEBUG if include_debug_info else TorchConverter.Mode.RELEASE
+    )
+    converter = TorchConverter(mode=mode).add_exported_program(
         exported_program=exported,
         input_names=["image"],
         output_names=["depth", "depth_conf", "extrinsics", "intrinsics"],
@@ -186,6 +190,12 @@ def main():
         action="store_true",
         help="Overwrite an existing .aimodel asset at the output path.",
     )
+    parser.add_argument(
+        "--include-debug-info",
+        action="store_true",
+        help="Embed debug information in the exported .aimodel for debugging a conversion. "
+        "Default: off, which embeds minimum debug information and makes the exported asset smaller.",
+    )
     args = parser.parse_args()
 
     dtype = {
@@ -198,6 +208,7 @@ def main():
         args.model,
         dtype,
         args.overwrite,
+        args.include_debug_info,
     )
 
 
