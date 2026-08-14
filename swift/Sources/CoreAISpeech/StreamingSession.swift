@@ -127,6 +127,7 @@ package final class StreamingSessionState: @unchecked Sendable {
         config: StreamingConfig,
         decoder: ParakeetTDTDecoder,
         tdtConfig: ParakeetTDTConfig,
+        endpointing: EndpointingConfig,
         deferredDecode: Bool = false,
         continuation: AsyncStream<TranscriptionUpdate>.Continuation
     ) {
@@ -135,8 +136,8 @@ package final class StreamingSessionState: @unchecked Sendable {
         self.decoder = decoder
         self.stream = decoder.makeStream(config: tdtConfig)
         self.endpoint = EndpointDetector(
-            silenceFrames: config.endpointSilenceFrames,
-            maxSegmentFrames: config.maxSegmentFrames)
+            silenceFrames: endpointing.silenceFrames,
+            maxSegmentFrames: endpointing.maxSegmentFrames)
         self.window = []
         self.window.reserveCapacity(config.windowSampleCount)
         self.continuation = continuation
@@ -160,14 +161,16 @@ extension SpeechRecognitionModel {
     /// `speech_to_text_streaming_infer_rnnt.py:446-527`). Parakeet TDT v3 has no
     /// cache-aware encoder, so this is how streaming is done for it.
     ///
-    /// - Parameter config: Window geometry. Defaults to `.balanced` (1.92 s theoretical
-    ///   latency). If the bundle's encoder was traced for a different window, the left
-    ///   context is widened to fit it, keeping `chunk` and `right` exact.
+    /// The window comes from the bundle: geometry is fixed when the encoder is traced, so only
+    /// a `--streaming` export can stream. Read `activeStreamingConfig` for what it turned out to
+    /// be. Endpointing is the caller's, because it changes no tensor shape.
+    ///
+    /// - Parameter endpointing: When a segment is closed for display.
     /// - Parameter deferredDecode: Diagnostic only — chunk the encoder but decode once at the
     ///   end, for diffing against a live stream. It emits no partials, never runs endpointing,
-    ///   and holds every consumed frame in memory,, so it is not a mode to ship.
+    ///   and holds every consumed frame in memory, so it is not a mode to ship.
     public func startStream(
-        config requested: StreamingConfig = .balanced,
+        endpointing: EndpointingConfig = EndpointingConfig(),
         deferredDecode: Bool = false
     ) throws -> AsyncStream<TranscriptionUpdate> {
         guard case .parakeetTDT = bundle.kind, let tdtConfig,
@@ -186,46 +189,27 @@ extension SpeechRecognitionModel {
         // encoder is separately unreliable on the GPU path at many shapes.
         guard melConfig.nFrames != nil else {
             throw SpeechError.invalidStreamingConfig(
-                "this bundle's encoder has a dynamic time axis. Streaming needs a fixed "
-                    + "traced window: export with --streaming (preferred) or plain static, "
-                    + "not --dynamic.")
+                "this bundle's encoder has a dynamic time axis, so there is no traced window to "
+                    + "stream against. Re-export with 'uv run export.py --streaming'.")
         }
 
-        // A bundle exported with --streaming already carries the geometry it was traced
-        // for; that is authoritative, and only the endpointing knobs come from the
-        // caller. Otherwise fit the requested preset to whatever window shipped.
-        var config = requested
-        if let bundled = bundleStreamingConfig {
-            config = StreamingConfig(
-                windowMelFrames: bundled.windowMelFrames,
-                chunkFrames: bundled.chunkFrames,
-                rightContextFrames: bundled.rightContextFrames,
-                endpointSilenceFrames: requested.endpointSilenceFrames,
-                maxSegmentFrames: requested.maxSegmentFrames,
-                hopLength: bundled.hopLength,
-                subsamplingFactor: bundled.subsamplingFactor,
-                sampleRate: bundled.sampleRate)
-        }
-        if let melFrames = melConfig.nFrames, melFrames != config.windowMelFrames {
-            guard let fitted = requested.fitting(encoderMelFrames: melFrames) else {
-                throw SpeechError.invalidStreamingConfig(
-                    "encoder traced for \(melFrames) mel frames, which cannot hold chunk "
-                        + "\(requested.chunkFrames) + right \(requested.rightContextFrames) "
-                        + "encoder frames with at least that much left context")
-            }
-            config = fitted
-            CLILogger.log(
-                "Streaming: fitted left context to \(config.leftContextFrames) frames "
-                    + "(\(String(format: "%.2f", config.seconds(frames: config.leftContextFrames))) s) "
-                    + "for this bundle's \(melFrames)-frame window", level: 1)
+        // The traced window *is* the geometry, so a bundle that never recorded one cannot
+        // stream. Fitting a caller's preset to whatever window happened to ship would run the
+        // session with a left context nobody chose.
+        guard let config = bundleStreamingConfig else {
+            throw SpeechError.invalidStreamingConfig(
+                "this bundle has no streaming geometry. Re-export with "
+                    + "'uv run export.py --streaming' — streaming needs a window the export "
+                    + "traced and recorded.")
         }
         try config.validate(
             maxDuration: tdtConfig.durations.max() ?? 0, encoderMelFrames: melConfig.nFrames)
+        try endpointing.validate(chunkFrames: config.chunkFrames)
 
         let (stream, continuation) = AsyncStream.makeStream(of: TranscriptionUpdate.self)
         streaming = StreamingSessionState(
-            config: config, decoder: parakeet, tdtConfig: tdtConfig, deferredDecode: deferredDecode,
-            continuation: continuation)
+            config: config, decoder: parakeet, tdtConfig: tdtConfig, endpointing: endpointing,
+            deferredDecode: deferredDecode, continuation: continuation)
         return stream
     }
 
@@ -277,9 +261,9 @@ extension SpeechRecognitionModel {
 
     /// Convenience: drive a whole async sequence of buffers to completion.
     public func transcribe<S: AsyncSequence & Sendable>(
-        pcmStream: S, config: StreamingConfig = .balanced
+        pcmStream: S, endpointing: EndpointingConfig = EndpointingConfig()
     ) throws -> AsyncStream<TranscriptionUpdate> where S.Element == [Float] {
-        let updates = try startStream(config: config)
+        let updates = try startStream(endpointing: endpointing)
         Task { [weak self] in
             guard let self else { return }
             do {

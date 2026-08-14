@@ -41,9 +41,6 @@ private func fittedTail(_ text: String, width: Int) -> String {
 func runStreaming(
     bundleURL: URL,
     audioPath: String,
-    chunkFrames: Int?,
-    rightContextFrames: Int?,
-    leftContextFrames: Int?,
     endpointFrames: Int?,
     realtime: Bool,
     deferredDecode: Bool = false,
@@ -54,28 +51,20 @@ func runStreaming(
     let loadMs = (ContinuousClock.now - start).inMilliseconds
     let sampleRate = await model.sampleRate
 
-    let base = StreamingConfig.balanced
-    let config = StreamingConfig(
-        leftContextFrames: leftContextFrames ?? base.leftContextFrames,
-        chunkFrames: chunkFrames ?? base.chunkFrames,
-        rightContextFrames: rightContextFrames ?? base.rightContextFrames,
-        endpointSilenceFrames: endpointFrames ?? base.endpointSilenceFrames,
-        maxSegmentFrames: base.maxSegmentFrames)
+    var endpointing = EndpointingConfig()
+    if let endpointFrames { endpointing.silenceFrames = endpointFrames }
 
     let url = URL(fileURLWithPath: audioPath)
     let pcm = try MelSpectrogram.loadAndResample(url, targetSampleRate: sampleRate)
 
-    let updates = try await model.startStream(config: config, deferredDecode: deferredDecode)
-    // Report what the session adopted, not what was asked for: a bundle not exported for
-    // streaming has its own traced window, and left context is widened to fill it.
-    let active = await model.activeStreamingConfig ?? config
+    let updates = try await model.startStream(
+        endpointing: endpointing, deferredDecode: deferredDecode)
+    // The bundle's own geometry, which is the only source of it.
+    guard let active = await model.activeStreamingConfig else {
+        throw SpeechError.invalidStreamingConfig("streaming session reported no geometry")
+    }
 
     print("Model loaded in \(String(format: "%.0f", loadMs)) ms")
-    if active.windowMelFrames != config.windowMelFrames {
-        print(
-            "Bundle traced for \(active.windowMelFrames) mel frames — left context widened "
-                + "from \(config.leftContextFrames) to \(active.leftContextFrames) frames")
-    }
     print(
         "Streaming: left \(active.leftContextFrames) / chunk \(active.chunkFrames) / "
             + "right \(active.rightContextFrames) frames "

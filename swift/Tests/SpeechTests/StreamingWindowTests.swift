@@ -59,6 +59,11 @@ struct EncoderSubsamplingTests {
 
 @Suite("Streaming window geometry")
 struct StreamingFrameMathTests {
+    /// The default export geometry, as a bundle would record it. Geometry is no longer a
+    /// library preset, so the tests carry their own.
+    static let balancedGeometry = StreamingConfig(
+        leftContextFrames: 126, chunkFrames: 12, rightContextFrames: 12)
+
     /// The identity the whole design rests on: a PCM window that is a whole number of
     /// encoder frames gives `8W + 1` mel frames, of which `8W` are real, and the encoder
     /// emits `W + 1` frames of which `W` can be trusted.
@@ -88,7 +93,8 @@ struct StreamingFrameMathTests {
 
     @Test("One encoder frame is 1280 samples / 80 ms")
     func frameDuration() {
-        let config = StreamingConfig.balanced
+        let config = StreamingConfig(
+            leftContextFrames: 126, chunkFrames: 12, rightContextFrames: 12)
         #expect(config.samplesPerEncoderFrame == 1280)
         #expect(config.subsamplingFactor == 8)
         #expect(abs(config.seconds(frame: 1) - 0.08) < 1e-12)
@@ -96,9 +102,12 @@ struct StreamingFrameMathTests {
         #expect(config.seconds(frame: 0) == 0)
     }
 
-    @Test("Presets have the advertised geometry and latency")
-    func presets() {
-        let balanced = StreamingConfig.balanced
+    /// The two geometries the README recommends exporting, pinned so their advertised latency
+    /// and window sizes stay true even though the library no longer carries them as presets.
+    @Test("The recommended export geometries have the advertised window and latency")
+    func recommendedGeometries() {
+        let balanced = StreamingConfig(
+            leftContextFrames: 126, chunkFrames: 12, rightContextFrames: 12)
         #expect(balanced.chunkFrames == 12)
         #expect(balanced.rightContextFrames == 12)
         #expect(balanced.leftContextFrames == 126)
@@ -107,33 +116,12 @@ struct StreamingFrameMathTests {
         #expect(balanced.windowSampleCount == 192_000)
         #expect(abs(balanced.theoreticalLatency - 1.92) < 1e-9)
 
-        let accuracy = StreamingConfig.accuracy
+        let accuracy = StreamingConfig(
+            leftContextFrames: 125, chunkFrames: 25, rightContextFrames: 25)
         #expect(accuracy.usableEncoderFrames == 175)
         #expect(accuracy.windowMelFrames == 1401)
         #expect(accuracy.windowSampleCount == 224_000)
         #expect(abs(accuracy.theoreticalLatency - 4.0) < 1e-9)
-    }
-
-    /// The shipped `_static` bundle was traced at 2101 mel frames, which is *not* of the
-    /// form `8W + 1` (2100 % 8 == 4). Streaming still has to run against it, with `chunk`
-    /// and `right` exact and left context taking the remainder.
-    @Test("Fits a bundle whose window was never chosen for streaming")
-    func fitsNonAlignedWindow() throws {
-        let fitted = try #require(StreamingConfig.balanced.fitting(encoderMelFrames: 2101))
-        #expect(fitted.windowMelFrames == 2101)
-        #expect(fitted.chunkFrames == 12)
-        #expect(fitted.rightContextFrames == 12)
-        // ceil(2100 / 8) == 263 usable frames, so left context is 263 - 12 - 12.
-        #expect(fitted.usableEncoderFrames == 263)
-        #expect(fitted.leftContextFrames == 239)
-        #expect(fitted.windowSampleCount == 2100 * 160)
-        try fitted.validate(maxDuration: 4, encoderMelFrames: 2101)
-    }
-
-    @Test("Refuses a window too small to hold chunk plus right context")
-    func rejectsTooSmallWindow() {
-        // 33 mel frames -> 4 usable encoder frames, far short of chunk 12 + right 12.
-        #expect(StreamingConfig.balanced.fitting(encoderMelFrames: 33) == nil)
     }
 
     @Test("Hop geometry partitions the timeline with no gaps or repeats")
@@ -166,7 +154,7 @@ struct StreamingFrameMathTests {
 
     @Test("Ramp-up clamps the window to zero, giving early hops more left context")
     func rampUpClampsToZero() {
-        let config = StreamingConfig.balanced  // left 126, chunk 12
+        let config = Self.balancedGeometry  // left 126, chunk 12
         // Until hop*chunk exceeds left context the window cannot slide.
         for hop in 0...10 {
             #expect(config.windowStartFrame(hop: hop) == 0, "hop=\(hop)")
@@ -180,7 +168,7 @@ struct StreamingFrameMathTests {
 
     @Test("A hop waits for its chunk plus right context before running")
     func requiredSampleCount() {
-        let config = StreamingConfig.balanced
+        let config = Self.balancedGeometry
         // Matches NeMo's initial-latency gate: chunk + right before the first encode.
         #expect(config.requiredSampleCount(hop: 0) == (12 + 12) * 1280)
         #expect(config.requiredSampleCount(hop: 1) == (24 + 12) * 1280)
@@ -205,13 +193,14 @@ struct StreamingFrameMathTests {
         }
         // A config built for a different window than the bundle actually shipped.
         #expect(throws: SpeechError.self) {
-            try StreamingConfig.balanced.validate(maxDuration: 4, encoderMelFrames: 2101)
+            try Self.balancedGeometry.validate(maxDuration: 4, encoderMelFrames: 2101)
         }
         // The happy paths.
         #expect(throws: Never.self) {
-            try StreamingConfig.balanced.validate(maxDuration: 4, encoderMelFrames: 1201)
-            try StreamingConfig.accuracy.validate(maxDuration: 4, encoderMelFrames: 1401)
-            try StreamingConfig.balanced.validate(maxDuration: 4, encoderMelFrames: nil)
+            try Self.balancedGeometry.validate(maxDuration: 4, encoderMelFrames: 1201)
+            try StreamingConfig(leftContextFrames: 125, chunkFrames: 25, rightContextFrames: 25)
+                .validate(maxDuration: 4, encoderMelFrames: 1401)
+            try Self.balancedGeometry.validate(maxDuration: 4, encoderMelFrames: nil)
         }
     }
 }
@@ -301,7 +290,7 @@ struct StreamingMetadataTests {
               "samples_per_encoder_frame":1280,"seconds_per_encoder_frame":0.08,
               "sample_rate":16000,"hop_length":160,"subsampling_factor":8}}
             """
-        let config = try #require(StreamingConfig.decode(fromMetadata: Data(json.utf8)))
+        let config = try #require(try StreamingConfig.decode(fromMetadata: Data(json.utf8)))
         #expect(config.windowMelFrames == 1201)
         #expect(config.chunkFrames == 12)
         #expect(config.rightContextFrames == 12)
@@ -311,11 +300,44 @@ struct StreamingMetadataTests {
         try config.validate(maxDuration: 4, encoderMelFrames: 1201)
     }
 
+    /// The block a current export writes carries only what the runtime reads. Older bundles
+    /// carry six extra derived keys, which `Decodable` ignores — covered above.
+    @Test("A block of only the recorded keys decodes")
+    func recordedKeysOnly() throws {
+        let json = """
+            {"metadata_version":"0.2","kind":"speech_recognizer","streaming":{
+              "left_context_encoder_frames":126,"chunk_encoder_frames":12,
+              "right_context_encoder_frames":12,"window_mel_frames":1201,
+              "sample_rate":16000,"hop_length":160,"subsampling_factor":8}}
+            """
+        let config = try #require(try StreamingConfig.decode(fromMetadata: Data(json.utf8)))
+        #expect(config.leftContextFrames == 126)
+        #expect(config.chunkFrames == 12)
+        #expect(config.windowMelFrames == 1201)
+    }
+
+    /// Left is derived, so the recorded copy is only a cross-check — and it has to bite, or a
+    /// hand-edited chunk would leave the file describing a geometry the runtime never runs.
+    @Test("A block whose left context disagrees with its window is rejected")
+    func inconsistentLeftIsRejected() {
+        // chunk raised to 25 without fixing left: 150 - 25 - 12 is 113, not 126.
+        let json = """
+            {"metadata_version":"0.2","kind":"speech_recognizer","streaming":{
+              "left_context_encoder_frames":126,"chunk_encoder_frames":25,
+              "right_context_encoder_frames":12,"window_mel_frames":1201,
+              "sample_rate":16000,"hop_length":160,"subsampling_factor":8}}
+            """
+        #expect(throws: SpeechError.self) {
+            try StreamingConfig.decode(fromMetadata: Data(json.utf8))
+        }
+    }
+
     @Test("Bundles without the block decode to nil rather than failing")
-    func absentBlockIsNil() {
-        // Every bundle exported before streaming existed looks like this.
+    func absentBlockIsNil() throws {
+        // Every bundle exported before streaming existed looks like this. Such a bundle simply
+        // cannot stream; `startStream` reports that rather than inventing a geometry.
         let json = #"{"metadata_version":"0.2","kind":"speech_recognizer","config":{}}"#
-        #expect(StreamingConfig.decode(fromMetadata: Data(json.utf8)) == nil)
-        #expect(StreamingConfig.decode(fromMetadata: Data("not json".utf8)) == nil)
+        #expect(try StreamingConfig.decode(fromMetadata: Data(json.utf8)) == nil)
+        #expect(try StreamingConfig.decode(fromMetadata: Data("not json".utf8)) == nil)
     }
 }

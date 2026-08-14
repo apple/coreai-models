@@ -5,6 +5,37 @@
 
 import Foundation
 
+// MARK: - EndpointingConfig
+
+/// When a streaming segment is closed for display.
+///
+/// Separate from `StreamingConfig` because it changes no tensor shape: the window is fixed by
+/// the traced graph, but where a transcript is cut is a caller's policy — dictation wants a long
+/// pause tolerance, live captions a short one.
+public struct EndpointingConfig: Sendable, Equatable {
+    /// Frames of decoder silence, duration-weighted, before a segment is finalized. 10 frames
+    /// is 0.8 s at 80 ms per frame.
+    public var silenceFrames: Int
+    /// Soft cap on segment length, 375 frames being 30 s. Splits the transcript for display
+    /// without resetting the transducer, and waits for a pause so no word is cut.
+    public var maxSegmentFrames: Int
+
+    public init(silenceFrames: Int = 10, maxSegmentFrames: Int = 375) {
+        self.silenceFrames = silenceFrames
+        self.maxSegmentFrames = maxSegmentFrames
+    }
+
+    /// Checked against the geometry it will run with: a cap below one chunk could never be
+    /// reached at a pause, and zero silence frames would endpoint on every hop.
+    public func validate(chunkFrames: Int) throws {
+        guard silenceFrames >= 1, maxSegmentFrames >= chunkFrames else {
+            throw SpeechError.invalidStreamingConfig(
+                "silenceFrames must be >= 1 and maxSegmentFrames (\(maxSegmentFrames)) must be "
+                    + ">= the bundle's chunk (\(chunkFrames))")
+        }
+    }
+}
+
 // MARK: - StreamingConfig
 
 /// Window geometry for buffered ("streaming") Parakeet TDT inference.
@@ -33,12 +64,6 @@ public struct StreamingConfig: Sendable, Equatable {
     /// Mel frames the encoder graph is traced for — the primary quantity, because it is
     /// the one the exported graph fixes. Everything else derives from it.
     public let windowMelFrames: Int
-    /// Consecutive silent frames before a segment is finalized.
-    public let endpointSilenceFrames: Int
-    /// Soft cap on segment length. Splits the transcript for display without
-    /// resetting the transducer, and keeps a segment inside one offline encoder run for
-    /// any later rescoring pass.
-    public let maxSegmentFrames: Int
 
     public let samplesPerEncoderFrame: Int
     public let hopLength: Int
@@ -68,10 +93,15 @@ public struct StreamingConfig: Sendable, Equatable {
     }
 
     /// Frames of past audio the encoder sees but does not decode. Improves quality
-    /// without affecting latency.
+    /// without affecting latency. This is the steady-state target — NeMo's
+    /// `expected_context.left`; the effective left is smaller during ramp-up, because
+    /// `windowStartFrame` clamps to 0.
     ///
-    /// Derived rather than stored: `chunk` and `right` must be exact, so left context is
-    /// what absorbs whatever window the bundle was actually traced for.
+    /// Derived rather than stored, which makes `left + chunk + right <= usable` identically
+    /// true. That inequality is load-bearing: `windowStartFrame` positions a fixed-size window
+    /// from it, so a stored left that disagreed would either start the window past the audio or
+    /// leave part of a chunk unconsumed. `decode(fromMetadata:)` cross-checks the recorded value
+    /// instead of trusting it.
     public var leftContextFrames: Int {
         usableEncoderFrames - chunkFrames - rightContextFrames
     }
@@ -87,8 +117,6 @@ public struct StreamingConfig: Sendable, Equatable {
         leftContextFrames: Int,
         chunkFrames: Int,
         rightContextFrames: Int,
-        endpointSilenceFrames: Int = 10,
-        maxSegmentFrames: Int = 375,
         hopLength: Int = 160,
         subsamplingFactor: Int = 8,
         sampleRate: Double = 16_000
@@ -97,8 +125,6 @@ public struct StreamingConfig: Sendable, Equatable {
             windowMelFrames: (leftContextFrames + chunkFrames + rightContextFrames) * subsamplingFactor + 1,
             chunkFrames: chunkFrames,
             rightContextFrames: rightContextFrames,
-            endpointSilenceFrames: endpointSilenceFrames,
-            maxSegmentFrames: maxSegmentFrames,
             hopLength: hopLength,
             subsamplingFactor: subsamplingFactor,
             sampleRate: sampleRate)
@@ -109,8 +135,6 @@ public struct StreamingConfig: Sendable, Equatable {
         windowMelFrames: Int,
         chunkFrames: Int,
         rightContextFrames: Int,
-        endpointSilenceFrames: Int = 10,
-        maxSegmentFrames: Int = 375,
         hopLength: Int = 160,
         subsamplingFactor: Int = 8,
         sampleRate: Double = 16_000
@@ -118,47 +142,39 @@ public struct StreamingConfig: Sendable, Equatable {
         self.windowMelFrames = windowMelFrames
         self.chunkFrames = chunkFrames
         self.rightContextFrames = rightContextFrames
-        self.endpointSilenceFrames = endpointSilenceFrames
-        self.maxSegmentFrames = maxSegmentFrames
         self.hopLength = hopLength
         self.samplesPerEncoderFrame = hopLength * subsamplingFactor
         self.sampleRate = sampleRate
     }
 
-    // MARK: Presets
-
-    /// 10.08 s left / 0.96 s chunk / 0.96 s right — 1.92 s theoretical latency,
-    /// 12.0 s window (1201 mel frames, 151 encoder frames).
-    ///
-    /// Upstream recommends 10-2-2 (`:31`), but measurement on this checkpoint found
-    /// 10-1-1 no worse at half the latency, and the encoder costs ~54 ms per hop
-    /// against a 960 ms budget — so throughput is not what should set this.
-    public static let balanced = StreamingConfig(
-        leftContextFrames: 126, chunkFrames: 12, rightContextFrames: 12)
-
-    /// 10.0 s left / 2.0 s chunk / 2.0 s right — 4.0 s latency, 14.0 s window
-    /// (1401 mel frames, 176 encoder frames). Upstream's recommended setting.
-    public static let accuracy = StreamingConfig(
-        leftContextFrames: 125, chunkFrames: 25, rightContextFrames: 25)
-
     // MARK: Bundle metadata
 
     /// Decode the `streaming` block a `--streaming` export writes into `metadata.json`.
     ///
-    /// Returns nil for bundles without the block — every bundle exported before
-    /// streaming existed — so `startStream` falls back to fitting a preset to the
-    /// traced window.
-    package static func decode(fromMetadata raw: Data) -> StreamingConfig? {
+    /// `nil` for a bundle without the block — it simply cannot stream, and `startStream` says so.
+    /// Throws when the block is present but disagrees with itself: the recorded left context must
+    /// equal the window minus chunk and right. Left is derived for use, so this is the one place
+    /// the recorded copy is checked, which is what keeps a hand-edited block from describing a
+    /// geometry the runtime would not actually run.
+    package static func decode(fromMetadata raw: Data) throws -> StreamingConfig? {
         guard let payload = try? JSONDecoder().decode(MetadataPayload.self, from: raw),
             let block = payload.streaming
         else { return nil }
-        return StreamingConfig(
+        let config = StreamingConfig(
             windowMelFrames: block.windowMelFrames,
             chunkFrames: block.chunkEncoderFrames,
             rightContextFrames: block.rightContextEncoderFrames,
             hopLength: block.hopLength,
             subsamplingFactor: block.subsamplingFactor,
             sampleRate: Double(block.sampleRate))
+        guard block.leftContextEncoderFrames == config.leftContextFrames else {
+            throw SpeechError.invalidStreamingConfig(
+                "metadata records left context \(block.leftContextEncoderFrames) but its window "
+                    + "leaves \(config.leftContextFrames) after chunk \(config.chunkFrames) and "
+                    + "right \(config.rightContextFrames). The block disagrees with itself; "
+                    + "re-export rather than editing it.")
+        }
+        return config
     }
 
     fileprivate struct MetadataPayload: Decodable {
@@ -166,6 +182,7 @@ public struct StreamingConfig: Sendable, Equatable {
     }
 
     fileprivate struct StreamingBlock: Decodable {
+        let leftContextEncoderFrames: Int
         let chunkEncoderFrames: Int
         let rightContextEncoderFrames: Int
         let windowMelFrames: Int
@@ -174,6 +191,7 @@ public struct StreamingConfig: Sendable, Equatable {
         let sampleRate: Int
 
         enum CodingKeys: String, CodingKey {
+            case leftContextEncoderFrames = "left_context_encoder_frames"
             case chunkEncoderFrames = "chunk_encoder_frames"
             case rightContextEncoderFrames = "right_context_encoder_frames"
             case windowMelFrames = "window_mel_frames"
@@ -213,10 +231,6 @@ public struct StreamingConfig: Sendable, Equatable {
                 "rightContextFrames (\(rightContextFrames)) must be >= the largest TDT "
                     + "duration (\(maxDuration))")
         }
-        guard endpointSilenceFrames >= 1, maxSegmentFrames >= chunkFrames else {
-            throw SpeechError.invalidStreamingConfig(
-                "endpointSilenceFrames must be >= 1 and maxSegmentFrames >= chunkFrames")
-        }
         // The load-bearing one: the graph the bundle actually shipped must match the
         // geometry this config claims. A one-frame mismatch is 80 ms of audio and would
         // drop or duplicate words at every boundary.
@@ -226,26 +240,6 @@ public struct StreamingConfig: Sendable, Equatable {
                     + "\(windowMelFrames). Build the config with "
                     + "StreamingConfig(windowMelFrames:) or let startStream() fit it.")
         }
-    }
-
-    /// The same config resized to an encoder traced for `melFrames` mel frames.
-    ///
-    /// Lets a streaming session run against a plain `_static` bundle whose window was
-    /// never chosen with streaming in mind: `chunk` and `right` stay exact and left
-    /// context takes the remainder. Returns nil if the window cannot even hold
-    /// `chunk + right` with that much left context.
-    public func fitting(encoderMelFrames melFrames: Int) -> StreamingConfig? {
-        let resized = StreamingConfig(
-            windowMelFrames: melFrames,
-            chunkFrames: chunkFrames,
-            rightContextFrames: rightContextFrames,
-            endpointSilenceFrames: endpointSilenceFrames,
-            maxSegmentFrames: maxSegmentFrames,
-            hopLength: hopLength,
-            subsamplingFactor: subsamplingFactor,
-            sampleRate: sampleRate)
-        guard resized.leftContextFrames >= chunkFrames else { return nil }
-        return resized
     }
 
     // MARK: Hop geometry

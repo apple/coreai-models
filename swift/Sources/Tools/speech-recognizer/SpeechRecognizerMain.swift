@@ -54,15 +54,6 @@ struct SpeechRecognizer: AsyncParsableCommand {
             """)
     var deferredDecode = false
 
-    @Option(help: "Streaming chunk size in encoder frames (1 frame = 80 ms).")
-    var chunkFrames: Int?
-
-    @Option(help: "Streaming right context in encoder frames.")
-    var rightContextFrames: Int?
-
-    @Option(help: "Streaming left context in encoder frames.")
-    var leftContextFrames: Int?
-
     @Option(help: "Silent encoder frames before a segment is finalized.")
     var endpointFrames: Int?
 
@@ -124,9 +115,6 @@ struct SpeechRecognizer: AsyncParsableCommand {
         let streamingOnly: [String] = [
             realtime ? "--realtime" : nil,
             deferredDecode ? "--deferred-decode" : nil,
-            chunkFrames != nil ? "--chunk-frames" : nil,
-            rightContextFrames != nil ? "--right-context-frames" : nil,
-            leftContextFrames != nil ? "--left-context-frames" : nil,
             endpointFrames != nil ? "--endpoint-frames" : nil,
         ].compactMap { $0 }
         if !stream, !streamingOnly.isEmpty {
@@ -179,9 +167,7 @@ struct SpeechRecognizer: AsyncParsableCommand {
             && FileManager.default.fileExists(atPath: bundleURL.appending(path: "metadata.json").path)
         if isBundle, stream, let audioPath {
             try await runStreaming(
-                bundleURL: bundleURL, audioPath: audioPath,
-                chunkFrames: chunkFrames, rightContextFrames: rightContextFrames,
-                leftContextFrames: leftContextFrames, endpointFrames: endpointFrames,
+                bundleURL: bundleURL, audioPath: audioPath, endpointFrames: endpointFrames,
                 realtime: realtime, deferredDecode: deferredDecode, verbose: verbose)
         } else if isBundle {
             try await runBundle(

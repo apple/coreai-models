@@ -101,6 +101,15 @@ Produces `parakeet-tdt-0.6b-v3_float16_streaming150/`, plus a `streaming` block 
 
 The three frame counts are read only when `--streaming` is set, and `--audio-seconds` only when it isn't. The export warns rather than failing when it sees a flag the chosen shape mode doesn't use, so a stray `--chunk-frames` can't quietly produce a window you didn't ask for.
 
+**Only a `--streaming` bundle can stream.** The window is fixed when the encoder is traced, so
+it is chosen here and cannot be changed later; `startStream` rejects a `--static` or `--dynamic`
+bundle and names the re-export command. Two geometries worth starting from:
+
+| geometry | export flags | latency |
+| --- | --- | --- |
+| balanced (the default) | `--streaming` | 1.92 s |
+| accuracy (NeMo's 10-2-2) | `--streaming --chunk-frames 25 --right-context-frames 25 --left-context-frames 125` | 4.00 s |
+
 The `150` in the name is the window's **usable encoder frame count** — `left + chunk + right` = `126 + 12 + 12`, or 12.0 s at 80 ms per frame. It comes from the three flags above, so a different geometry produces a different suffix; it is not a model size or a latency figure.
 
 **The chunk size is a throughput knob, not a quality one.** Every hop re-encodes the whole window to consume one chunk, so the encoder work per second of audio scales with `window / chunk`: halving the chunk doubles it.
@@ -126,19 +135,15 @@ So while audio is still arriving, the window is zero-filled to its traced size �
 
 Cost is a one-time increase in front-end work per session, since the mel is computed across the full window during ramp-up rather than just the real prefix.
 
-Do **not** stream against a `--dynamic` bundle — `startStream` rejects one outright. There is no traced window to derive the geometry from, so there is nothing to validate a config against, and the `float32` dynamic encoder is separately unreliable on the GPU path at many shapes. Static exports are unaffected by both.
+A `--dynamic` bundle cannot stream either: its time axis is symbolic, so there is no traced
+window at all, and the `float32` dynamic encoder is separately unreliable on the GPU path at many
+shapes.
 
-### Streaming against a plain `_static` bundle
-
-`--streaming` is not required. Streaming needs only a *fixed* traced window, which every static bundle has, so a bundle exported for one-shot transcription can be streamed as-is: `startStream` fits the requested preset to the window that shipped, keeping `chunk` and `right` exact and letting left context absorb the remainder. The fitted geometry is logged, and `activeStreamingConfig` reports what the session actually adopted.
-
-It works, but a purpose-built window is better on three counts:
-
-- **Left context gets whatever is left over.** At the default `--audio-seconds 5.0` the window holds 63 usable frames, so left context is `63 − 12 − 12` = 39 frames ≈ 3.1 s, against the 10.08 s a `--streaming` export gives you. Past context is the cheapest quality knob there is — it costs no latency — so this is the real loss. Below ~2.8 s of traced window there is no room for `chunk + right` plus that much left context, and `startStream` throws.
-- **Cost scales with the window, not the chunk.** Every hop re-encodes the entire traced window to consume one 0.96 s chunk, so a window sized for one-shot use pays for context the hop never asked for.
-- **The geometry isn't recorded.** Without a `streaming` block in `metadata.json`, the window depends on whichever preset the caller passes rather than travelling with the bundle.
-
-A static window is also rarely of the form `8W + 1`, so it isn't frame-aligned. Streaming still runs against it — `chunk` and `right` stay exact and left context takes up the slack — but the alignment is a coincidence rather than a guarantee.
+The recorded block carries only what the runtime reads — left, chunk, right, the window's mel
+frame count, and the sample rate, hop and subsampling factor it was traced at. Left context is
+*derived* at load (`window − chunk − right`) and the recorded copy is cross-checked against it, so
+a block that has been edited into disagreeing with itself fails to load rather than running a
+geometry the file misdescribes.
 
 ### Running
 
@@ -150,7 +155,7 @@ let model = try await SpeechRecognitionModel(
 
 // This package does not capture audio. A host app owns AVAudioEngine, converts to
 // mono float32 at model.sampleRate, and pushes buffers in.
-let updates = try await model.startStream(config: .balanced)
+let updates = try await model.startStream()
 
 Task {
     for await update in updates {
@@ -165,13 +170,13 @@ try await model.append(pcm: buffer)     // call from a Task, not an audio render
 try await model.finishStream()
 ```
 
-`.balanced` is the default and needn't be passed: 10.08 s left / 0.96 s chunk / 0.96 s right, for 1.92 s of theoretical latency. `.accuracy` is NeMo's recommended 10-2-2 geometry at 4.0 s. A bundle exported with `--streaming` overrides the preset's window with its own, so only the endpointing knobs come from the caller — read `activeStreamingConfig` for the geometry the session settled on.
+`startStream` takes no geometry: the bundle's window is the geometry, and `activeStreamingConfig` reports it — chunk, right, the derived left, and the theoretical latency. What the caller does control is `EndpointingConfig`, which decides only when a segment is cut for display and so changes no tensor shape.
 
 ```bash
 swift run -c release speech-recognizer --model <bundle> --audio-path audio.wav --stream
 ```
 
-The CLI has no preset flag: it starts from `.balanced` and applies `--chunk-frames`, `--left-context-frames`, `--right-context-frames`, and `--endpoint-frames` as overrides. Add `--realtime` to pace file input at 1× so reported latency is realistic, or `--deferred-decode` to chunk the encoder but decode once at the end. All of these require `--stream`.
+The CLI has no geometry flags, for the same reason — it prints the window the bundle records. `--endpoint-frames` sets the silence threshold, `--realtime` paces file input at 1× so reported latency is realistic, and `--deferred-decode` chunks the encoder but decodes once at the end. All of these require `--stream`.
 
 Partials are rewritten in place on a terminal, and dropped entirely when stdout is redirected so that piped output stays diffable.
 
@@ -189,6 +194,6 @@ That expectation is what makes it a test. Because it shares the encoder path but
 
 ### Streaming removes the length limit
 
-The offline path silently pads or truncates PCM to the traced window, so `transcribe` on a static bundle covers only as much audio as that window holds — longer input is dropped without an error. Streaming has no such bound: it slides the same fixed window across input of any length, so a session transcribes an arbitrarily long stream regardless of which bundle it runs against.
+The offline path silently pads or truncates PCM to the traced window, so `transcribe` on a static bundle covers only as much audio as that window holds — longer input is dropped without an error. A streaming bundle has no such bound: it slides the same fixed window across input of any length, so a session transcribes an arbitrarily long stream.
 
 [^1]: [TDT paper](https://arxiv.org/abs/2304.06795) · [Parakeet TDT v3 paper](https://arxiv.org/abs/2509.14128) · [HuggingFace](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3)

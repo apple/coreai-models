@@ -138,6 +138,24 @@ def _audio_features(
     return _audio_features_samples(model_name, dtype, int(sample_rate * seconds))
 
 
+def _encoder_frame_count(mel_frames: int, subsampling_factor: int) -> int:
+    """Encoder frames emitted for `mel_frames`, applying the subsampling stack stage by stage.
+
+    Each stride-2, kernel-3, pad-1 conv maps `T` to `floor((T - 1) / 2) + 1`, so the count follows
+    from halving once per factor of two rather than from the `ceil(L/8)` closed form. Mirrors
+    `encoderFrameCount` in StreamingWindow.swift and HF
+    `ParakeetPreTrainedModel._get_subsampling_output_length`, so the export, the simulator and the
+    runtime cannot disagree about the same quantity — and an unusual factor still computes right.
+    """
+    if mel_frames <= 0 or subsampling_factor <= 1:
+        return max(0, mel_frames)
+    length, factor = mel_frames, subsampling_factor
+    while factor > 1:
+        length = (length - 1) // 2 + 1
+        factor //= 2
+    return length
+
+
 def _streaming_geometry(
     model_name: str,
     config: "transformers.ParakeetTDTConfig",
@@ -149,10 +167,11 @@ def _streaming_geometry(
 
     Everything hangs off one rule: make the PCM window a whole number of encoder
     frames. The feature extractor emits `1 + N/hop` frames (torch.stft
-    center=True), and the FastConformer subsampling stack is three stride-2
-    kernel-3 pad-1 convs, i.e. `ceil(L/8)`. So a window of `W * hop * subsampling`
-    samples gives `8W + 1` mel frames and `W + 1` encoder frames, of which `W` are
-    fully backed by real audio and the last covers the zero-padded remainder.
+    center=True), and each subsampling conv maps `T` to `floor((T - 1) / 2) + 1` — see
+    `_encoder_frame_count`, which is the definition; `ceil(L/8)` is only its consequence for
+    a factor of 8. So a window of `W * hop * subsampling` samples gives `8W + 1` mel frames and
+    `W + 1` encoder frames, of which `W` are fully backed by real audio and the last covers the
+    zero-padded remainder. The `8W + 1` identity is asserted below rather than assumed.
 
     Deriving the sample count from `seconds` instead would be lossy at exactly the
     lengths we care about: `16000 * 6.4 == 102400.00000000001`.
@@ -166,21 +185,51 @@ def _streaming_geometry(
     usable = left + chunk + right
     samples_per_encoder_frame = hop_length * subsampling
     window_samples = usable * samples_per_encoder_frame
+    window_mel_frames = usable * subsampling + 1
+
+    # The whole window arithmetic rests on a frame-aligned window: the mel frames backed by real
+    # audio must subsample to exactly `usable`. Check it rather than trusting the closed form.
+    valid_mel_frames = window_mel_frames - 1
+    recovered = _encoder_frame_count(valid_mel_frames, subsampling)
+    if recovered != usable:
+        raise ValueError(
+            f"window of {usable} encoder frames gives {valid_mel_frames} valid mel frames, "
+            f"which subsample to {recovered}, not {usable}"
+        )
+
     return {
         "left_context_encoder_frames": left,
         "chunk_encoder_frames": chunk,
         "right_context_encoder_frames": right,
         "usable_encoder_frames": usable,
-        "window_encoder_frames": usable + 1,
-        "window_mel_frames": usable * subsampling + 1,
-        "valid_window_mel_frames": usable * subsampling,
+        "window_encoder_frames": _encoder_frame_count(window_mel_frames, subsampling),
+        "window_mel_frames": window_mel_frames,
         "window_sample_count": window_samples,
-        "samples_per_encoder_frame": samples_per_encoder_frame,
         "seconds_per_encoder_frame": samples_per_encoder_frame / sample_rate,
         "sample_rate": sample_rate,
         "hop_length": hop_length,
         "subsampling_factor": subsampling,
     }
+
+
+# Keys the Swift runtime reads (StreamingConfig.StreamingBlock). Everything else
+# `_streaming_geometry` computes is for this script's own use — naming the bundle, sizing the
+# dummy input, the forward-pass assertions, the log line — and is deliberately not published:
+# a derived value in the file is one more thing that can contradict the traced graph.
+_RECORDED_GEOMETRY_KEYS = (
+    "left_context_encoder_frames",
+    "chunk_encoder_frames",
+    "right_context_encoder_frames",
+    "window_mel_frames",
+    "sample_rate",
+    "hop_length",
+    "subsampling_factor",
+)
+
+
+def _recorded_geometry(geometry: dict) -> dict:
+    """The subset of the geometry a bundle records, in the order above."""
+    return {key: geometry[key] for key in _RECORDED_GEOMETRY_KEYS}
 
 
 def _decoder_step_inputs(
@@ -360,7 +409,7 @@ def _write_bundle_metadata(
         # A sibling of `config`, not a member of it, so ParakeetTDTConfig.decode on
         # the Swift side is untouched and existing bundles keep decoding. Note
         # metadata_version stays "0.2": ModelBundle hard-rejects anything else.
-        metadata["streaming"] = streaming
+        metadata["streaming"] = _recorded_geometry(streaming)
     metadata_path = bundle_dir / "metadata.json"
     with open(metadata_path, "w") as f:
         json.dump(metadata, f, indent=2)

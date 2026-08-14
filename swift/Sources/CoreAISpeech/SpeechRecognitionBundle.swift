@@ -139,10 +139,10 @@ public struct SpeechRecognitionBundle: Sendable {
             melConfig = Self.melConfig(forEncoderTimeDim: nd.shape[tDim])
         }
 
-        // A streaming export records its geometry; cross-check it against the graph
-        // rather than trusting the JSON, since a one-frame disagreement would misalign
+        // A streaming export records its geometry; cross-check it against the graph and against
+        // itself rather than trusting the JSON, since a one-frame disagreement would misalign
         // every chunk boundary.
-        let streamingConfig = StreamingConfig.decode(fromMetadata: bundle.raw)
+        let streamingConfig = try StreamingConfig.decode(fromMetadata: bundle.raw)
         if let streamingConfig {
             try streamingConfig.validate(
                 maxDuration: config.durations.max() ?? 0, encoderMelFrames: melConfig.nFrames)
