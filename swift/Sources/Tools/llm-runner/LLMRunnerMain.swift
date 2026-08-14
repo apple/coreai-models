@@ -806,9 +806,6 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
 
         var generatedText = ""
         var generatedTokenCount = 0
-        var promptSpan: ProfileSpan? = InstrumentsProfiler.beginPrompt(
-            tokens: actualInputTokens, engine: "CoreAI-Constrained")
-        var extendSpan: ProfileSpan?
 
         let constrainedStream = try await constrainedStrategy.decode(
             from: input,
@@ -818,6 +815,11 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             options: InferenceOptions(maxTokens: maxTokens),
             stopSequences: stopSequences
         )
+
+        var promptSpan: ProfileSpan? = InstrumentsProfiler.beginPrompt(
+            tokens: actualInputTokens, engine: "CoreAI-Constrained")
+        var extendSpan: ProfileSpan?
+
         for try await result in constrainedStream {
             if promptSpan != nil {
                 promptSpan?.end()
