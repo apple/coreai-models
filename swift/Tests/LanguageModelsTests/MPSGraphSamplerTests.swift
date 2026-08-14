@@ -849,7 +849,8 @@ struct MPSGraphConstrainedArgmaxTests {
 
         // Block token 5000 in the bitmask
         let bitmaskSize = (Self.vocabSize + 31) / 32
-        let bitmaskPtr = try sampler.bitmaskBuffer.contents().assumingMemoryBound(to: Int32.self)
+        let bitmaskBuffer = try #require(try sampler.bitmaskBuffer)
+        let bitmaskPtr = bitmaskBuffer.contents().assumingMemoryBound(to: Int32.self)
         for i in 0..<bitmaskSize { bitmaskPtr[i] = ~Int32(0) }
         bitmaskPtr[5000 / 32] &= ~(Int32(1) << (5000 % 32))
 
@@ -884,7 +885,8 @@ struct MPSGraphConstrainedArgmaxTests {
         logitsPtr[12345] = Float16(100.0)
 
         let bitmaskSize = (Self.vocabSize + 31) / 32
-        let bitmaskPtr = try sampler.bitmaskBuffer.contents().assumingMemoryBound(to: Int32.self)
+        let bitmaskBuffer = try #require(try sampler.bitmaskBuffer)
+        let bitmaskPtr = bitmaskBuffer.contents().assumingMemoryBound(to: Int32.self)
         for i in 0..<bitmaskSize { bitmaskPtr[i] = ~Int32(0) }
 
         let queue = try #require(device.makeCommandQueue())
@@ -927,7 +929,8 @@ struct MPSGraphConstrainedArgmaxTests {
         logitsPtr[300] = Float16(52.0)
 
         let bitmaskSize = (Self.vocabSize + 31) / 32
-        let bitmaskPtr = try sampler.bitmaskBuffer.contents().assumingMemoryBound(to: Int32.self)
+        let bitmaskBuffer = try #require(try sampler.bitmaskBuffer)
+        let bitmaskPtr = bitmaskBuffer.contents().assumingMemoryBound(to: Int32.self)
         for i in 0..<bitmaskSize { bitmaskPtr[i] = 0 }
         bitmaskPtr[100 / 32] |= Int32(1) << (100 % 32)
         bitmaskPtr[200 / 32] |= Int32(1) << (200 % 32)
@@ -969,7 +972,8 @@ struct MPSGraphConstrainedCompositeTests {
         for t in 8001...8005 { logitsPtr[t] = Float16(10.0) }
 
         let bitmaskSize = (Self.vocabSize + 31) / 32
-        let bitmaskPtr = try sampler.bitmaskBuffer.contents().assumingMemoryBound(to: Int32.self)
+        let bitmaskBuffer = try #require(try sampler.bitmaskBuffer)
+        let bitmaskPtr = bitmaskBuffer.contents().assumingMemoryBound(to: Int32.self)
         for i in 0..<bitmaskSize { bitmaskPtr[i] = ~Int32(0) }
         bitmaskPtr[8000 / 32] &= ~(Int32(1) << (8000 % 32))
 
@@ -1009,7 +1013,8 @@ struct MPSGraphConstrainedCompositeTests {
         for t in allowed { logitsPtr[t] = Float16(10.0) }
 
         let bitmaskSize = (Self.vocabSize + 31) / 32
-        let bitmaskPtr = try sampler.bitmaskBuffer.contents().assumingMemoryBound(to: Int32.self)
+        let bitmaskBuffer = try #require(try sampler.bitmaskBuffer)
+        let bitmaskPtr = bitmaskBuffer.contents().assumingMemoryBound(to: Int32.self)
         for i in 0..<bitmaskSize { bitmaskPtr[i] = 0 }
         for t in allowed {
             bitmaskPtr[t / 32] |= Int32(1) << (t % 32)
@@ -1046,7 +1051,8 @@ struct MPSGraphConstrainedCompositeTests {
         let outputBuffer = try #require(device.makeBuffer(length: 4, options: .storageModeShared))
 
         let bitmaskSize = (Self.vocabSize + 31) / 32
-        let bitmaskPtr = try sampler.bitmaskBuffer.contents().assumingMemoryBound(to: Int32.self)
+        let bitmaskBuffer = try #require(try sampler.bitmaskBuffer)
+        let bitmaskPtr = bitmaskBuffer.contents().assumingMemoryBound(to: Int32.self)
         for i in 0..<bitmaskSize { bitmaskPtr[i] = Int32(bitPattern: 0xAAAA_AAAA) }
 
         let queue = try #require(device.makeCommandQueue())

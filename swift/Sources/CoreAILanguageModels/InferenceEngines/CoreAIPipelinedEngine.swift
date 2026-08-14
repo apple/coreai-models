@@ -61,7 +61,7 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
     private let _activeToken = Mutex<GenerationToken?>(nil)
     private let _generationTask = Mutex<Task<Void, Never>?>(nil)
 
-    // Constrained session cache — checkout/checkin pattern for reuse across calls
+    // Cached across calls
     private let _constrainedSessionCache = Mutex<ConstrainedSessionHandle?>(nil)
 
     var isBusy: Bool { _activeToken.withLock { $0 != nil } }
@@ -269,7 +269,7 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
 
         let (stream, continuation) = AsyncThrowingStream<TokenId, Error>.makeStream()
 
-        let sessionBox = session
+        let session = session
         let isCancelled = Atomic<Bool>(false)
         continuation.onTermination = { _ in
             isCancelled.store(true, ordering: .relaxed)
@@ -282,7 +282,7 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
             self.acquireEngine()
             defer {
                 self.releaseEngine()
-                self.storeConstrainedSessionForReuse(sessionBox)
+                self.storeConstrainedSessionForReuse(session)
                 if self._activeToken.withLock({ $0 === token }) {
                     self._activeToken.withLock { $0 = nil }
                     self._generationTask.withLock { $0 = nil }
@@ -294,7 +294,7 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
                 try await self.engine.runConstrainedCompletion(
                     prompt: input,
                     sampler: samplingConfiguration,
-                    sessionBox: sessionBox,
+                    session: session,
                     maxTokens: maxTokens,
                     isCancelled: isCancelled,
                     yieldingTo: continuation
@@ -521,6 +521,8 @@ final class PipelineGate: Sendable {
 
 private struct EngineImpl: ~Copyable {
     var vocabSize: Int { config.vocabSize }
+
+    static let maxJumpForwardTokens = 64
 
     let config: ModelConfig
     let options: EngineOptions
@@ -1176,22 +1178,16 @@ private struct EngineImpl: ~Copyable {
     mutating func runConstrainedCompletion(
         prompt: [Int32],
         sampler: SamplingConfiguration,
-        sessionBox: ConstrainedSessionHandle,
+        session: ConstrainedSessionHandle,
         maxTokens: Int,
         isCancelled: borrowing Atomic<Bool>,
         yieldingTo continuation: AsyncThrowingStream<Int32, Error>.Continuation
     ) async throws {
         let gpuSampler = try getOrCreateSampler(for: sampler)
 
-        // Get the bitmask buffer from whichever concrete sampler we have
-        let bitmaskBuffer: MTLBuffer
-        if let composite = gpuSampler as? MPSGraphCompositeSampler {
-            bitmaskBuffer = try composite.bitmaskBuffer
-        } else if let argmax = gpuSampler as? MPSGraphArgmaxSampler {
-            bitmaskBuffer = try argmax.bitmaskBuffer
-        } else {
+        guard let bitmaskBuffer = try gpuSampler.bitmaskBuffer else {
             throw InferenceRuntimeError.invalidArgument(
-                "Constrained generation requires MPSGraphArgmaxSampler or MPSGraphCompositeSampler")
+                "Constrained generation requires a sampler that supports bitmask application")
         }
 
         // Pre-grow KV cache
@@ -1212,7 +1208,7 @@ private struct EngineImpl: ~Copyable {
         // Fill initial bitmask — the first generated token must also be constrained
         // (e.g. JSON schema requires '{' as first character, not '<think>')
         let bitmaskPtr = bitmaskBuffer.contents().assumingMemoryBound(to: Int32.self)
-        let initialMask = sessionBox.fillBitmask(into: bitmaskPtr)
+        let initialMask = session.fillBitmask(into: bitmaskPtr)
         if case .terminated = initialMask {
             return  // Grammar already terminated — nothing to generate
         }
@@ -1242,17 +1238,17 @@ private struct EngineImpl: ~Copyable {
             try Task.checkCancellation()
 
             // Accept previous token in grammar
-            if !sessionBox.acceptToken(lastToken) { break }
-            if sessionBox.isTerminated { break }
+            if !session.acceptToken(lastToken) { break }
+            if session.isTerminated { break }
 
             // Check for jump-forward: deterministic grammar segments that can be
             // batch-encoded without per-token sampling (saves N-1 round-trips)
-            if let jumpString = sessionBox.findJumpForwardString(),
-                let jumpTokens = tokenizeJumpForward(jumpString, sessionBox: sessionBox)
+            if let jumpString = session.findJumpForwardString(),
+                let jumpTokens = tokenizeJumpForward(jumpString, session: session)
             {
                 // Batch-encode jump-forward tokens + sample next token after them
                 let bitmaskPtr = bitmaskBuffer.contents().assumingMemoryBound(to: Int32.self)
-                let postJumpMask = sessionBox.fillBitmask(into: bitmaskPtr)
+                let postJumpMask = session.fillBitmask(into: bitmaskPtr)
                 if case .terminated = postJumpMask { break }
                 let applyMaskAfterJump = postJumpMask == .constrained
 
@@ -1281,7 +1277,7 @@ private struct EngineImpl: ~Copyable {
 
             // Fill bitmask — may signal unconstrained (all tokens allowed) or terminated
             let bitmaskPtr = bitmaskBuffer.contents().assumingMemoryBound(to: Int32.self)
-            let bitmaskResult = sessionBox.fillBitmask(into: bitmaskPtr)
+            let bitmaskResult = session.fillBitmask(into: bitmaskPtr)
             if case .terminated = bitmaskResult { break }
             let applyMask = bitmaskResult == .constrained
 
@@ -1326,9 +1322,9 @@ private struct EngineImpl: ~Copyable {
     /// back any partially-accepted tokens to restore grammar state.
     private func tokenizeJumpForward(
         _ string: String,
-        sessionBox: ConstrainedSessionHandle
+        session: ConstrainedSessionHandle
     ) -> [Int32]? {
-        let tokenIds = sessionBox.tokenizeForJumpForward(string)
+        let tokenIds = session.tokenizeForJumpForward(string)
         guard !tokenIds.isEmpty else { return nil }
 
         // Boundary-safety trim (MLX-style): only keep tokens whose cumulative
@@ -1336,26 +1332,26 @@ private struct EngineImpl: ~Copyable {
         // This prevents tokenization boundary disagreements where multi-byte
         // tokens span grammar-forced character boundaries differently than the
         // model's BPE tokenizer expects.
-        let ffByteLength = string.utf8.count
+        let byteLength = string.utf8.count
         var safeCount = 0
         for i in 1...tokenIds.count {
-            let prefixDecoded = sessionBox.decodeTokens(Array(tokenIds.prefix(i)))
-            if prefixDecoded.utf8.count < ffByteLength {
+            let prefixDecoded = session.decodeTokens(Array(tokenIds.prefix(i)))
+            if prefixDecoded.utf8.count < byteLength {
                 safeCount = i
             } else {
                 break
             }
         }
-        guard safeCount > 0, safeCount <= 64 else { return nil }
+        guard safeCount > 0, safeCount <= Self.maxJumpForwardTokens else { return nil }
 
         let safeTokens = Array(tokenIds.prefix(safeCount))
 
         // Accept each safe token one-at-a-time; rollback on rejection.
         var accepted = 0
         for tokenId in safeTokens {
-            if !sessionBox.acceptToken(tokenId) {
+            if !session.acceptToken(tokenId) {
                 if accepted > 0 {
-                    sessionBox.rollback(accepted)
+                    session.rollback(accepted)
                 }
                 return nil
             }
@@ -1462,25 +1458,11 @@ private struct EngineImpl: ~Copyable {
         let queue = pipelineQueue
 
         if queryLength == 1 {
-            if let compositeSampler = gpuSampler as? MPSGraphCompositeSampler {
-                compositeSampler.encode(
-                    to: queue, logitsBuffer: logitsBuffer, logitsOffset: 0,
-                    outputBuffer: outputBuffer, outputOffset: 0,
-                    applyBitmask: applyBitmask, completion: completion
-                )
-            } else if let argmaxSampler = gpuSampler as? MPSGraphArgmaxSampler {
-                argmaxSampler.encode(
-                    to: queue, logitsBuffer: logitsBuffer, logitsOffset: 0,
-                    outputBuffer: outputBuffer, outputOffset: 0,
-                    applyBitmask: applyBitmask, completion: completion
-                )
-            } else {
-                gpuSampler.encode(
-                    to: queue, logitsBuffer: logitsBuffer, logitsOffset: 0,
-                    outputBuffer: outputBuffer, outputOffset: 0,
-                    completion: completion
-                )
-            }
+            gpuSampler.encode(
+                to: queue, logitsBuffer: logitsBuffer, logitsOffset: 0,
+                outputBuffer: outputBuffer, outputOffset: 0,
+                applyBitmask: applyBitmask, completion: completion
+            )
         } else {
             if let compositeSampler = gpuSampler as? MPSGraphCompositeSampler {
                 compositeSampler.encodeWithSlice(
