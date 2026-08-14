@@ -333,6 +333,16 @@ LLM_PRESETS: list[ModelPreset] = [
         4096,
         _model_type_override="qwen2",
     ),
+    ModelPreset(
+        "qwen3-8b",
+        "Qwen/Qwen3-8B",
+        "qwen3",
+        "llm",
+        "iOS",
+        "4bit_weight_palettized_group32",
+        "float16",
+        IOS_DEFAULT_MAX_CONTEXT_LENGTH,
+    ),
 ]
 
 # ---------------------------------------------------------------------------
