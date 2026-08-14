@@ -443,12 +443,15 @@ class StaticVisionEncoder(nn.Module):
         self.channels = 3
         self.num_frames = num_frames
 
-        if num_frames % temporal_patch_size != 0:
+        if num_frames == 1:
+            self.grid_t = 1
+        elif num_frames % temporal_patch_size != 0:
             raise ValueError(
                 f"num_frames ({num_frames}) must be divisible by "
                 f"temporal_patch_size ({temporal_patch_size})"
             )
-        self.grid_t = num_frames // temporal_patch_size
+        else:
+            self.grid_t = num_frames // temporal_patch_size
         self.grid_h = image_size // patch_size
         self.grid_w = image_size // patch_size
         self.num_patches = self.grid_t * self.grid_h * self.grid_w
@@ -638,7 +641,7 @@ async def export_vision_encoder(
     ).eval()
     del hf_model
 
-    grid_t = num_frames // spec.temporal_patch_size
+    grid_t = 1 if num_frames == 1 else num_frames // spec.temporal_patch_size
     num_visual_tokens = spec.num_visual_tokens * grid_t
     if num_frames == 1:
         pixel_shape = (1, 3, spec.image_size, spec.image_size)
