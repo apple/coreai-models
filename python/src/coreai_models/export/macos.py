@@ -177,7 +177,7 @@ def export_macos_model(
     model: BaseForCausalLM,
     config,
     export_config,
-    externalized_model: torch.nn.Module | None = None,
+    externalized_model: BaseForCausalLM | None = None,
 ) -> AIProgram:
     """Export a macOS model to a AIProgram.
 
