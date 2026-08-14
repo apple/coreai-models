@@ -786,30 +786,55 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             throw ExitCode.failure
         }
 
-        let constrainedStrategy = ConstrainedDecodingStrategy(
-            jsonSchema: schema,
-            vocabSize: vocabSize
-        )
+        let constrainedStrategy: any DecodingStrategy
+        if inferenceEngine is any ConstrainedGenerationCapable {
+            constrainedStrategy = PipelinedConstrainedDecodingStrategy(
+                jsonSchema: schema,
+                vocabSize: vocabSize
+            )
+        } else {
+            constrainedStrategy = ConstrainedDecodingStrategy(
+                jsonSchema: schema,
+                vocabSize: vocabSize
+            )
+        }
 
         let inferenceID = InstrumentsProfiler.beginInference(
             promptTokens: actualInputTokens, maxTokens: maxTokens)
 
+        await PerformanceMetrics.shared.recordPromptTokens(actualInputTokens)
+
         var generatedText = ""
+        var generatedTokenCount = 0
+
         let constrainedStream = try await constrainedStrategy.decode(
             from: input,
             tokenizer: tokenizer,
             inferenceEngine: inferenceEngine,
             samplingConfiguration: samplingConfiguration,
-            options: InferenceOptions(maxTokens: maxTokens, includeLogits: true),
+            options: InferenceOptions(maxTokens: maxTokens),
             stopSequences: stopSequences
         )
+
+        var promptSpan: ProfileSpan? = InstrumentsProfiler.beginPrompt(
+            tokens: actualInputTokens, engine: "CoreAI-Constrained")
+        var extendSpan: ProfileSpan?
+
         for try await result in constrainedStream {
+            if promptSpan != nil {
+                promptSpan?.end()
+                promptSpan = nil
+                extendSpan = InstrumentsProfiler.beginExtend(step: 0, tokens: 1)
+            }
             generatedText += result.text
+            generatedTokenCount += 1
             print(result.text, terminator: "")
         }
+        promptSpan?.end()
+        extendSpan?.end()
         print()
 
-        let generatedTokenCount = tokenizer.encode(text: generatedText).count
+        await PerformanceMetrics.shared.recordGeneratedTokens(generatedTokenCount)
         InstrumentsProfiler.endInference(generatedTokens: generatedTokenCount, signpostID: inferenceID)
         await PerformanceMetrics.shared.endOverallTiming()
     }

@@ -43,5 +43,5 @@ package protocol ConstrainedGenerationCapable: InferenceEngine {
         samplingConfiguration: SamplingConfiguration,
         maxTokens: Int,
         session: ConstrainedSessionHandle
-    ) throws -> AsyncThrowingStream<TokenId, Error>
+    ) throws -> InferenceTokenSequence
 }
