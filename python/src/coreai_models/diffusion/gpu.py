@@ -16,6 +16,8 @@ import coreai_torch
 import torch
 from coreai.authoring import AIProgram
 
+from coreai_models._constants import DEFAULT_INCLUDE_DEBUG_INFO
+
 logger = logging.getLogger(__name__)
 
 
@@ -24,6 +26,7 @@ def export_stateless(
     dummy_inputs: tuple[torch.Tensor, ...],
     input_names: tuple[str, ...],
     output_names: tuple[str, ...],
+    include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
 ) -> AIProgram:
     """Export a stateless model to a Core AI AIProgram.
 
@@ -32,6 +35,9 @@ def export_stateless(
         dummy_inputs: Reference input tensors (positional) for tracing.
         input_names: Names for the exported model's inputs.
         output_names: Names for the exported model's outputs.
+        include_debug_info: When True, the converter runs in ``DEBUG`` mode and embeds debug
+            information in the exported ``.aimodel``. Defaults to ``RELEASE`` mode,
+            which embeds minimum debug information and makes the exported asset smaller.
 
     Returns:
         An optimized AIProgram ready for saving/compilation.
@@ -45,7 +51,13 @@ def export_stateless(
         decomposed: torch.export.ExportedProgram = exported.run_decompositions(coreai_decomp_table)
         return decomposed
 
-    converter = coreai_torch.TorchConverter()
+    converter = coreai_torch.TorchConverter(
+        mode=(
+            coreai_torch.TorchConverter.Mode.DEBUG
+            if include_debug_info
+            else coreai_torch.TorchConverter.Mode.RELEASE
+        )
+    )
     converter.add_pytorch_module(
         wrapper,
         export_fn=export_fn,

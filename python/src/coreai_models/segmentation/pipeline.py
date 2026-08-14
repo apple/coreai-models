@@ -32,6 +32,8 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
+from coreai_models._constants import DEFAULT_INCLUDE_DEBUG_INFO
+
 logger = logging.getLogger(__name__)
 
 
@@ -151,6 +153,7 @@ class SegmentationExportConfig:
     output_dir: str = "exports"
     output_name: str | None = None
     overwrite: bool = False
+    include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO
 
 
 def _bundle_name(config: SegmentationExportConfig) -> str:
@@ -263,7 +266,13 @@ async def _async_export_segmentation(config: SegmentationExportConfig) -> str:
     det_program = cast_to_16_bit_precision(det_program)
 
     logger.info("Converting to Core AI...")
-    converter = coreai_torch.TorchConverter()
+    converter = coreai_torch.TorchConverter(
+        mode=(
+            coreai_torch.TorchConverter.Mode.DEBUG
+            if config.include_debug_info
+            else coreai_torch.TorchConverter.Mode.RELEASE
+        )
+    )
     converter.add_exported_program(
         img_program,
         entrypoint_name="image_encode",
@@ -359,6 +368,7 @@ class FullExportConfig:
     output_dir: str = "exports"
     output_name: str | None = None
     overwrite: bool = False
+    include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO
 
 
 class _Sam3FullModule(nn.Module):
@@ -442,7 +452,13 @@ async def _async_export_full(config: FullExportConfig) -> str:
     exported = exported.run_decompositions(get_decomp_table())
 
     logger.info("Converting to Core AI...")
-    converter = coreai_torch.TorchConverter().add_exported_program(
+    converter = coreai_torch.TorchConverter(
+        mode=(
+            coreai_torch.TorchConverter.Mode.DEBUG
+            if config.include_debug_info
+            else coreai_torch.TorchConverter.Mode.RELEASE
+        )
+    ).add_exported_program(
         exported_program=exported,
         input_names=["pixel_values", "input_ids"],
         output_names=[

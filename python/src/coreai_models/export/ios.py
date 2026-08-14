@@ -22,6 +22,7 @@ from coreai.authoring import AIProgram
 from coreai_torch import TorchConverter
 
 from coreai_models._constants import (
+    DEFAULT_INCLUDE_DEBUG_INFO,
     EXTEND_FUNCTION_NAME,
     GATHER_EMBEDDINGS_FUNCTION_NAME,
     LOAD_EMBEDDINGS_FUNCTION_NAME,
@@ -95,6 +96,7 @@ async def _convert_to_coreai(
     programs: dict[str, torch.export.ExportedProgram],
     config,
     max_context_length: int,
+    include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
 ) -> AIProgram:
     """Convert the traced programs to one AIProgram with iOS constraints.
 
@@ -114,7 +116,8 @@ async def _convert_to_coreai(
         PROMPT_OPT_FUNCTION_NAME: EXTEND_FUNCTION_NAME,
     }
 
-    converter = TorchConverter()
+    mode = TorchConverter.Mode.DEBUG if include_debug_info else TorchConverter.Mode.RELEASE
+    converter = TorchConverter(mode=mode)
     register_custom_torch_lowering(converter)
     for entrypoint, graph in contract_for.items():
         converter.add_exported_program(
@@ -185,4 +188,5 @@ async def export_ios_model(
         programs=programs,
         config=config,
         max_context_length=max_context_length,
+        include_debug_info=getattr(export_config, "include_debug_info", DEFAULT_INCLUDE_DEBUG_INFO),
     )

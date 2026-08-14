@@ -94,6 +94,7 @@ def create_edsr(
     dtype: torch.dtype,
     overwrite: bool,
     dynamic: bool,
+    include_debug_info: bool,
 ):
     print("[INFO] Sourcing model...")
     model = torchsr.models.edsr_r16f64(scale=2, pretrained=True)
@@ -111,7 +112,10 @@ def create_edsr(
     exported = exported.run_decompositions(get_decomp_table())
     print("[INFO] Model exported. Converting to Core AI...")
 
-    converter = TorchConverter().add_exported_program(
+    mode = (
+        TorchConverter.Mode.DEBUG if include_debug_info else TorchConverter.Mode.RELEASE
+    )
+    converter = TorchConverter(mode=mode).add_exported_program(
         exported_program=exported,
         input_names=["x"],
         output_names=["output"],
@@ -157,6 +161,12 @@ def main():
         action="store_true",
         help="Export with dynamic input shapes.",
     )
+    parser.add_argument(
+        "--include-debug-info",
+        action="store_true",
+        help="Embed debug information in the exported .aimodel for debugging a conversion. "
+        "Default: off, which embeds minimum debug information and makes the exported asset smaller.",
+    )
     args = parser.parse_args()
 
     dtype = {
@@ -172,6 +182,7 @@ def main():
         dtype,
         args.overwrite,
         args.dynamic,
+        args.include_debug_info,
     )
 
 

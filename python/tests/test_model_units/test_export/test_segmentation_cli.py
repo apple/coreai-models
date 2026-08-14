@@ -163,3 +163,36 @@ def test_no_warning_when_nothing_mode_specific_is_passed(
         with caplog.at_level(logging.WARNING):
             _warn_unused_flags(args)
         assert caplog.text == "", f"unexpected warning for {argv}"
+
+
+# --- --include-debug-info -----------------------------------------------------
+
+
+def test_include_debug_info_defaults_to_off() -> None:
+    """Exports default to the converter's RELEASE mode: minimum debug information."""
+    _, args = _parse()
+    assert args.include_debug_info is False
+
+
+def test_include_debug_info_can_be_enabled() -> None:
+    _, args = _parse("--include-debug-info")
+    assert args.include_debug_info is True
+
+
+def test_include_debug_info_reaches_both_config_dataclasses() -> None:
+    """The flag is mode-agnostic, so both branches of ``main`` must carry it."""
+    for config_cls in (SegmentationExportConfig, FullExportConfig):
+        assert config_cls().include_debug_info is False
+        assert config_cls(include_debug_info=True).include_debug_info is True
+
+
+@pytest.mark.parametrize("argv", [("--include-debug-info",), ("--full", "--include-debug-info")])
+def test_include_debug_info_is_not_treated_as_mode_specific(
+    argv: tuple[str, ...], caplog: pytest.LogCaptureFixture
+) -> None:
+    """Regression guard: --include-debug-info applies to both modes, so it must never be
+    added to the mode-specific warn lists in ``_warn_unused_flags``."""
+    _, args = _parse(*argv)
+    with caplog.at_level(logging.WARNING):
+        _warn_unused_flags(args)
+    assert caplog.text == ""

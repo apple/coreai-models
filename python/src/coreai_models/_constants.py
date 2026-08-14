@@ -52,3 +52,8 @@ VALUE_CACHE_INPUT_NAME = "value_cache"
 KEY_CACHE_OUTPUT_NAME = "new_k_cache"
 VALUE_CACHE_OUTPUT_NAME = "new_v_cache"
 OUTPUT_LOGITS_NAME = "out_logits"
+
+# Whether exports embed debug information into .aimodel. Off by default, which puts
+# the converter in RELEASE mode and embeds minimum debug information. The
+# --include-debug-info flag turns it on (DEBUG mode).
+DEFAULT_INCLUDE_DEBUG_INFO = False

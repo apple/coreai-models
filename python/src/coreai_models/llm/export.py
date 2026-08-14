@@ -145,6 +145,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Allow exporting models without a registry preset. Requires --compute-precision.",
     )
     parser.add_argument(
+        "--include-debug-info",
+        action="store_true",
+        help=(
+            "Embed debug information in the exported .aimodel for debugging a conversion. "
+            "Default: off, which embeds minimum debug information and makes the "
+            "exported asset smaller."
+        ),
+    )
+    parser.add_argument(
         "--disable-embedding-quantization-ios",
         action="store_true",
         help=(
@@ -365,6 +374,7 @@ def _resolve_export_config(args: argparse.Namespace) -> ExportConfig:
         overwrite=args.overwrite,
         compression_config_object=compression_config_object,
         disable_embedding_quantization=args.disable_embedding_quantization_ios,
+        include_debug_info=args.include_debug_info,
     )
 
 
@@ -428,6 +438,7 @@ def main() -> None:
         if config.num_layers:
             print(f"  num_layers:         {config.num_layers}")
         print(f"  overwrite:          {config.overwrite}")
+        print(f"  include_debug_info: {config.include_debug_info}")
         if config.variant == "iOS":
             print(f"  disable_embedding_quantization: {config.disable_embedding_quantization}")
         return
