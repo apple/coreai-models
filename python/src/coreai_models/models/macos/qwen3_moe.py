@@ -278,6 +278,28 @@ class Qwen3MoeForCausalLM(BaseForCausalLM):
         for i in range(max_layer + 1):
             prefix = f"model.layers.{i}.mlp"
 
+            # transformers >= 5.0 keeps the experts of a layer in two fused 3D
+            # parameters instead of a ModuleList of per-expert MLPs:
+            #   experts.gate_up_proj: (num_experts, 2 * hidden_dim, dim)
+            #   experts.down_proj:    (num_experts, dim, hidden_dim)
+            # Older checkpoints on the hub still use the per-expert layout
+            # handled below, so both are supported.
+            gate_up_key = f"{prefix}.experts.gate_up_proj"
+            if gate_up_key in state_dict:
+                gate_up_weight = state_dict.pop(gate_up_key)
+                down_weight = state_dict.pop(f"{prefix}.experts.down_proj")
+                gate_weight, up_weight = gate_up_weight.chunk(2, dim=1)
+                state_dict[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_weight.unsqueeze(
+                    0
+                ).contiguous()
+                state_dict[f"{prefix}.switch_mlp.up_proj.weight"] = up_weight.unsqueeze(
+                    0
+                ).contiguous()
+                state_dict[f"{prefix}.switch_mlp.down_proj.weight"] = down_weight.unsqueeze(
+                    0
+                ).contiguous()
+                continue
+
             if f"{prefix}.experts.0.gate_proj.weight" not in state_dict:
                 continue
 

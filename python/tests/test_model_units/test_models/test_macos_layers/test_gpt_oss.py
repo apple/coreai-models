@@ -102,9 +102,12 @@ def _make_gpt_oss_config(
         head_dim=head_dim,
         num_local_experts=num_local_experts,
         num_experts_per_tok=num_experts_per_tok,
-        rope_theta=10000.0,
+        # GptOssConfig defaults to YaRN scaling, which the reauthored model does
+        # not support. `rope_scaling` is an alias of `rope_parameters` as of
+        # transformers 5.0, so setting it to None would drop the RoPE config
+        # entirely instead of just disabling scaling.
+        rope_parameters={"rope_type": "default", "rope_theta": 10000.0},
     )
-    config.rope_scaling = None
     return config
 
 

@@ -87,12 +87,13 @@ def _make_gemma3_config(
         head_dim=head_dim,
         query_pre_attn_scalar=head_dim,
         sliding_window=16,
+        # Must be passed to the constructor: `layer_types` is derived from it in
+        # `__post_init__` and is what drives the attention type per layer.
+        sliding_window_pattern=2,
         rope_theta=10000.0,
         rope_local_base_freq=10000.0,
         pad_token_id=0,
     )
-    config._sliding_window_pattern = 2
-    config.rope_scaling = None
     return config
 
 
@@ -262,14 +263,13 @@ class _HFGemma3Attention(torch.nn.Module):
     ) -> None:
         super().__init__()
         self.inner = HFGemma3Attention(config=config, layer_idx=layer_idx)
-        # Use local rope_theta for local layers
-        rope_config = Gemma3TextConfig(**config.to_dict())
-        if (layer_idx + 1) % config.sliding_window_pattern != 0:
-            rope_config.rope_theta = config.rope_local_base_freq
-        self.rotary = Gemma3RotaryEmbedding(rope_config)
+        # A single rotary embedding covers both layer types; it picks the local
+        # or global theta from `config.rope_parameters[layer_type]`.
+        self.rotary = Gemma3RotaryEmbedding(config)
+        self._layer_type = config.layer_types[layer_idx]
         self._layer_idx = layer_idx
         self._sliding_window = config.sliding_window
-        self._sliding_window_pattern = config.sliding_window_pattern
+        self._sliding_window_pattern = config._sliding_window_pattern
 
     def forward(self: Self, x: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
         seq_len = x.shape[1]
@@ -280,7 +280,7 @@ class _HFGemma3Attention(torch.nn.Module):
             self._sliding_window_pattern,
             x.dtype,
         )
-        cos, sin = self.rotary(x, position_ids)
+        cos, sin = self.rotary(x, position_ids, layer_type=self._layer_type)
         output = self.inner(
             hidden_states=x,
             attention_mask=attention_mask,
@@ -299,14 +299,11 @@ class _HFGemma3TransformerBlock(torch.nn.Module):
     ) -> None:
         super().__init__()
         self.inner = Gemma3DecoderLayer(config=config, layer_idx=layer_idx)
-        # Use local rope_theta for local layers
-        rope_config = Gemma3TextConfig(**config.to_dict())
-        if (layer_idx + 1) % config.sliding_window_pattern != 0:
-            rope_config.rope_theta = config.rope_local_base_freq
-        self.rotary = Gemma3RotaryEmbedding(rope_config)
+        self.rotary = Gemma3RotaryEmbedding(config)
+        self._layer_type = config.layer_types[layer_idx]
         self._layer_idx = layer_idx
         self._sliding_window = config.sliding_window
-        self._sliding_window_pattern = config.sliding_window_pattern
+        self._sliding_window_pattern = config._sliding_window_pattern
         self._seq_len: int | None = None
 
     def forward(self: Self, x: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
@@ -318,15 +315,15 @@ class _HFGemma3TransformerBlock(torch.nn.Module):
             self._sliding_window_pattern,
             x.dtype,
         )
-        cos, sin = self.rotary(x, position_ids)
-        output = self.inner(
+        cos, sin = self.rotary(x, position_ids, layer_type=self._layer_type)
+        # transformers >= 5.0 takes one `position_embeddings` for the layer's own
+        # attention type and returns the hidden states directly.
+        return self.inner(
             hidden_states=x,
             attention_mask=attention_mask,
-            position_embeddings_global=(cos, sin),
-            position_embeddings_local=(cos, sin),
+            position_embeddings=(cos, sin),
             cache_position=torch.arange(0, seq_len),
-        )[0]
-        return output
+        )
 
 
 class _HFGemma3MLP(torch.nn.Module):
@@ -379,7 +376,8 @@ class Gemma3Attention(Model):
         layer_idx: int = 0,
         sliding_window: int = 4,
         sliding_window_pattern: int = 2,
-        query_pre_attn_scalar: float = 3.14,
+        # Arbitrary non-default value; Gemma3TextConfig requires an int.
+        query_pre_attn_scalar: int = 3,
         batch_size: int = 1,
         seq_len: int = 10,
         offset: int = 3,
@@ -397,7 +395,10 @@ class Gemma3Attention(Model):
         self._offset = offset
 
         # derived
-        self._hidden_size = 4  # small fixed hidden_size for fast CI
+        # Small fixed hidden_size for fast CI. Gemma3TextConfig validates that
+        # hidden_size is a multiple of num_attention_heads, so this has to cover
+        # the largest parameterized head count.
+        self._hidden_size = 8
 
         # Pre-generate shared weights (no bias for Gemma3)
         qkv_total_size = (num_attention_heads + 2 * num_key_value_heads) * head_dim
@@ -515,7 +516,8 @@ class Gemma3TransformerBlock(Model):
         layer_idx: int = 0,
         sliding_window: int = 4,
         sliding_window_pattern: int = 2,
-        query_pre_attn_scalar: float = 3.14,
+        # Arbitrary non-default value; Gemma3TextConfig requires an int.
+        query_pre_attn_scalar: int = 3,
         batch_size: int = 1,
         seq_len: int = 10,
         offset: int = 3,
@@ -534,7 +536,10 @@ class Gemma3TransformerBlock(Model):
         self._offset = offset
 
         # derived
-        self._hidden_size = 4  # small fixed hidden_size for fast CI
+        # Small fixed hidden_size for fast CI. Gemma3TextConfig validates that
+        # hidden_size is a multiple of num_attention_heads, so this has to cover
+        # the largest parameterized head count.
+        self._hidden_size = 8
 
         # Pre-generate shared attention weights (no bias for Gemma3)
         qkv_total_size = (num_attention_heads + 2 * num_key_value_heads) * head_dim
@@ -722,6 +727,10 @@ class Gemma3MLP(Model):
             hidden_size=self._hidden_size,
             intermediate_size=self._intermediate_size,
             hidden_activation="gelu_pytorch_tanh",
+            # Attention is unused here, but the config validates that
+            # hidden_size is a multiple of num_attention_heads.
+            num_attention_heads=1,
+            num_key_value_heads=1,
         )
 
     @override
