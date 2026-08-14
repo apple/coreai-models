@@ -18,12 +18,12 @@ import coreai_torch
 import torch
 from coreai.authoring import AIProgram
 
+from coreai_models._constants import MAIN_GRAPH_NAME, TRACE_KV_CACHE_SEQ_LEN
 from coreai_models.export.externalize import (
     EXTERNALIZE_SPECS,
     restore_externalized,
     subexport_and_restore,
 )
-from coreai_models._constants import MAIN_GRAPH_NAME, TRACE_KV_CACHE_SEQ_LEN
 from coreai_models.export.mlir_ops import (
     register_custom_torch_lowering,
     remove_functionalization,
@@ -187,8 +187,9 @@ def export_macos_model(
     3. Optimizes the resulting AIProgram
 
     Args:
-        model: A loaded PyTorch model (already in the correct dtype). Its
-            export-contract hooks supply the graph's inputs, states, and names.
+        model: A loaded PyTorch model (already in the correct dtype). Under
+            graph-mode quantization this is the flattened ``torch.fx.GraphModule``,
+            and the contract is read off ``externalized_model`` instead.
         config: HuggingFace model config (used for cache dimensions, vocab size, etc.).
         export_config: An ExportConfig instance (used for max_context_length, etc.).
         externalized_model: The eager module marked by
@@ -202,6 +203,11 @@ def export_macos_model(
     if max_context_length is None:
         max_context_length = getattr(config, "max_position_embeddings", 2048)
 
+    # Graph-mode quantization flattens the model into a torch.fx.GraphModule, which
+    # carries none of the export-contract hooks. `externalized_model` is the eager
+    # module that graph was captured from, so query the contract there.
+    contract_model = model if externalized_model is None else externalized_model
+
     # Determine target dtype from the model parameters
     target_dtype = _resolve_target_dtype(model)
 
@@ -210,7 +216,7 @@ def export_macos_model(
     )
 
     reference_inputs, dynamic_shapes = _build_reference_inputs(
-        model, config, target_dtype, max_context_length
+        contract_model, config, target_dtype, max_context_length
     )
 
     logger.info("Exporting model to Core AI dialect...")
@@ -218,9 +224,9 @@ def export_macos_model(
         model,
         reference_inputs,
         dynamic_shapes=dynamic_shapes,
-        input_names=model.export_input_names()[MAIN_GRAPH_NAME],
-        output_names=model.export_output_names()[MAIN_GRAPH_NAME],
-        state_names=model.export_state_names()[MAIN_GRAPH_NAME],
+        input_names=contract_model.export_input_names()[MAIN_GRAPH_NAME],
+        output_names=contract_model.export_output_names()[MAIN_GRAPH_NAME],
+        state_names=contract_model.export_state_names()[MAIN_GRAPH_NAME],
         externalized_model=externalized_model,
     )
 

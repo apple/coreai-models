@@ -283,14 +283,6 @@ async def _async_export_model(config: ExportConfig) -> str:
                 if isinstance(quant_cfg, dict)
                 else quant_cfg.execution_mode
             )
-            model = quantize_for_export(
-                model,
-                hf_config,
-                target_dtype,
-                quant_cfg,
-                calibration_data_fn=get_calibration_data,
-                mmap_dir=quantizer_mmap_dir,
-            )
             graph_mode = execution_mode == ExecutionMode.GRAPH
 
             quantizer_mmap_dir: str | None = None
@@ -304,10 +296,10 @@ async def _async_export_model(config: ExportConfig) -> str:
                 externalized_model = patch_model_for_externalization(model)
 
             try:
-                model = quantize_pytorch_model(
+                model = quantize_for_export(
                     model,
-                    quantization_inputs,
-                    quantization_dynamic_shapes,
+                    hf_config,
+                    target_dtype,
                     quant_cfg,
                     calibration_data_fn=get_calibration_data,
                     mmap_dir=quantizer_mmap_dir,
