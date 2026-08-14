@@ -261,10 +261,11 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
         maxTokens: Int,
         session: ConstrainedSessionHandle
     ) throws -> AsyncThrowingStream<TokenId, Error> {
-        precondition(
-            !engineInUse.load(ordering: .acquiring),
-            "generateConstrained called while a prior generation is still in flight — caller must drain first"
-        )
+        if _generationTask.withLock({ $0 }) != nil || engineInUse.load(ordering: .acquiring) {
+            throw InferenceRuntimeError.invalidState(
+                "generateConstrained called while a prior generation is still in flight — caller must drain first"
+            )
+        }
 
         let (stream, continuation) = AsyncThrowingStream<TokenId, Error>.makeStream()
 
@@ -288,6 +289,7 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
                 }
             }
             self.engine.reset()
+            self.history.clear()
             do {
                 try await self.engine.runConstrainedCompletion(
                     prompt: input,
@@ -432,60 +434,6 @@ extension CoreAIPipelinedEngine {
     }
 }
 
-// MARK: - Constrained Session Handle
-
-/// Thread-safe handle to a `ConstrainedGenerationSession`.
-///
-/// Access is serialized by the engine's `acquireEngine()`/`releaseEngine()` atomic
-/// gate — only one Task mutates the session at a time. The `@unchecked Sendable`
-/// conformance is justified by this single-writer guarantee.
-///
-/// The handle exposes only the operations the engine loop needs — no raw
-/// session access from outside.
-package final class ConstrainedSessionHandle: @unchecked Sendable {
-    /// Schema string is immutable after init — cached to avoid repeated access.
-    let schema: String
-
-    /// Tokenizer used for jump-forward string encoding.
-    private let tokenizer: any Tokenizer
-
-    private var _session: ConstrainedGenerationSession
-
-    init(session: consuming ConstrainedGenerationSession, tokenizer: any Tokenizer) {
-        self.schema = session.schema
-        self.tokenizer = tokenizer
-        self._session = session
-    }
-
-    var isTerminated: Bool { _session.isTerminated }
-
-    func acceptToken(_ token: Int32) -> Bool {
-        _session.acceptToken(token)
-    }
-
-    func fillBitmask(into ptr: UnsafeMutablePointer<Int32>) -> ConstrainedGenerationSession.BitmaskResult {
-        _session.fillBitmask(into: ptr)
-    }
-
-    func reset() { _session.reset() }
-
-    func rollback(_ numTokens: Int = 1) { _session.rollback(numTokens) }
-
-    func findJumpForwardString() -> String? {
-        _session.findJumpForwardString()
-    }
-
-    /// Decode a sequence of token IDs back into a string using the stored tokenizer.
-    func decodeTokens(_ tokens: [Int32]) -> String {
-        tokenizer.decode(tokens: tokens.map(Int.init))
-    }
-
-    /// Tokenize a string for jump-forward injection. Uses the stored tokenizer
-    /// without adding special tokens.
-    func tokenizeForJumpForward(_ string: String) -> [Int32] {
-        tokenizer.encode(text: string).map(Int32.init)
-    }
-}
 
 // MARK: - Pipeline Depth Gate
 
@@ -1239,9 +1187,9 @@ private struct EngineImpl: ~Copyable {
         // Get the bitmask buffer from whichever concrete sampler we have
         let bitmaskBuffer: MTLBuffer
         if let composite = gpuSampler as? MPSGraphCompositeSampler {
-            bitmaskBuffer = composite.bitmaskBuffer
+            bitmaskBuffer = try composite.bitmaskBuffer
         } else if let argmax = gpuSampler as? MPSGraphArgmaxSampler {
-            bitmaskBuffer = argmax.bitmaskBuffer
+            bitmaskBuffer = try argmax.bitmaskBuffer
         } else {
             throw InferenceRuntimeError.invalidArgument(
                 "Constrained generation requires MPSGraphArgmaxSampler or MPSGraphCompositeSampler")
@@ -1250,7 +1198,6 @@ private struct EngineImpl: ~Copyable {
         // Pre-grow KV cache
         let totalNeeded = prompt.count + maxTokens
         try kvCache.ensureCapacity(forContextLength: totalNeeded, queue: pipelineQueue)
-        try logits.ensureCapacity(forContextLength: 1)
 
         // Prefill prompt (unconstrained -- grammar doesn't constrain the prompt)
         let prefillTokens: [Int32]
@@ -1260,6 +1207,8 @@ private struct EngineImpl: ~Copyable {
         } else {
             prefillTokens = prompt
         }
+
+        try logits.ensureCapacity(forContextLength: max(1, prefillTokens.count))
 
         // Fill initial bitmask — the first generated token must also be constrained
         // (e.g. JSON schema requires '{' as first character, not '<think>')
@@ -1311,7 +1260,7 @@ private struct EngineImpl: ~Copyable {
                 lastToken = try await withCheckedThrowingContinuation { cont in
                     do {
                         try _encodeStepForConstrainedGeneration(
-                            tokens: jumpTokens,
+                            tokens: [lastToken] + jumpTokens,
                             gpuSampler: gpuSampler,
                             applyBitmask: applyMaskAfterJump
                         ) { token in
@@ -1398,7 +1347,7 @@ private struct EngineImpl: ~Copyable {
                 break
             }
         }
-        guard safeCount > 0 else { return nil }
+        guard safeCount > 0, safeCount <= 64 else { return nil }
 
         let safeTokens = Array(tokenIds.prefix(safeCount))
 

@@ -42,6 +42,14 @@ final class ModelResources: ResourceManaging {
         state.withLock { $0.loaded?.supportsLogits }
     }
 
+    /// Whether the loaded engine supports GPU-side constrained generation, or `nil` when unloaded.
+    var loadedEngineIsConstrainedCapable: Bool? {
+        state.withLock { engine in
+            guard let loaded = engine.loaded else { return nil }
+            return loaded is any ConstrainedGenerationCapable
+        }
+    }
+
     /// Returns the engine, loading it on first use. Concurrent callers share one
     /// load; later callers get the warmed engine instantly.
     func engine() async throws -> any InferenceEngine {
