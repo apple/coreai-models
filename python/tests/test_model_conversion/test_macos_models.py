@@ -129,6 +129,21 @@ class TestQwen2EndtoEnd:
         )
 
 
+def _load_gemma3_ref_model(hf_model_id: str) -> HFGemma3ForCausalLM:
+    """Load the Gemma3 reference model in float32.
+
+    `from_pretrained` defaults to the checkpoint dtype (bfloat16 for
+    google/gemma-3-*), and the cast reaches `embed_tokens.embed_scale` — a
+    non-persistent buffer holding `hidden_size ** 0.5`. For the 1B model that
+    rounds sqrt(1152) = 33.94113 to bfloat16's 34.0, a 0.17% error baked into
+    every embedding, which stays even after the caller casts the model back up.
+    Our `Embedding` derives the scale at its own dtype, so it never carries that
+    rounding. Loading in float32 keeps both sides deriving the scale the same
+    way; the caller casts to the precision under test afterwards.
+    """
+    return HFGemma3ForCausalLM.from_pretrained(hf_model_id, dtype=torch.float32).eval()
+
+
 class TestGemma3EndtoEnd:
     @staticmethod
     @pytest.mark.parametrize(
@@ -150,7 +165,7 @@ class TestGemma3EndtoEnd:
         """Test model comparison with prompt / extend."""
         precision, atol, rtol = precision_tol
 
-        ref_model = HFGemma3ForCausalLM.from_pretrained(hf_model_id).eval()
+        ref_model = _load_gemma3_ref_model(hf_model_id)
         model = Gemma3ForCausalLM(ref_model.config).eval()
         load_state_dict_from_ref_model(model, ref_model)
 
@@ -186,7 +201,7 @@ class TestGemma3EndtoEnd:
     def test_coreai(hf_model_id: str, use_bfp16: bool) -> None:
         # create models from config
         max_seq_len = 4096
-        ref_model = HFGemma3ForCausalLM.from_pretrained(hf_model_id).eval()
+        ref_model = _load_gemma3_ref_model(hf_model_id)
         config = ref_model.config
         config.max_position_embeddings = max_seq_len
         model = Gemma3ForCausalLM(config).eval()
@@ -528,6 +543,7 @@ class TestMistralEndtoEnd:
         if hf_model_id == "mistralai/Mistral-7B-Instruct-v0.3":
             ref_model = TestMistralEndtoEnd.get_7b_like_model()
             config = ref_model.config
+            config.max_position_embeddings = max_seq_len
         else:
             ref_model = HFMistralForCausalLM.from_pretrained(hf_model_id).eval()
             config = ref_model.config

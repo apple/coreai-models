@@ -18,7 +18,11 @@ import coreai_torch.composite_ops
 import torch
 from coreai.authoring import AIProgram
 
-from coreai_models._constants import MAIN_GRAPH_NAME, TRACE_KV_CACHE_SEQ_LEN
+from coreai_models._constants import (
+    DEFAULT_INCLUDE_DEBUG_INFO,
+    MAIN_GRAPH_NAME,
+    TRACE_KV_CACHE_SEQ_LEN,
+)
 from coreai_models.export.mlir_ops import (
     register_custom_torch_lowering,
     remove_functionalization,
@@ -88,6 +92,7 @@ def export_to_coreai(
     input_names: tuple[str, ...] | None = None,
     output_names: tuple[str, ...] | None = None,
     state_names: tuple[str, ...] | None = None,
+    include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
 ) -> AIProgram:
     """Export a stateful macOS model to a AIProgram.
 
@@ -114,6 +119,9 @@ def export_to_coreai(
         state_names: Names of inputs that are state (i.e. mutated in place by
             the forward pass and surfaced via the runtime ``state=`` kwarg
             rather than as regular inputs/outputs).
+        include_debug_info: When True, the converter runs in ``DEBUG`` mode and embeds debug
+            information in the exported ``.aimodel``. Defaults to ``RELEASE`` mode,
+            which embeds minimum debug information and makes the exported asset smaller.
 
     Returns:
         A AIProgram ready for optimization and compilation.
@@ -140,7 +148,12 @@ def export_to_coreai(
         return coreaten_exported_program
 
     model.eval()
-    converter = coreai_torch.TorchConverter()
+    mode = (
+        coreai_torch.TorchConverter.Mode.DEBUG
+        if include_debug_info
+        else coreai_torch.TorchConverter.Mode.RELEASE
+    )
+    converter = coreai_torch.TorchConverter(mode=mode)
     converter.add_pytorch_module(
         model,
         export_fn=export_fn,
@@ -197,6 +210,7 @@ def export_macos_model(
         input_names=model.export_input_names()[MAIN_GRAPH_NAME],
         output_names=model.export_output_names()[MAIN_GRAPH_NAME],
         state_names=model.export_state_names()[MAIN_GRAPH_NAME],
+        include_debug_info=getattr(export_config, "include_debug_info", DEFAULT_INCLUDE_DEBUG_INFO),
     )
 
     logger.info("Optimizing AIProgram...")

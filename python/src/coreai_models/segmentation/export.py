@@ -153,6 +153,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Overwrite an existing bundle directory.",
     )
     parser.add_argument(
+        "--include-debug-info",
+        action="store_true",
+        help=(
+            "Embed debug information in the exported .aimodel for debugging a conversion. "
+            "Default: off, which embeds minimum debug information and makes the "
+            "exported asset smaller. Applies to both modes."
+        ),
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print the resolved export config and exit without exporting.",
@@ -225,16 +234,18 @@ def main() -> None:
             output_dir=args.output_dir or _default_output_dir(),
             output_name=args.output_name,
             overwrite=args.overwrite,
+            include_debug_info=args.include_debug_info,
         )
         if args.dry_run:
             print("Dry run — resolved full export config:")
-            print(f"  model:       {config.hf_model_id}")
-            print(f"  image_size:  {config.image_size}")
-            print(f"  dtype:       {config.dtype}")
-            print(f"  output_dir:  {config.output_dir}")
+            print(f"  model:              {config.hf_model_id}")
+            print(f"  image_size:         {config.image_size}")
+            print(f"  dtype:              {config.dtype}")
+            print(f"  output_dir:         {config.output_dir}")
             if config.output_name:
-                print(f"  output_name: {config.output_name}")
-            print(f"  overwrite:   {config.overwrite}")
+                print(f"  output_name:        {config.output_name}")
+            print(f"  overwrite:          {config.overwrite}")
+            print(f"  include_debug_info: {config.include_debug_info}")
             return
         bundle_path = export_full(config)
     else:
@@ -261,20 +272,22 @@ def main() -> None:
             output_dir=args.output_dir or _default_output_dir(),
             output_name=args.output_name,
             overwrite=args.overwrite,
+            include_debug_info=args.include_debug_info,
         )
         if args.dry_run:
             print("Dry run — resolved export config:")
-            print(f"  model:             {config.hf_model_id}")
-            print(f"  image_size:        {config.image_size}")
-            print(f"  max_text_seq_len:  {config.max_text_seq_len}")
-            print(f"  image_n_bits:      {config.image_n_bits}")
-            print(f"  image_group_size:  {config.image_group_size}")
-            print(f"  text_n_bits:       {config.text_n_bits}")
-            print(f"  text_group_size:   {config.text_group_size}")
-            print(f"  output_dir:        {config.output_dir}")
+            print(f"  model:              {config.hf_model_id}")
+            print(f"  image_size:         {config.image_size}")
+            print(f"  max_text_seq_len:   {config.max_text_seq_len}")
+            print(f"  image_n_bits:       {config.image_n_bits}")
+            print(f"  image_group_size:   {config.image_group_size}")
+            print(f"  text_n_bits:        {config.text_n_bits}")
+            print(f"  text_group_size:    {config.text_group_size}")
+            print(f"  output_dir:         {config.output_dir}")
             if config.output_name:
-                print(f"  output_name:       {config.output_name}")
-            print(f"  overwrite:         {config.overwrite}")
+                print(f"  output_name:        {config.output_name}")
+            print(f"  overwrite:          {config.overwrite}")
+            print(f"  include_debug_info: {config.include_debug_info}")
             return
         bundle_path = export_segmentation(config)
 

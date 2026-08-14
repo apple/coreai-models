@@ -35,6 +35,7 @@ from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from transformers import AutoConfig, AutoTokenizer
 
+from coreai_models._constants import DEFAULT_INCLUDE_DEBUG_INFO
 from coreai_models.export.macos import export_to_coreai
 from coreai_models.export.metadata import build_aimodel_metadata
 from coreai_models.models.macos.qwen3_vl import Qwen3VLForCausalLMEmbeddings
@@ -209,7 +210,12 @@ def _load_embed_weight(model_dir: str) -> torch.Tensor:
 
 
 async def export_embed_model(
-    spec: VLMSpec, bundle_path: Path, model_dir: str, max_ctx: int, overwrite: bool
+    spec: VLMSpec,
+    bundle_path: Path,
+    model_dir: str,
+    max_ctx: int,
+    overwrite: bool,
+    include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
 ) -> str:
     """Export the token-embedding lookup as embed.aimodel (asset role `embedding`)."""
     weight = _load_embed_weight(model_dir)
@@ -225,6 +231,7 @@ async def export_embed_model(
         input_names=("input_ids",),
         output_names=("embeddings",),
         state_names=None,
+        include_debug_info=include_debug_info,
     )
     program.optimize()
 
@@ -251,6 +258,7 @@ async def export_text_bundle(
     num_layers: int | None,
     output_dir: Path,
     overwrite: bool,
+    include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
 ) -> Path:
     """Download weights and write the text portion of the VLM bundle.
 
@@ -327,6 +335,7 @@ async def export_text_bundle(
         input_names=("inputs_embeds", "position_ids"),
         output_names=("logits",),
         state_names=KV_STATE_NAMES,
+        include_debug_info=include_debug_info,
     )
     logging.info("Optimizing AIProgram...")
     program.optimize()
@@ -348,7 +357,9 @@ async def export_text_bundle(
 
     # ---- 6. Embed model ----
     logging.info("Exporting embed.aimodel...")
-    embed_rel = await export_embed_model(spec, bundle_path, model_dir, max_ctx, overwrite)
+    embed_rel = await export_embed_model(
+        spec, bundle_path, model_dir, max_ctx, overwrite, include_debug_info=include_debug_info
+    )
 
     # ---- 7. Tokenizer ----
     logging.info("Saving tokenizer...")
@@ -605,7 +616,11 @@ def _patch_fast_pos_embed_interpolate(vision_model_cls: type) -> None:
 
 
 async def export_vision_encoder(
-    spec: VLMSpec, bundle_path: Path, overwrite: bool, num_frames: int = 1
+    spec: VLMSpec,
+    bundle_path: Path,
+    overwrite: bool,
+    num_frames: int = 1,
+    include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
 ) -> str:
     """Export the vision encoder as vision.aimodel and patch metadata.json."""
     from transformers.models.qwen3_vl.modeling_qwen3_vl import (
@@ -694,6 +709,7 @@ async def export_vision_encoder(
         dynamic_shapes=None,
         input_names=("pixel_values",),
         output_names=("image_features",),
+        include_debug_info=include_debug_info,
     )
     logging.info("Optimizing AIProgram...")
     program.optimize()
@@ -797,6 +813,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Overwrite existing output files",
     )
     parser.add_argument(
+        "--include-debug-info",
+        action="store_true",
+        help=(
+            "Embed debug information in the exported .aimodel for debugging a conversion. "
+            "Default: off, which embeds minimum debug information and makes the "
+            "exported asset smaller."
+        ),
+    )
+    parser.add_argument(
         "--verbose",
         "-v",
         action="store_true",
@@ -813,10 +838,17 @@ async def _run(spec: VLMSpec, args: argparse.Namespace) -> Path:
         num_layers=args.num_layers,
         output_dir=output_dir,
         overwrite=args.overwrite,
+        include_debug_info=args.include_debug_info,
     )
     if not args.skip_vision:
         logging.info("Exporting vision encoder...")
-        await export_vision_encoder(spec, bundle_path, args.overwrite, args.num_frames)
+        await export_vision_encoder(
+            spec,
+            bundle_path,
+            args.overwrite,
+            args.num_frames,
+            include_debug_info=args.include_debug_info,
+        )
     return bundle_path
 
 

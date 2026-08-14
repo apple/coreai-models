@@ -59,7 +59,7 @@ def _hf_hub_reachable(model_id: str = "yujiepan/qwen3-tiny-random") -> bool:
         import huggingface_hub
 
         huggingface_hub.HfApi().model_info(model_id, timeout=2)
-        huggingface_hub.hf_hub_download(model_id, "config.json", timeout=5)
+        huggingface_hub.hf_hub_download(model_id, "config.json")
         return True
     except Exception:
         return False

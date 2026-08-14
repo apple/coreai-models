@@ -205,13 +205,28 @@ class TestIOSStaticShapeConfigs:
         large = model.export_static_shape_configs(config, MAX_CTX * 4)[EXTEND_FUNCTION_NAME]
         assert set(small) < set(large)
 
-    def test_head_dim_is_derived_when_absent(self, model, config) -> None:
-        """Configs without an explicit head_dim fall back to hidden_size // heads."""
-        config.head_dim = None
-        entry = next(iter(model.export_static_shape_configs(config, MAX_CTX)[EXTEND_FUNCTION_NAME]))
-        shapes = model.export_static_shape_configs(config, MAX_CTX)[EXTEND_FUNCTION_NAME][entry]
+    @pytest.mark.parametrize("model_type", ["qwen2", "mixtral"])
+    def test_head_dim_is_derived_when_absent(self, model_type) -> None:
+        """Configs without an explicit head_dim fall back to hidden_size // heads.
+
+        Not testable on the qwen3 fixture: transformers >= 5 configs are strict
+        dataclasses, and qwen3 types ``head_dim`` as ``int``, so assigning None
+        raises. The fallback is still live for real checkpoints, in both of the
+        shapes ``_head_dim`` handles -- qwen2 declares no ``head_dim`` field at
+        all, mixtral declares one that defaults to None.
+        """
+        config = AutoConfig.for_model(model_type)
+        config.num_hidden_layers = 2
+        config.hidden_size = 64
+        config.num_attention_heads = 4
+        config.num_key_value_heads = 2
+        config.max_position_embeddings = MAX_CTX
+        assert not isinstance(getattr(config, "head_dim", None), int), "no head_dim to fall back on"
+
+        shape_configs = Qwen3ForCausalLMForiOS.export_static_shape_configs(config, MAX_CTX)
         derived = config.hidden_size // config.num_attention_heads
-        assert shapes[KEY_CACHE_INPUT_NAME][2] == config.num_key_value_heads * derived
+        for entry in shape_configs[EXTEND_FUNCTION_NAME].values():
+            assert entry[KEY_CACHE_INPUT_NAME][2] == config.num_key_value_heads * derived
 
 
 class TestIOSHardwareConstraints:

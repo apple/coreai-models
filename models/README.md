@@ -88,6 +88,53 @@ uv run coreai.llm.export Qwen/Qwen3-0.6B --max-context-length 4096
 uv run coreai.llm.export Qwen/Qwen3-0.6B --platform iOS --max-context-length 4096
 ```
 
+#### Debug Information
+
+Exports default to the converter's `RELEASE` mode, which embeds minimum debug information in the exported `.aimodel`. This keeps assets as small as possible and is what you want for anything you ship.
+
+Pass `--include-debug-info` to switch the converter to `DEBUG` mode, which embeds full debug information in the exported `.aimodel`. That's worth doing when you're diagnosing a conversion — wrong numerics, an op that fails to lower, or a graph you need to map back to Python source:
+
+```bash
+uv run coreai.llm.export Qwen/Qwen3-0.6B --include-debug-info
+```
+
+The flag is available on `coreai.llm.export`, `coreai.vlm.export`, `coreai.diffusion.export`, `coreai.segmentation.export`, and every standalone `models/<name>/export.py` recipe, so all export paths produce assets carrying the same debug information by default.
+
+**Note:** `--include-debug-info` is independent of `--verbose`/`-v`. `--verbose` only raises the console log level; it does not change what goes into the asset.
+
+You don't need to re-export to shed debug information from an asset you already converted. Load it, strip the debug information in place, and save it back out:
+
+```python
+from pathlib import Path
+
+from coreai.authoring import AIModelAsset
+from coreai_torch.debugging.debug_info import strip_debug_info
+
+source = AIModelAsset.load("inputModel.aimodel")
+
+# `save_asset` writes only what the program carries, so capture the curated
+# metadata first — it lives on the asset, not on the program.
+metadata = source.metadata
+author, license_, description = metadata.author, metadata.license, metadata.model_description
+
+program = source.program
+strip_debug_info(program)  # modifies the program in place
+program.save_asset(Path("outputModel.aimodel"))  # save_asset requires a Path
+
+# Re-attach it, otherwise `author`, `license` and `description` are lost.
+AIModelAsset.load("outputModel.aimodel").update_metadata(
+    lambda m: (
+        setattr(m, "author", author),
+        setattr(m, "license", license_),
+        setattr(m, "model_description", description),
+    )
+)
+```
+
+`outputModel.aimodel` then carries the same minimum debug information a default `RELEASE` export would produce.
+
+**Note:** the re-attach step is not optional bookkeeping. `program.save_asset()` persists only `creationDate`, `assetVersion` and `producer`; without it the round-trip silently drops the model's `author`, `license` and `description`, so a shipped asset would lose its attribution and license. The metadata attribute is `model_description`, even though the key serialized into `metadata.json` is `description`. `creationDate` is always reset to the time of the save.
+
 ### Diffusion Models
 
 ```bash
@@ -113,6 +160,7 @@ Models with a standalone `export.py` are run directly:
 
 ```bash
 uv run models/<name>/export.py
+uv run models/<name>/export.py --include-debug-info   # embed debug information in exported .aimodel
 ```
 
 ## Model Catalog
@@ -164,7 +212,7 @@ To make a new model exportable via short-name, add a `ModelPreset(...)` entry to
 
 For models with bespoke export logic that doesn't fit the standard `coreai.llm.export` / `coreai.diffusion.export` flow, write a standalone recipe under `models/<name>/export.py` — see existing recipes for the [PEP 723](https://peps.python.org/pep-0723/) pattern and `models/README.md` for the contribution checklist.
 
-- `export.py` — Standalone conversion script with [PEP 723](https://peps.python.org/pep-0723/) inline dependencies.
+- `export.py` — Standalone conversion script with [PEP 723](https://peps.python.org/pep-0723/) inline dependencies. It must accept a `--include-debug-info` flag and construct its `TorchConverter` with `TorchConverter.Mode.RELEASE` by default, so that every export path in the repo produces assets with the same debug information. See [Debug Information](#debug-information).
 - `README.md` — Model introduction, export recipe and example Swift code to make app integration easier.
 
 For models that fit the standard `coreai.llm.export` or `coreai.diffusion.export` pipeline, add a `ModelPreset` entry to [`model_registry.py`](../python/src/coreai_models/model_registry.py) instead.
