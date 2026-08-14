@@ -121,6 +121,37 @@ public func readNDArray<T: BitwiseCopyable>(
     }
 }
 
+/// Fill a float NDArray from `[Float]` source data, converting to the array's
+/// own scalar type.
+///
+/// A model input's dtype is fixed by the exported graph: an f16 export exposes
+/// f16 input tensors. Filling those via `fillNDArray(_:as: Float.self,…)` writes
+/// 4-byte elements into a 2-byte-per-element buffer — a size mismatch that traps
+/// or corrupts memory. This helper is the single home for that runtime
+/// scalar-type dispatch (callers hold `[Float]` and don't know the descriptor's
+/// dtype statically); the actual writes delegate to `fillNDArray`.
+public func fillFloatNDArray(_ array: inout NDArray, with elements: [Float]) {
+    fillFloatNDArray(&array, with: elements[...])
+}
+
+/// Slice overload of `fillFloatNDArray`. Lets hot-loop callers pass a slice
+/// (`buffer[a..<b]`) straight through without materializing an intermediate
+/// `Array`. This is the canonical implementation; the `[Float]` overload forwards
+/// here. Indices are taken relative to the slice's own `startIndex`.
+public func fillFloatNDArray(_ array: inout NDArray, with elements: ArraySlice<Float>) {
+    let base = elements.startIndex
+    switch array.scalarType {
+    #if !((os(macOS) || targetEnvironment(macCatalyst)) && arch(x86_64))
+    case .float16:
+        fillNDArray(&array, as: Float16.self, count: elements.count) { Float16(elements[base + $0]) }
+    #endif
+    case .float32:
+        fillNDArray(&array, as: Float.self, with: elements)
+    default:
+        preconditionFailure("fillFloatNDArray: unsupported scalar type \(array.scalarType)")
+    }
+}
+
 // MARK: - Flatten Helpers
 
 /// Flatten an NDArray output into `[Float]`, branching on its own scalar type.

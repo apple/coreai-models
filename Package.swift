@@ -43,7 +43,7 @@ let package = Package(
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.2.0"),
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.1.0"),
-        .package(url: "https://github.com/mlc-ai/xgrammar", branch: "main"),
+        .package(url: "https://github.com/mlc-ai/xgrammar", exact: "0.2.2"),
     ],
     targets: [
         .target(
@@ -57,6 +57,7 @@ let package = Package(
             swiftSettings: [
                 .define("CXGRAMMAR_IMPORT"),
                 .enableUpcomingFeature("MemberImportVisibility"),
+                .enableExperimentalFeature("Lifetimes"),
             ],
             linkerSettings: [
                 .linkedLibrary("c++")
@@ -176,13 +177,13 @@ let package = Package(
             ]
         ),
         .executableTarget(
-            name: "speech-runner",
+            name: "speech-recognizer",
             dependencies: [
                 "CoreAISpeech",
                 "CoreAIShared",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ],
-            path: "swift/Sources/Tools/speech-runner",
+            path: "swift/Sources/Tools/speech-recognizer",
             swiftSettings: [
                 .enableUpcomingFeature("MemberImportVisibility")
             ]
@@ -224,6 +225,9 @@ let package = Package(
             path: "swift/Tests/LanguageModelsTests",
             resources: [
                 .copy("Resources/MinimalTokenizer")
+            ],
+            swiftSettings: [
+                .enableExperimentalFeature("Lifetimes")
             ],
             linkerSettings: [
                 .linkedLibrary("c++")
@@ -268,7 +272,10 @@ let package = Package(
         ),
         .testTarget(
             name: "SpeechTests",
-            dependencies: ["CoreAISpeech"],
+            dependencies: [
+                "CoreAISpeech",
+                "TestUtilities",
+            ],
             path: "swift/Tests/SpeechTests"
         ),
     ],
