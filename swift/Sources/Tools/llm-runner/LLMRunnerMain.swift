@@ -828,6 +828,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             generatedTokenCount += 1
             print(result.text, terminator: "")
         }
+        promptSpan?.end()
         extendSpan?.end()
         print()
 
