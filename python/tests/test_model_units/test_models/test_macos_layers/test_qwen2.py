@@ -83,9 +83,9 @@ def _make_qwen2_config(
         intermediate_size=intermediate_size,
         vocab_size=vocab_size,
         max_position_embeddings=max_position_embeddings,
+        rope_theta=10000.0,
+        rope_parameters={"rope_type": "default"},
     )
-    config.rope_scaling = None
-    config.rope_theta = 10000.0
     return config
 
 
@@ -278,9 +278,9 @@ class TestmacOSQwen2ForCausalLM:
             max_position_embeddings=32,
             attention_bias=False,
             tie_word_embeddings=True,
+            rope_theta=130000.0,
+            rope_parameters={"rope_type": "default"},
         )
-        config.rope_scaling = None
-        config.rope_theta = 130000.0
 
         hf_model = HFQwen2ForCausalLM(config).to(torch.float32).eval()
         our_model = Qwen2ForCausalLM(config, model_device="cpu")
@@ -311,9 +311,9 @@ class TestmacOSQwen2ForCausalLM:
             vocab_size=100,
             max_position_embeddings=32,
             attention_bias=False,
+            rope_theta=10000.0,
+            rope_parameters={"rope_type": "default"},
         )
-        config.rope_scaling = None
-        config.rope_theta = 10000.0
         our_model = Qwen2ForCausalLM(config, model_device="cpu")
 
         hidden = 64
@@ -355,9 +355,9 @@ class TestmacOSQwen2ForCausalLM:
             vocab_size=100,
             max_position_embeddings=32,
             tie_word_embeddings=True,
+            rope_theta=10000.0,
+            rope_parameters={"rope_type": "default"},
         )
-        config.rope_scaling = None
-        config.rope_theta = 10000.0
 
         hf_model = HFQwen2ForCausalLM(config).eval()
         our_model = Qwen2ForCausalLM(config, model_device="cpu").eval()
