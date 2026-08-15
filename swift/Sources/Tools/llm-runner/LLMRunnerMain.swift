@@ -108,6 +108,16 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         help: "Min-P sampling: keep tokens with probability >= minP × max probability (e.g., 0.05)")
     var minP: Double?
 
+    @Option(
+        name: .customLong("repetition-penalty"),
+        help: "Repetition penalty factor (>= 1.0). Penalizes tokens that appeared in recent generation (e.g., 1.2)")
+    var repetitionPenalty: Double?
+
+    @Option(
+        name: .customLong("repetition-penalty-window"),
+        help: "Number of recent tokens to consider for repetition penalty (default: all)")
+    var repetitionPenaltyWindow: Int?
+
     @Option(help: "Sampling strategy. Options: 'temperature' (default), 'greedy'")
     var samplingStrategy: String = "temperature"
 
@@ -850,6 +860,8 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
                 topK: topK,
                 topP: topP,
                 minP: minP,
+                repetitionPenalty: repetitionPenalty,
+                repetitionPenaltyWindow: repetitionPenaltyWindow,
                 combined: !synchronousSampling
             )
         case "greedy":

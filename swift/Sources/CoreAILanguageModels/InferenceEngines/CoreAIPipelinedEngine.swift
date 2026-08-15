@@ -127,6 +127,12 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
                     + "Use a sequential engine for evaluation."
             )
         }
+        if samplingConfiguration.needsRepetitionPenalty {
+            throw InferenceRuntimeError.invalidArgument(
+                "CoreAI pipelined engine does not yet support repetition penalty (GPU-side sampling). "
+                    + "Use a sequential engine (--inference-engine-variant coreai-sequential)."
+            )
+        }
 
         // Serialize: if a prior generation is still winding down (GPU drain),
         // cancel it and wait for the engine slot to be released.
