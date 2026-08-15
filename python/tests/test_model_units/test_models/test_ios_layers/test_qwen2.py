@@ -251,18 +251,28 @@ class TestNEQwen2ForCausalLM:
         seq_len = 4
         max_seq = 32
         hf_config = Qwen2Config(
-            hidden_size=64, num_attention_heads=4, num_key_value_heads=4,
-            num_hidden_layers=2, intermediate_size=128, vocab_size=100,
-            max_position_embeddings=max_seq, attention_bias=False,
+            hidden_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            num_hidden_layers=2,
+            intermediate_size=128,
+            vocab_size=100,
+            max_position_embeddings=max_seq,
+            attention_bias=False,
             tie_word_embeddings=True,
         )
         hf_config.rope_scaling = None
         hf_config.rope_theta = 130000.0
 
         ne_config = Qwen2Config(
-            hidden_size=64, num_attention_heads=4, num_key_value_heads=4,
-            num_hidden_layers=2, intermediate_size=128, vocab_size=100,
-            max_position_embeddings=max_seq, attention_bias=False,
+            hidden_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            num_hidden_layers=2,
+            intermediate_size=128,
+            vocab_size=100,
+            max_position_embeddings=max_seq,
+            attention_bias=False,
             tie_word_embeddings=True,
         )
         ne_config.rope_scaling = None
@@ -288,9 +298,7 @@ class TestNEQwen2ForCausalLM:
             ne_out = ne_model(input_ids, position_ids, in_step, causal_mask, k_cache, v_cache)
             hf_out = hf_model(input_ids=input_ids, position_ids=position_ids.long())
 
-        torch.testing.assert_close(
-            ne_out[:, 0, :, :], hf_out.logits, atol=1e-5, rtol=1e-5
-        )
+        torch.testing.assert_close(ne_out[:, 0, :, :], hf_out.logits, atol=1e-5, rtol=1e-5)
 
 
 @pytest.fixture
