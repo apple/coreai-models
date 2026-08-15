@@ -246,6 +246,52 @@ class TestNEQwen2ForCausalLM:
         # Embedding table should exist under load_embeddings
         assert "load_embeddings.embedding_table" in sd
 
+    def test_attention_bias_false_parity(self):
+        """SmolLM2-style: attention_bias=False + tie_word_embeddings=True on iOS."""
+        seq_len = 4
+        max_seq = 32
+        hf_config = Qwen2Config(
+            hidden_size=64, num_attention_heads=4, num_key_value_heads=4,
+            num_hidden_layers=2, intermediate_size=128, vocab_size=100,
+            max_position_embeddings=max_seq, attention_bias=False,
+            tie_word_embeddings=True,
+        )
+        hf_config.rope_scaling = None
+        hf_config.rope_theta = 130000.0
+
+        ne_config = Qwen2Config(
+            hidden_size=64, num_attention_heads=4, num_key_value_heads=4,
+            num_hidden_layers=2, intermediate_size=128, vocab_size=100,
+            max_position_embeddings=max_seq, attention_bias=False,
+            tie_word_embeddings=True,
+        )
+        ne_config.rope_scaling = None
+        ne_config.rope_theta = 130000.0
+
+        hf_model = HFQwen2ForCausalLM(hf_config).to(torch.float32).eval()
+        sd = dict(hf_model.state_dict())
+
+        ne_model = Qwen2ForCausalLMForiOS(
+            ne_config, model_device="cpu", disable_embedding_quantization=True
+        )
+        ne_model.to(torch.float32).eval()
+        ne_model._mutate_state_dict(sd)
+        ne_model.load_state_dict(sd, assign=True, strict=True)
+
+        input_ids = torch.randint(0, 100, (1, seq_len))
+        position_ids = torch.arange(seq_len, dtype=torch.int32).unsqueeze(0)
+        in_step = torch.tensor([0], dtype=torch.int32)
+        causal_mask = _make_ne_causal_mask(seq_len, max_seq)
+        k_cache, v_cache = KVCacheHandler.get_kv_cache_from_hf(ne_config, dtype=torch.float32)
+
+        with torch.no_grad():
+            ne_out = ne_model(input_ids, position_ids, in_step, causal_mask, k_cache, v_cache)
+            hf_out = hf_model(input_ids=input_ids, position_ids=position_ids.long())
+
+        torch.testing.assert_close(
+            ne_out[:, 0, :, :], hf_out.logits, atol=1e-5, rtol=1e-5
+        )
+
 
 @pytest.fixture
 def base_qwen2_config():

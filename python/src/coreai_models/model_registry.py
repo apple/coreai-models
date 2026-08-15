@@ -51,6 +51,10 @@ class ModelPreset:
     # Optional YAML config path, resolved relative to the repo root in the
     # source tree (e.g. `models/qwen3/qwen3_0_6b_mixed_4bit_8bit.yaml`).
     compression_config: str | None = None
+    # Override HuggingFace model_type for registry lookup. Use when a model's
+    # config.json reports a type we don't want to register globally (e.g.
+    # SmolLM2 reports "llama" but we use the qwen2 export path).
+    _model_type_override: str | None = None
 
 
 @dataclass(frozen=True)
@@ -131,6 +135,40 @@ LLM_PRESETS: list[ModelPreset] = [
     ModelPreset(
         "gpt-oss-20b", "openai/gpt-oss-20b", "gpt-oss", "llm", "macOS", "none", "bfloat16", 32768
     ),
+    ModelPreset(
+        "smollm2-1.7b-instruct",
+        "HuggingFaceTB/SmolLM2-1.7B-Instruct",
+        "smollm2",
+        "llm",
+        "macOS",
+        "4bit",
+        "float16",
+        8192,
+        compression_config="models/smollm2/smollm2_4bit_embedding_excluded.yaml",
+        _model_type_override="qwen2",
+    ),
+    ModelPreset(
+        "smollm2-360m-instruct",
+        "HuggingFaceTB/SmolLM2-360M-Instruct",
+        "smollm2",
+        "llm",
+        "macOS",
+        "none",
+        "float16",
+        8192,
+        _model_type_override="qwen2",
+    ),
+    ModelPreset(
+        "smollm2-135m-instruct",
+        "HuggingFaceTB/SmolLM2-135M-Instruct",
+        "smollm2",
+        "llm",
+        "macOS",
+        "none",
+        "float16",
+        8192,
+        _model_type_override="qwen2",
+    ),
     # --- iOS (compression = palettized) ---
     ModelPreset(
         "qwen3-0.6b",
@@ -163,6 +201,39 @@ LLM_PRESETS: list[ModelPreset] = [
         "float16",
         IOS_DEFAULT_MAX_CONTEXT_LENGTH,
         compression_config="models/qwen3/qwen3_4b_mixed_4bit_8bit.yaml",
+    ),
+    ModelPreset(
+        "smollm2-1.7b-instruct",
+        "HuggingFaceTB/SmolLM2-1.7B-Instruct",
+        "smollm2",
+        "llm",
+        "iOS",
+        "4bit_weight_palettized_group8",
+        "float16",
+        4096,
+        _model_type_override="qwen2",
+    ),
+    ModelPreset(
+        "smollm2-360m-instruct",
+        "HuggingFaceTB/SmolLM2-360M-Instruct",
+        "smollm2",
+        "llm",
+        "iOS",
+        "none",
+        "float16",
+        4096,
+        _model_type_override="qwen2",
+    ),
+    ModelPreset(
+        "smollm2-135m-instruct",
+        "HuggingFaceTB/SmolLM2-135M-Instruct",
+        "smollm2",
+        "llm",
+        "iOS",
+        "none",
+        "float16",
+        4096,
+        _model_type_override="qwen2",
     ),
 ]
 
