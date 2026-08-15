@@ -137,7 +137,8 @@ public struct ConstrainedDecodingStrategy: DecodingStrategy {
 
         var maskedLogits = logits
         if samplingConfiguration.needsRepetitionPenalty {
-            let window = samplingConfiguration.repetitionPenaltyWindow.map { min($0, generatedTokens.count) }
+            let window =
+                samplingConfiguration.repetitionPenaltyWindow.map { min($0, generatedTokens.count) }
                 ?? generatedTokens.count
             RepetitionPenaltyProcessor.apply(
                 to: &maskedLogits,

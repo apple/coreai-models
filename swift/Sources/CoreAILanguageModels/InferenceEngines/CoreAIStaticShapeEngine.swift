@@ -454,7 +454,8 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
 
         let actualLogits = returnsLogits ? logitBuffer : nil
         let sampleSpan = InstrumentsProfiler.beginSample(strategy: "cpu-fallback")
-        let nextToken = samplingConfig.fallbackSampler(from: &logitBuffer, tokenHistory: inputTokens[generationStartOffset...])
+        let nextToken = samplingConfig.fallbackSampler(
+            from: &logitBuffer, tokenHistory: inputTokens[generationStartOffset...])
         sampleSpan.end()
         CLILogger.log("Token: \(nextToken), processed: \(processedTokenCount)")
         return (logits: actualLogits, token: nextToken)
