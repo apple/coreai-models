@@ -49,9 +49,9 @@ def _make_ne_qwen2_config(
         intermediate_size=intermediate_size,
         vocab_size=vocab_size,
         max_position_embeddings=max_position_embeddings,
+        rope_theta=10000.0,
+        rope_parameters={"rope_type": "default"},
     )
-    config.rope_scaling = None
-    config.rope_theta = 10000.0
     return config
 
 
@@ -260,9 +260,9 @@ class TestNEQwen2ForCausalLM:
             max_position_embeddings=max_seq,
             attention_bias=False,
             tie_word_embeddings=True,
+            rope_theta=130000.0,
+            rope_parameters={"rope_type": "default"},
         )
-        hf_config.rope_scaling = None
-        hf_config.rope_theta = 130000.0
 
         ne_config = Qwen2Config(
             hidden_size=64,
@@ -274,9 +274,9 @@ class TestNEQwen2ForCausalLM:
             max_position_embeddings=max_seq,
             attention_bias=False,
             tie_word_embeddings=True,
+            rope_theta=130000.0,
+            rope_parameters={"rope_type": "default"},
         )
-        ne_config.rope_scaling = None
-        ne_config.rope_theta = 130000.0
 
         hf_model = HFQwen2ForCausalLM(hf_config).to(torch.float32).eval()
         sd = dict(hf_model.state_dict())
