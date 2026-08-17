@@ -3,6 +3,7 @@
 // Use of this source code is governed by a BSD-3-clause license that can
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
+import CoreAIShared
 import CoreGraphics
 import Foundation
 import Testing
@@ -15,9 +16,9 @@ struct CoreAISegmentationEngineTests {
 
     @Test("findImageInputName: matches 'pixel' and 'image' variants")
     func findImageInputName() {
-        #expect(CoreAISegmentationEngine.findImageInputName(in: ["pixel_values", "input_ids"]) == "pixel_values")
-        #expect(CoreAISegmentationEngine.findImageInputName(in: ["text_tokens", "image_input"]) == "image_input")
-        #expect(CoreAISegmentationEngine.findImageInputName(in: ["text_tokens", "input_ids"]) == nil)
+        #expect(ModelIONameResolver.findImageInputName(in: ["pixel_values", "input_ids"]) == "pixel_values")
+        #expect(ModelIONameResolver.findImageInputName(in: ["text_tokens", "image_input"]) == "image_input")
+        #expect(ModelIONameResolver.findImageInputName(in: ["text_tokens", "input_ids"]) == nil)
     }
 
     @Test("findTextInputName: matches 'input_id', 'token', and 'text' variants")
@@ -83,10 +84,10 @@ struct CoreAISegmentationEngineTests {
     @Test("findLogitsOutputName: skips presence_logits, picks pred_logits")
     func findLogitsOutputNameSkipsPresence() {
         let outputs = ["pred_masks", "pred_boxes", "pred_logits", "presence_logits", "semantic_seg"]
-        #expect(CoreAISegmentationEngine.findLogitsOutputName(in: outputs) == "pred_logits")
+        #expect(ModelIONameResolver.findLogitsOutputName(in: outputs) == "pred_logits")
         // Order shouldn't matter
         let reversed = outputs.reversed() as [String]
-        #expect(CoreAISegmentationEngine.findLogitsOutputName(in: reversed) == "pred_logits")
+        #expect(ModelIONameResolver.findLogitsOutputName(in: reversed) == "pred_logits")
     }
 
     @Test("findPresenceOutputName: picks presence_logits and not pred_logits")
