@@ -581,13 +581,6 @@ public struct Flux2Pipeline: DiffusionPipeline {
         return result
     }
 
-    // MARK: - Noise Generation
-
-    private func generateNoise(count: Int, seed: UInt32) -> [Float] {
-        var rng = NumPyRandomSource(seed: seed)
-        return (0..<count).map { _ in Float(rng.nextNormal()) }
-    }
-
     // MARK: - Image Conversion
 
     // MARK: - Half/Tiled Decode Helpers
