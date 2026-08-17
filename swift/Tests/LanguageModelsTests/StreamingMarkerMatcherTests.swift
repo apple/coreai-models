@@ -34,4 +34,30 @@ struct StreamingMarkerMatcherTests {
         let buffer = "<thin"
         #expect(lastSafeIndex(in: buffer, forTag: "<think>") == buffer.startIndex)
     }
+
+    @Test("Empty buffer returns endIndex")
+    func emptyBuffer() {
+        let buffer = ""
+        #expect(lastSafeIndex(in: buffer, forTag: "<think>") == buffer.endIndex)
+    }
+
+    @Test("Buffer is just '<' — held back as prefix")
+    func bufferIsSingleOpenAngle() {
+        let buffer = "<"
+        #expect(lastSafeIndex(in: buffer, forTag: "<think>") == buffer.startIndex)
+    }
+
+    @Test("'>' and '!' are not prefixes — safe to emit")
+    func nonPrefixSpecialChars() {
+        let gt = ">"
+        let bang = "!"
+        #expect(lastSafeIndex(in: gt, forTag: "<think>") == gt.endIndex)
+        #expect(lastSafeIndex(in: bang, forTag: "<think>") == bang.endIndex)
+    }
+
+    @Test("Single-char tag — nothing is ever held back")
+    func singleCharTag() {
+        let buffer = "abc<"
+        #expect(lastSafeIndex(in: buffer, forTag: "X") == buffer.endIndex)
+    }
 }
