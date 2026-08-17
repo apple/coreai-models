@@ -280,11 +280,6 @@ public struct SD3Pipeline: DiffusionPipeline {
         return result
     }
 
-    private func generateNoise(count: Int, seed: UInt32) -> [Float] {
-        var rng = NumPyRandomSource(seed: seed)
-        return (0..<count).map { _ in Float(rng.nextNormal()) }
-    }
-
     // MARK: - SD 3.5 Medium constants
 
     private static let clipSeqLen = 77
