@@ -72,7 +72,7 @@ struct ThinkTagParser {
                 // a partial-marker suffix; emit the entire buffer. Otherwise:
                 // hold back at most `marker.count - 1` characters in case the
                 // next delta completes the marker.
-                let safe = isFinal ? buffer.endIndex : lastSafeIndex(forTag: marker)
+                let safe = isFinal ? buffer.endIndex : lastSafeIndex(in: buffer, forTag: marker)
                 if safe > buffer.startIndex {
                     let toEmit = String(buffer[buffer.startIndex..<safe])
                     if !toEmit.isEmpty { events.append(makeEvent(toEmit)) }
@@ -81,23 +81,5 @@ struct ThinkTagParser {
                 return events
             }
         }
-    }
-
-    /// Rightmost index such that the suffix from there to end-of-buffer is
-    /// NOT a non-empty prefix of `tag`. Conservative: only scans the last
-    /// `tag.count - 1` characters (the longest possible held-back prefix).
-    private func lastSafeIndex(forTag tag: String) -> String.Index {
-        let maxHold = tag.count - 1
-        guard !buffer.isEmpty, maxHold > 0 else { return buffer.endIndex }
-        let holdStart = buffer.index(buffer.endIndex, offsetBy: -min(maxHold, buffer.count))
-        for offset in 0..<buffer.distance(from: holdStart, to: buffer.endIndex) {
-            let idx = buffer.index(holdStart, offsetBy: offset)
-            // `starts(with:)` accepts any Sequence<Character>, so we pass the
-            // Substring directly — avoids a per-iteration String allocation.
-            if tag.starts(with: buffer[idx...]) {
-                return idx
-            }
-        }
-        return buffer.endIndex
     }
 }
