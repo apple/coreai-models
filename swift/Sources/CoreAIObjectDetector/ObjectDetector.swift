@@ -40,19 +40,19 @@ public struct ObjectDetector {
         }
 
         // Discover input names
-        guard let imageInputName = Self.findImageInputName(in: descriptor.inputNames) else {
+        guard let imageInputName = ModelIONameResolver.findImageInputName(in: descriptor.inputNames) else {
             throw DetectionRuntimeError.invalidConfiguration(
                 "Cannot find image input in model. Inputs: \(descriptor.inputNames)"
             )
         }
 
         // Discover output names
-        guard let logitsOutputName = Self.findLogitsOutputName(in: descriptor.outputNames) else {
+        guard let logitsOutputName = ModelIONameResolver.findLogitsOutputName(in: descriptor.outputNames) else {
             throw DetectionRuntimeError.invalidConfiguration(
                 "Cannot find logits output in model. Outputs: \(descriptor.outputNames)"
             )
         }
-        guard let boxesOutputName = Self.findBoxesOutputName(in: descriptor.outputNames) else {
+        guard let boxesOutputName = ModelIONameResolver.findBoxesOutputName(in: descriptor.outputNames) else {
             throw DetectionRuntimeError.invalidConfiguration(
                 "Cannot find boxes output in model. Outputs: \(descriptor.outputNames)"
             )
@@ -309,26 +309,6 @@ public struct ObjectDetector {
         let width = widthExpected < 0 ? parameters.inputWidth : widthExpected
 
         return BatchPlan(batch: imageCount, height: height, width: width)
-    }
-
-    // MARK: - Name Discovery
-
-    static func findImageInputName(in names: [String]) -> String? {
-        names.first {
-            let l = $0.lowercased()
-            return l.contains("pixel") || l.contains("image")
-        }
-    }
-
-    static func findLogitsOutputName(in names: [String]) -> String? {
-        names.first { $0.lowercased().contains("logit") }
-    }
-
-    static func findBoxesOutputName(in names: [String]) -> String? {
-        names.first {
-            let l = $0.lowercased()
-            return l.contains("box")
-        }
     }
 }
 

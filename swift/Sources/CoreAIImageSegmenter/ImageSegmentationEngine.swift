@@ -168,7 +168,7 @@ public struct CoreAISegmentationEngine {
         let iouScoresOutputName: String?
 
         init(model: AIModel, descriptor: InferenceFunctionDescriptor) async throws {
-            guard let imageInputName = findImageInputName(in: descriptor.inputNames) else {
+            guard let imageInputName = ModelIONameResolver.findImageInputName(in: descriptor.inputNames) else {
                 throw SegmentationRuntimeError.invalidConfiguration(
                     "Cannot find image input in model. Inputs: \(descriptor.inputNames)"
                 )
@@ -188,8 +188,8 @@ public struct CoreAISegmentationEngine {
                 throw SegmentationRuntimeError.outputMissing(masksOutputName)
             }
 
-            let boxesOutputName = findBoxesOutputName(in: descriptor.outputNames)
-            let logitsOutputName = findLogitsOutputName(in: descriptor.outputNames)
+            let boxesOutputName = ModelIONameResolver.findBoxesOutputName(in: descriptor.outputNames)
+            let logitsOutputName = ModelIONameResolver.findLogitsOutputName(in: descriptor.outputNames)
             let presenceLogitsOutputName = findPresenceOutputName(in: descriptor.outputNames)
             let semanticSegOutputName = findSemanticOutputName(in: descriptor.outputNames)
             let iouScoresOutputName = findIouScoresOutputName(in: descriptor.outputNames)
@@ -284,7 +284,8 @@ public struct CoreAISegmentationEngine {
             detectDescriptor: InferenceFunctionDescriptor
         ) async throws {
             // image_encode: needs an image input + backbone-features output.
-            guard let imageInputName = findImageInputName(in: imageEncodeDescriptor.inputNames) else {
+            guard let imageInputName = ModelIONameResolver.findImageInputName(in: imageEncodeDescriptor.inputNames)
+            else {
                 throw SegmentationRuntimeError.invalidConfiguration(
                     "Cannot find image input in 'image_encode'. Inputs: \(imageEncodeDescriptor.inputNames)"
                 )
@@ -336,12 +337,13 @@ public struct CoreAISegmentationEngine {
             guard case .ndArray = detectDescriptor.outputDescriptor(of: masksOutputName) else {
                 throw SegmentationRuntimeError.outputMissing(masksOutputName)
             }
-            guard let boxesOutputName = findBoxesOutputName(in: detectDescriptor.outputNames) else {
+            guard let boxesOutputName = ModelIONameResolver.findBoxesOutputName(in: detectDescriptor.outputNames) else {
                 throw SegmentationRuntimeError.invalidConfiguration(
                     "Cannot find boxes output in 'detect'. Outputs: \(detectDescriptor.outputNames)"
                 )
             }
-            guard let logitsOutputName = findLogitsOutputName(in: detectDescriptor.outputNames) else {
+            guard let logitsOutputName = ModelIONameResolver.findLogitsOutputName(in: detectDescriptor.outputNames)
+            else {
                 throw SegmentationRuntimeError.invalidConfiguration(
                     "Cannot find logits output in 'detect'. Outputs: \(detectDescriptor.outputNames)"
                 )
@@ -1190,13 +1192,6 @@ public struct CoreAISegmentationEngine {
 
     // MARK: - Static name-discovery helpers
 
-    static func findImageInputName(in names: [String]) -> String? {
-        names.first {
-            let l = $0.lowercased()
-            return l.contains("pixel") || l.contains("image")
-        }
-    }
-
     static func findTextInputName(in names: [String]) -> String? {
         names.first {
             let l = $0.lowercased()
@@ -1241,17 +1236,6 @@ public struct CoreAISegmentationEngine {
 
     static func findMasksOutputName(in names: [String]) -> String? {
         names.first { $0.lowercased().contains("mask") }
-    }
-
-    static func findBoxesOutputName(in names: [String]) -> String? {
-        names.first { $0.lowercased().contains("box") }
-    }
-
-    static func findLogitsOutputName(in names: [String]) -> String? {
-        names.first {
-            let l = $0.lowercased()
-            return l.contains("logit") && !l.contains("presence")
-        }
     }
 
     static func findPresenceOutputName(in names: [String]) -> String? {
