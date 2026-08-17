@@ -131,6 +131,16 @@ LLM_PRESETS: list[ModelPreset] = [
     ModelPreset(
         "gpt-oss-20b", "openai/gpt-oss-20b", "gpt-oss", "llm", "macOS", "none", "bfloat16", 32768
     ),
+    ModelPreset(
+        "muse-glimmer-30b",
+        "meta-models/Muse-Glimmer-30B",
+        "muse_glimmer",
+        "llm",
+        "macOS",
+        "4bit",
+        "float16",
+        131072,
+    ),
     # --- iOS (compression = palettized) ---
     ModelPreset(
         "qwen3-0.6b",
