@@ -34,7 +34,7 @@ from coreai_models.models.base import (
 from coreai_models.primitives.macos.cache import KVCache
 from coreai_models.primitives.macos.mlp import MLP
 from coreai_models.primitives.macos.rms_norm import RMSNorm, RMSNormPlusOne
-from coreai_models.primitives.macos.rope import initialize_rope
+from coreai_models.primitives.macos.rope import RoPE
 from coreai_models.primitives.macos.sdpa import SDPA
 
 
@@ -70,7 +70,11 @@ class Attention(nn.Module):
             self.sdpa = SDPA(is_causal=True)
 
         if self.has_rope:
-            self.rope = initialize_rope(base=rope_theta)
+            self.rope = RoPE()
+            with torch.device("cpu"):
+                self._rope_freqs = 1.0 / (
+                    rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
+                )
 
     def forward(
         self,
@@ -107,8 +111,8 @@ class Attention(nn.Module):
         rope_positions = position_ids.narrow(-1, offset, query_len)
 
         if self.has_rope:
-            query = self.rope(query, position_ids=rope_positions)
-            key = self.rope(key, position_ids=rope_positions)
+            query = self.rope(query, position_ids=rope_positions, freqs=self._rope_freqs.float())
+            key = self.rope(key, position_ids=rope_positions, freqs=self._rope_freqs.float())
 
         if cache is not None:
             key, value = cache.update_and_fetch(
