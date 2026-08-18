@@ -161,6 +161,9 @@ struct SpeechRecognizer: AsyncParsableCommand {
             ).run()
             return
         }
+        if verbose {
+            CLILogger.level = 1
+        }
         guard let model else {
             throw ValidationError("--model is required.")
         }
@@ -237,10 +240,6 @@ func runBundle(
     let loadElapsed = ContinuousClock.now - loadStart
     print(" done in \(String(format: "%.3f", loadElapsed.inSeconds))s\(cacheHit ? " (cache hit)" : "")")
     print("Format: bundle (\(await model.architecture))")
-
-    if verbose {
-        CLILogger.level = 1
-    }
 
     // Resolve the PCM buffer once — either the decoded audio file or a fixed
     // silence buffer for latency benchmarking — then share the warmup / transcribe

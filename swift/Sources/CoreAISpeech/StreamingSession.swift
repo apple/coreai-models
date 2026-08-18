@@ -306,8 +306,6 @@ extension SpeechRecognitionModel {
                 contentsOf: repeatElement(0, count: cfg.windowSampleCount - validSamples))
         }
 
-        // TODO: add code here that does not run the model if the last chunk/hop was entirely silence
-
         // The encoder's own count now covers the padding, so recompute what real audio backs:
         // frames are consumed only where they are, padded window or not.
         let (encOut, encShape, encoderValidEnc) = try await runEncoder(pcm: session.window)

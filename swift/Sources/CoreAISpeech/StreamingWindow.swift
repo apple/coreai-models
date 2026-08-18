@@ -29,6 +29,10 @@ public struct EndpointingConfig: Sendable, Equatable {
     /// utterance loses its opening words. Well above `silenceFrames`, which closes a segment for
     /// display only: resetting at every endpoint cost ~3.8 s of dropped audio. NeMo never resets
     /// (`speech_to_text_streaming_infer_rnnt.py:426`), so 0 matches upstream.
+    ///
+    /// Assumes the host pushes audio through pauses: this and `silenceFrames` advance only when
+    /// hops run. A host that gates its mic should call `finishStream()` rather than withhold
+    /// samples, which freezes the session instead of pausing it.
     public var resetAfterSilenceFrames: Int
 
     public init(

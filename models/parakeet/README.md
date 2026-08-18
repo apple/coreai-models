@@ -190,6 +190,12 @@ A long gap is the exception. `resetAfterSilenceFrames` (default 40, so 3.2 s) re
 
 That loss reproduces identically offline and under HF's own `generate()`, so it is the checkpoint's behaviour rather than the chunking's, and the reset is a streaming-side correction to it. It is applied inside the decode loop rather than at a hop boundary, so `--deferred-decode` runs the same rule and still agrees with a live stream. Offline transcription defaults to `0` to stay reference-exact — `--parity-test` compares tokens and transcript against PyTorch traces — so pass `--reset-after-silence-frames` to opt an offline run in.
 
+### Gating the mic
+
+Endpointing and `resetAfterSilenceFrames` advance only when hops run, so both assume the host pushes audio continuously — including through pauses.
+
+An app that gates the mic with a voice-activity detector must not simply withhold audio: that freezes the session rather than pausing it, so the open segment never finalizes and the predictor reset never fires. Call `finishStream()` at the pause and `startStream()` again when speech resumes, after a hangover long enough that an inter-word gap does not split one utterance. Flush a few hundred milliseconds of pre-roll on the transition, since a detector fires after onset. `hop` and `segmentIndex` are per-session, so timestamps restart and the app supplies its own offset.
+
 ### `--deferred-decode` is the correctness test
 
 It chunks the encoder but concatenates the outputs and decodes in one pass. This is NeMo's `simulated` flag under a name that says what changes — upstream describes it as "encoder is evaluated on chunks, output is concatenated and decoded at one step … expected to provide the same results".
