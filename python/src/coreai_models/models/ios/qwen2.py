@@ -34,10 +34,11 @@ class Attention(nn.Module):
         self.n_heads = n_heads = config.num_attention_heads
         self.n_kv_heads = n_kv_heads = config.num_key_value_heads
         self.head_dim = head_dim = getattr(config, "head_dim", dim // n_heads)
+        attention_bias = getattr(config, "attention_bias", True)
 
-        self.q_proj = nn.Conv2d(dim, n_heads * head_dim, kernel_size=1, bias=True)
-        self.k_proj = nn.Conv2d(dim, n_kv_heads * head_dim, kernel_size=1, bias=True)
-        self.v_proj = nn.Conv2d(dim, n_kv_heads * head_dim, kernel_size=1, bias=True)
+        self.q_proj = nn.Conv2d(dim, n_heads * head_dim, kernel_size=1, bias=attention_bias)
+        self.k_proj = nn.Conv2d(dim, n_kv_heads * head_dim, kernel_size=1, bias=attention_bias)
+        self.v_proj = nn.Conv2d(dim, n_kv_heads * head_dim, kernel_size=1, bias=attention_bias)
 
         self.o_proj = nn.Conv2d(n_heads * head_dim, dim, kernel_size=1, bias=False)
 
@@ -271,6 +272,13 @@ class Qwen2ForCausalLMForiOS(BaseForCausalLMForiOS):
             raise ValueError(err)
 
         for i in range(max_layer + 1):
+            # Remove spurious attention bias keys (HF may init them even when
+            # the original model has attention_bias=False)
+            if not getattr(self.config, "attention_bias", True):
+                for proj in ["q_proj", "k_proj", "v_proj"]:
+                    bias_key = f"model.layers.{i}.self_attn.{proj}.bias"
+                    state_dict.pop(bias_key, None)
+
             # Reshape attention weights for Conv2d
             for proj in ["q_proj", "k_proj", "v_proj", "o_proj"]:
                 weight_key = f"model.layers.{i}.self_attn.{proj}.weight"
