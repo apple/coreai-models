@@ -10,7 +10,6 @@ Exports a PyTorch LLM model to a Core AI AIProgram via:
 torch.export -> decompose -> defunctionalize -> TorchConverter -> optimize.
 """
 
-import itertools
 import logging
 from typing import Any
 
@@ -21,7 +20,6 @@ from coreai.authoring import AIProgram
 from coreai_models._constants import MAIN_GRAPH_NAME, TRACE_KV_CACHE_SEQ_LEN
 from coreai_models.export.externalize import (
     EXTERNALIZE_SPECS,
-    restore_externalized,
     subexport_and_restore,
 )
 from coreai_models.export.mlir_ops import (
@@ -31,18 +29,6 @@ from coreai_models.export.mlir_ops import (
 from coreai_models.models.base import BaseForCausalLM, TraceSpec
 
 logger = logging.getLogger(__name__)
-
-
-def _resolve_target_dtype(model: torch.nn.Module) -> torch.dtype:
-    """Return the first floating-point parameter or buffer dtype.
-
-    Skips non-float tensors: after graph-mode quantization the module holds packed
-    integer weights, and picking one would build the KV cache in the wrong dtype.
-    """
-    for tensor in itertools.chain(model.parameters(), model.buffers()):
-        if tensor.is_floating_point():
-            return tensor.dtype
-    raise ValueError("Model has no floating-point parameters or buffers.")
 
 
 def _build_reference_inputs(
@@ -155,11 +141,8 @@ def export_to_coreai(
             state_names=state_names,
         )
     else:
-        try:
-            exported_program = export_fn(model, pass_inputs_as_kwargs=False)
-            externalized_programs = subexport_and_restore(externalized_model, exported_program)
-        finally:
-            restore_externalized(externalized_model)
+        exported_program = export_fn(model, pass_inputs_as_kwargs=False)
+        externalized_programs = subexport_and_restore(externalized_model, exported_program)
 
         converter.add_exported_program(
             exported_program,
@@ -208,8 +191,9 @@ def export_macos_model(
     # module that graph was captured from, so query the contract there.
     contract_model = model if externalized_model is None else externalized_model
 
-    # Determine target dtype from the model parameters
-    target_dtype = _resolve_target_dtype(model)
+    from coreai_models.export.pipeline import _resolve_precision
+
+    target_dtype = _resolve_precision(export_config.compute_precision)
 
     logger.info(
         f"Exporting macOS model (dtype={target_dtype}, max_context_length={max_context_length})"

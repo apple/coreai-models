@@ -17,7 +17,7 @@ from collections.abc import Sequence
 import coreai_torch
 import coreai_torch.composite_ops
 import torch
-from coreai_torch.externalize import _find_marked_submodules, _restore_externalized
+from coreai_torch.externalize import _find_marked_submodules
 
 logger = logging.getLogger(__name__)
 
@@ -105,17 +105,3 @@ def subexport_and_restore(
             marked_count,
         )
     return externalized_programs
-
-
-def restore_externalized(model: torch.nn.Module | None) -> None:
-    """Undo any externalization patches still on ``model``.
-
-    Idempotent and safe on an unpatched or ``None`` model, so it works as a ``finally``
-    guard.
-    """
-    if model is None:
-        return
-    marked = _find_marked_submodules(model)
-    if marked:
-        _restore_externalized(marked)
-        logger.info("Restored %d externalization patch(es)", len(marked))

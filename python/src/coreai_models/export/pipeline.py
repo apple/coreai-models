@@ -35,10 +35,7 @@ from coreai_models.export.compression import (
     palettize_pytorch_model,
     quantize_for_export,
 )
-from coreai_models.export.externalize import (
-    patch_model_for_externalization,
-    restore_externalized,
-)
+from coreai_models.export.externalize import patch_model_for_externalization
 from coreai_models.export.ios import export_ios_model
 from coreai_models.export.macos import export_macos_model
 from coreai_models.export.metadata import build_aimodel_metadata
@@ -295,7 +292,6 @@ async def _async_export_model(config: ExportConfig) -> str:
             if graph_mode:
                 externalized_model = patch_model_for_externalization(model)
 
-            try:
                 model = quantize_for_export(
                     model,
                     hf_config,
@@ -304,12 +300,7 @@ async def _async_export_model(config: ExportConfig) -> str:
                     calibration_data_fn=get_calibration_data,
                     mmap_dir=quantizer_mmap_dir,
                 )
-            except Exception:
-                # The marks outlive quantization, so drop them if no export
-                # can consume them.
-                if graph_mode:
-                    restore_externalized(externalized_model)
-                raise
+
         if torch_palettization_config is not None:
             assert config.variant == "iOS", "palettization is only supported for iOS variant."
 
@@ -344,16 +335,12 @@ async def _async_export_model(config: ExportConfig) -> str:
             model = palettize_pytorch_model(model, palettization_inputs, torch_palettization_config)
 
         # ---- 4. Variant-specific export ----
-        try:
-            if config.variant == "macOS":
-                coreai_program = export_macos_model(
-                    model, hf_config, config, externalized_model=externalized_model
-                )
-            else:
-                coreai_program = await export_ios_model(model, hf_config, config)
-        finally:
-            # in case of export failure
-            restore_externalized(externalized_model)
+        if config.variant == "macOS":
+            coreai_program = export_macos_model(
+                model, hf_config, config, externalized_model=externalized_model
+            )
+        else:
+            coreai_program = await export_ios_model(model, hf_config, config)
 
         del model
 
