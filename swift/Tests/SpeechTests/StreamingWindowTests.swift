@@ -233,10 +233,8 @@ struct EndpointDetectorTests {
         #expect(detector.framesSinceEmission == 12)
     }
 
-    /// The regression that motivated frame-granular silence: hops arrive a whole chunk at a
-    /// time, so accumulating `chunkFrames` per quiet hop made the default 12-frame chunk
-    /// cross a 10-frame threshold on the *first* quiet hop, endpointing mid-utterance and
-    /// fragmenting continuous speech.
+    /// The regression that motivated frame-granular silence: accumulating `chunkFrames` per quiet
+    /// hop made any single quiet hop cross a 10-frame threshold, endpointing mid-utterance.
     @Test("A hop that emits late in its chunk is not an endpoint")
     func partialEmissionWithinChunkIsNotSilence() {
         var detector = EndpointDetector(silenceFrames: 10, maxSegmentFrames: 1_000)
@@ -279,10 +277,8 @@ struct EndpointDetectorTests {
         #expect(detector.observe(framesAdvanced: 1, silentFrames: 0, segmentHasContent: true) == false)
     }
 
-    /// The bug: a long pause runs hops that consume frames while the next segment is still
-    /// empty. Charging them to that segment spent its length budget before it had any audio —
-    /// an 8 s pause cut the following segment ~7 s early, and a pause past `maxSegmentFrames`
-    /// left it to close at its first internal breath.
+    /// The bug: a long pause consumes frames while the next segment is still empty, spending its
+    /// length budget before it has any audio — an 8 s pause cut the next segment ~7 s early.
     @Test("A pause does not spend the next segment's length budget")
     func silenceDoesNotChargeTheEmptySegment() {
         var detector = EndpointDetector(silenceFrames: 10, maxSegmentFrames: 20)

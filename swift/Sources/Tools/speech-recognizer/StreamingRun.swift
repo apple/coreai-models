@@ -89,12 +89,10 @@ func runStreaming(
 
     // Collect finalized segments off the update stream while the pusher runs.
     //
-    // Partials are rendered in place with `\r`, which only works on a terminal and only
-    // while the line fits on one physical row: `\r` returns to the start of the last
-    // *wrapped* row, so a partial wider than the terminal leaves its earlier rows on
-    // screen and the rewrite becomes an append. So clamp to the width and keep the tail,
-    // where the new words are — and when stdout is redirected, drop partials entirely
-    // rather than emit a wall of prefixes that makes piped output undiffable.
+    // Partials are rewritten with `\r`, which only works on a terminal and only while the line
+    // fits one physical row — `\r` returns to the last *wrapped* row — so clamp to the width and
+    // keep the tail, where the new words are. Redirected stdout drops partials entirely so piped
+    // output stays diffable.
     let showPartials = isatty(STDOUT_FILENO) != 0
     let width = terminalWidth()
     let collector = Task { () -> [TranscriptSegment] in

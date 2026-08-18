@@ -129,7 +129,7 @@ The export runs one forward pass and fails if the traced encoder disagrees with 
 
 ### Ramp-up
 
-At the start of a session the window holds less audio than it was traced for. That matters because the encoder is full-attention and non-causal: a frame's representation depends on how much audio surrounds it, so a window that grows hop by hop decodes the opening under a different regime than steady state, and the transducer ends up consuming a sequence stitched from mismatched representations. Measured on a 7.4 s sample, that inserted a word.
+At the start of a session the window holds less audio than it was traced for. That matters because the encoder is full-attention and non-causal: a frame's representation depends on how much audio surrounds it, so a window that grows hop by hop decodes the opening under a different regime than steady state, and the transducer ends up consuming a sequence stitched from mismatched representations.
 
 So while audio is still arriving, the window is zero-filled to its traced size — the padding stands in for audio not yet received, and every hop presents the same extent. Frames are still only consumed where real audio backs them. The final flush is deliberately *not* padded: there the zeros would mean "no more speech", and masking them honestly is what cues the sentence-final token.
 
@@ -170,21 +170,25 @@ try await model.append(pcm: buffer)     // call from a Task, not an audio render
 try await model.finishStream()
 ```
 
-`startStream` takes no geometry: the bundle's window is the geometry, and `activeStreamingConfig` reports it — chunk, right, the derived left, and the theoretical latency. What the caller does control is `EndpointingConfig`, which decides only when a segment is cut for display and so changes no tensor shape.
+`startStream` takes no geometry: the bundle's window is the geometry, and `activeStreamingConfig` reports it — chunk, right, the derived left, and the theoretical latency. What the caller does control is `EndpointingConfig`: where a transcript is cut for display, and how long a gap has to be before the predictor is reset. Neither changes a tensor shape.
 
 ```bash
 swift run -c release speech-recognizer --model <bundle> --audio-path audio.wav --stream
 ```
 
-The CLI has no geometry flags, for the same reason — it prints the window the bundle records. `--endpoint-frames` sets the silence threshold, `--realtime` paces file input at 1× so reported latency is realistic, and `--deferred-decode` chunks the encoder but decodes once at the end. All of these require `--stream`.
+The CLI has no geometry flags, for the same reason — it prints the window the bundle records. `--endpoint-frames` sets the silence threshold, `--realtime` paces file input at 1× so reported latency is realistic, and `--deferred-decode` chunks the encoder but decodes once at the end; all three require `--stream`. `--reset-after-silence-frames` overrides the predictor reset and deliberately does *not*, since it applies to offline transcription too.
 
 Partials are rewritten in place on a terminal, and dropped entirely when stdout is redirected so that piped output stays diffable.
 
 ### Segments and endpointing
 
-A segment closes when the decoder has gone `endpointSilenceFrames` (default 10, so 0.8 s) without emitting, or — past the `maxSegmentFrames` cap (default 375, 30 s) — at the first pause after it. Silence is counted in *frames of audio the decoder skipped*, duration-weighted: a blank carrying duration 4 contributes 4 frames, so the threshold means 0.8 s of audio rather than "one hop produced nothing".
+A segment closes when the decoder has gone `silenceFrames` (default 10, so 0.8 s) without emitting, or — past the `maxSegmentFrames` cap (default 375, 30 s) — at the first pause after it. Silence is counted in *frames of audio the decoder skipped*, duration-weighted: a blank carrying duration 4 contributes 4 frames, so the threshold means 0.8 s of audio rather than "one hop produced nothing".
 
-Closing a segment is a display boundary only — the transducer state carries straight across it. Zeroing the predictor there instead cost roughly 3.8 s of dropped audio each time while it resynced from scratch. `ParakeetTDTDecoder.Stream.resetSegment()` remains available for a caller that wants a genuine hard reset.
+Closing a segment is a display boundary: the transducer state carries straight across it. Zeroing the predictor at *every* endpoint instead cost roughly 3.8 s of dropped audio each time, while it re-established context from a cold start.
+
+A long gap is the exception. `resetAfterSilenceFrames` (default 40, so 3.2 s) restores the predictor's start condition — a zeroed LSTM plus the blank as the previous label, which is all-zeros because the blank's embedding row is itself zero. Without it, a predictor that has emitted a sentence-final token and then consumed tens of seconds of blanks resists re-entering an emitting state: the duration head jumps across the re-onset and the resuming utterance loses its opening words.
+
+That loss reproduces identically offline and under HF's own `generate()`, so it is the checkpoint's behaviour rather than the chunking's, and the reset is a streaming-side correction to it. It is applied inside the decode loop rather than at a hop boundary, so `--deferred-decode` runs the same rule and still agrees with a live stream. Offline transcription defaults to `0` to stay reference-exact — `--parity-test` compares tokens and transcript against PyTorch traces — so pass `--reset-after-silence-frames` to opt an offline run in.
 
 ### `--deferred-decode` is the correctness test
 

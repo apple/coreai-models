@@ -13,9 +13,8 @@ import Foundation
 public enum TranscriptionUpdate: Sendable {
     /// Cumulative text for the in-progress segment.
     ///
-    /// Append-only within a segment: because the decoder never revisits a consumed
-    /// encoder frame, each partial is a prefix-extension of the previous one and text
-    /// already shown is never retracted.
+    /// Append-only: the decoder never revisits a consumed encoder frame, so each partial extends
+    /// the previous one and text already shown is never retracted.
     case partial(TranscriptSegment)
     /// A segment closed by an endpoint, the length cap, or end of stream.
     case finalized(TranscriptSegment)
@@ -35,9 +34,8 @@ public struct TranscriptSegment: Sendable {
 
 /// Decides when a segment has gone quiet enough to finalize.
 ///
-/// Extracted as a plain value type so every branch is testable: the streaming path
-/// otherwise needs three loaded `AIModel`s, the same reasoning behind
-/// `ParakeetTDTDecoder.validate` being `package static`.
+/// A plain value type so every branch is testable: the streaming path otherwise needs three
+/// loaded `AIModel`s.
 package struct EndpointDetector {
     package let silenceFrames: Int
     package let maxSegmentFrames: Int
@@ -52,24 +50,12 @@ package struct EndpointDetector {
     /// Record a chunk's outcome and report whether to close the segment.
     ///
     /// Two ways to fire, and both land on a pause so the transcript is split at a gap:
+    /// `silenceFrames` of quiet, or the first quiet chunk past `maxSegmentFrames`. A hard cut
+    /// at the cap would split a word's tokens across segments (`examination` → `exam ination`).
     ///
-    /// - `silenceFrames` of quiet — the ordinary endpoint.
-    /// - past `maxSegmentFrames`, the *first* quiet chunk. A hard cut at the cap would
-    ///   land mid-word: it splits a token sequence that detokenizes as one word into two
-    ///   segments, and joining them reinserts a space (`examination` became `exam
-    ///   ination`). Waiting for any pause keeps the bound without corrupting a word.
-    ///
-    /// `silentFrames` is the decoder's own duration-weighted count of frames since its last
-    /// emission, so the threshold means what it says at frame resolution. Accumulating a
-    /// whole chunk per hop instead made the effective rule "one hop emitted nothing" — with
-    /// the default 12-frame chunk against a 10-frame threshold, any single quiet hop fired an
-    /// endpoint mid-utterance.
-    ///
-    /// The cap bounds a segment's *displayed* length, so it runs from the first emission and
-    /// `segmentHasContent` holds it at zero until then. Counting the quiet hops after an
-    /// endpoint spent the next segment's budget before it had any audio: an 8 s pause cut the
-    /// following segment at ~23 s instead of 30, and a pause past the cap left it to close at
-    /// its first internal breath.
+    /// `silentFrames` is the decoder's duration-weighted count, so the threshold means what it
+    /// says at frame resolution. `segmentHasContent` holds the cap at zero until the segment
+    /// emits, so a pause cannot spend the next segment's budget before it has any audio.
     package mutating func observe(
         framesAdvanced: Int, silentFrames: Int, segmentHasContent: Bool
     ) -> Bool {
@@ -89,10 +75,9 @@ package struct EndpointDetector {
 
 /// Mutable state for one live streaming session.
 ///
-/// Lives inside the `SpeechRecognitionModel` actor rather than in a separate actor so
-/// that `ParakeetTDTDecoder.Stream` and the encoder's `NDArray` outputs never cross an
-/// isolation boundary. `@unchecked Sendable` for the same reason as `Stream`: this is
-/// only ever reached from the owning actor's isolated state.
+/// Lives inside the `SpeechRecognitionModel` actor so that `ParakeetTDTDecoder.Stream` and the
+/// encoder's `NDArray` outputs never cross an isolation boundary; `@unchecked Sendable` for the
+/// same reason as `Stream`.
 package final class StreamingSessionState: @unchecked Sendable {
     package let config: StreamingConfig
     let endpointing: EndpointingConfig
@@ -111,14 +96,9 @@ package final class StreamingSessionState: @unchecked Sendable {
     /// Diagnostic mode: chunk the encoder but concatenate its outputs and decode once at
     /// the end.
     ///
-    /// This is NeMo's `simulated` flag under a name that says what changes
-    /// (`speech_to_text_streaming_infer_rnnt.py:169`, aggregation at `:480-490`, the single
-    /// decode at `:529-554`), whose own comment reads "encoder is evaluated on chunks, output
-    /// is concatenated and decoded at one step / expected to provide the same results".
-    ///
-    /// That expectation is the point: this shares the encoder path but not the incremental
-    /// decode, so a difference against a live stream isolates the state carry, the
-    /// duration-overshoot carry, or the frame partition — no quality judgement needed.
+    /// NeMo's `simulated` flag (`speech_to_text_streaming_infer_rnnt.py:169`) under a name that
+    /// says what changes. It shares the encoder path but not the incremental decode, so a
+    /// difference against a live stream isolates the state carry or the frame partition.
     let deferredDecode: Bool
     var aggregated: [Float] = []
     var aggregatedFrames = 0
@@ -165,17 +145,11 @@ extension SpeechRecognitionModel {
     /// not capture audio: a host app owns `AVAudioEngine`, converts to mono float32 at
     /// `sampleRate`, and pushes buffers in.
     ///
-    /// The encoder runs over a bounded `[left | chunk | right]` window each hop and only
-    /// the chunk's frames are decoded, with the transducer state carried across hops —
-    /// NVIDIA's buffered-inference algorithm (NeMo
-    /// `speech_to_text_streaming_infer_rnnt.py:446-527`). Parakeet TDT v3 has no
-    /// cache-aware encoder, so this is how streaming is done for it.
+    /// Buffered inference over the bundle's traced window — see `StreamingConfig`. Only a
+    /// `--streaming` export can stream; `activeStreamingConfig` reports the geometry in use.
     ///
-    /// The window comes from the bundle: geometry is fixed when the encoder is traced, so only
-    /// a `--streaming` export can stream. Read `activeStreamingConfig` for what it turned out to
-    /// be. Endpointing is the caller's, because it changes no tensor shape.
-    ///
-    /// - Parameter endpointing: When a segment is closed for display.
+    /// - Parameter endpointing: Where a transcript is cut, and when a long gap resets the
+    ///   predictor. Neither changes a tensor shape.
     /// - Parameter deferredDecode: Diagnostic only — chunk the encoder but decode once at the
     ///   end, for diffing against a live stream. It emits no partials, never runs endpointing,
     ///   and holds every consumed frame in memory, so it is not a mode to ship.
@@ -307,8 +281,8 @@ extension SpeechRecognitionModel {
         if windowStartSample >= available { return false }
 
         // How much real audio this window covers. Tail padding (never front) keeps
-        // `attention_mask` a *prefix*, the only shape HF's mask and the subsampling channel
-        // mask can express, so a window is always `[audio | zeros]`.
+        // `attention_mask` a prefix, the only shape HF's mask and the subsampling channel mask
+        // can express, so a window is always `[audio | zeros]`.
         let validSamples = min(cfg.windowSampleCount, available - windowStartSample)
         if validSamples <= 0 { return false }
         let localStart = windowStartSample - session.pcmOrigin
@@ -322,15 +296,10 @@ extension SpeechRecognitionModel {
 
         let isLastHop = session.finished && windowStartSample + validSamples >= available
 
-        // Zero-fill the window up to the size it was traced for while more audio is still
-        // expected. The encoder is full-attention and non-causal, so a frame's representation
-        // depends on how much audio surrounds it: through ramp-up a growing window decodes the
-        // opening of a session under a different regime than steady state, and the transducer
-        // then consumes a sequence stitched from mismatched representations.
-        //
-        // Never on the final hop: there the zeros mean "no more speech" rather than "audio not
-        // yet received", and masking them honestly is what cues the sentence-final token —
-        // padding it dropped the closing period.
+        // Zero-fill to the traced size while more audio is expected: the encoder is non-causal,
+        // so a growing window decodes the session's opening under a different regime than steady
+        // state. Never on the final hop, where the zeros mean "no more speech" and masking them
+        // honestly is what cues the sentence-final token.
         let padWindow = !isLastHop && validSamples < cfg.windowSampleCount
         if padWindow {
             session.window.append(
@@ -385,11 +354,9 @@ extension SpeechRecognitionModel {
 
             if shouldEndpoint, !session.segmentTokens.isEmpty {
                 _ = try emit(session, final: true)
-                // A segment boundary is a *display* boundary: the transducer state carries
-                // straight through it. Zeroing the LSTM here instead cost ~48 encoder frames
-                // (3.8 s) of dropped audio while it re-established context — measured as three
-                // segments and 105 tokens where carrying the state gives one continuous
-                // decode and 119. Callers wanting a hard reset can still use `resetSegment`.
+                // A display boundary only: the transducer state carries straight through.
+                // Zeroing the LSTM at every endpoint instead cost ~3.8 s of dropped audio while
+                // it re-established context.
                 session.endpoint.reset()
                 session.segmentIndex += 1
                 session.segmentTokens = []

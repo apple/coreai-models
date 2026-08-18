@@ -13,13 +13,9 @@ import Foundation
 /// the traced graph, but where a transcript is cut is a caller's policy — dictation wants a long
 /// pause tolerance, live captions a short one.
 ///
-/// Counts **encoder frames**, matching `StreamingConfig`, because that is the only unit in which
-/// a chunk boundary is exact. The *defaults* are wall-clock judgements calibrated at 80 ms per
-/// frame — `hop_length 160 × subsampling 8 / 16 kHz`, the frame duration of every Parakeet TDT
-/// bundle and the only one reachable today, since `export.py` reads all three off the checkpoint
-/// with no flag to override them. A bundle with a different frame duration would leave these
-/// counts meaning different durations than they were tuned as, so scale them to
-/// `StreamingConfig.seconds(frames:)` rather than reusing the defaults as-is.
+/// Counts encoder frames, matching `StreamingConfig`. The defaults are wall-clock judgements
+/// calibrated at 80 ms per frame, every Parakeet bundle's frame duration; scale them if a bundle
+/// ever ships a different one.
 public struct EndpointingConfig: Sendable, Equatable {
     /// Frames of decoder silence, duration-weighted, before a segment is finalized. 10 frames
     /// is 0.8 s at 80 ms per frame.
@@ -27,32 +23,12 @@ public struct EndpointingConfig: Sendable, Equatable {
     /// Soft cap on segment length, 375 frames being 30 s. Splits the transcript for display
     /// without resetting the transducer, and waits for a pause so no word is cut.
     public var maxSegmentFrames: Int
-    /// Silent frames after which the transducer state is genuinely reset, or 0 to never.
-    /// 40 frames is 3.2 s at 80 ms per frame.
+    /// Silent frames after which the predictor is reset, or 0 to never. 40 frames is 3.2 s.
     ///
-    /// Distinct from `silenceFrames`, which only closes a segment for display. Across a long
-    /// gap the predictor is still conditioned on a sentence that ended tens of seconds ago,
-    /// and having emitted a sentence-final token it resists re-entering an emitting state:
-    /// the duration head jumps across the re-onset and the resuming utterance loses its
-    /// opening words. On 11 s speech + 13 s quiet + 7 s speech the first ~5 s of the resuming
-    /// audio went missing — identically offline and under HF's own `generate()`, so this is
-    /// the checkpoint's behaviour rather than the chunking's, and the reset is a streaming-only
-    /// correction to it. Measured with `streaming_sim.py --reset-after-silence`: 33.3% -> 4.4%
-    /// WER against ground truth, and 0 resets with byte-identical output on four
-    /// continuous-speech files.
-    ///
-    /// 40 sits in a wide safe band rather than on a cliff: 30 through 150 frames all left the
-    /// continuous-speech files byte-identical, and 40 through 150 all recovered the pause cases.
-    ///
-    /// Deliberately well above `silenceFrames`. Resetting at every endpoint cost ~3.8 s of
-    /// dropped audio while the predictor re-established context, because across an ordinary
-    /// inter-phrase pause the state is still worth carrying. NeMo threads one unbroken state
-    /// through the whole stream (`speech_to_text_streaming_infer_rnnt.py:426`, `:494-510`), so
-    /// this has no upstream counterpart — set 0 to match it exactly.
-    ///
-    /// Applied inside the decode loop, not at a hop boundary, so `--deferred-decode` — which
-    /// decodes aggregated frames in one pass — runs the same rule and still agrees with a live
-    /// stream. The offline path leaves it at 0 to stay byte-for-byte identical to HF.
+    /// Past a long gap the predictor resists re-entering an emitting state, so the resuming
+    /// utterance loses its opening words. Well above `silenceFrames`, which closes a segment for
+    /// display only: resetting at every endpoint cost ~3.8 s of dropped audio. NeMo never resets
+    /// (`speech_to_text_streaming_infer_rnnt.py:426`), so 0 matches upstream.
     public var resetAfterSilenceFrames: Int
 
     public init(
@@ -71,8 +47,8 @@ public struct EndpointingConfig: Sendable, Equatable {
                 "silenceFrames must be >= 1 and maxSegmentFrames (\(maxSegmentFrames)) must be "
                     + ">= the bundle's chunk (\(chunkFrames))")
         }
-        // At or below the endpoint threshold this fires on every segment boundary, which is
-        // the configuration already measured to drop ~3.8 s of audio to a predictor reset.
+        // At or below the endpoint threshold this fires on every segment boundary, the
+        // configuration measured to drop ~3.8 s of audio.
         guard resetAfterSilenceFrames == 0 || resetAfterSilenceFrames > silenceFrames else {
             throw SpeechError.invalidStreamingConfig(
                 "resetAfterSilenceFrames (\(resetAfterSilenceFrames)) must be 0 or greater than "
@@ -86,20 +62,14 @@ public struct EndpointingConfig: Sendable, Equatable {
 
 /// Window geometry for buffered ("streaming") Parakeet TDT inference.
 ///
-/// Parakeet TDT v3 is an offline full-context FastConformer — its attention is
-/// bidirectional over the whole utterance and there is no cache-aware variant in
-/// `transformers`. So live transcription re-runs the *whole* encoder over a bounded
-/// window `[left | chunk | right]` each hop, consumes only the chunk's encoder
-/// frames, and carries the transducer state across hops.
+/// Parakeet TDT v3 is an offline full-context FastConformer with no cache-aware variant in
+/// `transformers`, so live transcription re-runs the whole encoder over a bounded
+/// `[left | chunk | right]` window each hop, consumes only the chunk's frames, and carries the
+/// transducer state across hops — NVIDIA's own algorithm (NeMo
+/// `examples/asr/asr_chunked_inference/rnnt/speech_to_text_streaming_infer_rnnt.py:446-527`).
 ///
-/// This ports NVIDIA's own buffered-inference algorithm (NeMo
-/// `examples/asr/asr_chunked_inference/rnnt/speech_to_text_streaming_infer_rnnt.py`,
-/// main loop at :446-527), which its own example applies to non-cache-aware
-/// checkpoints — so this is a supported upstream mode, not a workaround.
-///
-/// Everything is expressed in **encoder frames**, because that is the only unit in
-/// which the chunk boundary is exact. One encoder frame is
-/// `hopLength * subsamplingFactor` samples (1280 = 80 ms for Parakeet).
+/// Everything is in encoder frames, the only unit in which the chunk boundary is exact. One
+/// frame is `hopLength * subsamplingFactor` samples (1280 = 80 ms for Parakeet).
 public struct StreamingConfig: Sendable, Equatable {
     /// Frames consumed per hop. Sets the emission cadence. Must be exact — the sliding
     /// arithmetic depends on it.
@@ -138,16 +108,13 @@ public struct StreamingConfig: Sendable, Equatable {
         encoderFrameCount(melFrames: windowMelFrames, subsamplingFactor: subsamplingFactor)
     }
 
-    /// Frames of past audio the encoder sees but does not decode. Improves quality
-    /// without affecting latency. This is the steady-state target — NeMo's
-    /// `expected_context.left`; the effective left is smaller during ramp-up, because
-    /// `windowStartFrame` clamps to 0.
+    /// Frames of past audio the encoder sees but does not decode. Improves quality without
+    /// affecting latency. The steady-state target — NeMo's `expected_context.left`; the effective
+    /// left is smaller during ramp-up, because `windowStartFrame` clamps to 0.
     ///
-    /// Derived rather than stored, which makes `left + chunk + right <= usable` identically
-    /// true. That inequality is load-bearing: `windowStartFrame` positions a fixed-size window
-    /// from it, so a stored left that disagreed would either start the window past the audio or
-    /// leave part of a chunk unconsumed. `decode(fromMetadata:)` cross-checks the recorded value
-    /// instead of trusting it.
+    /// Derived rather than stored, which makes `left + chunk + right <= usable` identically true.
+    /// A stored left that disagreed would start the window past the audio or leave part of a
+    /// chunk unconsumed; `decode(fromMetadata:)` cross-checks the recorded copy instead.
     public var leftContextFrames: Int {
         usableEncoderFrames - chunkFrames - rightContextFrames
     }
@@ -197,11 +164,8 @@ public struct StreamingConfig: Sendable, Equatable {
 
     /// Decode the `streaming` block a `--streaming` export writes into `metadata.json`.
     ///
-    /// `nil` for a bundle without the block — it simply cannot stream, and `startStream` says so.
-    /// Throws when the block is present but disagrees with itself: the recorded left context must
-    /// equal the window minus chunk and right. Left is derived for use, so this is the one place
-    /// the recorded copy is checked, which is what keeps a hand-edited block from describing a
-    /// geometry the runtime would not actually run.
+    /// `nil` for a bundle without the block — it cannot stream, and `startStream` says so. Throws
+    /// when the block disagrees with itself, the one place the recorded left context is checked.
     package static func decode(fromMetadata raw: Data) throws -> StreamingConfig? {
         guard let payload = try? JSONDecoder().decode(MetadataPayload.self, from: raw),
             let block = payload.streaming
@@ -334,11 +298,9 @@ public struct StreamingConfig: Sendable, Equatable {
 
 /// Encoder frames emitted for `melFrames` mel frames.
 ///
-/// The FastConformer subsampling stack is three stride-2, kernel-3, pad-1 convs, each
-/// `floor((L + 2·1 − 3)/2) + 1 = floor((L−1)/2) + 1 = ceil(L/2)`, which composes to
-/// `ceil(L/8)`. Mirrors HF `ParakeetPreTrainedModel._get_subsampling_output_length`
-/// rather than hardcoding the closed form, so an unusual `subsamplingFactor` still
-/// computes the right answer.
+/// Three stride-2, kernel-3, pad-1 convs, each `ceil(L/2)`, composing to `ceil(L/8)`. Mirrors HF
+/// `ParakeetPreTrainedModel._get_subsampling_output_length` rather than hardcoding the closed
+/// form, so an unusual `subsamplingFactor` still computes the right answer.
 public func encoderFrameCount(melFrames: Int, subsamplingFactor: Int) -> Int {
     guard melFrames > 0, subsamplingFactor > 1 else { return max(0, melFrames) }
     var length = melFrames

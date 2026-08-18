@@ -127,9 +127,8 @@ public actor SpeechRecognitionModel {
 
     /// Transcribe an audio file, returning the full text and decode stats.
     ///
-    /// - Parameter resetAfterSilenceFrames: See the same parameter on
-    ///   `ParakeetTDTDecoder.decode`. 0 keeps this path reference-exact; pass non-zero only for
-    ///   recordings with pauses long enough to lose the resuming utterance's opening words.
+    /// - Parameter resetAfterSilenceFrames: See `ParakeetTDTDecoder.decode`. 0 keeps this path
+    ///   reference-exact.
     public func transcribe(
         audioURL: URL, resetAfterSilenceFrames: Int = 0
     ) async throws -> (String, DecodeStats) {
@@ -284,9 +283,8 @@ public actor SpeechRecognitionModel {
         pcm: [Float], resetAfterSilenceFrames: Int = 0
     ) async throws -> ([Int32], DecodeStats) {
         let (encOut, encShape, validEnc) = try await runEncoder(pcm: pcm)
-        // The predictor reset belongs to a transducer's carried label history, so it is not on
-        // `SpeechDecoder`. Reached by downcast, the way `startStream` does. Rejected rather than
-        // ignored for other architectures: silently dropping a flag the caller passed is how a
+        // Not on `SpeechDecoder`, so reached by downcast the way `startStream` does. Thrown
+        // rather than ignored elsewhere: silently dropping a flag the caller passed is how a
         // missed effect reads as a clean run.
         if resetAfterSilenceFrames > 0 {
             guard let parakeet = decoder as? ParakeetTDTDecoder else {

@@ -38,19 +38,6 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
 
     /// Every NDArray a decode call needs, allocated once up front and rewritten in
     /// place on each step rather than reallocated per emission.
-    ///
-    /// Stays a **struct held in a local `var`**, which is what lets the inner loop hand it
-    /// around as `inout`. Two things go wrong if a streaming session persists it as a
-    /// class property instead: `swap(&buffers.hIn, &buffers.hOut)` and the three
-    /// simultaneous `insert(&buffers.…)` output views become overlapping *dynamic*
-    /// exclusive accesses to one property ("Fatal access conflict detected"), and the
-    /// nonescapable `MutableViews` can no longer prove it outlives the `await`
-    /// ("lifetime-dependent variable 'stepOut' escapes its scope") without the
-    /// experimental `Lifetimes` feature this target doesn't enable.
-    ///
-    /// So `Stream` persists the state *values* across chunks instead, and rebinds them
-    /// into a fresh `Buffers` per call — 8 small allocations and 3 memcpys of ~1280 floats
-    /// at roughly one hop per second, i.e. free.
     private struct Buffers {
         var inputIds: NDArray
         /// LSTM state, double-buffered: a step reads `hIn`/`cIn` and writes `hOut`/`cOut`,
@@ -130,27 +117,7 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
     /// one chunk of encoder frames at a time and keep going where it left off.
     ///
     /// The fields mirror NeMo's `BatchedLabelLoopingState`
-    /// (`nemo/collections/asr/parts/submodules/transducer_decoding/label_looping_base.py:41-49`),
-    /// which is the authority on what has to survive a chunk boundary:
-    /// `predictor_states` → `buffers.hIn`/`cIn`, `predictor_outputs` → `buffers.decOut`,
-    /// `labels` → `previousSymbol`, `time_jumps` → `timeJump`.
-    ///
-    /// `predictor_outputs` is the easy one to miss: the blank-skip branch reuses
-    /// `decOut` without re-running the step graph, so if it were reallocated per chunk
-    /// the first step of every chunk would silently read a stale decoder output.
-    ///
-    /// A `final class` for the reason `FixedNDArrayState`
-    /// (`CoreAILanguageModels/Handlers/StateHandler+NDArray.swift:14-59`) is one: the
-    /// NDArrays stay at refcount 1, so writing them in place never triggers COW.
-    /// Mirrored rather than imported — CoreAISpeech doesn't depend on that target, and
-    /// unlike `FixedNDArrayState` these are ordinary graph inputs/outputs rather than
-    /// CoreAI runtime states, so there is no `bind(into:)` surface to conform to.
-    ///
-    /// `@unchecked Sendable` rather than an actor. `decodeFrames` is `async` because the
-    /// graph runs are, so calling it from the owning actor "sends" this reference into a
-    /// nonisolated context — but the actor serializes those calls and hands the reference
-    /// to nobody else, so exactly one `decodeFrames` is ever in flight. Making it an actor
-    /// instead would put an actor hop around every buffer write in the inner loop.
+    /// (`nemo/collections/asr/parts/submodules/transducer_decoding/label_looping_base.py:41-49`)
     public final class Stream: @unchecked Sendable {
         private let decoder: ParakeetTDTDecoder
         private let cfg: ParakeetTDTConfig
@@ -170,13 +137,7 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
         private var firstStep: Bool
 
         /// Frames a TDT duration overshot the last chunk by, to be skipped at the start of
-        /// the next one. NeMo's `time_jumps`: `tdt_label_looping.py:654` computes it as
-        /// `time_indices - encoder_output_length`, and `:385` seeds the next chunk's
-        /// `time_indices` from it.
-        ///
-        /// Clamping to the chunk end instead would re-run the joint on a frame the model
-        /// asked to skip, with the same state and the same `previousSymbol` — very likely
-        /// re-emitting the same token, i.e. a duplicated word at every chunk boundary.
+        /// the next one.
         public private(set) var timeJump: Int = 0
 
         /// Consecutive encoder frames consumed without emitting anything, duration-weighted.
@@ -200,18 +161,6 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
         }
 
         /// Start a new segment: zero the LSTM and re-seed the blank as the previous label.
-        ///
-        /// There is no start-of-sequence token; the start condition is all-zeros, since the
-        /// blank's embedding row is itself zero (NeMo's `padding_idx=blank_idx`,
-        /// `nemo/collections/asr/modules/rnnt.py:843`). `firstStep` is load-bearing: without it
-        /// the blank takes the blank-skip branch and reuses a `decOut` from the discarded state.
-        ///
-        /// Not called when a streaming segment is finalized — that is only a display
-        /// boundary, and resetting there cost ~3.8 s of dropped audio while the predictor
-        /// re-established context. This is for a caller that wants a genuine hard reset.
-        ///
-        /// Deliberately leaves `timeJump` alone — it describes the audio timeline, which is
-        /// continuous across a segment boundary, not the label history.
         public func resetSegment() {
             let stateCount = lstmShape.reduce(1, *)
             hiddenState = [Float](repeating: 0, count: stateCount)
@@ -401,22 +350,14 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
                 // skips 320 ms in one step, so counting steps would under-measure silence 4×.
                 silentFrames = emittedThisStep == 0 ? silentFrames + advance : 0
 
-                // Past a long gap, drop the label history. Having emitted a sentence-final
-                // token the predictor resists re-entering an emitting state, and the resuming
-                // utterance loses its opening words — see
-                // `EndpointingConfig.resetAfterSilenceFrames` for the measurement.
-                //
-                // In the loop rather than at the caller's chunk boundary, because that is the
-                // only place every path shares: streaming, `--deferred-decode`'s single pass
-                // over aggregated frames, and offline all run this same rule, so the modes
-                // still agree with each other. Off by default, which is what keeps the offline
-                // path byte-for-byte identical to HF.
+                // Past a long gap, drop the label history — see
+                // `EndpointingConfig.resetAfterSilenceFrames`. In the loop rather than at the
+                // caller's chunk boundary because that is the only place streaming,
+                // `--deferred-decode` and offline all share, so the modes still agree.
                 if resetAfterSilenceFrames > 0, silentFrames >= resetAfterSilenceFrames {
-                    // `resetSegment` owns what a reset means, including leaving `timeJump`
-                    // alone. It writes the stream's own properties, so the loop's buffers have
-                    // to be re-seeded from them: `hIn`/`cIn` are what the next step reads, and
-                    // `firstStep` forces the step graph to recompute `decOut` from the zeroed
-                    // state rather than reusing it via the blank-skip branch.
+                    // `resetSegment` writes the stream's properties, so re-seed the buffers the
+                    // loop actually reads. `firstStep` then forces `decOut` to be recomputed
+                    // rather than reused via the blank-skip branch.
                     resetSegment()
                     fillFloatNDArray(&buffers.hIn, with: hiddenState)
                     fillFloatNDArray(&buffers.cIn, with: cellState)
@@ -485,17 +426,13 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
 
     /// As the protocol's `decode`, with the transducer's long-silence predictor reset.
     ///
-    /// Not on `SpeechDecoder` because it is specific to a transducer's carried label history —
-    /// Whisper has no predictor to re-seed. Callers reach it the way `startStream` does, by
-    /// downcasting to this type.
+    /// Not on `SpeechDecoder` because Whisper has no predictor to re-seed. Callers reach it the
+    /// way `startStream` does, by downcasting to this type.
     ///
-    /// - Parameter resetAfterSilenceFrames: Encoder frames of decoder silence after which the
-    ///   predictor is reset to its start condition, or 0 to never. **0 is the right default for offline work**:
-    ///   it is what keeps this path byte-for-byte identical to HF's `generate()`, which is the property the
-    ///   `--parity-test` token and transcript comparisons rest on. Pass a non-zero value only when
-    ///   transcribing recordings whose internal pauses are long enough to lose the resuming utterance's
-    ///   opening words — see `EndpointingConfig.resetAfterSilenceFrames` for the measurement
-    ///   and for why 40 frames is the streaming default.
+    /// - Parameter resetAfterSilenceFrames: Silent encoder frames after which the predictor is
+    ///   reset, or 0 to never. 0 is the right default offline: it keeps this path identical to
+    ///   HF's `generate()`, which is what `--parity-test` rests on. See
+    ///   `EndpointingConfig.resetAfterSilenceFrames`.
     public func decode(
         encoderOutput: NDArray,
         encoderOutputShape: [Int],
