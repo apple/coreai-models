@@ -299,7 +299,7 @@ struct EndpointDetectorTests {
     }
 
     /// The predictor reset has to sit well above the endpoint threshold: firing it at every
-    /// segment boundary is the configuration measured to drop ~3.8 s of audio to an SOS resync.
+    /// segment boundary is the configuration measured to drop ~3.8 s of audio to a reset.
     @Test("A predictor reset at or below the endpoint threshold is rejected")
     func resetThresholdMustExceedSilence() throws {
         #expect(throws: SpeechError.self) {

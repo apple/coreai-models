@@ -126,14 +126,26 @@ public actor SpeechRecognitionModel {
     // MARK: - Transcription
 
     /// Transcribe an audio file, returning the full text and decode stats.
-    public func transcribe(audioURL: URL) async throws -> (String, DecodeStats) {
-        let (tokens, stats) = try await decodeAudio(from: audioURL)
+    ///
+    /// - Parameter resetAfterSilenceFrames: See the same parameter on
+    ///   `ParakeetTDTDecoder.decode`. 0 keeps this path reference-exact; pass non-zero only for
+    ///   recordings with pauses long enough to lose the resuming utterance's opening words.
+    public func transcribe(
+        audioURL: URL, resetAfterSilenceFrames: Int = 0
+    ) async throws -> (String, DecodeStats) {
+        let (tokens, stats) = try await decodeAudio(
+            from: audioURL, resetAfterSilenceFrames: resetAfterSilenceFrames)
         return try (detokenize(tokens), stats)
     }
 
     /// Transcribe raw 16 kHz mono PCM samples, returning the full text and decode stats.
-    public func transcribe(pcm: [Float]) async throws -> (String, DecodeStats) {
-        let (tokens, stats) = try await decodeAudio(pcm: pcm)
+    ///
+    /// - Parameter resetAfterSilenceFrames: See `transcribe(audioURL:resetAfterSilenceFrames:)`.
+    public func transcribe(
+        pcm: [Float], resetAfterSilenceFrames: Int = 0
+    ) async throws -> (String, DecodeStats) {
+        let (tokens, stats) = try await decodeAudio(
+            pcm: pcm, resetAfterSilenceFrames: resetAfterSilenceFrames)
         return try (detokenize(tokens), stats)
     }
 
@@ -261,13 +273,34 @@ public actor SpeechRecognitionModel {
         }
     }
 
-    private func decodeAudio(from url: URL) async throws -> ([Int32], DecodeStats) {
+    private func decodeAudio(
+        from url: URL, resetAfterSilenceFrames: Int = 0
+    ) async throws -> ([Int32], DecodeStats) {
         let pcm = try MelSpectrogram.loadAndResample(url, targetSampleRate: melConfig.sampleRate)
-        return try await decodeAudio(pcm: pcm)
+        return try await decodeAudio(pcm: pcm, resetAfterSilenceFrames: resetAfterSilenceFrames)
     }
 
-    private func decodeAudio(pcm: [Float]) async throws -> ([Int32], DecodeStats) {
+    private func decodeAudio(
+        pcm: [Float], resetAfterSilenceFrames: Int = 0
+    ) async throws -> ([Int32], DecodeStats) {
         let (encOut, encShape, validEnc) = try await runEncoder(pcm: pcm)
+        // The predictor reset belongs to a transducer's carried label history, so it is not on
+        // `SpeechDecoder`. Reached by downcast, the way `startStream` does. Rejected rather than
+        // ignored for other architectures: silently dropping a flag the caller passed is how a
+        // missed effect reads as a clean run.
+        if resetAfterSilenceFrames > 0 {
+            guard let parakeet = decoder as? ParakeetTDTDecoder else {
+                throw SpeechError.incompatibleResources(
+                    "resetAfterSilenceFrames applies to a transducer's predictor state; "
+                        + "\(architecture) has none")
+            }
+            return try await parakeet.decode(
+                encoderOutput: encOut,
+                encoderOutputShape: encShape,
+                validEncoderFrames: validEnc,
+                resources: resources,
+                resetAfterSilenceFrames: resetAfterSilenceFrames)
+        }
         return try await decoder.decode(
             encoderOutput: encOut,
             encoderOutputShape: encShape,

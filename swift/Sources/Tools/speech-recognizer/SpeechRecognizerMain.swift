@@ -59,9 +59,11 @@ struct SpeechRecognizer: AsyncParsableCommand {
 
     @Option(
         help: """
-            Silent encoder frames after which the transducer predictor is reset to SOS, or 0 \
-            to never reset (NeMo's behaviour). Recovers the opening of an utterance resuming \
-            after a long gap. Defaults to the library's 40 frames (3.2 s).
+            Silent encoder frames after which the transducer predictor is reset to its start \
+            condition, or 0 to never reset. Recovers the opening of an utterance resuming after \
+            Defaults to 40 frames (3.2 s) with --stream, and to 0 offline — offline stays \
+            reference-exact unless you ask otherwise, since --parity-test rests on that. Pass a \
+            value here to opt an offline run in. Parakeet TDT only.
             """)
     var resetAfterSilenceFrames: Int?
 
@@ -124,7 +126,6 @@ struct SpeechRecognizer: AsyncParsableCommand {
             realtime ? "--realtime" : nil,
             deferredDecode ? "--deferred-decode" : nil,
             endpointFrames != nil ? "--endpoint-frames" : nil,
-            resetAfterSilenceFrames != nil ? "--reset-after-silence-frames" : nil,
         ].compactMap { $0 }
         if !stream, !streamingOnly.isEmpty {
             throw ValidationError(
@@ -182,12 +183,20 @@ struct SpeechRecognizer: AsyncParsableCommand {
         } else if isBundle {
             try await runBundle(
                 bundleURL: bundleURL, audioPath: audioPath, warmup: warmup, verbose: verbose,
-                dumpMel: dumpMel)
+                dumpMel: dumpMel, resetAfterSilenceFrames: resetAfterSilenceFrames)
         } else if stream {
             throw ValidationError(
                 "--stream needs a Parakeet TDT bundle directory. A single .aimodel is the "
                     + "legacy Whisper layout, which has no chunked path.")
         } else {
+            // The legacy layout is Whisper, which is encoder-decoder and has no transducer
+            // predictor to reset. Rejected rather than ignored, for the same reason as the
+            // streaming-only flags above.
+            if resetAfterSilenceFrames != nil {
+                throw ValidationError(
+                    "--reset-after-silence-frames applies to a transducer's predictor state; a "
+                        + "single .aimodel is the legacy Whisper layout, which has none.")
+            }
             try await runLegacy(model: model, audioPath: audioPath, warmup: warmup)
         }
     }
@@ -206,7 +215,8 @@ struct SpeechRecognizer: AsyncParsableCommand {
 // MARK: - Split bundle via CoreAISpeech
 
 func runBundle(
-    bundleURL: URL, audioPath: String?, warmup: Bool, verbose: Bool, dumpMel: String? = nil
+    bundleURL: URL, audioPath: String?, warmup: Bool, verbose: Bool, dumpMel: String? = nil,
+    resetAfterSilenceFrames: Int? = nil
 ) async throws {
     // The architecture is printed after loading, once the bundle has reported it.
     // Detect an existing cached specialization before loading so we can annotate the load time
@@ -263,7 +273,8 @@ func runBundle(
 
     if let audioURL { print("Transcribing \(audioURL.lastPathComponent)…") }
     let t0 = ContinuousClock.now
-    let (text, stats) = try await model.transcribe(pcm: pcm)
+    let (text, stats) = try await model.transcribe(
+        pcm: pcm, resetAfterSilenceFrames: resetAfterSilenceFrames ?? 0)
     let totalTranscribeTime = (ContinuousClock.now - t0)
     let totalMs = totalTranscribeTime.inMilliseconds
     print("\n── Decode ─────────────────────────────────────────────────────────────")

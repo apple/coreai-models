@@ -45,7 +45,7 @@ public struct EndpointingConfig: Sendable, Equatable {
     /// continuous-speech files byte-identical, and 40 through 150 all recovered the pause cases.
     ///
     /// Deliberately well above `silenceFrames`. Resetting at every endpoint cost ~3.8 s of
-    /// dropped audio while the predictor resynced from SOS, because across an ordinary
+    /// dropped audio while the predictor re-established context, because across an ordinary
     /// inter-phrase pause the state is still worth carrying. NeMo threads one unbroken state
     /// through the whole stream (`speech_to_text_streaming_infer_rnnt.py:426`, `:494-510`), so
     /// this has no upstream counterpart — set 0 to match it exactly.
@@ -72,12 +72,12 @@ public struct EndpointingConfig: Sendable, Equatable {
                     + ">= the bundle's chunk (\(chunkFrames))")
         }
         // At or below the endpoint threshold this fires on every segment boundary, which is
-        // the configuration already measured to drop ~3.8 s of audio to an SOS resync.
+        // the configuration already measured to drop ~3.8 s of audio to a predictor reset.
         guard resetAfterSilenceFrames == 0 || resetAfterSilenceFrames > silenceFrames else {
             throw SpeechError.invalidStreamingConfig(
                 "resetAfterSilenceFrames (\(resetAfterSilenceFrames)) must be 0 or greater than "
                     + "silenceFrames (\(silenceFrames)) — resetting at every endpoint drops "
-                    + "audio while the predictor resyncs from SOS")
+                    + "audio while the predictor re-establishes context")
         }
     }
 }

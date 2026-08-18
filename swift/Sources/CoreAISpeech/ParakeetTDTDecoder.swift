@@ -199,11 +199,16 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
             self.firstStep = true
         }
 
-        /// Start a new segment: zero the LSTM and re-seed SOS.
+        /// Start a new segment: zero the LSTM and re-seed the blank as the previous label.
+        ///
+        /// There is no start-of-sequence token; the start condition is all-zeros, since the
+        /// blank's embedding row is itself zero (NeMo's `padding_idx=blank_idx`,
+        /// `nemo/collections/asr/modules/rnnt.py:843`). `firstStep` is load-bearing: without it
+        /// the blank takes the blank-skip branch and reuses a `decOut` from the discarded state.
         ///
         /// Not called when a streaming segment is finalized — that is only a display
         /// boundary, and resetting there cost ~3.8 s of dropped audio while the predictor
-        /// resynced. This is for a caller that wants a genuine hard reset.
+        /// re-established context. This is for a caller that wants a genuine hard reset.
         ///
         /// Deliberately leaves `timeJump` alone — it describes the audio timeline, which is
         /// continuous across a segment boundary, not the label history.
@@ -304,7 +309,8 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
                 for _ in 0..<cfg.maxSymbolsPerStep {
                     // Per-iteration, not per-step: one step runs this loop up to
                     // `maxSymbolsPerStep` times, so the input here may be a symbol the same step
-                    // just emitted. `firstStep` covers SOS.
+                    // just emitted. `firstStep` covers the initial blank, which is the
+                    // start-of-sequence condition rather than a real previous label.
                     let inputIsBlank = (previousSymbol == cfg.blankTokenId)
 
                     // Blank-skip (optimization): a blank input reproduces the last decoder
@@ -469,6 +475,34 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
         validEncoderFrames: Int,
         resources: DecoderResources
     ) async throws -> (tokens: [Int32], stats: DecodeStats) {
+        try await decode(
+            encoderOutput: encoderOutput,
+            encoderOutputShape: encoderOutputShape,
+            validEncoderFrames: validEncoderFrames,
+            resources: resources,
+            resetAfterSilenceFrames: 0)
+    }
+
+    /// As the protocol's `decode`, with the transducer's long-silence predictor reset.
+    ///
+    /// Not on `SpeechDecoder` because it is specific to a transducer's carried label history —
+    /// Whisper has no predictor to re-seed. Callers reach it the way `startStream` does, by
+    /// downcasting to this type.
+    ///
+    /// - Parameter resetAfterSilenceFrames: Encoder frames of decoder silence after which the
+    ///   predictor is reset to its start condition, or 0 to never. **0 is the right default for offline work**:
+    ///   it is what keeps this path byte-for-byte identical to HF's `generate()`, which is the property the
+    ///   `--parity-test` token and transcript comparisons rest on. Pass a non-zero value only when
+    ///   transcribing recordings whose internal pauses are long enough to lose the resuming utterance's
+    ///   opening words — see `EndpointingConfig.resetAfterSilenceFrames` for the measurement
+    ///   and for why 40 frames is the streaming default.
+    public func decode(
+        encoderOutput: NDArray,
+        encoderOutputShape: [Int],
+        validEncoderFrames: Int,
+        resources: DecoderResources,
+        resetAfterSilenceFrames: Int
+    ) async throws -> (tokens: [Int32], stats: DecodeStats) {
         // Only the config is read from `resources`; the two graphs come from the same
         // models this decoder was initialized with, already loaded in `init`.
         guard case .parakeetTDT(_, _, let cfg) = resources else {
@@ -487,12 +521,14 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
         let cap = max(1, min(tEnc, validEncoderFrames))
 
         // The offline path is one chunk covering the whole utterance, over state that
-        // nothing else will touch — so it is byte-for-byte the previous behaviour.
+        // nothing else will touch — so at the default reset of 0 it is byte-for-byte the
+        // previous behaviour.
         return try await makeStream(config: cfg).decodeFrames(
             encoderOutput: encoderOutput,
             encoderOutputShape: encoderOutputShape,
             frames: 0..<cap,
-            windowStartFrame: 0)
+            windowStartFrame: 0,
+            resetAfterSilenceFrames: resetAfterSilenceFrames)
     }
 
     /// Preconditions the decode loop's arithmetic depends on.

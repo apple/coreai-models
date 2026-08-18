@@ -387,7 +387,7 @@ extension SpeechRecognitionModel {
                 _ = try emit(session, final: true)
                 // A segment boundary is a *display* boundary: the transducer state carries
                 // straight through it. Zeroing the LSTM here instead cost ~48 encoder frames
-                // (3.8 s) of dropped audio while it resynced from SOS — measured as three
+                // (3.8 s) of dropped audio while it re-established context — measured as three
                 // segments and 105 tokens where carrying the state gives one continuous
                 // decode and 119. Callers wanting a hard reset can still use `resetSegment`.
                 session.endpoint.reset()
