@@ -58,6 +58,14 @@ struct SpeechRecognizer: AsyncParsableCommand {
     var endpointFrames: Int?
 
     @Option(
+        help: """
+            Silent encoder frames after which the transducer predictor is reset to SOS, or 0 \
+            to never reset (NeMo's behaviour). Recovers the opening of an utterance resuming \
+            after a long gap. Defaults to the library's 40 frames (3.2 s).
+            """)
+    var resetAfterSilenceFrames: Int?
+
+    @Option(
         help:
             "Write the computed mel features to this path as raw little-endian f32, plus a <path>.json sidecar with the shape. For front-end parity checks."
     )
@@ -116,6 +124,7 @@ struct SpeechRecognizer: AsyncParsableCommand {
             realtime ? "--realtime" : nil,
             deferredDecode ? "--deferred-decode" : nil,
             endpointFrames != nil ? "--endpoint-frames" : nil,
+            resetAfterSilenceFrames != nil ? "--reset-after-silence-frames" : nil,
         ].compactMap { $0 }
         if !stream, !streamingOnly.isEmpty {
             throw ValidationError(
@@ -168,6 +177,7 @@ struct SpeechRecognizer: AsyncParsableCommand {
         if isBundle, stream, let audioPath {
             try await runStreaming(
                 bundleURL: bundleURL, audioPath: audioPath, endpointFrames: endpointFrames,
+                resetAfterSilenceFrames: resetAfterSilenceFrames,
                 realtime: realtime, deferredDecode: deferredDecode, verbose: verbose)
         } else if isBundle {
             try await runBundle(

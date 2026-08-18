@@ -229,7 +229,8 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
             encoderOutputShape: [Int],
             frames: Range<Int>,
             windowStartFrame: Int,
-            collectStats: Bool = true
+            collectStats: Bool = true,
+            resetAfterSilenceFrames: Int = 0
         ) async throws -> (tokens: [Int32], stats: DecodeStats) {
             try ParakeetTDTDecoder.validate(
                 encoderOutputShape: encoderOutputShape, logitsSize: logitsSize, config: cfg)
@@ -249,7 +250,8 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
                 encoderOutputShape: [1, frames.count, hidden],
                 frames: frames,
                 windowStartFrame: frames.lowerBound,
-                collectStats: collectStats)
+                collectStats: collectStats,
+                resetAfterSilenceFrames: resetAfterSilenceFrames)
         }
 
         /// As above, for a caller that already holds the encoder output as floats — e.g.
@@ -259,7 +261,8 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
             encoderOutputShape: [Int],
             frames: Range<Int>,
             windowStartFrame: Int,
-            collectStats: Bool = true
+            collectStats: Bool = true,
+            resetAfterSilenceFrames: Int = 0
         ) async throws -> (tokens: [Int32], stats: DecodeStats) {
             try ParakeetTDTDecoder.validate(
                 encoderOutputShape: encoderOutputShape, logitsSize: logitsSize, config: cfg)
@@ -391,6 +394,28 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
                 // Endpointing counts *frames of audio*, not steps: a blank with duration 4
                 // skips 320 ms in one step, so counting steps would under-measure silence 4×.
                 silentFrames = emittedThisStep == 0 ? silentFrames + advance : 0
+
+                // Past a long gap, drop the label history. Having emitted a sentence-final
+                // token the predictor resists re-entering an emitting state, and the resuming
+                // utterance loses its opening words — see
+                // `EndpointingConfig.resetAfterSilenceFrames` for the measurement.
+                //
+                // In the loop rather than at the caller's chunk boundary, because that is the
+                // only place every path shares: streaming, `--deferred-decode`'s single pass
+                // over aggregated frames, and offline all run this same rule, so the modes
+                // still agree with each other. Off by default, which is what keeps the offline
+                // path byte-for-byte identical to HF.
+                if resetAfterSilenceFrames > 0, silentFrames >= resetAfterSilenceFrames {
+                    // `resetSegment` owns what a reset means, including leaving `timeJump`
+                    // alone. It writes the stream's own properties, so the loop's buffers have
+                    // to be re-seeded from them: `hIn`/`cIn` are what the next step reads, and
+                    // `firstStep` forces the step graph to recompute `decOut` from the zeroed
+                    // state rather than reusing it via the blank-skip branch.
+                    resetSegment()
+                    fillFloatNDArray(&buffers.hIn, with: hiddenState)
+                    fillFloatNDArray(&buffers.cIn, with: cellState)
+                    coverage.predictorResets += 1
+                }
                 if collectStats {
                     stepTimesMs.append((ContinuousClock.now - t0).inMilliseconds)
                 }

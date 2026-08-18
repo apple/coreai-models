@@ -215,9 +215,9 @@ struct EndpointDetectorTests {
     func durationWeighted() {
         var detector = EndpointDetector(silenceFrames: 10, maxSegmentFrames: 1_000)
         // Three silent chunks of 4 frames each = 12 frames > 10, so it fires on the third.
-        #expect(detector.observe(framesAdvanced: 4, silentFrames: 4) == false)
-        #expect(detector.observe(framesAdvanced: 4, silentFrames: 8) == false)
-        #expect(detector.observe(framesAdvanced: 4, silentFrames: 12) == true)
+        #expect(detector.observe(framesAdvanced: 4, silentFrames: 4, segmentHasContent: true) == false)
+        #expect(detector.observe(framesAdvanced: 4, silentFrames: 8, segmentHasContent: true) == false)
+        #expect(detector.observe(framesAdvanced: 4, silentFrames: 12, segmentHasContent: true) == true)
         #expect(detector.framesSinceEmission == 12)
     }
 
@@ -229,20 +229,20 @@ struct EndpointDetectorTests {
     func partialEmissionWithinChunkIsNotSilence() {
         var detector = EndpointDetector(silenceFrames: 10, maxSegmentFrames: 1_000)
         // A 12-frame hop that emitted 9 frames in: only 3 frames of trailing silence.
-        #expect(detector.observe(framesAdvanced: 12, silentFrames: 3) == false)
+        #expect(detector.observe(framesAdvanced: 12, silentFrames: 3, segmentHasContent: true) == false)
         // Another full chunk of audio, still emitting — silence stays short.
-        #expect(detector.observe(framesAdvanced: 12, silentFrames: 2) == false)
+        #expect(detector.observe(framesAdvanced: 12, silentFrames: 2, segmentHasContent: true) == false)
         #expect(detector.segmentFrames == 24)
     }
 
     @Test("Any emission resets the silence run")
     func emissionResets() {
         var detector = EndpointDetector(silenceFrames: 10, maxSegmentFrames: 1_000)
-        #expect(detector.observe(framesAdvanced: 8, silentFrames: 8) == false)
-        #expect(detector.observe(framesAdvanced: 2, silentFrames: 0) == false)
+        #expect(detector.observe(framesAdvanced: 8, silentFrames: 8, segmentHasContent: true) == false)
+        #expect(detector.observe(framesAdvanced: 2, silentFrames: 0, segmentHasContent: true) == false)
         #expect(detector.framesSinceEmission == 0)
-        #expect(detector.observe(framesAdvanced: 9, silentFrames: 9) == false)
-        #expect(detector.observe(framesAdvanced: 1, silentFrames: 10) == true)
+        #expect(detector.observe(framesAdvanced: 9, silentFrames: 9, segmentHasContent: true) == false)
+        #expect(detector.observe(framesAdvanced: 1, silentFrames: 10, segmentHasContent: true) == true)
     }
 
     /// A hard cut at the cap lands mid-word: it splits one word's tokens across two
@@ -252,28 +252,80 @@ struct EndpointDetectorTests {
     func lengthCapWaitsForPause() {
         var detector = EndpointDetector(silenceFrames: 1_000, maxSegmentFrames: 20)
         // Well past the cap, but speech is continuous — must not fire.
-        #expect(detector.observe(framesAdvanced: 12, silentFrames: 0) == false)
-        #expect(detector.observe(framesAdvanced: 12, silentFrames: 0) == false)
+        #expect(detector.observe(framesAdvanced: 12, silentFrames: 0, segmentHasContent: true) == false)
+        #expect(detector.observe(framesAdvanced: 12, silentFrames: 0, segmentHasContent: true) == false)
         #expect(detector.segmentFrames == 24)
-        #expect(detector.observe(framesAdvanced: 12, silentFrames: 0) == false)
+        #expect(detector.observe(framesAdvanced: 12, silentFrames: 0, segmentHasContent: true) == false)
         // The first quiet frame past the cap closes the segment.
-        #expect(detector.observe(framesAdvanced: 1, silentFrames: 1) == true)
+        #expect(detector.observe(framesAdvanced: 1, silentFrames: 1, segmentHasContent: true) == true)
     }
 
     @Test("Under the cap, a single quiet frame is not an endpoint")
     func underCapIgnoresBriefPause() {
         var detector = EndpointDetector(silenceFrames: 10, maxSegmentFrames: 1_000)
-        #expect(detector.observe(framesAdvanced: 1, silentFrames: 1) == false)
-        #expect(detector.observe(framesAdvanced: 1, silentFrames: 0) == false)
+        #expect(detector.observe(framesAdvanced: 1, silentFrames: 1, segmentHasContent: true) == false)
+        #expect(detector.observe(framesAdvanced: 1, silentFrames: 0, segmentHasContent: true) == false)
+    }
+
+    /// The bug: a long pause runs hops that consume frames while the next segment is still
+    /// empty. Charging them to that segment spent its length budget before it had any audio —
+    /// an 8 s pause cut the following segment ~7 s early, and a pause past `maxSegmentFrames`
+    /// left it to close at its first internal breath.
+    @Test("A pause does not spend the next segment's length budget")
+    func silenceDoesNotChargeTheEmptySegment() {
+        var detector = EndpointDetector(silenceFrames: 10, maxSegmentFrames: 20)
+        // Speech, then an endpoint — the streaming path resets here.
+        #expect(detector.observe(framesAdvanced: 12, silentFrames: 12, segmentHasContent: true) == true)
+        detector.reset()
+        // A long pause: hops keep consuming frames with nothing in the open segment.
+        for _ in 0..<10 {
+            #expect(
+                detector.observe(framesAdvanced: 12, silentFrames: 132, segmentHasContent: false)
+                    == true)
+        }
+        #expect(detector.segmentFrames == 0)
+        // Speech resumes with the cap's full budget: one chunk in, it is nowhere near it.
+        #expect(detector.observe(framesAdvanced: 12, silentFrames: 0, segmentHasContent: true) == false)
+        #expect(detector.segmentFrames == 12)
     }
 
     @Test("Reset clears both counters")
     func resetClears() {
         var detector = EndpointDetector(silenceFrames: 10, maxSegmentFrames: 20)
-        _ = detector.observe(framesAdvanced: 5, silentFrames: 5)
+        _ = detector.observe(framesAdvanced: 5, silentFrames: 5, segmentHasContent: true)
         detector.reset()
         #expect(detector.framesSinceEmission == 0)
         #expect(detector.segmentFrames == 0)
+    }
+
+    /// The predictor reset has to sit well above the endpoint threshold: firing it at every
+    /// segment boundary is the configuration measured to drop ~3.8 s of audio to an SOS resync.
+    @Test("A predictor reset at or below the endpoint threshold is rejected")
+    func resetThresholdMustExceedSilence() throws {
+        #expect(throws: SpeechError.self) {
+            try EndpointingConfig(silenceFrames: 10, resetAfterSilenceFrames: 10)
+                .validate(chunkFrames: 12)
+        }
+        #expect(throws: SpeechError.self) {
+            try EndpointingConfig(silenceFrames: 10, resetAfterSilenceFrames: 5)
+                .validate(chunkFrames: 12)
+        }
+        // 0 disables it, matching NeMo's unbroken state carry, and must stay legal.
+        try EndpointingConfig(silenceFrames: 10, resetAfterSilenceFrames: 0)
+            .validate(chunkFrames: 12)
+        try EndpointingConfig(silenceFrames: 10, resetAfterSilenceFrames: 40)
+            .validate(chunkFrames: 12)
+    }
+
+    /// The shipped default, pinned: 40 frames is 3.2 s at the 80 ms frame every Parakeet
+    /// bundle has, chosen from a safe band of 30–150 (see `resetAfterSilenceFrames`).
+    @Test("The default endpointing config is internally consistent")
+    func defaultsValidate() throws {
+        let config = EndpointingConfig()
+        #expect(config.silenceFrames == 10)
+        #expect(config.maxSegmentFrames == 375)
+        #expect(config.resetAfterSilenceFrames == 40)
+        try config.validate(chunkFrames: 25)
     }
 }
 

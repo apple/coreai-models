@@ -45,6 +45,9 @@ public struct DecodeStats: Sendable {
         public var multiTokenSteps = 0
         /// Outer steps that emitted no token at all.
         public var blankOnlySteps = 0
+        /// Times the predictor was zeroed after a long silence, which only happens when a
+        /// caller opts in with `resetAfterSilenceFrames`. 0 on the offline path.
+        public var predictorResets = 0
 
         public init() {}
     }

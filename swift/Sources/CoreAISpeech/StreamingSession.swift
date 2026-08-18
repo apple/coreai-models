@@ -64,8 +64,16 @@ package struct EndpointDetector {
     /// whole chunk per hop instead made the effective rule "one hop emitted nothing" — with
     /// the default 12-frame chunk against a 10-frame threshold, any single quiet hop fired an
     /// endpoint mid-utterance.
-    package mutating func observe(framesAdvanced: Int, silentFrames: Int) -> Bool {
-        segmentFrames += framesAdvanced
+    ///
+    /// The cap bounds a segment's *displayed* length, so it runs from the first emission and
+    /// `segmentHasContent` holds it at zero until then. Counting the quiet hops after an
+    /// endpoint spent the next segment's budget before it had any audio: an 8 s pause cut the
+    /// following segment at ~23 s instead of 30, and a pause past the cap left it to close at
+    /// its first internal breath.
+    package mutating func observe(
+        framesAdvanced: Int, silentFrames: Int, segmentHasContent: Bool
+    ) -> Bool {
+        if segmentHasContent { segmentFrames += framesAdvanced }
         framesSinceEmission = silentFrames
         if framesSinceEmission >= silenceFrames { return true }
         return segmentFrames >= maxSegmentFrames && framesSinceEmission >= 1
@@ -87,6 +95,7 @@ package struct EndpointDetector {
 /// only ever reached from the owning actor's isolated state.
 package final class StreamingSessionState: @unchecked Sendable {
     package let config: StreamingConfig
+    let endpointing: EndpointingConfig
     let stream: ParakeetTDTDecoder.Stream
     let decoder: ParakeetTDTDecoder
     var endpoint: EndpointDetector
@@ -132,6 +141,7 @@ package final class StreamingSessionState: @unchecked Sendable {
         continuation: AsyncStream<TranscriptionUpdate>.Continuation
     ) {
         self.config = config
+        self.endpointing = endpointing
         self.deferredDecode = deferredDecode
         self.decoder = decoder
         self.stream = decoder.makeStream(config: tdtConfig)
@@ -249,7 +259,8 @@ extension SpeechRecognitionModel {
                 encoderOutputShape: [1, session.aggregatedFrames, hidden],
                 frames: 0..<session.aggregatedFrames,
                 windowStartFrame: 0,
-                collectStats: false)
+                collectStats: false,
+                resetAfterSilenceFrames: session.endpointing.resetAfterSilenceFrames)
             session.segmentTokens = tokens
             session.segmentStartFrame = 0
         }
@@ -326,6 +337,8 @@ extension SpeechRecognitionModel {
                 contentsOf: repeatElement(0, count: cfg.windowSampleCount - validSamples))
         }
 
+        // TODO: add code here that does not run the model if the last chunk/hop was entirely silence
+
         // The encoder's own count now covers the padding, so recompute what real audio backs:
         // frames are consumed only where they are, padded window or not.
         let (encOut, encShape, encoderValidEnc) = try await runEncoder(pcm: session.window)
@@ -357,7 +370,8 @@ extension SpeechRecognitionModel {
                 encoderOutputShape: encShape,
                 frames: lower..<upper,
                 windowStartFrame: windowStartFrame,
-                collectStats: false)
+                collectStats: false,
+                resetAfterSilenceFrames: session.endpointing.resetAfterSilenceFrames)
 
             if session.segmentTokens.isEmpty && !tokens.isEmpty {
                 session.segmentStartFrame = lower
@@ -366,7 +380,8 @@ extension SpeechRecognitionModel {
             session.lastConsumedFrame = upper
 
             let shouldEndpoint = session.endpoint.observe(
-                framesAdvanced: upper - lower, silentFrames: session.stream.silentFrames)
+                framesAdvanced: upper - lower, silentFrames: session.stream.silentFrames,
+                segmentHasContent: !session.segmentTokens.isEmpty)
 
             if shouldEndpoint, !session.segmentTokens.isEmpty {
                 _ = try emit(session, final: true)

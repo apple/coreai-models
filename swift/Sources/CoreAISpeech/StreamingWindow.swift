@@ -12,6 +12,14 @@ import Foundation
 /// Separate from `StreamingConfig` because it changes no tensor shape: the window is fixed by
 /// the traced graph, but where a transcript is cut is a caller's policy — dictation wants a long
 /// pause tolerance, live captions a short one.
+///
+/// Counts **encoder frames**, matching `StreamingConfig`, because that is the only unit in which
+/// a chunk boundary is exact. The *defaults* are wall-clock judgements calibrated at 80 ms per
+/// frame — `hop_length 160 × subsampling 8 / 16 kHz`, the frame duration of every Parakeet TDT
+/// bundle and the only one reachable today, since `export.py` reads all three off the checkpoint
+/// with no flag to override them. A bundle with a different frame duration would leave these
+/// counts meaning different durations than they were tuned as, so scale them to
+/// `StreamingConfig.seconds(frames:)` rather than reusing the defaults as-is.
 public struct EndpointingConfig: Sendable, Equatable {
     /// Frames of decoder silence, duration-weighted, before a segment is finalized. 10 frames
     /// is 0.8 s at 80 ms per frame.
@@ -19,10 +27,40 @@ public struct EndpointingConfig: Sendable, Equatable {
     /// Soft cap on segment length, 375 frames being 30 s. Splits the transcript for display
     /// without resetting the transducer, and waits for a pause so no word is cut.
     public var maxSegmentFrames: Int
+    /// Silent frames after which the transducer state is genuinely reset, or 0 to never.
+    /// 40 frames is 3.2 s at 80 ms per frame.
+    ///
+    /// Distinct from `silenceFrames`, which only closes a segment for display. Across a long
+    /// gap the predictor is still conditioned on a sentence that ended tens of seconds ago,
+    /// and having emitted a sentence-final token it resists re-entering an emitting state:
+    /// the duration head jumps across the re-onset and the resuming utterance loses its
+    /// opening words. On 11 s speech + 13 s quiet + 7 s speech the first ~5 s of the resuming
+    /// audio went missing — identically offline and under HF's own `generate()`, so this is
+    /// the checkpoint's behaviour rather than the chunking's, and the reset is a streaming-only
+    /// correction to it. Measured with `streaming_sim.py --reset-after-silence`: 33.3% -> 4.4%
+    /// WER against ground truth, and 0 resets with byte-identical output on four
+    /// continuous-speech files.
+    ///
+    /// 40 sits in a wide safe band rather than on a cliff: 30 through 150 frames all left the
+    /// continuous-speech files byte-identical, and 40 through 150 all recovered the pause cases.
+    ///
+    /// Deliberately well above `silenceFrames`. Resetting at every endpoint cost ~3.8 s of
+    /// dropped audio while the predictor resynced from SOS, because across an ordinary
+    /// inter-phrase pause the state is still worth carrying. NeMo threads one unbroken state
+    /// through the whole stream (`speech_to_text_streaming_infer_rnnt.py:426`, `:494-510`), so
+    /// this has no upstream counterpart — set 0 to match it exactly.
+    ///
+    /// Applied inside the decode loop, not at a hop boundary, so `--deferred-decode` — which
+    /// decodes aggregated frames in one pass — runs the same rule and still agrees with a live
+    /// stream. The offline path leaves it at 0 to stay byte-for-byte identical to HF.
+    public var resetAfterSilenceFrames: Int
 
-    public init(silenceFrames: Int = 10, maxSegmentFrames: Int = 375) {
+    public init(
+        silenceFrames: Int = 10, maxSegmentFrames: Int = 375, resetAfterSilenceFrames: Int = 40
+    ) {
         self.silenceFrames = silenceFrames
         self.maxSegmentFrames = maxSegmentFrames
+        self.resetAfterSilenceFrames = resetAfterSilenceFrames
     }
 
     /// Checked against the geometry it will run with: a cap below one chunk could never be
@@ -32,6 +70,14 @@ public struct EndpointingConfig: Sendable, Equatable {
             throw SpeechError.invalidStreamingConfig(
                 "silenceFrames must be >= 1 and maxSegmentFrames (\(maxSegmentFrames)) must be "
                     + ">= the bundle's chunk (\(chunkFrames))")
+        }
+        // At or below the endpoint threshold this fires on every segment boundary, which is
+        // the configuration already measured to drop ~3.8 s of audio to an SOS resync.
+        guard resetAfterSilenceFrames == 0 || resetAfterSilenceFrames > silenceFrames else {
+            throw SpeechError.invalidStreamingConfig(
+                "resetAfterSilenceFrames (\(resetAfterSilenceFrames)) must be 0 or greater than "
+                    + "silenceFrames (\(silenceFrames)) — resetting at every endpoint drops "
+                    + "audio while the predictor resyncs from SOS")
         }
     }
 }

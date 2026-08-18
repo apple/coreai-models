@@ -42,6 +42,7 @@ func runStreaming(
     bundleURL: URL,
     audioPath: String,
     endpointFrames: Int?,
+    resetAfterSilenceFrames: Int? = nil,
     realtime: Bool,
     deferredDecode: Bool = false,
     verbose: Bool
@@ -53,6 +54,9 @@ func runStreaming(
 
     var endpointing = EndpointingConfig()
     if let endpointFrames { endpointing.silenceFrames = endpointFrames }
+    if let resetAfterSilenceFrames {
+        endpointing.resetAfterSilenceFrames = resetAfterSilenceFrames
+    }
 
     let url = URL(fileURLWithPath: audioPath)
     let pcm = try MelSpectrogram.loadAndResample(url, targetSampleRate: sampleRate)
