@@ -191,6 +191,18 @@ struct StreamingFrameMathTests {
             try StreamingConfig(leftContextFrames: 100, chunkFrames: 0, rightContextFrames: 12)
                 .validate(maxDuration: 4, encoderMelFrames: nil)
         }
+        // Negative context. `leftContextFrames` is derived, so a window too small to hold the
+        // chunk plus right context makes it negative, which would start the window past the
+        // frames it is meant to cover.
+        #expect(throws: SpeechError.self) {
+            // usable = ceil(80/8) = 10 encoder frames, but chunk + right asks for 13.
+            try StreamingConfig(windowMelFrames: 81, chunkFrames: 8, rightContextFrames: 5)
+                .validate(maxDuration: 4, encoderMelFrames: 81)
+        }
+        #expect(throws: SpeechError.self) {
+            try StreamingConfig(leftContextFrames: 100, chunkFrames: 12, rightContextFrames: -1)
+                .validate(maxDuration: 4, encoderMelFrames: nil)
+        }
         // A config built for a different window than the bundle actually shipped.
         #expect(throws: SpeechError.self) {
             try Self.balancedGeometry.validate(maxDuration: 4, encoderMelFrames: 2101)
@@ -326,6 +338,27 @@ struct EndpointDetectorTests {
         #expect(config.maxSegmentFrames == 375)
         #expect(config.resetAfterSilenceFrames == 40)
         try config.validate(chunkFrames: 25)
+    }
+
+    /// Zero silence frames would fire an endpoint on every hop, and a cap below one chunk
+    /// could never be reached at a pause — the segment would be cut on the first chunk instead.
+    @Test("Endpointing rejects a threshold that could never behave as intended")
+    func endpointingRejectsUnreachableThresholds() {
+        #expect(throws: SpeechError.self) {
+            try EndpointingConfig(silenceFrames: 0).validate(chunkFrames: 25)
+        }
+        #expect(throws: SpeechError.self) {
+            try EndpointingConfig(silenceFrames: -1).validate(chunkFrames: 25)
+        }
+        #expect(throws: SpeechError.self) {
+            try EndpointingConfig(silenceFrames: 10, maxSegmentFrames: 24)
+                .validate(chunkFrames: 25)
+        }
+        // A cap of exactly one chunk is the boundary, and is allowed.
+        #expect(throws: Never.self) {
+            try EndpointingConfig(silenceFrames: 10, maxSegmentFrames: 25)
+                .validate(chunkFrames: 25)
+        }
     }
 }
 

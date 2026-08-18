@@ -93,6 +93,47 @@ struct TDTArgmaxTests {
     }
 }
 
+// MARK: - Partial reads
+
+/// `floatElements` is how a streaming hop converts only the frames it decodes, leaving the
+/// window's left and right context unconverted. Getting the range arithmetic wrong would hand
+/// the joint a frame of the wrong audio, so the offsets are pinned here.
+@Suite("Encoder frame slicing")
+struct FloatElementsTests {
+    /// A `[1, frames, hidden]` encoder output, the shape the streaming path slices.
+    private func encoderOutput(
+        frames: Int, hidden: Int, scalarType: NDArray.ScalarType = .float32
+    ) -> NDArray {
+        var array = NDArray(shape: [1, frames, hidden], scalarType: scalarType)
+        fillFloatNDArray(&array, with: (0..<(frames * hidden)).map { Float($0) })
+        return array
+    }
+
+    @Test("Converts exactly the requested range, in row-major order")
+    func convertsRequestedRange() {
+        let array = encoderOutput(frames: 4, hidden: 3)
+        #expect(floatElements(array, in: 0..<3) == [0, 1, 2])
+        // Frame 2 of a hidden-3 output: the slice the decode loop takes per step.
+        #expect(floatElements(array, in: 6..<9) == [6, 7, 8])
+        #expect(floatElements(array, in: 0..<12).count == 12)
+    }
+
+    @Test("An empty range converts to nothing")
+    func emptyRange() {
+        #expect(floatElements(encoderOutput(frames: 2, hidden: 3), in: 3..<3).isEmpty)
+    }
+
+    /// The usual case at runtime: a `--dtype float16` bundle's encoder output, converted up.
+    @Test("An f16 output converts to the same values as f32")
+    func float16Matches() {
+        let expected: [Float] = [3, 4, 5]
+        #expect(floatElements(encoderOutput(frames: 4, hidden: 3), in: 3..<6) == expected)
+        #expect(
+            floatElements(encoderOutput(frames: 4, hidden: 3, scalarType: .float16), in: 3..<6)
+                == expected)
+    }
+}
+
 // MARK: - Decode preconditions
 
 @Suite("TDT decode preconditions")
