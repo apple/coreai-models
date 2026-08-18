@@ -22,6 +22,26 @@ def _register_novel_configs() -> None:
             class _MuseGlimmerTextConfig(PretrainedConfig):
                 model_type = "muse_glimmer_text"
 
+                def __init__(self, **kwargs):
+                    kwargs.setdefault("hidden_size", 64)
+                    kwargs.setdefault("num_attention_heads", 4)
+                    kwargs.setdefault("num_key_value_heads", 2)
+                    kwargs.setdefault("num_hidden_layers", 4)
+                    kwargs.setdefault("intermediate_size", 128)
+                    kwargs.setdefault("vocab_size", 200)
+                    kwargs.setdefault("max_position_embeddings", 512)
+                    kwargs.setdefault("head_dim", 16)
+                    kwargs.setdefault("rms_norm_eps", 1e-5)
+                    kwargs.setdefault("sliding_window", 8)
+                    kwargs.setdefault("output_multiplier", 0.196)
+                    kwargs.setdefault("qk_scale_factor", 3.87)
+                    kwargs.setdefault("final_logit_softcapping", 20.0)
+                    kwargs.setdefault("tie_word_embeddings", False)
+                    kwargs.setdefault("post_norm_eps", 1e-8)
+                    kwargs.setdefault("layer_types", ["sliding_attention", "sliding_attention", "sliding_attention", "full_attention"])
+                    kwargs.setdefault("layer_rope_theta", [500000, 500000, 500000, 0])
+                    super().__init__(**kwargs)
+
             class _MuseGlimmerConfig(PretrainedConfig):
                 model_type = "muse_glimmer"
 
@@ -34,6 +54,7 @@ def _register_novel_configs() -> None:
                         self.text_config = tc
 
             AutoConfig.register("muse_glimmer", _MuseGlimmerConfig)
+            AutoConfig.register("muse_glimmer_text", _MuseGlimmerTextConfig)
     except Exception:
         pass
 
