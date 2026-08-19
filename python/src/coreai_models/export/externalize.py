@@ -55,15 +55,12 @@ EXTERNALIZE_SPECS: list[type | coreai_torch.ExternalizeSpec] = [
 def patch_model_for_externalization(
     model: torch.nn.Module,
     specs: Sequence[type | coreai_torch.ExternalizeSpec] | None = None,
-) -> torch.nn.Module:
+) -> None:
     """Mark ``model``'s composite-op submodules in place.
 
     Args:
         model: The eager module to mark. Mutated in place.
         specs: Externalization specs. Defaults to ``EXTERNALIZE_SPECS``.
-
-    Returns:
-        ``model``, as the handle to pass back to ``subexport_and_restore``.
     """
     specs = EXTERNALIZE_SPECS if specs is None else specs
     coreai_torch._patch_model_for_externalization(model, list(specs))
@@ -71,7 +68,6 @@ def patch_model_for_externalization(
         "Marked %d composite-op submodule(s) for externalization",
         len(_find_marked_submodules(model)),
     )
-    return model
 
 
 def subexport_and_restore(

@@ -253,33 +253,21 @@ async def _async_export_model(config: ExportConfig) -> str:
                 tokenizer = AutoTokenizer.from_pretrained(config.hf_model_id)
                 return get_c4(tokenizer)
 
-            # Pass-through prebuilt QuantizerConfig objects.
-            # copy dicts so we don't mutate the shared preset.
-            quant_cfg = (
-                torch_quantization_config
-                if not isinstance(torch_quantization_config, dict)
-                else dict(torch_quantization_config)
-            )
+            # Copy so we don't mutate the shared preset.
+            quant_cfg = dict(torch_quantization_config)
 
             # The preset or YAML is the source of truth; `--quantization-mode` overrides
             # it only when given.
             if config.quantization_mode is not None:
-                if isinstance(quant_cfg, dict):
-                    quant_cfg["execution_mode"] = config.quantization_mode
-                else:
-                    quant_cfg.execution_mode = ExecutionMode(config.quantization_mode)
-            elif isinstance(quant_cfg, dict) and "execution_mode" not in quant_cfg:
+                quant_cfg["execution_mode"] = config.quantization_mode
+            elif "execution_mode" not in quant_cfg:
                 raise ValueError(
                     f"Compression config '{config.compression}' does not set "
                     "'execution_mode'. Set it there, or pass --quantization-mode "
                     "{eager,graph}."
                 )
 
-            execution_mode = ExecutionMode(
-                quant_cfg["execution_mode"]
-                if isinstance(quant_cfg, dict)
-                else quant_cfg.execution_mode
-            )
+            execution_mode = ExecutionMode(quant_cfg["execution_mode"])
             graph_mode = execution_mode == ExecutionMode.GRAPH
 
             quantizer_mmap_dir: str | None = None
@@ -290,16 +278,22 @@ async def _async_export_model(config: ExportConfig) -> str:
                 os.makedirs(quantizer_mmap_dir, exist_ok=True)
 
             if graph_mode:
-                externalized_model = patch_model_for_externalization(model)
+                patch_model_for_externalization(model)
+                # externalization patches live on the eager module's composite op
+                # submodules but quantize_for_export in graph-mode below returns a
+                # new GraphModule which get overwritten to `model`.
+                # So, keep a handle on the eager module the composites were patched on,
+                # for the sub-export later.
+                externalized_model = model
 
-                model = quantize_for_export(
-                    model,
-                    hf_config,
-                    target_dtype,
-                    quant_cfg,
-                    calibration_data_fn=get_calibration_data,
-                    mmap_dir=quantizer_mmap_dir,
-                )
+            model = quantize_for_export(
+                model,
+                hf_config,
+                target_dtype,
+                quant_cfg,
+                calibration_data_fn=get_calibration_data,
+                mmap_dir=quantizer_mmap_dir,
+            )
 
         if torch_palettization_config is not None:
             assert config.variant == "iOS", "palettization is only supported for iOS variant."
