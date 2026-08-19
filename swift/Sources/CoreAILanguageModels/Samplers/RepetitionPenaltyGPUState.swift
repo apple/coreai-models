@@ -10,13 +10,13 @@ import Metal
 ///
 /// Uses a split design to avoid races between GPU reads and CPU writes:
 /// - `recordToken()`: updates only the CPU-side ring buffer (no MTLBuffer writes)
-/// - `syncBuffer(forStep:)`: writes the full penalty state to a specific buffer
+/// - `buffer(forStep:)`: writes the full penalty state to a specific buffer
 ///   slot, called at encode time when the gate guarantees that slot is not in use
 ///
-/// Thread safety: `recordToken` is called from Metal completion callbacks.
-/// `syncBuffer` is called from the encode thread. The gate serializes them:
-/// `syncBuffer(N)` is called only after the gate releases (meaning the previous
-/// user of slot N%depth completed), and `recordToken` fires from that completion.
+/// Thread safety: relies on MPSGraph runAsync completions being dispatched in
+/// submission order on a single MTLCommandQueue (observed behavior, validated by
+/// `MPSGraphCompletionOrderingTests`). The gate further ensures that
+/// `buffer(forStep:)` does not overlap with `recordToken` for the same slot.
 final class RepetitionPenaltyGPUState: @unchecked Sendable {
     let penaltyBuffers: [MTLBuffer]
     let vocabSize: Int
