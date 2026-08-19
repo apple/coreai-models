@@ -39,8 +39,14 @@ def _make_glimmer_config(**overrides) -> SimpleNamespace:
         post_norm_eps=1e-8,
         qk_scale_factor=3.87,
         layer_types=[
-            "sliding_attention", "sliding_attention", "sliding_attention", "full_attention",
-            "sliding_attention", "sliding_attention", "sliding_attention", "full_attention",
+            "sliding_attention",
+            "sliding_attention",
+            "sliding_attention",
+            "full_attention",
+            "sliding_attention",
+            "sliding_attention",
+            "sliding_attention",
+            "full_attention",
         ],
         layer_rope_theta=[500000, 500000, 500000, 0, 500000, 500000, 500000, 0],
     )
