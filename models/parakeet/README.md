@@ -48,7 +48,7 @@ uv run export.py --help
 import CoreAISpeech
 
 // Load an exported bundle directory (metadata.json + encoder/decoder_step/joint .aimodel assets + processor/).
-let model = try await SpeechRecognitionModel(resourcesAt: "coreai-models/exports/parakeet-tdt-0.6b-v3_float32_static")
+let model = try await SpeechRecognitionModel(resourcesAt: URL(fileURLWithPath: "coreai-models/exports/parakeet-tdt-0.6b-v3_float32_static"))
 
 // Transcribe an audio file — decoded and resampled to the model's sample rate automatically:
 let (text, stats) = try await model.transcribe(audioURL: URL(fileURLWithPath: "audio.wav"))
@@ -151,7 +151,7 @@ geometry the file misdescribes.
 import CoreAISpeech
 
 let model = try await SpeechRecognitionModel(
-    resourcesAt: "exports/parakeet-tdt-0.6b-v3_float16_streaming150")
+    resourcesAt: URL(fileURLWithPath: "exports/parakeet-tdt-0.6b-v3_float16_streaming150"))
 
 // This package does not capture audio. A host app owns AVAudioEngine, converts to
 // mono float32 at model.sampleRate, and pushes buffers in.
