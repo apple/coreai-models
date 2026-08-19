@@ -1056,10 +1056,14 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
         completion: @escaping (Int32, Error?) -> Void
     ) {
         if queryLength == 1 {
-            try? encode(
-                to: queue, logitsBuffer: logitsBuffer, logitsOffset: 0,
-                outputBuffer: outputBuffer, outputOffset: outputOffset,
-                applyBitmask: applyBitmask, completion: completion)
+            do {
+                try encode(
+                    to: queue, logitsBuffer: logitsBuffer, logitsOffset: 0,
+                    outputBuffer: outputBuffer, outputOffset: outputOffset,
+                    applyBitmask: applyBitmask, completion: completion)
+            } catch {
+                completion(0, error)
+            }
             return
         }
         let logitsOffset = (queryLength - 1) * vocabSize * MemoryLayout<UInt16>.size
@@ -1077,10 +1081,14 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
         blitEncoder.endEncoding()
         blitCmdBuffer.commit()
 
-        try? encode(
-            to: queue, logitsBuffer: tempBuffer, logitsOffset: 0,
-            outputBuffer: outputBuffer, outputOffset: outputOffset,
-            applyBitmask: applyBitmask, completion: completion)
+        do {
+            try encode(
+                to: queue, logitsBuffer: tempBuffer, logitsOffset: 0,
+                outputBuffer: outputBuffer, outputOffset: outputOffset,
+                applyBitmask: applyBitmask, completion: completion)
+        } catch {
+            completion(0, error)
+        }
     }
 
     /// Encode sampling with repetition penalty buffer.

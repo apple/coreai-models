@@ -115,7 +115,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
 
     @Option(
         name: .customLong("repetition-penalty-window"),
-        help: "Number of recent tokens to consider for repetition penalty (default: all)")
+        help: "Number of recent tokens to consider for repetition penalty (default: all; GPU engine caps at 256)")
     var repetitionPenaltyWindow: Int?
 
     @Option(help: "Sampling strategy. Options: 'temperature' (default), 'greedy'")
