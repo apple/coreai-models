@@ -85,11 +85,14 @@ class Attention(nn.Module):
         batch_size, query_len, _ = x.shape
         n_heads, n_kv_heads = self.n_heads, self.n_kv_heads
 
-        query = self.qk_norm(
-            self.q_proj(x)
-            .reshape(batch_size, query_len, n_heads, self.head_dim)
-            .permute(0, 2, 1, 3)
-        ) * self.qk_scale_factor
+        query = (
+            self.qk_norm(
+                self.q_proj(x)
+                .reshape(batch_size, query_len, n_heads, self.head_dim)
+                .permute(0, 2, 1, 3)
+            )
+            * self.qk_scale_factor
+        )
         key = self.qk_norm(
             self.k_proj(x)
             .reshape(batch_size, query_len, n_kv_heads, self.head_dim)
@@ -111,8 +114,9 @@ class Attention(nn.Module):
         rope_positions = position_ids.narrow(-1, offset, query_len)
 
         if self.has_rope:
-            query = self.rope(query, position_ids=rope_positions, freqs=self._rope_freqs.float())
-            key = self.rope(key, position_ids=rope_positions, freqs=self._rope_freqs.float())
+            freqs = self._rope_freqs.to(device=query.device)
+            query = self.rope(query, position_ids=rope_positions, freqs=freqs)
+            key = self.rope(key, position_ids=rope_positions, freqs=freqs)
 
         if cache is not None:
             key, value = cache.update_and_fetch(
@@ -279,7 +283,7 @@ class MuseGlimmerForCausalLM(BaseForCausalLM):
         prefix = "model.language_model."
         for k, v in shared_dict.items():
             if k.startswith(prefix):
-                normalized["model." + k[len(prefix):]] = v
+                normalized["model." + k[len(prefix) :]] = v
             else:
                 normalized[k] = v
         del shared_dict
@@ -295,7 +299,7 @@ class MuseGlimmerForCausalLM(BaseForCausalLM):
             # Strip prefix → "layers.N.*", then add "model." → "model.layers.N.*"
             remapped: dict[str, torch.Tensor] = {}
             for k, v in layer_sd.items():
-                remapped["model." + k[len(prefix):]] = v
+                remapped["model." + k[len(prefix) :]] = v
             del layer_sd
             model.load_state_dict(remapped, assign=True, strict=False)
             del remapped
@@ -348,7 +352,7 @@ class MuseGlimmerForCausalLM(BaseForCausalLM):
             if key.startswith("model.vision_tower.") or key.startswith("model.vision_"):
                 del state_dict[key]
             elif key.startswith(prefix):
-                state_dict["model." + key[len(prefix):]] = state_dict.pop(key)
+                state_dict["model." + key[len(prefix) :]] = state_dict.pop(key)
             elif (
                 key.startswith("layers.") or key.startswith("norm.") or key == "embed_tokens.weight"
             ):
