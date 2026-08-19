@@ -59,7 +59,7 @@ uv run export.py --help
 ### In your iOS and macOS applications
 
 ```swift
-import CoreAIImageSegmenter
+import ImageSegmenter
 
 // Load from a segmenter bundle directory (contains metadata.json and *.aimodel).
 let segmenter = try await ImageSegmenter(resourcesAt: "coreai-models/exports/efficient_sam_vitt_float32_static")

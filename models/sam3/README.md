@@ -75,7 +75,7 @@ Full bundles land at `<repo-root>/exports/<model>_<dtype>/` (e.g. `exports/sam3_
 ### In your iOS and macOS applications
 
 ```swift
-import CoreAIImageSegmenter
+import ImageSegmenter
 
 // Load from a segmenter bundle directory (contains metadata.json, *.aimodel, and tokenizer/)
 let segmenter = try await ImageSegmenter(resourcesAt: "coreai-models/exports/sam3_lite_336_w4_static")
