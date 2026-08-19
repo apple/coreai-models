@@ -136,14 +136,16 @@ public struct ConstrainedDecodingStrategy: DecodingStrategy {
         }
 
         var maskedLogits = logits
-        if samplingConfiguration.needsRepetitionPenalty {
+        if samplingConfiguration.needsRepetitionPenalty,
+            let penalty = samplingConfiguration.repetitionPenalty
+        {
             let window =
                 samplingConfiguration.repetitionPenaltyWindow.map { min($0, generatedTokens.count) }
                 ?? generatedTokens.count
             RepetitionPenaltyProcessor.apply(
                 to: &maskedLogits,
                 recentTokenIds: generatedTokens.suffix(window),
-                penalty: Float(samplingConfiguration.repetitionPenalty!)
+                penalty: Float(penalty)
             )
         }
         _ = session.applyMask(to: &maskedLogits)

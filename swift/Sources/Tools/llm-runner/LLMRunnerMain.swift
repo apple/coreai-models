@@ -262,6 +262,16 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         if videoFrames < 1 {
             throw ValidationError("--video-frames must be >= 1")
         }
+        if let p = repetitionPenalty, p < 1.0 {
+            throw ValidationError("--repetition-penalty must be >= 1.0")
+        }
+        if repetitionPenaltyWindow != nil && repetitionPenalty == nil {
+            throw ValidationError("--repetition-penalty-window requires --repetition-penalty")
+        }
+        if repetitionPenalty != nil && jsonSchema != nil {
+            throw ValidationError(
+                "--repetition-penalty cannot be used with --json-schema (constrained generation does not support penalty on the pipelined engine)")
+        }
     }
 
     func run() async throws {
@@ -865,13 +875,17 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
                 combined: !synchronousSampling
             )
         case "greedy":
-            // Fatal error if topK/topP/minP set with greedy
             if topK != nil || topP != nil || minP != nil {
                 print("Error: --top-k, --top-p, and --min-p cannot be used with --sampling-strategy greedy")
                 print("Use --sampling-strategy temperature with --top-k/--top-p/--min-p, or remove them for greedy")
                 throw ExitCode.failure
             }
-            config = SamplingConfiguration(temperature: 0, combined: !synchronousSampling)
+            config = SamplingConfiguration(
+                temperature: 0,
+                repetitionPenalty: repetitionPenalty,
+                repetitionPenaltyWindow: repetitionPenaltyWindow,
+                combined: !synchronousSampling
+            )
         default:
             print("Error: Unknown sampling strategy '\(samplingStrategy)'")
             print("Valid options: 'temperature', 'greedy'")

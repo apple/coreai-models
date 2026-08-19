@@ -314,6 +314,10 @@ extension SamplingConfiguration {
     /// - Parameter logits: Mutable array of Float16 logits. May be modified during sampling.
     /// - Returns: The sampled token ID.
     public func fallbackSampler(from logits: inout [LogitsScalarType]) -> Int32 {
+        precondition(
+            !needsRepetitionPenalty,
+            "Use fallbackSampler(from:tokenHistory:) when repetition penalty is configured"
+        )
         return CompositeSampler.sample(from: &logits, config: self)
     }
 
