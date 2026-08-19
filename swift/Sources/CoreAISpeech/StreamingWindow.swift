@@ -174,6 +174,14 @@ public struct StreamingConfig: Sendable, Equatable {
         guard let payload = try? JSONDecoder().decode(MetadataPayload.self, from: raw),
             let block = payload.streaming
         else { return nil }
+        // Checked before the config is built: every frame count below runs through
+        // `encoderFrameCount`, and a zero hop would divide by zero in `subsamplingFactor`.
+        guard block.hopLength > 0, isValidSubsamplingFactor(block.subsamplingFactor) else {
+            throw SpeechError.invalidStreamingConfig(
+                "streaming metadata has hop_length \(block.hopLength) and subsampling_factor "
+                    + "\(block.subsamplingFactor); the hop must be positive and the factor a "
+                    + "power of two (the encoder's front end is a stack of stride-2 convs)")
+        }
         let config = StreamingConfig(
             windowMelFrames: block.windowMelFrames,
             chunkFrames: block.chunkEncoderFrames,
@@ -304,9 +312,16 @@ public struct StreamingConfig: Sendable, Equatable {
 ///
 /// Three stride-2, kernel-3, pad-1 convs, each `ceil(L/2)`, composing to `ceil(L/8)`. Mirrors HF
 /// `ParakeetPreTrainedModel._get_subsampling_output_length` rather than hardcoding the closed
-/// form, so an unusual `subsamplingFactor` still computes the right answer.
+/// form, so a bundle with a different power-of-two factor still computes the right answer.
+///
+/// `subsamplingFactor` must be a power of two — all a stack of stride-2 convs can express. The
+/// loop halves, so a factor of 6 would otherwise apply silently as 4. Both metadata decoders
+/// reject a bad factor first, so this traps only a programming error.
 public func encoderFrameCount(melFrames: Int, subsamplingFactor: Int) -> Int {
     guard melFrames > 0, subsamplingFactor > 1 else { return max(0, melFrames) }
+    precondition(
+        subsamplingFactor & (subsamplingFactor - 1) == 0,
+        "subsamplingFactor must be a power of two, got \(subsamplingFactor)")
     var length = melFrames
     var factor = subsamplingFactor
     while factor > 1 {
@@ -314,4 +329,9 @@ public func encoderFrameCount(melFrames: Int, subsamplingFactor: Int) -> Int {
         factor /= 2
     }
     return length
+}
+
+/// Whether `factor` is a subsampling factor `encoderFrameCount` can express.
+package func isValidSubsamplingFactor(_ factor: Int) -> Bool {
+    factor > 0 && factor & (factor - 1) == 0
 }

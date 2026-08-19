@@ -110,7 +110,7 @@ package final class StreamingSessionState: @unchecked Sendable {
     var lastConsumedFrame = 0
     var finished = false
 
-    let continuation: AsyncStream<TranscriptionUpdate>.Continuation
+    let continuation: AsyncThrowingStream<TranscriptionUpdate, Error>.Continuation
 
     init(
         config: StreamingConfig,
@@ -118,7 +118,7 @@ package final class StreamingSessionState: @unchecked Sendable {
         tdtConfig: ParakeetTDTConfig,
         endpointing: EndpointingConfig,
         deferredDecode: Bool = false,
-        continuation: AsyncStream<TranscriptionUpdate>.Continuation
+        continuation: AsyncThrowingStream<TranscriptionUpdate, Error>.Continuation
     ) {
         self.config = config
         self.endpointing = endpointing
@@ -156,7 +156,7 @@ extension SpeechRecognitionModel {
     public func startStream(
         endpointing: EndpointingConfig = EndpointingConfig(),
         deferredDecode: Bool = false
-    ) throws -> AsyncStream<TranscriptionUpdate> {
+    ) throws -> AsyncThrowingStream<TranscriptionUpdate, Error> {
         guard case .parakeetTDT = bundle.kind, let tdtConfig,
             let parakeet = decoder as? ParakeetTDTDecoder
         else {
@@ -190,7 +190,8 @@ extension SpeechRecognitionModel {
             maxDuration: tdtConfig.durations.max() ?? 0, encoderMelFrames: melConfig.nFrames)
         try endpointing.validate(chunkFrames: config.chunkFrames)
 
-        let (stream, continuation) = AsyncStream.makeStream(of: TranscriptionUpdate.self)
+        let (stream, continuation) = AsyncThrowingStream.makeStream(
+            of: TranscriptionUpdate.self, throwing: Error.self)
         streaming = StreamingSessionState(
             config: config, decoder: parakeet, tdtConfig: tdtConfig, endpointing: endpointing,
             deferredDecode: deferredDecode, continuation: continuation)
@@ -247,7 +248,7 @@ extension SpeechRecognitionModel {
     /// Convenience: drive a whole async sequence of buffers to completion.
     public func transcribe<S: AsyncSequence & Sendable>(
         pcmStream: S, endpointing: EndpointingConfig = EndpointingConfig()
-    ) throws -> AsyncStream<TranscriptionUpdate> where S.Element == [Float] {
+    ) throws -> AsyncThrowingStream<TranscriptionUpdate, Error> where S.Element == [Float] {
         let updates = try startStream(endpointing: endpointing)
         Task { [weak self] in
             guard let self else { return }
@@ -257,10 +258,20 @@ extension SpeechRecognitionModel {
                 }
                 _ = try await self.finishStream()
             } catch {
-                _ = try? await self.finishStream()
+                await self.abandonStream(throwing: error)
             }
         }
         return updates
+    }
+
+    /// Drop a failed session and hand the error to the stream's consumer.
+    ///
+    /// Not `finishStream()`: that flushes and calls `finish()`, and the first finish wins — the
+    /// consumer would see a clean end of stream instead of the failure.
+    private func abandonStream(throwing error: Error) {
+        let continuation = streaming?.continuation
+        streaming = nil
+        continuation?.finish(throwing: error)
     }
 
     // MARK: - Internals
@@ -323,45 +334,13 @@ extension SpeechRecognitionModel {
         let lower = min(consume.lowerBound, upper)
 
         if lower < upper, session.deferredDecode {
-            // Keep only the chunk's frames, exactly as the streaming path consumes them,
-            // and defer all decoding to finishStream().
-            let hidden = tdtConfig?.decoderHiddenSize ?? 0
-            let lo = (lower - windowStartFrame) * hidden
-            let hi = (upper - windowStartFrame) * hidden
-            session.aggregated.append(contentsOf: floatElements(encOut, in: lo..<hi))
-            session.aggregatedFrames += upper - lower
-            session.lastConsumedFrame = upper
+            aggregateChunk(
+                session, encOut: encOut, frames: lower..<upper,
+                windowStartFrame: windowStartFrame)
         } else if lower < upper {
-            let (tokens, _) = try await session.stream.decodeFrames(
-                encoderOutput: encOut,
-                encoderOutputShape: encShape,
-                frames: lower..<upper,
-                windowStartFrame: windowStartFrame,
-                collectStats: false,
-                resetAfterSilenceFrames: session.endpointing.resetAfterSilenceFrames)
-
-            if session.segmentTokens.isEmpty && !tokens.isEmpty {
-                session.segmentStartFrame = lower
-            }
-            session.segmentTokens.append(contentsOf: tokens)
-            session.lastConsumedFrame = upper
-
-            let shouldEndpoint = session.endpoint.observe(
-                framesAdvanced: upper - lower, silentFrames: session.stream.silentFrames,
-                segmentHasContent: !session.segmentTokens.isEmpty)
-
-            if shouldEndpoint, !session.segmentTokens.isEmpty {
-                _ = try emit(session, final: true)
-                // A display boundary only: the transducer state carries straight through.
-                // Zeroing the LSTM at every endpoint instead cost ~3.8 s of dropped audio while
-                // it re-established context.
-                session.endpoint.reset()
-                session.segmentIndex += 1
-                session.segmentTokens = []
-                session.segmentStartFrame = upper
-            } else if !tokens.isEmpty {
-                _ = try emit(session, final: false)
-            }
+            try await consumeChunk(
+                session, encOut: encOut, encShape: encShape, frames: lower..<upper,
+                windowStartFrame: windowStartFrame)
         }
 
         session.hop += 1
@@ -373,6 +352,57 @@ extension SpeechRecognitionModel {
             session.pcmOrigin += drop
         }
         return !isLastHop
+    }
+
+    /// Keep only the chunk's frames, exactly as the streaming path consumes them, and defer
+    /// all decoding to `finishStream()`.
+    private func aggregateChunk(
+        _ session: StreamingSessionState, encOut: NDArray, frames: Range<Int>,
+        windowStartFrame: Int
+    ) {
+        let hidden = tdtConfig?.decoderHiddenSize ?? 0
+        let lo = (frames.lowerBound - windowStartFrame) * hidden
+        let hi = (frames.upperBound - windowStartFrame) * hidden
+        session.aggregated.append(contentsOf: floatElements(encOut, in: lo..<hi))
+        session.aggregatedFrames += frames.count
+        session.lastConsumedFrame = frames.upperBound
+    }
+
+    /// Decode the chunk's frames, then endpoint and emit on what came back.
+    private func consumeChunk(
+        _ session: StreamingSessionState, encOut: NDArray, encShape: [Int], frames: Range<Int>,
+        windowStartFrame: Int
+    ) async throws {
+        let (tokens, _) = try await session.stream.decodeFrames(
+            encoderOutput: encOut,
+            encoderOutputShape: encShape,
+            frames: frames,
+            windowStartFrame: windowStartFrame,
+            collectStats: false,
+            resetAfterSilenceFrames: session.endpointing.resetAfterSilenceFrames)
+
+        if session.segmentTokens.isEmpty && !tokens.isEmpty {
+            session.segmentStartFrame = frames.lowerBound
+        }
+        session.segmentTokens.append(contentsOf: tokens)
+        session.lastConsumedFrame = frames.upperBound
+
+        let shouldEndpoint = session.endpoint.observe(
+            framesAdvanced: frames.count, silentFrames: session.stream.silentFrames,
+            segmentHasContent: !session.segmentTokens.isEmpty)
+
+        if shouldEndpoint, !session.segmentTokens.isEmpty {
+            _ = try emit(session, final: true)
+            // A display boundary only: the transducer state carries straight through.
+            // Zeroing the LSTM at every endpoint instead cost ~3.8 s of dropped audio while
+            // it re-established context.
+            session.endpoint.reset()
+            session.segmentIndex += 1
+            session.segmentTokens = []
+            session.segmentStartFrame = frames.upperBound
+        } else if !tokens.isEmpty {
+            _ = try emit(session, final: false)
+        }
     }
 
     private func emit(_ session: StreamingSessionState, final: Bool) throws -> String {

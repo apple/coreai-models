@@ -95,15 +95,20 @@ private func forEachElement<T: BinaryFloatingPoint & BitwiseCopyable>(
             indices[d] = remainder % shape[d]
             remainder /= shape[d]
         }
+        // Carry the physical offset outside the loop instead of re-deriving it per
+        // element: advancing one step is `+strides[dim]`, and a dimension that wraps gives
+        // back `strides[dim] * shape[dim]`. O(1) amortized rather than O(rank) per element.
+        var offset = 0
+        for d in 0..<rank { offset += indices[d] * strides[d] }
         for i in 0..<elementRange.count {
-            var offset = 0
-            for d in 0..<rank { offset += indices[d] * strides[d] }
             visit(i, Float(ptr[offset]))
             var dim = rank - 1
             while dim >= 0 {
                 indices[dim] += 1
+                offset += strides[dim]
                 if indices[dim] < shape[dim] { break }
                 indices[dim] = 0
+                offset -= strides[dim] * shape[dim]
                 dim -= 1
             }
         }

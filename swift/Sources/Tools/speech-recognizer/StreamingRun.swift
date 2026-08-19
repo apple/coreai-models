@@ -98,7 +98,7 @@ func runStreaming(
     let collector = Task { () -> [TranscriptSegment] in
         var finals: [TranscriptSegment] = []
         var lastPartialLength = 0
-        for await update in updates {
+        for try await update in updates {
             switch update {
             case .partial(let segment):
                 guard showPartials else { break }
@@ -143,7 +143,7 @@ func runStreaming(
         offset = end
     }
     _ = try await model.finishStream()
-    let segments = await collector.value
+    let segments = try await collector.value
     let wallMs = (ContinuousClock.now - wallStart).inMilliseconds
 
     let full = segments.map(\.text).joined(separator: " ")

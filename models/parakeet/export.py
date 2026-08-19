@@ -17,6 +17,7 @@
 # index-strategy  = "unsafe-best-match"
 # ///
 import argparse
+import dataclasses
 import json
 import shutil
 import time
@@ -121,9 +122,8 @@ class ParakeetJointModule(torch.nn.Module):
 
 
 def _audio_features_samples(
-    model_name: str, dtype: torch.dtype, num_samples: int
+    processor: "transformers.ProcessorMixin", dtype: torch.dtype, num_samples: int
 ) -> torch.Tensor:
-    processor = transformers.AutoProcessor.from_pretrained(model_name)
     sample_rate = processor.feature_extractor.sampling_rate
     dummy_audio = np.random.randn(num_samples).astype(np.float32)
     features = processor.feature_extractor(dummy_audio, sampling_rate=sample_rate)
@@ -131,11 +131,10 @@ def _audio_features_samples(
 
 
 def _audio_features(
-    model_name: str, dtype: torch.dtype, seconds: float
+    processor: "transformers.ProcessorMixin", dtype: torch.dtype, seconds: float
 ) -> torch.Tensor:
-    processor = transformers.AutoProcessor.from_pretrained(model_name)
     sample_rate = processor.feature_extractor.sampling_rate
-    return _audio_features_samples(model_name, dtype, int(sample_rate * seconds))
+    return _audio_features_samples(processor, dtype, int(sample_rate * seconds))
 
 
 def _encoder_frame_count(mel_frames: int, subsampling_factor: int) -> int:
@@ -145,10 +144,17 @@ def _encoder_frame_count(mel_frames: int, subsampling_factor: int) -> int:
     from halving once per factor of two rather than from the `ceil(L/8)` closed form. Mirrors
     `encoderFrameCount` in StreamingWindow.swift and HF
     `ParakeetPreTrainedModel._get_subsampling_output_length`, so the export, the simulator and the
-    runtime cannot disagree about the same quantity — and an unusual factor still computes right.
+    runtime cannot disagree about the same quantity.
+
+    `subsampling_factor` must be a power of two, which is all a stack of stride-2 convs can
+    express — the loop halves, so a factor of 6 would silently behave as 4.
     """
     if mel_frames <= 0 or subsampling_factor <= 1:
         return max(0, mel_frames)
+    if subsampling_factor & (subsampling_factor - 1) != 0:
+        raise ValueError(
+            f"subsampling_factor must be a power of two, got {subsampling_factor}"
+        )
     length, factor = mel_frames, subsampling_factor
     while factor > 1:
         length = (length - 1) // 2 + 1
@@ -156,12 +162,23 @@ def _encoder_frame_count(mel_frames: int, subsampling_factor: int) -> int:
     return length
 
 
+@dataclasses.dataclass(frozen=True)
+class StreamingWindowArgs:
+    """The three knobs that size a streaming window, in encoder frames.
+
+    `None` rather than a `streaming=False` flag is what makes "not streaming" unable to carry
+    window values nothing reads.
+    """
+
+    left_context_frames: int = 126
+    chunk_frames: int = 12
+    right_context_frames: int = 12
+
+
 def _streaming_geometry(
-    model_name: str,
+    processor: "transformers.ProcessorMixin",
     config: "transformers.ParakeetTDTConfig",
-    left: int,
-    chunk: int,
-    right: int,
+    window: StreamingWindowArgs,
 ) -> dict:
     """Window geometry for a streaming encoder export, in exact integers.
 
@@ -176,12 +193,16 @@ def _streaming_geometry(
     Deriving the sample count from `seconds` instead would be lossy at exactly the
     lengths we care about: `16000 * 6.4 == 102400.00000000001`.
     """
-    processor = transformers.AutoProcessor.from_pretrained(model_name)
     extractor = processor.feature_extractor
     sample_rate = extractor.sampling_rate
     hop_length = extractor.hop_length
     subsampling = config.encoder_config.subsampling_factor
 
+    left, chunk, right = (
+        window.left_context_frames,
+        window.chunk_frames,
+        window.right_context_frames,
+    )
     usable = left + chunk + right
     samples_per_encoder_frame = hop_length * subsampling
     window_samples = usable * samples_per_encoder_frame
@@ -371,11 +392,12 @@ def _prepare_bundle_dir(bundle_dir: Path, overwrite: bool) -> None:
     bundle_dir.mkdir(parents=True, exist_ok=True)
 
 
-def _write_processor(dest: Path, model_name: str) -> None:
+def _write_processor(
+    dest: Path, processor: "transformers.ProcessorMixin", model_name: str
+) -> None:
     print(
         f"[INFO] Saving processor (feature extractor + tokenizer) from {model_name} to {dest}..."
     )
-    processor = transformers.AutoProcessor.from_pretrained(model_name)
     processor.save_pretrained(str(dest))
 
 
@@ -416,6 +438,66 @@ def _write_bundle_metadata(
     print(f"[INFO] Wrote bundle metadata to {metadata_path}.")
 
 
+def _encoder_inputs(features: torch.Tensor) -> dict[str, torch.Tensor]:
+    return {
+        "input_features": features,
+        # All-valid mask for the trace; the Swift runtime supplies the real
+        # per-frame mask (1 for real audio, 0 for the static window's padding).
+        "attention_mask": torch.ones(features.shape[:2], dtype=torch.bool),
+    }
+
+
+def _streaming_encoder_inputs(
+    processor: "transformers.ProcessorMixin",
+    model: "transformers.ParakeetForTDT",
+    dtype: torch.dtype,
+    geometry: dict,
+) -> dict[str, torch.Tensor]:
+    """Trace inputs for a streaming window, checked against the geometry that sized them.
+
+    Catches an arithmetic error here in Python rather than six files later in Swift: a
+    one-frame slice error is 80 ms of audio and would drop or duplicate words at every chunk
+    boundary. Costs one forward pass.
+    """
+    features = _audio_features_samples(
+        processor, dtype, geometry["window_sample_count"]
+    )
+    if features.shape[1] != geometry["window_mel_frames"]:
+        raise ValueError(
+            f"streaming geometry mismatch: {geometry['window_sample_count']} samples "
+            f"produced {features.shape[1]} mel frames, expected "
+            f"{geometry['window_mel_frames']}"
+        )
+    inputs = _encoder_inputs(features)
+    with torch.no_grad():
+        probe = ParakeetEncoderModule(model)(**inputs)
+    if probe.shape[1] != geometry["window_encoder_frames"]:
+        raise ValueError(
+            f"streaming geometry mismatch: traced encoder emits {probe.shape[1]} "
+            f"frames, expected {geometry['window_encoder_frames']}"
+        )
+    print(
+        f"[INFO] Verified encoder emits {probe.shape[1]} frames "
+        f"({geometry['usable_encoder_frames']} usable + 1 padding boundary)."
+    )
+    return inputs
+
+
+def _log_streaming_window(geometry: dict) -> None:
+    latency = (
+        geometry["chunk_encoder_frames"] + geometry["right_context_encoder_frames"]
+    ) * geometry["seconds_per_encoder_frame"]
+    print(
+        f"[INFO] Streaming window: left {geometry['left_context_encoder_frames']} / "
+        f"chunk {geometry['chunk_encoder_frames']} / "
+        f"right {geometry['right_context_encoder_frames']} encoder frames "
+        f"({geometry['usable_encoder_frames']} usable) = "
+        f"{geometry['window_sample_count']} samples "
+        f"({geometry['window_sample_count'] / geometry['sample_rate']:.2f} s), "
+        f"{geometry['window_mel_frames']} mel frames. Theoretical latency {latency:.2f} s."
+    )
+
+
 def create_parakeet(
     output_dir: str,
     model_name: str,
@@ -424,10 +506,7 @@ def create_parakeet(
     dynamic: bool,
     audio_seconds: float,
     include_debug_info: bool,
-    streaming: bool = False,
-    left_context_frames: int = 126,
-    chunk_frames: int = 12,
-    right_context_frames: int = 12,
+    window: StreamingWindowArgs | None = None,
 ):
     print(f"[INFO] Sourcing {model_name}...")
     model = transformers.AutoModelForTDT.from_pretrained(
@@ -440,59 +519,24 @@ def create_parakeet(
         f"decoder hidden={config.decoder_hidden_size}, vocab={config.vocab_size}, "
         f"durations={list(config.durations)}."
     )
+    # One load, threaded through: it sizes the window, shapes the dummy input, and ships in
+    # the bundle.
+    processor = transformers.AutoProcessor.from_pretrained(model_name)
 
     geometry = None
-    if streaming:
-        geometry = _streaming_geometry(
-            model_name, config, left_context_frames, chunk_frames, right_context_frames
-        )
-        print(
-            f"[INFO] Streaming window: left {geometry['left_context_encoder_frames']} / "
-            f"chunk {geometry['chunk_encoder_frames']} / "
-            f"right {geometry['right_context_encoder_frames']} encoder frames "
-            f"({geometry['usable_encoder_frames']} usable) = "
-            f"{geometry['window_sample_count']} samples "
-            f"({geometry['window_sample_count'] / geometry['sample_rate']:.2f} s), "
-            f"{geometry['window_mel_frames']} mel frames. Theoretical latency "
-            f"{(geometry['chunk_encoder_frames'] + geometry['right_context_encoder_frames']) * geometry['seconds_per_encoder_frame']:.2f} s."
-        )
+    if window is not None:
+        geometry = _streaming_geometry(processor, config, window)
+        _log_streaming_window(geometry)
 
     bundle_dir, assets = _bundle_paths(output_dir, model_name, dtype, dynamic, geometry)
     _prepare_bundle_dir(bundle_dir, overwrite)
 
     print(f"[INFO] Exporting {ENCODER_GRAPH} graph...")
     if geometry is not None:
-        encoder_features = _audio_features_samples(
-            model_name, dtype, geometry["window_sample_count"]
-        )
-        if encoder_features.shape[1] != geometry["window_mel_frames"]:
-            raise ValueError(
-                f"streaming geometry mismatch: {geometry['window_sample_count']} samples "
-                f"produced {encoder_features.shape[1]} mel frames, expected "
-                f"{geometry['window_mel_frames']}"
-            )
+        encoder_inputs = _streaming_encoder_inputs(processor, model, dtype, geometry)
     else:
-        encoder_features = _audio_features(model_name, dtype, audio_seconds)
-    encoder_inputs = {
-        "input_features": encoder_features,
-        # All-valid mask for the trace; the Swift runtime supplies the real
-        # per-frame mask (1 for real audio, 0 for the static window's padding).
-        "attention_mask": torch.ones(encoder_features.shape[:2], dtype=torch.bool),
-    }
-    if geometry is not None:
-        # Catch an arithmetic error here in Python rather than six files later in
-        # Swift: a one-frame slice error is 80 ms of audio and would drop or
-        # duplicate words at every chunk boundary. Costs one forward pass.
-        with torch.no_grad():
-            probe = ParakeetEncoderModule(model)(**encoder_inputs)
-        if probe.shape[1] != geometry["window_encoder_frames"]:
-            raise ValueError(
-                f"streaming geometry mismatch: traced encoder emits {probe.shape[1]} "
-                f"frames, expected {geometry['window_encoder_frames']}"
-            )
-        print(
-            f"[INFO] Verified encoder emits {probe.shape[1]} frames "
-            f"({geometry['usable_encoder_frames']} usable + 1 padding boundary)."
+        encoder_inputs = _encoder_inputs(
+            _audio_features(processor, dtype, audio_seconds)
         )
 
     encoder_program = _convert(
@@ -528,7 +572,7 @@ def create_parakeet(
     )
     _save_program(joint_program, assets[JOINT_GRAPH], JOINT_GRAPH)
 
-    _write_processor(bundle_dir / "processor", model_name)
+    _write_processor(bundle_dir / "processor", processor, model_name)
     _write_bundle_metadata(
         bundle_dir,
         _variant_name(model_name, dtype, dynamic, geometry),
@@ -675,17 +719,20 @@ def main():
 
     output_dir = args.output_dir or _default_output_dir()
     create_parakeet(
-        output_dir,
-        args.model,
-        dtype,
-        args.overwrite,
-        args.dynamic,
-        args.audio_seconds,
-        args.include_debug_info,
-        args.streaming,
-        args.left_context_frames,
-        args.chunk_frames,
-        args.right_context_frames,
+        output_dir=output_dir,
+        model_name=args.model,
+        dtype=dtype,
+        overwrite=args.overwrite,
+        dynamic=args.dynamic,
+        audio_seconds=args.audio_seconds,
+        include_debug_info=args.include_debug_info,
+        window=StreamingWindowArgs(
+            left_context_frames=args.left_context_frames,
+            chunk_frames=args.chunk_frames,
+            right_context_frames=args.right_context_frames,
+        )
+        if args.streaming
+        else None,
     )
 
 

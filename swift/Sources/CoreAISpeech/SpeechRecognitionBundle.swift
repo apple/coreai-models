@@ -324,6 +324,13 @@ public struct ParakeetTDTConfig: Sendable {
         guard let cfg = payload.config else {
             throw ModelBundle.BundleError.missingField("config")
         }
+        // `encoderFrameCount` derives every valid-frame count by halving, so a factor that
+        // isn't a power of two would trip its precondition on the first decode.
+        guard isValidSubsamplingFactor(cfg.encoder.subsamplingFactor) else {
+            throw SpeechError.missingModel(
+                "config.encoder.subsampling_factor must be a power of two, got "
+                    + "\(cfg.encoder.subsamplingFactor)")
+        }
         return ParakeetTDTConfig(
             vocabSize: cfg.vocabSize,
             blankTokenId: Int32(cfg.blankTokenId),

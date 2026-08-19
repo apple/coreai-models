@@ -421,4 +421,35 @@ struct StreamingMetadataTests {
         #expect(try StreamingConfig.decode(fromMetadata: Data(json.utf8)) == nil)
         #expect(try StreamingConfig.decode(fromMetadata: Data("not json".utf8)) == nil)
     }
+
+    /// `encoderFrameCount` halves, so a factor of 6 would silently act as 4 — one frame is
+    /// 80 ms, enough to drop or duplicate words at every boundary. Caught before any frame
+    /// count is derived from it.
+    @Test("A subsampling factor the frame arithmetic cannot express is rejected")
+    func nonPowerOfTwoSubsamplingIsRejected() {
+        for factor in [0, 6, 7, 12] {
+            let json = """
+                {"metadata_version":"0.2","kind":"speech_recognizer","streaming":{
+                  "left_context_encoder_frames":126,"chunk_encoder_frames":12,
+                  "right_context_encoder_frames":12,"window_mel_frames":1201,
+                  "sample_rate":16000,"hop_length":160,"subsampling_factor":\(factor)}}
+                """
+            #expect(throws: SpeechError.self, "factor=\(factor)") {
+                try StreamingConfig.decode(fromMetadata: Data(json.utf8))
+            }
+        }
+    }
+
+    @Test("A zero hop length is rejected rather than dividing by zero")
+    func zeroHopLengthIsRejected() {
+        let json = """
+            {"metadata_version":"0.2","kind":"speech_recognizer","streaming":{
+              "left_context_encoder_frames":126,"chunk_encoder_frames":12,
+              "right_context_encoder_frames":12,"window_mel_frames":1201,
+              "sample_rate":16000,"hop_length":0,"subsampling_factor":8}}
+            """
+        #expect(throws: SpeechError.self) {
+            try StreamingConfig.decode(fromMetadata: Data(json.utf8))
+        }
+    }
 }
