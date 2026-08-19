@@ -3,10 +3,10 @@
 // Use of this source code is governed by a BSD-3-clause license that can
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
+import TestUtilities
 import Testing
 
 @testable import CoreAILanguageModels
-import TestUtilities
 
 #if (arch(arm64) || arch(arm64e)) && canImport(CoreAI)
 
@@ -106,7 +106,8 @@ struct ThinkTagParserAgenticTests {
     @Test("Switch from user back to self (multi-turn)")
     func multiTurnSwitching() {
         var parser = ThinkTagParser(format: format)
-        let input = "thought<|eom|>to=user<|message|>reply 1<|eot|>to=self<|message|>more thought<|eom|>to=user<|message|>reply 2<|eot|>"
+        let input =
+            "thought<|eom|>to=user<|message|>reply 1<|eot|>to=self<|message|>more thought<|eom|>to=user<|message|>reply 2<|eot|>"
         let events = parser.consume(input) + parser.flush()
         #expect(eventStrings(events, kind: .reasoning) == ["thought", "more thought"])
         #expect(eventStrings(events, kind: .text) == ["reply 1", "reply 2"])
