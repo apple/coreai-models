@@ -270,7 +270,8 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         }
         if repetitionPenalty != nil && jsonSchema != nil {
             throw ValidationError(
-                "--repetition-penalty cannot be used with --json-schema (constrained generation does not support penalty on the pipelined engine)")
+                "--repetition-penalty cannot be used with --json-schema"
+                    + " (constrained generation does not support penalty on the pipelined engine)")
         }
     }
 

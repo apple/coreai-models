@@ -713,7 +713,8 @@ struct MPSGraphCompletionOrderingTests {
         }
 
         let observed = orderRecord.withLock { $0 }
-        #expect(observed == Array(0..<stepCount),
-            "MPSGraph completions did not fire in submission order — RepetitionPenaltyGPUState needs synchronization")
+        #expect(
+            observed == Array(0..<stepCount),
+            "Completions not in submission order — RepetitionPenaltyGPUState needs a lock")
     }
 }
