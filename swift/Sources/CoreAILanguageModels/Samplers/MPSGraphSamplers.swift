@@ -1122,6 +1122,16 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
         let outputData = MPSGraphTensorData(
             outputBuffer, shape: [1 as NSNumber], dataType: .int32)
 
+        let tensorDataMap: [MPSGraphTensor: MPSGraphTensorData] = [
+            logitsPlaceholder: logitsData,
+            penaltyPlaceholder!: penaltyData,
+            temperaturePlaceholder: temperatureData,
+            randomPlaceholder: randomData,
+            topPPlaceholder: topPData,
+            minPPlaceholder: minPData,
+        ]
+        let inputs = executable.feedTensors!.map { tensorDataMap[$0]! }
+
         let execDesc = MPSGraphExecutableExecutionDescriptor()
         execDesc.completionHandler = { [outputBuffer, outputOffset] (_, error) in
             if let error = error {
@@ -1135,7 +1145,7 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
         }
         executable.runAsync(
             with: queue,
-            inputs: [logitsData, penaltyData, temperatureData, randomData, topPData, minPData],
+            inputs: inputs,
             results: [outputData], executionDescriptor: execDesc)
     }
 
