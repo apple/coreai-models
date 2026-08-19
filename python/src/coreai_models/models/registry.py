@@ -11,6 +11,62 @@ from functools import lru_cache
 import torch.nn as nn
 
 
+def _register_novel_configs() -> None:
+    """Register model types not in our transformers version with AutoConfig."""
+    try:
+        from transformers import AutoConfig, PretrainedConfig
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING_NAMES
+
+        if "muse_glimmer" not in CONFIG_MAPPING_NAMES:
+
+            class _MuseGlimmerTextConfig(PretrainedConfig):
+                model_type = "muse_glimmer_text"
+
+                def __init__(self, **kwargs):
+                    kwargs.setdefault("hidden_size", 64)
+                    kwargs.setdefault("num_attention_heads", 4)
+                    kwargs.setdefault("num_key_value_heads", 2)
+                    kwargs.setdefault("intermediate_size", 128)
+                    kwargs.setdefault("vocab_size", 200)
+                    kwargs.setdefault("max_position_embeddings", 512)
+                    kwargs.setdefault("head_dim", 16)
+                    kwargs.setdefault("rms_norm_eps", 1e-5)
+                    kwargs.setdefault("sliding_window", 8)
+                    kwargs.setdefault("output_multiplier", 0.196)
+                    kwargs.setdefault("qk_scale_factor", 3.87)
+                    kwargs.setdefault("final_logit_softcapping", 20.0)
+                    kwargs.setdefault("tie_word_embeddings", False)
+                    kwargs.setdefault("post_norm_eps", 1e-8)
+                    n_layers = kwargs.setdefault("num_hidden_layers", 4)
+                    # Ensure layer_types/layer_rope_theta match num_hidden_layers
+                    pattern = ["sliding_attention"] * 3 + ["full_attention"]
+                    theta_pattern = [500000.0, 500000.0, 500000.0, 0]
+                    kwargs.setdefault("layer_types", (pattern * ((n_layers // 4) + 1))[:n_layers])
+                    kwargs.setdefault(
+                        "layer_rope_theta", (theta_pattern * ((n_layers // 4) + 1))[:n_layers]
+                    )
+                    super().__init__(**kwargs)
+
+            class _MuseGlimmerConfig(PretrainedConfig):
+                model_type = "muse_glimmer"
+
+                def __init__(self, **kwargs):
+                    tc = kwargs.pop("text_config", None)
+                    super().__init__(**kwargs)
+                    if isinstance(tc, dict):
+                        self.text_config = _MuseGlimmerTextConfig(**tc)
+                    elif tc is not None:
+                        self.text_config = tc
+
+            AutoConfig.register("muse_glimmer", _MuseGlimmerConfig)
+            AutoConfig.register("muse_glimmer_text", _MuseGlimmerTextConfig)
+    except Exception:
+        pass
+
+
+_register_novel_configs()
+
+
 @dataclass
 class ModelEntry:
     """Registry entry for a model family."""
@@ -37,6 +93,7 @@ def _get_registry() -> dict[str, ModelEntry]:
     from coreai_models.models.macos.gpt_oss import GptOssForCausalLM
     from coreai_models.models.macos.mistral import MistralForCausalLM
     from coreai_models.models.macos.mixtral import MixtralForCausalLM
+    from coreai_models.models.macos.muse_glimmer import MuseGlimmerForCausalLM
     from coreai_models.models.macos.qwen2 import Qwen2ForCausalLM
     from coreai_models.models.macos.qwen3 import Qwen3ForCausalLM
     from coreai_models.models.macos.qwen3_moe import Qwen3MoeForCausalLM
@@ -59,6 +116,11 @@ def _get_registry() -> dict[str, ModelEntry]:
         ),
         "mixtral": ModelEntry(
             macos_class=MixtralForCausalLM,
+        ),
+        "muse_glimmer_text": ModelEntry(
+            macos_class=MuseGlimmerForCausalLM,
+            hf_config_attr="text_config",
+            hf_state_dict_prefix="model.language_model.",
         ),
         "qwen2": ModelEntry(
             macos_class=Qwen2ForCausalLM,
@@ -85,6 +147,7 @@ def _get_registry() -> dict[str, ModelEntry]:
 # Type alias for the remapping dict
 MODEL_TYPE_REMAPPING: dict[str, str] = {
     "gemma3": "gemma3_text",
+    "muse_glimmer": "muse_glimmer_text",
     "qwen2_5": "qwen2",
 }
 
