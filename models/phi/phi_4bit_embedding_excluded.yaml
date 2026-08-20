@@ -1,0 +1,19 @@
+quantization_config:
+  execution_mode: eager
+  global_config:
+    op_state_spec:
+      weight:
+        dtype: int4
+        qscheme: symmetric_with_clipping
+        granularity:
+          type: per_block
+          block_size: 32
+          axis: 1
+    op_input_spec: null
+    op_output_spec: null
+  module_type_configs:
+    coreai_models.primitives.macos.sdpa.SDPA: null
+    coreai_models.primitives.macos.rope.RoPE: null
+    coreai_models.primitives.macos.rms_norm.RMSNorm: null
+    coreai_models.primitives.macos.rms_norm.RMSNormPlusOne: null
+    torch.nn.modules.sparse.Embedding: null
