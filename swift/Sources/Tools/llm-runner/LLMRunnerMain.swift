@@ -108,6 +108,16 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         help: "Min-P sampling: keep tokens with probability >= minP × max probability (e.g., 0.05)")
     var minP: Double?
 
+    @Option(
+        name: .customLong("repetition-penalty"),
+        help: "Repetition penalty factor (>= 1.0). Penalizes tokens that appeared in recent generation (e.g., 1.2)")
+    var repetitionPenalty: Double?
+
+    @Option(
+        name: .customLong("repetition-penalty-window"),
+        help: "Number of recent tokens to consider for repetition penalty (default: all; GPU engine caps at 256)")
+    var repetitionPenaltyWindow: Int?
+
     @Option(help: "Sampling strategy. Options: 'temperature' (default), 'greedy'")
     var samplingStrategy: String = "temperature"
 
@@ -251,6 +261,17 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         }
         if videoFrames < 1 {
             throw ValidationError("--video-frames must be >= 1")
+        }
+        if let p = repetitionPenalty, p < 1.0 {
+            throw ValidationError("--repetition-penalty must be >= 1.0")
+        }
+        if repetitionPenaltyWindow != nil && repetitionPenalty == nil {
+            throw ValidationError("--repetition-penalty-window requires --repetition-penalty")
+        }
+        if repetitionPenalty != nil && jsonSchema != nil {
+            throw ValidationError(
+                "--repetition-penalty cannot be used with --json-schema"
+                    + " (constrained generation does not support penalty on the pipelined engine)")
         }
     }
 
@@ -850,16 +871,22 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
                 topK: topK,
                 topP: topP,
                 minP: minP,
+                repetitionPenalty: repetitionPenalty,
+                repetitionPenaltyWindow: repetitionPenaltyWindow,
                 combined: !synchronousSampling
             )
         case "greedy":
-            // Fatal error if topK/topP/minP set with greedy
             if topK != nil || topP != nil || minP != nil {
                 print("Error: --top-k, --top-p, and --min-p cannot be used with --sampling-strategy greedy")
                 print("Use --sampling-strategy temperature with --top-k/--top-p/--min-p, or remove them for greedy")
                 throw ExitCode.failure
             }
-            config = SamplingConfiguration(temperature: 0, combined: !synchronousSampling)
+            config = SamplingConfiguration(
+                temperature: 0,
+                repetitionPenalty: repetitionPenalty,
+                repetitionPenaltyWindow: repetitionPenaltyWindow,
+                combined: !synchronousSampling
+            )
         default:
             print("Error: Unknown sampling strategy '\(samplingStrategy)'")
             print("Valid options: 'temperature', 'greedy'")

@@ -136,7 +136,8 @@ enum MPSGraphSamplerFactory {
             k: effectiveK,
             temperature: Float(config.temperature),
             topP: config.topP.map { Float($0) } ?? 1.0,
-            minP: config.minP.map { Float($0) } ?? 0.0
+            minP: config.minP.map { Float($0) } ?? 0.0,
+            penaltyEnabled: config.needsRepetitionPenalty
         )
     }
 
@@ -670,6 +671,7 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
 
     // Graph tensors
     private let logitsPlaceholder: MPSGraphTensor
+    private let penaltyPlaceholder: MPSGraphTensor?
     private let temperaturePlaceholder: MPSGraphTensor
     private let randomPlaceholder: MPSGraphTensor
     private let topPPlaceholder: MPSGraphTensor
@@ -692,6 +694,9 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
 
     /// The minP value (0.0 = disabled)
     let minP: Float
+
+    /// Whether repetition penalty is compiled into this sampler's graph
+    let penaltyEnabled: Bool
 
     /// Pre-allocated buffer for random value
     private let randomBuffer: MTLBuffer
@@ -734,7 +739,10 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
     ///   - temperature: Sampling temperature
     ///   - topP: Nucleus sampling threshold (1.0 = disabled)
     ///   - minP: Minimum probability threshold (0.0 = disabled)
-    init(device: MTLDevice, vocabSize: Int, k: Int = 40, temperature: Float = 1.0, topP: Float = 1.0, minP: Float = 0.0)
+    init(
+        device: MTLDevice, vocabSize: Int, k: Int = 40, temperature: Float = 1.0, topP: Float = 1.0, minP: Float = 0.0,
+        penaltyEnabled: Bool = false
+    )
         throws
     {
         self.device = device
@@ -744,6 +752,7 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
         self.temperature = temperature
         self.topP = topP
         self.minP = minP
+        self.penaltyEnabled = penaltyEnabled
         self.bitmaskSize = (vocabSize + 31) / 32
 
         // Pre-allocate buffers
@@ -770,6 +779,17 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
             name: "logits"
         )
         self.logitsPlaceholder = logitsPlaceholder
+
+        if penaltyEnabled {
+            let pp = graph.placeholder(
+                shape: [1, vocabSize as NSNumber],
+                dataType: .float16,
+                name: "penalty"
+            )
+            self.penaltyPlaceholder = pp
+        } else {
+            self.penaltyPlaceholder = nil
+        }
 
         // Temperature scalar [1]
         let temperaturePlaceholder = graph.placeholder(
@@ -806,71 +826,50 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
         // Cast logits to Float32 for numerical stability
         let logitsFloat32 = graph.cast(logitsPlaceholder, to: .float32, name: "logits_f32")
 
-        // Step 1: Get Top-K values and indices
-        let topKResult = graph.topK(logitsFloat32, k: k, name: "topk")
-        let topKValues = topKResult[0]  // [1, k] sorted descending
-        let topKIndices = topKResult[1]  // [1, k] as Int32
+        // Build sampling pipeline using composable stage helpers
+        let penalizedLogits: MPSGraphTensor
+        if penaltyEnabled {
+            penalizedLogits = Self.applyPenaltyStage(
+                graph: graph, logits: logitsFloat32, penaltyTensor: penaltyPlaceholder!, name: "penalty")
+        } else {
+            penalizedLogits = logitsFloat32
+        }
 
-        // Step 2: Apply temperature: values / temperature
-        let scaledValues = graph.division(topKValues, temperaturePlaceholder, name: "scaled")
+        let (topKValues, topKIndices) = Self.topKStage(
+            graph: graph, logits: penalizedLogits, k: k, name: "topk")
 
-        // Step 3: Softmax over the K dimension (axis 1)
-        let probabilities = graph.softMax(with: scaledValues, axis: 1, name: "probs")
+        let scaledValues = Self.temperatureStage(
+            graph: graph, values: topKValues, temperature: temperaturePlaceholder, name: "temp")
 
-        // Step 4: MinP filtering
-        // max_prob is the first element (topK returns sorted descending)
-        let maxProb = graph.sliceTensor(probabilities, dimension: 1, start: 0, length: 1, name: "max_prob")
-        // threshold = minP * max_prob
-        let minPThreshold = graph.multiplication(minPPlaceholder, maxProb, name: "minp_threshold")
-        // mask: probs >= threshold (broadcasts [1,1] to [1,k])
-        let minPMask = graph.greaterThanOrEqualTo(probabilities, minPThreshold, name: "minp_mask")
+        let probabilities = Self.softmaxStage(graph: graph, values: scaledValues, name: "sm")
 
-        // Step 5: TopP filtering via exclusive cumulative sum
-        // exclusive_cumsum[i] = sum of probs[0..i-1], so position 0 always has value 0
-        let exclusiveCumsum = graph.cumulativeSum(
-            probabilities, axis: 1, exclusive: true, reverse: false, name: "excl_cumsum")
-        // mask: exclusive_cumsum < topP (includes all tokens before cumsum reaches topP)
-        let topPMask = graph.lessThan(exclusiveCumsum, topPPlaceholder, name: "topp_mask")
+        let minPMask = Self.minPStage(
+            graph: graph, probs: probabilities, minP: minPPlaceholder, name: "minp")
 
-        // Step 6: Combined mask = minP AND topP
-        let combinedMask = graph.logicalAND(minPMask, topPMask, name: "combined_mask")
-        let maskFloat = graph.cast(combinedMask, to: .float32, name: "mask_float")
+        let topPMask = Self.topPStage(
+            graph: graph, probs: probabilities, topP: topPPlaceholder, name: "topp")
 
-        // Step 7: Apply mask and re-normalize
-        let maskedProbs = graph.multiplication(probabilities, maskFloat, name: "masked_probs")
-        let sumMasked = graph.reductionSum(with: maskedProbs, axis: 1, name: "sum_masked")
-        // Avoid division by zero: use max(sum, epsilon)
-        let epsilon = graph.constant(1e-10, dataType: .float32)
-        let safeDenominator = graph.maximum(sumMasked, epsilon, name: "safe_denom")
-        let normalizedProbs = graph.division(maskedProbs, safeDenominator, name: "normalized_probs")
+        let normalizedProbs = Self.maskAndNormalizeStage(
+            graph: graph, probs: probabilities, masks: [minPMask, topPMask], name: "norm")
 
-        // Step 8: Multinomial sampling via cumulative sum + random comparison
-        let cumsum = graph.cumulativeSum(normalizedProbs, axis: 1, exclusive: false, reverse: false, name: "cumsum")
-        let selectionMask = graph.greaterThanOrEqualTo(cumsum, randomPlaceholder, name: "selection_mask")
-        let selectionMaskFloat = graph.cast(selectionMask, to: .float32, name: "selection_mask_float")
-        let selectedIdx = graph.reductionArgMaximum(with: selectionMaskFloat, axis: 1, name: "selected_idx")
+        let selectedIdx = Self.multinomialStage(
+            graph: graph, probs: normalizedProbs, random: randomPlaceholder, name: "sample")
 
-        // Step 9: Gather the token index from topKIndices
-        let selectedIdxInt32 = graph.cast(selectedIdx, to: .int32, name: "selected_idx_i32")
-        let indicesFlat = graph.reshape(topKIndices, shape: [k as NSNumber], name: "indices_flat")
-        let selectedIdxFlat = graph.reshape(selectedIdxInt32, shape: [1 as NSNumber], name: "selected_flat")
-
-        let outputTensor = graph.gatherAlongAxis(
-            0,
-            updates: indicesFlat,
-            indices: selectedIdxFlat,
-            name: "token_id"
-        )
+        let outputTensor = Self.gatherTokenStage(
+            graph: graph, topKIndices: topKIndices, selectedIdx: selectedIdx, k: k, name: "gather")
         self.outputTensor = outputTensor
 
         // Compile to executable
-        let feeds: [MPSGraphTensor: MPSGraphShapedType] = [
+        var feeds: [MPSGraphTensor: MPSGraphShapedType] = [
             logitsPlaceholder: MPSGraphShapedType(shape: [1, vocabSize as NSNumber], dataType: .float16),
             temperaturePlaceholder: MPSGraphShapedType(shape: [1 as NSNumber], dataType: .float32),
             randomPlaceholder: MPSGraphShapedType(shape: [1 as NSNumber], dataType: .float32),
             topPPlaceholder: MPSGraphShapedType(shape: [1 as NSNumber], dataType: .float32),
             minPPlaceholder: MPSGraphShapedType(shape: [1 as NSNumber], dataType: .float32),
         ]
+        if let pp = penaltyPlaceholder {
+            feeds[pp] = MPSGraphShapedType(shape: [1, vocabSize as NSNumber], dataType: .float16)
+        }
 
         let compilationDescriptor = MPSGraphCompilationDescriptor()
         compilationDescriptor.optimizationLevel = .level0
@@ -1057,10 +1056,14 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
         completion: @escaping (Int32, Error?) -> Void
     ) {
         if queryLength == 1 {
-            try? encode(
-                to: queue, logitsBuffer: logitsBuffer, logitsOffset: 0,
-                outputBuffer: outputBuffer, outputOffset: outputOffset,
-                applyBitmask: applyBitmask, completion: completion)
+            do {
+                try encode(
+                    to: queue, logitsBuffer: logitsBuffer, logitsOffset: 0,
+                    outputBuffer: outputBuffer, outputOffset: outputOffset,
+                    applyBitmask: applyBitmask, completion: completion)
+            } catch {
+                completion(0, error)
+            }
             return
         }
         let logitsOffset = (queryLength - 1) * vocabSize * MemoryLayout<UInt16>.size
@@ -1078,10 +1081,72 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
         blitEncoder.endEncoding()
         blitCmdBuffer.commit()
 
-        try? encode(
-            to: queue, logitsBuffer: tempBuffer, logitsOffset: 0,
-            outputBuffer: outputBuffer, outputOffset: outputOffset,
-            applyBitmask: applyBitmask, completion: completion)
+        do {
+            try encode(
+                to: queue, logitsBuffer: tempBuffer, logitsOffset: 0,
+                outputBuffer: outputBuffer, outputOffset: outputOffset,
+                applyBitmask: applyBitmask, completion: completion)
+        } catch {
+            completion(0, error)
+        }
+    }
+
+    /// Encode sampling with repetition penalty buffer.
+    /// The penalty buffer must be Float16[vocabSize] with 1.0 for unpenalized tokens.
+    func encode(
+        to queue: MTLCommandQueue,
+        logitsBuffer: MTLBuffer,
+        logitsOffset: Int,
+        penaltyBuffer: MTLBuffer,
+        outputBuffer: MTLBuffer,
+        outputOffset: Int,
+        completion: @escaping (Int32, Error?) -> Void
+    ) {
+        guard penaltyEnabled else {
+            encode(
+                to: queue, logitsBuffer: logitsBuffer, logitsOffset: logitsOffset,
+                outputBuffer: outputBuffer, outputOffset: outputOffset, completion: completion)
+            return
+        }
+
+        temperatureBuffer.contents().assumingMemoryBound(to: Float.self).pointee = max(temperature, 0.01)
+        topPBuffer.contents().assumingMemoryBound(to: Float.self).pointee = topP
+        minPBuffer.contents().assumingMemoryBound(to: Float.self).pointee = minP
+        let randomValue = testingOnlyRandomOverride ?? Float.random(in: 0..<1)
+        randomBuffer.contents().assumingMemoryBound(to: Float.self).pointee = randomValue
+
+        let logitsData = MPSGraphTensorData(
+            logitsBuffer, shape: [1, vocabSize as NSNumber], dataType: .float16)
+        let penaltyData = MPSGraphTensorData(
+            penaltyBuffer, shape: [1, vocabSize as NSNumber], dataType: .float16)
+        let outputData = MPSGraphTensorData(
+            outputBuffer, shape: [1 as NSNumber], dataType: .int32)
+
+        let tensorDataMap: [MPSGraphTensor: MPSGraphTensorData] = [
+            logitsPlaceholder: logitsData,
+            penaltyPlaceholder!: penaltyData,
+            temperaturePlaceholder: temperatureData,
+            randomPlaceholder: randomData,
+            topPPlaceholder: topPData,
+            minPPlaceholder: minPData,
+        ]
+        let inputs = executable.feedTensors!.map { tensorDataMap[$0]! }
+
+        let execDesc = MPSGraphExecutableExecutionDescriptor()
+        execDesc.completionHandler = { [outputBuffer, outputOffset] (_, error) in
+            if let error = error {
+                completion(0, error)
+                return
+            }
+            let result = outputBuffer.contents()
+                .advanced(by: outputOffset)
+                .assumingMemoryBound(to: Int32.self).pointee
+            completion(result, nil)
+        }
+        executable.runAsync(
+            with: queue,
+            inputs: inputs,
+            results: [outputData], executionDescriptor: execDesc)
     }
 
     /// Encode composite sampling asynchronously (protocol conformance).
@@ -1229,6 +1294,93 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
             results: [outputData],
             executionDescriptor: prefillExecDescriptor
         )
+    }
+
+    // MARK: - Graph Stage Helpers
+
+    /// Apply repetition penalty: where(logits > 0, logits / penalty, logits * penalty)
+    static func applyPenaltyStage(
+        graph: MPSGraph, logits: MPSGraphTensor, penaltyTensor: MPSGraphTensor, name: String
+    ) -> MPSGraphTensor {
+        let penaltyF32 = graph.cast(penaltyTensor, to: .float32, name: "\(name)_f32")
+        let zero = graph.constant(0.0, dataType: .float32)
+        let positive = graph.greaterThan(logits, zero, name: "\(name)_pos")
+        let divided = graph.division(logits, penaltyF32, name: "\(name)_div")
+        let multiplied = graph.multiplication(logits, penaltyF32, name: "\(name)_mul")
+        return graph.select(predicate: positive, trueTensor: divided, falseTensor: multiplied, name: name)
+    }
+
+    /// Extract top-K values and indices from logits.
+    static func topKStage(
+        graph: MPSGraph, logits: MPSGraphTensor, k: Int, name: String
+    ) -> (values: MPSGraphTensor, indices: MPSGraphTensor) {
+        let result = graph.topK(logits, k: k, name: name)
+        return (result[0], result[1])
+    }
+
+    /// Scale values by temperature: values / temperature.
+    static func temperatureStage(
+        graph: MPSGraph, values: MPSGraphTensor, temperature: MPSGraphTensor, name: String
+    ) -> MPSGraphTensor {
+        graph.division(values, temperature, name: name)
+    }
+
+    /// Softmax over the K dimension (axis 1).
+    static func softmaxStage(graph: MPSGraph, values: MPSGraphTensor, name: String) -> MPSGraphTensor {
+        graph.softMax(with: values, axis: 1, name: name)
+    }
+
+    /// MinP mask: probs >= minP * max_prob.
+    static func minPStage(
+        graph: MPSGraph, probs: MPSGraphTensor, minP: MPSGraphTensor, name: String
+    ) -> MPSGraphTensor {
+        let maxProb = graph.sliceTensor(probs, dimension: 1, start: 0, length: 1, name: "\(name)_max")
+        let threshold = graph.multiplication(minP, maxProb, name: "\(name)_thr")
+        return graph.greaterThanOrEqualTo(probs, threshold, name: "\(name)_mask")
+    }
+
+    /// TopP mask: exclusive_cumsum < topP.
+    static func topPStage(
+        graph: MPSGraph, probs: MPSGraphTensor, topP: MPSGraphTensor, name: String
+    ) -> MPSGraphTensor {
+        let cumsum = graph.cumulativeSum(probs, axis: 1, exclusive: true, reverse: false, name: "\(name)_cs")
+        return graph.lessThan(cumsum, topP, name: "\(name)_mask")
+    }
+
+    /// Combine boolean masks, apply to probs, and re-normalize.
+    static func maskAndNormalizeStage(
+        graph: MPSGraph, probs: MPSGraphTensor, masks: [MPSGraphTensor], name: String
+    ) -> MPSGraphTensor {
+        var combined = masks[0]
+        for i in 1..<masks.count {
+            combined = graph.logicalAND(combined, masks[i], name: "\(name)_and\(i)")
+        }
+        let maskFloat = graph.cast(combined, to: .float32, name: "\(name)_mf")
+        let masked = graph.multiplication(probs, maskFloat, name: "\(name)_masked")
+        let sum = graph.reductionSum(with: masked, axis: 1, name: "\(name)_sum")
+        let eps = graph.constant(1e-10, dataType: .float32)
+        let safeDenom = graph.maximum(sum, eps, name: "\(name)_denom")
+        return graph.division(masked, safeDenom, name: name)
+    }
+
+    /// Multinomial sampling: cumsum + random comparison → argmax of selection mask.
+    static func multinomialStage(
+        graph: MPSGraph, probs: MPSGraphTensor, random: MPSGraphTensor, name: String
+    ) -> MPSGraphTensor {
+        let cumsum = graph.cumulativeSum(probs, axis: 1, exclusive: false, reverse: false, name: "\(name)_cs")
+        let mask = graph.greaterThanOrEqualTo(cumsum, random, name: "\(name)_sel")
+        let maskFloat = graph.cast(mask, to: .float32, name: "\(name)_sf")
+        return graph.reductionArgMaximum(with: maskFloat, axis: 1, name: name)
+    }
+
+    /// Gather the final token ID from topK indices using the selected position.
+    static func gatherTokenStage(
+        graph: MPSGraph, topKIndices: MPSGraphTensor, selectedIdx: MPSGraphTensor, k: Int, name: String
+    ) -> MPSGraphTensor {
+        let idxI32 = graph.cast(selectedIdx, to: .int32, name: "\(name)_i32")
+        let flat = graph.reshape(topKIndices, shape: [k as NSNumber], name: "\(name)_flat")
+        let idxFlat = graph.reshape(idxI32, shape: [1 as NSNumber], name: "\(name)_idx")
+        return graph.gatherAlongAxis(0, updates: flat, indices: idxFlat, name: name)
     }
 }
 
