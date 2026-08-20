@@ -86,11 +86,18 @@ public struct LogProbabilities: Sendable {
     ) -> (Double, [Float]) {
         let count = logits.count
 
+        // Float16 → Float32 via vFloatConversion (Accelerate)
         var floatBuffer = [Float](repeating: 0, count: count)
         logits.withUnsafeBufferPointer { src in
-            floatBuffer.withUnsafeMutableBufferPointer { dst in
-                for i in 0..<count {
-                    dst[i] = Float(src[i])
+            src.baseAddress!.withMemoryRebound(to: UInt16.self, capacity: count) { halfPtr in
+                floatBuffer.withUnsafeMutableBufferPointer { dst in
+                    var bufferSrc = vImage_Buffer(
+                        data: UnsafeMutableRawPointer(mutating: halfPtr),
+                        height: 1, width: vImagePixelCount(count), rowBytes: count * 2)
+                    var bufferDst = vImage_Buffer(
+                        data: dst.baseAddress!, height: 1,
+                        width: vImagePixelCount(count), rowBytes: count * 4)
+                    vImageConvert_Planar16FtoPlanarF(&bufferSrc, &bufferDst, 0)
                 }
             }
         }
@@ -98,29 +105,28 @@ public struct LogProbabilities: Sendable {
         var maxVal: Float = 0
         vDSP_maxv(floatBuffer, 1, &maxVal, vDSP_Length(count))
 
-        // If max is +Inf, log-softmax assigns 0 to all Inf positions and -Inf elsewhere.
-        // Return logSumExp = +Inf so that Inf - Inf = NaN is handled by the caller.
-        // Instead, return finite logSumExp by counting Inf positions.
         if maxVal.isInfinite {
-            let infCount = floatBuffer.filter({ $0.isInfinite && $0 > 0 }).count
-            let logSumExp = Double.infinity
-            // Caller handles Inf - Inf by clamping to 0.0
-            return (logSumExp, floatBuffer)
+            return (Double.infinity, floatBuffer)
         }
 
+        // log-sum-exp with temporary stack buffers
         var negMax = -maxVal
-        var shiftedBuffer = [Float](repeating: 0, count: count)
-        vDSP_vsadd(floatBuffer, 1, &negMax, &shiftedBuffer, 1, vDSP_Length(count))
-
-        var expBuffer = [Float](repeating: 0, count: count)
+        let countLen = vDSP_Length(count)
         var countInt32 = Int32(count)
-        vvexpf(&expBuffer, shiftedBuffer, &countInt32)
 
-        var sumExp: Float = 0
-        vDSP_sve(expBuffer, 1, &sumExp, vDSP_Length(count))
+        return withUnsafeTemporaryAllocation(of: Float.self, capacity: count) { shiftedBuf in
+            vDSP_vsadd(floatBuffer, 1, &negMax, shiftedBuf.baseAddress!, 1, countLen)
 
-        let logSumExp = Double(maxVal) + Double(log(sumExp))
-        return (logSumExp, floatBuffer)
+            return withUnsafeTemporaryAllocation(of: Float.self, capacity: count) { expBuf in
+                vvexpf(expBuf.baseAddress!, shiftedBuf.baseAddress!, &countInt32)
+
+                var sumExp: Float = 0
+                vDSP_sve(expBuf.baseAddress!, 1, &sumExp, countLen)
+
+                let logSumExp = Double(maxVal) + Double(log(sumExp))
+                return (logSumExp, floatBuffer)
+            }
+        }
     }
 
     /// Find top-K elements using partial sort (O(n) for small K).
