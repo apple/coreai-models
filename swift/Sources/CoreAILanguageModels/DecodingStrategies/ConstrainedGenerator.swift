@@ -204,6 +204,18 @@ public struct ConstrainedGenerator: DecodingStrategy {
             }
 
             var maskedLogits = logits
+            if samplingConfiguration.needsRepetitionPenalty,
+                let penalty = samplingConfiguration.repetitionPenalty
+            {
+                let window =
+                    samplingConfiguration.repetitionPenaltyWindow.map { min($0, generatedTokens.count) }
+                    ?? generatedTokens.count
+                RepetitionPenaltyProcessor.apply(
+                    to: &maskedLogits,
+                    recentTokenIds: generatedTokens.suffix(window),
+                    penalty: Float(penalty)
+                )
+            }
             _ = session.applyMask(to: &maskedLogits)
 
             let bestToken = CompositeSampler.sample(from: &maskedLogits, config: samplingConfiguration)

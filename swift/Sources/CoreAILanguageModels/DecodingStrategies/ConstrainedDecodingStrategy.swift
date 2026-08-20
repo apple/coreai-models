@@ -116,6 +116,7 @@ public struct ConstrainedDecodingStrategy: DecodingStrategy {
     /// Returns `(nil, nil)` if generation should stop.
     fileprivate static func generateOneToken(
         inputTokens: [Int32],
+        generatedTokens: [Int32],
         session: inout ConstrainedGenerationSession,
         inferenceEngine: any InferenceEngine,
         samplingConfiguration: SamplingConfiguration,
@@ -135,6 +136,18 @@ public struct ConstrainedDecodingStrategy: DecodingStrategy {
         }
 
         var maskedLogits = logits
+        if samplingConfiguration.needsRepetitionPenalty,
+            let penalty = samplingConfiguration.repetitionPenalty
+        {
+            let window =
+                samplingConfiguration.repetitionPenaltyWindow.map { min($0, generatedTokens.count) }
+                ?? generatedTokens.count
+            RepetitionPenaltyProcessor.apply(
+                to: &maskedLogits,
+                recentTokenIds: generatedTokens.suffix(window),
+                penalty: Float(penalty)
+            )
+        }
         _ = session.applyMask(to: &maskedLogits)
 
         let bestToken = CompositeSampler.sample(from: &maskedLogits, config: samplingConfiguration)
@@ -296,6 +309,7 @@ extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
                 do {
                     result = try await ConstrainedDecodingStrategy.generateOneToken(
                         inputTokens: inputTokens,
+                        generatedTokens: generatedTokens,
                         session: &session,
                         inferenceEngine: inferenceEngine,
                         samplingConfiguration: samplingConfiguration,
