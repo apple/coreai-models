@@ -16,7 +16,7 @@ import Foundation
 /// **Agentic**: multi-turn message routing where reasoning
 /// is emitted as `to=self` messages and responses as `to=user` messages,
 /// delimited by message boundary tokens.
-struct ThinkTagParser {
+public struct ThinkTagParser {
     enum Event {
         case text(String)
         case reasoning(String)
@@ -201,5 +201,22 @@ struct ThinkTagParser {
             }
         }
         return buffer.endIndex
+    }
+
+    /// Strip all completed thinking blocks from a full string.
+    /// Unclosed blocks at the end are also removed.
+    public static func stripCompleted(
+        from text: String, open: String = "<think>", close: String = "</think>"
+    ) -> String {
+        var result = text
+        while let startRange = result.range(of: open) {
+            if let endRange = result.range(of: close, range: startRange.upperBound..<result.endIndex) {
+                result.removeSubrange(startRange.lowerBound..<endRange.upperBound)
+            } else {
+                result.removeSubrange(startRange.lowerBound..<result.endIndex)
+                break
+            }
+        }
+        return result
     }
 }
