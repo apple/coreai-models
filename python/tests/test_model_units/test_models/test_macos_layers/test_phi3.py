@@ -45,6 +45,7 @@ def _phi4_mini_config(**overrides) -> Phi3Config:
     defaults.update(overrides)
     config = Phi3Config(**defaults)
     config.rope_scaling = None
+    config.rope_parameters = {"rope_type": "default"}
     return config
 
 
@@ -67,6 +68,7 @@ def _phi35_mini_config(**overrides) -> Phi3Config:
     defaults.update(overrides)
     config = Phi3Config(**defaults)
     config.rope_scaling = None
+    config.rope_parameters = {"rope_type": "default"}
     return config
 
 
