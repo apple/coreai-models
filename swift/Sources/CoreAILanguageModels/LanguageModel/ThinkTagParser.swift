@@ -113,6 +113,16 @@ struct ThinkTagParser {
 
         var events: [Event] = []
         while true {
+            // Entry markers may arrive across consume() boundaries — strip them
+            // at the top of each iteration before searching for end markers.
+            if buffer.hasPrefix(selfMarker) {
+                buffer = String(buffer.dropFirst(selfMarker.count))
+                insideThink = true
+            } else if buffer.hasPrefix(userMarker) {
+                buffer = String(buffer.dropFirst(userMarker.count))
+                insideThink = false
+            }
+
             if insideThink {
                 if let range = buffer.range(of: eom) {
                     let before = String(buffer[buffer.startIndex..<range.lowerBound])
