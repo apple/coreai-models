@@ -21,7 +21,7 @@ public struct LogProbabilities: Sendable {
     }
 
     public var mean: Double {
-        let finite = entries.filter { $0.value.isFinite }
+        let finite = entries.filter(\.value.isFinite)
         return finite.isEmpty ? 0 : finite.reduce(0) { $0 + $1.value } / Double(finite.count)
     }
 
@@ -102,7 +102,7 @@ public struct LogProbabilities: Sendable {
         // Return logSumExp = +Inf so that Inf - Inf = NaN is handled by the caller.
         // Instead, return finite logSumExp by counting Inf positions.
         if maxVal.isInfinite {
-            let infCount = floatBuffer.filter { $0.isInfinite && $0 > 0 }.count
+            let infCount = floatBuffer.filter({ $0.isInfinite && $0 > 0 }).count
             let logSumExp = Double.infinity
             // Caller handles Inf - Inf by clamping to 0.0
             return (logSumExp, floatBuffer)
