@@ -60,7 +60,15 @@ public func fillNDArray<T: BitwiseCopyable>(
 public func fillNDArray<T: BitwiseCopyable>(
     _ array: inout NDArray, as type: T.Type, count: Int, using generator: (Int) -> T
 ) {
-    let view = array.mutableView(as: type)
+    fillNDArray(array.mutableRawView(), as: T.self, count: count, using: generator)
+}
+
+/// Fill an NDArray's MutableRawView using a generator closure (index → value).
+/// Takes the view as `consuming` — caller gives up ownership after the call.
+public func fillNDArray<T: BitwiseCopyable>(
+    _ rawView: consuming NDArray.MutableRawView, as type: T.Type, count: Int, using generator: (Int) -> T
+) {
+    let view = rawView.view(as: type)
     view.withUnsafeMutablePointer { ptr, shape, strides in
         let capacity = shape.product
         precondition(count <= capacity, "fillNDArray: count \(count) exceeds array capacity \(capacity)")

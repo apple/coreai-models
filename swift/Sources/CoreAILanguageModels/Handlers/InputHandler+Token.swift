@@ -97,3 +97,53 @@ public struct CompositeInputHandler<Base: SyncInputHandler>: SyncInputHandler {
         return inputs
     }
 }
+
+// MARK: - TokenStaticInputHandler (new inout fill pattern)
+
+/// Zero-allocation token input filler. Fills `input_ids` and `position_ids`
+/// into pre-allocated buffers owned by the engine.
+public struct TokenStaticInputHandler: StaticInputHandler {
+    public let inputNames: [String]
+
+    private let inputIdsName: String
+    private let positionIdsName: String
+    private let inputIdsDescriptor: NDArrayDescriptor
+    private let positionIdsDescriptor: NDArrayDescriptor
+
+    public init(
+        inputIdsName: String,
+        positionIdsName: String,
+        inputIdsDescriptor: NDArrayDescriptor,
+        positionIdsDescriptor: NDArrayDescriptor
+    ) {
+        self.inputIdsName = inputIdsName
+        self.positionIdsName = positionIdsName
+        self.inputIdsDescriptor = inputIdsDescriptor
+        self.positionIdsDescriptor = positionIdsDescriptor
+        self.inputNames = [inputIdsName, positionIdsName]
+    }
+
+    public func registerBuffers(into buffers: inout InputBuffers) {
+        buffers.register(name: inputIdsName, descriptor: inputIdsDescriptor)
+        buffers.register(name: positionIdsName, descriptor: positionIdsDescriptor)
+    }
+
+    public func fill(_ context: InputContext, into buffers: inout InputBuffers) throws {
+        let tokens = context.tokens
+        let batchSize = tokens.count
+        precondition(batchSize > 0, "TokenStaticInputHandler: empty token batch")
+
+        // Ensure input_ids buffer has correct shape
+        buffers.ensureCapacity(name: inputIdsName, shape: [1, batchSize])
+        buffers.withBuffer(inputIdsName) { array in
+            fillNDArray(&array, as: Int32.self, with: tokens)
+        }
+
+        // Ensure position_ids buffer has correct shape
+        let totalPositions = context.processedTokenCount + batchSize
+        buffers.ensureCapacity(name: positionIdsName, shape: [1, totalPositions])
+        buffers.withBuffer(positionIdsName) { array in
+            fillNDArray(&array, as: Int32.self, count: totalPositions) { Int32($0) }
+        }
+    }
+}

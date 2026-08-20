@@ -88,3 +88,88 @@ public enum InputCoverage {
         }
     }
 }
+
+// MARK: - New InputHandler Protocol (inout fill pattern)
+
+/// Pre-allocated input buffer set. Owns NDArrays, reused across steps.
+/// The engine creates this once at init and passes it to `StaticInputHandler.fill()` each step.
+public struct InputBuffers {
+    private var buffers: [String: NDArray] = [:]
+    private var descriptors: [String: NDArrayDescriptor] = [:]
+
+    public init() {}
+
+    /// Register a named input with its descriptor. Allocates initial buffer at batch=1.
+    public mutating func register(name: String, descriptor: NDArrayDescriptor) {
+        descriptors[name] = descriptor
+        let resolved = descriptor.resolvingDynamicDimensions([1, 1])
+        buffers[name] = NDArray(descriptor: resolved)
+    }
+
+    /// Ensure the named buffer has capacity for the given shape.
+    /// Only reallocates if the current shape doesn't match.
+    public mutating func ensureCapacity(name: String, shape: [Int]) {
+        guard let desc = descriptors[name] else { return }
+        let current = buffers[name]
+        let resolved = desc.resolvingDynamicDimensions(shape)
+        if current == nil || current!.shape != resolved.shape {
+            buffers[name] = NDArray(descriptor: resolved)
+        }
+    }
+
+    /// Access a buffer for in-place filling via fillNDArray.
+    ///
+    /// The `_modify` accessor yields the NDArray in-place from the dictionary
+    /// without copying the struct out and back. This avoids COW reference counting
+    /// overhead that would otherwise add ~30µs per access. Do NOT replace with a
+    /// simple get/set — that reintroduces the COW cost (measured: 28µs → 1.1µs).
+    public subscript(name: String) -> NDArray? {
+        get { buffers[name] }
+        set { buffers[name] = newValue }
+        _modify { yield &buffers[name] }
+    }
+
+    /// Access a buffer's MutableRawView for zero-copy filling.
+    /// Same pattern as StateHandler+NDArray.swift bind(into:).
+    public subscript(view name: String) -> NDArray.MutableRawView? {
+        mutating get {
+            _overrideLifetime(buffers[name]?.mutableRawView(), borrowing: ())
+        }
+    }
+
+    /// Get a mutable reference to a buffer for fillNDArray.
+    /// Note: prefer `buffers[name]` with _modify for zero-overhead access.
+    public mutating func withBuffer(
+        _ name: String,
+        body: (inout NDArray) -> Void
+    ) {
+        guard var array = buffers[name] else { return }
+        body(&array)
+        buffers[name] = array
+    }
+
+    /// O(1) as this returns the backing dictionary directly.
+    public func asDict() -> [String: NDArray] {
+        buffers
+    }
+}
+
+/// Fills pre-allocated input buffers in-place. No per-step allocation.
+///
+/// The engine owns `InputBuffers` and passes it to `fill()` each step.
+/// Implementations write into the buffers via `fillNDArray` — no dict creation,
+/// no COW risk from accidental copy-out.
+///
+/// Handlers are stateless — all per-step state lives in `InputContext` or `InputBuffers`.
+/// This allows handlers to be stored as `let` and shared across engines.
+public protocol StaticInputHandler: Sendable {
+    /// Input names this filler produces.
+    var inputNames: [String] { get }
+
+    /// Register required buffers into the InputBuffers at engine init time.
+    func registerBuffers(into buffers: inout InputBuffers)
+
+    /// Fill input buffers for the given context.
+    /// Non-mutating: handler holds no per-step state. All mutation goes into `buffers`.
+    func fill(_ context: InputContext, into buffers: inout InputBuffers) throws
+}
