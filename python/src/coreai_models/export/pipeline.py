@@ -21,8 +21,6 @@ from pathlib import Path
 from typing import Any, Literal
 
 import torch
-from coreai_opt.palettization.config.palettization_config import KMeansPalettizerConfig
-from coreai_opt.quantization import ExecutionMode
 from transformers import AutoConfig, AutoTokenizer
 
 from coreai_models._constants import (
@@ -32,8 +30,10 @@ from coreai_models._constants import (
 from coreai_models.export.bundle import bundle_llm_asset
 from coreai_models.export.compression import (
     get_c4,
+    is_compression_mode_graph,
     palettize_pytorch_model,
     quantize_for_export,
+    split_compression_config,
 )
 from coreai_models.export.externalize import patch_model_for_externalization
 from coreai_models.export.ios import export_ios_model
@@ -223,12 +223,9 @@ async def _async_export_model(config: ExportConfig) -> str:
         model = model.eval()
         # ---- 3. Resolve compression preset ----
         if config.compression_config_object is not None:
-            if isinstance(config.compression_config_object, KMeansPalettizerConfig):
-                torch_palettization_config = config.compression_config_object
-                torch_quantization_config = None
-            else:
-                torch_quantization_config = config.compression_config_object
-                torch_palettization_config = None
+            torch_quantization_config, torch_palettization_config = split_compression_config(
+                config.compression_config_object
+            )
         else:
             preset = get_preset(config.compression)
             torch_quantization_config = preset.get("torch_quantization_config")
@@ -259,6 +256,10 @@ async def _async_export_model(config: ExportConfig) -> str:
             # The preset or YAML is the source of truth; `--quantization-mode` overrides
             # it only when given.
             if config.quantization_mode is not None:
+                logger.warning(
+                    "Overriding execution_mode for `coreai-opt` compression with "
+                    f"{config.quantization_mode}"
+                )
                 quant_cfg["execution_mode"] = config.quantization_mode
             elif "execution_mode" not in quant_cfg:
                 raise ValueError(
@@ -267,8 +268,7 @@ async def _async_export_model(config: ExportConfig) -> str:
                     "{eager,graph}."
                 )
 
-            execution_mode = ExecutionMode(quant_cfg["execution_mode"])
-            graph_mode = execution_mode == ExecutionMode.GRAPH
+            graph_mode = is_compression_mode_graph(quant_cfg)
 
             quantizer_mmap_dir: str | None = None
             # coreai-opt only supports mmap-backed finalization in eager mode.

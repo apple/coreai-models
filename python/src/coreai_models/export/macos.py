@@ -90,7 +90,8 @@ def export_to_coreai(
             rather than as regular inputs/outputs).
         externalized_model: The eager module whose composite-op submodules were marked
             by ``patch_model_for_externalization`` before ``model`` was produced.
-            Required in case of graph-mode quantization.
+            Required when ``model`` is a flattened ``torch.fx.GraphModule``, and
+            unused when it is an eager module.
 
     Returns:
         A AIProgram ready for optimization and compilation.
@@ -125,12 +126,24 @@ def export_to_coreai(
 
     converter = coreai_torch.TorchConverter()
 
-    if externalized_model is None:
-        if isinstance(model, torch.fx.GraphModule):
+    # GraphModule subclasses nn.Module, so this specific check has to come first
+    if isinstance(model, torch.fx.GraphModule):
+        if externalized_model is None:
             raise ValueError(
                 "A flattened torch.fx.GraphModule needs an externalized_model handle. "
                 "Call patch_model_for_externalization on the model before quantization."
             )
+        exported_program = export_fn(model, pass_inputs_as_kwargs=False)
+        externalized_programs = subexport_and_restore(externalized_model, exported_program)
+
+        converter.add_exported_program(
+            exported_program,
+            input_names=input_names,
+            output_names=output_names,
+            state_names=state_names,
+            _externalized_exported_programs=externalized_programs,  # type: ignore[call-arg]
+        )
+    elif isinstance(model, torch.nn.Module):
         model.eval()
         converter.add_pytorch_module(
             model,
@@ -141,15 +154,9 @@ def export_to_coreai(
             state_names=state_names,
         )
     else:
-        exported_program = export_fn(model, pass_inputs_as_kwargs=False)
-        externalized_programs = subexport_and_restore(externalized_model, exported_program)
-
-        converter.add_exported_program(
-            exported_program,
-            input_names=input_names,
-            output_names=output_names,
-            state_names=state_names,
-            _externalized_exported_programs=externalized_programs,  # type: ignore[call-arg]
+        raise TypeError(
+            "model must be a torch.nn.Module (eager-mode) or torch.fx.GraphModule "
+            f"(graph-mode), got {type(model).__name__}."
         )
 
     register_custom_torch_lowering(converter)
