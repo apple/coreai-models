@@ -149,7 +149,7 @@ struct SpeechRecognizer: AsyncParsableCommand {
 
     func run() async throws {
         if let parityTest {
-            try await SpeechParityTest(
+            try await SpeechParity(
                 directory: URL(fileURLWithPath: parityTest),
                 modelPath: model,
                 psnrFloor: psnrFloor,

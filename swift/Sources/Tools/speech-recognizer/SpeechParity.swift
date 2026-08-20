@@ -30,7 +30,7 @@ import Foundation
 // Every `ref_*` file is optional: whichever are present become rows, so a trace set can
 // cover only the front-end. Arrays must be C-contiguous — see `NpyArray.load`.
 
-struct SpeechParityTest {
+struct SpeechParity {
     let directory: URL
     let modelPath: String?
     let psnrFloor: Double

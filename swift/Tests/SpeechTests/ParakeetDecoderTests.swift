@@ -10,12 +10,12 @@ import Testing
 
 @testable import CoreAISpeech
 
-// MARK: - Argmax
+// MARK: - Argmax ranges
 
-/// Exercised through an `NDArray`, which is what the decode loop scans (`buffers.logits`), so
-/// these pin the same call the runtime makes — including the scalar-type dispatch and the
-/// `[1, 1, N]` layout the joint emits.
-@Suite("TDT argmax")
+/// The two ranges the decode loop carves out of one joint output. `argmaxFloat` itself — ties,
+/// empty ranges, relative indices, f16 dispatch — is pinned in `CoreAISharedTests`; what these
+/// add is that the *TDT* range arithmetic reaches every id it must.
+@Suite("TDT argmax ranges")
 struct TDTArgmaxTests {
     /// A `[1, 1, values.count]` logits row, shaped like the joint's output.
     private func logitsRow(
@@ -24,44 +24,6 @@ struct TDTArgmaxTests {
         var array = NDArray(shape: [1, 1, values.count], scalarType: scalarType)
         fillFloatNDArray(&array, with: values)
         return array
-    }
-
-    @Test("Returns the index of the largest value")
-    func returnsLargest() {
-        #expect(argmaxFloat(logitsRow([1, 5, 3]), in: 0..<3) == 1)
-    }
-
-    @Test("Ties go to the lowest index")
-    func tiesGoLow() {
-        // Documented contract, and it differs from WhisperDecoder's `indices.max(by:)`, which
-        // returns the *last* maximal element. Pinned so the two are not accidentally unified.
-        #expect(argmaxFloat(logitsRow([2, 2, 1]), in: 0..<3) == 0)
-    }
-
-    @Test("An all-negative-infinity range returns zero")
-    func allNegativeInfinityReturnsZero() {
-        #expect(argmaxFloat(logitsRow([-.infinity, -.infinity]), in: 0..<2) == 0)
-    }
-
-    @Test("Indices are relative to the range lower bound")
-    func indicesAreRelative() {
-        // The duration argmax indexes `cfg.durations` with this result, so an absolute index here
-        // would read the wrong duration or run off the end.
-        #expect(argmaxFloat(logitsRow([9, 9, 0, 7]), in: 2..<4) == 1)
-    }
-
-    @Test("A single-element range returns zero")
-    func singleElementRange() {
-        #expect(argmaxFloat(logitsRow([4, 8, 2]), in: 1..<2) == 0)
-    }
-
-    /// The scan converts as it reads, so an f16 row — what a `--dtype float16` bundle emits,
-    /// and the case the decode loop usually runs — must order identically to f32.
-    @Test("An f16 row scans the same as f32")
-    func float16RowMatches() {
-        let values: [Float] = [1, 5, 3, 5, 2]
-        #expect(argmaxFloat(logitsRow(values, scalarType: .float16), in: 0..<5) == 1)
-        #expect(argmaxFloat(logitsRow(values, scalarType: .float16), in: 2..<5) == 1)
     }
 
     /// Half of the invariant the reviewer questioned: `lastToken == blankTokenId` only means "the
@@ -80,6 +42,8 @@ struct TDTArgmaxTests {
 
     @Test("Duration indices stay inside the durations array")
     func durationIndicesAreInRange() {
+        // The duration argmax indexes `cfg.durations` with a range-relative result, so an
+        // off-by-one here reads the wrong duration or runs off the end.
         let vocabSize = 1_030
         let durations = [0, 1, 2, 3, 4]
         for j in durations.indices {
@@ -90,47 +54,6 @@ struct TDTArgmaxTests {
             #expect(index == j)
             #expect(durations.indices.contains(index))
         }
-    }
-}
-
-// MARK: - Partial reads
-
-/// `floatElements` is how a streaming hop converts only the frames it decodes, leaving the
-/// window's left and right context unconverted. Getting the range arithmetic wrong would hand
-/// the joint a frame of the wrong audio, so the offsets are pinned here.
-@Suite("Encoder frame slicing")
-struct FloatElementsTests {
-    /// A `[1, frames, hidden]` encoder output, the shape the streaming path slices.
-    private func encoderOutput(
-        frames: Int, hidden: Int, scalarType: NDArray.ScalarType = .float32
-    ) -> NDArray {
-        var array = NDArray(shape: [1, frames, hidden], scalarType: scalarType)
-        fillFloatNDArray(&array, with: (0..<(frames * hidden)).map { Float($0) })
-        return array
-    }
-
-    @Test("Converts exactly the requested range, in row-major order")
-    func convertsRequestedRange() {
-        let array = encoderOutput(frames: 4, hidden: 3)
-        #expect(floatElements(array, in: 0..<3) == [0, 1, 2])
-        // Frame 2 of a hidden-3 output: the slice the decode loop takes per step.
-        #expect(floatElements(array, in: 6..<9) == [6, 7, 8])
-        #expect(floatElements(array, in: 0..<12).count == 12)
-    }
-
-    @Test("An empty range converts to nothing")
-    func emptyRange() {
-        #expect(floatElements(encoderOutput(frames: 2, hidden: 3), in: 3..<3).isEmpty)
-    }
-
-    /// The usual case at runtime: a `--dtype float16` bundle's encoder output, converted up.
-    @Test("An f16 output converts to the same values as f32")
-    func float16Matches() {
-        let expected: [Float] = [3, 4, 5]
-        #expect(floatElements(encoderOutput(frames: 4, hidden: 3), in: 3..<6) == expected)
-        #expect(
-            floatElements(encoderOutput(frames: 4, hidden: 3, scalarType: .float16), in: 3..<6)
-                == expected)
     }
 }
 
