@@ -1071,6 +1071,7 @@ extension CoreAISequentialVLMEngine.GenerationSequence {
         private let generationToken: GenerationToken
 
         private var inputTokens: [CoreAISequentialVLMEngine.TokenId]
+        private let generationStartOffset: Int
         private var embeddedInput: InputEmbeddings?
         private var step: Int = 0
         private var finished: Bool = false
@@ -1092,6 +1093,7 @@ extension CoreAISequentialVLMEngine.GenerationSequence {
             self.stopReasonStore = stopReasonStore
             self.generationToken = generationToken
             self.inputTokens = input
+            self.generationStartOffset = input.count
             self.embeddedInput = embeddedInput
             if let forced = inferenceOptions.forcedContinuation {
                 self.maxTokens = forced.count
@@ -1180,7 +1182,8 @@ extension CoreAISequentialVLMEngine.GenerationSequence {
                     nextToken = forced[step]
                 } else {
                     var mutableLogits = logitBuffer
-                    nextToken = samplingConfiguration.fallbackSampler(from: &mutableLogits)
+                    nextToken = samplingConfiguration.fallbackSampler(
+                        from: &mutableLogits, tokenHistory: inputTokens[generationStartOffset...])
                 }
 
                 inputTokens.append(nextToken)

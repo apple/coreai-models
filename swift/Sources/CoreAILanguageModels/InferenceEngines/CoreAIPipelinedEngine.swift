@@ -566,6 +566,7 @@ private struct EngineImpl: ~Copyable {
     // GPU sampler — reuses MPSGraphSampler from MPSGraphSamplers.swift
     var cachedSampler: (any MPSGraphSampler)?
     var cachedSamplerTemperature: Double?
+    var penaltyState: RepetitionPenaltyGPUState?
 
     // State
     var processedTokenCount: Int = 0
@@ -817,6 +818,24 @@ private struct EngineImpl: ~Copyable {
             return existingSampler
         }
 
+        // Create penalized sampler if repetition penalty is configured
+        if config.needsRepetitionPenalty {
+            if config.temperature == 0 {
+                throw InferenceRuntimeError.invalidArgument(
+                    "Repetition penalty with greedy sampling is not supported on pipelined engine. "
+                        + "Use temperature > 0, or use a sequential engine.")
+            }
+            if penaltyState == nil {
+                penaltyState = try RepetitionPenaltyGPUState(
+                    device: device,
+                    vocabSize: self.config.vocabSize,
+                    pipelineDepth: pipelineDepth,
+                    penalty: config.repetitionPenalty!,
+                    windowSize: config.repetitionPenaltyWindow
+                )
+            }
+        }
+
         let newSampler = try MPSGraphSamplerFactory.makeSampler(
             device: device,
             vocabSize: self.config.vocabSize,
@@ -977,7 +996,10 @@ private struct EngineImpl: ~Copyable {
 
         let queue = pipelineQueue
         let localInFlightGate = inFlightGate
+        let localPenaltyState = penaltyState
         let completionCallback: (Int32, Error?) -> Void = { nextToken, error in
+            // Update penalty state BEFORE releasing the gate.
+            localPenaltyState?.recordToken(nextToken)
             // Release the pipeline slot acquired before encode. Happens on
             // Metal's callback thread — PipelineGate.release() is thread-safe.
             localInFlightGate.release()
@@ -994,7 +1016,22 @@ private struct EngineImpl: ~Copyable {
         }
 
         do {
-            if queryLength == 1 {
+            // Use penalty-aware path for decode steps when penalty is active.
+            if queryLength == 1, let state = penaltyState,
+                let compositeSampler = localGPUSampler as? MPSGraphCompositeSampler,
+                compositeSampler.penaltyEnabled
+            {
+                let penaltyBuf = state.buffer(forStep: currentStep)
+                compositeSampler.encode(
+                    to: queue,
+                    logitsBuffer: samplerLogitsBuffer,
+                    logitsOffset: logitsOffset,
+                    penaltyBuffer: penaltyBuf,
+                    outputBuffer: outputBuffer,
+                    outputOffset: 0,
+                    completion: completionCallback
+                )
+            } else if queryLength == 1 {
                 try localGPUSampler.encode(
                     to: queue,
                     logitsBuffer: samplerLogitsBuffer,

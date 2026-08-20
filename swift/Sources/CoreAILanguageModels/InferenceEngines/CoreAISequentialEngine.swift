@@ -480,6 +480,7 @@ extension CoreAISequentialEngine.GenerationSequence {
         private let generationToken: GenerationToken
 
         private var inputTokens: [CoreAISequentialEngine.TokenId]
+        private let generationStartOffset: Int
         private var step: Int = 0
         private var finished: Bool = false
 
@@ -498,6 +499,7 @@ extension CoreAISequentialEngine.GenerationSequence {
             self.stopReasonStore = stopReasonStore
             self.generationToken = generationToken
             self.inputTokens = input
+            self.generationStartOffset = input.count
             if let forced = inferenceOptions.forcedContinuation {
                 self.maxTokens = forced.count
             } else {
@@ -570,7 +572,8 @@ extension CoreAISequentialEngine.GenerationSequence {
                     nextToken = forced[step]
                 } else {
                     var mutableLogits = logitBuffer
-                    nextToken = samplingConfiguration.fallbackSampler(from: &mutableLogits)
+                    nextToken = samplingConfiguration.fallbackSampler(
+                        from: &mutableLogits, tokenHistory: inputTokens[generationStartOffset...])
                 }
 
                 inputTokens.append(nextToken)

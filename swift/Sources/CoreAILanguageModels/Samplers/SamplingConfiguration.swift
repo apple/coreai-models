@@ -15,11 +15,12 @@ import CoreAIShared
 ///
 /// ## Sampling Algorithm Order
 /// When multiple parameters are set, they are applied in this order:
-/// 1. Temperature scaling (logits / temperature)
-/// 2. MinP filtering (relative probability threshold)
-/// 3. TopP filtering (cumulative probability cutoff)
-/// 4. TopK filtering (hard limit on vocabulary)
-/// 5. Softmax and multinomial sampling
+/// 1. Repetition penalty (logits modified based on token history)
+/// 2. Temperature scaling (logits / temperature)
+/// 3. MinP filtering (relative probability threshold)
+/// 4. TopP filtering (cumulative probability cutoff)
+/// 5. TopK filtering (hard limit on vocabulary)
+/// 6. Softmax and multinomial sampling
 ///
 /// ## Usage Example
 /// ```swift
@@ -90,6 +91,26 @@ public struct SamplingConfiguration: Sendable, Equatable, Hashable {
     /// Unlike TopP, it does not require sorting — it operates as a simple threshold in logit space.
     public let minP: Double?
 
+    /// Repetition penalty factor applied to tokens that appear in the generation history.
+    ///
+    /// - **nil** or **1.0**: No penalty (disabled)
+    /// - **1.1–1.3**: Common range for reducing repetition
+    /// - **>1.5**: Aggressive penalty, may hurt coherence
+    ///
+    /// For each token in recent history:
+    /// - If logit > 0: divide by penalty
+    /// - If logit < 0: multiply by penalty
+    ///
+    /// Applied before all other sampling steps (temperature, topK, topP, minP).
+    public let repetitionPenalty: Double?
+
+    /// How many recent tokens to consider for repetition penalty.
+    ///
+    /// - **nil**: All tokens in generation history
+    /// - **64**: Only penalize tokens from the last 64 steps
+    /// - **256**: Moderate window
+    public let repetitionPenaltyWindow: Int?
+
     /// A boolean flag that requests the sampling operation be combined
     /// with logit inference.
     ///
@@ -107,20 +128,35 @@ public struct SamplingConfiguration: Sendable, Equatable, Hashable {
     ///   - topK: Optional top-K limit. Must be > 0 if set.
     ///   - topP: Optional top-P threshold. Must be in (0, 1] if set.
     ///   - minP: Optional min-P threshold. Must be in (0, 1] if set.
+    ///   - repetitionPenalty: Optional repetition penalty factor. Must be >= 1.0 if set.
+    ///   - repetitionPenaltyWindow: Optional window size. Must be > 0 if set.
     ///   - combined: Whether to combine sampling with logit inference. Defaults to true.
-    ///
-    /// - Note: Call `validate()` to check for potentially suboptimal configurations.
-    public init(temperature: Double, topK: Int? = nil, topP: Double? = nil, minP: Double? = nil, combined: Bool = true)
-    {
+    public init(
+        temperature: Double,
+        topK: Int? = nil,
+        topP: Double? = nil,
+        minP: Double? = nil,
+        repetitionPenalty: Double? = nil,
+        repetitionPenaltyWindow: Int? = nil,
+        combined: Bool = true
+    ) {
         precondition(temperature >= 0, "Temperature must be non-negative.")
         precondition(topK == nil || topK! > 0, "TopK must be positive if set.")
         precondition(topP == nil || (topP! > 0 && topP! <= 1), "TopP must be in (0, 1] if set.")
         precondition(minP == nil || (minP! > 0 && minP! <= 1), "MinP must be in (0, 1] if set.")
+        precondition(
+            repetitionPenalty == nil || repetitionPenalty! >= 1.0,
+            "Repetition penalty must be >= 1.0 if set.")
+        precondition(
+            repetitionPenaltyWindow == nil || repetitionPenaltyWindow! > 0,
+            "Repetition penalty window must be > 0 if set.")
 
         self.temperature = temperature
         self.topK = topK
         self.topP = topP
         self.minP = minP
+        self.repetitionPenalty = repetitionPenalty
+        self.repetitionPenaltyWindow = repetitionPenaltyWindow
         self.combined = combined
     }
 
@@ -152,6 +188,12 @@ public struct SamplingConfiguration: Sendable, Equatable, Hashable {
     /// True when temperature > 0 and any of topK, topP, or minP is set.
     public var isComposite: Bool {
         temperature > 0 && (topK != nil || topP != nil || minP != nil)
+    }
+
+    /// Whether repetition penalty is active.
+    public var needsRepetitionPenalty: Bool {
+        guard let penalty = repetitionPenalty else { return false }
+        return penalty > 1.0
     }
 
     /// Validates the configuration and returns warnings for potentially suboptimal settings.
@@ -255,6 +297,8 @@ public struct SamplingConfiguration: Sendable, Equatable, Hashable {
             topK: effectiveTopK,
             topP: effectiveTopP,
             minP: effectiveMinP,
+            repetitionPenalty: repetitionPenalty,
+            repetitionPenaltyWindow: repetitionPenaltyWindow,
             combined: combined
         )
     }
@@ -270,6 +314,32 @@ extension SamplingConfiguration {
     /// - Parameter logits: Mutable array of Float16 logits. May be modified during sampling.
     /// - Returns: The sampled token ID.
     public func fallbackSampler(from logits: inout [LogitsScalarType]) -> Int32 {
+        precondition(
+            !needsRepetitionPenalty,
+            "Use fallbackSampler(from:tokenHistory:) when repetition penalty is configured"
+        )
+        return CompositeSampler.sample(from: &logits, config: self)
+    }
+
+    /// Samples the next token with repetition penalty applied first.
+    ///
+    /// Applies repetition penalty (if configured) to the logits based on token history,
+    /// then delegates to the standard sampler pipeline.
+    ///
+    /// - Parameters:
+    ///   - logits: Mutable array of Float16 logits. May be modified during sampling.
+    ///   - tokenHistory: Recent token IDs for repetition penalty.
+    /// - Returns: The sampled token ID.
+    public func fallbackSampler(from logits: inout [LogitsScalarType], tokenHistory: some Collection<Int32>) -> Int32 {
+        if needsRepetitionPenalty {
+            let window = repetitionPenaltyWindow.map { min($0, tokenHistory.count) } ?? tokenHistory.count
+            let recentTokens = tokenHistory.suffix(window)
+            RepetitionPenaltyProcessor.apply(
+                to: &logits,
+                recentTokenIds: recentTokens,
+                penalty: Float(repetitionPenalty!)
+            )
+        }
         return CompositeSampler.sample(from: &logits, config: self)
     }
 }

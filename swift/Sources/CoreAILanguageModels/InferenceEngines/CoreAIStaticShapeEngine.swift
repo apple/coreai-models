@@ -368,7 +368,8 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     // MARK: - Inference
 
     public func inference(
-        inputTokens: [Int32], samplingConfig: SamplingConfiguration, returnsLogits: Bool
+        inputTokens: [Int32], samplingConfig: SamplingConfiguration, returnsLogits: Bool,
+        generationStartOffset: Int = 0
     ) async throws -> (logits: [LogitsScalarType]?, token: Int32) {
         CLILogger.log("Inference: \(inputTokens.count) tokens, processed: \(processedTokenCount)")
 
@@ -453,7 +454,8 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
 
         let actualLogits = returnsLogits ? logitBuffer : nil
         let sampleSpan = InstrumentsProfiler.beginSample(strategy: "cpu-fallback")
-        let nextToken = samplingConfig.fallbackSampler(from: &logitBuffer)
+        let nextToken = samplingConfig.fallbackSampler(
+            from: &logitBuffer, tokenHistory: inputTokens[generationStartOffset...])
         sampleSpan.end()
         CLILogger.log("Token: \(nextToken), processed: \(processedTokenCount)")
         return (logits: actualLogits, token: nextToken)
@@ -657,6 +659,7 @@ extension StaticShapeEngine.GenerationSequence {
         private let generationToken: GenerationToken
 
         private var inputTokens: [StaticShapeEngine.TokenId]
+        private let generationStartOffset: Int
         private var step: Int = 0
         private var finished: Bool = false
 
@@ -675,6 +678,7 @@ extension StaticShapeEngine.GenerationSequence {
             self.stopReasonStore = stopReasonStore
             self.generationToken = generationToken
             self.inputTokens = input
+            self.generationStartOffset = input.count
             if let forced = inferenceOptions.forcedContinuation {
                 self.maxTokens = forced.count
             } else {
@@ -711,7 +715,8 @@ extension StaticShapeEngine.GenerationSequence {
                 let (logits, sampledToken) = try await engine.inference(
                     inputTokens: inputTokens,
                     samplingConfig: samplingConfiguration,
-                    returnsLogits: returnsLogits || forcedContinuation != nil
+                    returnsLogits: returnsLogits || forcedContinuation != nil,
+                    generationStartOffset: generationStartOffset
                 )
 
                 // Update history with newly processed tokens
