@@ -172,6 +172,7 @@ uv run models/<name>/export.py --include-debug-info   # embed debug information 
 - [Mistral](mistral)
 - [Mixtral](mixtral)
 - [Muse Glimmer](muse_glimmer)
+- [Phi](phi)
 - [Qwen2.5](qwen2)
 - [Qwen3](qwen3)
 - [Qwen3 MoE](qwen3_moe)
