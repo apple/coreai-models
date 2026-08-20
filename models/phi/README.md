@@ -65,13 +65,16 @@ Defaults: 512 prompt tokens, 1024 generation tokens, 5 trials. Override with `-p
 
 Perplexity score on the [`WikiText-2`](https://huggingface.co/datasets/EleutherAI/wikitext_document_level) dataset computed using the [lm-evaluation-harness](https://github.com/EleutherAI/lm-evaluation-harness/blob/main/lm_eval/tasks/wikitext/README.md) with the Core AI PyTorch models. The full precision scores have been validated against HuggingFace transformers baseline (within 0.3%).
 
-| Model            | Compression               | Bits Per Weight (BPW) | Platform | Perplexity Score |
-| ---------------- | ------------------------- | --------------------- | -------- | ---------------- |
-| Phi-3-mini       | none (`float16`)          | 16.00                 | macOS    | 9.47             |
-| Phi-3-mini       | [4-bit quantized][p-4bit] | 4.50                  | macOS    | 11.24            |
-| Phi-3.5-mini     | none (`float16`)          | 16.00                 | macOS    | 9.98             |
-| Phi-3.5-mini     | [4-bit quantized][p-4bit] | 4.50                  | macOS    | 12.04            |
-| Phi-4-mini       | none (`float16`)          | 16.00                 | macOS    | 11.12            |
-| Phi-4-mini       | [4-bit quantized][p-4bit] | 4.50                  | macOS    | 12.80            |
+| Model            | Compression                              | Bits Per Weight (BPW) | Platform | Perplexity Score |
+| ---------------- | ---------------------------------------- | --------------------- | -------- | ---------------- |
+| Phi-3-mini       | none (`float16`)                         | 16.00                 | macOS    | 9.47             |
+| Phi-3-mini       | [INT4 with FP16 embedding][phi-4bit-yaml]| 4.56\*                | macOS    | 11.24            |
+| Phi-3.5-mini     | none (`float16`)                         | 16.00                 | macOS    | 9.98             |
+| Phi-3.5-mini     | [INT4 with FP16 embedding][phi-4bit-yaml]| 4.56\*                | macOS    | 12.04            |
+| Phi-4-mini       | none (`float16`)                         | 16.00                 | macOS    | 11.12            |
+| Phi-4-mini       | [INT4 with FP16 embedding][phi-4bit-yaml]| 4.56\*                | macOS    | 12.80            |
 
-[p-4bit]: ../README.md#quantization-options
+\* BPW: INT4 body (4.50) + FP16 embedding. Embedding is excluded from quantization
+because Phi-4 ties embedding and lm_head weights — INT4 on lm_head degrades generation quality.
+
+[phi-4bit-yaml]: phi_4bit_embedding_excluded.yaml
