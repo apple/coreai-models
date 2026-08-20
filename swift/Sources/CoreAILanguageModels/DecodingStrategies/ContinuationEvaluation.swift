@@ -66,69 +66,25 @@ public struct ContinuationEvaluationResult: Sendable {
     public let logits: [[LogitsScalarType]]
 
     /// Calculate log probability of the continuation
-    /// Sum of log probabilities for each target token
     public func logProbability() -> Double {
-        var totalLogProb: Double = 0.0
-        for (logitsVec, targetToken) in zip(logits, continuationTokens) {
-            let tokenIndex = Int(targetToken)
-            // Validate token index is within vocabulary bounds
-            guard tokenIndex >= 0 && tokenIndex < logitsVec.count else {
-                continue
-            }
-            let logProbs = logSoftmax(logitsVec)
-            totalLogProb += Double(logProbs[tokenIndex])
-        }
-        return totalLogProb
+        LogProbabilities.compute(logits: logits, targets: continuationTokens).sum
     }
 
     /// Calculate average log probability per token
     public func averageLogProbability() -> Double {
-        guard !continuationTokens.isEmpty else { return 0.0 }
-        return logProbability() / Double(continuationTokens.count)
+        LogProbabilities.compute(logits: logits, targets: continuationTokens).mean
     }
 
     /// Calculate perplexity of the continuation
     public func perplexity() -> Double {
-        let avgLogProb = averageLogProbability()
-        return exp(-avgLogProb)
+        LogProbabilities.compute(logits: logits, targets: continuationTokens).perplexity
     }
 
-    /// Get probability of the target token at each position
+    /// Get probability of the target token at each position.
+    /// Invalid tokens (out-of-bounds) return 0.0.
     public func targetProbabilities() -> [Double] {
-        var probs: [Double] = []
-        for (logitsVec, targetToken) in zip(logits, continuationTokens) {
-            let tokenIndex = Int(targetToken)
-            // Validate token index is within vocabulary bounds
-            guard tokenIndex >= 0 && tokenIndex < logitsVec.count else {
-                probs.append(0.0)
-                continue
-            }
-            let logProbs = logSoftmax(logitsVec)
-            probs.append(exp(Double(logProbs[tokenIndex])))
-        }
-        return probs
-    }
-
-    /// Compute log-softmax over logits for better numerical stability than softmax + log
-    ///
-    /// **Why log-softmax is more stable:**
-    /// With softmax + log, small probabilities underflow:
-    ///   - logits = [100, 0, 0] → softmax ≈ [1.0, 3.7e-44, 3.7e-44]
-    ///   - In Float16, 3.7e-44 underflows to 0 → log(0) = -inf
-    ///
-    /// With log-softmax, we compute directly:
-    ///   - shifted = [100-100, 0-100, 0-100] = [0, -100, -100]
-    ///   - logSumExp ≈ log(1 + 2e-44) ≈ 0
-    ///   - log-softmax ≈ [0, -100, -100] (finite values, not -inf)
-    ///
-    /// Formula: log(softmax(x)[i]) = x[i] - max(x) - log(sum(exp(x - max(x))))
-    private func logSoftmax<T: BinaryFloatingPoint>(_ logits: [T]) -> [T] {
-        let maxLogit = logits.max() ?? 0
-        let shifted = logits.map { Float($0) - Float(maxLogit) }
-        let sumExp = shifted.map { exp($0) }.reduce(0, +)
-        // Guard against log(0) with epsilon 1e-10; bounds log at ~-23 nats
-        let logSumExp = log(max(sumExp, 1e-10))
-        return shifted.map { T($0 - logSumExp) }
+        LogProbabilities.compute(logits: logits, targets: continuationTokens)
+            .entries.map { $0.value.isFinite ? exp($0.value) : 0.0 }
     }
 }
 
@@ -140,6 +96,7 @@ public enum ContinuationEvaluationError: Error, LocalizedError {
     case engineDoesNotSupportLogits
     case emptyContinuation
     case rawTokensNotSupported
+    case emptyInput
 
     public var errorDescription: String? {
         switch self {
@@ -153,6 +110,8 @@ public enum ContinuationEvaluationError: Error, LocalizedError {
             return "Continuation string cannot be empty"
         case .rawTokensNotSupported:
             return "--continuation requires text prompt (--prompt or --prompt-file), not --raw-tokens"
+        case .emptyInput:
+            return "Raw token evaluation requires at least 2 tokens"
         }
     }
 }
