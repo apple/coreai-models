@@ -82,8 +82,18 @@ private func handleChatCompletionsFromBody(body: ByteBuffer, state: ServerState)
             status: .tooManyRequests, headers: [.contentType: "application/json"],
             body: .init(byteBuffer: ByteBuffer(data: data)))
     }
+    let chatRequest: ChatCompletionRequest
     do {
-        let chatRequest = try JSONDecoder().decode(ChatCompletionRequest.self, from: body)
+        chatRequest = try JSONDecoder().decode(ChatCompletionRequest.self, from: body)
+    } catch {
+        state.release()
+        let err = ErrorResponse(error: .init(message: "\(error)", type: "invalid_request_error", code: nil))
+        let data = try JSONEncoder().encode(err)
+        return Response(
+            status: .badRequest, headers: [.contentType: "application/json"],
+            body: .init(byteBuffer: ByteBuffer(data: data)))
+    }
+    do {
         let shouldStream = chatRequest.stream ?? false
         if shouldStream {
             return try await handleStreamingRequest(chatRequest: chatRequest, state: state)
@@ -349,7 +359,7 @@ private func tokenizeMessages(_ messages: [ChatMessage], state: ServerState) -> 
         return tokens
     }
 
-    let text = messages.map { "\($0.role): \($0.content.textContent)" }.joined(separator: "\n")
+    let text = templateMessages.map { "\($0["role"] ?? "user"): \($0["content"] ?? "")" }.joined(separator: "\n")
     return state.tokenizer.encode(text: text)
 }
 

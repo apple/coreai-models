@@ -54,6 +54,12 @@ struct LLMServer: AsyncParsableCommand {
     @Flag(name: .customLong("no-thinking"), help: "Disable thinking/reasoning (appends /no_think or sets template)")
     var noThinking: Bool = false
 
+    @Flag(
+        name: .customLong("clear-coreai-cache"),
+        help: "Clear Core AI cached specialization for this model before loading (forces re-specialization)"
+    )
+    var clearCoreAICache: Bool = false
+
     @Flag(help: "Enable verbose logging")
     var verbose: Bool = false
 
@@ -68,6 +74,11 @@ struct LLMServer: AsyncParsableCommand {
 
         let bundle = try LanguageBundle(from: url.path)
         try bundle.bundle.verify()
+
+        if clearCoreAICache {
+            let cleared = try PreparedModel.clearCache(at: bundle.bundlePath)
+            print("Cleared specialization cache for \(bundle.name) (\(cleared.count) component(s))")
+        }
 
         let engineOptions = EngineOptions(
             variant: inferenceEngineVariant,
@@ -121,6 +132,7 @@ struct LLMServer: AsyncParsableCommand {
         try await engine.warmup(queryLength: 1, sampling: samplingConfig)
 
         modelLoadSpan.end()
+        await Task.yield()
 
         let modelName = serverModelName ?? bundle.name
         let supportsLogprobs = engine.supportsLogits

@@ -44,7 +44,7 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.2.0"),
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.1.0"),
         .package(url: "https://github.com/mlc-ai/xgrammar", exact: "0.2.2"),
-        .package(url: "https://github.com/hummingbird-project/hummingbird", from: "2.0.0"),
+        .package(url: "https://github.com/hummingbird-project/hummingbird", exact: "2.22.0"),
     ],
     targets: [
         .target(

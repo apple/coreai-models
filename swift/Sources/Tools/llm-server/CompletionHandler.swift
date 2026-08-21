@@ -38,8 +38,18 @@ func handleCompletionsFromBody(body: ByteBuffer, state: ServerState) async throw
             body: .init(byteBuffer: ByteBuffer(data: data)))
     }
     defer { state.release() }
+    let req: CompletionRequest
     do {
-        let req = try JSONDecoder().decode(CompletionRequest.self, from: body)
+        req = try JSONDecoder().decode(CompletionRequest.self, from: body)
+    } catch {
+        print("[SERVER] Completions decode error: \(error)")
+        let err = ErrorResponse(error: .init(message: "\(error)", type: "invalid_request_error", code: nil))
+        let data = try JSONEncoder().encode(err)
+        return Response(
+            status: .badRequest, headers: [.contentType: "application/json"],
+            body: .init(byteBuffer: ByteBuffer(data: data)))
+    }
+    do {
         return try await handleLoglikelihood(req: req, state: state)
     } catch {
         print("[SERVER] Completions error: \(error)")
