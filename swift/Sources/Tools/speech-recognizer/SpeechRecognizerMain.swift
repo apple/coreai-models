@@ -37,6 +37,36 @@ struct SpeechRecognizer: AsyncParsableCommand {
     @Flag(name: .long, help: "Print verbose debug output")
     var verbose = false
 
+    @Flag(name: .long, help: "Transcribe incrementally through the streaming API.")
+    var stream = false
+
+    @Flag(
+        name: .long,
+        help: "In --stream mode, pace file input at 1x so reported latency is realistic.")
+    var realtime = false
+
+    @Flag(
+        name: .long,
+        help: """
+            Chunk the encoder but decode once at the end. Isolates encoder-context \
+            truncation from decoder-state-carry bugs: --deferred-decode and plain --stream \
+            should agree exactly. For diagnostic purposes only.
+            """)
+    var deferredDecode = false
+
+    @Option(help: "Silent encoder frames before a segment is finalized.")
+    var endpointFrames: Int?
+
+    @Option(
+        help: """
+            Silent encoder frames after which the transducer predictor is reset to its start \
+            condition, or 0 to never reset. Recovers the opening of an utterance resuming after \
+            Defaults to 40 frames (3.2 s) with --stream, and to 0 offline — offline stays \
+            reference-exact unless you ask otherwise, since --parity-test rests on that. Pass a \
+            value here to opt an offline run in. Parakeet TDT only.
+            """)
+    var resetAfterSilenceFrames: Int?
+
     @Option(
         help:
             "Write the computed mel features to this path as raw little-endian f32, plus a <path>.json sidecar with the shape. For front-end parity checks."
@@ -84,11 +114,42 @@ struct SpeechRecognizer: AsyncParsableCommand {
         if parityTest == nil && model == nil {
             throw ValidationError("--model is required (unless --parity-test is set).")
         }
+        if stream && audioPath == nil {
+            throw ValidationError(
+                "--stream needs --audio-path. This repo does not capture audio; a host app "
+                    + "owns the microphone and pushes PCM into the streaming API.")
+        }
+        // Flags that only mean anything on the streaming path. Accepting and ignoring them
+        // is worst for --deferred-decode: its whole job is to be diffed against plain
+        // --stream, so dropping it silently turns a missed bug into a false "IDENTICAL" pass.
+        let streamingOnly: [String] = [
+            realtime ? "--realtime" : nil,
+            deferredDecode ? "--deferred-decode" : nil,
+            endpointFrames != nil ? "--endpoint-frames" : nil,
+        ].compactMap { $0 }
+        if !stream, !streamingOnly.isEmpty {
+            throw ValidationError(
+                "\(streamingOnly.joined(separator: ", ")) "
+                    + "\(streamingOnly.count == 1 ? "requires" : "require") --stream.")
+        }
+        // The reverse case. Streaming traces one fixed window, so `init` has already
+        // compiled the encoder at exactly the shape every hop uses — there is nothing for
+        // --warmup to do. And --dump-mel has no single answer under chunking.
+        if stream, warmup {
+            throw ValidationError(
+                "--warmup does not apply to --stream: the window is one fixed shape, so the "
+                    + "encoder is already compiled at that shape when the model loads.")
+        }
+        if stream, dumpMel != nil {
+            throw ValidationError(
+                "--dump-mel does not apply to --stream: there is one mel window per hop, "
+                    + "not one per run. Use it without --stream for front-end parity checks.")
+        }
     }
 
     func run() async throws {
         if let parityTest {
-            try await SpeechParityTest(
+            try await SpeechParity(
                 directory: URL(fileURLWithPath: parityTest),
                 modelPath: model,
                 psnrFloor: psnrFloor,
@@ -99,6 +160,9 @@ struct SpeechRecognizer: AsyncParsableCommand {
                 cosineFloor: cosineFloor
             ).run()
             return
+        }
+        if verbose {
+            CLILogger.level = 1
         }
         guard let model else {
             throw ValidationError("--model is required.")
@@ -114,11 +178,28 @@ struct SpeechRecognizer: AsyncParsableCommand {
         let isBundle =
             !assetExtensions.contains(bundleURL.pathExtension)
             && FileManager.default.fileExists(atPath: bundleURL.appending(path: "metadata.json").path)
-        if isBundle {
+        if isBundle, stream, let audioPath {
+            try await runStreaming(
+                bundleURL: bundleURL, audioPath: audioPath, endpointFrames: endpointFrames,
+                resetAfterSilenceFrames: resetAfterSilenceFrames,
+                realtime: realtime, deferredDecode: deferredDecode, verbose: verbose)
+        } else if isBundle {
             try await runBundle(
                 bundleURL: bundleURL, audioPath: audioPath, warmup: warmup, verbose: verbose,
-                dumpMel: dumpMel)
+                dumpMel: dumpMel, resetAfterSilenceFrames: resetAfterSilenceFrames)
+        } else if stream {
+            throw ValidationError(
+                "--stream needs a Parakeet TDT bundle directory. A single .aimodel is the "
+                    + "legacy Whisper layout, which has no chunked path.")
         } else {
+            // The legacy layout is Whisper, which is encoder-decoder and has no transducer
+            // predictor to reset. Rejected rather than ignored, for the same reason as the
+            // streaming-only flags above.
+            if resetAfterSilenceFrames != nil {
+                throw ValidationError(
+                    "--reset-after-silence-frames applies to a transducer's predictor state; a "
+                        + "single .aimodel is the legacy Whisper layout, which has none.")
+            }
             try await runLegacy(model: model, audioPath: audioPath, warmup: warmup)
         }
     }
@@ -137,7 +218,8 @@ struct SpeechRecognizer: AsyncParsableCommand {
 // MARK: - Split bundle via CoreAISpeech
 
 func runBundle(
-    bundleURL: URL, audioPath: String?, warmup: Bool, verbose: Bool, dumpMel: String? = nil
+    bundleURL: URL, audioPath: String?, warmup: Bool, verbose: Bool, dumpMel: String? = nil,
+    resetAfterSilenceFrames: Int? = nil
 ) async throws {
     // The architecture is printed after loading, once the bundle has reported it.
     // Detect an existing cached specialization before loading so we can annotate the load time
@@ -158,10 +240,6 @@ func runBundle(
     let loadElapsed = ContinuousClock.now - loadStart
     print(" done in \(String(format: "%.3f", loadElapsed.inSeconds))s\(cacheHit ? " (cache hit)" : "")")
     print("Format: bundle (\(await model.architecture))")
-
-    if verbose {
-        CLILogger.level = 1
-    }
 
     // Resolve the PCM buffer once — either the decoded audio file or a fixed
     // silence buffer for latency benchmarking — then share the warmup / transcribe
@@ -194,7 +272,8 @@ func runBundle(
 
     if let audioURL { print("Transcribing \(audioURL.lastPathComponent)…") }
     let t0 = ContinuousClock.now
-    let (text, stats) = try await model.transcribe(pcm: pcm)
+    let (text, stats) = try await model.transcribe(
+        pcm: pcm, resetAfterSilenceFrames: resetAfterSilenceFrames ?? 0)
     let totalTranscribeTime = (ContinuousClock.now - t0)
     let totalMs = totalTranscribeTime.inMilliseconds
     print("\n── Decode ─────────────────────────────────────────────────────────────")

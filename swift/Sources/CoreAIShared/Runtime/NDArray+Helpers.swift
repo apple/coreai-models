@@ -202,3 +202,112 @@ public func flattenNDArray<T: BinaryFloatingPoint & BitwiseCopyable>(
     }
     return result
 }
+
+// MARK: - Partial Read / Scan Helpers
+
+// Partial reads of a graph output, for callers whose hot loop touches only part of a tensor.
+// Flattening whole is the wrong shape for those: converting what you skip dominates.
+
+/// Elements `elementRange` of `array` as `[Float]`, in row-major order.
+///
+/// Lets a chunked decoder convert only the frames it reads. A streaming hop's encoder output
+/// also holds left and right context the loop never indexes — at Parakeet's default geometry,
+/// 12 frames of 151 — so flattening it whole converts an order of magnitude more than is used.
+public func floatElements(_ array: NDArray, in elementRange: Range<Int>) -> [Float] {
+    var result = [Float](repeating: 0, count: elementRange.count)
+    forEachFloatElement(array, in: elementRange) { result[$0] = $1 }
+    return result
+}
+
+/// Index of the largest value in `elementRange`, relative to `elementRange.lowerBound`.
+///
+/// Scans in place, because the alternative — flatten to `[Float]`, then scan — allocates and
+/// converts a whole vocab row per emitted symbol (32 KB for Parakeet's 8,198 logits).
+public func argmaxFloat(_ array: NDArray, in elementRange: Range<Int>) -> Int {
+    var scan = FloatArgmax()
+    forEachFloatElement(array, in: elementRange) { scan.offer($0, $1) }
+    return scan.best
+}
+
+/// Running argmax over values offered in order. Ties go to the lowest index, and offering
+/// nothing — or only `-infinity` — yields 0.
+///
+/// Kept as a separate type so that tie-and-empty rule lives in one place rather than being
+/// re-derived at each scan site.
+private struct FloatArgmax {
+    private(set) var best = 0
+    private var bestValue = -Float.infinity
+
+    @inline(__always)
+    mutating func offer(_ index: Int, _ value: Float) {
+        if value > bestValue {
+            bestValue = value
+            best = index
+        }
+    }
+}
+
+/// Visit logical row-major elements `elementRange` of `array` as `Float`, in order. `visit`
+/// receives the offset within the range, not the absolute index.
+///
+/// Output dtype can differ from the model's input dtype, so this branches on the array's own
+/// scalar type rather than threading a flag from the input descriptors.
+@inline(__always)
+private func forEachFloatElement(
+    _ array: NDArray, in elementRange: Range<Int>, _ visit: (Int, Float) -> Void
+) {
+    switch array.scalarType {
+    #if !((os(macOS) || targetEnvironment(macCatalyst)) && arch(x86_64))
+    case .float16:
+        forEachElement(array, as: Float16.self, in: elementRange, visit)
+    #endif
+    case .float32:
+        forEachElement(array, as: Float.self, in: elementRange, visit)
+    default:
+        preconditionFailure("forEachFloatElement: unsupported scalar type \(array.scalarType)")
+    }
+}
+
+@inline(__always)
+private func forEachElement<T: BinaryFloatingPoint & BitwiseCopyable>(
+    _ array: NDArray, as type: T.Type, in elementRange: Range<Int>,
+    _ visit: (Int, Float) -> Void
+) {
+    let total = array.shape.reduce(1, *)
+    precondition(
+        elementRange.lowerBound >= 0 && elementRange.upperBound <= total,
+        "element range \(elementRange) exceeds element count \(total)")
+    if elementRange.isEmpty { return }
+
+    array.view(as: type).withUnsafePointer { ptr, shape, strides in
+        if isContiguousRowMajor(shape: shape, strides: strides) {
+            for i in 0..<elementRange.count { visit(i, Float(ptr[elementRange.lowerBound + i])) }
+            return
+        }
+        // Seed the index walk at the range's own start rather than counting up from zero.
+        let rank = shape.count
+        var indices = [Int](repeating: 0, count: rank)
+        var remainder = elementRange.lowerBound
+        for d in (0..<rank).reversed() {
+            indices[d] = remainder % shape[d]
+            remainder /= shape[d]
+        }
+        // Carry the physical offset outside the loop instead of re-deriving it per
+        // element: advancing one step is `+strides[dim]`, and a dimension that wraps gives
+        // back `strides[dim] * shape[dim]`. O(1) amortized rather than O(rank) per element.
+        var offset = 0
+        for d in 0..<rank { offset += indices[d] * strides[d] }
+        for i in 0..<elementRange.count {
+            visit(i, Float(ptr[offset]))
+            var dim = rank - 1
+            while dim >= 0 {
+                indices[dim] += 1
+                offset += strides[dim]
+                if indices[dim] < shape[dim] { break }
+                indices[dim] = 0
+                offset -= strides[dim] * shape[dim]
+                dim -= 1
+            }
+        }
+    }
+}

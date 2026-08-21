@@ -113,22 +113,341 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
         self.jointGraph = JointGraph(fn: jointFn, encoderIn: jointEncDesc, logits: logitsDesc)
     }
 
+    /// Transducer state that outlives a single call, so a streaming session can decode
+    /// one chunk of encoder frames at a time and keep going where it left off.
+    ///
+    /// The fields mirror NeMo's `BatchedLabelLoopingState`
+    /// (`nemo/collections/asr/parts/submodules/transducer_decoding/label_looping_base.py:41-49`)
+    public final class Stream: @unchecked Sendable {
+        private let decoder: ParakeetTDTDecoder
+        private let cfg: ParakeetTDTConfig
+        private let logitsSize: Int
+        private let lstmShape: [Int]
+
+        /// LSTM state carried across chunks (NeMo `predictor_states`).
+        private var hiddenState: [Float]
+        private var cellState: [Float]
+        /// Last decoder output (NeMo `predictor_outputs`). Load-bearing across a chunk
+        /// boundary: the blank-skip branch reuses it without re-running the step graph, so
+        /// dropping it would make the first step of every chunk read a stale value.
+        private var decoderOutput: [Float]?
+
+        /// Previous iteration's symbol, blanks included — fed back as the next `input_ids`.
+        private var previousSymbol: Int32
+        private var firstStep: Bool
+
+        /// Frames a TDT duration overshot the last chunk by, to be skipped at the start of
+        /// the next one.
+        public private(set) var timeJump: Int = 0
+
+        /// Consecutive encoder frames consumed without emitting anything, duration-weighted.
+        ///
+        /// Read by the streaming endpointer: a blank carrying duration 4 skips 320 ms in one
+        /// step, so a step count would under-measure silence by up to 4x, and a per-hop count
+        /// can only say "this whole chunk was quiet".
+        public private(set) var silentFrames: Int = 0
+
+        init(decoder: ParakeetTDTDecoder, config: ParakeetTDTConfig) {
+            self.decoder = decoder
+            self.cfg = config
+            self.logitsSize = decoder.jointGraph.logits.shape.last!
+            self.lstmShape = [config.numDecoderLayers, 1, config.decoderHiddenSize]
+            let stateCount = lstmShape.reduce(1, *)
+            self.hiddenState = [Float](repeating: 0, count: stateCount)
+            self.cellState = [Float](repeating: 0, count: stateCount)
+            self.decoderOutput = nil
+            self.previousSymbol = config.blankTokenId
+            self.firstStep = true
+        }
+
+        /// Start a new segment: zero the LSTM and re-seed the blank as the previous label.
+        public func resetSegment() {
+            let stateCount = lstmShape.reduce(1, *)
+            hiddenState = [Float](repeating: 0, count: stateCount)
+            cellState = [Float](repeating: 0, count: stateCount)
+            decoderOutput = nil
+            previousSymbol = cfg.blankTokenId
+            firstStep = true
+            silentFrames = 0
+        }
+
+        /// Decode the global encoder frames in `frames`, where local index 0 of
+        /// `encoderOutput` is global frame `windowStartFrame`.
+        ///
+        /// The loop body is the offline one verbatim; only the frame pointer's coordinate
+        /// system (global rather than window-local) and the `timeJump` carry are new.
+        /// `collectStats` off skips the first-step tensor capture and the per-step timings,
+        /// which only the offline parity harness reads.
+        public func decodeFrames(
+            encoderOutput: NDArray,
+            encoderOutputShape: [Int],
+            frames: Range<Int>,
+            windowStartFrame: Int,
+            collectStats: Bool = true,
+            resetAfterSilenceFrames: Int = 0
+        ) async throws -> (tokens: [Int32], stats: DecodeStats) {
+            try ParakeetTDTDecoder.validate(
+                encoderOutputShape: encoderOutputShape, logitsSize: logitsSize, config: cfg)
+            try checkFrames(
+                frames, windowStartFrame: windowStartFrame,
+                windowEncoderFrames: encoderOutputShape[1])
+
+            // Convert only the frames this call reads. The window also carries the left and
+            // right context the loop never indexes — at the default geometry that is 12 frames
+            // of 151 — and `floatElements` inspects the array's own scalar type, so an f16
+            // encoder output reads correctly (a raw `as: Float.self` read would not).
+            let hidden = cfg.decoderHiddenSize
+            let lower = (frames.lowerBound - windowStartFrame) * hidden
+            let upper = (frames.upperBound - windowStartFrame) * hidden
+            return try await decodeFrames(
+                encoderFlat: floatElements(encoderOutput, in: lower..<upper),
+                encoderOutputShape: [1, frames.count, hidden],
+                frames: frames,
+                windowStartFrame: frames.lowerBound,
+                collectStats: collectStats,
+                resetAfterSilenceFrames: resetAfterSilenceFrames)
+        }
+
+        /// As above, for a caller that already holds the encoder output as floats — e.g.
+        /// `--deferred-decode`, which concatenates per-chunk encoder outputs and decodes once.
+        public func decodeFrames(
+            encoderFlat: [Float],
+            encoderOutputShape: [Int],
+            frames: Range<Int>,
+            windowStartFrame: Int,
+            collectStats: Bool = true,
+            resetAfterSilenceFrames: Int = 0
+        ) async throws -> (tokens: [Int32], stats: DecodeStats) {
+            try ParakeetTDTDecoder.validate(
+                encoderOutputShape: encoderOutputShape, logitsSize: logitsSize, config: cfg)
+            try checkFrames(
+                frames, windowStartFrame: windowStartFrame,
+                windowEncoderFrames: encoderOutputShape[1])
+            if frames.isEmpty { return (tokens: [], stats: DecodeStats(stepTimesMs: [])) }
+
+            let hidden = cfg.decoderHiddenSize
+            let vocabSize = cfg.vocabSize
+
+            var buffers = Buffers(
+                step: decoder.stepGraph, joint: decoder.jointGraph,
+                lstmShape: lstmShape, hidden: hidden, logitsSize: logitsSize)
+            // Restore the state this stream left off with. `Buffers.init` already seeded
+            // zeros, so a fresh stream's first chunk is unaffected by these writes.
+            fillFloatNDArray(&buffers.hIn, with: hiddenState)
+            fillFloatNDArray(&buffers.cIn, with: cellState)
+            if let previousDecoderOutput = decoderOutput {
+                fillFloatNDArray(&buffers.decOut, with: previousDecoderOutput)
+            }
+
+            var emitted: [Int32] = []
+            // Resume where the last chunk's duration jump landed, then clear the debt.
+            var frame = frames.lowerBound + timeJump
+            timeJump = 0
+            // Per-hop, not per-utterance: bounds this chunk's work only.
+            let emitCap = frames.count * cfg.maxSymbolsPerStep
+
+            var stepTimesMs: [Double] = []
+            var coverage = DecodeStats.Coverage()
+            var capturedStep: (decoderOutput: [Float], newHidden: [Float], newCell: [Float])?
+            var capturedLogits: [Float]?
+
+            while frame < frames.upperBound && emitted.count < emitCap {
+                let t0 = ContinuousClock.now
+                var advance = 0
+                let emittedAtStepStart = emitted.count
+                for _ in 0..<cfg.maxSymbolsPerStep {
+                    // Per-iteration, not per-step: one step runs this loop up to
+                    // `maxSymbolsPerStep` times, so the input here may be a symbol the same step
+                    // just emitted. `firstStep` covers the initial blank, which is the
+                    // start-of-sequence condition rather than a real previous label.
+                    let inputIsBlank = (previousSymbol == cfg.blankTokenId)
+
+                    // Blank-skip (optimization): a blank input reproduces the last decoder
+                    // output, since the state was held too — and `buffers.decOut` still holds
+                    // it, because this branch doesn't run the step graph that would overwrite it.
+                    if !firstStep, inputIsBlank {
+                        coverage.blankSkipReuses += 1
+                    } else {
+                        try await decoder.runDecoderStep(token: previousSymbol, buffers: &buffers)
+
+                        // Parity capture only: gating on nil keeps the flattens to once per call
+                        // instead of once per step, and reads `hOut`/`cOut` before the swap below.
+                        if collectStats, capturedStep == nil {
+                            capturedStep = (
+                                decoderOutput: flattenAsFloat(buffers.decOut),
+                                newHidden: flattenAsFloat(buffers.hOut),
+                                newCell: flattenAsFloat(buffers.cOut)
+                            )
+                        }
+
+                        // Load-bearing: a blank carries no label, so the state must not absorb
+                        // it. Mirrors HF `cache.update(..., mask=~blank_mask)`. Blanks normally
+                        // never get here at all — they take the reuse branch above — but the
+                        // guard still has to hold if that branch is ever changed. Not adopting
+                        // means not swapping: `hIn`/`cIn` keep the state the step ran from, and
+                        // the next step overwrites `hOut`/`cOut`.
+                        if firstStep || !inputIsBlank {
+                            swap(&buffers.hIn, &buffers.hOut)
+                            swap(&buffers.cIn, &buffers.cOut)
+                            coverage.lstmStateAdvances += 1
+                        }
+                        firstStep = false
+                    }
+
+                    // Joint(decoder_output, encoder[:, frame, :]) — `frame` is global, so it
+                    // has to be rebased onto this window's local indexing.
+                    let encOffset = (frame - windowStartFrame) * hidden
+                    try await decoder.runJoint(
+                        encoderFrame: encoderFlat[encOffset..<encOffset + hidden],
+                        buffers: &buffers)
+                    // Scanned in place: materializing the row would allocate and convert the
+                    // whole vocab per emitted symbol, only to read two argmaxes off it.
+                    if collectStats, capturedLogits == nil {
+                        capturedLogits = flattenAsFloat(buffers.logits)
+                    }
+
+                    let symbol = Int32(argmaxFloat(buffers.logits, in: 0..<vocabSize))
+                    let dur = cfg.durations[argmaxFloat(buffers.logits, in: vocabSize..<logitsSize)]
+                    // Output-side counterpart to `inputIsBlank`; becomes it next iteration.
+                    let isBlank = (symbol == cfg.blankTokenId)
+
+                    if !isBlank {
+                        emitted.append(symbol)
+                    }
+                    // Carries blanks too, matching HF. Holding the last non-blank instead would
+                    // re-feed it and advance the state as if the label repeated.
+                    previousSymbol = symbol
+
+                    // A blank that picks duration 0 still moves one frame forward, matching HF's
+                    // `torch.where(blank_mask & (durations == 0), 1, durations)`. Without this the
+                    // inner loop re-runs the joint on the same frame with the same (cached)
+                    // decoder output until maxSymbolsPerStep is exhausted.
+                    if isBlank && dur == 0 {
+                        coverage.blankZeroDurationBreaks += 1
+                        advance = 1
+                        break
+                    }
+
+                    if dur > 0 {
+                        coverage.positiveDurationBreaks += 1
+                        advance = dur
+                        break
+                    }
+                }
+                // No duration > 0 was selected within max_symbols_per_step — force one frame
+                // forward to guarantee outer-loop progress.
+                if advance == 0 {
+                    coverage.symbolCapExhaustions += 1
+                    advance = 1
+                }
+                let emittedThisStep = emitted.count - emittedAtStepStart
+                switch emittedThisStep {
+                case 0: coverage.blankOnlySteps += 1
+                case 1: break
+                default: coverage.multiTokenSteps += 1
+                }
+                // Endpointing counts *frames of audio*, not steps: a blank with duration 4
+                // skips 320 ms in one step, so counting steps would under-measure silence 4×.
+                silentFrames = emittedThisStep == 0 ? silentFrames + advance : 0
+
+                // Past a long gap, drop the label history — see
+                // `EndpointingConfig.resetAfterSilenceFrames`. In the loop rather than at the
+                // caller's chunk boundary because that is the only place streaming,
+                // `--deferred-decode` and offline all share, so the modes still agree.
+                if resetAfterSilenceFrames > 0, silentFrames >= resetAfterSilenceFrames {
+                    // `resetSegment` writes the stream's properties, so re-seed the buffers the
+                    // loop actually reads. `firstStep` then forces `decOut` to be recomputed
+                    // rather than reused via the blank-skip branch.
+                    resetSegment()
+                    fillFloatNDArray(&buffers.hIn, with: hiddenState)
+                    fillFloatNDArray(&buffers.cIn, with: cellState)
+                    coverage.predictorResets += 1
+                }
+                if collectStats {
+                    stepTimesMs.append((ContinuousClock.now - t0).inMilliseconds)
+                }
+                frame += advance
+            }
+
+            // Carry the overshoot rather than clamping it. See `timeJump`.
+            timeJump = max(0, frame - frames.upperBound)
+
+            // Hand the state to the next chunk. `hIn`/`cIn` are read after the swaps, so
+            // they hold the state the *next* step should run from.
+            hiddenState = flattenAsFloat(buffers.hIn)
+            cellState = flattenAsFloat(buffers.cIn)
+            decoderOutput = flattenAsFloat(buffers.decOut)
+
+            var capture: DecodeStats.FirstStep?
+            if let step = capturedStep, let logits = capturedLogits {
+                capture = DecodeStats.FirstStep(
+                    decoderOutput: step.decoderOutput, newHiddenState: step.newHidden,
+                    newCellState: step.newCell, jointLogits: logits)
+            }
+            return (
+                tokens: emitted,
+                stats: DecodeStats(
+                    stepTimesMs: stepTimesMs, coverage: coverage, firstStep: capture)
+            )
+        }
+
+        /// Preconditions the frame arithmetic depends on, shared by both overloads.
+        private func checkFrames(
+            _ frames: Range<Int>, windowStartFrame: Int, windowEncoderFrames: Int
+        ) throws {
+            guard frames.lowerBound >= windowStartFrame,
+                frames.upperBound - windowStartFrame <= windowEncoderFrames
+            else {
+                throw SpeechError.invalidStreamingConfig(
+                    "frames \(frames) fall outside the window starting at \(windowStartFrame) "
+                        + "with \(windowEncoderFrames) encoder frames")
+            }
+        }
+    }
+
+    /// A fresh streaming state for this decoder's graphs.
+    public func makeStream(config: ParakeetTDTConfig) -> Stream {
+        Stream(decoder: self, config: config)
+    }
+
     public func decode(
         encoderOutput: NDArray,
         encoderOutputShape: [Int],
         validEncoderFrames: Int,
         resources: DecoderResources
     ) async throws -> (tokens: [Int32], stats: DecodeStats) {
+        try await decode(
+            encoderOutput: encoderOutput,
+            encoderOutputShape: encoderOutputShape,
+            validEncoderFrames: validEncoderFrames,
+            resources: resources,
+            resetAfterSilenceFrames: 0)
+    }
+
+    /// As the protocol's `decode`, with the transducer's long-silence predictor reset.
+    ///
+    /// Not on `SpeechDecoder` because Whisper has no predictor to re-seed. Callers reach it the
+    /// way `startStream` does, by downcasting to this type.
+    ///
+    /// - Parameter resetAfterSilenceFrames: Silent encoder frames after which the predictor is
+    ///   reset, or 0 to never. 0 is the right default offline: it keeps this path identical to
+    ///   HF's `generate()`, which is what `--parity-test` rests on. See
+    ///   `EndpointingConfig.resetAfterSilenceFrames`.
+    public func decode(
+        encoderOutput: NDArray,
+        encoderOutputShape: [Int],
+        validEncoderFrames: Int,
+        resources: DecoderResources,
+        resetAfterSilenceFrames: Int
+    ) async throws -> (tokens: [Int32], stats: DecodeStats) {
         // Only the config is read from `resources`; the two graphs come from the same
         // models this decoder was initialized with, already loaded in `init`.
         guard case .parakeetTDT(_, _, let cfg) = resources else {
             throw SpeechError.incompatibleResources("ParakeetTDTDecoder requires .parakeetTDT resources")
         }
-        let hidden = cfg.decoderHiddenSize
-        let vocabSize = cfg.vocabSize
-        let logitsSize = jointGraph.logits.shape.last!
         try Self.validate(
-            encoderOutputShape: encoderOutputShape, logitsSize: logitsSize, config: cfg)
+            encoderOutputShape: encoderOutputShape,
+            logitsSize: jointGraph.logits.shape.last!, config: cfg)
 
         let tEnc = encoderOutputShape[1]
         if tEnc == 0 { return (tokens: [], stats: DecodeStats(stepTimesMs: [])) }
@@ -137,132 +456,16 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
         // them yields spurious tokens (trailing periods). Cap the loop at the number
         // of frames that carry real audio. Dynamic exports pass tEnc, so cap == tEnc.
         let cap = max(1, min(tEnc, validEncoderFrames))
-        let lstmShape = [cfg.numDecoderLayers, 1, hidden]
 
-        // Pull the full encoder output once; slice frame-by-frame in pure Swift.
-        // flattenAsFloat inspects the array's own scalar type, so this reads an
-        // f16 encoder output correctly (a raw `as: Float.self` read would not).
-        let encFlat = flattenAsFloat(encoderOutput)
-        var buffers = Buffers(
-            step: stepGraph, joint: jointGraph,
-            lstmShape: lstmShape, hidden: hidden, logitsSize: logitsSize)
-
-        // Previous iteration's symbol, blanks included — fed back as the next `input_ids`.
-        // Distinct from `emitted`, which keeps only the non-blank symbols.
-        var previousSymbol: Int32 = cfg.blankTokenId
-        var emitted: [Int32] = []
-        var frame = 0
-        var firstStep = true
-        let emitCap = cap * cfg.maxSymbolsPerStep
-
-        var stepTimesMs: [Double] = []
-        var coverage = DecodeStats.Coverage()
-        var capturedStep: (decoderOutput: [Float], newHidden: [Float], newCell: [Float])?
-        var capturedLogits: [Float]?
-
-        while frame < cap && emitted.count < emitCap {
-            let t0 = ContinuousClock.now
-            var advance = 0
-            let emittedAtStepStart = emitted.count
-            for _ in 0..<cfg.maxSymbolsPerStep {
-                // Per-iteration, not per-step: one step runs this loop up to
-                // `maxSymbolsPerStep` times, so the input here may be a symbol the same step
-                // just emitted. `firstStep` covers SOS.
-                let inputIsBlank = (previousSymbol == cfg.blankTokenId)
-
-                // Blank-skip (optimization): a blank input reproduces the last decoder
-                // output, since the state was held too — and `buffers.decOut` still holds
-                // it, because this branch doesn't run the step graph that would overwrite it.
-                if !firstStep, inputIsBlank {
-                    coverage.blankSkipReuses += 1
-                } else {
-                    try await runDecoderStep(token: previousSymbol, buffers: &buffers)
-
-                    // Parity capture only: gating on nil keeps the flattens to once per decode
-                    // instead of once per step, and reads `hOut`/`cOut` before the swap below.
-                    if capturedStep == nil {
-                        capturedStep = (
-                            decoderOutput: flattenAsFloat(buffers.decOut),
-                            newHidden: flattenAsFloat(buffers.hOut),
-                            newCell: flattenAsFloat(buffers.cOut)
-                        )
-                    }
-
-                    // Load-bearing: a blank carries no label, so the state must not absorb
-                    // it. Mirrors HF `cache.update(..., mask=~blank_mask)`. Blanks normally
-                    // never get here at all — they take the reuse branch above — but the
-                    // guard still has to hold if that branch is ever changed. Not adopting
-                    // means not swapping: `hIn`/`cIn` keep the state the step ran from, and
-                    // the next step overwrites `hOut`/`cOut`.
-                    if firstStep || !inputIsBlank {
-                        swap(&buffers.hIn, &buffers.hOut)
-                        swap(&buffers.cIn, &buffers.cOut)
-                        coverage.lstmStateAdvances += 1
-                    }
-                    firstStep = false
-                }
-
-                // Joint(decoder_output, encoder[:, frame:frame+1, :]).
-                let encOffset = frame * hidden
-                let logitsFlat = try await runJoint(
-                    encoderFrame: encFlat[encOffset..<encOffset + hidden],
-                    buffers: &buffers)
-                if capturedLogits == nil { capturedLogits = logitsFlat }
-
-                let symbol = Int32(Self.argmax(logitsFlat, in: 0..<vocabSize))
-                let dur = cfg.durations[Self.argmax(logitsFlat, in: vocabSize..<logitsSize)]
-                // Output-side counterpart to `inputIsBlank`; becomes it next iteration.
-                let isBlank = (symbol == cfg.blankTokenId)
-
-                if !isBlank {
-                    emitted.append(symbol)
-                }
-                // Carries blanks too, matching HF. Holding the last non-blank instead would
-                // re-feed it and advance the state as if the label repeated.
-                previousSymbol = symbol
-
-                // A blank that picks duration 0 still moves one frame forward, matching HF's
-                // `torch.where(blank_mask & (durations == 0), 1, durations)`. Without this the
-                // inner loop re-runs the joint on the same frame with the same (cached)
-                // decoder output until maxSymbolsPerStep is exhausted.
-                if isBlank && dur == 0 {
-                    coverage.blankZeroDurationBreaks += 1
-                    advance = 1
-                    break
-                }
-
-                if dur > 0 {
-                    coverage.positiveDurationBreaks += 1
-                    advance = dur
-                    break
-                }
-            }
-            // No duration > 0 was selected within max_symbols_per_step — force one frame
-            // forward to guarantee outer-loop progress.
-            if advance == 0 {
-                coverage.symbolCapExhaustions += 1
-                advance = 1
-            }
-            switch emitted.count - emittedAtStepStart {
-            case 0: coverage.blankOnlySteps += 1
-            case 1: break
-            default: coverage.multiTokenSteps += 1
-            }
-            stepTimesMs.append((ContinuousClock.now - t0).inMilliseconds)
-            frame += advance
-        }
-
-        var capture: DecodeStats.FirstStep?
-        if let step = capturedStep, let logits = capturedLogits {
-            capture = DecodeStats.FirstStep(
-                decoderOutput: step.decoderOutput, newHiddenState: step.newHidden,
-                newCellState: step.newCell, jointLogits: logits)
-        }
-        return (
-            tokens: emitted,
-            stats: DecodeStats(
-                stepTimesMs: stepTimesMs, coverage: coverage, firstStep: capture)
-        )
+        // The offline path is one chunk covering the whole utterance, over state that
+        // nothing else will touch — so at the default reset of 0 it is byte-for-byte the
+        // previous behaviour.
+        return try await makeStream(config: cfg).decodeFrames(
+            encoderOutput: encoderOutput,
+            encoderOutputShape: encoderOutputShape,
+            frames: 0..<cap,
+            windowStartFrame: 0,
+            resetAfterSilenceFrames: resetAfterSilenceFrames)
     }
 
     /// Preconditions the decode loop's arithmetic depends on.
@@ -326,13 +529,14 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
             outputViews: consume stepOut)
     }
 
-    /// `joint(decoder_output, encoder_frame)` → the flattened `[vocab | durations]` row.
+    /// `joint(decoder_output, encoder_frame)`, leaving the `[vocab | durations]` row in
+    /// `buffers.logits` for the caller to scan in place.
     ///
     /// The decoder side comes straight from `buffers.decOut`, whether the last step wrote it
     /// or the blank-skip branch left it in place.
     private func runJoint(
         encoderFrame: ArraySlice<Float>, buffers: inout Buffers
-    ) async throws -> [Float] {
+    ) async throws {
         fillFloatNDArray(&buffers.jointEncIn, with: encoderFrame)
 
         var jointOut = InferenceFunction.MutableViews()
@@ -344,24 +548,5 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
             ],
             states: InferenceFunction.MutableViews(),
             outputViews: consume jointOut)
-
-        return flattenAsFloat(buffers.logits)
-    }
-
-    /// Index of the largest value in `values[range]`, relative to `range.lowerBound`.
-    /// Ties go to the lowest index, and an all-`-infinity` range yields 0 — matching the
-    /// hand-rolled scans this replaces.
-    ///
-    /// `static` because it reads no instance state, which also lets it be unit-tested: the
-    /// initializer needs two loaded `AIModel`s, so an instance method here would be reachable
-    /// only with model assets on disk.
-    package static func argmax(_ values: [Float], in range: Range<Int>) -> Int {
-        var best = range.lowerBound
-        var bestVal: Float = -.infinity
-        for i in range where values[i] > bestVal {
-            bestVal = values[i]
-            best = i
-        }
-        return best - range.lowerBound
     }
 }
