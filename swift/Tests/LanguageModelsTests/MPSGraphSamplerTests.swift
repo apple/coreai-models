@@ -40,13 +40,13 @@ struct MPSGraphArgmaxSamplerTests {
         let queue = try #require(device.makeCommandQueue())
 
         await withCheckedContinuation { continuation in
-            sampler.encode(
+            try! sampler.encode(
                 to: queue,
                 logitsBuffer: logitsBuffer,
                 logitsOffset: 0,
                 outputBuffer: outputBuffer,
                 outputOffset: 0,
-                completion: { _ in
+                completion: { _, _ in
                     continuation.resume()
                 }
             )
@@ -73,13 +73,13 @@ struct MPSGraphArgmaxSamplerTests {
         let queue = try #require(device.makeCommandQueue())
 
         await withCheckedContinuation { continuation in
-            sampler.encode(
+            try! sampler.encode(
                 to: queue,
                 logitsBuffer: logitsBuffer,
                 logitsOffset: 0,
                 outputBuffer: outputBuffer,
                 outputOffset: 0,
-                completion: { _ in
+                completion: { _, _ in
                     continuation.resume()
                 }
             )
@@ -117,7 +117,7 @@ struct MPSGraphArgmaxSamplerTests {
                 queryLength: queryLength,
                 outputBuffer: outputBuffer,
                 outputOffset: 0,
-                completion: { _ in
+                completion: { _, _ in
                     continuation.resume()
                 }
             )
@@ -140,13 +140,13 @@ struct MPSGraphArgmaxSamplerTests {
         // Warm up
         for _ in 0..<10 {
             await withCheckedContinuation { continuation in
-                sampler.encode(
+                try! sampler.encode(
                     to: queue,
                     logitsBuffer: logitsBuffer,
                     logitsOffset: 0,
                     outputBuffer: outputBuffer,
                     outputOffset: 0,
-                    completion: { _ in
+                    completion: { _, _ in
                         continuation.resume()
                     }
                 )
@@ -158,13 +158,13 @@ struct MPSGraphArgmaxSamplerTests {
         let start = SuspendingClock().now
         for _ in 0..<iterations {
             await withCheckedContinuation { continuation in
-                sampler.encode(
+                try! sampler.encode(
                     to: queue,
                     logitsBuffer: logitsBuffer,
                     logitsOffset: 0,
                     outputBuffer: outputBuffer,
                     outputOffset: 0,
-                    completion: { _ in
+                    completion: { _, _ in
                         continuation.resume()
                     }
                 )
@@ -197,13 +197,13 @@ struct MPSGraphArgmaxSamplerTests {
         }
 
         await withCheckedContinuation { continuation in
-            sampler.encode(
+            try! sampler.encode(
                 to: queue,
                 logitsBuffer: logitsBuffer,
                 logitsOffset: 0,
                 outputBuffer: outputBuffer,
                 outputOffset: 0,
-                completion: { _ in
+                completion: { _, _ in
                     continuation.resume()
                 }
             )
@@ -218,13 +218,13 @@ struct MPSGraphArgmaxSamplerTests {
         }
 
         await withCheckedContinuation { continuation in
-            sampler.encode(
+            try! sampler.encode(
                 to: queue,
                 logitsBuffer: logitsBuffer,
                 logitsOffset: 0,
                 outputBuffer: outputBuffer,
                 outputOffset: 0,
-                completion: { _ in
+                completion: { _, _ in
                     continuation.resume()
                 }
             )
@@ -271,13 +271,13 @@ struct MPSGraphCompositeSamplerTests {
         var sampledTokens = Set<Int32>()
         for _ in 0..<20 {
             await withCheckedContinuation { continuation in
-                sampler.encode(
+                try! sampler.encode(
                     to: queue,
                     logitsBuffer: logitsBuffer,
                     logitsOffset: 0,
                     outputBuffer: outputBuffer,
                     outputOffset: 0,
-                    completion: { _ in
+                    completion: { _, _ in
                         continuation.resume()
                     }
                 )
@@ -321,13 +321,13 @@ struct MPSGraphCompositeSamplerTests {
         sampler.testingOnlyRandomOverride = 0.5
 
         await withCheckedContinuation { continuation in
-            sampler.encode(
+            try! sampler.encode(
                 to: queue,
                 logitsBuffer: logitsBuffer,
                 logitsOffset: 0,
                 outputBuffer: outputBuffer,
                 outputOffset: 0,
-                completion: { _ in
+                completion: { _, _ in
                     continuation.resume()
                 }
             )
@@ -371,13 +371,13 @@ struct MPSGraphCompositeSamplerTests {
             sampler.testingOnlyRandomOverride = randomValue
 
             await withCheckedContinuation { continuation in
-                sampler.encode(
+                try! sampler.encode(
                     to: queue,
                     logitsBuffer: logitsBuffer,
                     logitsOffset: 0,
                     outputBuffer: outputBuffer,
                     outputOffset: 0,
-                    completion: { _ in
+                    completion: { _, _ in
                         continuation.resume()
                     }
                 )
@@ -417,13 +417,13 @@ struct MPSGraphCompositeSamplerTests {
         // Warm up
         for _ in 0..<10 {
             await withCheckedContinuation { continuation in
-                sampler.encode(
+                try! sampler.encode(
                     to: queue,
                     logitsBuffer: logitsBuffer,
                     logitsOffset: 0,
                     outputBuffer: outputBuffer,
                     outputOffset: 0,
-                    completion: { _ in
+                    completion: { _, _ in
                         continuation.resume()
                     }
                 )
@@ -435,13 +435,13 @@ struct MPSGraphCompositeSamplerTests {
         let start = SuspendingClock().now
         for _ in 0..<iterations {
             await withCheckedContinuation { continuation in
-                sampler.encode(
+                try! sampler.encode(
                     to: queue,
                     logitsBuffer: logitsBuffer,
                     logitsOffset: 0,
                     outputBuffer: outputBuffer,
                     outputOffset: 0,
-                    completion: { _ in
+                    completion: { _, _ in
                         continuation.resume()
                     }
                 )
@@ -491,7 +491,7 @@ struct MPSGraphCompositeSamplerTests {
                 queryLength: queryLength,
                 outputBuffer: outputBuffer,
                 outputOffset: 0,
-                completion: { _ in
+                completion: { _, _ in
                     continuation.resume()
                 }
             )
@@ -537,13 +537,13 @@ struct MPSGraphTopPSamplerTests {
         var sampledTokens = Set<Int32>()
         for _ in 0..<30 {
             await withCheckedContinuation { continuation in
-                sampler.encode(
+                try! sampler.encode(
                     to: queue,
                     logitsBuffer: logitsBuffer,
                     logitsOffset: 0,
                     outputBuffer: outputBuffer,
                     outputOffset: 0,
-                    completion: { _ in continuation.resume() }
+                    completion: { _, _ in continuation.resume() }
                 )
             }
             let result = outputBuffer.contents().assumingMemoryBound(to: Int32.self).pointee
@@ -575,13 +575,13 @@ struct MPSGraphTopPSamplerTests {
 
         sampler.testingOnlyRandomOverride = 0.5
         await withCheckedContinuation { continuation in
-            sampler.encode(
+            try! sampler.encode(
                 to: queue,
                 logitsBuffer: logitsBuffer,
                 logitsOffset: 0,
                 outputBuffer: outputBuffer,
                 outputOffset: 0,
-                completion: { _ in continuation.resume() }
+                completion: { _, _ in continuation.resume() }
             )
         }
 
@@ -611,13 +611,13 @@ struct MPSGraphTopPSamplerTests {
         // With topP=0.01 and a dominant token, should always pick the top one
         sampler.testingOnlyRandomOverride = 0.005
         await withCheckedContinuation { continuation in
-            sampler.encode(
+            try! sampler.encode(
                 to: queue,
                 logitsBuffer: logitsBuffer,
                 logitsOffset: 0,
                 outputBuffer: outputBuffer,
                 outputOffset: 0,
-                completion: { _ in continuation.resume() }
+                completion: { _, _ in continuation.resume() }
             )
         }
 
@@ -660,13 +660,13 @@ struct MPSGraphMinPSamplerTests {
         var sampledTokens = Set<Int32>()
         for _ in 0..<30 {
             await withCheckedContinuation { continuation in
-                sampler.encode(
+                try! sampler.encode(
                     to: queue,
                     logitsBuffer: logitsBuffer,
                     logitsOffset: 0,
                     outputBuffer: outputBuffer,
                     outputOffset: 0,
-                    completion: { _ in continuation.resume() }
+                    completion: { _, _ in continuation.resume() }
                 )
             }
             let result = outputBuffer.contents().assumingMemoryBound(to: Int32.self).pointee
@@ -702,13 +702,13 @@ struct MPSGraphMinPSamplerTests {
         for r in randomValues {
             sampler.testingOnlyRandomOverride = r
             await withCheckedContinuation { continuation in
-                sampler.encode(
+                try! sampler.encode(
                     to: queue,
                     logitsBuffer: logitsBuffer,
                     logitsOffset: 0,
                     outputBuffer: outputBuffer,
                     outputOffset: 0,
-                    completion: { _ in continuation.resume() }
+                    completion: { _, _ in continuation.resume() }
                 )
             }
             let result = outputBuffer.contents().assumingMemoryBound(to: Int32.self).pointee
@@ -749,13 +749,13 @@ struct MPSGraphMinPSamplerTests {
         for r in randomValues {
             sampler.testingOnlyRandomOverride = r
             await withCheckedContinuation { continuation in
-                sampler.encode(
+                try! sampler.encode(
                     to: queue,
                     logitsBuffer: logitsBuffer,
                     logitsOffset: 0,
                     outputBuffer: outputBuffer,
                     outputOffset: 0,
-                    completion: { _ in continuation.resume() }
+                    completion: { _, _ in continuation.resume() }
                 )
             }
             let result = outputBuffer.contents().assumingMemoryBound(to: Int32.self).pointee
@@ -849,21 +849,22 @@ struct MPSGraphConstrainedArgmaxTests {
 
         // Block token 5000 in the bitmask
         let bitmaskSize = (Self.vocabSize + 31) / 32
-        let bitmaskPtr = try sampler.bitmaskBuffer.contents().assumingMemoryBound(to: Int32.self)
+        let bitmaskBuffer = try #require(try sampler.bitmaskBuffer)
+        let bitmaskPtr = bitmaskBuffer.contents().assumingMemoryBound(to: Int32.self)
         for i in 0..<bitmaskSize { bitmaskPtr[i] = ~Int32(0) }
         bitmaskPtr[5000 / 32] &= ~(Int32(1) << (5000 % 32))
 
         let queue = try #require(device.makeCommandQueue())
 
         await withCheckedContinuation { continuation in
-            sampler.encode(
+            try! sampler.encode(
                 to: queue,
                 logitsBuffer: logitsBuffer,
                 logitsOffset: 0,
                 outputBuffer: outputBuffer,
                 outputOffset: 0,
                 applyBitmask: true,
-                completion: { _ in continuation.resume() }
+                completion: { _, _ in continuation.resume() }
             )
         }
 
@@ -884,25 +885,26 @@ struct MPSGraphConstrainedArgmaxTests {
         logitsPtr[12345] = Float16(100.0)
 
         let bitmaskSize = (Self.vocabSize + 31) / 32
-        let bitmaskPtr = try sampler.bitmaskBuffer.contents().assumingMemoryBound(to: Int32.self)
+        let bitmaskBuffer = try #require(try sampler.bitmaskBuffer)
+        let bitmaskPtr = bitmaskBuffer.contents().assumingMemoryBound(to: Int32.self)
         for i in 0..<bitmaskSize { bitmaskPtr[i] = ~Int32(0) }
 
         let queue = try #require(device.makeCommandQueue())
 
         await withCheckedContinuation { continuation in
-            sampler.encode(
+            try! sampler.encode(
                 to: queue, logitsBuffer: logitsBuffer, logitsOffset: 0,
                 outputBuffer: outputBuffer, outputOffset: 0,
-                applyBitmask: true, completion: { _ in continuation.resume() }
+                applyBitmask: true, completion: { _, _ in continuation.resume() }
             )
         }
         let constrainedResult = outputBuffer.contents().assumingMemoryBound(to: Int32.self).pointee
 
         await withCheckedContinuation { continuation in
-            sampler.encode(
+            try! sampler.encode(
                 to: queue, logitsBuffer: logitsBuffer, logitsOffset: 0,
                 outputBuffer: outputBuffer, outputOffset: 0,
-                applyBitmask: false, completion: { _ in continuation.resume() }
+                applyBitmask: false, completion: { _, _ in continuation.resume() }
             )
         }
         let unconstrainedResult = outputBuffer.contents().assumingMemoryBound(to: Int32.self).pointee
@@ -927,7 +929,8 @@ struct MPSGraphConstrainedArgmaxTests {
         logitsPtr[300] = Float16(52.0)
 
         let bitmaskSize = (Self.vocabSize + 31) / 32
-        let bitmaskPtr = try sampler.bitmaskBuffer.contents().assumingMemoryBound(to: Int32.self)
+        let bitmaskBuffer = try #require(try sampler.bitmaskBuffer)
+        let bitmaskPtr = bitmaskBuffer.contents().assumingMemoryBound(to: Int32.self)
         for i in 0..<bitmaskSize { bitmaskPtr[i] = 0 }
         bitmaskPtr[100 / 32] |= Int32(1) << (100 % 32)
         bitmaskPtr[200 / 32] |= Int32(1) << (200 % 32)
@@ -936,10 +939,10 @@ struct MPSGraphConstrainedArgmaxTests {
         let queue = try #require(device.makeCommandQueue())
 
         await withCheckedContinuation { continuation in
-            sampler.encode(
+            try! sampler.encode(
                 to: queue, logitsBuffer: logitsBuffer, logitsOffset: 0,
                 outputBuffer: outputBuffer, outputOffset: 0,
-                applyBitmask: true, completion: { _ in continuation.resume() }
+                applyBitmask: true, completion: { _, _ in continuation.resume() }
             )
         }
 
@@ -969,7 +972,8 @@ struct MPSGraphConstrainedCompositeTests {
         for t in 8001...8005 { logitsPtr[t] = Float16(10.0) }
 
         let bitmaskSize = (Self.vocabSize + 31) / 32
-        let bitmaskPtr = try sampler.bitmaskBuffer.contents().assumingMemoryBound(to: Int32.self)
+        let bitmaskBuffer = try #require(try sampler.bitmaskBuffer)
+        let bitmaskPtr = bitmaskBuffer.contents().assumingMemoryBound(to: Int32.self)
         for i in 0..<bitmaskSize { bitmaskPtr[i] = ~Int32(0) }
         bitmaskPtr[8000 / 32] &= ~(Int32(1) << (8000 % 32))
 
@@ -978,10 +982,10 @@ struct MPSGraphConstrainedCompositeTests {
         var sampledTokens = Set<Int32>()
         for _ in 0..<20 {
             await withCheckedContinuation { continuation in
-                sampler.encode(
+                try! sampler.encode(
                     to: queue, logitsBuffer: logitsBuffer, logitsOffset: 0,
                     outputBuffer: outputBuffer, outputOffset: 0,
-                    applyBitmask: true, completion: { _ in continuation.resume() }
+                    applyBitmask: true, completion: { _, _ in continuation.resume() }
                 )
             }
             let result = outputBuffer.contents().assumingMemoryBound(to: Int32.self).pointee
@@ -1009,7 +1013,8 @@ struct MPSGraphConstrainedCompositeTests {
         for t in allowed { logitsPtr[t] = Float16(10.0) }
 
         let bitmaskSize = (Self.vocabSize + 31) / 32
-        let bitmaskPtr = try sampler.bitmaskBuffer.contents().assumingMemoryBound(to: Int32.self)
+        let bitmaskBuffer = try #require(try sampler.bitmaskBuffer)
+        let bitmaskPtr = bitmaskBuffer.contents().assumingMemoryBound(to: Int32.self)
         for i in 0..<bitmaskSize { bitmaskPtr[i] = 0 }
         for t in allowed {
             bitmaskPtr[t / 32] |= Int32(1) << (t % 32)
@@ -1020,10 +1025,10 @@ struct MPSGraphConstrainedCompositeTests {
         var sampledTokens = Set<Int32>()
         for _ in 0..<50 {
             await withCheckedContinuation { continuation in
-                sampler.encode(
+                try! sampler.encode(
                     to: queue, logitsBuffer: logitsBuffer, logitsOffset: 0,
                     outputBuffer: outputBuffer, outputOffset: 0,
-                    applyBitmask: true, completion: { _ in continuation.resume() }
+                    applyBitmask: true, completion: { _, _ in continuation.resume() }
                 )
             }
             let result = outputBuffer.contents().assumingMemoryBound(to: Int32.self).pointee
@@ -1046,17 +1051,18 @@ struct MPSGraphConstrainedCompositeTests {
         let outputBuffer = try #require(device.makeBuffer(length: 4, options: .storageModeShared))
 
         let bitmaskSize = (Self.vocabSize + 31) / 32
-        let bitmaskPtr = try sampler.bitmaskBuffer.contents().assumingMemoryBound(to: Int32.self)
+        let bitmaskBuffer = try #require(try sampler.bitmaskBuffer)
+        let bitmaskPtr = bitmaskBuffer.contents().assumingMemoryBound(to: Int32.self)
         for i in 0..<bitmaskSize { bitmaskPtr[i] = Int32(bitPattern: 0xAAAA_AAAA) }
 
         let queue = try #require(device.makeCommandQueue())
 
         for _ in 0..<10 {
             await withCheckedContinuation { continuation in
-                sampler.encode(
+                try! sampler.encode(
                     to: queue, logitsBuffer: logitsBuffer, logitsOffset: 0,
                     outputBuffer: outputBuffer, outputOffset: 0,
-                    applyBitmask: true, completion: { _ in continuation.resume() }
+                    applyBitmask: true, completion: { _, _ in continuation.resume() }
                 )
             }
         }
@@ -1065,10 +1071,10 @@ struct MPSGraphConstrainedCompositeTests {
         let start = SuspendingClock().now
         for _ in 0..<iterations {
             await withCheckedContinuation { continuation in
-                sampler.encode(
+                try! sampler.encode(
                     to: queue, logitsBuffer: logitsBuffer, logitsOffset: 0,
                     outputBuffer: outputBuffer, outputOffset: 0,
-                    applyBitmask: true, completion: { _ in continuation.resume() }
+                    applyBitmask: true, completion: { _, _ in continuation.resume() }
                 )
             }
         }

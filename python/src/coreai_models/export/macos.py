@@ -17,7 +17,11 @@ import coreai_torch
 import torch
 from coreai.authoring import AIProgram
 
-from coreai_models._constants import MAIN_GRAPH_NAME, TRACE_KV_CACHE_SEQ_LEN
+from coreai_models._constants import (
+    DEFAULT_INCLUDE_DEBUG_INFO,
+    MAIN_GRAPH_NAME,
+    TRACE_KV_CACHE_SEQ_LEN,
+)
 from coreai_models.export.externalize import (
     EXTERNALIZE_SPECS,
     subexport_and_restore,
@@ -62,6 +66,7 @@ def export_to_coreai(
     output_names: tuple[str, ...] | None = None,
     state_names: tuple[str, ...] | None = None,
     externalized_model: torch.nn.Module | None = None,
+    include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
 ) -> AIProgram:
     """Export a stateful macOS model to a AIProgram.
 
@@ -92,6 +97,9 @@ def export_to_coreai(
             by ``patch_model_for_externalization`` before ``model`` was produced.
             Required when ``model`` is a flattened ``torch.fx.GraphModule``, and
             unused when it is an eager module.
+        include_debug_info: When True, the converter runs in ``DEBUG`` mode and embeds debug
+            information in the exported ``.aimodel``. Defaults to ``RELEASE`` mode,
+            which embeds minimum debug information and makes the exported asset smaller.
 
     Returns:
         A AIProgram ready for optimization and compilation.
@@ -124,7 +132,12 @@ def export_to_coreai(
         remove_functionalization(coreaten_exported_program)
         return coreaten_exported_program
 
-    converter = coreai_torch.TorchConverter()
+    mode = (
+        coreai_torch.TorchConverter.Mode.DEBUG
+        if include_debug_info
+        else coreai_torch.TorchConverter.Mode.RELEASE
+    )
+    converter = coreai_torch.TorchConverter(mode=mode)
 
     # GraphModule subclasses nn.Module, so this specific check has to come first
     if isinstance(model, torch.fx.GraphModule):
@@ -218,6 +231,7 @@ def export_macos_model(
         input_names=contract_model.export_input_names()[MAIN_GRAPH_NAME],
         output_names=contract_model.export_output_names()[MAIN_GRAPH_NAME],
         state_names=contract_model.export_state_names()[MAIN_GRAPH_NAME],
+        include_debug_info=getattr(export_config, "include_debug_info", DEFAULT_INCLUDE_DEBUG_INFO),
         externalized_model=externalized_model,
     )
 

@@ -97,9 +97,36 @@ def _make_mixtral_config(
         num_experts_per_tok=num_experts_per_tok,
         vocab_size=vocab_size,
         max_position_embeddings=max_position_embeddings,
+        # Must be passed to the constructor: as of transformers 5.0 the theta
+        # lives in `rope_parameters`, and assigning `config.rope_theta`
+        # afterwards only sets an attribute that the HF model ignores.
+        rope_theta=10000.0,
     )
-    config.rope_theta = 10000.0
     return config
+
+
+def _load_hf_moe_weights(
+    hf_moe: torch.nn.Module,
+    gate_weight: torch.Tensor,
+    gate_proj_weight: torch.Tensor,
+    up_proj_weight: torch.Tensor,
+    down_proj_weight: torch.Tensor,
+) -> None:
+    """Load SwitchGLU-layout expert weights into an HF MixtralSparseMoeBlock.
+
+    transformers >= 5.0 stores the experts of a layer in two fused 3D
+    parameters on ``MixtralExperts`` rather than per-expert w1/w2/w3 linears,
+    with w1 (gate) and w3 (up) concatenated along the output dim and w2 as
+    ``down_proj``.
+
+    The projection weights use the SwitchGLU layout, i.e. a leading singleton
+    dim in front of the expert dim.
+    """
+    hf_moe.gate.weight = torch.nn.Parameter(gate_weight.clone())
+    hf_moe.experts.gate_up_proj = torch.nn.Parameter(
+        torch.cat([gate_proj_weight[0], up_proj_weight[0]], dim=1)
+    )
+    hf_moe.experts.down_proj = torch.nn.Parameter(down_proj_weight[0].clone())
 
 
 class TestmacOSMixtralForCausalLM:
@@ -210,6 +237,61 @@ class TestmacOSMixtralForCausalLM:
         )
         assert "model.layers.0.block_sparse_moe.experts.0.w1.weight" not in sd
 
+    def test_mutate_state_dict_splits_fused_moe_experts(self):
+        """Fused (transformers >= 5.0) `mlp` experts become SwitchGLU weights."""
+        config = _make_mixtral_config()
+        our_model = MixtralForCausalLM(config, model_device="cpu")
+
+        hidden = 64
+        n_heads = 4
+        n_kv_heads = 2
+        head_dim = hidden // n_heads
+        num_experts = 4
+        intermediate = 128
+
+        sd = {}
+        sd["model.embed_tokens.weight"] = torch.randn(100, hidden)
+        sd["model.norm.weight"] = torch.randn(hidden)
+        sd["lm_head.weight"] = torch.randn(100, hidden)
+        sd["model.layers.0.self_attn.q_proj.weight"] = torch.randn(n_heads * head_dim, hidden)
+        sd["model.layers.0.self_attn.k_proj.weight"] = torch.randn(n_kv_heads * head_dim, hidden)
+        sd["model.layers.0.self_attn.v_proj.weight"] = torch.randn(n_kv_heads * head_dim, hidden)
+        sd["model.layers.0.self_attn.o_proj.weight"] = torch.randn(hidden, hidden)
+        sd["model.layers.0.input_layernorm.weight"] = torch.randn(hidden)
+        sd["model.layers.0.post_attention_layernorm.weight"] = torch.randn(hidden)
+        router_weight = torch.randn(num_experts, hidden)
+        sd["model.layers.0.mlp.gate.weight"] = router_weight
+        gate_up_proj = torch.randn(num_experts, 2 * intermediate, hidden)
+        sd["model.layers.0.mlp.experts.gate_up_proj"] = gate_up_proj
+        sd["model.layers.0.mlp.experts.down_proj"] = torch.randn(num_experts, hidden, intermediate)
+
+        our_model._mutate_state_dict(sd)
+
+        prefix = "model.layers.0.block_sparse_moe"
+        for proj, expected_shape in (
+            ("gate_proj", (1, num_experts, intermediate, hidden)),
+            ("up_proj", (1, num_experts, intermediate, hidden)),
+            ("down_proj", (1, num_experts, hidden, intermediate)),
+        ):
+            key = f"{prefix}.switch_mlp.{proj}.weight"
+            assert key in sd
+            assert sd[key].shape == expected_shape
+
+        # w1 (gate) and w3 (up) are packed in that order along the output dim
+        torch.testing.assert_close(
+            sd[f"{prefix}.switch_mlp.gate_proj.weight"][0], gate_up_proj[:, :intermediate]
+        )
+        torch.testing.assert_close(
+            sd[f"{prefix}.switch_mlp.up_proj.weight"][0], gate_up_proj[:, intermediate:]
+        )
+
+        # The router moves to our module name
+        torch.testing.assert_close(sd[f"{prefix}.gate.weight"], router_weight)
+
+        assert "model.layers.0.mlp.gate.weight" not in sd
+        assert "model.layers.0.mlp.experts.gate_up_proj" not in sd
+        assert "model.layers.0.mlp.experts.down_proj" not in sd
+
 
 # =============================================================================
 # Functional-parity tests
@@ -280,14 +362,18 @@ class _HFMixtralTransformerBlock(torch.nn.Module):
 
 
 class _HFMixtralSparseMoeBlockWrapper(torch.nn.Module):
-    """Wrapper that returns just hidden_states (drops router_logits)."""
+    """Wrapper around HF MixtralSparseMoeBlock.
+
+    transformers >= 5.0 returns the hidden states directly instead of a
+    ``(hidden_states, router_logits)`` tuple.
+    """
 
     def __init__(self: Self, config: MixtralConfig) -> None:
         super().__init__()
         self.inner = HFMixtralSparseMoeBlock(config)
 
     def forward(self: Self, x: torch.Tensor) -> torch.Tensor:
-        return self.inner(x)[0]
+        return self.inner(x)
 
 
 # ---------------------------------------------------------------------------
@@ -595,19 +681,15 @@ class MixtralTransformerBlock(Model):
         hf_attn.v_proj.weight = torch.nn.Parameter(self._qkv_proj_weight[q_size + k_size :].clone())
         hf_attn.o_proj.weight = torch.nn.Parameter(self._o_proj_weight.clone())
 
-        # MoE weights (per-expert layout)
-        # HF uses w1/w2/w3 naming: w1->gate, w3->up, w2->down
-        hf_block.block_sparse_moe.gate.weight = torch.nn.Parameter(self._moe_gate_weight.clone())
-        for i in range(self._num_local_experts):
-            hf_block.block_sparse_moe.experts[i].w1.weight = torch.nn.Parameter(
-                self._switch_gate_proj_weight[0, i].clone()
-            )
-            hf_block.block_sparse_moe.experts[i].w3.weight = torch.nn.Parameter(
-                self._switch_up_proj_weight[0, i].clone()
-            )
-            hf_block.block_sparse_moe.experts[i].w2.weight = torch.nn.Parameter(
-                self._switch_down_proj_weight[0, i].clone()
-            )
+        # MoE weights (fused expert layout). transformers >= 5.0 renamed the
+        # submodule from `block_sparse_moe` to `mlp`.
+        _load_hf_moe_weights(
+            hf_block.mlp,
+            self._moe_gate_weight,
+            self._switch_gate_proj_weight,
+            self._switch_up_proj_weight,
+            self._switch_down_proj_weight,
+        )
 
         # Layernorm weights
         hf_block.input_layernorm.weight = torch.nn.Parameter(self._input_ln_weight.clone())
@@ -800,19 +882,14 @@ class MixtralSparseMoeBlock(Model):
         moe.switch_mlp.down_proj.weight = torch.nn.Parameter(self._switch_down_proj_weight.clone())
 
     def _load_torch_weights_hf(self: Self, hf_moe: torch.nn.Module) -> None:
-        """Load pre-generated weights into HF MixtralSparseMoeBlock (per-expert)."""
-        hf_moe.gate.weight = torch.nn.Parameter(self._moe_gate_weight.clone())
-        # HF uses w1/w2/w3 naming: w1->gate, w3->up, w2->down
-        for i in range(self._num_local_experts):
-            hf_moe.experts[i].w1.weight = torch.nn.Parameter(
-                self._switch_gate_proj_weight[0, i].clone()
-            )
-            hf_moe.experts[i].w3.weight = torch.nn.Parameter(
-                self._switch_up_proj_weight[0, i].clone()
-            )
-            hf_moe.experts[i].w2.weight = torch.nn.Parameter(
-                self._switch_down_proj_weight[0, i].clone()
-            )
+        """Load pre-generated weights into HF MixtralSparseMoeBlock (fused experts)."""
+        _load_hf_moe_weights(
+            hf_moe,
+            self._moe_gate_weight,
+            self._switch_gate_proj_weight,
+            self._switch_up_proj_weight,
+            self._switch_down_proj_weight,
+        )
 
     def _load_mlx_weights(self: Self, mlx_moe: "mlx_nn.Module") -> None:
         """Load pre-generated weights into MLX MixtralSparseMoeBlock."""

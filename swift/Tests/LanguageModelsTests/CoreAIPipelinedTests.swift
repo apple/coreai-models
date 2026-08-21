@@ -6,6 +6,7 @@
 import CoreAI
 import Foundation
 import Metal
+import Synchronization
 import TestUtilities
 import Testing
 
@@ -481,7 +482,7 @@ struct GPUSamplerContinuationSyncTests {
                 logitsOffset: 0,
                 outputBuffer: outputBuffer,
                 outputOffset: 0,
-                completion: { nextToken in
+                completion: { nextToken, _ in
                     let task = Task {
                         for await _ in proceedStream { break }
                         continuation.yield(nextToken)
@@ -522,7 +523,7 @@ struct GPUSamplerContinuationSyncTests {
                 logitsOffset: 0,
                 outputBuffer: outputBuffer,
                 outputOffset: 0,
-                completion: { nextToken in
+                completion: { nextToken, _ in
                     continuation.yield(nextToken)
                     earlyDoneContinuation.yield(())
                 }
@@ -548,7 +549,7 @@ struct GPUSamplerContinuationSyncTests {
                 logitsOffset: 0,
                 outputBuffer: lastOutput,
                 outputOffset: 0,
-                completion: { nextToken in
+                completion: { nextToken, _ in
                     let task = Task {
                         for await _ in proceedStream { break }
                         continuation.yield(nextToken)
@@ -590,7 +591,7 @@ struct GPUSamplerContinuationSyncTests {
             logitsOffset: 0,
             outputBuffer: outputBuffer,
             outputOffset: 0,
-            completion: { nextToken in
+            completion: { nextToken, _ in
                 continuation.yield(nextToken)
             }
         )
@@ -631,7 +632,7 @@ struct GPUSamplerContinuationSyncTests {
                 logitsOffset: 0,
                 outputBuffer: outputBuffer,
                 outputOffset: 0,
-                completion: { nextToken in
+                completion: { nextToken, _ in
                     continuation.yield(nextToken)
                 }
             )
@@ -651,5 +652,69 @@ struct GPUSamplerContinuationSyncTests {
         do { for try await token in stream { received.append(token) } } catch {}
 
         #expect(received.count == tokenCount)
+    }
+}
+
+// MARK: - MPSGraph Completion Ordering Sentinel
+
+/// Validates that MPSGraphExecutable.runAsync completionHandler calls are dispatched
+/// in submission order when using a single MTLCommandQueue. This is not documented by
+/// Apple but is relied upon by RepetitionPenaltyGPUState (recordToken is called from
+/// these completions without additional synchronization).
+///
+/// If this test fails, RepetitionPenaltyGPUState needs a lock.
+@Suite("MPSGraph completion ordering", .enabled(if: !CIEnvironment.isVM))
+struct MPSGraphCompletionOrderingTests {
+    static let device: MTLDevice? = MTLCreateSystemDefaultDevice()
+    static let vocabSize = 512
+
+    @Test("completions fire in submission order on a single command queue")
+    func completionsAreSerial() async throws {
+        let device = try #require(Self.device)
+        let queue = try #require(device.makeCommandQueue())
+        let sampler = try MPSGraphArgmaxSampler(device: device, vocabSize: Self.vocabSize)
+
+        let stepCount = 16
+        let orderRecord = Mutex<[Int]>([])
+
+        // Submit stepCount encode calls back-to-back. Each completion records its index.
+        for i in 0..<stepCount {
+            let logitsBuffer = try #require(
+                device.makeBuffer(
+                    length: Self.vocabSize * MemoryLayout<Float16>.size,
+                    options: .storageModeShared))
+            let ptr = logitsBuffer.contents().assumingMemoryBound(to: Float16.self)
+            for v in 0..<Self.vocabSize { ptr[v] = Float16(0) }
+            ptr[i % Self.vocabSize] = Float16(10.0)
+
+            let outputBuffer = try #require(
+                device.makeBuffer(length: MemoryLayout<Int32>.size, options: .storageModeShared))
+
+            sampler.encode(
+                to: queue,
+                logitsBuffer: logitsBuffer,
+                logitsOffset: 0,
+                outputBuffer: outputBuffer,
+                outputOffset: 0,
+                completion: { _, _ in
+                    orderRecord.withLock { $0.append(i) }
+                }
+            )
+        }
+
+        // Wait for all completions via a sentinel command buffer.
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            guard let cmdBuf = queue.makeCommandBuffer() else {
+                cont.resume()
+                return
+            }
+            cmdBuf.addCompletedHandler { _ in cont.resume() }
+            cmdBuf.commit()
+        }
+
+        let observed = orderRecord.withLock { $0 }
+        #expect(
+            observed == Array(0..<stepCount),
+            "Completions not in submission order — RepetitionPenaltyGPUState needs a lock")
     }
 }

@@ -24,6 +24,7 @@ import torch
 from transformers import AutoConfig, AutoTokenizer
 
 from coreai_models._constants import (
+    DEFAULT_INCLUDE_DEBUG_INFO,
     IOS_DEFAULT_MAX_CONTEXT_LENGTH,
     TRACE_KV_CACHE_SEQ_LEN,
 )
@@ -64,6 +65,10 @@ class ExportConfig:
     quantization_mode: Literal["eager", "graph"] | None = None
     # iOS only. When True, embedding table is not quantized to int8.
     disable_embedding_quantization: bool = False
+    # When True, the converter embeds debug information in the exported .aimodel
+    # (DEBUG mode). Default keeps the converter in RELEASE mode, which embeds
+    # minimum debug information and makes the exported asset smaller.
+    include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO
     # Optional prebuilt coreai-opt config (KMeansPalettizerConfig or
     # QuantizerConfig) loaded from a user-provided YAML. When set, the pipeline
     # uses this directly and ignores `compression` for config resolution

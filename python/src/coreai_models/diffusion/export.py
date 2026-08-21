@@ -98,6 +98,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print the resolved export config and exit without exporting",
     )
     parser.add_argument(
+        "--include-debug-info",
+        action="store_true",
+        help=(
+            "Embed debug information in the exported .aimodel for debugging a conversion. "
+            "Default: off, which embeds minimum debug information and makes the "
+            "exported asset smaller."
+        ),
+    )
+    parser.add_argument(
         "--verbose",
         "-v",
         action="store_true",
@@ -212,19 +221,21 @@ def main() -> None:
         compute_precision=compute_precision,
         compression=compression,
         overwrite=args.overwrite,
+        include_debug_info=args.include_debug_info,
     )
 
     if args.dry_run:
         print("Dry run — resolved export config:")
-        print(f"  model:             {config.hf_model_id}")
-        print(f"  compression:       {config.compression}")
-        print(f"  compute_precision: {config.compute_precision}")
-        print(f"  output_dir:        {config.output_dir}")
+        print(f"  model:              {config.hf_model_id}")
+        print(f"  compression:        {config.compression}")
+        print(f"  compute_precision:  {config.compute_precision}")
+        print(f"  output_dir:         {config.output_dir}")
         if config.components:
-            print(f"  components:        {', '.join(config.components)}")
+            print(f"  components:         {', '.join(config.components)}")
         else:
-            print("  components:        all")
-        print(f"  overwrite:         {config.overwrite}")
+            print("  components:         all")
+        print(f"  overwrite:          {config.overwrite}")
+        print(f"  include_debug_info: {config.include_debug_info}")
         return
 
     try:

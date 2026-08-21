@@ -43,7 +43,7 @@ public struct CoreAILanguageModel: LanguageModel {
     fileprivate let samplingConfig: SamplingConfiguration
     fileprivate let bundle: LanguageBundle
     fileprivate let tokenizer: any Tokenizer
-    fileprivate let thinkingMarkers: (open: String, close: String)
+    fileprivate let thinkingFormat: ThinkTagParser.Format
     fileprivate let toolCallMarkers: (open: String, close: String)?
     private let supportsToolCalling: Bool
     fileprivate let supportsReasoning: Bool
@@ -132,27 +132,40 @@ public struct CoreAILanguageModel: LanguageModel {
         resources: ModelResources
     ) {
         let toolCallMarkers = CoreAIExecutor.detectToolCallMarkers(using: tokenizer)
+        let thinkingFormat = CoreAIExecutor.detectThinkingFormat(using: tokenizer)
         self.url = configuration.url
         self.variant = configuration.variant
         self.kvCacheStrategy = configuration.kvCacheStrategy
         self.samplingConfig = configuration.samplingConfig
         self.bundle = bundle
         self.tokenizer = tokenizer
-        self.thinkingMarkers = CoreAIExecutor.detectThinkingMarkers(using: tokenizer)
+        self.thinkingFormat = thinkingFormat
         self.toolCallMarkers = toolCallMarkers
         self.supportsToolCalling = toolCallMarkers != nil
-        self.supportsReasoning =
-            tokenizer.convertTokenToId("<think>") != nil
-            || tokenizer.convertTokenToId("<|reasoning_start|>") != nil
+        self.supportsReasoning = {
+            switch thinkingFormat {
+            case .agentic: return true
+            case .tagPair(let open, _): return tokenizer.convertTokenToId(open) != nil
+            }
+        }()
         self.resources = resources
         // Read additional stop token IDs from tokenizer_config.json (e.g. Gemma's
         // <end_of_turn>). Empty when the bundle has no tokenizer directory.
+        var extraEos: [Int32] = []
         if let tokenizerDir = bundle.tokenizerPath {
-            self.additionalEosTokenIds = LanguageConfig.additionalStopTokenIds(
+            extraEos = LanguageConfig.additionalStopTokenIds(
                 from: tokenizerDir, tokenizer: tokenizer)
-        } else {
-            self.additionalEosTokenIds = []
         }
+        // Agentic models: stop on <|eot|> (end of user-facing turn) so the
+        // runner doesn't loop through repeated self→user cycles.
+        if case .agentic(_, _, _, let eot) = thinkingFormat,
+            let eotId = tokenizer.convertTokenToId(eot)
+        {
+            if !extraEos.contains(Int32(eotId)) {
+                extraEos.append(Int32(eotId))
+            }
+        }
+        self.additionalEosTokenIds = extraEos
     }
 
     // MARK: - Resource control
@@ -174,10 +187,13 @@ public struct CoreAILanguageModel: LanguageModel {
 
     /// Whether guided generation is available for this model.
     private var isGuidedGenerationSupported: Bool {
+        if let isConstrainedCapable = resources.loadedEngineIsConstrainedCapable {
+            return isConstrainedCapable
+        }
         if let supportsLogits = resources.loadedEngineSupportsLogits {
             return supportsLogits
         }
-        return variant != "coreai-pipelined"
+        return true
     }
 
     // MARK: - Executor
@@ -204,20 +220,26 @@ public struct CoreAILanguageModel: LanguageModel {
             self.resources = ModelResources.shared(for: configuration)
         }
 
-        /// Probes the tokenizer for known reasoning marker pairs. Each
-        /// candidate pair is verified to exist as added/special tokens via
-        /// `convertTokenToId(_:)` — only models that actually have these
-        /// tokens in their vocab match. First match wins; falls back to
-        /// `<think>`/`</think>` so the parser is harmless on models that
-        /// don't emit reasoning markup at all.
-        ///
-        /// Add a new pair here when onboarding a model with different
-        /// markers. For models with non-pair-symmetric formats (e.g.
-        /// gpt-oss / Harmony), a different parser is needed; this one
-        /// covers the `<open>...</close>` shape.
-        fileprivate static func detectThinkingMarkers(
+        /// Probes the tokenizer for known reasoning formats. Supports both
+        /// tag-pair models (symmetric open/close markers) and agentic models
+        /// that use message routing for chain-of-thought.
+        static func detectThinkingFormat(
             using tokenizer: any Tokenizer
-        ) -> (open: String, close: String) {
+        ) -> ThinkTagParser.Format {
+            // Agentic format: to=self/to=user message routing with eom/eot
+            if tokenizer.convertTokenToId("<|eom|>") != nil,
+                tokenizer.convertTokenToId("<|eot|>") != nil,
+                tokenizer.convertTokenToId("<|message|>") != nil
+            {
+                return .agentic(
+                    selfMarker: "to=self<|message|>",
+                    userMarker: "to=user<|message|>",
+                    endOfMessage: "<|eom|>",
+                    endOfTurn: "<|eot|>"
+                )
+            }
+
+            // Tag-pair format: symmetric open/close markers
             let candidates: [(open: String, close: String)] = [
                 ("<think>", "</think>"),
                 ("<|reasoning_start|>", "<|reasoning_end|>"),
@@ -226,10 +248,10 @@ public struct CoreAILanguageModel: LanguageModel {
                 if tokenizer.convertTokenToId(pair.open) != nil,
                     tokenizer.convertTokenToId(pair.close) != nil
                 {
-                    return pair
+                    return .tagPair(open: pair.open, close: pair.close)
                 }
             }
-            return ("<think>", "</think>")
+            return .tagPair(open: "<think>", close: "</think>")
         }
 
         /// Probes the tokenizer for known tool call marker pairs. Each
@@ -311,7 +333,7 @@ public struct CoreAILanguageModel: LanguageModel {
 
                 // Check if guided generation is requested
                 if let schema = request.schema {
-                    guard engine.supportsLogits else {
+                    guard engine.supportsLogits || engine is any ConstrainedGenerationCapable else {
                         throw LanguageModelError.unsupportedCapability(
                             .init(
                                 capability: .guidedGeneration,
@@ -381,10 +403,7 @@ public struct CoreAILanguageModel: LanguageModel {
             // its own `Transcript.Reasoning` entry, not mixed into the
             // user-facing `Transcript.Response`. Markers were resolved at
             // model init from the tokenizer's known token ids.
-            var thinkParser = ThinkTagParser(
-                open: model.thinkingMarkers.open,
-                close: model.thinkingMarkers.close
-            )
+            var thinkParser = ThinkTagParser(format: model.thinkingFormat)
             // Routes tool call markup to .toolCalls(...) channel events.
             // nil when the model's tokenizer has no tool call tokens.
             var toolCallParser: ToolCallParser? = model.toolCallMarkers.map {
@@ -560,8 +579,14 @@ public struct CoreAILanguageModel: LanguageModel {
                 preconditionFailure("GenerationSchema JSON encoding produced invalid UTF-8")
             }
 
-            let strategy = ConstrainedDecodingStrategy(
-                jsonSchema: jsonSchema, vocabSize: model.bundle.vocabSize)
+            let strategy: any DecodingStrategy
+            if engine is any ConstrainedGenerationCapable {
+                strategy = PipelinedConstrainedDecodingStrategy(
+                    jsonSchema: jsonSchema, vocabSize: model.bundle.vocabSize)
+            } else {
+                strategy = ConstrainedDecodingStrategy(
+                    jsonSchema: jsonSchema, vocabSize: model.bundle.vocabSize)
+            }
             let stopSequences = StopSequences(
                 for: model.tokenizer,
                 additionalEosTokenIds: model.additionalEosTokenIds

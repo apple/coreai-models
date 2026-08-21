@@ -27,6 +27,7 @@ import numpy as np
 import torch
 from huggingface_hub import snapshot_download
 
+from coreai_models._constants import DEFAULT_INCLUDE_DEBUG_INFO
 from coreai_models.diffusion.components import get_component_registry
 from coreai_models.diffusion.gpu import export_stateless
 from coreai_models.diffusion.models import get_pipeline_type
@@ -49,6 +50,7 @@ class DiffusionExportConfig:
     compute_precision: str = "float16"
     compression: str = "none"
     overwrite: bool = False
+    include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO
 
 
 def export_diffusion(config: DiffusionExportConfig) -> dict[str, str]:
@@ -108,7 +110,13 @@ async def _async_export_diffusion(config: DiffusionExportConfig) -> dict[str, st
         wrapper = spec.wrapper_fn(hf_pipe)
         dummy_inputs = spec.dummy_fn(hf_pipe)
 
-        program = export_stateless(wrapper, dummy_inputs, spec.input_names, spec.output_names)
+        program = export_stateless(
+            wrapper,
+            dummy_inputs,
+            spec.input_names,
+            spec.output_names,
+            include_debug_info=config.include_debug_info,
+        )
 
         # Optional MLIR quantization
         component_quant = quant_config if spec.quantizable else None

@@ -12,12 +12,16 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
 )
 from typing_extensions import Self, override
 
+from coreai_models._hf import resolve_rope_theta
 from coreai_models.models.base import BaseForCausalLM
 from coreai_models.primitives.macos.cache import KVCache
 from coreai_models.primitives.macos.mlp import MLP
 from coreai_models.primitives.macos.rms_norm import RMSNorm
 from coreai_models.primitives.macos.rope import initialize_rope
 from coreai_models.primitives.macos.sdpa import SDPA
+
+# Fallback for checkpoints whose config carries no RoPE theta at all.
+_DEFAULT_ROPE_THETA = 5_000_000
 
 
 class Attention(nn.Module):
@@ -38,7 +42,11 @@ class Attention(nn.Module):
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
         self.qk_norm = RMSNorm(head_dim, eps=config.rms_norm_eps, n_heads=n_heads + n_kv_heads)
         self.sdpa = SDPA(is_causal=True)
-        self.rope = initialize_rope(base=config.rope_theta)
+        # transformers >= 5.0 keeps the theta in `config.rope_parameters`, so it
+        # cannot be read off the config directly.
+        self.rope = initialize_rope(
+            base=resolve_rope_theta(config, default=_DEFAULT_ROPE_THETA),
+        )
 
     def forward(
         self,
@@ -146,15 +154,7 @@ class Qwen3VLForCausalLM(BaseForCausalLM):
             text_config.num_hidden_layers = num_layers
         text_config.tie_word_embeddings = getattr(hf_config, "tie_word_embeddings", False)
 
-        rope_theta = getattr(text_config, "rope_theta", None)
-        if rope_theta is None:
-            rope_params = getattr(text_config, "rope_parameters", None) or getattr(
-                text_config, "rope_scaling", None
-            )
-            if rope_params and "rope_theta" in rope_params:
-                rope_theta = rope_params["rope_theta"]
-            else:
-                rope_theta = 5_000_000
+        rope_theta = resolve_rope_theta(text_config, default=_DEFAULT_ROPE_THETA)
         text_config.rope_theta = float(rope_theta)
         text_config.rope_scaling = None
         return text_config
@@ -301,15 +301,7 @@ class Qwen3VLForCausalLMEmbeddings(BaseForCausalLM):
             text_config.num_hidden_layers = num_layers
         text_config.tie_word_embeddings = getattr(hf_config, "tie_word_embeddings", False)
 
-        rope_theta = getattr(text_config, "rope_theta", None)
-        if rope_theta is None:
-            rope_params = getattr(text_config, "rope_parameters", None) or getattr(
-                text_config, "rope_scaling", None
-            )
-            if rope_params and "rope_theta" in rope_params:
-                rope_theta = rope_params["rope_theta"]
-            else:
-                rope_theta = 5_000_000
+        rope_theta = resolve_rope_theta(text_config, default=_DEFAULT_ROPE_THETA)
         text_config.rope_theta = float(rope_theta)
         text_config.rope_scaling = None
         return text_config

@@ -69,7 +69,7 @@ struct ToolCallParser {
             }
             buffer = ""
         } else {
-            let safe = isFinal ? buffer.endIndex : lastSafeIndex(for: openMarker)
+            let safe = isFinal ? buffer.endIndex : lastSafeIndex(in: buffer, forTag: openMarker)
             if safe > buffer.startIndex {
                 let toEmit = String(buffer[buffer.startIndex..<safe])
                 if !toEmit.isEmpty { events.append(.text(toEmit)) }
@@ -112,20 +112,5 @@ struct ToolCallParser {
         }
 
         return .toolCall(id: UUID().uuidString, name: name, argsJSON: argsJSON)
-    }
-
-    /// Rightmost index such that the suffix from there to end-of-buffer is NOT
-    /// a non-empty prefix of `tag`. Same implementation as `ThinkTagParser`.
-    private func lastSafeIndex(for tag: String) -> String.Index {
-        let maxHold = tag.count - 1
-        guard !buffer.isEmpty, maxHold > 0 else { return buffer.endIndex }
-        let holdStart = buffer.index(buffer.endIndex, offsetBy: -min(maxHold, buffer.count))
-        for offset in 0..<buffer.distance(from: holdStart, to: buffer.endIndex) {
-            let idx = buffer.index(holdStart, offsetBy: offset)
-            if tag.starts(with: buffer[idx...]) {
-                return idx
-            }
-        }
-        return buffer.endIndex
     }
 }

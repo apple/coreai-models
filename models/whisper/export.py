@@ -99,6 +99,7 @@ def create_whisper(
     model_name: str,
     dtype: torch.dtype,
     overwrite: bool,
+    include_debug_info: bool,
 ):
     print("[INFO] Sourcing model...")
     model = WhisperModule(model_name, dtype)
@@ -121,7 +122,10 @@ def create_whisper(
     exported = exported.run_decompositions(get_decomp_table())
     print("[INFO] Model exported. Converting to Core AI...")
 
-    converter = TorchConverter().add_exported_program(
+    mode = (
+        TorchConverter.Mode.DEBUG if include_debug_info else TorchConverter.Mode.RELEASE
+    )
+    converter = TorchConverter(mode=mode).add_exported_program(
         exported_program=exported,
         input_names=["input_features", "decoder_input_ids"],
         output_names=["logits"],
@@ -162,6 +166,12 @@ def main():
         action="store_true",
         help="Overwrite an existing .aimodel asset at the output path.",
     )
+    parser.add_argument(
+        "--include-debug-info",
+        action="store_true",
+        help="Embed debug information in the exported .aimodel for debugging a conversion. "
+        "Default: off, which embeds minimum debug information and makes the exported asset smaller.",
+    )
     args = parser.parse_args()
 
     dtype = {
@@ -171,7 +181,9 @@ def main():
     }[args.dtype]
 
     output_dir = args.output_dir or _default_output_dir()
-    create_whisper(output_dir, args.model, dtype, args.overwrite)
+    create_whisper(
+        output_dir, args.model, dtype, args.overwrite, args.include_debug_info
+    )
 
 
 if __name__ == "__main__":

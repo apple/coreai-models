@@ -209,7 +209,7 @@ def gemma3_config() -> Gemma3TextConfig:
         intermediate_size=128,
         rms_norm_eps=1e-5,
         sliding_window=128,
-        query_pre_attn_scalar=1.0,
+        query_pre_attn_scalar=1,
     )
 
 

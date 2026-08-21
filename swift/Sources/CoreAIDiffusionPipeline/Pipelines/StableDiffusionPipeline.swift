@@ -228,9 +228,4 @@ public struct StableDiffusionPipeline: DiffusionPipeline {
                 "discreteFlow is not supported by StableDiffusionPipeline — use SD3Pipeline or Flux2Pipeline")
         }
     }
-
-    private func generateNoise(count: Int, seed: UInt32) -> [Float] {
-        var rng = NumPyRandomSource(seed: seed)
-        return (0..<count).map { _ in Float(rng.nextNormal()) }
-    }
 }

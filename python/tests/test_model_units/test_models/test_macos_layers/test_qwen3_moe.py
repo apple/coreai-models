@@ -110,6 +110,29 @@ def _make_qwen3_moe_config(
     return config
 
 
+def _load_hf_moe_weights(
+    hf_moe: torch.nn.Module,
+    gate_weight: torch.Tensor,
+    gate_proj_weight: torch.Tensor,
+    up_proj_weight: torch.Tensor,
+    down_proj_weight: torch.Tensor,
+) -> None:
+    """Load SwitchGLU-layout expert weights into an HF Qwen3MoeSparseMoeBlock.
+
+    transformers >= 5.0 stores the experts of a layer in two fused 3D
+    parameters on ``Qwen3MoeExperts`` rather than a ModuleList of per-expert
+    MLPs, with the gate and up projections concatenated along the output dim.
+
+    The projection weights use the SwitchGLU layout, i.e. a leading singleton
+    dim in front of the expert dim.
+    """
+    hf_moe.gate.weight = torch.nn.Parameter(gate_weight.clone())
+    hf_moe.experts.gate_up_proj = torch.nn.Parameter(
+        torch.cat([gate_proj_weight[0], up_proj_weight[0]], dim=1)
+    )
+    hf_moe.experts.down_proj = torch.nn.Parameter(down_proj_weight[0].clone())
+
+
 def _make_hf_qwen3_moe_config(
     hidden_size: int = 64,
     num_attention_heads: int = 4,
@@ -335,6 +358,78 @@ class TestmacOSQwen3MoeForCausalLM:
         # Individual expert keys should be gone
         assert "model.layers.1.mlp.experts.0.gate_proj.weight" not in sd
 
+    def test_mutate_state_dict_splits_fused_moe_experts(self):
+        """_mutate_state_dict converts fused (transformers >= 5.0) experts to SwitchGLU."""
+        our_config = _make_qwen3_moe_config(num_hidden_layers=2)
+        our_model = Qwen3MoeForCausalLM(our_config, model_device="cpu")
+
+        hidden = 64
+        n_heads = 4
+        n_kv_heads = 2
+        head_dim = 16
+        num_experts = 4
+        moe_intermediate = 64
+
+        sd = {}
+        sd["model.embed_tokens.weight"] = torch.randn(100, hidden)
+        sd["model.norm.weight"] = torch.randn(hidden)
+        sd["lm_head.weight"] = torch.randn(100, hidden)
+
+        # Layer 0: dense MLP (layer_idx=0, (0+1)%2 != 0)
+        sd["model.layers.0.self_attn.q_proj.weight"] = torch.randn(n_heads * head_dim, hidden)
+        sd["model.layers.0.self_attn.k_proj.weight"] = torch.randn(n_kv_heads * head_dim, hidden)
+        sd["model.layers.0.self_attn.v_proj.weight"] = torch.randn(n_kv_heads * head_dim, hidden)
+        sd["model.layers.0.self_attn.o_proj.weight"] = torch.randn(hidden, hidden)
+        sd["model.layers.0.self_attn.q_norm.weight"] = torch.randn(head_dim)
+        sd["model.layers.0.self_attn.k_norm.weight"] = torch.randn(head_dim)
+        sd["model.layers.0.mlp.gate_proj.weight"] = torch.randn(128, hidden)
+        sd["model.layers.0.mlp.up_proj.weight"] = torch.randn(128, hidden)
+        sd["model.layers.0.mlp.down_proj.weight"] = torch.randn(hidden, 128)
+        sd["model.layers.0.input_layernorm.weight"] = torch.randn(hidden)
+        sd["model.layers.0.post_attention_layernorm.weight"] = torch.randn(hidden)
+
+        # Layer 1: MoE (layer_idx=1, (1+1)%2 == 0) with fused expert weights
+        sd["model.layers.1.self_attn.q_proj.weight"] = torch.randn(n_heads * head_dim, hidden)
+        sd["model.layers.1.self_attn.k_proj.weight"] = torch.randn(n_kv_heads * head_dim, hidden)
+        sd["model.layers.1.self_attn.v_proj.weight"] = torch.randn(n_kv_heads * head_dim, hidden)
+        sd["model.layers.1.self_attn.o_proj.weight"] = torch.randn(hidden, hidden)
+        sd["model.layers.1.self_attn.q_norm.weight"] = torch.randn(head_dim)
+        sd["model.layers.1.self_attn.k_norm.weight"] = torch.randn(head_dim)
+        sd["model.layers.1.mlp.gate.weight"] = torch.randn(num_experts, hidden)
+        gate_up_proj = torch.randn(num_experts, 2 * moe_intermediate, hidden)
+        sd["model.layers.1.mlp.experts.gate_up_proj"] = gate_up_proj
+        sd["model.layers.1.mlp.experts.down_proj"] = torch.randn(
+            num_experts, hidden, moe_intermediate
+        )
+        sd["model.layers.1.input_layernorm.weight"] = torch.randn(hidden)
+        sd["model.layers.1.post_attention_layernorm.weight"] = torch.randn(hidden)
+
+        our_model._mutate_state_dict(sd)
+
+        # Fused experts should be split into the SwitchGLU layout
+        for proj, expected_shape in (
+            ("gate_proj", (1, num_experts, moe_intermediate, hidden)),
+            ("up_proj", (1, num_experts, moe_intermediate, hidden)),
+            ("down_proj", (1, num_experts, hidden, moe_intermediate)),
+        ):
+            key = f"model.layers.1.mlp.switch_mlp.{proj}.weight"
+            assert key in sd
+            assert sd[key].shape == expected_shape
+
+        # gate/up are packed in that order along the output dim
+        torch.testing.assert_close(
+            sd["model.layers.1.mlp.switch_mlp.gate_proj.weight"][0],
+            gate_up_proj[:, :moe_intermediate],
+        )
+        torch.testing.assert_close(
+            sd["model.layers.1.mlp.switch_mlp.up_proj.weight"][0],
+            gate_up_proj[:, moe_intermediate:],
+        )
+
+        # Fused keys should be gone
+        assert "model.layers.1.mlp.experts.gate_up_proj" not in sd
+        assert "model.layers.1.mlp.experts.down_proj" not in sd
+
 
 # =============================================================================
 # Functional-parity tests
@@ -405,14 +500,18 @@ class _HFQwen3MoeTransformerBlock(torch.nn.Module):
 
 
 class _HFQwen3MoeSparseMoeBlockWrapper(torch.nn.Module):
-    """Wrapper that returns just hidden_states (drops router_logits)."""
+    """Wrapper around HF Qwen3MoeSparseMoeBlock.
+
+    transformers >= 5.0 returns the hidden states directly instead of a
+    ``(hidden_states, router_logits)`` tuple.
+    """
 
     def __init__(self: Self, config: Qwen3MoeConfig) -> None:
         super().__init__()
         self.inner = HFQwen3MoeSparseMoeBlock(config)
 
     def forward(self: Self, x: torch.Tensor) -> torch.Tensor:
-        return self.inner(x)[0]
+        return self.inner(x)
 
 
 # ---------------------------------------------------------------------------
@@ -1003,18 +1102,14 @@ class Qwen3MoeTransformerBlockMoE(Model):
         hf_attn.q_norm.weight = torch.nn.Parameter(self._q_norm_weight.clone())
         hf_attn.k_norm.weight = torch.nn.Parameter(self._k_norm_weight.clone())
 
-        # MoE weights (per-expert layout)
-        hf_block.mlp.gate.weight = torch.nn.Parameter(self._moe_gate_weight.clone())
-        for i in range(self._num_experts):
-            hf_block.mlp.experts[i].gate_proj.weight = torch.nn.Parameter(
-                self._switch_gate_proj_weight[0, i].clone()
-            )
-            hf_block.mlp.experts[i].up_proj.weight = torch.nn.Parameter(
-                self._switch_up_proj_weight[0, i].clone()
-            )
-            hf_block.mlp.experts[i].down_proj.weight = torch.nn.Parameter(
-                self._switch_down_proj_weight[0, i].clone()
-            )
+        # MoE weights (fused expert layout)
+        _load_hf_moe_weights(
+            hf_block.mlp,
+            self._moe_gate_weight,
+            self._switch_gate_proj_weight,
+            self._switch_up_proj_weight,
+            self._switch_down_proj_weight,
+        )
 
         # Layernorm weights
         hf_block.input_layernorm.weight = torch.nn.Parameter(self._input_ln_weight.clone())
@@ -1203,18 +1298,14 @@ class Qwen3MoeSparseMoeBlock(Model):
         moe.switch_mlp.down_proj.weight = torch.nn.Parameter(self._switch_down_proj_weight.clone())
 
     def _load_torch_weights_hf(self: Self, hf_moe: torch.nn.Module) -> None:
-        """Load pre-generated weights into HF Qwen3MoeSparseMoeBlock (per-expert)."""
-        hf_moe.gate.weight = torch.nn.Parameter(self._moe_gate_weight.clone())
-        for i in range(self._num_experts):
-            hf_moe.experts[i].gate_proj.weight = torch.nn.Parameter(
-                self._switch_gate_proj_weight[0, i].clone()
-            )
-            hf_moe.experts[i].up_proj.weight = torch.nn.Parameter(
-                self._switch_up_proj_weight[0, i].clone()
-            )
-            hf_moe.experts[i].down_proj.weight = torch.nn.Parameter(
-                self._switch_down_proj_weight[0, i].clone()
-            )
+        """Load pre-generated weights into HF Qwen3MoeSparseMoeBlock (fused experts)."""
+        _load_hf_moe_weights(
+            hf_moe,
+            self._moe_gate_weight,
+            self._switch_gate_proj_weight,
+            self._switch_up_proj_weight,
+            self._switch_down_proj_weight,
+        )
 
     def _make_config(self: Self) -> Qwen3MoeConfig:
         return Qwen3MoeConfig(
