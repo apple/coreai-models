@@ -208,9 +208,10 @@ LLM_PRESETS: list[ModelPreset] = [
         "smollm2",
         "llm",
         "iOS",
-        "4bit_weight_palettized_group8",
+        "none",
         "float16",
         4096,
+        compression_config="models/smollm2/smollm2_1_7b_6bit.yaml",
         _model_type_override="qwen2",
     ),
     ModelPreset(

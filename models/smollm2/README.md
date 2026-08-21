@@ -38,12 +38,6 @@ uv run coreai.llm.export HuggingFaceTB/SmolLM2-1.7B-Instruct --compression none
 
 # iOS variant
 uv run coreai.llm.export HuggingFaceTB/SmolLM2-1.7B-Instruct --platform iOS
-
-# Custom output directory
-uv run coreai.llm.export HuggingFaceTB/SmolLM2-1.7B-Instruct --output-dir ./my-models/
-
-# Preview resolved config without exporting
-uv run coreai.llm.export HuggingFaceTB/SmolLM2-1.7B-Instruct --dry-run
 ```
 
 ## Run a Core AI Language Model
@@ -85,7 +79,7 @@ Perplexity score on the [`WikiText-2`](https://huggingface.co/datasets/EleutherA
 | ----- | ------------------------------------------ | --------------------- | -------- | ---------------- |
 | 1.7B  | none (`float16`)                           | 16.00                 | macOS    | 12.27            |
 | 1.7B  | [INT4 with FP16 embedding][smollm2-yaml]   | 4.56\*                | macOS    | 14.17            |
-| 1.7B  | `4bit_weight_palettized_group8`            | 4.50                  | iOS      | —                |
+| 1.7B  | [6-bit palettized][smollm2-6bit-yaml]      | 6.00                  | iOS      | 13.63            |
 | 360M  | none (`float16`)                           | 16.00                 | macOS    | 18.23            |
 | 135M  | none (`float16`)                           | 16.00                 | macOS    | 24.99            |
 
@@ -94,3 +88,4 @@ is kept at FP16 because SmolLM2 ties embedding and lm_head weights — INT4 on l
 degrades generation quality in long-form outputs.
 
 [smollm2-yaml]: smollm2_4bit_embedding_excluded.yaml
+[smollm2-6bit-yaml]: smollm2_1_7b_6bit.yaml
