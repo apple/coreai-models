@@ -253,46 +253,49 @@ struct EncoderFrameMappingTests {
                 == [1, 101, 128])
     }
 
-    @Test("Dynamic configs treat every encoder frame as valid")
-    func dynamicTreatsAllFramesValid() {
+    @Test("Dynamic exports count every real-audio frame, excluding the trailing zero frame")
+    func dynamicExcludesOnlyThePaddedFrame() {
+        // 16 000 samples = 100 real mel frames; the dynamic path appends one zero frame to
+        // match HF's shape, and 100 frames subsample to 13.
         #expect(
             SpeechRecognitionModel.validEncoderFrames(
-                pcmCount: 16_000, tEnc: 99, config: .parakeet) == 99)
+                pcmCount: 16_000, tEnc: 13, config: .parakeet, subsamplingFactor: 8) == 13)
         #expect(
-            SpeechRecognitionModel.validEncoderFrames(pcmCount: 0, tEnc: 5, config: .parakeet) == 5)
+            SpeechRecognitionModel.validEncoderFrames(
+                pcmCount: 0, tEnc: 5, config: .parakeet, subsamplingFactor: 8) == 0)
     }
 
-    @Test("Static configs scale the valid count proportionally")
-    func staticScalesProportionally() {
-        // 1000 of 3000 mel frames are real, so 500 of 1500 encoder frames are.
+    @Test("A static window's padded tail is excluded exactly")
+    func staticExcludesPaddingExactly() {
+        // Whisper: 1000 of 3000 mel frames are real, subsampling 2 -> (1000-1)/2+1 = 500.
         #expect(
             SpeechRecognitionModel.validEncoderFrames(
-                pcmCount: 1_000 * 160, tEnc: 1_500, config: .whisper) == 500)
+                pcmCount: 1_000 * 160, tEnc: 1_500, config: .whisper, subsamplingFactor: 2) == 500)
     }
 
-    @Test("The boundary frame rounds to nearest")
-    func boundaryFrameRoundsToNearest() {
-        // The heuristic keeps a boundary frame only when it is majority real audio. With
-        // nFrames 100 and tEnc 10, 25 valid mel frames give 2.5 -> 3 and 24 give 2.4 -> 2.
-        let config = MelConfig.parakeet.withNFrames(100)
+    /// The regression this pins: a proportional estimate rounded to nearest lands one frame
+    /// low for ~25% of audio lengths against the shipped 21 s geometry, clipping a trailing
+    /// token. Nine real mel frames subsample to 2 (9 -> 5 -> 3 -> 2), where the ratio
+    /// 9/2101 x 263 rounds to 1.
+    @Test("The boundary frame is derived, not rounded")
+    func boundaryFrameIsExact() {
+        let config = MelConfig.parakeet.withNFrames(2_101)
         #expect(
             SpeechRecognitionModel.validEncoderFrames(
-                pcmCount: 25 * 160, tEnc: 10, config: config) == 3)
+                pcmCount: 9 * 160, tEnc: 263, config: config, subsamplingFactor: 8) == 2)
+        // 743 real frames (7.43 s) -> 743 -> 372 -> 186 -> 93.
         #expect(
             SpeechRecognitionModel.validEncoderFrames(
-                pcmCount: 24 * 160, tEnc: 10, config: config) == 2)
+                pcmCount: 743 * 160, tEnc: 263, config: config, subsamplingFactor: 8) == 93)
     }
 
-    @Test("The valid count is clamped between one and tEnc")
+    @Test("The valid count never exceeds the encoder's own length")
     func validCountIsClamped() {
         let config = MelConfig.parakeet.withNFrames(100)
-        // Less than one hop of audio still decodes a frame rather than none.
-        #expect(
-            SpeechRecognitionModel.validEncoderFrames(pcmCount: 100, tEnc: 10, config: config) == 1)
-        // Audio beyond the traced window cannot exceed the encoder's own length.
+        // Audio beyond the traced window cannot exceed the encoder's own output length.
         #expect(
             SpeechRecognitionModel.validEncoderFrames(
-                pcmCount: 1_000_000, tEnc: 10, config: config) == 10)
+                pcmCount: 1_000_000, tEnc: 10, config: config, subsamplingFactor: 8) == 10)
     }
 
     /// Regression: the static-encoder path rebuilt `MelConfig` field by field and omitted
