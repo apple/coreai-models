@@ -5,11 +5,18 @@
 
 import Foundation
 
+// MARK: - Prompt (typed representation, avoids magic string packing)
+
+public enum Prompt: Sendable {
+    case text(String)
+    case tokenIds([Int32])
+}
+
 // MARK: - Completions Request (Legacy /v1/completions)
 
 public struct CompletionRequest: Decodable, Sendable {
     public let model: String?
-    public let prompt: [String]
+    public let prompts: [Prompt]
     public let maxTokens: Int?
     public let temperature: Double?
     public let echo: Bool?
@@ -28,15 +35,14 @@ public struct CompletionRequest: Decodable, Sendable {
         echo = try container.decodeIfPresent(Bool.self, forKey: .echo)
         logprobs = try container.decodeIfPresent(Int.self, forKey: .logprobs)
 
-        // prompt can be: string, [string], [int] (token IDs), [[int]] (batched token IDs)
         if let s = try? container.decode(String.self, forKey: .prompt) {
-            prompt = [s]
+            prompts = [.text(s)]
         } else if let arr = try? container.decode([String].self, forKey: .prompt) {
-            prompt = arr
+            prompts = arr.map { .text($0) }
         } else if let tokenIds = try? container.decode([Int].self, forKey: .prompt) {
-            prompt = ["__TOKEN_IDS__:\(tokenIds.map(String.init).joined(separator: ","))"]
+            prompts = [.tokenIds(tokenIds.map { Int32($0) })]
         } else if let batchedIds = try? container.decode([[Int]].self, forKey: .prompt) {
-            prompt = batchedIds.map { "__TOKEN_IDS__:\($0.map(String.init).joined(separator: ","))" }
+            prompts = batchedIds.map { .tokenIds($0.map { Int32($0) }) }
         } else {
             throw DecodingError.dataCorrupted(
                 .init(

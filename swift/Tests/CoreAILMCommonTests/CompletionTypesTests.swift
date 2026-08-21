@@ -18,7 +18,8 @@ struct CompletionTypesTests {
             {"prompt":"Hello world","max_tokens":10}
             """.data(using: .utf8)!
         let request = try JSONDecoder().decode(CompletionRequest.self, from: json)
-        #expect(request.prompt == ["Hello world"])
+        #expect(request.prompts.count == 1)
+        if case .text(let s) = request.prompts[0] { #expect(s == "Hello world") }
         #expect(request.maxTokens == 10)
     }
 
@@ -28,9 +29,9 @@ struct CompletionTypesTests {
             {"prompt":["Hello","World"],"temperature":0.5}
             """.data(using: .utf8)!
         let request = try JSONDecoder().decode(CompletionRequest.self, from: json)
-        #expect(request.prompt.count == 2)
-        #expect(request.prompt[0] == "Hello")
-        #expect(request.prompt[1] == "World")
+        #expect(request.prompts.count == 2)
+        if case .text(let s) = request.prompts[0] { #expect(s == "Hello") }
+        if case .text(let s) = request.prompts[1] { #expect(s == "World") }
         #expect(request.temperature == 0.5)
     }
 
@@ -40,9 +41,12 @@ struct CompletionTypesTests {
             {"prompt":[1,2,3]}
             """.data(using: .utf8)!
         let request = try JSONDecoder().decode(CompletionRequest.self, from: json)
-        #expect(request.prompt.count == 1)
-        #expect(request.prompt[0].hasPrefix("__TOKEN_IDS__:"))
-        #expect(request.prompt[0].contains("1,2,3"))
+        #expect(request.prompts.count == 1)
+        if case .tokenIds(let ids) = request.prompts[0] {
+            #expect(ids == [1, 2, 3])
+        } else {
+            Issue.record("Expected .tokenIds")
+        }
     }
 
     @Test("Batched token ID arrays prompt decodes")
@@ -51,9 +55,9 @@ struct CompletionTypesTests {
             {"prompt":[[1,2],[3,4,5]]}
             """.data(using: .utf8)!
         let request = try JSONDecoder().decode(CompletionRequest.self, from: json)
-        #expect(request.prompt.count == 2)
-        #expect(request.prompt[0] == "__TOKEN_IDS__:1,2")
-        #expect(request.prompt[1] == "__TOKEN_IDS__:3,4,5")
+        #expect(request.prompts.count == 2)
+        if case .tokenIds(let ids) = request.prompts[0] { #expect(ids == [1, 2]) }
+        if case .tokenIds(let ids) = request.prompts[1] { #expect(ids == [3, 4, 5]) }
     }
 
     @Test("Echo and logprobs fields decode")

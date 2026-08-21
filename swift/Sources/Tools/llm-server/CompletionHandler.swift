@@ -58,17 +58,17 @@ private func handleLoglikelihood(req: CompletionRequest, state: ServerState) asy
     let created = Int(Date().timeIntervalSince1970)
     let wantsEcho = req.echo ?? false
 
-    guard req.prompt.count <= 1024 else {
-        throw ServerError.badRequest("prompt batch too large (\(req.prompt.count)); maximum 1024")
+    guard req.prompts.count <= 1024 else {
+        throw ServerError.badRequest("prompt batch too large (\(req.prompts.count)); maximum 1024")
     }
     let topN = req.logprobs ?? 1
 
     let t0 = ContinuousClock.now
     var choices: [CompletionResponse.CompletionChoice] = []
 
-    for (idx, promptText) in req.prompt.enumerated() {
+    for (idx, prompt) in req.prompts.enumerated() {
         let choice = try await processOnePrompt(
-            promptText: promptText, index: idx,
+            prompt: prompt, index: idx,
             wantsEcho: wantsEcho, topN: topN, state: state
         )
         choices.append(choice)
@@ -76,15 +76,15 @@ private func handleLoglikelihood(req: CompletionRequest, state: ServerState) asy
 
     let elapsed = ContinuousClock.now - t0
     let seconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
-    let totalTokens = req.prompt.reduce(0) { acc, p in
-        if p.hasPrefix("__TOKEN_IDS__:") {
-            return acc + p.dropFirst("__TOKEN_IDS__:".count).split(separator: ",").count
+    let totalTokens = req.prompts.reduce(0) { acc, p in
+        switch p {
+        case .tokenIds(let ids): return acc + ids.count
+        case .text(let s): return acc + state.tokenizer.encode(text: s).count
         }
-        return acc + state.tokenizer.encode(text: p).count
     }
     let tokPerSec = seconds > 0 ? Double(totalTokens) / seconds : 0
     print(
-        "[\(requestID)] logprobs: \(req.prompt.count) prompts, \(totalTokens) tokens, \(String(format: "%.2f", seconds))s (\(String(format: "%.0f", tokPerSec)) tok/s)"
+        "[\(requestID)] logprobs: \(req.prompts.count) prompts, \(totalTokens) tokens, \(String(format: "%.2f", seconds))s (\(String(format: "%.0f", tokPerSec)) tok/s)"
     )
 
     let response = CompletionResponse(
@@ -101,21 +101,16 @@ private func handleLoglikelihood(req: CompletionRequest, state: ServerState) asy
 }
 
 private func processOnePrompt(
-    promptText: String, index: Int,
+    prompt: Prompt, index: Int,
     wantsEcho: Bool, topN: Int,
     state: ServerState
 ) async throws -> CompletionResponse.CompletionChoice {
     let allTokens: [Int32]
-    if promptText.hasPrefix("__TOKEN_IDS__:") {
-        let idsStr = String(promptText.dropFirst("__TOKEN_IDS__:".count))
-        allTokens = try idsStr.split(separator: ",").map { sub in
-            guard let id = Int32(sub) else {
-                throw ServerError.badRequest("Invalid token ID: \(sub)")
-            }
-            return id
-        }
-    } else {
-        allTokens = state.tokenizer.encode(text: promptText).map { Int32($0) }
+    switch prompt {
+    case .tokenIds(let ids):
+        allTokens = ids
+    case .text(let text):
+        allTokens = state.tokenizer.encode(text: text).map { Int32($0) }
     }
 
     guard allTokens.count >= 2 else {
@@ -127,6 +122,9 @@ private func processOnePrompt(
             "Prompt length \(allTokens.count) exceeds max context \(state.config.maxContextLength)")
     }
 
+    // lm-eval sends echo=true, max_tokens=1 and slices logprobs[ctxlen:-1].
+    // The :-1 discards the last entry. We append a padding token so :-1
+    // drops it instead of discarding real data.
     let paddingToken = allTokens[0]
     let continuation = Array(allTokens.dropFirst()) + [paddingToken]
 

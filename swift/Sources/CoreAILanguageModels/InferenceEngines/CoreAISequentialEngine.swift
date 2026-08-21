@@ -596,7 +596,10 @@ extension CoreAISequentialEngine.GenerationSequence {
                 for i in 0..<forced.count {
                     let offset = (promptLen - 1 + i) * vocabSize
                     let endOffset = offset + vocabSize
-                    guard endOffset <= allLogits.count else { break }
+                    guard endOffset <= allLogits.count else {
+                        throw InferenceRuntimeError.invalidState(
+                            "Batched logits underflow at position \(i): need \(endOffset), got \(allLogits.count)")
+                    }
                     buffer.append(Array(allLogits[offset..<endOffset]))
                 }
                 batchedLogitsBuffer = buffer
