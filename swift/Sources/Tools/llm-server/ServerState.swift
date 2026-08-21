@@ -70,24 +70,15 @@ final class ServerStats: @unchecked Sendable {
         let avgGenTokPerSec = s.totalGenSeconds > 0 ? Double(s.totalGenTokens) / s.totalGenSeconds : 0
         let avgPromptTokPerSec = s.totalPromptSeconds > 0 ? Double(s.totalPromptTokens) / s.totalPromptSeconds : 0
         let overhead = s.totalSeconds - s.totalPromptSeconds - s.totalGenSeconds
-        var info = mach_task_basic_info()
-        var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size) / 4
-        let result = withUnsafeMutablePointer(to: &info) {
-            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
-                task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count)
-            }
-        }
-        let memoryMB = result == KERN_SUCCESS ? info.resident_size / (1024 * 1024) : 0
 
         print(
             """
 
-            ⏱️  Server Stats (\(s.totalRequests) requests):
+            Server Stats (\(s.totalRequests) requests):
             ==================================================
             Prefill:    \(s.totalPromptTokens) tokens, \(String(format: "%.1f", s.totalPromptSeconds))s (\(String(format: "%.1f", avgPromptTokPerSec)) tok/s)
             Generation: \(s.totalGenTokens) tokens, \(String(format: "%.1f", s.totalGenSeconds))s (\(String(format: "%.1f", avgGenTokPerSec)) tok/s)
             Overhead:   \(String(format: "%.1f", overhead))s (\(String(format: "%.1f", overhead / Double(max(1, s.totalRequests))))s/req)
-            Memory:     \(memoryMB) MB
             ==================================================
             """)
     }

@@ -3,6 +3,7 @@
 // Use of this source code is governed by a BSD-3-clause license that can
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
+import CoreAILMCommon
 import CoreAILanguageModels
 import CoreAIShared
 import Foundation
@@ -11,94 +12,48 @@ import NIOCore
 import NIOFoundationCompat
 import Tokenizers
 
-// MARK: - Completions Request (Legacy /v1/completions)
-
-struct CompletionRequest: Decodable, Sendable {
-    let model: String?
-    let prompt: [String]
-    let maxTokens: Int?
-    let temperature: Double?
-    let echo: Bool?
-    let logprobs: Int?
-
-    enum CodingKeys: String, CodingKey {
-        case model, prompt, temperature, echo, logprobs
-        case maxTokens = "max_tokens"
-    }
-
-    init(from decoder: any Swift.Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        model = try container.decodeIfPresent(String.self, forKey: .model)
-        maxTokens = try container.decodeIfPresent(Int.self, forKey: .maxTokens)
-        temperature = try container.decodeIfPresent(Double.self, forKey: .temperature)
-        echo = try container.decodeIfPresent(Bool.self, forKey: .echo)
-        logprobs = try container.decodeIfPresent(Int.self, forKey: .logprobs)
-
-        // prompt can be: string, [string], [int] (token IDs), [[int]] (batched token IDs)
-        if let s = try? container.decode(String.self, forKey: .prompt) {
-            prompt = [s]
-        } else if let arr = try? container.decode([String].self, forKey: .prompt) {
-            prompt = arr
-        } else if let tokenIds = try? container.decode([Int].self, forKey: .prompt) {
-            prompt = ["__TOKEN_IDS__:\(tokenIds.map(String.init).joined(separator: ","))"]
-        } else if let batchedIds = try? container.decode([[Int]].self, forKey: .prompt) {
-            prompt = batchedIds.map { "__TOKEN_IDS__:\($0.map(String.init).joined(separator: ","))" }
-        } else {
-            throw DecodingError.dataCorrupted(
-                .init(
-                    codingPath: [CodingKeys.prompt],
-                    debugDescription: "Expected string, [string], [int], or [[int]] for 'prompt'"
-                ))
-        }
-    }
-}
-
-// MARK: - Completions Response
-
-struct CompletionResponse: Encodable, Sendable {
-    let id: String
-    let object: String
-    let created: Int
-    let model: String
-    let choices: [CompletionChoice]
-
-    struct CompletionChoice: Encodable, Sendable {
-        let index: Int
-        let text: String
-        let logprobs: LogprobsResult?
-        let finishReason: String?
-
-        enum CodingKeys: String, CodingKey {
-            case index, text, logprobs
-            case finishReason = "finish_reason"
-        }
-    }
-
-    struct LogprobsResult: Encodable, Sendable {
-        let tokens: [String]
-        let tokenLogprobs: [Double?]
-        let topLogprobs: [[String: Double]?]
-        let textOffset: [Int]
-
-        enum CodingKeys: String, CodingKey {
-            case tokens
-            case tokenLogprobs = "token_logprobs"
-            case topLogprobs = "top_logprobs"
-            case textOffset = "text_offset"
-        }
-    }
-}
-
-// MARK: - Completions Handler
+// MARK: - Route Entry
 
 func handleCompletionsRoute(request: Request, state: ServerState) async throws -> Response {
     let body = try await request.body.collect(upTo: 10 * 1024 * 1024)
     return try await handleCompletionsFromBody(body: body, state: state)
 }
 
+func handleCompletionsFromBody(body: ByteBuffer, state: ServerState) async throws -> Response {
+    guard state.config.supportsLogprobs else {
+        let err = ErrorResponse(
+            error: .init(
+                message: "Logprobs not supported. Use --variant coreai-sequential", type: "server_error",
+                code: "unsupported"))
+        let data = try JSONEncoder().encode(err)
+        return Response(
+            status: .notImplemented, headers: [.contentType: "application/json"],
+            body: .init(byteBuffer: ByteBuffer(data: data)))
+    }
+    guard state.tryAcquire() else {
+        let err = ErrorResponse(error: .init(message: "Server is busy.", type: "server_error", code: "busy"))
+        let data = try JSONEncoder().encode(err)
+        return Response(
+            status: .tooManyRequests, headers: [.contentType: "application/json"],
+            body: .init(byteBuffer: ByteBuffer(data: data)))
+    }
+    defer { state.release() }
+    do {
+        let req = try JSONDecoder().decode(CompletionRequest.self, from: body)
+        return try await handleLoglikelihood(req: req, state: state)
+    } catch {
+        print("[SERVER] Completions error: \(error)")
+        let err = ErrorResponse(error: .init(message: "\(error)", type: "server_error", code: nil))
+        let data = try JSONEncoder().encode(err)
+        return Response(
+            status: .internalServerError, headers: [.contentType: "application/json"],
+            body: .init(byteBuffer: ByteBuffer(data: data)))
+    }
+}
+
 // MARK: - Loglikelihood Implementation
 
-func handleLoglikelihood(req: CompletionRequest, state: ServerState) async throws -> Response {
+private func handleLoglikelihood(req: CompletionRequest, state: ServerState) async throws -> Response {
     let requestID = RequestID.next()
     let created = Int(Date().timeIntervalSince1970)
     let wantsEcho = req.echo ?? false
@@ -172,9 +127,6 @@ private func processOnePrompt(
             "Prompt length \(allTokens.count) exceeds max context \(state.config.maxContextLength)")
     }
 
-    // lm-eval sends echo=true, max_tokens=1 and slices [ctxlen:-1].
-    // The :-1 discards the last entry (the "generated" token).
-    // We append one padding token so :-1 drops it instead of real data.
     let paddingToken = allTokens[0]
     let continuation = Array(allTokens.dropFirst()) + [paddingToken]
 
@@ -199,7 +151,6 @@ private func processOnePrompt(
         }
     }
 
-    // Compute per-token logprobs (including padding token at end)
     let probs = LogProbabilities.compute(logits: allLogits, targets: continuation, topK: topN)
 
     var tokens: [String] = []
@@ -208,7 +159,6 @@ private func processOnePrompt(
     var textOffsets: [Int] = []
     var currentOffset = 0
 
-    // First token has no logprob (prompt start)
     let firstTokenStr = state.tokenizer.decode(tokens: [Int(allTokens[0])])
     tokens.append(firstTokenStr)
     tokenLogprobs.append(nil)

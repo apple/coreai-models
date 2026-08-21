@@ -117,6 +117,16 @@ let package = Package(
             ]
         ),
 
+        // Shared types for LLM CLI tools (used by both llm-runner and llm-server)
+        .target(
+            name: "CoreAILMCommon",
+            dependencies: [],
+            path: "swift/Sources/CoreAILMCommon",
+            swiftSettings: [
+                .enableUpcomingFeature("MemberImportVisibility")
+            ]
+        ),
+
         // CXGrammar C bridge
         .target(
             name: "CXGrammar",
@@ -135,9 +145,22 @@ let package = Package(
                 "CoreAILanguageModels",
                 "CoreAIShared",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
-                .product(name: "Hummingbird", package: "hummingbird"),
             ],
             path: "swift/Sources/Tools/llm-runner",
+            swiftSettings: [
+                .enableUpcomingFeature("MemberImportVisibility")
+            ]
+        ),
+        .executableTarget(
+            name: "llm-server",
+            dependencies: [
+                "CoreAILanguageModels",
+                "CoreAILMCommon",
+                "CoreAIShared",
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+                .product(name: "Hummingbird", package: "hummingbird"),
+            ],
+            path: "swift/Sources/Tools/llm-server",
             swiftSettings: [
                 .enableUpcomingFeature("MemberImportVisibility")
             ]
@@ -260,6 +283,11 @@ let package = Package(
             name: "CoreAISharedTests",
             dependencies: ["CoreAIShared", "TestUtilities"],
             path: "swift/Tests/CoreAISharedTests"
+        ),
+        .testTarget(
+            name: "CoreAILMCommonTests",
+            dependencies: ["CoreAILMCommon"],
+            path: "swift/Tests/CoreAILMCommonTests"
         ),
         .testTarget(
             name: "GuidedGenerationTests",

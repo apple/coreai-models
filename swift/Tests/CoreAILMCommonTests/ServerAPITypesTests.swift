@@ -6,7 +6,7 @@
 import Foundation
 import Testing
 
-@testable import CoreAILanguageModels
+@testable import CoreAILMCommon
 
 @Suite("Server API Types")
 struct ServerAPITypesTests {

@@ -3,6 +3,7 @@
 // Use of this source code is governed by a BSD-3-clause license that can
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
+import CoreAILMCommon
 import CoreAILanguageModels
 import CoreAIShared
 import Foundation
@@ -109,38 +110,6 @@ private func handleChatCompletionsFromBody(body: ByteBuffer, state: ServerState)
     }
 }
 
-func handleCompletionsFromBody(body: ByteBuffer, state: ServerState) async throws -> Response {
-    guard state.config.supportsLogprobs else {
-        let err = ErrorResponse(
-            error: .init(
-                message: "Logprobs not supported. Use --variant coreai-sequential", type: "server_error",
-                code: "unsupported"))
-        let data = try JSONEncoder().encode(err)
-        return Response(
-            status: .notImplemented, headers: [.contentType: "application/json"],
-            body: .init(byteBuffer: ByteBuffer(data: data)))
-    }
-    guard state.tryAcquire() else {
-        let err = ErrorResponse(error: .init(message: "Server is busy.", type: "server_error", code: "busy"))
-        let data = try JSONEncoder().encode(err)
-        return Response(
-            status: .tooManyRequests, headers: [.contentType: "application/json"],
-            body: .init(byteBuffer: ByteBuffer(data: data)))
-    }
-    defer { state.release() }
-    do {
-        let req = try JSONDecoder().decode(CompletionRequest.self, from: body)
-        return try await handleLoglikelihood(req: req, state: state)
-    } catch {
-        print("[SERVER] Completions error: \(error)")
-        let err = ErrorResponse(error: .init(message: "\(error)", type: "server_error", code: nil))
-        let data = try JSONEncoder().encode(err)
-        return Response(
-            status: .internalServerError, headers: [.contentType: "application/json"],
-            body: .init(byteBuffer: ByteBuffer(data: data)))
-    }
-}
-
 // MARK: - Route Handler
 
 private func handleChatCompletionsRoute(request: Request, state: ServerState) async throws -> Response {
@@ -182,42 +151,30 @@ private func handleNonStreamingRequest(chatRequest: ChatCompletionRequest, state
     try await state.engine.reset()
     let t0 = ContinuousClock.now
 
-    var genTokenCount = 0
-    let text: String
+    let strategy: any DecodingStrategy
     if let schema = chatRequest.responseFormat?.extractedSchema {
         CLILogger.log("[\(requestID)] constrained generation (json_schema)", component: "Server")
-        let strategy = ConstrainedDecodingStrategy(jsonSchema: schema, vocabSize: state.config.vocabSize)
-        let stream = try await strategy.decode(
-            from: input,
-            tokenizer: state.tokenizer,
-            inferenceEngine: state.engine,
-            samplingConfiguration: samplingConfig,
-            options: InferenceOptions(maxTokens: requestMaxTokens),
-            stopSequences: stopSequences
-        )
-        var parts: [String] = []
-        for try await result in stream {
-            parts.append(result.text)
-            genTokenCount += 1
-        }
-        text = parts.joined()
+        strategy = ConstrainedDecodingStrategy(jsonSchema: schema, vocabSize: state.config.vocabSize)
     } else {
-        let strategy = VanillaDecodingStrategy()
-        let stream = try await strategy.decode(
-            from: input,
-            tokenizer: state.tokenizer,
-            inferenceEngine: state.engine,
-            samplingConfiguration: samplingConfig,
-            options: InferenceOptions(maxTokens: requestMaxTokens),
-            stopSequences: stopSequences
-        )
-        var parts: [String] = []
-        for try await result in stream {
-            parts.append(result.text)
-            genTokenCount += 1
-        }
-        text = parts.joined()
+        strategy = VanillaDecodingStrategy()
     }
+
+    let stream = try await strategy.decode(
+        from: input,
+        tokenizer: state.tokenizer,
+        inferenceEngine: state.engine,
+        samplingConfiguration: samplingConfig,
+        options: InferenceOptions(maxTokens: requestMaxTokens),
+        stopSequences: stopSequences
+    )
+
+    var genTokenCount = 0
+    var parts: [String] = []
+    for try await result in stream {
+        parts.append(result.text)
+        genTokenCount += 1
+    }
+    let text = parts.joined()
 
     let elapsed = ContinuousClock.now - t0
     let seconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
@@ -375,7 +332,6 @@ private func handleStreamingRequest(chatRequest: ChatCompletionRequest, state: S
 // MARK: - Helpers
 
 private func tokenizeMessages(_ messages: [ChatMessage], state: ServerState) -> [Int] {
-    // Convert OpenAI messages to swift-transformers Message format
     var templateMessages: [[String: any Sendable]] = []
     for msg in messages {
         var content = msg.content.textContent
@@ -385,17 +341,14 @@ private func tokenizeMessages(_ messages: [ChatMessage], state: ServerState) -> 
         templateMessages.append(["role": msg.role, "content": content])
     }
 
-    // If no system message exists but no-thinking is enabled, prepend one
     if state.config.noThinking && !messages.contains(where: { $0.role == "system" }) {
         templateMessages.insert(["role": "system", "content": "/no_think"], at: 0)
     }
 
-    // Apply chat template (produces proper special tokens)
     if let tokens = try? state.tokenizer.applyChatTemplate(messages: templateMessages) {
         return tokens
     }
 
-    // Fallback: plain tokenization (no template)
     let text = messages.map { "\($0.role): \($0.content.textContent)" }.joined(separator: "\n")
     return state.tokenizer.encode(text: text)
 }

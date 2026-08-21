@@ -208,15 +208,19 @@ public struct ThinkTagParser {
     public static func stripCompleted(
         from text: String, open: String = "<think>", close: String = "</think>"
     ) -> String {
-        var result = text
-        while let startRange = result.range(of: open) {
-            if let endRange = result.range(of: close, range: startRange.upperBound..<result.endIndex) {
-                result.removeSubrange(startRange.lowerBound..<endRange.upperBound)
+        var result = ""
+        result.reserveCapacity(text.count)
+        var remaining = text[...]
+        while let startRange = remaining.range(of: open) {
+            result.append(contentsOf: remaining[remaining.startIndex..<startRange.lowerBound])
+            if let endRange = remaining.range(of: close, range: startRange.upperBound..<remaining.endIndex) {
+                remaining = remaining[endRange.upperBound...]
             } else {
-                result.removeSubrange(startRange.lowerBound..<result.endIndex)
-                break
+                // Unclosed block — discard everything from here
+                return result
             }
         }
+        result.append(contentsOf: remaining)
         return result
     }
 }

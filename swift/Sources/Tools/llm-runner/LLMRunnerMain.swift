@@ -63,14 +63,7 @@ extension FrameSamplingStrategy: ExpressibleByArgument {
 @main
 struct Main {
     static func main() async throws {
-        // Manual dispatch: ArgumentParser can't share --model between root and subcommand.
-        let args = CommandLine.arguments
-        if args.count > 1 && args[1] == "serve" {
-            let serveArgs: [String]? = args.count > 2 ? Array(args.dropFirst(2)) : []
-            await Serve.main(serveArgs)
-        } else {
-            await LLMRunner.main()
-        }
+        await LLMRunner.main()
     }
 }
 
