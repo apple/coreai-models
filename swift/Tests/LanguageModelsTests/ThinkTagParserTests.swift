@@ -329,3 +329,28 @@ struct ThinkTagParserDetectionTests {
 }
 
 #endif
+
+// MARK: - stripCompleted (no platform restriction — pure string processing)
+
+@Suite("ThinkTagParser.stripCompleted")
+struct ThinkTagStripTests {
+    @Test("Strips completed thinking blocks and unclosed tails")
+    func stripVariants() {
+        #expect(ThinkTagParser.stripCompleted(from: "<think>reason</think>Answer") == "Answer")
+        #expect(ThinkTagParser.stripCompleted(from: "Hello<think>still...") == "Hello")
+        #expect(ThinkTagParser.stripCompleted(from: "<think>all</think>") == "")
+        #expect(ThinkTagParser.stripCompleted(from: "No tags here") == "No tags here")
+        #expect(ThinkTagParser.stripCompleted(from: "") == "")
+    }
+
+    @Test("Custom markers")
+    func customMarkers() {
+        #expect(ThinkTagParser.stripCompleted(from: "<r>x</r>Y", open: "<r>", close: "</r>") == "Y")
+    }
+
+    @Test("Preserves whitespace")
+    func preservesWhitespace() {
+        #expect(ThinkTagParser.stripCompleted(from: "Hello ") == "Hello ")
+        #expect(ThinkTagParser.stripCompleted(from: "<think>x</think>Answer ") == "Answer ")
+    }
+}

@@ -319,6 +319,27 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         return lastTokenLogits(from: lastLogits, vocabSize: config.vocabSize)
     }
 
+    /// Process tokens in chunks, returning ALL position logits (not just last token).
+    /// Used for batched PPL evaluation where every position's logits are needed.
+    func processChunkedPromptAllLogits(
+        tokens: ArraySlice<Int32>,
+        chunkSize: Int
+    ) async throws -> [LogitsScalarType] {
+        var allLogits: [LogitsScalarType] = []
+        var remainingTokens = tokens
+
+        while !remainingTokens.isEmpty {
+            let currentChunkSize = min(chunkSize, remainingTokens.count)
+            let chunkEnd = remainingTokens.startIndex + currentChunkSize
+            let chunk = remainingTokens[remainingTokens.startIndex..<chunkEnd]
+            let chunkLogits = try await processTokenBatch(chunk)
+            allLogits.append(contentsOf: chunkLogits)
+            remainingTokens = remainingTokens[chunkEnd...]
+        }
+
+        return allLogits
+    }
+
     // MARK: - Generate (primary API)
 
     public func generate(
@@ -483,6 +504,9 @@ extension CoreAISequentialEngine.GenerationSequence {
         private let generationStartOffset: Int
         private var step: Int = 0
         private var finished: Bool = false
+        // Pre-computed logits for batched forcedContinuation evaluation.
+        // When non-nil, next() yields from this buffer instead of running inference.
+        private var batchedLogitsBuffer: [[LogitsScalarType]]?
 
         init(
             engine: CoreAISequentialEngine,
@@ -528,6 +552,66 @@ extension CoreAISequentialEngine.GenerationSequence {
                 stopReasonStore.setIfUnset(.maxTokens)
                 finishAndRelease()
                 return nil
+            }
+
+            // Fast path: batched forcedContinuation with logits.
+            // All tokens were processed in one prefill; yield pre-computed logits.
+            if let buffer = batchedLogitsBuffer {
+                let logits = buffer[step]
+                let token = forcedContinuation![step]
+                step += 1
+                if step >= maxTokens {
+                    stopReasonStore.setIfUnset(.maxTokens)
+                    finishAndRelease()
+                }
+                return InferenceOutput(tokenId: token, logits: logits)
+            }
+
+            // First call with forcedContinuation + logits: batch-process all tokens at once.
+            if let forced = forcedContinuation, returnsLogits, step == 0 {
+                let allTokens = inputTokens + forced.map { $0 }
+                let vocabSize = engine.config.vocabSize
+
+                let allLogits: [LogitsScalarType]
+                let strategy = engine.selectPrefillStrategy(newTokenCount: allTokens.count)
+                switch strategy {
+                case .chunked(let chunkSize):
+                    allLogits = try await engine.processChunkedPromptAllLogits(
+                        tokens: allTokens[...], chunkSize: chunkSize)
+                case .wholeBatch:
+                    allLogits = try await engine.processTokenBatch(allTokens[...])
+                case .oneAtATime:
+                    var collected: [LogitsScalarType] = []
+                    for j in allTokens.indices {
+                        collected.append(contentsOf: try await engine.processTokenBatch(allTokens[j...j]))
+                    }
+                    allLogits = collected
+                }
+
+                // Split into per-position logit vectors.
+                // Skip the prompt positions (inputTokens.count - 1 positions);
+                // we want logits that predict each forced token.
+                let promptLen = inputTokens.count
+                var buffer: [[LogitsScalarType]] = []
+                for i in 0..<forced.count {
+                    let offset = (promptLen - 1 + i) * vocabSize
+                    let endOffset = offset + vocabSize
+                    guard endOffset <= allLogits.count else {
+                        throw InferenceRuntimeError.invalidState(
+                            "Batched logits underflow at position \(i): need \(endOffset), got \(allLogits.count)")
+                    }
+                    buffer.append(Array(allLogits[offset..<endOffset]))
+                }
+                batchedLogitsBuffer = buffer
+
+                // Update engine state
+                engine.history.append(contentsOf: allTokens[...])
+
+                // Yield first result
+                let logits = buffer[step]
+                let token = forced[step]
+                step += 1
+                return InferenceOutput(tokenId: token, logits: logits)
             }
 
             do {

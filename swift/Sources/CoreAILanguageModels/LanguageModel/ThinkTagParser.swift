@@ -16,8 +16,8 @@ import Foundation
 /// **Agentic**: multi-turn message routing where reasoning
 /// is emitted as `to=self` messages and responses as `to=user` messages,
 /// delimited by message boundary tokens.
-struct ThinkTagParser {
-    enum Event {
+public struct ThinkTagParser {
+    public enum Event {
         case text(String)
         case reasoning(String)
     }
@@ -39,7 +39,7 @@ struct ThinkTagParser {
     private var buffer: String = ""
     private var insideThink: Bool = false
 
-    init(open: String = "<think>", close: String = "</think>") {
+    public init(open: String = "<think>", close: String = "</think>") {
         self.format = .tagPair(open: open, close: close)
     }
 
@@ -50,7 +50,7 @@ struct ThinkTagParser {
         }
     }
 
-    mutating func consume(_ delta: String) -> [Event] {
+    public mutating func consume(_ delta: String) -> [Event] {
         buffer.append(delta)
         switch format {
         case .tagPair:
@@ -60,7 +60,7 @@ struct ThinkTagParser {
         }
     }
 
-    mutating func flush() -> [Event] {
+    public mutating func flush() -> [Event] {
         switch format {
         case .tagPair:
             return drainTagPair(isFinal: true)
@@ -201,5 +201,26 @@ struct ThinkTagParser {
             }
         }
         return buffer.endIndex
+    }
+
+    /// Strip all completed thinking blocks from a full string.
+    /// Unclosed blocks at the end are also removed.
+    public static func stripCompleted(
+        from text: String, open: String = "<think>", close: String = "</think>"
+    ) -> String {
+        var result = ""
+        result.reserveCapacity(text.count)
+        var remaining = text[...]
+        while let startRange = remaining.range(of: open) {
+            result.append(contentsOf: remaining[remaining.startIndex..<startRange.lowerBound])
+            if let endRange = remaining.range(of: close, range: startRange.upperBound..<remaining.endIndex) {
+                remaining = remaining[endRange.upperBound...]
+            } else {
+                // Unclosed block — discard everything from here
+                return result
+            }
+        }
+        result.append(contentsOf: remaining)
+        return result
     }
 }
