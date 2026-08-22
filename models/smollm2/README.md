@@ -86,8 +86,7 @@ Perplexity score on the [`WikiText-2`](https://huggingface.co/datasets/EleutherA
 
 The iOS 1.7B default uses a mixed 4/8-bit recipe derived from a per-block sensitivity
 sweep: blocks 0, 1, 22, and 23 are promoted to 8-bit (most sensitive to 4-bit
-palettization). This achieves better quality than uniform 6-bit while decoding 32%
-faster on ANE (37 vs 28 tok/s).
+palettization), achieving better quality than uniform 6-bit at lower bits per weight.
 
 [smollm2-yaml]: smollm2_4bit_embedding_excluded.yaml
 [smollm2-6bit-yaml]: smollm2_1_7b_6bit.yaml
