@@ -73,7 +73,7 @@ private func handleLoglikelihood(req: CompletionRequest, state: ServerState) asy
     }
     let topN = req.logprobs ?? 1
 
-    let t0 = ContinuousClock.now
+    let t0 = SuspendingClock().now
     var choices: [CompletionResponse.CompletionChoice] = []
 
     for (idx, prompt) in req.prompts.enumerated() {
@@ -84,7 +84,7 @@ private func handleLoglikelihood(req: CompletionRequest, state: ServerState) asy
         choices.append(choice)
     }
 
-    let elapsed = ContinuousClock.now - t0
+    let elapsed = SuspendingClock().now - t0
     let seconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
     let totalTokens = req.prompts.reduce(0) { acc, p in
         switch p {

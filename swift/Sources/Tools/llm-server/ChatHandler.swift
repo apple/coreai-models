@@ -159,7 +159,7 @@ private func handleNonStreamingRequest(chatRequest: ChatCompletionRequest, state
         component: "Server")
 
     try await state.engine.reset()
-    let t0 = ContinuousClock.now
+    let t0 = SuspendingClock().now
 
     let strategy: any DecodingStrategy
     if let schema = chatRequest.responseFormat?.extractedSchema {
@@ -186,7 +186,7 @@ private func handleNonStreamingRequest(chatRequest: ChatCompletionRequest, state
     }
     let text = parts.joined()
 
-    let elapsed = ContinuousClock.now - t0
+    let elapsed = SuspendingClock().now - t0
     let seconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
     let cleaned = stripThinkingTags(text)
     let finishReason = genTokenCount >= requestMaxTokens ? "length" : "stop"
@@ -261,6 +261,7 @@ private func handleStreamingRequest(chatRequest: ChatCompletionRequest, state: S
         do {
             try await state.engine.reset()
             let encoder = JSONEncoder()
+            let genStart = SuspendingClock().now
 
             let roleChunk = ChatCompletionChunk(
                 id: requestID, object: "chat.completion.chunk", created: created, model: state.config.modelName,
@@ -331,7 +332,16 @@ private func handleStreamingRequest(chatRequest: ChatCompletionRequest, state: S
             }
             try await writer.write(ByteBuffer(string: "data: [DONE]\n\n"))
 
-            print("[\(requestID)] stream done: \(tokenCount) tokens (\(finishReason))")
+            let elapsed = SuspendingClock().now - genStart
+            let seconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
+            let tokPerSec = seconds > 0 ? Double(tokenCount) / seconds : 0
+            print(
+                "[\(requestID)] stream: \(promptTokens.count)t → \(tokenCount)t in \(String(format: "%.2f", seconds))s (\(String(format: "%.1f", tokPerSec)) tok/s) [\(finishReason)]"
+            )
+            state.stats.record(
+                promptTokens: promptTokens.count, genTokens: tokenCount, promptSeconds: 0, genSeconds: seconds,
+                totalSeconds: seconds)
+
             try await writer.finish(nil)
         } catch {
             print("[\(requestID)] stream error: \(error)")
