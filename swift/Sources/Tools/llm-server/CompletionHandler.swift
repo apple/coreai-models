@@ -71,7 +71,7 @@ private func handleLoglikelihood(req: CompletionRequest, state: ServerState) asy
     guard req.prompts.count <= 1024 else {
         throw ServerError.badRequest("prompt batch too large (\(req.prompts.count)); maximum 1024")
     }
-    let topN = req.logprobs ?? 1
+    let topN = min(req.logprobs ?? 1, 20)
 
     let t0 = SuspendingClock().now
     var choices: [CompletionResponse.CompletionChoice] = []

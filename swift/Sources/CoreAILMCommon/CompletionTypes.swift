@@ -40,9 +40,31 @@ public struct CompletionRequest: Decodable, Sendable {
         } else if let arr = try? container.decode([String].self, forKey: .prompt) {
             prompts = arr.map { .text($0) }
         } else if let tokenIds = try? container.decode([Int].self, forKey: .prompt) {
-            prompts = [.tokenIds(tokenIds.map { Int32($0) })]
+            prompts = [
+                .tokenIds(
+                    try tokenIds.map { id in
+                        guard let id32 = Int32(exactly: id) else {
+                            throw DecodingError.dataCorrupted(
+                                .init(
+                                    codingPath: [CodingKeys.prompt],
+                                    debugDescription: "Token ID \(id) out of Int32 range"))
+                        }
+                        return id32
+                    })
+            ]
         } else if let batchedIds = try? container.decode([[Int]].self, forKey: .prompt) {
-            prompts = batchedIds.map { .tokenIds($0.map { Int32($0) }) }
+            prompts = try batchedIds.map { batch in
+                .tokenIds(
+                    try batch.map { id in
+                        guard let id32 = Int32(exactly: id) else {
+                            throw DecodingError.dataCorrupted(
+                                .init(
+                                    codingPath: [CodingKeys.prompt],
+                                    debugDescription: "Token ID \(id) out of Int32 range"))
+                        }
+                        return id32
+                    })
+            }
         } else {
             throw DecodingError.dataCorrupted(
                 .init(
