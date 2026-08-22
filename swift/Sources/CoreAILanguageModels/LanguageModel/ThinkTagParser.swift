@@ -17,7 +17,7 @@ import Foundation
 /// is emitted as `to=self` messages and responses as `to=user` messages,
 /// delimited by message boundary tokens.
 public struct ThinkTagParser {
-    enum Event {
+    public enum Event {
         case text(String)
         case reasoning(String)
     }
@@ -39,7 +39,7 @@ public struct ThinkTagParser {
     private var buffer: String = ""
     private var insideThink: Bool = false
 
-    init(open: String = "<think>", close: String = "</think>") {
+    public init(open: String = "<think>", close: String = "</think>") {
         self.format = .tagPair(open: open, close: close)
     }
 
@@ -50,7 +50,7 @@ public struct ThinkTagParser {
         }
     }
 
-    mutating func consume(_ delta: String) -> [Event] {
+    public mutating func consume(_ delta: String) -> [Event] {
         buffer.append(delta)
         switch format {
         case .tagPair:
@@ -60,7 +60,7 @@ public struct ThinkTagParser {
         }
     }
 
-    mutating func flush() -> [Event] {
+    public mutating func flush() -> [Event] {
         switch format {
         case .tagPair:
             return drainTagPair(isFinal: true)

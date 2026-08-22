@@ -286,21 +286,33 @@ private func handleStreamingRequest(chatRequest: ChatCompletionRequest, state: S
                 stopSequences: stopSequences
             )
 
-            var fullText = ""
-            var lastCleanedLength = 0
+            var thinkParser = ThinkTagParser()
             var tokenCount = 0
 
             for try await result in tokenStream {
-                fullText += result.text
                 tokenCount += 1
-                let cleaned = stripThinkingTags(fullText)
+                let events = thinkParser.consume(result.text)
+                for event in events {
+                    if case .text(let delta) = event, !delta.isEmpty {
+                        let chunk = ChatCompletionChunk(
+                            id: requestID, object: "chat.completion.chunk", created: created,
+                            model: state.config.modelName,
+                            choices: [.init(index: 0, delta: .init(role: nil, content: delta), finishReason: nil)]
+                        )
+                        if let data = try? encoder.encode(chunk), let json = String(data: data, encoding: .utf8) {
+                            try await writer.write(ByteBuffer(string: "data: \(json)\n\n"))
+                        }
+                    }
+                }
+            }
 
-                if cleaned.count > lastCleanedLength {
-                    let delta = String(cleaned.dropFirst(lastCleanedLength))
-                    lastCleanedLength = cleaned.count
-
+            // Flush any remaining buffered text
+            let finalEvents = thinkParser.flush()
+            for event in finalEvents {
+                if case .text(let delta) = event, !delta.isEmpty {
                     let chunk = ChatCompletionChunk(
-                        id: requestID, object: "chat.completion.chunk", created: created, model: state.config.modelName,
+                        id: requestID, object: "chat.completion.chunk", created: created,
+                        model: state.config.modelName,
                         choices: [.init(index: 0, delta: .init(role: nil, content: delta), finishReason: nil)]
                     )
                     if let data = try? encoder.encode(chunk), let json = String(data: data, encoding: .utf8) {
