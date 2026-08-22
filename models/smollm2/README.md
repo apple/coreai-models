@@ -75,17 +75,20 @@ Defaults: 512 prompt tokens, 1024 generation tokens, 5 trials. Override with `-p
 
 Perplexity score on the [`WikiText-2`](https://huggingface.co/datasets/EleutherAI/wikitext_document_level) dataset computed using the [lm-evaluation-harness](https://github.com/EleutherAI/lm-evaluation-harness/blob/main/lm_eval/tasks/wikitext/README.md) with the Core AI PyTorch models.
 
-| Model | Compression                                | Bits Per Weight (BPW) | Platform | Perplexity Score |
-| ----- | ------------------------------------------ | --------------------- | -------- | ---------------- |
-| 1.7B  | none (`float16`)                           | 16.00                 | macOS    | 12.27            |
-| 1.7B  | [INT4 with FP16 embedding][smollm2-yaml]   | 4.56\*                | macOS    | 14.17            |
-| 1.7B  | [6-bit palettized][smollm2-6bit-yaml]      | 6.00                  | iOS      | 13.63            |
-| 360M  | none (`float16`)                           | 16.00                 | macOS    | 18.23            |
-| 135M  | none (`float16`)                           | 16.00                 | macOS    | 24.99            |
+| Model | Compression                                    | BPW   | Platform | Perplexity |
+| ----- | ---------------------------------------------- | ----- | -------- | ---------- |
+| 1.7B  | none (`float16`)                               | 16.00 | macOS    | 12.27      |
+| 1.7B  | [INT4 with FP16 embedding][smollm2-yaml]       | 4.56  | macOS    | 14.17      |
+| 1.7B  | [Mixed 4/8-bit palettized][smollm2-mixed-yaml] | 4.67  | iOS      | 13.41      |
+| 1.7B  | [6-bit palettized][smollm2-6bit-yaml]          | 6.00  | iOS      | 13.63      |
+| 360M  | none (`float16`)                               | 16.00 | macOS    | 18.23      |
+| 135M  | none (`float16`)                               | 16.00 | macOS    | 24.99      |
 
-\* BPW: INT4 body (4.50) + FP16 embedding (5.9% of params at 16 bits). The embedding
-is kept at FP16 because SmolLM2 ties embedding and lm_head weights — INT4 on lm_head
-degrades generation quality in long-form outputs.
+The iOS 1.7B default uses a mixed 4/8-bit recipe derived from a per-block sensitivity
+sweep: blocks 0, 1, 22, and 23 are promoted to 8-bit (most sensitive to 4-bit
+palettization). This achieves better quality than uniform 6-bit while decoding 32%
+faster on ANE (37 vs 28 tok/s).
 
 [smollm2-yaml]: smollm2_4bit_embedding_excluded.yaml
 [smollm2-6bit-yaml]: smollm2_1_7b_6bit.yaml
+[smollm2-mixed-yaml]: smollm2_1_7b_mixed_4bit_8bit.yaml
