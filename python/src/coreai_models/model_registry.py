@@ -211,7 +211,7 @@ LLM_PRESETS: list[ModelPreset] = [
         "none",
         "float16",
         4096,
-        compression_config="models/smollm2/smollm2_1_7b_mixed_4bit_8bit.yaml",
+        compression_config="models/smollm2/smollm2_1_7b_6bit.yaml",
         _model_type_override="qwen2",
     ),
     ModelPreset(

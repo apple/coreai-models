@@ -75,19 +75,16 @@ Defaults: 512 prompt tokens, 1024 generation tokens, 5 trials. Override with `-p
 
 Perplexity score on the [`WikiText-2`](https://huggingface.co/datasets/EleutherAI/wikitext_document_level) dataset computed using the [lm-evaluation-harness](https://github.com/EleutherAI/lm-evaluation-harness/blob/main/lm_eval/tasks/wikitext/README.md) with the Core AI PyTorch models.
 
-| Model | Compression                                    | BPW   | Platform | Perplexity |
-| ----- | ---------------------------------------------- | ----- | -------- | ---------- |
-| 1.7B  | none (`float16`)                               | 16.00 | macOS    | 12.27      |
-| 1.7B  | [INT4 with FP16 embedding][smollm2-yaml]       | 4.56  | macOS    | 14.17      |
-| 1.7B  | [Mixed 4/8-bit palettized][smollm2-mixed-yaml] | 4.67  | iOS      | 13.41      |
-| 1.7B  | [6-bit palettized][smollm2-6bit-yaml]          | 6.00  | iOS      | 13.63      |
-| 360M  | none (`float16`)                               | 16.00 | macOS    | 18.23      |
-| 135M  | none (`float16`)                               | 16.00 | macOS    | 24.99      |
+| Model | Compression                                | BPW   | Platform | Perplexity |
+| ----- | ------------------------------------------ | ----- | -------- | ---------- |
+| 1.7B  | none (`float16`)                           | 16.00 | macOS    | 12.27      |
+| 1.7B  | [INT4 with FP16 embedding][smollm2-yaml]   | 4.56  | macOS    | 14.17      |
+| 1.7B  | [6-bit palettized][smollm2-6bit-yaml]      | 6.00  | iOS      | 13.63      |
+| 360M  | none (`float16`)                           | 16.00 | macOS    | 18.23      |
+| 135M  | none (`float16`)                           | 16.00 | macOS    | 24.99      |
 
-The iOS 1.7B default uses a mixed 4/8-bit recipe derived from a per-block sensitivity
-sweep: blocks 0, 1, 22, and 23 are promoted to 8-bit (most sensitive to 4-bit
-palettization), achieving better quality than uniform 6-bit at lower bits per weight.
+The iOS 1.7B uses 6-bit palettization (64 centroids). 4-bit palettization (16 centroids)
+is too lossy for this model's weight distribution regardless of which layers are promoted.
 
 [smollm2-yaml]: smollm2_4bit_embedding_excluded.yaml
 [smollm2-6bit-yaml]: smollm2_1_7b_6bit.yaml
-[smollm2-mixed-yaml]: smollm2_1_7b_mixed_4bit_8bit.yaml
