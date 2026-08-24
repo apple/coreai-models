@@ -7,16 +7,15 @@
 Compression presets for diffusion model export.
 
 Each preset is a named configuration consumed by the diffusion export pipeline.
-Currently the only knob is post-export MLIR weight quantization (applied to
-quantizable components — text encoder and UNet). The VAE encoder/decoder is
-small and quality-sensitive, so it is never quantized.
+The only knob is post-export MLIR weight quantization (applied to quantizable
+components — text encoder and transformer). The VAE decoder is never quantized.
 
 Usage::
 
     from coreai_models.diffusion.presets import get_preset, list_presets
 
-    preset = get_preset("4bit")     # -> {"description": ..., "config": {...}}
-    names = list_presets()          # -> ["4bit", "none"]
+    preset = get_preset("4bit-asym")
+    names = list_presets()
 """
 
 from typing import Any
@@ -29,12 +28,29 @@ PRESETS: dict[str, dict[str, Any]] = {
         "config": None,
     },
     "4bit": {
-        "description": "INT4 per-block (block_size=32), symmetric",
+        "description": "INT4 symmetric per-block (block_size=32)",
         "config": {
             "type": "int4",
             "symmetric": True,
             "granularity": "per_block",
             "block_size": 32,
+        },
+    },
+    "4bit-asym": {
+        "description": "INT4 asymmetric per-block (block_size=32)",
+        "config": {
+            "type": "int4",
+            "symmetric": False,
+            "granularity": "per_block",
+            "block_size": 32,
+        },
+    },
+    "8bit": {
+        "description": "INT8 per-channel, symmetric",
+        "config": {
+            "type": "int8",
+            "symmetric": True,
+            "granularity": "per_channel",
         },
     },
 }

@@ -43,35 +43,82 @@ public actor CoreAIDiffusionModelFunction {
 
     // MARK: - [Float]-based API
 
+    /// Each input is either a pre-built NDArray (for cached constants) or a (Float, shape) pair.
+    public enum ModelInput: Sendable {
+        case floats([Float], [Int])
+        case cached(NDArray)
+    }
+
+    /// Pre-pack a Float array into an NDArray matching the model's input descriptor at a given index.
+    public func prepackInput(index: Int, data: [Float], shape: [Int]) async throws -> NDArray {
+        let fn = try await ensureLoaded()
+        let names = fn.descriptor.inputNames
+        guard index < names.count else {
+            throw CoreAIDiffusionError.functionNotFound("index \(index)", modelURL)
+        }
+        let name = names[index]
+        guard case .ndArray(let nd) = fn.descriptor.inputDescriptor(of: name) else {
+            throw CoreAIDiffusionError.functionNotFound(name, modelURL)
+        }
+        let resolved = nd.resolvingDynamicDimensions(shape)
+        var array = NDArray(descriptor: resolved)
+        Self.packFloatsIntoNDArray(&array, data: data, scalarType: resolved.scalarType)
+        return array
+    }
+
     public func run(floatInputs: [([Float], [Int])]) async throws -> [Float] {
+        try await run(inputs: floatInputs.map { .floats($0.0, $0.1) })
+    }
+
+    public func run(inputs: [ModelInput]) async throws -> [Float] {
         let fn = try await ensureLoaded()
 
         var namedInputs: [String: NDArray] = [:]
-        for (i, name) in fn.descriptor.inputNames.enumerated() where i < floatInputs.count {
-            let (data, shape) = floatInputs[i]
-            guard case .ndArray(let nd) = fn.descriptor.inputDescriptor(of: name) else { continue }
-            let resolved = nd.resolvingDynamicDimensions(shape)
-            var array = NDArray(descriptor: resolved)
-            switch resolved.scalarType {
-            #if !((os(macOS) || targetEnvironment(macCatalyst)) && arch(x86_64))
-            case .float16:
-                let view = array.mutableView(as: Float16.self)
-                view.withUnsafeMutablePointer { ptr, _, _ in
-                    for j in 0..<data.count { ptr[j] = Float16(data[j]) }
-                }
-            #endif
-            case .float32:
-                let view = array.mutableView(as: Float.self)
-                view.withUnsafeMutablePointer { ptr, _, _ in
-                    for j in 0..<data.count { ptr[j] = data[j] }
-                }
-            default:
-                throw CoreAIDiffusionError.unsupportedInputScalarType(resolved.scalarType)
+        for (i, name) in fn.descriptor.inputNames.enumerated() where i < inputs.count {
+            switch inputs[i] {
+            case .cached(let array):
+                namedInputs[name] = array
+            case .floats(let data, let shape):
+                guard case .ndArray(let nd) = fn.descriptor.inputDescriptor(of: name) else { continue }
+                let resolved = nd.resolvingDynamicDimensions(shape)
+                var array = NDArray(descriptor: resolved)
+                Self.packFloatsIntoNDArray(&array, data: data, scalarType: resolved.scalarType)
+                namedInputs[name] = array
             }
-            namedInputs[name] = array
         }
 
         return try await encodeAndSync(fn: fn, inputs: namedInputs)
+    }
+
+    private static func packFloatsIntoNDArray(
+        _ array: inout NDArray, data: [Float], scalarType: NDArray.ScalarType
+    ) {
+        switch scalarType {
+        #if !((os(macOS) || targetEnvironment(macCatalyst)) && arch(x86_64))
+        case .float16:
+            let view = array.mutableView(as: Float16.self)
+            view.withUnsafeMutablePointer { ptr, shape, strides in
+                fillStrided(ptr, data: data, shape: shape, strides: strides) { Float16($0) }
+            }
+        case .bfloat16:
+            array.mutableRawView().withUnsafeMutableBytes { ptr, shape, strides in
+                let dst = ptr.assumingMemoryBound(to: UInt16.self)
+                fillStrided(dst, data: data, shape: shape, strides: strides) { val in
+                    let bits = val.bitPattern
+                    let lsb = (bits >> 16) & 1
+                    let rounded = bits &+ 0x7FFF &+ lsb
+                    return UInt16(truncatingIfNeeded: rounded >> 16)
+                }
+            }
+        #endif
+        case .float32:
+            let view = array.mutableView(as: Float.self)
+            view.withUnsafeMutablePointer { ptr, shape, strides in
+                fillStrided(ptr, data: data, shape: shape, strides: strides) { $0 }
+            }
+        default:
+            break
+        }
     }
 
     public func run(intInputs: [([Int32], [Int])]) async throws -> [Float] {
@@ -133,6 +180,33 @@ public actor CoreAIDiffusionModelFunction {
         return fn
     }
 
+    /// Run inference and return the output as an NDArray (no CPU readback).
+    public func runReturningNDArray(inputs: [ModelInput]) async throws -> NDArray {
+        let fn = try await ensureLoaded()
+
+        var namedInputs: [String: NDArray] = [:]
+        for (i, name) in fn.descriptor.inputNames.enumerated() where i < inputs.count {
+            switch inputs[i] {
+            case .cached(let array):
+                namedInputs[name] = array
+            case .floats(let data, let shape):
+                guard case .ndArray(let nd) = fn.descriptor.inputDescriptor(of: name) else { continue }
+                let resolved = nd.resolvingDynamicDimensions(shape)
+                var array = NDArray(descriptor: resolved)
+                Self.packFloatsIntoNDArray(&array, data: data, scalarType: resolved.scalarType)
+                namedInputs[name] = array
+            }
+        }
+
+        var outputs = try await fn.run(inputs: namedInputs)
+        guard let outputName = fn.descriptor.outputNames.first,
+            let srcArray = outputs.remove(outputName)?.ndArray
+        else {
+            throw CoreAIDiffusionError.notLoaded
+        }
+        return srcArray
+    }
+
     private func encodeAndSync(fn: InferenceFunction, inputs: [String: NDArray]) async throws -> [Float] {
         var outputs = try await fn.run(inputs: inputs)
 
@@ -157,26 +231,16 @@ public actor CoreAIDiffusionModelFunction {
     }
 
     private func ndArrayToFloats(_ array: NDArray) throws -> [Float] {
-        var result = [Float]()
         switch array.scalarType {
         #if !((os(macOS) || targetEnvironment(macCatalyst)) && arch(x86_64))
-        case .float16:
-            array.view(as: Float16.self).withUnsafePointer { ptr, shape, _ in
-                let count = (0..<shape.count).reduce(1) { $0 * shape[$1] }
-                result.reserveCapacity(count)
-                for i in 0..<count { result.append(Float(ptr[i])) }
-            }
+        case .float16, .bfloat16:
+            return flattenAsFloat(array)
         #endif
         case .float32:
-            array.view(as: Float.self).withUnsafePointer { ptr, shape, _ in
-                let count = (0..<shape.count).reduce(1) { $0 * shape[$1] }
-                result.reserveCapacity(count)
-                for i in 0..<count { result.append(ptr[i]) }
-            }
+            return flattenAsFloat(array)
         default:
             throw CoreAIDiffusionError.unsupportedOutputScalarType(array.scalarType)
         }
-        return result
     }
 
     public var inputDescriptors: [String: NDArrayDescriptor] {
@@ -214,6 +278,40 @@ public actor CoreAIDiffusionModelFunction {
         }
         let dim = desc.shape[1]
         return dim > 0 ? dim : nil
+    }
+
+    // MARK: - Stride-aware fill/read helpers
+
+    /// Fill an NDArray buffer respecting non-contiguous strides.
+    private static func fillStrided<T>(
+        _ ptr: UnsafeMutablePointer<T>,
+        data: [Float],
+        shape: Span<Int>,
+        strides: Span<Int>,
+        convert: (Float) -> T
+    ) {
+        let ndim = shape.count
+        if ndim <= 1 {
+            for j in 0..<data.count { ptr[j] = convert(data[j]) }
+            return
+        }
+        if isContiguousRowMajor(shape: shape, strides: strides) {
+            for j in 0..<data.count { ptr[j] = convert(data[j]) }
+            return
+        }
+        var indices = [Int](repeating: 0, count: ndim)
+        for j in 0..<data.count {
+            var offset = 0
+            for d in 0..<ndim { offset += indices[d] * strides[d] }
+            ptr[offset] = convert(data[j])
+            var d = ndim - 1
+            while d >= 0 {
+                indices[d] += 1
+                if indices[d] < shape[d] { break }
+                indices[d] = 0
+                d -= 1
+            }
+        }
     }
 }
 
