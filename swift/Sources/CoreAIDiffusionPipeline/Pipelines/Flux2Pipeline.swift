@@ -202,6 +202,11 @@ public struct Flux2Pipeline: DiffusionPipeline {
         // 6. Build RoPE position IDs — the transformer computes the frequencies in-graph
         let axesDims = descriptor.ropeAxesDims ?? [32, 32, 32, 32]
         let numAxes = axesDims.count
+        // Image ids put H/W on axes 1/2; text ids put the seq index on the last axis.
+        guard numAxes >= 3 else {
+            throw PipelineLoadError.missingConfig(
+                "rope_axes_dims has \(numAxes) axes; FLUX.2 RoPE needs at least 3")
+        }
         let imageIds = buildImageIds(side: spatialSide, numAxes: numAxes)
         let textIds = buildTextIds(textSeqLen: textSeqLen, numAxes: numAxes)
 
