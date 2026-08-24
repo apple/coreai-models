@@ -158,11 +158,15 @@ let model = try await SpeechRecognitionModel(
 let updates = try await model.startStream()
 
 Task {
-    for await update in updates {
-        switch update {
-        case .partial(let segment):   render(segment.text)          // never retracts
-        case .finalized(let segment): commit(segment.text, segment.startTime...segment.endTime)
+    do {
+        for try await update in updates {
+            switch update {
+            case .partial(let segment):   render(segment.text)          // never retracts
+            case .finalized(let segment): commit(segment.text, segment.startTime...segment.endTime)
+            }
         }
+    } catch {
+        print("Streaming failed.")
     }
 }
 
