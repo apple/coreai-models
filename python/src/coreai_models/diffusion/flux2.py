@@ -11,11 +11,9 @@ FLUX.2 Klein 4B is a DiT (Diffusion Transformer) that uses:
 - 25-block double-stream + single-stream transformer with 4D RoPE
 - AutoencoderKLFlux2 VAE with batch normalization
 
-Key difference from SD: the transformer uses pre-computed RoPE embeddings
-passed as model inputs (not computed in-graph) to work around a Core AI graph
-optimizer bug that corrupts monolithic 25-block transformers when RoPE
-frequency ops (arange, outer, pow, repeat_interleave) are in the compiled
-graph. Pre-computing RoPE outside the graph avoids this issue.
+The transformer computes RoPE in-graph from position IDs (img_ids, txt_ids),
+matching upstream diffusers. Position IDs are cheap to build and depend only on
+grid geometry, so the exported graph owns the frequency computation.
 """
 
 from typing import Any, cast
@@ -23,67 +21,15 @@ from typing import Any, cast
 import torch
 
 # ---------------------------------------------------------------------------
-# RoPE pre-computation (outside the exported graph)
-# Core AI graph optimizer corrupts RoPE frequency ops (arange, outer, pow,
-# repeat_interleave) in monolithic 25-block transformers.
-# Workaround: compute embeddings in Python/Swift and pass as model inputs.
-# ---------------------------------------------------------------------------
-
-
-def _compute_rope_embeddings(
-    img_ids: torch.Tensor,
-    txt_ids: torch.Tensor,
-    axes_dim: list[int],
-    theta: float = 2000.0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute concatenated (cos, sin) RoPE embeddings from position IDs.
-
-    Replicates Flux2PosEmbed.forward() + get_1d_rotary_pos_embed() logic:
-      - For each axis: outer(pos, inv_freq) -> cos/sin -> repeat_interleave(2)
-      - Concatenate across axes -> [S, sum(axes_dim)]
-      - Concatenate text + image -> [txt_S + img_S, D]
-
-    Returns (rotary_emb_cos, rotary_emb_sin) each of shape [txt_S + img_S, D].
-    """
-    if img_ids.ndim == 3:
-        img_ids = img_ids[0]
-    if txt_ids.ndim == 3:
-        txt_ids = txt_ids[0]
-
-    def _embed_ids(ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        cos_parts = []
-        sin_parts = []
-        for i, dim in enumerate(axes_dim):
-            pos = ids[:, i].float()
-            inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float64) / dim))
-            freqs = torch.outer(pos.double(), inv_freq)
-            cos = freqs.cos().repeat_interleave(2, dim=1).float()
-            sin = freqs.sin().repeat_interleave(2, dim=1).float()
-            cos_parts.append(cos)
-            sin_parts.append(sin)
-        return torch.cat(cos_parts, dim=-1), torch.cat(sin_parts, dim=-1)
-
-    img_cos, img_sin = _embed_ids(img_ids)
-    txt_cos, txt_sin = _embed_ids(txt_ids)
-
-    # HF concatenates text FIRST, then image
-    rotary_cos = torch.cat([txt_cos, img_cos], dim=0)
-    rotary_sin = torch.cat([txt_sin, img_sin], dim=0)
-    return rotary_cos, rotary_sin
-
-
-# ---------------------------------------------------------------------------
 # Torch wrappers
 # ---------------------------------------------------------------------------
 
 
-class Flux2TransformerPrecomputedRoPEWrapper(torch.nn.Module):
-    """Wraps Flux2Transformer for export with pre-computed RoPE embeddings.
+class Flux2TransformerWrapper(torch.nn.Module):
+    """Wraps Flux2Transformer2DModel for export with in-graph RoPE.
 
-    Instead of accepting (img_ids, txt_ids) and computing RoPE internally via
-    self.pos_embed(), this wrapper accepts (rotary_emb_cos, rotary_emb_sin)
-    directly.  This removes all RoPE frequency computation from the traced graph,
-    leaving only the simple elementwise rotation in each attention block.
+    Takes position IDs and lets the model compute rotary embeddings internally via
+    self.pos_embed(), so the exported graph matches upstream diffusers.
     """
 
     def __init__(self, transformer: torch.nn.Module) -> None:
@@ -96,57 +42,20 @@ class Flux2TransformerPrecomputedRoPEWrapper(torch.nn.Module):
         encoder_hidden_states: torch.Tensor,
         timestep: torch.Tensor,
         guidance: torch.Tensor,
-        rotary_emb_cos: torch.Tensor,
-        rotary_emb_sin: torch.Tensor,
+        img_ids: torch.Tensor,
+        txt_ids: torch.Tensor,
     ) -> torch.Tensor:
-        model = self.model
-        num_txt_tokens = encoder_hidden_states.shape[1]
-
-        # 1. Timestep + guidance embedding
-        t = timestep.to(hidden_states.dtype) * 1000
-        g = guidance.to(hidden_states.dtype) * 1000
-        temb = model.time_guidance_embed(t, g)
-
-        # 2. Modulation parameters
-        double_stream_mod_img = model.double_stream_modulation_img(temb)
-        double_stream_mod_txt = model.double_stream_modulation_txt(temb)
-        single_stream_mod = model.single_stream_modulation(temb)
-
-        # 3. Input projections
-        hidden_states = model.x_embedder(hidden_states)
-        encoder_hidden_states = model.context_embedder(encoder_hidden_states)
-
-        # 4. RoPE -- PRE-COMPUTED, passed as model inputs (not computed in-graph)
-        concat_rotary_emb = (rotary_emb_cos, rotary_emb_sin)
-
-        # 5. Double stream blocks
-        for block in model.transformer_blocks:
-            encoder_hidden_states, hidden_states = block(
+        return cast(
+            torch.Tensor,
+            self.model(
                 hidden_states=hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
-                temb_mod_img=double_stream_mod_img,
-                temb_mod_txt=double_stream_mod_txt,
-                image_rotary_emb=concat_rotary_emb,
-            )
-
-        # 6. Concatenate text + image for single stream
-        hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
-
-        # 7. Single stream blocks
-        for block in model.single_transformer_blocks:
-            hidden_states = block(
-                hidden_states=hidden_states,
-                encoder_hidden_states=None,
-                temb_mod=single_stream_mod,
-                image_rotary_emb=concat_rotary_emb,
-            )
-
-        # 8. Remove text tokens
-        hidden_states = hidden_states[:, num_txt_tokens:, ...]
-
-        # 9. Output norm + projection
-        hidden_states = model.norm_out(hidden_states, temb)
-        return model.proj_out(hidden_states)
+                timestep=timestep,
+                guidance=guidance,
+                img_ids=img_ids,
+                txt_ids=txt_ids,
+            ).sample,
+        )
 
 
 class Flux2TextEncoderWrapper(torch.nn.Module):
@@ -222,8 +131,9 @@ def _dummy_flux2_transformer_impl(pipe: Any, grid_size: int) -> tuple[torch.Tens
     image_seq_len = grid_size * grid_size
     text_seq_len = 512
     axes_dim = list(cfg.axes_dims_rope)
-    theta = cfg.rope_theta if hasattr(cfg, "rope_theta") else 2000.0
 
+    # Position IDs per token: [T, H, W, L]. Image tokens carry the spatial grid on
+    # axes 1/2; text tokens carry the sequence index on the last axis.
     num_rope_axes = len(axes_dim)
     img_ids = torch.zeros(1, image_seq_len, num_rope_axes)
     for h in range(grid_size):
@@ -234,17 +144,15 @@ def _dummy_flux2_transformer_impl(pipe: Any, grid_size: int) -> tuple[torch.Tens
 
     txt_ids = torch.zeros(1, text_seq_len, num_rope_axes)
     for i in range(text_seq_len):
-        txt_ids[0, i, 3] = float(i)
-
-    rotary_cos, rotary_sin = _compute_rope_embeddings(img_ids, txt_ids, axes_dim, theta=theta)
+        txt_ids[0, i, num_rope_axes - 1] = float(i)
 
     return (
         torch.randn(1, image_seq_len, cfg.in_channels, dtype=dtype),
         torch.randn(1, text_seq_len, cfg.joint_attention_dim, dtype=dtype),
         torch.tensor([0.5], dtype=dtype),
         torch.tensor([1.0], dtype=dtype),
-        rotary_cos,
-        rotary_sin,
+        img_ids,
+        txt_ids,
     )
 
 

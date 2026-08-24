@@ -347,8 +347,28 @@ def _write_metadata_json(
     else:
         diffusion_config = _build_sd_config(hf_pipe, model_id, pipeline_type)
 
-    # Build assets map from exported component paths
+    # Build assets map from exported component paths, merged over the previous
+    # export's list. A partial run (--components) only knows what it just built, so
+    # without the merge it would drop the rest of the bundle from the manifest.
+    # Prior entries whose files no longer exist are dropped rather than carried.
+    json_path = output_path / "metadata.json"
     assets: dict[str, str] = {}
+    if json_path.exists():
+        try:
+            with open(json_path) as f:
+                prior_assets = json.load(f).get("assets")
+        except (OSError, json.JSONDecodeError):
+            logger.warning(f"Ignoring unreadable {json_path}; rebuilding the asset list")
+            prior_assets = None
+        if isinstance(prior_assets, dict):
+            assets = {
+                name: filename
+                for name, filename in prior_assets.items()
+                if (output_path / str(filename)).exists()
+            }
+    preserved = [name for name in assets if name not in exported_assets]
+    if preserved:
+        logger.info(f"Preserving previously exported assets: {sorted(preserved)}")
     for name, path_str in exported_assets.items():
         assets[name] = Path(path_str).name
 
@@ -369,7 +389,6 @@ def _write_metadata_json(
         },
     }
 
-    json_path = output_path / "metadata.json"
     with open(json_path, "w") as f:
         json.dump(metadata, f, indent=2)
     logger.info(f"Saved metadata.json to {json_path}")
