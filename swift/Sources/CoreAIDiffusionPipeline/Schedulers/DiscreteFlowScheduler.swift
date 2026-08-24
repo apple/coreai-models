@@ -3,6 +3,7 @@
 // Use of this source code is governed by a BSD-3-clause license that can
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
+import Accelerate
 import Foundation
 
 /// Discrete flow matching scheduler for SD3 and Flux models.
@@ -20,8 +21,6 @@ public final class DiscreteFlowScheduler {
     var counter: Int
     let sigmas: [Float]
 
-    public private(set) var modelOutputs: [[Float]] = []
-
     public init(
         stepCount: Int = 50,
         trainStepCount: Int = 1000,
@@ -37,31 +36,38 @@ public final class DiscreteFlowScheduler {
         self.mu = mu
         self.counter = 0
 
-        // Lower bound of the pre-shift sigma linspace. Diffusers builds
-        //   sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
-        // (pipeline_flux2_klein.py) and passes it to
-        // FlowMatchEulerDiscreteScheduler.set_timesteps, which uses the provided
-        // sigmas as-is and only applies the mu/shift transform — it does NOT
-        // recompute the endpoints from num_train_timesteps. So the floor must be
-        // 1/stepCount for BOTH the dynamic-shift (mu) and static-shift paths.
-        // Using 1/trainStepCount here collapsed the final sigma to ~0 at low step
-        // counts (e.g. 4-step Klein), wasting the last step and misplacing all
-        // intermediate noise levels.
-        let sigmaMin: Float = 1.0 / Float(stepCount)
-        var inferSigmas: [Float] = linspace(sigmaMax, sigmaMin, stepCount)
+        var inferSigmas: [Float]
 
         if let mu {
+            // Dynamic shift (Flux/Klein): linspace in raw sigma space [1.0, 1/stepCount],
+            // then apply exponential shift. This path uses 1/stepCount as floor because
+            // the Flux pipeline passes sigmas directly to set_timesteps.
+            let sigmaMin: Float = 1.0 / Float(stepCount)
+            inferSigmas = linspace(sigmaMax, sigmaMin, stepCount)
             let expMu = expf(mu)
             inferSigmas = inferSigmas.map { sigma in
                 expMu / (expMu + (1.0 / sigma - 1.0))
             }
         } else if timeStepShift != 1.0 {
-            inferSigmas = inferSigmas.map { sigma in
+            // Static shift (Wan, SD3): match diffusers FlowMatchEulerDiscreteScheduler.
+            // Algorithm: linspace in timestep space from sigma_max*T to sigma_min*T
+            // (where sigma_min = shift(1/T)), then divide by T, then apply shift.
+            let ts = Float(trainStepCount)
+            let rawSigmaMin: Float = 1.0 / ts
+            let shiftedSigmaMin = timeStepShift * rawSigmaMin / (1.0 + (timeStepShift - 1.0) * rawSigmaMin)
+            let tMax = sigmaMax * ts
+            let tMin = shiftedSigmaMin * ts
+            let timestepLinspace = linspace(tMax, tMin, stepCount)
+            let rawSigmas = timestepLinspace.map { $0 / ts }
+            inferSigmas = rawSigmas.map { sigma in
                 timeStepShift * sigma / (1.0 + (timeStepShift - 1.0) * sigma)
             }
+        } else {
+            // No shift: uniform linspace
+            inferSigmas = linspace(sigmaMax, 1.0 / Float(trainStepCount), stepCount)
         }
 
-        let ts = trainSteps
+        let ts = Float(trainStepCount)
         self.sigmas = inferSigmas + [0.0]
         self.timeSteps = inferSigmas.map { Int($0 * ts) }
     }
@@ -82,29 +88,20 @@ public final class DiscreteFlowScheduler {
     }
 
     public func step(output: [Float], timeStep t: Int, sample: [Float]) -> [Float] {
-        let stepIndex = timeSteps.firstIndex(of: t) ?? counter
-        precondition(stepIndex < sigmas.count, "step() called with invalid timeStep or beyond inferenceStepCount")
+        let stepIndex = counter
+        precondition(stepIndex < sigmas.count, "step() called beyond inferenceStepCount")
         let sigma = sigmas[stepIndex]
 
-        let count = output.count
-        var denoised = [Float](repeating: 0, count: count)
-        for i in 0..<count {
-            denoised[i] = sample[i] - output[i] * sigma
-        }
-        modelOutputs.append(denoised)
-
         var dt = sigma
-        var prevSigma: Float = 0
         if stepIndex < sigmas.count - 1 {
-            prevSigma = sigmas[stepIndex + 1]
-            dt = prevSigma - sigma
+            dt = sigmas[stepIndex + 1] - sigma
         }
 
-        var prevSample = [Float](repeating: 0, count: count)
-        for i in 0..<count {
-            let d = (sample[i] - denoised[i]) / sigma
-            prevSample[i] = sample[i] + d * dt
-        }
+        // prevSample = sample + output * dt (Euler step, simplified from the full derivation)
+        let count = vDSP_Length(output.count)
+        var prevSample = [Float](repeating: 0, count: Int(count))
+        var dtVal = dt
+        vDSP_vsma(output, 1, &dtVal, sample, 1, &prevSample, 1, count)
 
         counter += 1
         return prevSample
