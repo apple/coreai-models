@@ -63,7 +63,8 @@ def is_compression_mode_graph(quantization_config: dict) -> bool:
         quantization_config: coreai-opt's ``quantization_config`` dict.
     """
     _require_coreai_opt()
-    return ExecutionMode(quantization_config["execution_mode"]) == ExecutionMode.GRAPH
+    execution_mode = quantization_config.get("execution_mode")
+    return execution_mode is not None and ExecutionMode(execution_mode) == ExecutionMode.GRAPH
 
 
 def split_compression_config(
