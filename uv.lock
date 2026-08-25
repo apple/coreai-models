@@ -262,6 +262,7 @@ dependencies = [
     { name = "rich" },
     { name = "safetensors" },
     { name = "sentencepiece" },
+    { name = "setuptools" },
     { name = "tokenizers" },
     { name = "torch" },
     { name = "tqdm" },
@@ -273,13 +274,14 @@ requires-dist = [
     { name = "accelerate", specifier = ">=1.12,<2.0" },
     { name = "coreai-core", specifier = "==1.0.0b2" },
     { name = "coreai-opt", specifier = "==0.2.1" },
-    { name = "coreai-torch", specifier = "==0.4.1" },
+    { name = "coreai-torch", specifier = "==0.4.2" },
     { name = "diffusers", specifier = ">=0.37,<1.0" },
     { name = "huggingface-hub", specifier = ">=1.5.0,<2.0" },
     { name = "numpy", specifier = ">=2.2,<3.0" },
     { name = "rich", specifier = ">=14.0,<15.0" },
     { name = "safetensors", specifier = ">=0.5,<1.0" },
     { name = "sentencepiece", specifier = ">=0.2,<1.0" },
+    { name = "setuptools", specifier = ">=42" },
     { name = "tokenizers", specifier = ">=0.22,<0.23" },
     { name = "torch", specifier = "==2.9.0" },
     { name = "tqdm", specifier = ">=4.67,<5.0" },
@@ -307,8 +309,8 @@ wheels = [
 
 [[package]]
 name = "coreai-torch"
-version = "0.4.1"
-source = { registry = "https://pypi.apple.com/simple" }
+version = "0.4.2"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "coreai-core" },
     { name = "ml-dtypes" },
@@ -323,9 +325,9 @@ dependencies = [
     { name = "torch" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://pypi.apple.com/packages/packages/38/c1/0677a598a38c0c8a6af7156318015bcc2c8f4b59c68d091442690902459d/coreai_torch-0.4.1.tar.gz", hash = "sha256:2499429cc94f9e487122420b36b84c83b39a142505c4a54572572147bccc50fa", size = 212648, upload-time = "2026-07-01T23:11:02.067Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/da/4a/7ba9af90ffd9a04e5f2916fc6e5d0a3768bf32ccaaa7d611589e758f12ae/coreai_torch-0.4.2.tar.gz", hash = "sha256:233e5bb069620acba71d7609f143144b76140fda74ff3ea797d7bf43d80f1e57", size = 252537, upload-time = "2026-08-24T21:17:05.808Z" }
 wheels = [
-    { url = "https://pypi.apple.com/packages/packages/53/bd/0f377299bfd8d29cb44f3e803dcdadcee345d047097de84ce64199579ed9/coreai_torch-0.4.1-py3-none-any.whl", hash = "sha256:e2aae98339413b62c03132363dc397936f2b0d90747766852390ba220d085f54", size = 199132, upload-time = "2026-07-01T23:11:00.783Z" },
+    { url = "https://files.pythonhosted.org/packages/83/77/1a81d481db9e1aacaacf016fd3eff0d8bb841fddce56046f6fa6dc248873/coreai_torch-0.4.2-py3-none-any.whl", hash = "sha256:6d4349be6002a7a4c4475b65fd3d1bb7d49f01d137ea2c3259989f46c7a8c34e", size = 239211, upload-time = "2026-08-24T21:17:04.161Z" },
 ]
 
 [[package]]

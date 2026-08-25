@@ -28,7 +28,7 @@ import tempfile
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypeAlias
+from typing import TYPE_CHECKING, Any, Literal, TypeAlias
 
 import numpy as np
 import pytest
@@ -943,12 +943,15 @@ class ForCausalLMTestBase:
         assert lm_head_node is not None
         assert len(lm_head_node.users) == 2
 
+    @pytest.mark.parametrize("quantization_mode", ["eager", "graph"])
     @pytest.mark.parametrize("activation_quantization", [True, False])
     @pytest.mark.usefixtures("disable_hf_impl_for_coreai")
-    def test_weight_activation_quantization(self, activation_quantization) -> None:
+    def test_weight_activation_quantization(
+        self, activation_quantization: bool, quantization_mode: Literal["eager", "graph"]
+    ) -> None:
         """
         Test that weight and weight + activation quantization produces a mlirb model
-        through Core AI export.
+        through Core AI export, in both eager- and graph-mode quantization.
         Only runs if _test_weight_activation_quantization is True for the test class.
         """
         if not self._test_weight_activation_quantization:
@@ -963,8 +966,11 @@ class ForCausalLMTestBase:
         # production, as it had. The asset write is skipped; we only confirm
         # quantize + export produces a non-None AIProgram.
         from coreai_models.export.compression import quantize_for_export
+        from coreai_models.export.externalize import patch_model_for_externalization
         from coreai_models.export.macos import export_macos_model
         from coreai_models.export.pipeline import ExportConfig
+
+        graph_mode = quantization_mode == "graph"
 
         hf_config = transformers.AutoConfig.from_pretrained(self._toy_model_id)
         is_gemma = "gemma" in self._model_class.__name__.lower()
@@ -1007,7 +1013,7 @@ class ForCausalLMTestBase:
                 "coreai_models.primitives.macos.rope.RoPE": None,
                 rms_norm_cls: None,
             },
-            "execution_mode": "eager",
+            "execution_mode": quantization_mode,
         }
 
         max_context_length = 4096
@@ -1028,8 +1034,17 @@ class ForCausalLMTestBase:
                 hf_state_dict_prefix=hf_state_dict_prefix,
             ).eval()
 
-            quantizer_mmap_dir = f"{tmpdir}/quantized"
-            os.makedirs(quantizer_mmap_dir, exist_ok=True)
+            quantizer_mmap_dir: str | None = None
+            # coreai-opt only supports mmap-backed finalization in eager mode
+            if not graph_mode:
+                quantizer_mmap_dir = f"{tmpdir}/quantized"
+                os.makedirs(quantizer_mmap_dir, exist_ok=True)
+
+            externalized_model = None
+            if graph_mode:
+                patch_model_for_externalization(model)
+                externalized_model = model
+
             model = quantize_for_export(
                 model,
                 hf_config,
@@ -1042,8 +1057,11 @@ class ForCausalLMTestBase:
             export_config = ExportConfig(
                 hf_model_id=self._toy_model_id,
                 max_context_length=max_context_length,
+                quantization_mode=quantization_mode,
             )
-            coreai_program = export_macos_model(model, hf_config, export_config)
+            coreai_program = export_macos_model(
+                model, hf_config, export_config, externalized_model=externalized_model
+            )
 
             assert coreai_program is not None, "export_macos_model returned None, conversion failed"
 

@@ -12,6 +12,7 @@ using the coreai-opt library, including calibration data preparation.
 
 import logging
 from collections.abc import Callable, Sequence
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -53,6 +54,35 @@ def _require_coreai_opt() -> None:
         raise ImportError(
             "coreai-opt is required for model compression. Install it with: pip install coreai-opt"
         )
+
+
+def is_compression_mode_graph(quantization_config: dict) -> bool:
+    """Whether ``quantization_config`` selects coreai-opt's graph execution mode.
+
+    Args:
+        quantization_config: coreai-opt's ``quantization_config`` dict.
+    """
+    _require_coreai_opt()
+    execution_mode = quantization_config.get("execution_mode")
+    return execution_mode is not None and ExecutionMode(execution_mode) == ExecutionMode.GRAPH
+
+
+def split_compression_config(
+    compression_config_object: Any,
+) -> "tuple[dict | None, KMeansPalettizerConfig | None]":
+    """Route a prebuilt coreai-opt config to its quantization or palettization slot.
+
+    Args:
+        compression_config_object: A config loaded from a user-provided YAML.
+
+    Returns:
+        ``(quantization_config, palettization_config)``, exactly one of which is
+        non-``None``.
+    """
+    _require_coreai_opt()
+    if isinstance(compression_config_object, KMeansPalettizerConfig):
+        return None, compression_config_object
+    return compression_config_object, None
 
 
 def get_c4(

@@ -9,10 +9,10 @@ import asyncio
 from typing import TYPE_CHECKING
 
 import coreai_torch
-import coreai_torch.composite_ops
 import torch
 from typing_extensions import Self, final, override
 
+from coreai_models.export.externalize import EXTERNALIZE_SPECS
 from coreai_models.export.mlir_ops import (
     register_custom_torch_lowering,
     remove_functionalization,
@@ -20,39 +20,6 @@ from coreai_models.export.mlir_ops import (
 
 if TYPE_CHECKING:
     from coreai.authoring import AIProgram
-
-
-# Composite ops that ``coreai_torch.TorchConverter`` should externalize when
-# lowering a PyTorch module. Shared between the stateless and stateful
-# exporters; keep them in lockstep here rather than duplicating in each
-# ``_async_export`` body.
-_EXTERNALIZE_MODULES: list[coreai_torch.ExternalizeSpec] = [
-    coreai_torch.ExternalizeSpec(
-        target_class=coreai_torch.composite_ops.GatherMM,
-        composite_op_name="gather_mm",
-        composite_attrs=["num_batch_axes"],
-    ),
-    coreai_torch.ExternalizeSpec(
-        target_class=coreai_torch.composite_ops.RMSNormImpl,
-        composite_op_name="rms_norm",
-        composite_attrs=["axes", "eps"],
-    ),
-    coreai_torch.ExternalizeSpec(
-        target_class=coreai_torch.composite_ops.RoPE,
-        composite_op_name="rope",
-        composite_attrs=["scale", "base", "dims", "interleaved"],
-    ),
-    coreai_torch.ExternalizeSpec(
-        target_class=coreai_torch.composite_ops.SDPA,
-        composite_op_name="scaled_dot_product_attention",
-        composite_attrs=["scale", "is_causal", "window_size"],
-    ),
-    coreai_torch.ExternalizeSpec(
-        target_class=coreai_torch.composite_ops.GatedDeltaUpdate,
-        composite_op_name="gated_delta_update",
-        composite_attrs=[],
-    ),
-]
 
 
 class CoreaiExporter:
@@ -84,7 +51,7 @@ class CoreaiExporter:
                 kwargs=reference_inputs,
                 dynamic_shapes=dynamic_shapes,
             ).run_decompositions(coreai_torch.get_decomp_table()),
-            externalize_modules=_EXTERNALIZE_MODULES,
+            externalize_modules=EXTERNALIZE_SPECS,
             input_names=input_names,
             output_names=self._output_names,
         )
@@ -177,7 +144,7 @@ class CoreaiStatefulExporter(CoreaiExporter):
         converter.add_pytorch_module(
             torch_module,
             export_fn=export_fn,
-            externalize_modules=_EXTERNALIZE_MODULES,
+            externalize_modules=EXTERNALIZE_SPECS,
             input_names=input_names,
             output_names=self._output_names,
             state_names=self._state_names,

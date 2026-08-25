@@ -28,9 +28,10 @@ requires-python = ">=3.11"
 dependencies = [
     "accelerate>=1.12,<2.0",
     "coreai-core==1.0.0b2",
-    "coreai-torch==0.4.1",
+    "coreai-torch==0.4.2",
     "coreai-opt==0.2.1",
     "torch==2.9.0",
+    "setuptools>=42",
     "numpy>=2.2,<3.0",
     "tqdm>=4.67,<5.0",
     "rich>=14.0,<15.0",

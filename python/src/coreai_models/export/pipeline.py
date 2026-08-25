@@ -21,7 +21,6 @@ from pathlib import Path
 from typing import Any, Literal
 
 import torch
-from coreai_opt.palettization.config.palettization_config import KMeansPalettizerConfig
 from transformers import AutoConfig, AutoTokenizer
 
 from coreai_models._constants import (
@@ -32,9 +31,12 @@ from coreai_models._constants import (
 from coreai_models.export.bundle import bundle_llm_asset
 from coreai_models.export.compression import (
     get_c4,
+    is_compression_mode_graph,
     palettize_pytorch_model,
     quantize_for_export,
+    split_compression_config,
 )
+from coreai_models.export.externalize import patch_model_for_externalization
 from coreai_models.export.ios import export_ios_model
 from coreai_models.export.macos import export_macos_model
 from coreai_models.export.metadata import build_aimodel_metadata
@@ -60,6 +62,7 @@ class ExportConfig:
     output_name: str | None = None
     num_layers: int | None = None
     overwrite: bool = False
+    quantization_mode: Literal["eager", "graph"] | None = None
     # iOS only. When True, embedding table is not quantized to int8.
     disable_embedding_quantization: bool = False
     # When True, the converter embeds debug information in the exported .aimodel
@@ -70,6 +73,12 @@ class ExportConfig:
     # QuantizerConfig) loaded from a user-provided YAML. When set, the pipeline
     # uses this directly and ignores `compression` for config resolution
     compression_config_object: Any = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.quantization_mode == "graph" and self.variant != "macOS":
+            raise ValueError(
+                f"quantization_mode='graph' is macOS only (got variant '{self.variant}')."
+            )
 
 
 def _generate_output_name(config: ExportConfig) -> str:
@@ -219,12 +228,9 @@ async def _async_export_model(config: ExportConfig) -> str:
         model = model.eval()
         # ---- 3. Resolve compression preset ----
         if config.compression_config_object is not None:
-            if isinstance(config.compression_config_object, KMeansPalettizerConfig):
-                torch_palettization_config = config.compression_config_object
-                torch_quantization_config = None
-            else:
-                torch_quantization_config = config.compression_config_object
-                torch_palettization_config = None
+            torch_quantization_config, torch_palettization_config = split_compression_config(
+                config.compression_config_object
+            )
         else:
             preset = get_preset(config.compression)
             torch_quantization_config = preset.get("torch_quantization_config")
@@ -240,6 +246,8 @@ async def _async_export_model(config: ExportConfig) -> str:
         )
         vocab_size = hf_config.vocab_size
         batch_size = 1
+        # Set when composite ops are marked for externalization before quantization.
+        externalized_model: torch.nn.Module | None = None
         if torch_quantization_config is not None:
             logger.info(f"Applying pre-export torch quantization (preset={config.compression})")
 
@@ -247,19 +255,42 @@ async def _async_export_model(config: ExportConfig) -> str:
                 tokenizer = AutoTokenizer.from_pretrained(config.hf_model_id)
                 return get_c4(tokenizer)
 
+            # Copy so we don't mutate the shared preset.
+            quant_cfg = dict(torch_quantization_config)
+
+            # The preset or YAML is the source of truth; `--quantization-mode` overrides
+            # it only when given.
+            if config.quantization_mode is not None:
+                logger.warning(
+                    "Overriding execution_mode for `coreai-opt` compression with "
+                    f"{config.quantization_mode}"
+                )
+                quant_cfg["execution_mode"] = config.quantization_mode
+            elif "execution_mode" not in quant_cfg:
+                raise ValueError(
+                    f"Compression config '{config.compression}' does not set "
+                    "'execution_mode'. Set it there, or pass --quantization-mode "
+                    "{eager,graph}."
+                )
+
+            graph_mode = is_compression_mode_graph(quant_cfg)
+
             quantizer_mmap_dir: str | None = None
-            if use_memory_efficient:
+            # coreai-opt only supports mmap-backed finalization in eager mode.
+            if use_memory_efficient and not graph_mode:
                 assert temp_dir is not None
                 quantizer_mmap_dir = os.path.join(temp_dir, "quantized")
                 os.makedirs(quantizer_mmap_dir, exist_ok=True)
 
-            # Pass-through prebuilt QuantizerConfig objects.
-            # copy dicts so we don't mutate the shared preset.
-            quant_cfg = (
-                torch_quantization_config
-                if not isinstance(torch_quantization_config, dict)
-                else dict(torch_quantization_config)
-            )
+            if graph_mode:
+                patch_model_for_externalization(model)
+                # externalization patches live on the eager module's composite op
+                # submodules but quantize_for_export in graph-mode below returns a
+                # new GraphModule which get overwritten to `model`.
+                # So, keep a handle on the eager module the composites were patched on,
+                # for the sub-export later.
+                externalized_model = model
+
             model = quantize_for_export(
                 model,
                 hf_config,
@@ -268,6 +299,7 @@ async def _async_export_model(config: ExportConfig) -> str:
                 calibration_data_fn=get_calibration_data,
                 mmap_dir=quantizer_mmap_dir,
             )
+
         if torch_palettization_config is not None:
             assert config.variant == "iOS", "palettization is only supported for iOS variant."
 
@@ -303,7 +335,9 @@ async def _async_export_model(config: ExportConfig) -> str:
 
         # ---- 4. Variant-specific export ----
         if config.variant == "macOS":
-            coreai_program = export_macos_model(model, hf_config, config)
+            coreai_program = export_macos_model(
+                model, hf_config, config, externalized_model=externalized_model
+            )
         else:
             coreai_program = await export_ios_model(model, hf_config, config)
 
