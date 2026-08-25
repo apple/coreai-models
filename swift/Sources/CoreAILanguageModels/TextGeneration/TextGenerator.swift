@@ -166,6 +166,60 @@ public class TextGenerator {
             logits: allLogits
         )
     }
+
+    /// Evaluate logits for pre-tokenized raw token IDs.
+    ///
+    /// Feeds all tokens through the engine and returns logits for each position
+    /// after the first token (which serves as context seed). No text-based
+    /// tokenization or BPE boundary detection is needed.
+    ///
+    /// - Parameter tokens: Pre-tokenized token IDs (must have at least 2 tokens)
+    /// - Returns: ContinuationEvaluationResult with logits for positions 1..N
+    public func evaluateRawTokens(
+        _ tokens: [Int32]
+    ) async throws -> ContinuationEvaluationResult {
+        guard tokens.count >= 2 else {
+            throw ContinuationEvaluationError.emptyInput
+        }
+
+        let contextTokens = [tokens[0]]
+        let continuationTokens = Array(tokens.dropFirst())
+
+        CLILogger.log(
+            "Raw token evaluation: \(tokens.count) tokens "
+                + "(context=1, continuation=\(continuationTokens.count))",
+            component: "TextGenerator"
+        )
+
+        try await inferenceEngine.reset()
+
+        let options = InferenceOptions(
+            maxTokens: continuationTokens.count,
+            includeLogits: true,
+            forcedContinuation: continuationTokens
+        )
+
+        let stream = try await inferenceEngine.generate(
+            with: contextTokens,
+            samplingConfiguration: SamplingConfiguration.greedy,
+            inferenceOptions: options
+        )
+
+        var allLogits: [[LogitsScalarType]] = []
+        for try await output in stream {
+            if let logits = output.logits {
+                allLogits.append(logits)
+            }
+        }
+
+        try await inferenceEngine.reset()
+
+        return ContinuationEvaluationResult(
+            contextTokens: contextTokens,
+            continuationTokens: continuationTokens,
+            logits: allLogits
+        )
+    }
 }
 
 // MARK: - Text Generator Builder

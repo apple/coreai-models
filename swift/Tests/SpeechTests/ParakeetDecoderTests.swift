@@ -3,42 +3,27 @@
 // Use of this source code is governed by a BSD-3-clause license that can
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
+import CoreAI
+import CoreAIShared
 import Foundation
 import Testing
 
 @testable import CoreAISpeech
 
-// MARK: - Argmax
+// MARK: - Argmax ranges
 
-@Suite("TDT argmax")
+/// The two ranges the decode loop carves out of one joint output. `argmaxFloat` itself — ties,
+/// empty ranges, relative indices, f16 dispatch — is pinned in `CoreAISharedTests`; what these
+/// add is that the *TDT* range arithmetic reaches every id it must.
+@Suite("TDT argmax ranges")
 struct TDTArgmaxTests {
-    @Test("Returns the index of the largest value")
-    func returnsLargest() {
-        #expect(ParakeetTDTDecoder.argmax([1, 5, 3], in: 0..<3) == 1)
-    }
-
-    @Test("Ties go to the lowest index")
-    func tiesGoLow() {
-        // Documented contract, and it differs from WhisperDecoder's `indices.max(by:)`, which
-        // returns the *last* maximal element. Pinned so the two are not accidentally unified.
-        #expect(ParakeetTDTDecoder.argmax([2, 2, 1], in: 0..<3) == 0)
-    }
-
-    @Test("An all-negative-infinity range returns zero")
-    func allNegativeInfinityReturnsZero() {
-        #expect(ParakeetTDTDecoder.argmax([-.infinity, -.infinity], in: 0..<2) == 0)
-    }
-
-    @Test("Indices are relative to the range lower bound")
-    func indicesAreRelative() {
-        // The duration argmax indexes `cfg.durations` with this result, so an absolute index here
-        // would read the wrong duration or run off the end.
-        #expect(ParakeetTDTDecoder.argmax([9, 9, 0, 7], in: 2..<4) == 1)
-    }
-
-    @Test("A single-element range returns zero")
-    func singleElementRange() {
-        #expect(ParakeetTDTDecoder.argmax([4, 8, 2], in: 1..<2) == 0)
+    /// A `[1, 1, values.count]` logits row, shaped like the joint's output.
+    private func logitsRow(
+        _ values: [Float], scalarType: NDArray.ScalarType = .float32
+    ) -> NDArray {
+        var array = NDArray(shape: [1, 1, values.count], scalarType: scalarType)
+        fillFloatNDArray(&array, with: values)
+        return array
     }
 
     /// Half of the invariant the reviewer questioned: `lastToken == blankTokenId` only means "the
@@ -51,19 +36,21 @@ struct TDTArgmaxTests {
         for id in [0, 1, 512, 1_023, blank, vocabSize - 1] {
             var logits = [Float](repeating: -1, count: vocabSize + 5)
             logits[id] = 10
-            #expect(ParakeetTDTDecoder.argmax(logits, in: 0..<vocabSize) == id, "id \(id)")
+            #expect(argmaxFloat(logitsRow(logits), in: 0..<vocabSize) == id, "id \(id)")
         }
     }
 
     @Test("Duration indices stay inside the durations array")
     func durationIndicesAreInRange() {
+        // The duration argmax indexes `cfg.durations` with a range-relative result, so an
+        // off-by-one here reads the wrong duration or runs off the end.
         let vocabSize = 1_030
         let durations = [0, 1, 2, 3, 4]
         for j in durations.indices {
             var logits = [Float](repeating: -1, count: vocabSize + durations.count)
             logits[vocabSize + j] = 10
-            let index = ParakeetTDTDecoder.argmax(
-                logits, in: vocabSize..<(vocabSize + durations.count))
+            let index = argmaxFloat(
+                logitsRow(logits), in: vocabSize..<(vocabSize + durations.count))
             #expect(index == j)
             #expect(durations.indices.contains(index))
         }

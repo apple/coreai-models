@@ -67,7 +67,6 @@ struct Main {
     }
 }
 
-// MARK: - Main Runner Command (Refactored)
 struct LLMRunner: AsyncParsableCommand, Sendable {
     static let configuration = CommandConfiguration(
         commandName: "llm-runner",
@@ -632,6 +631,27 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             print("Generating...")
         }
 
+        // Raw token evaluation: feed pre-tokenized IDs and save per-position logits
+        if case .rawTokens(let container) = promptInput, saveLogits != nil || printLogits {
+            guard inferenceEngine.supportsLogits else {
+                throw ContinuationEvaluationError.engineDoesNotSupportLogits
+            }
+            let result = try await generator.evaluateRawTokens(container.tokens.map { Int32($0) })
+
+            await PerformanceMetrics.shared.endOverallTiming()
+
+            try LogitsWriter.handleEvaluationOutput(
+                result: result,
+                context: "(raw tokens: \(container.tokens.count) ids)",
+                continuation: "(forced: \(container.tokens.count - 1) ids)",
+                tokenizer: tokenizer,
+                saveLogitsLength: saveLogitsLength,
+                saveJsonPath: saveLogits,
+                printToConsole: printLogits
+            )
+            return
+        }
+
         // Check if this is continuation evaluation mode
         if let continuation = continuation {
             // CONTINUATION EVALUATION MODE
@@ -641,7 +661,6 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             case .text(let text):
                 contextString = text
             case .rawTokens:
-                // Raw tokens not supported for continuation - requires text-based tokenization
                 throw ContinuationEvaluationError.rawTokensNotSupported
             }
 
