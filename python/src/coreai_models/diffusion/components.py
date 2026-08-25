@@ -32,6 +32,15 @@ from coreai_models.diffusion.flux2 import (
     dummy_flux2_vae_encoder,
     dummy_flux2_vae_encoder_half,
 )
+from coreai_models.diffusion.wan import (
+    WanTextEncoderWrapper,
+    WanTransformerWrapper,
+    WanVAEDecoderWrapper,
+    dummy_wan_text_encoder,
+    dummy_wan_transformer,
+    dummy_wan_vae_decoder,
+    wan_transformer_dynamic_shapes,
+)
 
 # ---------------------------------------------------------------------------
 # Torch wrappers — thin adapters that extract the tensor we need from the
@@ -192,6 +201,7 @@ class ComponentSpec:
     wrapper_fn: Callable
     dummy_fn: Callable
     quantizable: bool = False
+    dynamic_shapes_fn: Callable | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -398,6 +408,39 @@ SD3_COMPONENTS: dict[str, ComponentSpec] = {
 
 ALL_SD3_COMPONENTS: list[str] = list(SD3_COMPONENTS.keys())
 
+WAN_COMPONENTS: dict[str, ComponentSpec] = {
+    "transformer": ComponentSpec(
+        asset_name="Transformer",
+        input_names=(
+            "hidden_states",
+            "encoder_hidden_states",
+            "timestep",
+        ),
+        output_names=("output",),
+        wrapper_fn=lambda p: WanTransformerWrapper(p.transformer),
+        dummy_fn=dummy_wan_transformer,
+        quantizable=True,
+        dynamic_shapes_fn=wan_transformer_dynamic_shapes,
+    ),
+    "text_encoder": ComponentSpec(
+        asset_name="TextEncoder",
+        input_names=("input_ids", "attention_mask"),
+        output_names=("hidden_states",),
+        wrapper_fn=lambda p: WanTextEncoderWrapper(p.text_encoder),
+        dummy_fn=dummy_wan_text_encoder,
+        quantizable=True,
+    ),
+    "vae_decoder": ComponentSpec(
+        asset_name="VAEDecoder",
+        input_names=("latent",),
+        output_names=("pixels",),
+        wrapper_fn=lambda p: WanVAEDecoderWrapper(p.vae),
+        dummy_fn=dummy_wan_vae_decoder,
+    ),
+}
+
+ALL_WAN_COMPONENTS: list[str] = list(WAN_COMPONENTS.keys())
+
 
 def get_component_registry(
     hf_pipe: Any,
@@ -414,6 +457,8 @@ def get_component_registry(
         return FLUX2_COMPONENTS
     if pipeline_type == "sd3":
         return SD3_COMPONENTS
+    if pipeline_type == "wan":
+        return WAN_COMPONENTS
     return SD_COMPONENTS
 
 
@@ -423,4 +468,6 @@ def get_valid_components(pipeline_type: str) -> list[str]:
         return ALL_FLUX2_COMPONENTS
     if pipeline_type == "sd3":
         return ALL_SD3_COMPONENTS
+    if pipeline_type == "wan":
+        return ALL_WAN_COMPONENTS
     return ALL_SD_COMPONENTS

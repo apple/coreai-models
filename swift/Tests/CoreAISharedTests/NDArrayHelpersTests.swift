@@ -105,3 +105,35 @@ struct FloatElementsTests {
             floatElements(output(outer: 4, inner: 3, scalarType: .float16), in: 3..<6) == expected)
     }
 }
+
+@Suite("BFloat16 Flatten")
+struct BFloat16FlattenTests {
+    @Test("flattenBFloat16NDArray converts known values correctly")
+    func knownValues() {
+        // BFloat16 for 1.0 = 0x3F80, for -2.0 = 0xC000, for 0.5 = 0x3F00
+        let bf16Values: [UInt16] = [0x3F80, 0xC000, 0x3F00]
+        let expected: [Float] = [1.0, -2.0, 0.5]
+
+        var array = NDArray(shape: [3], scalarType: .bfloat16)
+        array.mutableRawView().withUnsafeMutableBytes { ptr, _, _ in
+            let dst = ptr.assumingMemoryBound(to: UInt16.self)
+            for i in 0..<3 { dst[i] = bf16Values[i] }
+        }
+
+        let result = flattenBFloat16NDArray(array)
+        #expect(result == expected)
+    }
+
+    @Test("flattenAsFloat dispatches bfloat16 correctly")
+    func flattenAsFloatBF16() {
+        var array = NDArray(shape: [2], scalarType: .bfloat16)
+        array.mutableRawView().withUnsafeMutableBytes { ptr, _, _ in
+            let dst = ptr.assumingMemoryBound(to: UInt16.self)
+            dst[0] = 0x4040  // 3.0 in bf16
+            dst[1] = 0x4080  // 4.0 in bf16
+        }
+
+        let result = flattenAsFloat(array)
+        #expect(result == [3.0, 4.0])
+    }
+}

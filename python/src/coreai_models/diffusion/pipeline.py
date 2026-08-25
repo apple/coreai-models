@@ -50,6 +50,7 @@ class DiffusionExportConfig:
     compute_precision: str = "float16"
     compression: str = "none"
     overwrite: bool = False
+    vae_tile_size: int | None = None
     include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO
 
 
@@ -108,13 +109,18 @@ async def _async_export_diffusion(config: DiffusionExportConfig) -> dict[str, st
         logger.info(f"Exporting {name} -> {spec.asset_name}.aimodel")
 
         wrapper = spec.wrapper_fn(hf_pipe)
-        dummy_inputs = spec.dummy_fn(hf_pipe)
+        dummy_kwargs: dict[str, Any] = {}
+        if "vae" in name and config.vae_tile_size is not None:
+            dummy_kwargs["tile_size"] = config.vae_tile_size
+        dummy_inputs = spec.dummy_fn(hf_pipe, **dummy_kwargs)
+        dynamic_shapes = spec.dynamic_shapes_fn() if spec.dynamic_shapes_fn else None
 
         program = export_stateless(
             wrapper,
             dummy_inputs,
             spec.input_names,
             spec.output_names,
+            dynamic_shapes=dynamic_shapes,
             include_debug_info=config.include_debug_info,
         )
 
@@ -146,7 +152,13 @@ async def _async_export_diffusion(config: DiffusionExportConfig) -> dict[str, st
 
     # 4. Write pipeline.json
     _write_metadata_json(
-        hf_pipe, config.hf_model_id, pipeline_type, output_path, config.compression, results
+        hf_pipe,
+        config.hf_model_id,
+        pipeline_type,
+        output_path,
+        config.compression,
+        results,
+        vae_tile_size=config.vae_tile_size,
     )
 
     # Summary
@@ -170,6 +182,12 @@ def _load_hf_pipeline(model_id: str, pipeline_type: str, model_dtype: torch.dtyp
         from diffusers import Flux2KleinPipeline
 
         hf_pipe = Flux2KleinPipeline.from_pretrained(model_id, torch_dtype=model_dtype)
+        return hf_pipe
+
+    if pipeline_type == "wan":
+        from diffusers import WanPipeline
+
+        hf_pipe = WanPipeline.from_pretrained(model_id, torch_dtype=model_dtype)
         return hf_pipe
 
     if pipeline_type == "sd3":
@@ -284,7 +302,6 @@ def _save_tokenizer(model_id: str, output_path: Path, hf_pipe: Any, overwrite: b
                     snapshot_download(
                         model_id,
                         allow_patterns=[f"{subdir}/*"],
-                        local_files_only=True,
                     )
                 )
             except Exception:
@@ -317,12 +334,16 @@ def _write_metadata_json(
     output_path: Path,
     compression: str,
     exported_assets: dict[str, str],
+    *,
+    vae_tile_size: int | None = None,
 ) -> None:
     """Write metadata.json with the v0.2 bundle schema for diffusion models."""
     from datetime import datetime
 
     if pipeline_type == "flux2":
         diffusion_config = _build_flux2_config(hf_pipe, model_id)
+    elif pipeline_type == "wan":
+        diffusion_config = _build_wan_config(hf_pipe, model_id, vae_tile_size=vae_tile_size)
     else:
         diffusion_config = _build_sd_config(hf_pipe, model_id, pipeline_type)
 
@@ -333,7 +354,7 @@ def _write_metadata_json(
 
     metadata = {
         "metadata_version": METADATA_VERSION,
-        "kind": "diffusion",
+        "kind": "video-diffusion" if pipeline_type == "wan" else "diffusion",
         "name": output_path.name,
         "assets": assets,
         "diffusion": diffusion_config,
@@ -384,6 +405,30 @@ def _build_flux2_config(hf_pipe: Any, model_id: str) -> dict:
         "rope_axes_dims": axes_dims_rope,
         "rope_theta": rope_theta,
     }
+
+
+def _build_wan_config(hf_pipe: Any, model_id: str, *, vae_tile_size: int | None = None) -> dict:
+    cfg = hf_pipe.transformer.config
+    config = {
+        "type": "wan2.1",
+        "prediction_type": "flow_matching",
+        "num_attention_heads": cfg.num_attention_heads,
+        "attention_head_dim": cfg.attention_head_dim,
+        "text_dim": cfg.text_dim,
+        "z_dim": cfg.in_channels,
+        "patch_size": list(cfg.patch_size) if hasattr(cfg, "patch_size") else [1, 2, 2],
+        "default_steps": 50,
+        "default_guidance_scale": 5.0,
+        "default_shift": 3.0,
+        "default_num_frames": 81,
+        "default_fps": 16,
+        "spatial_compression": 8,
+        "temporal_compression": 4,
+    }
+    if vae_tile_size is not None:
+        config["vae_tile_size"] = vae_tile_size
+        config["vae_temporal_frames"] = 5
+    return config
 
 
 def _build_sd_config(hf_pipe: Any, model_id: str, pipeline_type: str = "sd") -> dict:

@@ -162,6 +162,8 @@ public func flattenAsFloat(_ array: NDArray) -> [Float] {
     #if !((os(macOS) || targetEnvironment(macCatalyst)) && arch(x86_64))
     case .float16:
         return flattenNDArray(array, as: Float16.self)
+    case .bfloat16:
+        return flattenBFloat16NDArray(array)
     #endif
     case .float32:
         return flattenNDArray(array, as: Float.self)
@@ -191,6 +193,40 @@ public func flattenNDArray<T: BinaryFloatingPoint & BitwiseCopyable>(
             var offset = 0
             for d in 0..<rank { offset += indices[d] * strides[d] }
             result[i] = Float(ptr[offset])
+            var dim = rank - 1
+            while dim >= 0 {
+                indices[dim] += 1
+                if indices[dim] < shape[dim] { break }
+                indices[dim] = 0
+                dim -= 1
+            }
+        }
+    }
+    return result
+}
+
+/// Flatten a bfloat16 NDArray to `[Float]` in row-major order.
+///
+/// BFloat16 is stored as UInt16 with the same exponent/sign layout as Float32's
+/// upper 16 bits. Conversion: `Float(bitPattern: UInt32(bits) << 16)`.
+public func flattenBFloat16NDArray(_ array: NDArray) -> [Float] {
+    let outerShape = array.shape
+    let total = outerShape.reduce(1, *)
+    var result = [Float](repeating: 0, count: total)
+    array.rawView().withUnsafeBytes { ptr, shape, strides in
+        let src = ptr.assumingMemoryBound(to: UInt16.self)
+        if isContiguousRowMajor(shape: shape, strides: strides) {
+            for i in 0..<total {
+                result[i] = Float(bitPattern: UInt32(src[i]) << 16)
+            }
+            return
+        }
+        let rank = shape.count
+        var indices = [Int](repeating: 0, count: rank)
+        for i in 0..<total {
+            var offset = 0
+            for d in 0..<rank { offset += indices[d] * strides[d] }
+            result[i] = Float(bitPattern: UInt32(src[offset]) << 16)
             var dim = rank - 1
             while dim >= 0 {
                 indices[dim] += 1

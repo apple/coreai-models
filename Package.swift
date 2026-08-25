@@ -24,6 +24,12 @@ let package = Package(
             ]
         ),
         .library(
+            name: "CoreAIVideoDiffusion",
+            targets: [
+                "CoreAIVideoDiffusionPipeline"
+            ]
+        ),
+        .library(
             name: "CoreAISegmentation",
             targets: [
                 "CoreAIImageSegmenter"
@@ -117,6 +123,19 @@ let package = Package(
             ]
         ),
 
+        .target(
+            name: "CoreAIVideoDiffusionPipeline",
+            dependencies: [
+                "CoreAIDiffusionPipeline",
+                "CoreAIShared",
+                .product(name: "Transformers", package: "swift-transformers"),
+            ],
+            path: "swift/Sources/CoreAIVideoDiffusionPipeline",
+            swiftSettings: [
+                .enableUpcomingFeature("MemberImportVisibility")
+            ]
+        ),
+
         // Shared types for LLM CLI tools (used by both llm-runner and llm-server)
         .target(
             name: "CoreAILMCommon",
@@ -202,6 +221,18 @@ let package = Package(
             ]
         ),
         .executableTarget(
+            name: "videodiffusion-runner",
+            dependencies: [
+                "CoreAIVideoDiffusionPipeline",
+                "CoreAIShared",
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+            ],
+            path: "swift/Sources/Tools/videodiffusion-runner",
+            swiftSettings: [
+                .enableUpcomingFeature("MemberImportVisibility")
+            ]
+        ),
+        .executableTarget(
             name: "speech-recognizer",
             dependencies: [
                 "CoreAISpeech",
@@ -270,6 +301,7 @@ let package = Package(
             name: "DiffusionPipelineTests",
             dependencies: [
                 "CoreAIDiffusionPipeline",
+                "CoreAIVideoDiffusionPipeline",
                 "TestUtilities",
             ],
             path: "swift/Tests/DiffusionPipelineTests"
