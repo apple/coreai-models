@@ -201,14 +201,14 @@ public struct Flux2Pipeline: DiffusionPipeline {
 
         // 6. Build RoPE position IDs — the transformer computes the frequencies in-graph
         let axesDims = descriptor.ropeAxesDims ?? [32, 32, 32, 32]
-        let numAxes = axesDims.count
+        let axisCount = axesDims.count
         // Image ids put H/W on axes 1/2; text ids put the seq index on the last axis.
-        guard numAxes >= 3 else {
+        guard axisCount >= 3 else {
             throw PipelineLoadError.missingConfig(
-                "rope_axes_dims has \(numAxes) axes; FLUX.2 RoPE needs at least 3")
+                "rope_axes_dims has \(axisCount) axes; FLUX.2 RoPE needs at least 3")
         }
-        let imageIds = buildImageIds(side: spatialSide, numAxes: numAxes)
-        let textIds = buildTextIds(textSeqLen: textSeqLen, numAxes: numAxes)
+        let imageIds = buildImageIds(side: spatialSide, axisCount: axisCount)
+        let textIds = buildTextIds(textSeqLen: textSeqLen, axisCount: axisCount)
 
         // 7. Denoising loop
         for (step, t) in scheduler.timeSteps.enumerated() {
@@ -219,8 +219,8 @@ public struct Flux2Pipeline: DiffusionPipeline {
                 (textEmbeddings, [1, textSeqLen, hiddenDim(textEmbeddings)]),
                 ([timestepValue], [1]),
                 ([guidanceScale], [1]),
-                (imageIds, [1, seqLen, numAxes]),
-                (textIds, [1, textSeqLen, numAxes]),
+                (imageIds, [1, seqLen, axisCount]),
+                (textIds, [1, textSeqLen, axisCount]),
             ])
 
             packedLatents = scheduler.step(output: output, timeStep: t, sample: packedLatents)
@@ -382,26 +382,26 @@ public struct Flux2Pipeline: DiffusionPipeline {
 
     // MARK: - RoPE Position IDs
 
-    /// `img_ids` for in-graph RoPE: `[1, side*side, numAxes]` flattened row-major,
+    /// `img_ids` for in-graph RoPE: `[1, side*side, axisCount]` flattened row-major,
     /// one row per image token as [T, H, W, L].
-    private func buildImageIds(side: Int, numAxes: Int) -> [Float] {
-        var ids = [Float](repeating: 0, count: side * side * numAxes)
+    private func buildImageIds(side: Int, axisCount: Int) -> [Float] {
+        var ids = [Float](repeating: 0, count: side * side * axisCount)
         for h in 0..<side {
             for w in 0..<side {
                 let idx = h * side + w
-                ids[idx * numAxes + 1] = Float(h)
-                ids[idx * numAxes + 2] = Float(w)
+                ids[idx * axisCount + 1] = Float(h)
+                ids[idx * axisCount + 2] = Float(w)
             }
         }
         return ids
     }
 
-    /// `txt_ids` for in-graph RoPE: `[1, textSeqLen, numAxes]` flattened row-major.
+    /// `txt_ids` for in-graph RoPE: `[1, textSeqLen, axisCount]` flattened row-major.
     /// Text tokens are [0, 0, 0, s] — sequence index on the last axis, spatial unused.
-    private func buildTextIds(textSeqLen: Int, numAxes: Int) -> [Float] {
-        var ids = [Float](repeating: 0, count: textSeqLen * numAxes)
+    private func buildTextIds(textSeqLen: Int, axisCount: Int) -> [Float] {
+        var ids = [Float](repeating: 0, count: textSeqLen * axisCount)
         for s in 0..<textSeqLen {
-            ids[s * numAxes + (numAxes - 1)] = Float(s)
+            ids[s * axisCount + (axisCount - 1)] = Float(s)
         }
         return ids
     }

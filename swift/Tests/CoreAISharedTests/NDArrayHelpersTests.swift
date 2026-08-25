@@ -165,17 +165,17 @@ struct StrideAwareFillReadTests {
     @Test("A [1, 4096, 4] position-ID buffer round-trips exactly")
     func imageIdsRoundTrip() {
         let side = 64
-        let numAxes = 4
-        var ids = [Float](repeating: 0, count: side * side * numAxes)
+        let axisCount = 4
+        var ids = [Float](repeating: 0, count: side * side * axisCount)
         for h in 0..<side {
             for w in 0..<side {
                 let index = h * side + w
-                ids[index * numAxes + 1] = Float(h)
-                ids[index * numAxes + 2] = Float(w)
+                ids[index * axisCount + 1] = Float(h)
+                ids[index * axisCount + 2] = Float(w)
             }
         }
 
-        var array = NDArray(shape: [1, side * side, numAxes], scalarType: .float32)
+        var array = NDArray(shape: [1, side * side, axisCount], scalarType: .float32)
         fillNDArray(&array, as: Float.self, count: ids.count) { ids[$0] }
 
         // Exact equality, not a tolerance: these are integer coordinates, and the failure
@@ -187,13 +187,13 @@ struct StrideAwareFillReadTests {
     @Test("A [1, 512, 4] position-ID buffer round-trips exactly")
     func textIdsRoundTrip() {
         let textSeqLen = 512
-        let numAxes = 4
-        var ids = [Float](repeating: 0, count: textSeqLen * numAxes)
+        let axisCount = 4
+        var ids = [Float](repeating: 0, count: textSeqLen * axisCount)
         for s in 0..<textSeqLen {
-            ids[s * numAxes + (numAxes - 1)] = Float(s)
+            ids[s * axisCount + (axisCount - 1)] = Float(s)
         }
 
-        var array = NDArray(shape: [1, textSeqLen, numAxes], scalarType: .float32)
+        var array = NDArray(shape: [1, textSeqLen, axisCount], scalarType: .float32)
         fillNDArray(&array, as: Float.self, count: ids.count) { ids[$0] }
         #expect(readNDArray(array, as: Float.self, count: ids.count) == ids)
     }
