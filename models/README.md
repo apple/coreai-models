@@ -60,6 +60,8 @@ uv run coreai.llm.export Qwen/Qwen3-0.6B --compression none                     
 uv run coreai.llm.export Qwen/Qwen3-0.6B --platform iOS --compression 4bit_weight_palettized_group8
 ```
 
+**Note:** By default, all quantization presets use `coreai-opt`'s `eager` execution mode. Use the `--quantization-mode graph` argument to override and use graph-mode quantization.
+
 ##### Specifying Compression Configs via YAML files
 
 Specialized compression recipes that aren't covered by pre-defined presets can be specified as YAML files using the `--compression-config` option with the path to a [coreai-opt](https://github.com/apple/coreai-optimization) config.
