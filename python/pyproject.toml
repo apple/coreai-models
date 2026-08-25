@@ -31,8 +31,6 @@ dependencies = [
     "coreai-torch==0.4.2",
     "coreai-opt==0.2.1",
     "torch==2.9.0",
-    # Imported at runtime by torch.utils.cpp_extension, which dynamo reaches when
-    # it compiles symbolic-shape guards during graph-mode export.
     "setuptools>=42",
     "numpy>=2.2,<3.0",
     "tqdm>=4.67,<5.0",
