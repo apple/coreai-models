@@ -9,12 +9,6 @@ keyring-provider = "subprocess"
 default-groups = ["dev"]
 required-version = ">=0.9.0"
 
-[tool.uv.sources]
-# TEMPORARY: the module externalization API (`_patch_model_for_externalization`,
-# `_subexport_and_restore`) that the graph-mode composite-op export path needs is
-# not in a coreai-torch release yet. Drop this and re-pin once it lands upstream.
-coreai-torch = { git = "https://github.com/gokulkrishna98/coreai-torch.git", branch = "dev/gokul/module-externalization-api" }
-
 # Dev tooling lives at workspace root because it's used across all members and
 # scripts, not specific to the `coreai-models` package itself.
 [dependency-groups]

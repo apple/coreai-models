@@ -274,7 +274,7 @@ requires-dist = [
     { name = "accelerate", specifier = ">=1.12,<2.0" },
     { name = "coreai-core", specifier = "==1.0.0b2" },
     { name = "coreai-opt", specifier = "==0.2.1" },
-    { name = "coreai-torch", git = "https://github.com/gokulkrishna98/coreai-torch.git?branch=dev%2Fgokul%2Fmodule-externalization-api" },
+    { name = "coreai-torch", specifier = "==0.4.2" },
     { name = "diffusers", specifier = ">=0.37,<1.0" },
     { name = "huggingface-hub", specifier = ">=1.5.0,<2.0" },
     { name = "numpy", specifier = ">=2.2,<3.0" },
@@ -309,8 +309,8 @@ wheels = [
 
 [[package]]
 name = "coreai-torch"
-version = "0.4.1"
-source = { git = "https://github.com/gokulkrishna98/coreai-torch.git?branch=dev%2Fgokul%2Fmodule-externalization-api#67c610e25e6ec972db65ce4fe7865679f76e7a58" }
+version = "0.4.2"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "coreai-core" },
     { name = "ml-dtypes" },
@@ -324,6 +324,10 @@ dependencies = [
     { name = "sympy" },
     { name = "torch" },
     { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/da/4a/7ba9af90ffd9a04e5f2916fc6e5d0a3768bf32ccaaa7d611589e758f12ae/coreai_torch-0.4.2.tar.gz", hash = "sha256:233e5bb069620acba71d7609f143144b76140fda74ff3ea797d7bf43d80f1e57", size = 252537, upload-time = "2026-08-24T21:17:05.808Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/83/77/1a81d481db9e1aacaacf016fd3eff0d8bb841fddce56046f6fa6dc248873/coreai_torch-0.4.2-py3-none-any.whl", hash = "sha256:6d4349be6002a7a4c4475b65fd3d1bb7d49f01d137ea2c3259989f46c7a8c34e", size = 239211, upload-time = "2026-08-24T21:17:04.161Z" },
 ]
 
 [[package]]
