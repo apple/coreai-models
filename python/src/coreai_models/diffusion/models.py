@@ -16,6 +16,7 @@ SUPPORTED_MODELS: list[tuple[str, str, str]] = [
     ("stable-diffusion-2.x", "sd2-community/stable-diffusion-2-1", "sd"),
     ("stable-diffusion-3.x", "stabilityai/stable-diffusion-3.5-medium", "sd3"),
     ("flux2", "black-forest-labs/FLUX.2-klein-4B", "flux2"),
+    ("wan-t2v-1.3b", "Wan-AI/Wan2.1-T2V-1.3B-Diffusers", "wan"),
 ]
 
 

@@ -255,6 +255,16 @@ DIFFUSION_PRESETS: list[ModelPreset] = [
         None,
         notes="4bit recommended; use --compression none for full precision",
     ),
+    ModelPreset(
+        "wan-t2v-1.3b",
+        "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+        "wan",
+        "diffusion",
+        None,
+        "none",
+        "float16",
+        None,
+    ),
 ]
 
 # ---------------------------------------------------------------------------

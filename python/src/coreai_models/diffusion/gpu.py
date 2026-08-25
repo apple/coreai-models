@@ -6,8 +6,8 @@
 """
 Stateless GPU export for diffusion components.
 
-Simpler than the LLM export path: no KV cache, no dynamic shapes, no
-externalized composites.  Each component is a single fixed-shape forward pass.
+Each component is a single forward pass. Video models use dynamic shapes
+for variable temporal dimensions.
 """
 
 import logging
@@ -21,11 +21,20 @@ from coreai_models._constants import DEFAULT_INCLUDE_DEBUG_INFO
 logger = logging.getLogger(__name__)
 
 
+def _decomp_empty_permuted(size, physical_layout, **kwargs):
+    """Decompose empty_permuted to empty + permute (not in coreai_torch decomp table)."""
+    perm = [0] * len(physical_layout)
+    for i, p in enumerate(physical_layout):
+        perm[p] = i
+    return torch.empty([size[p] for p in physical_layout], **kwargs).permute(perm)
+
+
 def export_stateless(
     wrapper: torch.nn.Module,
     dummy_inputs: tuple[torch.Tensor, ...],
     input_names: tuple[str, ...],
     output_names: tuple[str, ...],
+    dynamic_shapes: tuple[dict[int, torch.export.Dim] | None, ...] | None = None,
     include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
 ) -> AIProgram:
     """Export a stateless model to a Core AI AIProgram.
@@ -35,6 +44,8 @@ def export_stateless(
         dummy_inputs: Reference input tensors (positional) for tracing.
         input_names: Names for the exported model's inputs.
         output_names: Names for the exported model's outputs.
+        dynamic_shapes: Per-input dynamic dimension specs (same positional order
+            as dummy_inputs). None entries mean that input is fully static.
         include_debug_info: When True, the converter runs in ``DEBUG`` mode and embeds debug
             information in the exported ``.aimodel``. Defaults to ``RELEASE`` mode,
             which embeds minimum debug information and makes the exported asset smaller.
@@ -46,8 +57,9 @@ def export_stateless(
 
     def export_fn(module: torch.nn.Module) -> torch.export.ExportedProgram:
         with torch.no_grad():
-            exported = torch.export.export(module, args=dummy_inputs)
+            exported = torch.export.export(module, args=dummy_inputs, dynamic_shapes=dynamic_shapes)
         coreai_decomp_table = coreai_torch.get_decomp_table()
+        coreai_decomp_table[torch.ops.aten.empty_permuted.default] = _decomp_empty_permuted
         decomposed: torch.export.ExportedProgram = exported.run_decompositions(coreai_decomp_table)
         return decomposed
 

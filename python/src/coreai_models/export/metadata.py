@@ -171,6 +171,15 @@ _METADATA: dict[str, AIModelMetadataFields] = {
             "Source: https://huggingface.co/black-forest-labs/FLUX.2-klein-4B"
         ),
     ),
+    "Wan-AI/Wan2.1-T2V-1.3B-Diffusers": AIModelMetadataFields(
+        author="Wan Team",
+        license="Apache-2.0",
+        model_description=(
+            "Wan 2.1 T2V 1.3B is a 1.3B-parameter text-to-video diffusion "
+            "transformer generating 480p video at up to 81 frames. "
+            "Source: https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
+        ),
+    ),
     # ---- Segmentation ----
     "facebook/sam3": AIModelMetadataFields(
         author="N. Carion et al.",
