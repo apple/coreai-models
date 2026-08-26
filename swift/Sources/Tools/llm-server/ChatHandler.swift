@@ -7,6 +7,7 @@ import CoreAILMCommon
 import CoreAILanguageModels
 import CoreAIShared
 import Foundation
+import HTTPTypes
 import Hummingbird
 import NIOCore
 import NIOFoundationCompat
@@ -42,7 +43,8 @@ func startServer(state: ServerState, port: Int) async throws {
     }
 
     router.post("/v1/chat/completions") { request, _ in
-        let sessionID = request.headers[.init("X-Session-ID")!]
+        let sessionID: String? =
+            if let name = HTTPField.Name("X-Session-ID") { request.headers[name] } else { nil }
         return try await handleChatCompletionsRoute(request: request, state: state, sessionID: sessionID)
     }
 
