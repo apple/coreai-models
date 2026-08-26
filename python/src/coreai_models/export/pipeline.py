@@ -73,6 +73,8 @@ class ExportConfig:
     # QuantizerConfig) loaded from a user-provided YAML. When set, the pipeline
     # uses this directly and ignores `compression` for config resolution
     compression_config_object: Any = field(default=None, repr=False)
+    # Override HuggingFace model_type for registry lookup.
+    model_type_override: str | None = None
 
     def __post_init__(self) -> None:
         if self.quantization_mode == "graph" and self.variant != "macOS":
@@ -144,7 +146,7 @@ async def _async_export_model(config: ExportConfig) -> str:
 
     # ---- 1. Resolve model class ----
     hf_config = AutoConfig.from_pretrained(config.hf_model_id)
-    model_type = getattr(hf_config, "model_type", None)
+    model_type = config.model_type_override or getattr(hf_config, "model_type", None)
     if model_type is None:
         raise ValueError(
             f"Could not determine model_type from HuggingFace config for '{config.hf_model_id}'"

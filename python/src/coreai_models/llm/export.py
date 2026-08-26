@@ -26,7 +26,11 @@ from coreai_models.export.presets import (
     DEFAULT_IOS_COMPRESSION_PRESET as IOS_DEFAULT,
 )
 from coreai_models.export.presets import DEFAULT_MACOS_COMPRESSION_PRESET as MACOS_DEFAULT
-from coreai_models.model_registry import try_lookup_preset, try_lookup_preset_by_hf_id
+from coreai_models.model_registry import (
+    presets_for_type,
+    try_lookup_preset,
+    try_lookup_preset_by_hf_id,
+)
 from coreai_models.models.registry import list_models as list_llm_models
 
 
@@ -387,6 +391,7 @@ def _resolve_export_config(args: argparse.Namespace) -> ExportConfig:
         compression_config_object=compression_config_object,
         disable_embedding_quantization=args.disable_embedding_quantization_ios,
         include_debug_info=args.include_debug_info,
+        model_type_override=getattr(preset, "_model_type_override", None) if preset else None,
     )
 
 
@@ -420,7 +425,13 @@ def main() -> None:
         return
 
     if args.list_models:
-        print("LLM model types:")
+        print("LLM presets (use short name or HuggingFace ID):")
+        print()
+        for p in presets_for_type("llm"):
+            platform = p.variant or "macOS"
+            print(f"  {p.short_name:35s} {p.hf_id:45s} {platform}")
+        print()
+        print("Supported architectures:")
         print()
         for name in list_llm_models():
             print(f"  {name}")
