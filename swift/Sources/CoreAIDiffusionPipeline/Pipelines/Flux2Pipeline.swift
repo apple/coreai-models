@@ -557,21 +557,34 @@ public struct Flux2Pipeline: DiffusionPipeline {
         return ids
     }
 
-
-    /// Spatially subsample packed tokens from a larger grid to a smaller one.
-    /// Selects every `stride`-th token in both H and W dimensions.
+    /// Spatially downsample packed tokens to a smaller grid, area-averaging each
+    /// `stride`×`stride` block channel-wise.
+    ///
+    /// Point sampling would keep only 1/stride² of the encoded reference and throw
+    /// the rest away; the block mean retains all of it, so structure survives at the
+    /// half/quarter grids. Channel index encodes intra-patch position, so averaging
+    /// per channel keeps corresponding sub-positions aligned.
     /// Input: [fromSide*fromSide, channels], Output: [toSide*toSide, channels]
     private func subsampleTokens(
         _ tokens: [Float], fromSide: Int, toSide: Int, channels: Int
     ) -> [Float] {
         let stride = fromSide / toSide
+        let scale = 1.0 / Float(stride * stride)
         var result = [Float](repeating: 0, count: toSide * toSide * channels)
         for h in 0..<toSide {
             for w in 0..<toSide {
-                let srcIdx = (h * stride * fromSide + w * stride) * channels
                 let dstIdx = (h * toSide + w) * channels
+                for bh in 0..<stride {
+                    let srcRow = h * stride + bh
+                    for bw in 0..<stride {
+                        let srcIdx = (srcRow * fromSide + w * stride + bw) * channels
+                        for c in 0..<channels {
+                            result[dstIdx + c] += tokens[srcIdx + c]
+                        }
+                    }
+                }
                 for c in 0..<channels {
-                    result[dstIdx + c] = tokens[srcIdx + c]
+                    result[dstIdx + c] *= scale
                 }
             }
         }

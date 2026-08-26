@@ -8,29 +8,17 @@ Stateless GPU export for diffusion components.
 
 Each component is a single forward pass. Video models use dynamic shapes
 for variable temporal dimensions.
-
-When `externalize=True`, composite ops (SDPA, RoPE, RMSNorm) are emitted
-as named MLIR ops — enables compiler-level fusion (flash attention, etc.).
 """
 
 import logging
 
 import coreai_torch
-import coreai_torch.composite_ops
 import torch
 from coreai.authoring import AIProgram
 
 from coreai_models._constants import DEFAULT_INCLUDE_DEBUG_INFO
 
 logger = logging.getLogger(__name__)
-
-_DIFFUSION_EXTERNALIZE_SPECS = [
-    coreai_torch.ExternalizeSpec(
-        target_class=coreai_torch.composite_ops.SDPA,
-        composite_op_name="scaled_dot_product_attention",
-        composite_attrs=["scale", "is_causal", "window_size"],
-    ),
-]
 
 
 def _decomp_empty_permuted(size, physical_layout, **kwargs):
@@ -48,9 +36,8 @@ def export_stateless(
     output_names: tuple[str, ...],
     dynamic_shapes: tuple[dict[int, torch.export.Dim] | None, ...] | None = None,
     include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
-    externalize: bool = False,
 ) -> AIProgram:
-    """Export a stateless model to a CoreAI AIProgram.
+    """Export a stateless model to a Core AI AIProgram.
 
     Args:
         wrapper: A thin torch.nn.Module that wraps a HF model component.
@@ -62,8 +49,6 @@ def export_stateless(
         include_debug_info: When True, the converter runs in ``DEBUG`` mode and embeds debug
             information in the exported ``.aimodel``. Defaults to ``RELEASE`` mode,
             which embeds minimum debug information and makes the exported asset smaller.
-        externalize: If True, emit composite ops (SDPA, RoPE) as named
-            MLIR ops for compiler-level fusion.
 
     Returns:
         An optimized AIProgram ready for saving/compilation.
@@ -90,14 +75,8 @@ def export_stateless(
         export_fn=export_fn,
         input_names=input_names,
         output_names=output_names,
-        externalize_modules=_DIFFUSION_EXTERNALIZE_SPECS if externalize else None,
     )
-    if externalize:
-        from coreai_models.export.mlir_ops import register_custom_torch_lowering
-
-        register_custom_torch_lowering(converter)
     program = converter.to_coreai()
-
     program.optimize()
     return program
 

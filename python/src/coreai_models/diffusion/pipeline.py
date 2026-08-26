@@ -94,7 +94,6 @@ async def _async_export_diffusion(config: DiffusionExportConfig) -> dict[str, st
     output_path.mkdir(parents=True, exist_ok=True)
 
     # 2. Export each component
-
     results: dict[str, str] = {}
     for name in component_names:
         if name not in registry:
