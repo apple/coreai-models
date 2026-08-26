@@ -11,12 +11,11 @@ import Tokenizers
 
 /// FLUX.2 Klein pipeline using Core AI backend.
 ///
-/// Orchestrates: tokenize → text encode → RoPE compute → noise → pack →
-/// denoise loop (flow-match Euler) → unpack → BN denorm → unpatchify → VAE decode.
+/// Orchestrates: tokenize → text encode → noise → pack → denoise loop
+/// (flow-match Euler) → unpack → BN denorm → unpatchify → VAE decode.
 ///
-/// Key design: RoPE embeddings are pre-computed in Swift and passed as model inputs
-/// (not computed in-graph) to avoid graph optimizer issues on monolithic
-/// 25-block transformers.
+/// RoPE is computed inside the transformer graph; this pipeline only supplies
+/// position IDs, which depend on grid geometry alone.
 public struct Flux2Pipeline: DiffusionPipeline {
     public let descriptor: PipelineDescriptor
     public let mode: DecodeResolution
@@ -36,7 +35,6 @@ public struct Flux2Pipeline: DiffusionPipeline {
     private static let patchSize = 16
     private static let latentChannels = 128
     private static let textSeqLen = 512
-    private static let defaultRopeTheta: Float = 2000.0
     private static let qwen3PadTokenId = 151643
 
     /// FLUX.2 flow-matching timestep shift.
@@ -201,19 +199,18 @@ public struct Flux2Pipeline: DiffusionPipeline {
             packedLatents = noisePacked
         }
 
-        // 6. Pre-compute RoPE embeddings (cos, sin)
+        // 6. Build RoPE position IDs — the transformer computes the frequencies in-graph
         let axesDims = descriptor.ropeAxesDims ?? [32, 32, 32, 32]
-        let theta = descriptor.ropeTheta ?? Self.defaultRopeTheta
-        let (rotaryCos, rotarySin) = computeRotaryEmbeddings(
-            imgHeight: spatialSide, imgWidth: spatialSide,
-            textSeqLen: textSeqLen, axesDims: axesDims, theta: theta
-        )
+        let axisCount = axesDims.count
+        // Image ids put H/W on axes 1/2; text ids put the seq index on the last axis.
+        guard axisCount >= 3 else {
+            throw PipelineLoadError.missingConfig(
+                "rope_axes_dims has \(axisCount) axes; FLUX.2 RoPE needs at least 3")
+        }
+        let imageIds = buildImageIds(side: spatialSide, axisCount: axisCount)
+        let textIds = buildTextIds(textSeqLen: textSeqLen, axisCount: axisCount)
 
         // 7. Denoising loop
-        let totalDim = axesDims.reduce(0, +)
-        let totalSeqLen = textSeqLen + seqLen
-        let ropeShape = [totalSeqLen, totalDim]
-
         for (step, t) in scheduler.timeSteps.enumerated() {
             let timestepValue = Float(t) / 1000.0
 
@@ -222,8 +219,8 @@ public struct Flux2Pipeline: DiffusionPipeline {
                 (textEmbeddings, [1, textSeqLen, hiddenDim(textEmbeddings)]),
                 ([timestepValue], [1]),
                 ([guidanceScale], [1]),
-                (rotaryCos, ropeShape),
-                (rotarySin, ropeShape),
+                (imageIds, [1, seqLen, axisCount]),
+                (textIds, [1, textSeqLen, axisCount]),
             ])
 
             packedLatents = scheduler.step(output: output, timeStep: t, sample: packedLatents)
@@ -383,71 +380,30 @@ public struct Flux2Pipeline: DiffusionPipeline {
         embeddings.count / Self.textSeqLen
     }
 
-    // MARK: - RoPE Pre-computation
+    // MARK: - RoPE Position IDs
 
-    private func computeRotaryEmbeddings(
-        imgHeight: Int, imgWidth: Int,
-        textSeqLen: Int, axesDims: [Int], theta: Float
-    ) -> ([Float], [Float]) {
-        let imgSeqLen = imgHeight * imgWidth
-        let totalSeqLen = textSeqLen + imgSeqLen
-        let totalDim = axesDims.reduce(0, +)
-
-        var cosScalars = [Float](repeating: 0, count: totalSeqLen * totalDim)
-        var sinScalars = [Float](repeating: 0, count: totalSeqLen * totalDim)
-
-        var axisOffset = 0
-        for (axisIdx, axisDim) in axesDims.enumerated() {
-            let halfDim = axisDim / 2
-
-            var invFreq = [Double](repeating: 0, count: halfDim)
-            for k in 0..<halfDim {
-                let exponent = Double(2 * k) / Double(axisDim)
-                invFreq[k] = 1.0 / pow(Double(theta), exponent)
+    /// `img_ids` for in-graph RoPE: `[1, side*side, axisCount]` flattened row-major,
+    /// one row per image token as [T, H, W, L].
+    private func buildImageIds(side: Int, axisCount: Int) -> [Float] {
+        var ids = [Float](repeating: 0, count: side * side * axisCount)
+        for h in 0..<side {
+            for w in 0..<side {
+                let idx = h * side + w
+                ids[idx * axisCount + 1] = Float(h)
+                ids[idx * axisCount + 2] = Float(w)
             }
-
-            // Text tokens (first in sequence): axis 3 = sequential, others = 0
-            for s in 0..<textSeqLen {
-                let pos: Double = axisIdx == 3 ? Double(s) : 0.0
-                let outBase = s * totalDim + axisOffset
-                for k in 0..<halfDim {
-                    let angle = pos * invFreq[k]
-                    let c = Float(cos(angle))
-                    let sn = Float(sin(angle))
-                    cosScalars[outBase + 2 * k] = c
-                    cosScalars[outBase + 2 * k + 1] = c
-                    sinScalars[outBase + 2 * k] = sn
-                    sinScalars[outBase + 2 * k + 1] = sn
-                }
-            }
-
-            // Image tokens (after text): axis 1 = h, axis 2 = w, others = 0
-            for h in 0..<imgHeight {
-                for w in 0..<imgWidth {
-                    let s = textSeqLen + h * imgWidth + w
-                    let pos: Double
-                    switch axisIdx {
-                    case 1: pos = Double(h)
-                    case 2: pos = Double(w)
-                    default: pos = 0.0
-                    }
-                    let outBase = s * totalDim + axisOffset
-                    for k in 0..<halfDim {
-                        let angle = pos * invFreq[k]
-                        let c = Float(cos(angle))
-                        let sn = Float(sin(angle))
-                        cosScalars[outBase + 2 * k] = c
-                        cosScalars[outBase + 2 * k + 1] = c
-                        sinScalars[outBase + 2 * k] = sn
-                        sinScalars[outBase + 2 * k + 1] = sn
-                    }
-                }
-            }
-
-            axisOffset += axisDim
         }
+        return ids
+    }
 
-        return (cosScalars, sinScalars)
+    /// `txt_ids` for in-graph RoPE: `[1, textSeqLen, axisCount]` flattened row-major.
+    /// Text tokens are [0, 0, 0, s] — sequence index on the last axis, spatial unused.
+    private func buildTextIds(textSeqLen: Int, axisCount: Int) -> [Float] {
+        var ids = [Float](repeating: 0, count: textSeqLen * axisCount)
+        for s in 0..<textSeqLen {
+            ids[s * axisCount + (axisCount - 1)] = Float(s)
+        }
+        return ids
     }
 
     // MARK: - Latent Packing/Unpacking

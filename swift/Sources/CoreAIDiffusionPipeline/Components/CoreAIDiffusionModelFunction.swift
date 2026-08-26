@@ -66,6 +66,23 @@ public actor CoreAIDiffusionModelFunction {
         return array
     }
 
+    /// Reject a supplied buffer whose element count doesn't match its descriptor.
+    ///
+    /// The fills below copy `data.count` elements into an array sized by the
+    /// descriptor, so a short buffer would leave the tail zeroed and produce silently
+    /// wrong output rather than an error.
+    private static func requireExactCount(
+        _ count: Int, _ descriptor: NDArrayDescriptor, input name: String
+    ) throws {
+        // Skip when dimensions are still dynamic — there is no expected count yet.
+        guard descriptor.shape.allSatisfy({ $0 > 0 }) else { return }
+        let expected = descriptor.shape.reduce(1, *)
+        if count != expected {
+            throw CoreAIDiffusionError.inputCountMismatch(
+                name: name, shape: descriptor.shape, expected: expected, got: count)
+        }
+    }
+
     public func run(floatInputs: [([Float], [Int])]) async throws -> [Float] {
         try await run(inputs: floatInputs.map { .floats($0.0, $0.1) })
     }
@@ -129,11 +146,9 @@ public actor CoreAIDiffusionModelFunction {
             let (data, shape) = intInputs[i]
             guard case .ndArray(let nd) = fn.descriptor.inputDescriptor(of: name) else { continue }
             let resolved = nd.resolvingDynamicDimensions(shape)
+            try Self.requireExactCount(data.count, resolved, input: name)
             var array = NDArray(descriptor: resolved)
-            let view = array.mutableView(as: Int32.self)
-            view.withUnsafeMutablePointer { ptr, _, _ in
-                for j in 0..<data.count { ptr[j] = data[j] }
-            }
+            fillNDArray(&array, as: Int32.self, count: data.count) { data[$0] }
             namedInputs[name] = array
         }
 
@@ -230,14 +245,26 @@ public actor CoreAIDiffusionModelFunction {
         return result
     }
 
+    /// Read an output NDArray into a dense `[Float]`.
+    ///
+    /// Goes through `readNDArray` so a padded output buffer is indexed by stride
+    /// rather than read linearly, matching how inputs are written. The element count
+    /// comes from a same-typed view — `view(as:)` traps when the type disagrees with
+    /// the array's scalar type, so it can't be probed generically.
     private func ndArrayToFloats(_ array: NDArray) throws -> [Float] {
         switch array.scalarType {
         #if !((os(macOS) || targetEnvironment(macCatalyst)) && arch(x86_64))
         case .float16, .bfloat16:
-            return flattenAsFloat(array)
+            let count = array.view(as: Float16.self).withUnsafePointer { _, shape, _ in
+                (0..<shape.count).reduce(1) { $0 * shape[$1] }
+            }
+            return readNDArray(array, as: Float16.self, count: count).map { Float($0) }
         #endif
         case .float32:
-            return flattenAsFloat(array)
+            let count = array.view(as: Float.self).withUnsafePointer { _, shape, _ in
+                (0..<shape.count).reduce(1) { $0 * shape[$1] }
+            }
+            return readNDArray(array, as: Float.self, count: count)
         default:
             throw CoreAIDiffusionError.unsupportedOutputScalarType(array.scalarType)
         }
@@ -323,6 +350,7 @@ public enum CoreAIDiffusionError: Error, LocalizedError {
     case unsupportedInputScalarType(NDArray.ScalarType)
     case unsupportedOutputScalarType(NDArray.ScalarType)
     case expectedSingleOutput(got: [String])
+    case inputCountMismatch(name: String, shape: [Int], expected: Int, got: Int)
 
     public var errorDescription: String? {
         switch self {
@@ -337,6 +365,9 @@ public enum CoreAIDiffusionError: Error, LocalizedError {
         case .expectedSingleOutput(let names):
             return "Model declares \(names.count) outputs \(names); predict(...) expects exactly one. "
                 + "Use predictAllOutputs(inputs:) for multi-output models."
+        case .inputCountMismatch(let name, let shape, let expected, let got):
+            return "Input '\(name)' expects \(expected) elements for shape \(shape), got \(got). "
+                + "Check the order of the values passed to run(...) — binding is positional."
         }
     }
 }

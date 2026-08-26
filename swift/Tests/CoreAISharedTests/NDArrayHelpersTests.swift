@@ -137,3 +137,86 @@ struct BFloat16FlattenTests {
         #expect(result == [3.0, 4.0])
     }
 }
+
+// MARK: - Stride-aware fill and read
+
+/// `fillNDArray` and `readNDArray` index by stride so they survive alignment padding, which
+/// appears when the innermost dimension is small: FLUX.2's `img_ids` is `[1, 4096, 4]` fp32,
+/// a 16-byte row that the framework pads to a 64-byte stride.
+///
+/// This matters because writing such a buffer linearly — as `CoreAIDiffusionModelFunction`
+/// once did — scatters values across the padding. Each token then reads a *later* token's
+/// coordinates and only the first quarter of the grid gets written at all, which rendered as
+/// an image tiled 4x across its top quarter with the rest blank.
+///
+/// These round-trips exercise the stride walk whenever the buffer is padded. They pass on a
+/// densely packed buffer too, so they pin the contract rather than the padding itself — the
+/// bypass that caused the original defect can only be caught at the pipeline level, against a
+/// real asset whose descriptor reports padded strides.
+@Suite("Stride-aware fill and read")
+struct StrideAwareFillReadTests {
+    private func elementCount(_ array: NDArray) -> Int {
+        array.view(as: Float.self).withUnsafePointer { _, shape, _ in
+            (0..<shape.count).reduce(1) { $0 * shape[$1] }
+        }
+    }
+
+    /// FLUX.2 `img_ids`: one row per image token as [T, H, W, L].
+    @Test("A [1, 4096, 4] position-ID buffer round-trips exactly")
+    func imageIdsRoundTrip() {
+        let side = 64
+        let axisCount = 4
+        var ids = [Float](repeating: 0, count: side * side * axisCount)
+        for h in 0..<side {
+            for w in 0..<side {
+                let index = h * side + w
+                ids[index * axisCount + 1] = Float(h)
+                ids[index * axisCount + 2] = Float(w)
+            }
+        }
+
+        var array = NDArray(shape: [1, side * side, axisCount], scalarType: .float32)
+        fillNDArray(&array, as: Float.self, count: ids.count) { ids[$0] }
+
+        // Exact equality, not a tolerance: these are integer coordinates, and the failure
+        // mode being pinned is displacement rather than drift.
+        #expect(readNDArray(array, as: Float.self, count: ids.count) == ids)
+    }
+
+    /// FLUX.2 `txt_ids`: sequence index on the last axis, spatial axes unused.
+    @Test("A [1, 512, 4] position-ID buffer round-trips exactly")
+    func textIdsRoundTrip() {
+        let textSeqLen = 512
+        let axisCount = 4
+        var ids = [Float](repeating: 0, count: textSeqLen * axisCount)
+        for s in 0..<textSeqLen {
+            ids[s * axisCount + (axisCount - 1)] = Float(s)
+        }
+
+        var array = NDArray(shape: [1, textSeqLen, axisCount], scalarType: .float32)
+        fillNDArray(&array, as: Float.self, count: ids.count) { ids[$0] }
+        #expect(readNDArray(array, as: Float.self, count: ids.count) == ids)
+    }
+
+    /// A distinct value per element, so any displacement shows up rather than cancelling
+    /// against a repeated coordinate.
+    @Test("Every element of a small-innermost-dimension buffer is placed distinctly")
+    func distinctValuesSurviveRoundTrip() {
+        var array = NDArray(shape: [1, 1024, 4], scalarType: .float32)
+        let count = elementCount(array)
+        let values = (0..<count).map { Float($0) }
+        fillNDArray(&array, as: Float.self, count: count) { values[$0] }
+        #expect(readNDArray(array, as: Float.self, count: count) == values)
+    }
+
+    /// A large innermost dimension needs no padding, so this is the layout the pre-computed
+    /// RoPE tables used — and why the defect stayed hidden until an id-shaped input appeared.
+    @Test("A [4608, 128] table round-trips exactly")
+    func denseTableRoundTrip() {
+        var array = NDArray(shape: [4608, 128], scalarType: .float32)
+        let count = elementCount(array)
+        let values = (0..<count).map { Float($0 % 97) }
+        fillNDArray(&array, as: Float.self, count: count) { values[$0] }
+        #expect(readNDArray(array, as: Float.self, count: count) == values)
+    }
+}

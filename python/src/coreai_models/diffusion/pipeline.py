@@ -12,7 +12,7 @@ per component — plus tokenizer files and a pipeline.json descriptor.
 Supports:
 - Stable Diffusion 1.x / 2.x (UNet-based)
 - Stable Diffusion 3.x (MMDiT, T5-less)
-- FLUX.2 Klein (DiT-based, pre-computed RoPE)
+- FLUX.2 Klein (DiT-based)
 """
 
 import asyncio
@@ -327,6 +327,35 @@ def _save_tokenizer(model_id: str, output_path: Path, hf_pipe: Any, overwrite: b
 METADATA_VERSION = "0.2"
 
 
+def _prepare_assets(json_path: Path, exported_assets: dict[str, str]) -> dict[str, str]:
+    """Asset map for the manifest: this run's exports merged over the previous export's.
+
+    A partial run (--components) only knows what it just built, so without the merge it
+    would drop the rest of the bundle. Prior entries whose files are gone are dropped.
+    """
+    output_path = json_path.parent
+    assets: dict[str, str] = {}
+    if json_path.exists():
+        try:
+            with open(json_path) as f:
+                prior_assets = json.load(f).get("assets")
+        except (OSError, json.JSONDecodeError):
+            logger.warning(f"Ignoring unreadable {json_path}; rebuilding the asset list")
+            prior_assets = None
+        if isinstance(prior_assets, dict):
+            assets = {
+                name: filename
+                for name, filename in prior_assets.items()
+                if (output_path / str(filename)).exists()
+            }
+    preserved = [name for name in assets if name not in exported_assets]
+    if preserved:
+        logger.info(f"Preserving previously exported assets: {sorted(preserved)}")
+    for name, path_str in exported_assets.items():
+        assets[name] = Path(path_str).name
+    return assets
+
+
 def _write_metadata_json(
     hf_pipe: Any,
     model_id: str,
@@ -347,10 +376,8 @@ def _write_metadata_json(
     else:
         diffusion_config = _build_sd_config(hf_pipe, model_id, pipeline_type)
 
-    # Build assets map from exported component paths
-    assets: dict[str, str] = {}
-    for name, path_str in exported_assets.items():
-        assets[name] = Path(path_str).name
+    json_path = output_path / "metadata.json"
+    assets = _prepare_assets(json_path, exported_assets)
 
     metadata = {
         "metadata_version": METADATA_VERSION,
@@ -369,7 +396,6 @@ def _write_metadata_json(
         },
     }
 
-    json_path = output_path / "metadata.json"
     with open(json_path, "w") as f:
         json.dump(metadata, f, indent=2)
     logger.info(f"Saved metadata.json to {json_path}")
