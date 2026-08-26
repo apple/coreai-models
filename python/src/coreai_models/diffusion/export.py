@@ -88,6 +88,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Include half-resolution VAEs for tiled decode.",
     )
     parser.add_argument(
+        "--multifunction",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Export FLUX.2 transformer as multi-function .aimodel with 5 functions "
+        "(main, half, img2img_quarter/half/full) sharing weights. "
+        "Default: enabled. Use --no-multifunction for separate single-function models.",
+    )
+    parser.add_argument(
         "--experimental",
         action="store_true",
         help="Allow exporting models without a registry preset. Requires --compute-precision.",
@@ -178,7 +186,7 @@ def main() -> None:
         parser.error("Cannot specify both --components and --platform. Use only one.")
 
     if args.components:
-        valid = get_valid_components(pipeline_type)
+        valid = get_valid_components(pipeline_type, multifunction=args.multifunction)
         invalid = [c for c in args.components if c not in valid]
         if invalid:
             parser.error(
@@ -193,7 +201,19 @@ def main() -> None:
         if resolution is None:
             resolution = 512 if args.platform == "iOS" else 1024
 
-        if resolution == 512:
+        if args.multifunction:
+            # Multi-function mode: single transformer has all variants
+            target_components = [
+                "transformer",
+                "text_encoder",
+                "vae_decoder",
+                "vae_encoder",
+            ]
+            # Always include half VAEs for img2img reference encoding
+            for half in ["vae_decoder_half", "vae_encoder_half"]:
+                if half not in target_components:
+                    target_components.append(half)
+        elif resolution == 512:
             target_components = [
                 "transformer_512",
                 "text_encoder",
@@ -208,11 +228,11 @@ def main() -> None:
                 "vae_encoder",
             ]
 
-        # --low-memory adds half VAEs for tiled decode
-        if args.low_memory:
-            for half in ["vae_decoder_half", "vae_encoder_half"]:
-                if half not in target_components:
-                    target_components.append(half)
+            # --low-memory adds half VAEs for tiled decode
+            if args.low_memory:
+                for half in ["vae_decoder_half", "vae_encoder_half"]:
+                    if half not in target_components:
+                        target_components.append(half)
 
     config = DiffusionExportConfig(
         hf_model_id=hf_model_id,
@@ -222,6 +242,7 @@ def main() -> None:
         compression=compression,
         overwrite=args.overwrite,
         include_debug_info=args.include_debug_info,
+        multifunction=args.multifunction,
     )
 
     if args.dry_run:
@@ -233,8 +254,9 @@ def main() -> None:
         if config.components:
             print(f"  components:         {', '.join(config.components)}")
         else:
-            print("  components:         all")
-        print(f"  overwrite:          {config.overwrite}")
+            print("  components:        all")
+        print(f"  multifunction:     {config.multifunction}")
+        print(f"  overwrite:         {config.overwrite}")
         print(f"  include_debug_info: {config.include_debug_info}")
         return
 

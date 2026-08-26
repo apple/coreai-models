@@ -34,19 +34,46 @@ extension Flux2Pipeline {
             throw PipelineLoadError.missingComponent("text_encoder")
         }
 
-        // Select transformer by mode (explicit name, not auto-detect)
-        let transformerName: String
+        // Select transformer by mode.
+        // Prefer the multi-function Transformer.aimodel — it holds the "half"
+        // function AND the img2img_512_* functions. Only fall back to the legacy
+        // single-function Transformer_512.aimodel when the multi-function model is
+        // absent (or is a legacy full-only model without a "half" function).
+        let transformer: CoreAIDiffusionModelFunction
+        let transformerFnName: String
         switch resolvedMode {
         case .full, .tiled:
             guard let path = Self.resolveAsset(at: url, name: "Transformer") else {
                 throw PipelineLoadError.missingComponent("Transformer")
             }
-            transformerName = path
+            transformer = CoreAIDiffusionModelFunction(modelURL: url.appendingPathComponent(path))
+            transformerFnName = "main"
         case .half:
-            guard let path = Self.resolveAsset(at: url, name: "Transformer_512") else {
-                throw PipelineLoadError.missingComponent("Transformer_512")
+            if let path = Self.resolveAsset(at: url, name: "Transformer") {
+                let candidate = CoreAIDiffusionModelFunction(
+                    modelURL: url.appendingPathComponent(path))
+                if try await candidate.hasFunction(named: "half") {
+                    // Multi-function model: use its "half" function (img2img uses
+                    // img2img_512_* from the same asset).
+                    transformer = candidate
+                    transformerFnName = "half"
+                } else if let path512 = Self.resolveAsset(at: url, name: "Transformer_512") {
+                    transformer = CoreAIDiffusionModelFunction(
+                        modelURL: url.appendingPathComponent(path512))
+                    transformerFnName = "main"
+                } else {
+                    // Full-only Transformer without a "half" function and no
+                    // Transformer_512 — best effort with "main".
+                    transformer = candidate
+                    transformerFnName = "main"
+                }
+            } else if let path512 = Self.resolveAsset(at: url, name: "Transformer_512") {
+                transformer = CoreAIDiffusionModelFunction(
+                    modelURL: url.appendingPathComponent(path512))
+                transformerFnName = "main"
+            } else {
+                throw PipelineLoadError.missingComponent("Transformer or Transformer_512")
             }
-            transformerName = path
         case .auto:
             preconditionFailure("auto resolved above")
         }
@@ -68,8 +95,6 @@ extension Flux2Pipeline {
             preconditionFailure("auto resolved above")
         }
 
-        let transformer = CoreAIDiffusionModelFunction(
-            modelURL: url.appendingPathComponent(transformerName))
         let textEncoder = CoreAIDiffusionModelFunction(
             modelURL: url.appendingPathComponent(textEncoderPath))
         let decoder = CoreAIDiffusionModelFunction(
@@ -107,6 +132,7 @@ extension Flux2Pipeline {
         self.textEncoder = textEncoder
         self.decoder = decoder
         self.encoder = encoder
+        self.transformerFunctionName = transformerFnName
         self.tokenizer = tokenizer
         self.batchNormMean = bnMean
         self.batchNormVar = bnVar

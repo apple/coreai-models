@@ -12,6 +12,7 @@ import Foundation
 import ImageIO
 
 extension DecodeResolution: ExpressibleByArgument {}
+extension ReferenceGrid: ExpressibleByArgument {}
 
 @main
 struct DiffusionRunner: AsyncParsableCommand {
@@ -65,6 +66,15 @@ struct DiffusionRunner: AsyncParsableCommand {
 
     @Option(help: "VAE decode resolution: full, half, or tiled (default: full)")
     var decodeResolution: DecodeResolution = .full
+
+    @Option(
+        help:
+            "img2img reference-token grid, relative to the output grid: full (1:1, ~4096 tokens @1024 / 1024 @512), half (1/4 the tokens), quarter (1/16 the tokens). Only applies with --input-image. Default: full"
+    )
+    var referenceGrid: ReferenceGrid?
+
+    @Flag(help: "Use manual CFG (two forward passes) for stronger text guidance in img2img")
+    var manualCfg: Bool = false
 
     @Option(name: .customLong("parity-test"), help: "Path to parity data directory (numpy .npy files)")
     var parityTestDir: String?
@@ -126,6 +136,13 @@ struct DiffusionRunner: AsyncParsableCommand {
             startingCGImage = img
         }
 
+        // --reference-grid only affects the img2img reference-token path; it is
+        // ignored for txt2img. Warn if it was set without an input image.
+        if referenceGrid != nil && startingCGImage == nil {
+            FileHandle.standardError.write(
+                Data("Warning: --reference-grid is ignored without --input-image (txt2img).\n".utf8))
+        }
+
         let config = PipelineConfiguration(
             prompt: prompt,
             negativePrompt: negativePrompt,
@@ -135,6 +152,8 @@ struct DiffusionRunner: AsyncParsableCommand {
             schedulerType: schedulerType,
             startingImage: startingCGImage,
             strength: strength,
+            referenceGrid: referenceGrid ?? .full,
+            manualCFG: manualCfg,
             encoderScaleFactor: resolvedDescriptor.encoderScaleFactor ?? 0.18215,
             decoderScaleFactor: resolvedDescriptor.decoderScaleFactor ?? 0.18215,
             decoderShiftFactor: resolvedDescriptor.decoderShiftFactor ?? 0.0,

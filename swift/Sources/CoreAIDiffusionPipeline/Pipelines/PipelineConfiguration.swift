@@ -22,6 +22,19 @@ extension DecodeResolution: CustomStringConvertible {
     public var description: String { rawValue }
 }
 
+/// Size of the img2img reference-token grid, relative to the output/noise grid
+/// (FLUX.2 reference-token concatenation). A larger grid gives stronger structural
+/// fidelity to the reference at the cost of more compute per step. Token counts are
+/// resolution-dependent: at 1024 the grid side is 64, at 512 it is 32.
+public enum ReferenceGrid: String, Hashable, Sendable, CaseIterable {
+    /// Full grid — matches the output grid 1:1 (64×64=4096 tokens @1024, 32×32=1024 @512). ~2× compute.
+    case full
+    /// Half the linear side — a quarter of the tokens (1024 @1024, 256 @512). Good balance.
+    case half
+    /// Quarter the linear side — 1/16 of the tokens (256 @1024, 64 @512). Fast, coarse guidance.
+    case quarter
+}
+
 /// User-facing configuration for image generation.
 public struct PipelineConfiguration: Hashable, Sendable {
     public var prompt: String
@@ -34,6 +47,8 @@ public struct PipelineConfiguration: Hashable, Sendable {
     // Image-to-image
     public var startingImage: CGImage?
     public var strength: Float
+    public var referenceGrid: ReferenceGrid
+    public var manualCFG: Bool
 
     // VAE scale factors (from pipeline.json)
     public var encoderScaleFactor: Float
@@ -60,6 +75,8 @@ public struct PipelineConfiguration: Hashable, Sendable {
         schedulerType: SchedulerType = .dpmSolverMultistep,
         startingImage: CGImage? = nil,
         strength: Float = 1.0,
+        referenceGrid: ReferenceGrid = .full,
+        manualCFG: Bool = false,
         encoderScaleFactor: Float = 0.18215,
         decoderScaleFactor: Float = 0.18215,
         decoderShiftFactor: Float = 0.0,
@@ -76,6 +93,8 @@ public struct PipelineConfiguration: Hashable, Sendable {
         self.schedulerType = schedulerType
         self.startingImage = startingImage
         self.strength = strength
+        self.referenceGrid = referenceGrid
+        self.manualCFG = manualCFG
         self.encoderScaleFactor = encoderScaleFactor
         self.decoderScaleFactor = decoderScaleFactor
         self.decoderShiftFactor = decoderShiftFactor
@@ -98,6 +117,7 @@ extension PipelineConfiguration {
         hasher.combine(guidanceScale)
         hasher.combine(schedulerType)
         hasher.combine(strength)
+        hasher.combine(referenceGrid)
         hasher.combine(encoderScaleFactor)
         hasher.combine(decoderScaleFactor)
         hasher.combine(decoderShiftFactor)
@@ -115,6 +135,7 @@ extension PipelineConfiguration {
             && lhs.guidanceScale == rhs.guidanceScale
             && lhs.schedulerType == rhs.schedulerType
             && lhs.strength == rhs.strength
+            && lhs.referenceGrid == rhs.referenceGrid
             && lhs.encoderScaleFactor == rhs.encoderScaleFactor
             && lhs.decoderScaleFactor == rhs.decoderScaleFactor
             && lhs.decoderShiftFactor == rhs.decoderShiftFactor

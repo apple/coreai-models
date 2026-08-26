@@ -12,7 +12,9 @@ import Foundation
 public actor CoreAIDiffusionModelFunction {
     private let modelURL: URL
     private var model: AIModel?
-    private var function: InferenceFunction?
+    /// Cached InferenceFunctions keyed by name. Reusing loaded functions (rather
+    /// than reloading per call) avoids a GPU memory leak — see PR #110.
+    private var functionCache: [String: InferenceFunction] = [:]
     private var isLoaded = false
 
     public init(modelURL: URL) {
@@ -26,19 +28,33 @@ public actor CoreAIDiffusionModelFunction {
 
         let options = SpecializationOptions(preferredComputeUnitKind: .gpu)
         let loadedModel = try await AIModel(contentsOf: modelURL, options: options)
+        self.model = loadedModel
         guard let fn = try loadedModel.loadFunction(named: "main") else {
             throw CoreAIDiffusionError.functionNotFound("main", modelURL)
         }
 
-        self.model = loadedModel
-        self.function = fn
+        self.functionCache["main"] = fn
         self.isLoaded = true
     }
 
     public func unloadResources() {
-        function = nil
+        functionCache.removeAll()
         model = nil
         isLoaded = false
+    }
+
+    /// Whether the model asset declares a function with the given name.
+    ///
+    /// Answers from the asset's function table only — it does not resolve the
+    /// function, so no weights are materialized. `loadFunction` would make a
+    /// GPU-resident copy of the entire weight set (3.5 GB for the FLUX.2
+    /// transformer) and hold it for the lifetime of this actor; opening the
+    /// asset alone costs ~100 MB and is released when this returns.
+    public func hasFunction(named name: String) async throws -> Bool {
+        if let model { return model.functionNames.contains(name) }
+        let options = SpecializationOptions(preferredComputeUnitKind: .gpu)
+        let probe = try await AIModel(contentsOf: modelURL, options: options)
+        return probe.functionNames.contains(name)
     }
 
     // MARK: - [Float]-based API
@@ -83,12 +99,14 @@ public actor CoreAIDiffusionModelFunction {
         }
     }
 
-    public func run(floatInputs: [([Float], [Int])]) async throws -> [Float] {
-        try await run(inputs: floatInputs.map { .floats($0.0, $0.1) })
+    public func run(
+        floatInputs: [([Float], [Int])], functionName: String = "main"
+    ) async throws -> [Float] {
+        try await run(inputs: floatInputs.map { .floats($0.0, $0.1) }, functionName: functionName)
     }
 
-    public func run(inputs: [ModelInput]) async throws -> [Float] {
-        let fn = try await ensureLoaded()
+    public func run(inputs: [ModelInput], functionName: String = "main") async throws -> [Float] {
+        let fn = try await function(named: functionName)
 
         var namedInputs: [String: NDArray] = [:]
         for (i, name) in fn.descriptor.inputNames.enumerated() where i < inputs.count {
@@ -190,8 +208,27 @@ public actor CoreAIDiffusionModelFunction {
     // MARK: - Core inference
 
     private func ensureLoaded() async throws -> InferenceFunction {
-        if function == nil { try await loadResources() }
-        guard let fn = function else { throw CoreAIDiffusionError.notLoaded }
+        try await function(named: "main")
+    }
+
+    /// Return the named InferenceFunction, loading the model and caching the
+    /// function on first use. Throws if the function is absent from the asset.
+    private func function(named name: String) async throws -> InferenceFunction {
+        guard let fn = try await functionIfPresent(named: name) else {
+            throw CoreAIDiffusionError.functionNotFound(name, modelURL)
+        }
+        return fn
+    }
+
+    /// Like `function(named:)` but returns nil (instead of throwing) when the
+    /// function is not present in the model asset.
+    private func functionIfPresent(named name: String) async throws -> InferenceFunction? {
+        if !isLoaded { try await loadResources() }
+        if let cached = functionCache[name] { return cached }
+        guard let mdl = model, let fn = try mdl.loadFunction(named: name) else {
+            return nil
+        }
+        functionCache[name] = fn
         return fn
     }
 
