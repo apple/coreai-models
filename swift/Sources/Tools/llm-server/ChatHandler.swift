@@ -85,7 +85,9 @@ private func handleAutoRoute(request: Request, state: ServerState) async throws 
     }
 }
 
-private func handleChatCompletionsFromBody(body: ByteBuffer, state: ServerState, sessionID: String? = nil) async throws -> Response {
+private func handleChatCompletionsFromBody(body: ByteBuffer, state: ServerState, sessionID: String? = nil) async throws
+    -> Response
+{
     guard state.tryAcquire() else {
         let err = ErrorResponse(error: .init(message: "Server is busy.", type: "server_error", code: "busy"))
         let data = try JSONEncoder().encode(err)
@@ -109,7 +111,8 @@ private func handleChatCompletionsFromBody(body: ByteBuffer, state: ServerState,
         if shouldStream {
             return try await handleStreamingRequest(chatRequest: chatRequest, state: state, sessionID: sessionID)
         } else {
-            let response = try await handleNonStreamingRequest(chatRequest: chatRequest, state: state, sessionID: sessionID)
+            let response = try await handleNonStreamingRequest(
+                chatRequest: chatRequest, state: state, sessionID: sessionID)
             state.release()
             return response
         }
@@ -133,14 +136,17 @@ private func handleChatCompletionsFromBody(body: ByteBuffer, state: ServerState,
 
 // MARK: - Route Handler
 
-private func handleChatCompletionsRoute(request: Request, state: ServerState, sessionID: String? = nil) async throws -> Response {
+private func handleChatCompletionsRoute(request: Request, state: ServerState, sessionID: String? = nil) async throws
+    -> Response
+{
     let body = try await request.body.collect(upTo: 10 * 1024 * 1024)
     return try await handleChatCompletionsFromBody(body: body, state: state, sessionID: sessionID)
 }
 
 // MARK: - Non-Streaming
 
-private func handleNonStreamingRequest(chatRequest: ChatCompletionRequest, state: ServerState, sessionID: String? = nil) async throws -> Response
+private func handleNonStreamingRequest(chatRequest: ChatCompletionRequest, state: ServerState, sessionID: String? = nil)
+    async throws -> Response
 {
     let requestMaxTokens = chatRequest.maxCompletionTokens ?? chatRequest.maxTokens ?? state.config.defaultMaxTokens
     guard requestMaxTokens > 0 else {
@@ -243,7 +249,9 @@ private func handleNonStreamingRequest(chatRequest: ChatCompletionRequest, state
 
 // MARK: - Streaming (SSE)
 
-private func handleStreamingRequest(chatRequest: ChatCompletionRequest, state: ServerState, sessionID: String? = nil) async throws -> Response {
+private func handleStreamingRequest(chatRequest: ChatCompletionRequest, state: ServerState, sessionID: String? = nil)
+    async throws -> Response
+{
     let requestMaxTokens = chatRequest.maxCompletionTokens ?? chatRequest.maxTokens ?? state.config.defaultMaxTokens
     guard requestMaxTokens > 0 else {
         throw ServerError.badRequest("max_tokens must be positive")
