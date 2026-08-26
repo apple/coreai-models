@@ -872,3 +872,5 @@ class TestQwen2ForCausalLM(ForCausalLMTestBase):
     _model_class = CoreaiTorchQwen2ForCausalLM
     _test_weights_tying = True
     _test_weight_activation_quantization = True
+    # opt out of eager mode quantization for toy qwen2 model
+    _test_eager_activation_quantization = False

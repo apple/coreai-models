@@ -34,6 +34,7 @@ dependencies = [
     "setuptools>=42",
     "numpy>=2.2,<3.0",
     "tqdm>=4.67,<5.0",
+    "datasets>=4.0,<5.0",
     "rich>=14.0,<15.0",
     "transformers>=5.5.0,<6.0",
     "huggingface-hub>=1.5.0,<2.0",

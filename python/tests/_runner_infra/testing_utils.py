@@ -825,6 +825,7 @@ class ForCausalLMTestBase:
     _test_weights_tying: bool = False
     _test_kv_cache: bool = True
     _test_weight_activation_quantization: bool = False
+    _test_eager_activation_quantization: bool = True
 
     @pytest.fixture(autouse=True)
     def _skip_if_hf_unreachable(self) -> None:
@@ -957,8 +958,12 @@ class ForCausalLMTestBase:
         if not self._test_weight_activation_quantization:
             pytest.skip("Weight/Activation Quantization test not enabled for this model")
 
-        if activation_quantization:
-            pytest.skip("Activation quantization temporarily disabled with eager mode quantization")
+        if (
+            quantization_mode == "eager"
+            and activation_quantization
+            and not self._test_eager_activation_quantization
+        ):
+            pytest.skip("Eager-mode activation quantization test not enabled for this model")
 
         # Same building blocks as `_async_export_model`: load HF ->
         # `quantize_for_export` -> `export_macos_model`. Calling those rather than
@@ -1014,7 +1019,13 @@ class ForCausalLMTestBase:
                 rms_norm_cls: None,
             },
             "execution_mode": quantization_mode,
+            "calibrate_activations": activation_quantization,
         }
+
+        def calibration_data_fn() -> list[torch.Tensor]:
+            return [
+                torch.randint(1, hf_config.vocab_size, (1, 16), dtype=torch.int32) for _ in range(2)
+            ]
 
         max_context_length = 4096
         target_dtype = torch.float16
@@ -1050,7 +1061,7 @@ class ForCausalLMTestBase:
                 hf_config,
                 target_dtype,
                 dict(torch_quantization_config),
-                calibration_data_fn=None,
+                calibration_data_fn=calibration_data_fn if activation_quantization else None,
                 mmap_dir=quantizer_mmap_dir,
             )
 
