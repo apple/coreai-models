@@ -82,6 +82,20 @@ final class ServerStats: @unchecked Sendable {
             ==================================================
             """)
     }
+
+    func buildResponse(prefixHitRate: Double, prefixHits: Int, prefixMisses: Int) -> StatsResponse {
+        let s = lock.withLock { $0 }
+        return StatsResponse(
+            totalRequests: s.totalRequests,
+            totalPromptTokens: s.totalPromptTokens,
+            totalGenTokens: s.totalGenTokens,
+            avgPrefillTokPerSec: s.totalPromptSeconds > 0 ? Double(s.totalPromptTokens) / s.totalPromptSeconds : 0,
+            avgDecodeTokPerSec: s.totalGenSeconds > 0 ? Double(s.totalGenTokens) / s.totalGenSeconds : 0,
+            prefixHitRate: prefixHitRate,
+            prefixHits: prefixHits,
+            prefixMisses: prefixMisses
+        )
+    }
 }
 
 // MARK: - Server State
@@ -91,7 +105,15 @@ final class ServerState: @unchecked Sendable {
     let tokenizer: any Tokenizer
     let config: ServerConfig
     let stats = ServerStats()
-    private let _generating = Mutex<Bool>(false)
+    private let _state = Mutex<InternalState>(InternalState())
+
+    private struct InternalState {
+        var generating: Bool = false
+        var lastSessionID: String? = nil
+        var lastPromptTokens: [Int32] = []
+        var prefixHits: Int = 0
+        var prefixMisses: Int = 0
+    }
 
     init(engine: any InferenceEngine, tokenizer: any Tokenizer, config: ServerConfig) {
         self.engine = engine
@@ -100,15 +122,69 @@ final class ServerState: @unchecked Sendable {
     }
 
     func tryAcquire() -> Bool {
-        _generating.withLock { busy in
-            guard !busy else { return false }
-            busy = true
+        _state.withLock { s in
+            guard !s.generating else { return false }
+            s.generating = true
             return true
         }
     }
 
     func release() {
-        _generating.withLock { $0 = false }
+        _state.withLock { $0.generating = false }
+    }
+
+    /// Prepare engine for a new request. Returns the number of prefix tokens reused.
+    func prepareForRequest(sessionID: String?, promptTokens: [Int32]) async -> Int {
+        let action = _state.withLock { s -> PrepareAction in
+            guard let sid = sessionID, sid == s.lastSessionID else {
+                s.lastSessionID = sessionID
+                s.lastPromptTokens = []
+                s.prefixMisses += 1
+                return .reset
+            }
+
+            let cached = s.lastPromptTokens
+            var match = 0
+            let limit = min(cached.count, promptTokens.count)
+            while match < limit && cached[match] == promptTokens[match] {
+                match += 1
+            }
+
+            if match == 0 {
+                s.prefixMisses += 1
+                return .reset
+            }
+
+            s.prefixHits += 1
+            return .reuse(prefixLength: match)
+        }
+
+        switch action {
+        case .reset:
+            return 0
+        case .reuse(let prefixLength):
+            return prefixLength
+        }
+    }
+
+    /// Record the tokens that were processed (call after generate completes).
+    func recordPromptTokens(_ tokens: [Int32]) {
+        _state.withLock { $0.lastPromptTokens = tokens }
+    }
+
+    /// Stats snapshot for /v1/stats endpoint.
+    func statsSnapshot() -> StatsResponse {
+        let s = _state.withLock { s in
+            (prefixHits: s.prefixHits, prefixMisses: s.prefixMisses)
+        }
+        let hitTotal = s.prefixHits + s.prefixMisses
+        let hitRate = hitTotal > 0 ? Double(s.prefixHits) / Double(hitTotal) : 0
+        return stats.buildResponse(prefixHitRate: hitRate, prefixHits: s.prefixHits, prefixMisses: s.prefixMisses)
+    }
+
+    private enum PrepareAction {
+        case reset
+        case reuse(prefixLength: Int)
     }
 
     func makeSamplingConfig(
@@ -158,5 +234,29 @@ enum ServerError: Error, LocalizedError {
         switch self {
         case .badRequest(let msg): return msg
         }
+    }
+}
+
+// MARK: - Stats Response
+
+struct StatsResponse: Codable, Sendable {
+    let totalRequests: Int
+    let totalPromptTokens: Int
+    let totalGenTokens: Int
+    let avgPrefillTokPerSec: Double
+    let avgDecodeTokPerSec: Double
+    let prefixHitRate: Double
+    let prefixHits: Int
+    let prefixMisses: Int
+
+    enum CodingKeys: String, CodingKey {
+        case totalRequests = "total_requests"
+        case totalPromptTokens = "total_prompt_tokens"
+        case totalGenTokens = "total_gen_tokens"
+        case avgPrefillTokPerSec = "avg_prefill_tok_per_sec"
+        case avgDecodeTokPerSec = "avg_decode_tok_per_sec"
+        case prefixHitRate = "prefix_hit_rate"
+        case prefixHits = "prefix_hits"
+        case prefixMisses = "prefix_misses"
     }
 }
