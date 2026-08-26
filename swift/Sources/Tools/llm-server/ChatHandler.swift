@@ -43,8 +43,8 @@ func startServer(state: ServerState, port: Int) async throws {
     }
 
     router.post("/v1/chat/completions") { request, _ in
-        let sessionID: String? =
-            if let name = HTTPField.Name("X-Session-ID") { request.headers[name] } else { nil }
+        let sessionID =
+            HTTPField.Name("X-Session-ID").flatMap { request.headers[$0] } ?? "default"
         return try await handleChatCompletionsRoute(request: request, state: state, sessionID: sessionID)
     }
 
