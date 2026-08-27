@@ -177,7 +177,8 @@ private func handleNonStreamingRequest(chatRequest: ChatCompletionRequest, state
         "[\(requestID)] messages: \(chatRequest.messages.count), tokens: \(promptTokens.count), max_tokens: \(requestMaxTokens)",
         component: "Server")
 
-    let prefixReused = await state.prepareForRequest(sessionID: sessionID, promptTokens: promptTokens.map { Int32($0) })
+    let promptTokensInt32 = promptTokens.map { Int32($0) }
+    let prefixReused = await state.prepareForRequest(sessionID: sessionID, promptTokens: promptTokensInt32)
     if prefixReused > 0 {
         CLILogger.log("[\(requestID)] prefix reuse: \(prefixReused) tokens cached", component: "Server")
     }
@@ -220,7 +221,7 @@ private func handleNonStreamingRequest(chatRequest: ChatCompletionRequest, state
     state.stats.record(
         promptTokens: promptTokens.count, genTokens: genTokenCount, promptSeconds: 0, genSeconds: seconds,
         totalSeconds: seconds)
-    state.recordPromptTokens(promptTokens.map { Int32($0) })
+    state.recordPromptTokens(promptTokensInt32)
 
     let response = ChatCompletionResponse(
         id: requestID,
@@ -281,7 +282,8 @@ private func handleStreamingRequest(chatRequest: ChatCompletionRequest, state: S
         "[\(requestID)] stream, messages: \(chatRequest.messages.count), tokens: \(promptTokens.count), max_tokens: \(requestMaxTokens)",
         component: "Server")
 
-    let prefixReused = await state.prepareForRequest(sessionID: sessionID, promptTokens: promptTokens.map { Int32($0) })
+    let promptTokensInt32 = promptTokens.map { Int32($0) }
+    let prefixReused = await state.prepareForRequest(sessionID: sessionID, promptTokens: promptTokensInt32)
     if prefixReused > 0 {
         CLILogger.log("[\(requestID)] prefix reuse: \(prefixReused) tokens cached", component: "Server")
     }
@@ -370,7 +372,7 @@ private func handleStreamingRequest(chatRequest: ChatCompletionRequest, state: S
             state.stats.record(
                 promptTokens: promptTokens.count, genTokens: tokenCount, promptSeconds: 0, genSeconds: seconds,
                 totalSeconds: seconds)
-            state.recordPromptTokens(promptTokens.map { Int32($0) })
+            state.recordPromptTokens(promptTokensInt32)
 
             try await writer.finish(nil)
         } catch {
