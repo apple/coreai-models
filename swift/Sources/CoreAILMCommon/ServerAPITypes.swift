@@ -545,3 +545,107 @@ public struct ToolCallFunctionDelta: Encodable, Sendable {
         self.arguments = arguments
     }
 }
+
+// MARK: - Stats Response
+
+public struct StatsResponse: Codable, Sendable {
+    public let totalRequests: Int
+    public let totalPromptTokens: Int
+    public let totalGenTokens: Int
+    public let avgPrefillTokPerSec: Double
+    public let avgDecodeTokPerSec: Double
+    public let prefixHitRate: Double
+    public let prefixHits: Int
+    public let prefixMisses: Int
+    public let totalToolCalls: Int
+    public let topTools: [ToolCallStat]?
+
+    public init(
+        totalRequests: Int, totalPromptTokens: Int, totalGenTokens: Int,
+        avgPrefillTokPerSec: Double, avgDecodeTokPerSec: Double,
+        prefixHitRate: Double, prefixHits: Int, prefixMisses: Int,
+        totalToolCalls: Int = 0, topTools: [ToolCallStat]? = nil
+    ) {
+        self.totalRequests = totalRequests
+        self.totalPromptTokens = totalPromptTokens
+        self.totalGenTokens = totalGenTokens
+        self.avgPrefillTokPerSec = avgPrefillTokPerSec
+        self.avgDecodeTokPerSec = avgDecodeTokPerSec
+        self.prefixHitRate = prefixHitRate
+        self.prefixHits = prefixHits
+        self.prefixMisses = prefixMisses
+        self.totalToolCalls = totalToolCalls
+        self.topTools = topTools
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case totalRequests = "total_requests"
+        case totalPromptTokens = "total_prompt_tokens"
+        case totalGenTokens = "total_gen_tokens"
+        case avgPrefillTokPerSec = "avg_prefill_tok_per_sec"
+        case avgDecodeTokPerSec = "avg_decode_tok_per_sec"
+        case prefixHitRate = "prefix_hit_rate"
+        case prefixHits = "prefix_hits"
+        case prefixMisses = "prefix_misses"
+        case totalToolCalls = "total_tool_calls"
+        case topTools = "top_tools"
+    }
+}
+
+public struct ToolCallStat: Codable, Sendable {
+    public let name: String
+    public let count: Int
+
+    public init(name: String, count: Int) {
+        self.name = name
+        self.count = count
+    }
+}
+
+// MARK: - Ready Response
+
+public struct ReadyResponse: Codable, Sendable {
+    public let status: String
+    public let model: String
+    public let maxContextLength: Int
+    public let busy: Bool
+    public let cache: CacheStatus
+    public let toolCalling: Bool
+
+    public init(
+        status: String, model: String, maxContextLength: Int,
+        busy: Bool, cache: CacheStatus, toolCalling: Bool
+    ) {
+        self.status = status
+        self.model = model
+        self.maxContextLength = maxContextLength
+        self.busy = busy
+        self.cache = cache
+        self.toolCalling = toolCalling
+    }
+
+    public struct CacheStatus: Codable, Sendable {
+        public let usedTokens: Int
+        public let maxTokens: Int
+        public let utilization: Double
+
+        public init(usedTokens: Int, maxTokens: Int, utilization: Double) {
+            self.usedTokens = usedTokens
+            self.maxTokens = maxTokens
+            self.utilization = utilization
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case usedTokens = "used_tokens"
+            case maxTokens = "max_tokens"
+            case utilization
+        }
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case status, model
+        case maxContextLength = "max_context_length"
+        case busy, cache
+        case toolCalling = "tool_calling"
+    }
+}

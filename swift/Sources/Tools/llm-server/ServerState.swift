@@ -3,6 +3,7 @@
 // Use of this source code is governed by a BSD-3-clause license that can
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
+import CoreAILMCommon
 import CoreAILanguageModels
 import CoreAIShared
 import Foundation
@@ -293,68 +294,5 @@ enum ServerError: Error, LocalizedError {
         switch self {
         case .badRequest(let msg): return msg
         }
-    }
-}
-
-// MARK: - Stats Response
-
-struct StatsResponse: Codable, Sendable {
-    let totalRequests: Int
-    let totalPromptTokens: Int
-    let totalGenTokens: Int
-    let avgPrefillTokPerSec: Double
-    let avgDecodeTokPerSec: Double
-    let prefixHitRate: Double
-    let prefixHits: Int
-    let prefixMisses: Int
-    let totalToolCalls: Int
-    let topTools: [ToolCallStat]?
-
-    enum CodingKeys: String, CodingKey {
-        case totalRequests = "total_requests"
-        case totalPromptTokens = "total_prompt_tokens"
-        case totalGenTokens = "total_gen_tokens"
-        case avgPrefillTokPerSec = "avg_prefill_tok_per_sec"
-        case avgDecodeTokPerSec = "avg_decode_tok_per_sec"
-        case prefixHitRate = "prefix_hit_rate"
-        case prefixHits = "prefix_hits"
-        case prefixMisses = "prefix_misses"
-        case totalToolCalls = "total_tool_calls"
-        case topTools = "top_tools"
-    }
-}
-
-struct ToolCallStat: Codable, Sendable {
-    let name: String
-    let count: Int
-}
-
-// MARK: - Ready Response
-
-struct ReadyResponse: Codable, Sendable {
-    let status: String
-    let model: String
-    let maxContextLength: Int
-    let busy: Bool
-    let cache: CacheStatus
-    let toolCalling: Bool
-
-    struct CacheStatus: Codable, Sendable {
-        let usedTokens: Int
-        let maxTokens: Int
-        let utilization: Double
-
-        enum CodingKeys: String, CodingKey {
-            case usedTokens = "used_tokens"
-            case maxTokens = "max_tokens"
-            case utilization
-        }
-    }
-
-    enum CodingKeys: String, CodingKey {
-        case status, model
-        case maxContextLength = "max_context_length"
-        case busy, cache
-        case toolCalling = "tool_calling"
     }
 }
