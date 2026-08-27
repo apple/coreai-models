@@ -18,6 +18,7 @@ public struct TokenInputHandler: SyncInputHandler {
     private let positionIdsName: String
     private let inputIdsDescriptor: NDArrayDescriptor
     private let positionIdsDescriptor: NDArrayDescriptor
+    private let useCompactPositionIds: Bool
 
     private var inputIdsArray: NDArray
     private var cachedBatchSize: Int
@@ -26,12 +27,14 @@ public struct TokenInputHandler: SyncInputHandler {
         inputIdsName: String,
         positionIdsName: String,
         inputIdsDescriptor: NDArrayDescriptor,
-        positionIdsDescriptor: NDArrayDescriptor
+        positionIdsDescriptor: NDArrayDescriptor,
+        useCompactPositionIds: Bool = false
     ) {
         self.inputIdsName = inputIdsName
         self.positionIdsName = positionIdsName
         self.inputIdsDescriptor = inputIdsDescriptor
         self.positionIdsDescriptor = positionIdsDescriptor
+        self.useCompactPositionIds = useCompactPositionIds
         self.inputNames = [inputIdsName, positionIdsName]
 
         let initDesc = inputIdsDescriptor.resolvingDynamicDimensions([1, 1])
@@ -51,10 +54,19 @@ public struct TokenInputHandler: SyncInputHandler {
         }
         fillNDArray(&inputIdsArray, as: Int32.self, with: tokens)
 
-        let totalPositions = context.processedTokenCount + batchSize
-        let resolvedPosDesc = positionIdsDescriptor.resolvingDynamicDimensions([1, totalPositions])
-        var positionIds = NDArray(descriptor: resolvedPosDesc)
-        fillNDArray(&positionIds, as: Int32.self, count: totalPositions) { Int32($0) }
+        let positionIds: NDArray
+        if useCompactPositionIds {
+            let resolvedPosDesc = positionIdsDescriptor.resolvingDynamicDimensions([1, batchSize])
+            var pos = NDArray(descriptor: resolvedPosDesc)
+            fillNDArray(&pos, as: Int32.self, count: batchSize) { Int32(context.processedTokenCount + $0) }
+            positionIds = pos
+        } else {
+            let totalPositions = context.processedTokenCount + batchSize
+            let resolvedPosDesc = positionIdsDescriptor.resolvingDynamicDimensions([1, totalPositions])
+            var pos = NDArray(descriptor: resolvedPosDesc)
+            fillNDArray(&pos, as: Int32.self, count: totalPositions) { Int32($0) }
+            positionIds = pos
+        }
 
         return [
             inputIdsName: inputIdsArray,
@@ -95,5 +107,55 @@ public struct CompositeInputHandler<Base: SyncInputHandler>: SyncInputHandler {
             inputs[extra.name] = try extra.prepare(context)
         }
         return inputs
+    }
+}
+
+// MARK: - TokenStaticInputHandler (new inout fill pattern)
+
+/// Zero-allocation token input filler. Fills `input_ids` and `position_ids`
+/// into pre-allocated buffers owned by the engine.
+public struct TokenStaticInputHandler: StaticInputHandler {
+    public let inputNames: [String]
+
+    private let inputIdsName: String
+    private let positionIdsName: String
+    private let inputIdsDescriptor: NDArrayDescriptor
+    private let positionIdsDescriptor: NDArrayDescriptor
+
+    public init(
+        inputIdsName: String,
+        positionIdsName: String,
+        inputIdsDescriptor: NDArrayDescriptor,
+        positionIdsDescriptor: NDArrayDescriptor
+    ) {
+        self.inputIdsName = inputIdsName
+        self.positionIdsName = positionIdsName
+        self.inputIdsDescriptor = inputIdsDescriptor
+        self.positionIdsDescriptor = positionIdsDescriptor
+        self.inputNames = [inputIdsName, positionIdsName]
+    }
+
+    public func registerBuffers(into buffers: inout InputBuffers) {
+        buffers.register(name: inputIdsName, descriptor: inputIdsDescriptor)
+        buffers.register(name: positionIdsName, descriptor: positionIdsDescriptor)
+    }
+
+    public func fill(_ context: InputContext, into buffers: inout InputBuffers) throws {
+        let tokens = context.tokens
+        let batchSize = tokens.count
+        precondition(batchSize > 0, "TokenStaticInputHandler: empty token batch")
+
+        // Ensure input_ids buffer has correct shape
+        buffers.ensureCapacity(name: inputIdsName, shape: [1, batchSize])
+        buffers.withBuffer(inputIdsName) { array in
+            fillNDArray(&array, as: Int32.self, with: tokens)
+        }
+
+        // Ensure position_ids buffer has correct shape
+        let totalPositions = context.processedTokenCount + batchSize
+        buffers.ensureCapacity(name: positionIdsName, shape: [1, totalPositions])
+        buffers.withBuffer(positionIdsName) { array in
+            fillNDArray(&array, as: Int32.self, count: totalPositions) { Int32($0) }
+        }
     }
 }
