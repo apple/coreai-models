@@ -226,6 +226,26 @@ final class ServerState: @unchecked Sendable {
         case reuse(prefixLength: Int)
     }
 
+    /// Readiness snapshot for /ready endpoint.
+    func readySnapshot() -> ReadyResponse {
+        let busy = _state.withLock { $0.generating }
+        let usedTokens = engine.processedTokenCount
+        let maxTokens = config.maxContextLength
+        let utilization = maxTokens > 0 ? Double(usedTokens) / Double(maxTokens) : 0
+        return ReadyResponse(
+            status: "ready",
+            model: config.modelName,
+            maxContextLength: maxTokens,
+            busy: busy,
+            cache: .init(
+                usedTokens: usedTokens,
+                maxTokens: maxTokens,
+                utilization: utilization
+            ),
+            toolCalling: supportsToolCalling
+        )
+    }
+
     func makeSamplingConfig(
         temperature: Double?,
         topP: Double?,
@@ -307,4 +327,34 @@ struct StatsResponse: Codable, Sendable {
 struct ToolCallStat: Codable, Sendable {
     let name: String
     let count: Int
+}
+
+// MARK: - Ready Response
+
+struct ReadyResponse: Codable, Sendable {
+    let status: String
+    let model: String
+    let maxContextLength: Int
+    let busy: Bool
+    let cache: CacheStatus
+    let toolCalling: Bool
+
+    struct CacheStatus: Codable, Sendable {
+        let usedTokens: Int
+        let maxTokens: Int
+        let utilization: Double
+
+        enum CodingKeys: String, CodingKey {
+            case usedTokens = "used_tokens"
+            case maxTokens = "max_tokens"
+            case utilization
+        }
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case status, model
+        case maxContextLength = "max_context_length"
+        case busy, cache
+        case toolCalling = "tool_calling"
+    }
 }

@@ -56,6 +56,16 @@ func startServer(state: ServerState, port: Int) async throws {
         try await handleCompletionsRoute(request: request, state: state)
     }
 
+    router.get("/ready") { _, _ in
+        let ready = state.readySnapshot()
+        let data = try JSONEncoder().encode(ready)
+        return Response(
+            status: .ok,
+            headers: [.contentType: "application/json"],
+            body: .init(byteBuffer: ByteBuffer(data: data))
+        )
+    }
+
     router.get("/v1/stats") { _, _ in
         let stats = state.statsSnapshot()
         let data = try JSONEncoder().encode(stats)
