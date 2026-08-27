@@ -188,17 +188,6 @@ LLM_PRESETS: list[ModelPreset] = [
         compression_config="models/qwen3/qwen3_0_6b_mixed_4bit_8bit.yaml",
     ),
     ModelPreset(
-        "qwen3-1.7b",
-        "Qwen/Qwen3-1.7B",
-        "qwen3",
-        "llm",
-        "iOS",
-        "none",
-        "float16",
-        IOS_DEFAULT_MAX_CONTEXT_LENGTH,
-        compression_config="models/qwen3/qwen3_1_7b_mixed_4bit_8bit.yaml",
-    ),
-    ModelPreset(
         "qwen2.5-1.5b-instruct",
         "Qwen/Qwen2.5-1.5B-Instruct",
         "qwen2.5",
