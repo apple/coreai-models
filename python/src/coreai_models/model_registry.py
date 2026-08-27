@@ -83,6 +83,7 @@ LLM_PRESETS: list[ModelPreset] = [
         32768,
     ),
     ModelPreset("qwen3-0.6b", "Qwen/Qwen3-0.6B", "qwen3", "llm", "macOS", "4bit", "float16", 8192),
+    ModelPreset("qwen3-1.7b", "Qwen/Qwen3-1.7B", "qwen3", "llm", "macOS", "4bit", "float16", 32768),
     ModelPreset("qwen3-4b", "Qwen/Qwen3-4B", "qwen3", "llm", "macOS", "4bit", "float16", 40960),
     ModelPreset("qwen3-8b", "Qwen/Qwen3-8B", "qwen3", "llm", "macOS", "4bit", "float16", 40960),
     ModelPreset(
