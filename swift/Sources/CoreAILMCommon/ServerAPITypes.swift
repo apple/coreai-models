@@ -18,14 +18,19 @@ public struct ChatCompletionRequest: Decodable, Sendable {
     public let stream: Bool?
     public let stop: [String]?
     public let responseFormat: ResponseFormat?
+    public let tools: [ToolDefinition]?
+    public let toolChoice: ToolChoice?
+    public let parallelToolCalls: Bool?
 
     enum CodingKeys: String, CodingKey {
-        case model, messages, temperature, stream, stop
+        case model, messages, temperature, stream, stop, tools
         case maxTokens = "max_tokens"
         case maxCompletionTokens = "max_completion_tokens"
         case topP = "top_p"
         case topK = "top_k"
         case responseFormat = "response_format"
+        case toolChoice = "tool_choice"
+        case parallelToolCalls = "parallel_tool_calls"
     }
 
     public init(from decoder: Decoder) throws {
@@ -39,6 +44,9 @@ public struct ChatCompletionRequest: Decodable, Sendable {
         topK = try container.decodeIfPresent(Int.self, forKey: .topK)
         stream = try container.decodeIfPresent(Bool.self, forKey: .stream)
         responseFormat = try container.decodeIfPresent(ResponseFormat.self, forKey: .responseFormat)
+        tools = try container.decodeIfPresent([ToolDefinition].self, forKey: .tools)
+        toolChoice = try container.decodeIfPresent(ToolChoice.self, forKey: .toolChoice)
+        parallelToolCalls = try container.decodeIfPresent(Bool.self, forKey: .parallelToolCalls)
 
         if let arr = try? container.decode([String].self, forKey: .stop) {
             stop = arr
@@ -123,6 +131,17 @@ public enum JSONValue: Codable, Sendable {
         case .null: try container.encodeNil()
         }
     }
+
+    public func asJSONObject() -> Any {
+        switch self {
+        case .string(let s): return s
+        case .number(let n): return n
+        case .bool(let b): return b
+        case .null: return NSNull()
+        case .object(let obj): return obj.mapValues { $0.asJSONObject() }
+        case .array(let arr): return arr.map { $0.asJSONObject() }
+        }
+    }
 }
 
 // MARK: - Chat Message
@@ -130,14 +149,22 @@ public enum JSONValue: Codable, Sendable {
 public struct ChatMessage: Decodable, Sendable {
     public let role: String
     public let content: MessageContent
+    public let toolCalls: [ToolCall]?
+    public let toolCallId: String?
+    public let name: String?
 
     enum CodingKeys: String, CodingKey {
-        case role, content
+        case role, content, name
+        case toolCalls = "tool_calls"
+        case toolCallId = "tool_call_id"
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         role = try container.decode(String.self, forKey: .role)
+        toolCalls = try container.decodeIfPresent([ToolCall].self, forKey: .toolCalls)
+        toolCallId = try container.decodeIfPresent(String.self, forKey: .toolCallId)
+        name = try container.decodeIfPresent(String.self, forKey: .name)
 
         if let text = try? container.decode(String.self, forKey: .content) {
             content = .text(text)
@@ -247,10 +274,22 @@ public struct ChatCompletionResponse: Encodable, Sendable {
 
     public struct ResponseMessage: Encodable, Sendable {
         public let role: String
-        public let content: String
-        public init(role: String, content: String) {
+        public let content: String?
+        public let toolCalls: [ToolCall]?
+        public init(role: String, content: String?, toolCalls: [ToolCall]? = nil) {
             self.role = role
             self.content = content
+            self.toolCalls = toolCalls
+        }
+        enum CodingKeys: String, CodingKey {
+            case role, content
+            case toolCalls = "tool_calls"
+        }
+        public func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(role, forKey: .role)
+            try container.encode(content, forKey: .content)
+            try container.encodeIfPresent(toolCalls, forKey: .toolCalls)
         }
     }
 
@@ -310,9 +349,21 @@ public struct ChatCompletionChunk: Encodable, Sendable {
     public struct Delta: Encodable, Sendable {
         public let role: String?
         public let content: String?
-        public init(role: String? = nil, content: String? = nil) {
+        public let toolCalls: [ToolCallDelta]?
+        public init(role: String? = nil, content: String? = nil, toolCalls: [ToolCallDelta]? = nil) {
             self.role = role
             self.content = content
+            self.toolCalls = toolCalls
+        }
+        enum CodingKeys: String, CodingKey {
+            case role, content
+            case toolCalls = "tool_calls"
+        }
+        public func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encodeIfPresent(role, forKey: .role)
+            try container.encode(content, forKey: .content)
+            try container.encodeIfPresent(toolCalls, forKey: .toolCalls)
         }
     }
 }
@@ -372,5 +423,125 @@ public struct ErrorResponse: Encodable, Sendable {
             self.type = type
             self.code = code
         }
+    }
+}
+
+// MARK: - Tool Calling Types
+
+public struct ToolDefinition: Codable, Sendable {
+    public let type: String
+    public let function: FunctionDefinition
+
+    public init(type: String = "function", function: FunctionDefinition) {
+        self.type = type
+        self.function = function
+    }
+}
+
+public struct FunctionDefinition: Codable, Sendable {
+    public let name: String
+    public let description: String?
+    public let parameters: JSONValue?
+    public let strict: Bool?
+
+    public init(name: String, description: String? = nil, parameters: JSONValue? = nil, strict: Bool? = nil) {
+        self.name = name
+        self.description = description
+        self.parameters = parameters
+        self.strict = strict
+    }
+}
+
+public enum ToolChoice: Sendable, Equatable {
+    case auto
+    case none
+    case required
+    case function(name: String)
+}
+
+extension ToolChoice: Codable {
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let str = try? container.decode(String.self) {
+            switch str {
+            case "auto": self = .auto
+            case "none": self = .none
+            case "required": self = .required
+            default: self = .auto
+            }
+        } else {
+            let obj = try container.decode(ToolChoiceObject.self)
+            self = .function(name: obj.function.name)
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .auto: try container.encode("auto")
+        case .none: try container.encode("none")
+        case .required: try container.encode("required")
+        case .function(let name):
+            try container.encode(ToolChoiceObject(function: ToolChoiceFunctionName(name: name)))
+        }
+    }
+
+    private struct ToolChoiceObject: Codable {
+        let type: String
+        let function: ToolChoiceFunctionName
+        init(function: ToolChoiceFunctionName) {
+            self.type = "function"
+            self.function = function
+        }
+    }
+
+    private struct ToolChoiceFunctionName: Codable {
+        let name: String
+    }
+}
+
+public struct ToolCall: Codable, Sendable {
+    public let id: String
+    public let type: String
+    public let function: ToolCallFunction
+
+    public init(id: String, type: String = "function", function: ToolCallFunction) {
+        self.id = id
+        self.type = type
+        self.function = function
+    }
+}
+
+public struct ToolCallFunction: Codable, Sendable {
+    public let name: String
+    public let arguments: String
+
+    public init(name: String, arguments: String) {
+        self.name = name
+        self.arguments = arguments
+    }
+}
+
+public struct ToolCallDelta: Encodable, Sendable {
+    public let index: Int
+    public let id: String?
+    public let type: String?
+    public let function: ToolCallFunctionDelta?
+
+    public init(index: Int, id: String? = nil, type: String? = nil, function: ToolCallFunctionDelta? = nil) {
+        self.index = index
+        self.id = id
+        self.type = type
+        self.function = function
+    }
+}
+
+public struct ToolCallFunctionDelta: Encodable, Sendable {
+    public let name: String?
+    public let arguments: String?
+
+    public init(name: String? = nil, arguments: String? = nil) {
+        self.name = name
+        self.arguments = arguments
     }
 }

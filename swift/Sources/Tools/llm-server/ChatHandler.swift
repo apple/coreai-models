@@ -164,7 +164,7 @@ private func handleNonStreamingRequest(chatRequest: ChatCompletionRequest, state
         minP: nil
     )
 
-    let promptTokens = tokenizeMessages(chatRequest.messages, state: state)
+    let promptTokens = tokenizeMessages(chatRequest.messages, tools: chatRequest.tools, state: state)
     let stopSequences = buildStopSequences(from: chatRequest, state: state)
     let input: Input = .tokens(promptTokens)
 
@@ -212,15 +212,48 @@ private func handleNonStreamingRequest(chatRequest: ChatCompletionRequest, state
     let elapsed = SuspendingClock().now - t0
     let seconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
     let cleaned = stripThinkingTags(text)
-    let finishReason = genTokenCount >= requestMaxTokens ? "length" : "stop"
+
+    // Parse tool calls if the model supports them and tools were requested
+    var responseContent: String? = cleaned
+    var responseToolCalls: [ToolCall]? = nil
+    var finishReason = genTokenCount >= requestMaxTokens ? "length" : "stop"
+
+    if chatRequest.tools != nil, var parser = state.makeToolCallParser() {
+        let events = parser.consume(cleaned) + parser.flush()
+        var textParts: [String] = []
+        var toolCalls: [ToolCall] = []
+        for event in events {
+            switch event {
+            case .text(let t):
+                textParts.append(t)
+            case .toolCall(let id, let name, let argsJSON):
+                toolCalls.append(ToolCall(id: id, function: .init(name: name, arguments: argsJSON)))
+            }
+        }
+        if !toolCalls.isEmpty {
+            responseToolCalls = toolCalls
+            if finishReason != "length" {
+                finishReason = "tool_calls"
+            }
+            let remaining = textParts.joined().trimmingCharacters(in: .whitespacesAndNewlines)
+            responseContent = remaining.isEmpty ? nil : remaining
+            state.recordToolCalls(toolCalls.map(\.function.name))
+        }
+    }
 
     let tokPerSec = seconds > 0 ? Double(genTokenCount) / seconds : 0
-    print(
-        "[\(requestID)] \(promptTokens.count)t → \(genTokenCount)t in \(String(format: "%.2f", seconds))s (\(String(format: "%.1f", tokPerSec)) tok/s)"
-    )
+    var logLine =
+        "\(ts()) [\(requestID)] \(promptTokens.count)t → \(genTokenCount)t in \(String(format: "%.2f", seconds))s (\(String(format: "%.1f", tokPerSec)) tok/s)"
+    if let calls = responseToolCalls {
+        logLine += " → \(calls.count) tool call(s)"
+        if CLILogger.level > 0 {
+            logLine += ": \(calls.map(\.function.name).joined(separator: ", "))"
+        }
+    }
+    print(logLine)
     state.stats.record(
         promptTokens: promptTokens.count, genTokens: genTokenCount, promptSeconds: 0, genSeconds: seconds,
-        totalSeconds: seconds)
+        totalSeconds: seconds, toolCalls: responseToolCalls?.count ?? 0)
     state.recordPromptTokens(promptTokensInt32)
 
     let response = ChatCompletionResponse(
@@ -231,7 +264,7 @@ private func handleNonStreamingRequest(chatRequest: ChatCompletionRequest, state
         choices: [
             .init(
                 index: 0,
-                message: .init(role: "assistant", content: cleaned),
+                message: .init(role: "assistant", content: responseContent, toolCalls: responseToolCalls),
                 finishReason: finishReason
             )
         ],
@@ -269,7 +302,7 @@ private func handleStreamingRequest(chatRequest: ChatCompletionRequest, state: S
         minP: nil
     )
 
-    let promptTokens = tokenizeMessages(chatRequest.messages, state: state)
+    let promptTokens = tokenizeMessages(chatRequest.messages, tools: chatRequest.tools, state: state)
     let stopSequences = buildStopSequences(from: chatRequest, state: state)
     let input: Input = .tokens(promptTokens)
 
@@ -319,41 +352,79 @@ private func handleStreamingRequest(chatRequest: ChatCompletionRequest, state: S
             )
 
             var thinkParser = ThinkTagParser()
+            var toolParser = state.makeToolCallParser()
             var tokenCount = 0
+            var hasToolCalls = false
+            var toolCallIndex = 0
+            var toolCallNames: [String] = []
+
+            // Emit a single SSE chunk (text content or tool call delta)
+            func emitChunk(_ delta: ChatCompletionChunk.Delta) async throws {
+                let chunk = ChatCompletionChunk(
+                    id: requestID, object: "chat.completion.chunk", created: created,
+                    model: state.config.modelName,
+                    choices: [.init(index: 0, delta: delta, finishReason: nil)])
+                if let data = try? encoder.encode(chunk),
+                    let json = String(data: data, encoding: .utf8)
+                {
+                    try await writer.write(ByteBuffer(string: "data: \(json)\n\n"))
+                }
+            }
+
+            // Process tool parser events: emit text as content, tool calls as deltas
+            func emitToolEvents(_ events: [ToolCallParser.Event]) async throws {
+                for event in events {
+                    switch event {
+                    case .text(let t) where !t.isEmpty:
+                        try await emitChunk(.init(role: nil, content: t))
+                    case .toolCall(let id, let name, let argsJSON):
+                        hasToolCalls = true
+                        toolCallNames.append(name)
+                        let tcDelta = ToolCallDelta(
+                            index: toolCallIndex, id: id, type: "function",
+                            function: .init(name: name, arguments: argsJSON))
+                        try await emitChunk(.init(role: nil, content: nil, toolCalls: [tcDelta]))
+                        toolCallIndex += 1
+                    default: break
+                    }
+                }
+            }
+
+            // Process text through the tool parser (or emit directly if no tool support)
+            func emitText(_ text: String) async throws {
+                guard !text.isEmpty else { return }
+                if var tp = toolParser {
+                    let events = tp.consume(text)
+                    toolParser = tp
+                    try await emitToolEvents(events)
+                } else {
+                    try await emitChunk(.init(role: nil, content: text))
+                }
+            }
 
             for try await result in tokenStream {
                 tokenCount += 1
-                let events = thinkParser.consume(result.text)
-                for event in events {
-                    if case .text(let delta) = event, !delta.isEmpty {
-                        let chunk = ChatCompletionChunk(
-                            id: requestID, object: "chat.completion.chunk", created: created,
-                            model: state.config.modelName,
-                            choices: [.init(index: 0, delta: .init(role: nil, content: delta), finishReason: nil)]
-                        )
-                        if let data = try? encoder.encode(chunk), let json = String(data: data, encoding: .utf8) {
-                            try await writer.write(ByteBuffer(string: "data: \(json)\n\n"))
-                        }
+                for event in thinkParser.consume(result.text) {
+                    if case .text(let delta) = event {
+                        try await emitText(delta)
                     }
                 }
             }
 
-            // Flush any remaining buffered text
-            let finalEvents = thinkParser.flush()
-            for event in finalEvents {
-                if case .text(let delta) = event, !delta.isEmpty {
-                    let chunk = ChatCompletionChunk(
-                        id: requestID, object: "chat.completion.chunk", created: created,
-                        model: state.config.modelName,
-                        choices: [.init(index: 0, delta: .init(role: nil, content: delta), finishReason: nil)]
-                    )
-                    if let data = try? encoder.encode(chunk), let json = String(data: data, encoding: .utf8) {
-                        try await writer.write(ByteBuffer(string: "data: \(json)\n\n"))
-                    }
+            // Flush think parser
+            for event in thinkParser.flush() {
+                if case .text(let delta) = event {
+                    try await emitText(delta)
                 }
             }
 
-            let finishReason = tokenCount >= requestMaxTokens ? "length" : "stop"
+            // Flush tool parser
+            if var tp = toolParser {
+                try await emitToolEvents(tp.flush())
+                toolParser = tp
+            }
+
+            let finishReason = tokenCount >= requestMaxTokens ? "length" : (hasToolCalls ? "tool_calls" : "stop")
             let doneChunk = ChatCompletionChunk(
                 id: requestID, object: "chat.completion.chunk", created: created, model: state.config.modelName,
                 choices: [.init(index: 0, delta: .init(role: nil, content: nil), finishReason: finishReason)]
@@ -366,17 +437,26 @@ private func handleStreamingRequest(chatRequest: ChatCompletionRequest, state: S
             let elapsed = SuspendingClock().now - genStart
             let seconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
             let tokPerSec = seconds > 0 ? Double(tokenCount) / seconds : 0
-            print(
-                "[\(requestID)] stream: \(promptTokens.count)t → \(tokenCount)t in \(String(format: "%.2f", seconds))s (\(String(format: "%.1f", tokPerSec)) tok/s) [\(finishReason)]"
-            )
+            var logLine =
+                "\(ts()) [\(requestID)] stream: \(promptTokens.count)t → \(tokenCount)t in \(String(format: "%.2f", seconds))s (\(String(format: "%.1f", tokPerSec)) tok/s) [\(finishReason)]"
+            if !toolCallNames.isEmpty {
+                logLine += " → \(toolCallNames.count) tool call(s)"
+                if CLILogger.level > 0 {
+                    logLine += ": \(toolCallNames.joined(separator: ", "))"
+                }
+            }
+            print(logLine)
             state.stats.record(
                 promptTokens: promptTokens.count, genTokens: tokenCount, promptSeconds: 0, genSeconds: seconds,
-                totalSeconds: seconds)
+                totalSeconds: seconds, toolCalls: toolCallNames.count)
             state.recordPromptTokens(promptTokensInt32)
+            if !toolCallNames.isEmpty {
+                state.recordToolCalls(toolCallNames)
+            }
 
             try await writer.finish(nil)
         } catch {
-            print("[\(requestID)] stream error: \(error)")
+            print("\(ts()) [\(requestID)] stream error: \(error)")
             try? await writer.write(ByteBuffer(string: "data: [DONE]\n\n"))
             try? await writer.finish(nil)
         }
@@ -395,26 +475,80 @@ private func handleStreamingRequest(chatRequest: ChatCompletionRequest, state: S
 
 // MARK: - Helpers
 
-private func tokenizeMessages(_ messages: [ChatMessage], state: ServerState) -> [Int] {
+private func tokenizeMessages(
+    _ messages: [ChatMessage], tools: [ToolDefinition]? = nil, state: ServerState
+) -> [Int] {
     var templateMessages: [[String: any Sendable]] = []
     for msg in messages {
-        var content = msg.content.textContent
-        if msg.role == "system" && state.config.noThinking {
-            content += "\n/no_think"
+        var dict: [String: any Sendable] = ["role": msg.role]
+
+        if msg.role == "tool" {
+            dict["content"] = msg.content.textContent
+            if let id = msg.toolCallId { dict["tool_call_id"] = id }
+        } else if msg.role == "assistant", let calls = msg.toolCalls, !calls.isEmpty {
+            let callDicts: [[String: any Sendable]] = calls.map { call in
+                [
+                    "id": call.id,
+                    "type": "function",
+                    "function": [
+                        "name": call.function.name,
+                        "arguments": call.function.arguments,
+                    ] as [String: any Sendable],
+                ]
+            }
+            dict["tool_calls"] = callDicts
+            dict["content"] = msg.content.textContent
+        } else {
+            var content = msg.content.textContent
+            if msg.role == "system" && state.config.noThinking {
+                content += "\n/no_think"
+            }
+            dict["content"] = content
         }
-        templateMessages.append(["role": msg.role, "content": content])
+        templateMessages.append(dict)
     }
 
     if state.config.noThinking && !messages.contains(where: { $0.role == "system" }) {
         templateMessages.insert(["role": "system", "content": "/no_think"], at: 0)
     }
 
-    if let tokens = try? state.tokenizer.applyChatTemplate(messages: templateMessages) {
-        return tokens
+    let toolSpecs: [[String: any Sendable]]? = tools?.map { tool in
+        var funcDict: [String: any Sendable] = [
+            "name": tool.function.name,
+            "description": tool.function.description ?? "",
+        ]
+        if let params = tool.function.parameters {
+            funcDict["parameters"] = jsonValueToSendable(params)
+        }
+        let spec: [String: any Sendable] = [
+            "type": tool.type,
+            "function": funcDict,
+        ]
+        return spec
     }
 
-    let text = templateMessages.map { "\($0["role"] ?? "user"): \($0["content"] ?? "")" }.joined(separator: "\n")
+    do {
+        let tokens = try state.tokenizer.applyChatTemplate(
+            messages: templateMessages, tools: toolSpecs)
+        return tokens
+    } catch {
+        CLILogger.log("applyChatTemplate failed: \(error)", component: "Server")
+    }
+
+    let text = templateMessages.map { "\($0["role"] ?? "user"): \($0["content"] ?? "")" }
+        .joined(separator: "\n")
     return state.tokenizer.encode(text: text)
+}
+
+private func jsonValueToSendable(_ value: JSONValue) -> any Sendable {
+    switch value {
+    case .string(let s): return s
+    case .number(let n): return n
+    case .bool(let b): return b
+    case .null: return Optional<String>.none as any Sendable
+    case .object(let obj): return obj.mapValues { jsonValueToSendable($0) } as [String: any Sendable]
+    case .array(let arr): return arr.map { jsonValueToSendable($0) } as [any Sendable]
+    }
 }
 
 private func buildStopSequences(from request: ChatCompletionRequest, state: ServerState) -> StopSequences {
@@ -436,4 +570,13 @@ private func buildStopSequences(from request: ChatCompletionRequest, state: Serv
 
 private func stripThinkingTags(_ text: String) -> String {
     ThinkTagParser.stripCompleted(from: text)
+}
+
+private func ts() -> String {
+    let now = Date()
+    let calendar = Calendar.current
+    let h = calendar.component(.hour, from: now)
+    let m = calendar.component(.minute, from: now)
+    let s = calendar.component(.second, from: now)
+    return String(format: "%02d:%02d:%02d", h, m, s)
 }
