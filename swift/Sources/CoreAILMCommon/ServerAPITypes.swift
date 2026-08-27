@@ -21,9 +21,10 @@ public struct ChatCompletionRequest: Decodable, Sendable {
     public let tools: [ToolDefinition]?
     public let toolChoice: ToolChoice?
     public let parallelToolCalls: Bool?
+    public let raw: Bool?
 
     enum CodingKeys: String, CodingKey {
-        case model, messages, temperature, stream, stop, tools
+        case model, messages, temperature, stream, stop, tools, raw
         case maxTokens = "max_tokens"
         case maxCompletionTokens = "max_completion_tokens"
         case topP = "top_p"
@@ -47,6 +48,7 @@ public struct ChatCompletionRequest: Decodable, Sendable {
         tools = try container.decodeIfPresent([ToolDefinition].self, forKey: .tools)
         toolChoice = try container.decodeIfPresent(ToolChoice.self, forKey: .toolChoice)
         parallelToolCalls = try container.decodeIfPresent(Bool.self, forKey: .parallelToolCalls)
+        raw = try container.decodeIfPresent(Bool.self, forKey: .raw)
 
         if let arr = try? container.decode([String].self, forKey: .stop) {
             stop = arr

@@ -227,33 +227,37 @@ private func handleNonStreamingRequest(chatRequest: ChatCompletionRequest, state
     let elapsed = SuspendingClock().now - t0
     let totalSeconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
     let genSeconds = totalSeconds - promptSeconds
-    let cleaned = stripThinkingTags(text)
 
-    // Parse tool calls if the model supports them and tools were requested
-    var responseContent: String? = cleaned
+    // Raw mode: return unprocessed model output (no thinking strip, no tool parsing)
+    var responseContent: String? = text
     var responseToolCalls: [ToolCall]? = nil
     var finishReason = genTokenCount >= requestMaxTokens ? "length" : "stop"
 
-    if chatRequest.tools != nil, var parser = state.makeToolCallParser() {
-        let events = parser.consume(cleaned) + parser.flush()
-        var textParts: [String] = []
-        var toolCalls: [ToolCall] = []
-        for event in events {
-            switch event {
-            case .text(let t):
-                textParts.append(t)
-            case .toolCall(let id, let name, let argsJSON):
-                toolCalls.append(ToolCall(id: id, function: .init(name: name, arguments: argsJSON)))
+    if chatRequest.raw != true {
+        let cleaned = ThinkTagParser.stripReasoning(from: text, format: state.thinkingFormat)
+        responseContent = cleaned
+
+        if chatRequest.tools != nil, var parser = state.makeToolCallParser() {
+            let events = parser.consume(cleaned) + parser.flush()
+            var textParts: [String] = []
+            var toolCalls: [ToolCall] = []
+            for event in events {
+                switch event {
+                case .text(let t):
+                    textParts.append(t)
+                case .toolCall(let id, let name, let argsJSON):
+                    toolCalls.append(ToolCall(id: id, function: .init(name: name, arguments: argsJSON)))
+                }
             }
-        }
-        if !toolCalls.isEmpty {
-            responseToolCalls = toolCalls
-            if finishReason != "length" {
-                finishReason = "tool_calls"
+            if !toolCalls.isEmpty {
+                responseToolCalls = toolCalls
+                if finishReason != "length" {
+                    finishReason = "tool_calls"
+                }
+                let remaining = textParts.joined().trimmingCharacters(in: .whitespacesAndNewlines)
+                responseContent = remaining.isEmpty ? nil : remaining
+                state.recordToolCalls(toolCalls.map(\.function.name))
             }
-            let remaining = textParts.joined().trimmingCharacters(in: .whitespacesAndNewlines)
-            responseContent = remaining.isEmpty ? nil : remaining
-            state.recordToolCalls(toolCalls.map(\.function.name))
         }
     }
 
@@ -368,13 +372,14 @@ private func handleStreamingRequest(chatRequest: ChatCompletionRequest, state: S
                 stopSequences: stopSequences
             )
 
-            var thinkParser = ThinkTagParser()
+            var thinkParser = ThinkTagParser(format: state.thinkingFormat)
             var toolParser = state.makeToolCallParser()
             var tokenCount = 0
             var hasToolCalls = false
             var toolCallIndex = 0
             var toolCallNames: [String] = []
             var promptSeconds: Double = 0
+            let isRaw = chatRequest.raw == true
 
             // Emit a single SSE chunk (text content or tool call delta)
             func emitChunk(_ delta: ChatCompletionChunk.Delta) async throws {
@@ -426,24 +431,28 @@ private func handleStreamingRequest(chatRequest: ChatCompletionRequest, state: S
                     promptSeconds = Double(ttft.components.seconds) + Double(ttft.components.attoseconds) / 1e18
                 }
                 tokenCount += 1
-                for event in thinkParser.consume(result.text) {
-                    if case .text(let delta) = event {
-                        try await emitText(delta)
+                if isRaw {
+                    try await emitChunk(.init(role: nil, content: result.text))
+                } else {
+                    for event in thinkParser.consume(result.text) {
+                        if case .text(let delta) = event {
+                            try await emitText(delta)
+                        }
                     }
                 }
             }
 
-            // Flush think parser
-            for event in thinkParser.flush() {
-                if case .text(let delta) = event {
-                    try await emitText(delta)
+            if !isRaw {
+                for event in thinkParser.flush() {
+                    if case .text(let delta) = event {
+                        try await emitText(delta)
+                    }
                 }
-            }
 
-            // Flush tool parser
-            if var tp = toolParser {
-                try await emitToolEvents(tp.flush())
-                toolParser = tp
+                if var tp = toolParser {
+                    try await emitToolEvents(tp.flush())
+                    toolParser = tp
+                }
             }
 
             let finishReason = tokenCount >= requestMaxTokens ? "length" : (hasToolCalls ? "tool_calls" : "stop")
@@ -590,10 +599,6 @@ private func buildStopSequences(from request: ChatCompletionRequest, state: Serv
         additionalSequences: additionalSequences,
         additionalEosTokenIds: state.config.additionalEosTokenIds
     )
-}
-
-private func stripThinkingTags(_ text: String) -> String {
-    ThinkTagParser.stripCompleted(from: text)
 }
 
 private func ts() -> String {

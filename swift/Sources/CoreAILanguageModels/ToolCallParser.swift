@@ -13,14 +13,25 @@ public struct ToolCallParser: Sendable {
         case toolCall(id: String, name: String, argsJSON: String)
     }
 
+    public enum Format: Sendable {
+        case json
+        case atem
+    }
+
     private let openMarker: String
     private let closeMarker: String
+    private let format: Format
     private var buffer: String = ""
     private var isInsideToolCall: Bool = false
 
-    public init(openMarker: String = "<tool_call>", closeMarker: String = "</tool_call>") {
+    public init(
+        openMarker: String = "<tool_call>",
+        closeMarker: String = "</tool_call>",
+        format: Format = .json
+    ) {
         self.openMarker = openMarker
         self.closeMarker = closeMarker
+        self.format = format
     }
 
     public mutating func consume(_ delta: String) -> [Event] {
@@ -62,9 +73,6 @@ public struct ToolCallParser: Sendable {
     private mutating func processRemainder(of events: inout [Event], isFinal: Bool) {
         if isInsideToolCall {
             guard isFinal else { return }
-            // Newline-terminated formats (e.g. Mistral) have no dedicated close
-            // token — the block ends at EOS. Try to parse what we have.
-            // For tag-pair formats, an unclosed block is malformed: drop it.
             if closeMarker == "\n" {
                 events.append(contentsOf: parseToolCalls(from: buffer))
             }
@@ -79,25 +87,36 @@ public struct ToolCallParser: Sendable {
         }
     }
 
+    private func parseToolCalls(from content: String) -> [Event] {
+        switch format {
+        case .json:
+            return parseJSONToolCalls(from: content)
+        case .atem:
+            return parseATEMToolCalls(from: content)
+        }
+    }
+
+    // MARK: - JSON Format
+
     /// Single object `{"name":..}` (Qwen3) or array `[{"name":..},..]` (Mistral).
-    private func parseToolCalls(from json: String) -> [Event] {
+    private func parseJSONToolCalls(from json: String) -> [Event] {
         let trimmed = json.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let data = trimmed.data(using: .utf8) else { return [] }
 
         if trimmed.hasPrefix("["),
             let array = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
         {
-            return array.compactMap { makeToolCallEvent(from: $0) }
+            return array.compactMap { makeJSONToolCallEvent(from: $0) }
         }
 
         if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            return makeToolCallEvent(from: obj).map { [$0] } ?? []
+            return makeJSONToolCallEvent(from: obj).map { [$0] } ?? []
         }
 
         return []
     }
 
-    private func makeToolCallEvent(from obj: [String: Any]) -> Event? {
+    private func makeJSONToolCallEvent(from obj: [String: Any]) -> Event? {
         guard let name = obj["name"] as? String else { return nil }
 
         let argsJSON: String
@@ -115,13 +134,101 @@ public struct ToolCallParser: Sendable {
         let callId = "call_\(UUID().uuidString.prefix(8).lowercased())"
         return .toolCall(id: callId, name: name, argsJSON: argsJSON)
     }
+
+    // MARK: - ATEM Format
+
+    /// Parse `<atem:invoke name="fn"><atem:parameter name="k">v</atem:parameter></atem:invoke>` blocks.
+    private func parseATEMToolCalls(from xml: String) -> [Event] {
+        let invokePattern = "<atem:invoke\\s+name=\"([^\"]+)\"[^>]*>(.*?)</atem:invoke>"
+        guard let invokeRegex = try? NSRegularExpression(pattern: invokePattern, options: .dotMatchesLineSeparators)
+        else { return [] }
+
+        let nsString = xml as NSString
+        let matches = invokeRegex.matches(in: xml, range: NSRange(location: 0, length: nsString.length))
+
+        return matches.compactMap { match -> Event? in
+            guard match.numberOfRanges >= 3 else { return nil }
+            let name = nsString.substring(with: match.range(at: 1))
+            let body = nsString.substring(with: match.range(at: 2))
+            let args = parseATEMParameters(from: body)
+            let argsJSON: String
+            if args.isEmpty {
+                argsJSON = "{}"
+            } else if let data = try? JSONSerialization.data(withJSONObject: args),
+                let str = String(data: data, encoding: .utf8)
+            {
+                argsJSON = str
+            } else {
+                argsJSON = "{}"
+            }
+            let callId = "call_\(UUID().uuidString.prefix(8).lowercased())"
+            return .toolCall(id: callId, name: name, argsJSON: argsJSON)
+        }
+    }
+
+    private func parseATEMParameters(from body: String) -> [String: Any] {
+        let paramPattern = "<atem:parameter\\s+name=\"([^\"]+)\">(.*?)</atem:parameter>"
+        guard let paramRegex = try? NSRegularExpression(pattern: paramPattern, options: .dotMatchesLineSeparators)
+        else { return [:] }
+
+        let nsBody = body as NSString
+        let matches = paramRegex.matches(in: body, range: NSRange(location: 0, length: nsBody.length))
+
+        var result: [String: Any] = [:]
+        for match in matches {
+            guard match.numberOfRanges >= 3 else { continue }
+            let key = nsBody.substring(with: match.range(at: 1))
+            let rawValue = nsBody.substring(with: match.range(at: 2))
+            result[key] = coerceATEMValue(rawValue)
+        }
+        return result
+    }
+
+    private func coerceATEMValue(_ raw: String) -> Any {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed == "true" { return true }
+        if trimmed == "false" { return false }
+        if let intVal = Int(trimmed) { return intVal }
+        if let doubleVal = Double(trimmed), trimmed.contains(".") { return doubleVal }
+        return trimmed
+    }
 }
 
 // MARK: - Tool Call Marker Detection
 
+public struct ToolCallDetection: Sendable {
+    public let openMarker: String
+    public let closeMarker: String
+    public let format: ToolCallParser.Format
+}
+
 /// Probes a tokenizer's vocabulary for known tool-call special tokens.
-/// Returns the (open, close) marker pair if the model supports tool calling, nil otherwise.
-public func detectToolCallMarkers(using tokenizer: any Tokenizer) -> (open: String, close: String)? {
+public func detectToolCallFormat(using tokenizer: any Tokenizer) -> ToolCallDetection? {
+    // ATEM special tokens (if a future tokenizer adds them)
+    if tokenizer.convertTokenToId("<atem:function_calls>") != nil,
+        tokenizer.convertTokenToId("</atem:function_calls>") != nil
+    {
+        return ToolCallDetection(
+            openMarker: "<atem:function_calls>",
+            closeMarker: "</atem:function_calls>",
+            format: .atem
+        )
+    }
+
+    // ATEM via agentic model signature: <|eom|> + <|eot|> + <|start|> + <|message|>
+    // indicate a Meta agentic model that emits ATEM tags as regular text.
+    if tokenizer.convertTokenToId("<|eom|>") != nil,
+        tokenizer.convertTokenToId("<|eot|>") != nil,
+        tokenizer.convertTokenToId("<|start|>") != nil,
+        tokenizer.convertTokenToId("<|message|>") != nil
+    {
+        return ToolCallDetection(
+            openMarker: "<atem:function_calls>",
+            closeMarker: "</atem:function_calls>",
+            format: .atem
+        )
+    }
+
     let tagPairs: [(open: String, close: String)] = [
         ("<tool_call>", "</tool_call>"),
         ("<function_calls>", "</function_calls>"),
@@ -130,10 +237,40 @@ public func detectToolCallMarkers(using tokenizer: any Tokenizer) -> (open: Stri
     where tokenizer.convertTokenToId(pair.open) != nil
         && tokenizer.convertTokenToId(pair.close) != nil
     {
-        return pair
+        return ToolCallDetection(openMarker: pair.open, closeMarker: pair.close, format: .json)
     }
     if tokenizer.convertTokenToId("[TOOL_CALLS]") != nil {
-        return (open: "[TOOL_CALLS]", close: "\n")
+        return ToolCallDetection(openMarker: "[TOOL_CALLS]", closeMarker: "\n", format: .json)
     }
     return nil
+}
+
+// MARK: - Thinking Format Detection
+
+/// Probes a tokenizer's vocabulary for thinking/reasoning markers.
+public func detectThinkingFormat(using tokenizer: any Tokenizer) -> ThinkTagParser.Format {
+    if tokenizer.convertTokenToId("<|eom|>") != nil,
+        tokenizer.convertTokenToId("<|eot|>") != nil,
+        tokenizer.convertTokenToId("<|message|>") != nil
+    {
+        return .agentic(
+            selfMarker: "to=self<|message|>",
+            userMarker: "to=user<|message|>",
+            endOfMessage: "<|eom|>",
+            endOfTurn: "<|eot|>"
+        )
+    }
+
+    let candidates: [(open: String, close: String)] = [
+        ("<think>", "</think>"),
+        ("<|reasoning_start|>", "<|reasoning_end|>"),
+    ]
+    for pair in candidates {
+        if tokenizer.convertTokenToId(pair.open) != nil,
+            tokenizer.convertTokenToId(pair.close) != nil
+        {
+            return .tagPair(open: pair.open, close: pair.close)
+        }
+    }
+    return .tagPair(open: "<think>", close: "</think>")
 }
