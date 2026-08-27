@@ -203,14 +203,20 @@ private func handleNonStreamingRequest(chatRequest: ChatCompletionRequest, state
 
     var genTokenCount = 0
     var parts: [String] = []
+    var promptSeconds: Double = 0
     for try await result in stream {
+        if genTokenCount == 0 {
+            let ttft = SuspendingClock().now - t0
+            promptSeconds = Double(ttft.components.seconds) + Double(ttft.components.attoseconds) / 1e18
+        }
         parts.append(result.text)
         genTokenCount += 1
     }
     let text = parts.joined()
 
     let elapsed = SuspendingClock().now - t0
-    let seconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
+    let totalSeconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
+    let genSeconds = totalSeconds - promptSeconds
     let cleaned = stripThinkingTags(text)
 
     // Parse tool calls if the model supports them and tools were requested
@@ -241,9 +247,10 @@ private func handleNonStreamingRequest(chatRequest: ChatCompletionRequest, state
         }
     }
 
-    let tokPerSec = seconds > 0 ? Double(genTokenCount) / seconds : 0
+    let prefillTps = promptSeconds > 0 ? Double(promptTokens.count) / promptSeconds : 0
+    let genTps = genSeconds > 0 ? Double(genTokenCount) / genSeconds : 0
     var logLine =
-        "\(ts()) [\(requestID)] \(promptTokens.count)t → \(genTokenCount)t in \(String(format: "%.2f", seconds))s (\(String(format: "%.1f", tokPerSec)) tok/s)"
+        "\(ts()) [\(requestID)] \(promptTokens.count)t prefill \(String(format: "%.1f", prefillTps)) t/s, \(genTokenCount)t gen \(String(format: "%.1f", genTps)) t/s (\(String(format: "%.2f", totalSeconds))s)"
     if let calls = responseToolCalls {
         logLine += " → \(calls.count) tool call(s)"
         if CLILogger.level > 0 {
@@ -252,8 +259,8 @@ private func handleNonStreamingRequest(chatRequest: ChatCompletionRequest, state
     }
     print(logLine)
     state.stats.record(
-        promptTokens: promptTokens.count, genTokens: genTokenCount, promptSeconds: 0, genSeconds: seconds,
-        totalSeconds: seconds, toolCalls: responseToolCalls?.count ?? 0)
+        promptTokens: promptTokens.count, genTokens: genTokenCount, promptSeconds: promptSeconds,
+        genSeconds: genSeconds, totalSeconds: totalSeconds, toolCalls: responseToolCalls?.count ?? 0)
     state.recordPromptTokens(promptTokensInt32)
 
     let response = ChatCompletionResponse(
@@ -357,6 +364,7 @@ private func handleStreamingRequest(chatRequest: ChatCompletionRequest, state: S
             var hasToolCalls = false
             var toolCallIndex = 0
             var toolCallNames: [String] = []
+            var promptSeconds: Double = 0
 
             // Emit a single SSE chunk (text content or tool call delta)
             func emitChunk(_ delta: ChatCompletionChunk.Delta) async throws {
@@ -403,6 +411,10 @@ private func handleStreamingRequest(chatRequest: ChatCompletionRequest, state: S
             }
 
             for try await result in tokenStream {
+                if tokenCount == 0 {
+                    let ttft = SuspendingClock().now - genStart
+                    promptSeconds = Double(ttft.components.seconds) + Double(ttft.components.attoseconds) / 1e18
+                }
                 tokenCount += 1
                 for event in thinkParser.consume(result.text) {
                     if case .text(let delta) = event {
@@ -435,10 +447,12 @@ private func handleStreamingRequest(chatRequest: ChatCompletionRequest, state: S
             try await writer.write(ByteBuffer(string: "data: [DONE]\n\n"))
 
             let elapsed = SuspendingClock().now - genStart
-            let seconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
-            let tokPerSec = seconds > 0 ? Double(tokenCount) / seconds : 0
+            let totalSeconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
+            let genSeconds = totalSeconds - promptSeconds
+            let prefillTps = promptSeconds > 0 ? Double(promptTokens.count) / promptSeconds : 0
+            let genTps = genSeconds > 0 ? Double(tokenCount) / genSeconds : 0
             var logLine =
-                "\(ts()) [\(requestID)] stream: \(promptTokens.count)t → \(tokenCount)t in \(String(format: "%.2f", seconds))s (\(String(format: "%.1f", tokPerSec)) tok/s) [\(finishReason)]"
+                "\(ts()) [\(requestID)] stream: \(promptTokens.count)t prefill \(String(format: "%.1f", prefillTps)) t/s, \(tokenCount)t gen \(String(format: "%.1f", genTps)) t/s (\(String(format: "%.2f", totalSeconds))s) [\(finishReason)]"
             if !toolCallNames.isEmpty {
                 logLine += " → \(toolCallNames.count) tool call(s)"
                 if CLILogger.level > 0 {
@@ -447,8 +461,8 @@ private func handleStreamingRequest(chatRequest: ChatCompletionRequest, state: S
             }
             print(logLine)
             state.stats.record(
-                promptTokens: promptTokens.count, genTokens: tokenCount, promptSeconds: 0, genSeconds: seconds,
-                totalSeconds: seconds, toolCalls: toolCallNames.count)
+                promptTokens: promptTokens.count, genTokens: tokenCount, promptSeconds: promptSeconds,
+                genSeconds: genSeconds, totalSeconds: totalSeconds, toolCalls: toolCallNames.count)
             state.recordPromptTokens(promptTokensInt32)
             if !toolCallNames.isEmpty {
                 state.recordToolCalls(toolCallNames)
