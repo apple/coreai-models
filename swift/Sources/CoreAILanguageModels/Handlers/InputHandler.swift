@@ -18,6 +18,9 @@ public struct InputContext: Sendable {
     public let batchSize: Int
     /// Sliding window size (nil for models without sliding attention).
     public let slidingWindow: Int?
+    /// Context bucket size for the current graph (static engines only).
+    /// Determines causal mask height. 0 for dynamic engines.
+    public let contextBucket: Int
 
     /// For dynamic-shape engines (Sequential, Pipelined).
     /// alignedStep = processedTokenCount, batchSize = tokens.count.
@@ -30,7 +33,8 @@ public struct InputContext: Sendable {
             processedTokenCount: processedTokenCount,
             alignedStep: processedTokenCount,
             batchSize: tokens.count,
-            slidingWindow: nil)
+            slidingWindow: nil,
+            contextBucket: 0)
     }
 
     /// For static-shape engines. Batch is fixed-size and aligned.
@@ -38,14 +42,16 @@ public struct InputContext: Sendable {
         tokens: ArraySlice<Int32>,
         alignedStep: Int,
         batchSize: Int,
-        slidingWindow: Int?
+        slidingWindow: Int?,
+        contextBucket: Int
     ) -> InputContext {
         InputContext(
             tokens: tokens,
             processedTokenCount: alignedStep,
             alignedStep: alignedStep,
             batchSize: batchSize,
-            slidingWindow: slidingWindow)
+            slidingWindow: slidingWindow,
+            contextBucket: contextBucket)
     }
 }
 

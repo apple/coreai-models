@@ -231,7 +231,7 @@ struct InputHandlerFuzzTests {
         let alignedStep = 512
         let context = InputContext.static(
             tokens: tokens, alignedStep: alignedStep,
-            batchSize: batchSize, slidingWindow: 256)
+            batchSize: batchSize, slidingWindow: 256, contextBucket: 2048)
 
         #expect(context.batchSize == batchSize)
         #expect(context.alignedStep == alignedStep)

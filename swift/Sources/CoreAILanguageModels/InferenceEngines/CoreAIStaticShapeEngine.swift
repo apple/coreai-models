@@ -45,6 +45,10 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     private var keyCache: NDArray
     private var valueCache: NDArray
 
+    // Input handler (fills position_ids, causal_mask, step into pre-allocated buffers)
+    private let inputFiller: StaticBucketInputFiller
+    private var inputBuffers: InputBuffers
+
     // Number of tokens already processed in the current sequence.
     public private(set) var processedTokenCount: Int = 0
 
@@ -123,6 +127,42 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
             throw InferenceRuntimeError.invalidState(
                 "No KV cache state descriptors found — cannot allocate cache buffers")
         }
+
+        // Create input filler from the largest-context function's descriptors
+        let posName = largestExtendDescriptor.inputNames.first(where: { $0.contains("pos") })
+        guard let positionIdsName = posName,
+            case .ndArray(let posDesc) = largestExtendDescriptor.inputDescriptor(of: positionIdsName)
+        else {
+            throw InferenceRuntimeError.invalidState("No position_ids input found in model descriptor")
+        }
+
+        var maskName: String?
+        var maskDesc: NDArrayDescriptor?
+        if case .ndArray(let md) = largestExtendDescriptor.inputDescriptor(of: "causal_mask") {
+            maskName = "causal_mask"
+            maskDesc = md
+        }
+
+        var stepInputName: String?
+        var stepDesc: NDArrayDescriptor?
+        if let sName = largestExtendDescriptor.inputNames.first(where: { $0.contains("step") && !$0.contains("pos") }),
+            case .ndArray(let sd) = largestExtendDescriptor.inputDescriptor(of: sName)
+        {
+            stepInputName = sName
+            stepDesc = sd
+        }
+
+        self.inputFiller = StaticBucketInputFiller(
+            positionIdsName: positionIdsName,
+            positionIdsDescriptor: posDesc,
+            causalMaskName: maskName,
+            causalMaskDescriptor: maskDesc,
+            stepName: stepInputName,
+            stepDescriptor: stepDesc
+        )
+        var buffers = InputBuffers()
+        inputFiller.registerBuffers(into: &buffers)
+        self.inputBuffers = buffers
 
         CLILogger.log("Engine initialized")
     }
@@ -471,8 +511,19 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         tokensInBatch: Int
     ) async throws -> [String: NDArray] {
         let desc = try functionDescriptor(for: graphName)
-        var inputs = [String: NDArray]()
+        let contextLength = Self.contextLength(descriptor: desc, config: config)
 
+        // Fill position_ids, causal_mask, step via the handler
+        let context = InputContext.static(
+            tokens: ArraySlice(batchTokens),
+            alignedStep: alignedStep,
+            batchSize: batchSize,
+            slidingWindow: nil,
+            contextBucket: contextLength)
+        try inputFiller.fill(context, into: &inputBuffers)
+        var inputs = inputBuffers.asDict()
+
+        // Pass-through constant embedding table
         if desc.inputNames.contains("embedding_table") {
             inputs["embedding_table"] = embeddingTable
         }
@@ -488,43 +539,6 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
                 throw InferenceRuntimeError.invalidState("Gather '\(gatherName)' returned no output")
             }
             inputs[txName] = gathered
-        }
-
-        // Position IDs
-        guard let posName = desc.inputNames.first(where: { $0.contains("pos") }) else {
-            throw InferenceRuntimeError.invalidState("Graph '\(graphName)' has no position_ids input")
-        }
-        if case .ndArray(let nd) = desc.inputDescriptor(of: posName) {
-            var pos = NDArray(descriptor: nd)
-            let posView = pos.mutableView(as: UInt16.self)
-            guard var posSpan = posView.contiguousElements else {
-                throw InferenceRuntimeError.invalidState("pos array has non-contiguous layout")
-            }
-            for i in 0..<batchSize {
-                posSpan[i] = UInt16(alignedStep + i)
-            }
-            inputs[posName] = pos
-        }
-
-        // Causal mask
-        if case .ndArray(let nd) = desc.inputDescriptor(of: "causal_mask") {
-            var mask = NDArray(descriptor: nd)
-            let maskView = mask.mutableView(as: LogitsScalarType.self)
-            Self.fillCausalMask(maskView, tokensInBatch: tokensInBatch, alignedStep: alignedStep)
-            inputs["causal_mask"] = mask
-        }
-
-        // Step
-        if let stepName = desc.inputNames.first(where: { $0.contains("step") && !$0.contains("pos") }),
-            case .ndArray(let nd) = desc.inputDescriptor(of: stepName)
-        {
-            var step = NDArray(descriptor: nd)
-            let stepView = step.mutableView(as: Int32.self)
-            guard var stepSpan = stepView.contiguousElements else {
-                throw InferenceRuntimeError.invalidState("step array has non-contiguous layout")
-            }
-            stepSpan[0] = Int32(alignedStep)
-            inputs[stepName] = step
         }
 
         return inputs
