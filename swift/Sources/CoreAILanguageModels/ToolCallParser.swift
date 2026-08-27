@@ -4,10 +4,11 @@
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
 import Foundation
+import Tokenizers
 
 /// Streaming parser that detects tool call blocks in the model's token stream.
-struct ToolCallParser {
-    enum Event {
+public struct ToolCallParser: Sendable {
+    public enum Event {
         case text(String)
         case toolCall(id: String, name: String, argsJSON: String)
     }
@@ -17,12 +18,12 @@ struct ToolCallParser {
     private var buffer: String = ""
     private var isInsideToolCall: Bool = false
 
-    init(openMarker: String = "<tool_call>", closeMarker: String = "</tool_call>") {
+    public init(openMarker: String = "<tool_call>", closeMarker: String = "</tool_call>") {
         self.openMarker = openMarker
         self.closeMarker = closeMarker
     }
 
-    mutating func consume(_ delta: String) -> [Event] {
+    public mutating func consume(_ delta: String) -> [Event] {
         buffer.append(delta)
         return drain(isFinal: false)
     }
@@ -34,7 +35,7 @@ struct ToolCallParser {
     /// at EOS is dropped (malformed JSON is not useful to surface as text).
     /// Exception: newline-terminated formats (e.g. Mistral's `[TOOL_CALLS]`)
     /// have no trailing close token, so the buffered content is parsed on EOS.
-    mutating func flush() -> [Event] {
+    public mutating func flush() -> [Event] {
         drain(isFinal: true)
     }
 
@@ -111,6 +112,28 @@ struct ToolCallParser {
             argsJSON = "{}"
         }
 
-        return .toolCall(id: UUID().uuidString, name: name, argsJSON: argsJSON)
+        let callId = "call_\(UUID().uuidString.prefix(8).lowercased())"
+        return .toolCall(id: callId, name: name, argsJSON: argsJSON)
     }
+}
+
+// MARK: - Tool Call Marker Detection
+
+/// Probes a tokenizer's vocabulary for known tool-call special tokens.
+/// Returns the (open, close) marker pair if the model supports tool calling, nil otherwise.
+public func detectToolCallMarkers(using tokenizer: any Tokenizer) -> (open: String, close: String)? {
+    let tagPairs: [(open: String, close: String)] = [
+        ("<tool_call>", "</tool_call>"),
+        ("<function_calls>", "</function_calls>"),
+    ]
+    for pair in tagPairs
+    where tokenizer.convertTokenToId(pair.open) != nil
+        && tokenizer.convertTokenToId(pair.close) != nil
+    {
+        return pair
+    }
+    if tokenizer.convertTokenToId("[TOOL_CALLS]") != nil {
+        return (open: "[TOOL_CALLS]", close: "\n")
+    }
+    return nil
 }
