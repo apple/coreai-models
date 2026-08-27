@@ -7,6 +7,7 @@ import CoreAILMCommon
 import CoreAILanguageModels
 import CoreAIShared
 import Foundation
+import HTTPTypes
 import Hummingbird
 import NIOCore
 import NIOFoundationCompat
@@ -42,7 +43,9 @@ func startServer(state: ServerState, port: Int) async throws {
     }
 
     router.post("/v1/chat/completions") { request, _ in
-        try await handleChatCompletionsRoute(request: request, state: state)
+        let sessionID =
+            HTTPField.Name("X-Session-ID").flatMap { request.headers[$0] } ?? "default"
+        return try await handleChatCompletionsRoute(request: request, state: state, sessionID: sessionID)
     }
 
     router.post("/v1") { request, _ in
@@ -51,6 +54,16 @@ func startServer(state: ServerState, port: Int) async throws {
 
     router.post("/v1/completions") { request, _ in
         try await handleCompletionsRoute(request: request, state: state)
+    }
+
+    router.get("/v1/stats") { _, _ in
+        let stats = state.statsSnapshot()
+        let data = try JSONEncoder().encode(stats)
+        return Response(
+            status: .ok,
+            headers: [.contentType: "application/json"],
+            body: .init(byteBuffer: ByteBuffer(data: data))
+        )
     }
 
     let app = Application(
@@ -74,7 +87,9 @@ private func handleAutoRoute(request: Request, state: ServerState) async throws 
     }
 }
 
-private func handleChatCompletionsFromBody(body: ByteBuffer, state: ServerState) async throws -> Response {
+private func handleChatCompletionsFromBody(body: ByteBuffer, state: ServerState, sessionID: String? = nil) async throws
+    -> Response
+{
     guard state.tryAcquire() else {
         let err = ErrorResponse(error: .init(message: "Server is busy.", type: "server_error", code: "busy"))
         let data = try JSONEncoder().encode(err)
@@ -96,9 +111,10 @@ private func handleChatCompletionsFromBody(body: ByteBuffer, state: ServerState)
     do {
         let shouldStream = chatRequest.stream ?? false
         if shouldStream {
-            return try await handleStreamingRequest(chatRequest: chatRequest, state: state)
+            return try await handleStreamingRequest(chatRequest: chatRequest, state: state, sessionID: sessionID)
         } else {
-            let response = try await handleNonStreamingRequest(chatRequest: chatRequest, state: state)
+            let response = try await handleNonStreamingRequest(
+                chatRequest: chatRequest, state: state, sessionID: sessionID)
             state.release()
             return response
         }
@@ -122,14 +138,17 @@ private func handleChatCompletionsFromBody(body: ByteBuffer, state: ServerState)
 
 // MARK: - Route Handler
 
-private func handleChatCompletionsRoute(request: Request, state: ServerState) async throws -> Response {
+private func handleChatCompletionsRoute(request: Request, state: ServerState, sessionID: String? = nil) async throws
+    -> Response
+{
     let body = try await request.body.collect(upTo: 10 * 1024 * 1024)
-    return try await handleChatCompletionsFromBody(body: body, state: state)
+    return try await handleChatCompletionsFromBody(body: body, state: state, sessionID: sessionID)
 }
 
 // MARK: - Non-Streaming
 
-private func handleNonStreamingRequest(chatRequest: ChatCompletionRequest, state: ServerState) async throws -> Response
+private func handleNonStreamingRequest(chatRequest: ChatCompletionRequest, state: ServerState, sessionID: String? = nil)
+    async throws -> Response
 {
     let requestMaxTokens = chatRequest.maxCompletionTokens ?? chatRequest.maxTokens ?? state.config.defaultMaxTokens
     guard requestMaxTokens > 0 else {
@@ -158,7 +177,11 @@ private func handleNonStreamingRequest(chatRequest: ChatCompletionRequest, state
         "[\(requestID)] messages: \(chatRequest.messages.count), tokens: \(promptTokens.count), max_tokens: \(requestMaxTokens)",
         component: "Server")
 
-    try await state.engine.reset()
+    let promptTokensInt32 = promptTokens.map { Int32($0) }
+    let prefixReused = await state.prepareForRequest(sessionID: sessionID, promptTokens: promptTokensInt32)
+    if prefixReused > 0 {
+        CLILogger.log("[\(requestID)] prefix reuse: \(prefixReused) tokens cached", component: "Server")
+    }
     let t0 = SuspendingClock().now
 
     let strategy: any DecodingStrategy
@@ -198,6 +221,7 @@ private func handleNonStreamingRequest(chatRequest: ChatCompletionRequest, state
     state.stats.record(
         promptTokens: promptTokens.count, genTokens: genTokenCount, promptSeconds: 0, genSeconds: seconds,
         totalSeconds: seconds)
+    state.recordPromptTokens(promptTokensInt32)
 
     let response = ChatCompletionResponse(
         id: requestID,
@@ -228,7 +252,9 @@ private func handleNonStreamingRequest(chatRequest: ChatCompletionRequest, state
 
 // MARK: - Streaming (SSE)
 
-private func handleStreamingRequest(chatRequest: ChatCompletionRequest, state: ServerState) async throws -> Response {
+private func handleStreamingRequest(chatRequest: ChatCompletionRequest, state: ServerState, sessionID: String? = nil)
+    async throws -> Response
+{
     let requestMaxTokens = chatRequest.maxCompletionTokens ?? chatRequest.maxTokens ?? state.config.defaultMaxTokens
     guard requestMaxTokens > 0 else {
         throw ServerError.badRequest("max_tokens must be positive")
@@ -256,10 +282,15 @@ private func handleStreamingRequest(chatRequest: ChatCompletionRequest, state: S
         "[\(requestID)] stream, messages: \(chatRequest.messages.count), tokens: \(promptTokens.count), max_tokens: \(requestMaxTokens)",
         component: "Server")
 
+    let promptTokensInt32 = promptTokens.map { Int32($0) }
+    let prefixReused = await state.prepareForRequest(sessionID: sessionID, promptTokens: promptTokensInt32)
+    if prefixReused > 0 {
+        CLILogger.log("[\(requestID)] prefix reuse: \(prefixReused) tokens cached", component: "Server")
+    }
+
     let responseBody = ResponseBody { writer in
         defer { state.release() }
         do {
-            try await state.engine.reset()
             let encoder = JSONEncoder()
             let genStart = SuspendingClock().now
 
@@ -341,6 +372,7 @@ private func handleStreamingRequest(chatRequest: ChatCompletionRequest, state: S
             state.stats.record(
                 promptTokens: promptTokens.count, genTokens: tokenCount, promptSeconds: 0, genSeconds: seconds,
                 totalSeconds: seconds)
+            state.recordPromptTokens(promptTokensInt32)
 
             try await writer.finish(nil)
         } catch {
