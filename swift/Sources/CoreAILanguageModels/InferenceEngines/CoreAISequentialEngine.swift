@@ -70,6 +70,10 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
     private var cachedInputBatchSize: Int
     private var cachedLogitsBatchSize: Int
 
+    // Ring buffer mode: position_ids is [1, queryLen] starting at processedTokenCount
+    // (vs standard mode: [1, processedTokenCount + queryLen] starting at 0)
+    private let useCompactPositionIds: Bool
+
     // Track processed tokens for incremental inference
     public private(set) var processedTokenCount: Int = 0
 
@@ -162,6 +166,7 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         self.kvCache = stateHandlers.kvCache
         self.additionalStates = stateHandlers.additionalStates
         self.hasNonTruncatableStates = stateHandlers.hasNonTruncatableStates
+        self.useCompactPositionIds = stateHandlers.isAllSlidingCache
 
         CLILogger.log(
             "KV cache: capacity=\(kvCache.currentCapacity), states=\(kvCache.stateNames)"
@@ -258,12 +263,22 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         }
         fillNDArray(&inputIdsArray, as: Int32.self, with: tokens)
 
-        // Build position_ids: [0, 1, ..., processedTokenCount + batchSize - 1]
-        // Shape grows by 1 each step, so we can't easily pre-allocate this one.
-        let totalPositions = processedTokenCount + batchSize
-        let resolvedPosDesc = positionIdsDescriptor.resolvingDynamicDimensions([1, totalPositions])
-        var positionIds = NDArray(descriptor: resolvedPosDesc)
-        fillNDArray(&positionIds, as: Int32.self, count: totalPositions) { Int32($0) }
+        // Build position_ids based on cache mode:
+        // - Standard (growing KV cache): [0, 1, ..., processedTokenCount + batchSize - 1]
+        // - Compact (ring buffer):       [processedTokenCount, ..., processedTokenCount + batchSize - 1]
+        let positionIds: NDArray
+        if useCompactPositionIds {
+            let resolvedPosDesc = positionIdsDescriptor.resolvingDynamicDimensions([1, batchSize])
+            var pos = NDArray(descriptor: resolvedPosDesc)
+            fillNDArray(&pos, as: Int32.self, count: batchSize) { Int32(processedTokenCount + $0) }
+            positionIds = pos
+        } else {
+            let totalPositions = processedTokenCount + batchSize
+            let resolvedPosDesc = positionIdsDescriptor.resolvingDynamicDimensions([1, totalPositions])
+            var pos = NDArray(descriptor: resolvedPosDesc)
+            fillNDArray(&pos, as: Int32.self, count: totalPositions) { Int32($0) }
+            positionIds = pos
+        }
 
         // Reuse pre-allocated logits when the batch size is unchanged.
         if cachedLogitsBatchSize != batchSize {

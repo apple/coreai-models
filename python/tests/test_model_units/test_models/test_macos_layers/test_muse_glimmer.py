@@ -16,7 +16,6 @@ import pytest
 import torch
 
 from coreai_models.models.macos.muse_glimmer import MuseGlimmerForCausalLM
-from coreai_models.primitives.macos.cache import KVCache
 
 
 def _make_glimmer_config(**overrides) -> SimpleNamespace:
@@ -54,6 +53,29 @@ def _make_glimmer_config(**overrides) -> SimpleNamespace:
     return SimpleNamespace(**defaults)
 
 
+def _make_caches(
+    config, dtype: torch.dtype = torch.float32
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Create global + sliding KV cache tensors for the Muse Glimmer model.
+
+    Returns (global_k, global_v, sliding_k, sliding_v).
+    """
+    n_kv_heads = config.num_key_value_heads
+    head_dim = config.head_dim
+    max_seq = config.max_position_embeddings
+    window = config.sliding_window
+
+    # Count layers per pool
+    n_global = sum(1 for t in config.layer_types if t == "full_attention")
+    n_sliding = sum(1 for t in config.layer_types if t == "sliding_attention")
+
+    global_k = torch.zeros(n_global, 1, n_kv_heads, max_seq, head_dim, dtype=dtype)
+    global_v = torch.zeros(n_global, 1, n_kv_heads, max_seq, head_dim, dtype=dtype)
+    sliding_k = torch.zeros(n_sliding, 1, n_kv_heads, window, head_dim, dtype=dtype)
+    sliding_v = torch.zeros(n_sliding, 1, n_kv_heads, window, head_dim, dtype=dtype)
+    return global_k, global_v, sliding_k, sliding_v
+
+
 class TestMuseGlimmerForCausalLM:
     """Test Muse Glimmer structural correctness and numerical stability."""
 
@@ -64,10 +86,10 @@ class TestMuseGlimmerForCausalLM:
 
         input_ids = torch.randint(0, 200, (1, 6))
         position_ids = torch.arange(6, dtype=torch.int32).unsqueeze(0)
-        k_cache, v_cache = KVCache.create_cache_tensors(config, dtype=torch.float32)
+        gk, gv, sk, sv = _make_caches(config)
 
         with torch.no_grad():
-            out = model(input_ids, position_ids, k_cache, v_cache)
+            out = model(input_ids, position_ids, gk, gv, sk, sv)
 
         assert out.shape == (1, 6, config.vocab_size)
         assert torch.isfinite(out).all()
@@ -80,10 +102,10 @@ class TestMuseGlimmerForCausalLM:
 
         input_ids = torch.randint(0, 200, (1, 4))
         position_ids = torch.arange(4, dtype=torch.int32).unsqueeze(0)
-        k_cache, v_cache = KVCache.create_cache_tensors(config, dtype=torch.float32)
+        gk, gv, sk, sv = _make_caches(config)
 
         with torch.no_grad():
-            out = model(input_ids, position_ids, k_cache, v_cache)
+            out = model(input_ids, position_ids, gk, gv, sk, sv)
 
         assert out.abs().max() <= 20.0
 
@@ -99,12 +121,12 @@ class TestMuseGlimmerForCausalLM:
 
         input_ids = torch.randint(0, 200, (1, 4))
         position_ids = torch.arange(4, dtype=torch.int32).unsqueeze(0)
-        k1, v1 = KVCache.create_cache_tensors(config1, dtype=torch.float32)
-        k2, v2 = KVCache.create_cache_tensors(config2, dtype=torch.float32)
+        gk1, gv1, sk1, sv1 = _make_caches(config1)
+        gk2, gv2, sk2, sv2 = _make_caches(config2)
 
         with torch.no_grad():
-            out1 = model1(input_ids, position_ids, k1, v1)
-            out2 = model2(input_ids, position_ids, k2, v2)
+            out1 = model1(input_ids, position_ids, gk1, gv1, sk1, sv1)
+            out2 = model2(input_ids, position_ids, gk2, gv2, sk2, sv2)
 
         assert not torch.allclose(out1, out2, atol=1e-3)
 
@@ -159,12 +181,12 @@ class TestMuseGlimmerForCausalLM:
 
         input_ids = torch.randint(0, 200, (1, 4))
         position_ids = torch.arange(4, dtype=torch.int32).unsqueeze(0)
-        k1, v1 = KVCache.create_cache_tensors(config, dtype=torch.float32)
-        k2, v2 = KVCache.create_cache_tensors(config, dtype=torch.float32)
+        gk1, gv1, sk1, sv1 = _make_caches(config)
+        gk2, gv2, sk2, sv2 = _make_caches(config)
 
         with torch.no_grad():
-            out1 = model(input_ids, position_ids, k1, v1)
-            out2 = model(input_ids, position_ids, k2, v2)
+            out1 = model(input_ids, position_ids, gk1, gv1, sk1, sv1)
+            out2 = model(input_ids, position_ids, gk2, gv2, sk2, sv2)
 
         torch.testing.assert_close(out1, out2)
 

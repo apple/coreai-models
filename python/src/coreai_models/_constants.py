@@ -22,6 +22,10 @@ PREFILL_GRAPH_NAME = "prefill"
 KEY_CACHE_NAME = "keyCache"
 VALUE_CACHE_NAME = "valueCache"
 
+# Sliding (ring buffer) KV cache names — fixed-size states classified as .slidingCache
+SLIDING_KEY_CACHE_NAME = "slidingKeyCache"
+SLIDING_VALUE_CACHE_NAME = "slidingValueCache"
+
 # Trace-time KV cache sequence length, to bound peak trace memory. At inference the
 # cache size is dynamic.
 TRACE_KV_CACHE_SEQ_LEN = 2048

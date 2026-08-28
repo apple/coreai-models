@@ -14,6 +14,10 @@ Meta's 30B on-device agentic model (Apache 2.0). Architecture features:
 - qk_scale_factor: custom attention scaling (not 1/sqrt(d))
 - output_multiplier: scales final hidden state before lm_head
 - Logit softcapping: tanh(logits/cap) * cap
+
+KV cache: split into sliding (ring buffer, fixed size) and global (growing).
+Sliding layers use RingKVCache at window_size capacity; global layers use
+standard KVCache with dynamic sequence length.
 """
 
 import gc
@@ -26,12 +30,19 @@ import torch.nn as nn
 from huggingface_hub import snapshot_download
 from typing_extensions import Self, override
 
+from coreai_models._constants import (
+    KEY_CACHE_NAME,
+    MAIN_GRAPH_NAME,
+    SLIDING_KEY_CACHE_NAME,
+    SLIDING_VALUE_CACHE_NAME,
+    VALUE_CACHE_NAME,
+)
 from coreai_models.models.base import (
     BaseForCausalLM,
     _load_tensors_for_keys,
     _resolve_safetensors_files,
 )
-from coreai_models.primitives.macos.cache import KVCache
+from coreai_models.primitives.macos.cache import KVCache, RingKVCache, ring_window_causal_mask
 from coreai_models.primitives.macos.mlp import MLP
 from coreai_models.primitives.macos.rms_norm import RMSNorm, RMSNormPlusOne
 from coreai_models.primitives.macos.rope import RoPE
@@ -42,6 +53,7 @@ class Attention(nn.Module):
     def __init__(self, config, layer_idx: int) -> None:
         super().__init__()
         self.layer_idx = layer_idx
+        self.cache_slot_idx: int = 0  # set by MuseGlimmerModel.__init__
 
         dim = config.hidden_size
         self.n_heads = n_heads = config.num_attention_heads
@@ -65,7 +77,7 @@ class Attention(nn.Module):
         self.has_rope = rope_theta > 0
 
         if self.is_sliding:
-            self.sdpa = SDPA(is_causal=True, window_size=config.sliding_window)
+            self.sdpa = SDPA(is_causal=False)
         else:
             self.sdpa = SDPA(is_causal=True)
 
@@ -80,10 +92,16 @@ class Attention(nn.Module):
         self,
         x: torch.Tensor,
         position_ids: torch.IntTensor,
-        cache: KVCache | None = None,
+        offset: int,
+        query_len: int,
+        global_cache: KVCache | None = None,
+        sliding_cache: RingKVCache | None = None,
+        sliding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        batch_size, query_len, _ = x.shape
+        batch_size = x.shape[0]
         n_heads, n_kv_heads = self.n_heads, self.n_kv_heads
+        seq_len = position_ids.shape[-1]
+        rope_positions = position_ids.narrow(-1, offset, query_len)
 
         query = (
             self.qk_norm(
@@ -106,27 +124,26 @@ class Attention(nn.Module):
 
         gate = torch.sigmoid(self.gate_proj(x))
 
-        seq_len = position_ids.shape[-1]
-        torch._check_is_size(query_len)
-        torch._check_is_size(seq_len)
-        offset = seq_len - query_len
-        torch._check_is_size(offset)
-        rope_positions = position_ids.narrow(-1, offset, query_len)
-
         if self.has_rope:
             freqs = self._rope_freqs.to(device=query.device)
             query = self.rope(query, position_ids=rope_positions, freqs=freqs)
             key = self.rope(key, position_ids=rope_positions, freqs=freqs)
 
-        if cache is not None:
-            key, value = cache.update_and_fetch(
-                self.layer_idx, offset, key, value, seq_len=seq_len, query_len=query_len
+        if self.is_sliding and sliding_cache is not None:
+            key, value = sliding_cache.update_and_fetch(
+                self.cache_slot_idx, offset, key, value, query_len=query_len
             )
+            attn_output = self.sdpa(query=query, key=key, value=value, attn_mask=sliding_mask)
+        elif not self.is_sliding and global_cache is not None:
+            key, value = global_cache.update_and_fetch(
+                self.cache_slot_idx, offset, key, value, seq_len=seq_len, query_len=query_len
+            )
+            attn_output = self.sdpa(query, key, value)
+        else:
+            attn_output = self.sdpa(query, key, value)
 
-        attn_output = (
-            self.sdpa(query, key, value)
-            .permute(0, 2, 1, 3)
-            .reshape(batch_size, query_len, self.n_heads * self.head_dim)
+        attn_output = attn_output.permute(0, 2, 1, 3).reshape(
+            batch_size, query_len, self.n_heads * self.head_dim
         )
 
         return self.o_proj(attn_output * gate)
@@ -149,9 +166,21 @@ class TransformerBlock(nn.Module):
         self,
         x: torch.Tensor,
         position_ids: torch.IntTensor,
-        cache: KVCache | None = None,
+        offset: int,
+        query_len: int,
+        global_cache: KVCache | None = None,
+        sliding_cache: RingKVCache | None = None,
+        sliding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        r = self.self_attn(self.input_layernorm(x), position_ids, cache)
+        r = self.self_attn(
+            self.input_layernorm(x),
+            position_ids,
+            offset,
+            query_len,
+            global_cache,
+            sliding_cache,
+            sliding_mask,
+        )
         r = self.post_attention_layernorm(r)
         h = x + r
         r = self.mlp(self.pre_feedforward_layernorm(h))
@@ -164,6 +193,7 @@ class MuseGlimmerModel(nn.Module):
         super().__init__()
         self.config = config
         hidden_size = config.hidden_size
+        self.sliding_window = config.sliding_window
         self.embed_tokens = nn.Embedding(config.vocab_size, hidden_size)
         self.output_multiplier = getattr(config, "output_multiplier", 1.0)
         self.layers = nn.ModuleList(
@@ -171,17 +201,56 @@ class MuseGlimmerModel(nn.Module):
         )
         self.norm = RMSNorm(hidden_size, eps=config.rms_norm_eps)
 
+        # Assign dense cache slot indices per pool
+        global_idx, sliding_idx = 0, 0
+        for layer in self.layers:
+            attn = layer.self_attn
+            if attn.is_sliding:
+                attn.cache_slot_idx = sliding_idx
+                sliding_idx += 1
+            else:
+                attn.cache_slot_idx = global_idx
+                global_idx += 1
+        self.n_global_layers = global_idx
+        self.n_sliding_layers = sliding_idx
+
     def forward(
         self,
         input_ids: torch.Tensor,
         position_ids: torch.IntTensor,
-        cache: KVCache | None = None,
+        global_cache: KVCache | None = None,
+        sliding_cache: RingKVCache | None = None,
     ) -> torch.Tensor:
+        query_len = input_ids.shape[-1]
+        seq_len = position_ids.shape[-1]
+        torch._check_is_size(query_len)
+        torch._check_is_size(seq_len)
+        offset = seq_len - query_len
+        torch._check_is_size(offset)
+
         h = self.embed_tokens(input_ids)
-        # MuseGlimmerTextNormedEmbedding: weight-less RMSNorm on embeddings
         h = h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + self.config.rms_norm_eps)
+
+        sliding_mask = None
+        if sliding_cache is not None:
+            sliding_mask = ring_window_causal_mask(
+                query_len,
+                sliding_cache.capacity(),
+                offset,
+                self.sliding_window,
+                input_ids.device,
+            )
+
         for layer in self.layers:
-            h = layer(h, position_ids, cache)
+            h = layer(
+                h,
+                position_ids,
+                offset,
+                query_len,
+                global_cache,
+                sliding_cache,
+                sliding_mask,
+            )
         h = self.norm(h)
         if self.output_multiplier != 1.0:
             h = h * self.output_multiplier
@@ -333,20 +402,41 @@ class MuseGlimmerForCausalLM(BaseForCausalLM):
         self,
         input_ids: torch.Tensor,
         position_ids: torch.IntTensor,
-        k_cache: torch.Tensor,
-        v_cache: torch.Tensor,
+        global_k_cache: torch.Tensor,
+        global_v_cache: torch.Tensor,
+        sliding_k_cache: torch.Tensor,
+        sliding_v_cache: torch.Tensor,
     ) -> torch.Tensor | tuple:
-        cache = KVCache(k_cache, v_cache)
-        out = self.model(input_ids, position_ids, cache)
+        global_cache = KVCache(global_k_cache, global_v_cache)
+        sliding_cache = RingKVCache(sliding_k_cache, sliding_v_cache)
+        out = self.model(input_ids, position_ids, global_cache, sliding_cache)
         if self.prefill_mode:
-            # A bare `return` causes torch export to trace a leaf node with value
-            # `None` rather than having no leaf nodes whatsoever. Remedied with
-            # empty tuple.
             return ()
         logits = self.lm_head(out)
         if self._softcap:
             logits = torch.tanh(logits / self._softcap) * self._softcap
         return logits
+
+    @classmethod
+    @override
+    def export_state_names(cls) -> dict[str, tuple[str, ...]]:
+        return {
+            MAIN_GRAPH_NAME: (
+                KEY_CACHE_NAME,
+                VALUE_CACHE_NAME,
+                SLIDING_KEY_CACHE_NAME,
+                SLIDING_VALUE_CACHE_NAME,
+            )
+        }
+
+    @classmethod
+    def export_state_classification(cls) -> dict[str, str]:
+        return {
+            KEY_CACHE_NAME: "kv_cache",
+            VALUE_CACHE_NAME: "kv_cache",
+            SLIDING_KEY_CACHE_NAME: "sliding_cache",
+            SLIDING_VALUE_CACHE_NAME: "sliding_cache",
+        }
 
     @override
     def _mutate_state_dict(self: Self, state_dict: dict[str, torch.Tensor]) -> None:
