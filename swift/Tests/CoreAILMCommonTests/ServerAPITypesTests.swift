@@ -126,9 +126,9 @@ struct ServerAPITypesTests {
 
     // MARK: - Stats Response
 
-    @Test("StatsResponse encodes snake_case keys")
+    @Test("ServerStatsResponse encodes snake_case keys")
     func statsResponseEncodes() throws {
-        let stats = StatsResponse(
+        let stats = ServerStatsResponse(
             totalRequests: 10, totalPromptTokens: 500, totalGenTokens: 200,
             avgPrefillTokPerSec: 1000.0, avgDecodeTokPerSec: 50.0,
             prefixHitRate: 0.8, prefixHits: 8, prefixMisses: 2,
@@ -145,22 +145,22 @@ struct ServerAPITypesTests {
         #expect(tools?[0]["name"] as? String == "get_weather")
     }
 
-    @Test("StatsResponse round-trips through JSON")
+    @Test("ServerStatsResponse round-trips through JSON")
     func statsResponseRoundTrip() throws {
-        let stats = StatsResponse(
+        let stats = ServerStatsResponse(
             totalRequests: 5, totalPromptTokens: 100, totalGenTokens: 50,
             avgPrefillTokPerSec: 500.0, avgDecodeTokPerSec: 25.0,
             prefixHitRate: 0.6, prefixHits: 3, prefixMisses: 2
         )
         let data = try JSONEncoder().encode(stats)
-        let decoded = try JSONDecoder().decode(StatsResponse.self, from: data)
+        let decoded = try JSONDecoder().decode(ServerStatsResponse.self, from: data)
         #expect(decoded.totalRequests == 5)
         #expect(decoded.prefixHitRate == 0.6)
         #expect(decoded.totalToolCalls == 0)
         #expect(decoded.topTools == nil)
     }
 
-    @Test("StatsResponse decodes from external JSON")
+    @Test("ServerStatsResponse decodes from external JSON")
     func statsResponseDecodes() throws {
         let json = """
             {"total_requests":3,"total_prompt_tokens":100,"total_gen_tokens":50,
@@ -168,7 +168,7 @@ struct ServerAPITypesTests {
              "prefix_hit_rate":0.5,"prefix_hits":1,"prefix_misses":1,
              "total_tool_calls":0}
             """.data(using: .utf8)!
-        let stats = try JSONDecoder().decode(StatsResponse.self, from: json)
+        let stats = try JSONDecoder().decode(ServerStatsResponse.self, from: json)
         #expect(stats.totalRequests == 3)
         #expect(stats.avgDecodeTokPerSec == 25.0)
     }

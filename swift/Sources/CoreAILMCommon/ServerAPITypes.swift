@@ -548,7 +548,7 @@ public struct ToolCallFunctionDelta: Encodable, Sendable {
 
 // MARK: - Stats Response
 
-public struct StatsResponse: Codable, Sendable {
+public struct ServerStatsResponse: Codable, Sendable {
     public let totalRequests: Int
     public let totalPromptTokens: Int
     public let totalGenTokens: Int

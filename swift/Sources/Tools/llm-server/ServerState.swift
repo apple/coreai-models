@@ -93,9 +93,9 @@ final class ServerStats: @unchecked Sendable {
     func buildResponse(
         prefixHitRate: Double, prefixHits: Int, prefixMisses: Int,
         totalToolCalls: Int, topTools: [ToolCallStat]
-    ) -> StatsResponse {
+    ) -> ServerStatsResponse {
         let s = lock.withLock { $0 }
-        return StatsResponse(
+        return ServerStatsResponse(
             totalRequests: s.totalRequests,
             totalPromptTokens: s.totalPromptTokens,
             totalGenTokens: s.totalGenTokens,
@@ -206,7 +206,7 @@ final class ServerState: @unchecked Sendable {
     }
 
     /// Stats snapshot for /v1/stats endpoint.
-    func statsSnapshot() -> StatsResponse {
+    func statsSnapshot() -> ServerStatsResponse {
         let s = _state.withLock { s in
             (
                 prefixHits: s.prefixHits, prefixMisses: s.prefixMisses,
