@@ -128,37 +128,44 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
                 "No KV cache state descriptors found — cannot allocate cache buffers")
         }
 
-        // Create input filler from the largest-context function's descriptors
+        // Discover input names from the largest-context function
         let posName = largestExtendDescriptor.inputNames.first(where: { $0.contains("pos") })
-        guard let positionIdsName = posName,
-            case .ndArray(let posDesc) = largestExtendDescriptor.inputDescriptor(of: positionIdsName)
-        else {
+        guard let positionIdsName = posName else {
             throw InferenceRuntimeError.invalidState("No position_ids input found in model descriptor")
         }
+        let maskName: String? = largestExtendDescriptor.inputNames.contains("causal_mask")
+            ? "causal_mask" : nil
+        let stepInputName: String? = largestExtendDescriptor.inputNames.first(where: {
+            $0.contains("step") && !$0.contains("pos")
+        })
 
-        var maskName: String?
-        var maskDesc: NDArrayDescriptor?
-        if case .ndArray(let md) = largestExtendDescriptor.inputDescriptor(of: "causal_mask") {
-            maskName = "causal_mask"
-            maskDesc = md
-        }
+        // Build per-bucket descriptors from ALL extend/prompt functions
+        var bucketDescs: [StaticBucketInputFiller.BucketKey: StaticBucketInputFiller.BucketDescriptors] = [:]
+        for name in extendFunctionNames {
+            let desc = try Self.requireDescriptor(model: model, functionName: name)
+            let ql = Self.queryLength(descriptor: desc, functionName: name)
+            // Parse context length from function name (extend_256_64 → 256)
+            let nameParts = Array(name.split(separator: "_").suffix(2))
+            guard nameParts.count == 2, let cl = Int(nameParts[0]) else { continue }
+            let key = StaticBucketInputFiller.BucketKey(batchSize: ql, contextBucket: cl)
 
-        var stepInputName: String?
-        var stepDesc: NDArrayDescriptor?
-        if let sName = largestExtendDescriptor.inputNames.first(where: { $0.contains("step") && !$0.contains("pos") }),
-            case .ndArray(let sd) = largestExtendDescriptor.inputDescriptor(of: sName)
-        {
-            stepInputName = sName
-            stepDesc = sd
+            guard case .ndArray(let posDesc) = desc.inputDescriptor(of: positionIdsName) else { continue }
+            let mDesc: NDArrayDescriptor? = maskName.flatMap {
+                if case .ndArray(let d) = desc.inputDescriptor(of: $0) { return d }
+                return nil
+            }
+            let sDesc: NDArrayDescriptor? = stepInputName.flatMap {
+                if case .ndArray(let d) = desc.inputDescriptor(of: $0) { return d }
+                return nil
+            }
+            bucketDescs[key] = .init(positionIds: posDesc, causalMask: mDesc, step: sDesc)
         }
 
         self.inputFiller = StaticBucketInputFiller(
             positionIdsName: positionIdsName,
-            positionIdsDescriptor: posDesc,
             causalMaskName: maskName,
-            causalMaskDescriptor: maskDesc,
             stepName: stepInputName,
-            stepDescriptor: stepDesc
+            bucketDescriptors: bucketDescs
         )
         var buffers = InputBuffers()
         inputFiller.registerBuffers(into: &buffers)
@@ -264,12 +271,15 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     /// `transformer_input` descriptor's sequence dimension.
     private func queryLength(of functionName: String) throws -> Int {
         let desc = try functionDescriptor(for: functionName)
-        if let txName = desc.inputNames.first(where: { $0.contains("transformer_input") }),
-            case .ndArray(let nd) = desc.inputDescriptor(of: txName), nd.shape.count >= 2
+        return Self.queryLength(descriptor: desc, functionName: functionName)
+    }
+
+    private static func queryLength(descriptor: InferenceFunctionDescriptor, functionName: String) -> Int {
+        if let txName = descriptor.inputNames.first(where: { $0.contains("transformer_input") }),
+            case .ndArray(let nd) = descriptor.inputDescriptor(of: txName), nd.shape.count >= 2
         {
             return nd.shape[1]
         }
-        // Fallback: parse from function name (extend_<ctx>_<seq>)
         let parts = functionName.split(separator: "_")
         if let last = parts.last, let seq = Int(last) { return seq }
         return 1
@@ -335,34 +345,6 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         return isPrefill
             ? "prompt_opt_\(selected.contextLength)_\(selected.queryLength)"
             : "extend_\(selected.contextLength)_\(selected.queryLength)"
-    }
-
-    // MARK: - Causal Mask
-
-    private static func fillCausalMask(
-        _ view: consuming NDArray.MutableView<LogitsScalarType>,
-        tokensInBatch: Int,
-        alignedStep: Int
-    ) {
-        view.withUnsafeMutablePointer { ptr, shape, strides in
-            // Stride-aware indexing for non-contiguous strides
-            for context in 0..<shape[1] {
-                for query in 0..<shape[3] {
-                    let offset = context &* strides[1] &+ query &* strides[3]
-                    ptr[offset] = LogitsScalarType(-40000.0)
-                }
-            }
-
-            // Unmask positions where attention is allowed
-            for query in 0..<tokensInBatch {
-                let queryPos = alignedStep + query
-                let upperBound = min(queryPos, shape[1] &- 1)
-                for context in 0...upperBound {
-                    let offset = context &* strides[1] &+ query &* strides[3]
-                    ptr[offset] = 0
-                }
-            }
-        }
     }
 
     // MARK: - Generate (primary API)
@@ -511,7 +493,9 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         tokensInBatch: Int
     ) async throws -> [String: NDArray] {
         let desc = try functionDescriptor(for: graphName)
-        let contextLength = Self.contextLength(descriptor: desc, config: config)
+        // Parse context length from graph name to match bucket keys
+        let nameParts = Array(graphName.split(separator: "_").suffix(2))
+        let contextLength = nameParts.count == 2 ? (Int(nameParts[0]) ?? 0) : 0
 
         // Fill position_ids, causal_mask, step via the handler
         let context = InputContext.static(

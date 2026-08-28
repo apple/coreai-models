@@ -102,24 +102,48 @@ public enum InputCoverage {
 public struct InputBuffers {
     private var buffers: [String: NDArray] = [:]
     private var descriptors: [String: NDArrayDescriptor] = [:]
+    private var pool: [String: [[Int]: NDArray]] = [:]
 
     public init() {}
 
     /// Register a named input with its descriptor. Allocates initial buffer at batch=1.
+    /// For dynamic descriptors (sequential engine), resolves -1 dims to 1.
     public mutating func register(name: String, descriptor: NDArrayDescriptor) {
         descriptors[name] = descriptor
         let resolved = descriptor.resolvingDynamicDimensions([1, 1])
         buffers[name] = NDArray(descriptor: resolved)
     }
 
+    /// Pre-allocate a buffer for a specific descriptor shape. Called at init to
+    /// populate the pool with every shape the engine will use. The first call
+    /// for a given name also sets it as the active buffer.
+    public mutating func preAllocate(name: String, descriptor: NDArrayDescriptor) {
+        pool[name, default: [:]][descriptor.shape] = NDArray(descriptor: descriptor)
+        if buffers[name] == nil {
+            buffers[name] = pool[name]![descriptor.shape]!
+        }
+    }
+
     /// Ensure the named buffer has capacity for the given shape.
     /// Only reallocates if the current shape doesn't match.
+    /// For dynamic descriptors (sequential engine).
     public mutating func ensureCapacity(name: String, shape: [Int]) {
         guard let desc = descriptors[name] else { return }
         let current = buffers[name]
         let resolved = desc.resolvingDynamicDimensions(shape)
         if current == nil || current!.shape != resolved.shape {
             buffers[name] = NDArray(descriptor: resolved)
+        }
+    }
+
+    /// Swap the active buffer to a pre-allocated one matching the descriptor's shape.
+    /// O(1) pool lookup, zero allocation. Falls back to fresh allocation if not pooled.
+    public mutating func ensureCapacity(name: String, descriptor: NDArrayDescriptor) {
+        if buffers[name]?.shape == descriptor.shape { return }
+        if let pooled = pool[name]?[descriptor.shape] {
+            buffers[name] = pooled
+        } else {
+            buffers[name] = NDArray(descriptor: descriptor)
         }
     }
 
@@ -152,6 +176,18 @@ public struct InputBuffers {
         guard var array = buffers[name] else { return }
         body(&array)
         buffers[name] = array
+    }
+
+    /// Mutate a buffer in-place through the dictionary's _modify accessor.
+    /// Avoids the extract/put-back COW overhead of withBuffer.
+    public mutating func withMutableBuffer(
+        _ name: String,
+        body: (inout NDArray) throws -> Void
+    ) throws {
+        guard buffers[name] != nil else {
+            throw InferenceRuntimeError.invalidState("No buffer registered for '\(name)'")
+        }
+        try body(&buffers[name]!)
     }
 
     /// O(1) as this returns the backing dictionary directly.

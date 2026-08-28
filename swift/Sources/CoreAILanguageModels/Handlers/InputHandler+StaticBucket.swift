@@ -10,12 +10,14 @@ import CoreAIShared
 
 /// Zero-allocation input filler for static-shape (ANE) engines.
 ///
-/// Fills position_ids (UInt16), causal_mask (Float16), and step (Int32) into
-/// engine-owned `InputBuffers` in-place. Buffers are registered at the
-/// max-bucket descriptor size; `ensureCapacity` handles per-graph shape selection.
+/// Pre-allocates all input NDArrays per bucket (graph variant) at init time.
+/// Within a bucket, every call to `fill()` swaps in the right pre-allocated
+/// buffer and fills in-place — zero per-step allocation.
 ///
-/// Conforms to `StaticInputHandler` — the engine owns the buffers, this handler
-/// is stateless and can be stored as `let`.
+/// Fills position_ids (UInt16), causal_mask (Float16), and step (Int32).
+/// Inputs NOT managed (handled by the engine directly):
+/// - `embedding_table` (constant, passed through)
+/// - `transformer_input` (produced by gather function)
 public struct StaticBucketInputFiller: StaticInputHandler {
     public let inputNames: [String]
 
@@ -23,33 +25,29 @@ public struct StaticBucketInputFiller: StaticInputHandler {
     private let causalMaskName: String?
     private let stepName: String?
 
-    private let positionIdsDescriptor: NDArrayDescriptor
-    private let causalMaskDescriptor: NDArrayDescriptor?
-    private let stepDescriptor: NDArrayDescriptor?
+    private let bucketDescriptors: [BucketKey: BucketDescriptors]
 
-    /// Create from descriptors extracted from the model's function descriptors.
-    ///
-    /// - Parameters:
-    ///   - positionIdsName: Input name for position IDs
-    ///   - positionIdsDescriptor: Descriptor from the largest-batch function
-    ///   - causalMaskName: Input name for causal mask (nil if model doesn't declare it)
-    ///   - causalMaskDescriptor: Descriptor from the largest-context function
-    ///   - stepName: Input name for step scalar (nil if model doesn't declare it)
-    ///   - stepDescriptor: Descriptor for the step input
+    public struct BucketKey: Hashable, Sendable {
+        public let batchSize: Int
+        public let contextBucket: Int
+    }
+
+    public struct BucketDescriptors: Sendable {
+        public let positionIds: NDArrayDescriptor
+        public let causalMask: NDArrayDescriptor?
+        public let step: NDArrayDescriptor?
+    }
+
     public init(
         positionIdsName: String,
-        positionIdsDescriptor: NDArrayDescriptor,
         causalMaskName: String? = nil,
-        causalMaskDescriptor: NDArrayDescriptor? = nil,
         stepName: String? = nil,
-        stepDescriptor: NDArrayDescriptor? = nil
+        bucketDescriptors: [BucketKey: BucketDescriptors]
     ) {
         self.positionIdsName = positionIdsName
-        self.positionIdsDescriptor = positionIdsDescriptor
         self.causalMaskName = causalMaskName
-        self.causalMaskDescriptor = causalMaskDescriptor
         self.stepName = stepName
-        self.stepDescriptor = stepDescriptor
+        self.bucketDescriptors = bucketDescriptors
 
         var names = [positionIdsName]
         if let m = causalMaskName { names.append(m) }
@@ -58,12 +56,14 @@ public struct StaticBucketInputFiller: StaticInputHandler {
     }
 
     public func registerBuffers(into buffers: inout InputBuffers) {
-        buffers.register(name: positionIdsName, descriptor: positionIdsDescriptor)
-        if let maskName = causalMaskName, let maskDesc = causalMaskDescriptor {
-            buffers.register(name: maskName, descriptor: maskDesc)
-        }
-        if let sName = stepName, let sDesc = stepDescriptor {
-            buffers.register(name: sName, descriptor: sDesc)
+        for (_, descs) in bucketDescriptors {
+            buffers.preAllocate(name: positionIdsName, descriptor: descs.positionIds)
+            if let maskName = causalMaskName, let maskDesc = descs.causalMask {
+                buffers.preAllocate(name: maskName, descriptor: maskDesc)
+            }
+            if let sName = stepName, let sDesc = descs.step {
+                buffers.preAllocate(name: sName, descriptor: sDesc)
+            }
         }
     }
 
@@ -73,47 +73,48 @@ public struct StaticBucketInputFiller: StaticInputHandler {
         let tokensInBatch = context.tokens.count
         let contextLength = context.contextBucket
 
-        guard contextLength > 0 else {
+        let key = BucketKey(batchSize: batchSize, contextBucket: contextLength)
+        guard let descs = bucketDescriptors[key] else {
             throw InferenceRuntimeError.invalidState(
-                "StaticBucketInputFiller requires contextBucket > 0 in InputContext")
+                "No pre-allocated bucket for (batch=\(batchSize), ctx=\(contextLength)). "
+                    + "Available: \(bucketDescriptors.keys.sorted { ($0.contextBucket, $0.batchSize) < ($1.contextBucket, $1.batchSize) })")
         }
 
         // Position IDs: UInt16 ascending from alignedStep
-        buffers.ensureCapacity(name: positionIdsName, shape: [1, batchSize])
-        buffers.withBuffer(positionIdsName) { array in
+        buffers.ensureCapacity(name: positionIdsName, descriptor: descs.positionIds)
+        try buffers.withMutableBuffer(positionIdsName) { array in
             fillNDArray(&array, as: UInt16.self, count: batchSize) { i in
                 UInt16(alignedStep + i)
             }
         }
 
         // Causal mask: [1, ctx, 1, batch] — lower-triangular
-        if let maskName = causalMaskName {
-            buffers.ensureCapacity(name: maskName, shape: [1, contextLength, 1, batchSize])
-            buffers.withBuffer(maskName) { array in
-                var view = array.mutableView(as: Float16.self)
-                view.withUnsafeMutablePointer { ptr, shape, strides in
-                    for ctx in 0..<shape[1] {
-                        for query in 0..<shape[3] {
-                            let offset = ctx &* strides[1] &+ query &* strides[3]
-                            ptr[offset] = Float16(-40000)
+        if let maskName = causalMaskName, let maskDesc = descs.causalMask {
+            buffers.ensureCapacity(name: maskName, descriptor: maskDesc)
+            try buffers.withMutableBuffer(maskName) { array in
+                array.mutableView(as: Float16.self)
+                    .withUnsafeMutablePointer { ptr, shape, strides in
+                        for ctx in 0..<shape[1] {
+                            for query in 0..<shape[3] {
+                                let offset = ctx &* strides[1] &+ query &* strides[3]
+                                ptr[offset] = Float16(-40000)
+                            }
+                        }
+                        for query in 0..<tokensInBatch {
+                            let queryPos = alignedStep + query
+                            let upperBound = min(queryPos, shape[1] &- 1)
+                            for ctx in 0...upperBound {
+                                let offset = ctx &* strides[1] &+ query &* strides[3]
+                                ptr[offset] = 0
+                            }
                         }
                     }
-                    for query in 0..<tokensInBatch {
-                        let queryPos = alignedStep + query
-                        let upperBound = min(queryPos, shape[1] &- 1)
-                        for ctx in 0...upperBound {
-                            let offset = ctx &* strides[1] &+ query &* strides[3]
-                            ptr[offset] = 0
-                        }
-                    }
-                }
             }
         }
 
         // Step scalar: Int32
-        if let sName = stepName {
-            buffers.ensureCapacity(name: sName, shape: [1])
-            buffers.withBuffer(sName) { array in
+        if let sName = stepName, descs.step != nil {
+            try buffers.withMutableBuffer(sName) { array in
                 fillNDArray(&array, as: Int32.self, count: 1) { _ in Int32(alignedStep) }
             }
         }
