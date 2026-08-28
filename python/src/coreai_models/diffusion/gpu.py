@@ -52,7 +52,28 @@ def export_stateless(
 
     Returns:
         An optimized AIProgram ready for saving/compilation.
+
+    Raises:
+        ValueError: If ``input_names`` or ``dynamic_shapes`` disagrees in length with
+            ``dummy_inputs``.
     """
+    # This path traces positionally (args=), so all three tuples are bound by order
+    # and a length mismatch misbinds silently -- a dynamic spec would land on the
+    # wrong input, or the last input would go unconstrained. The LLM paths get this
+    # from `BaseForCausalLM.validate_export_contract`; the diffusion path has no
+    # equivalent, so check it here.
+    if len(input_names) != len(dummy_inputs):
+        raise ValueError(
+            f"input_names has {len(input_names)} entries but {len(dummy_inputs)} dummy "
+            f"inputs were given: {input_names}"
+        )
+    if dynamic_shapes is not None and len(dynamic_shapes) != len(dummy_inputs):
+        raise ValueError(
+            f"dynamic_shapes has {len(dynamic_shapes)} entries but {len(dummy_inputs)} "
+            "dummy inputs were given. It is a positional tuple, so it needs one entry "
+            "per input (None for a fully static one)."
+        )
+
     wrapper.eval()
 
     def export_fn(module: torch.nn.Module) -> torch.export.ExportedProgram:

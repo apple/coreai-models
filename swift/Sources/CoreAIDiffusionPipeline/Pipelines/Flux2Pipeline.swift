@@ -9,6 +9,17 @@ import CoreAIShared
 import CoreGraphics
 import Tokenizers
 
+/// A traced img2img graph: which asset holds it, and under which entrypoint.
+public struct Img2ImgRoute: Sendable {
+    public let function: CoreAIDiffusionModelFunction
+    public let entrypoint: String
+
+    public init(function: CoreAIDiffusionModelFunction, entrypoint: String) {
+        self.function = function
+        self.entrypoint = entrypoint
+    }
+}
+
 /// FLUX.2 Klein pipeline using Core AI backend.
 ///
 /// Orchestrates: tokenize → text encode → noise → pack → denoise loop
@@ -21,6 +32,18 @@ public struct Flux2Pipeline: DiffusionPipeline {
     public let mode: DecodeResolution
 
     public let transformer: CoreAIDiffusionModelFunction
+    /// How each reference grid reaches a traced graph, resolved at load time.
+    ///
+    /// img2img arrives two ways and a bundle can contain both, because export directories
+    /// accumulate assets across runs. Resolving to (asset, entrypoint) pairs up front
+    /// keeps the choice in one place:
+    ///
+    /// - multi-function: an `img2img_*` entrypoint on `transformer` — preferred, since it
+    ///   reuses the already-loaded asset instead of a second ~2 GB weight set
+    /// - single-function: a `Transformer[_512]_img2img_<grid>` asset, entrypoint `main`
+    ///
+    /// A grid absent from both is simply not supported by the bundle.
+    public let img2imgRoutes: [ReferenceGrid: Img2ImgRoute]
     public let textEncoder: CoreAIDiffusionModelFunction
     public let decoder: CoreAIDiffusionModelFunction
     public let encoder: CoreAIDiffusionModelFunction?
@@ -99,6 +122,7 @@ public struct Flux2Pipeline: DiffusionPipeline {
         descriptor: PipelineDescriptor,
         mode: DecodeResolution = .full,
         transformer: CoreAIDiffusionModelFunction,
+        img2imgRoutes: [ReferenceGrid: Img2ImgRoute] = [:],
         textEncoder: CoreAIDiffusionModelFunction,
         decoder: CoreAIDiffusionModelFunction,
         encoder: CoreAIDiffusionModelFunction?,
@@ -111,6 +135,7 @@ public struct Flux2Pipeline: DiffusionPipeline {
         self.descriptor = descriptor
         self.mode = mode
         self.transformer = transformer
+        self.img2imgRoutes = img2imgRoutes
         self.textEncoder = textEncoder
         self.decoder = decoder
         self.encoder = encoder
@@ -134,10 +159,18 @@ public struct Flux2Pipeline: DiffusionPipeline {
         try await textEncoder.loadResources()
         try await decoder.loadResources()
         if let encoder { try await encoder.loadResources() }
+        // The img2img transformers are deliberately *not* loaded here. Each is a full
+        // weight set (~2 GB resident on GPU) that a txt2img run never touches, and
+        // `CoreAIDiffusionModelFunction` loads itself on first use anyway. They are still
+        // unloaded below, so a run that did use one releases it.
     }
 
     public func unloadResources() async {
         await transformer.unloadResources()
+        // Distinct assets only: multi-function routes point back at `transformer`.
+        for route in img2imgRoutes.values where route.function !== transformer {
+            await route.function.unloadResources()
+        }
         await textEncoder.unloadResources()
         await decoder.unloadResources()
         if let encoder { await encoder.unloadResources() }
@@ -256,16 +289,30 @@ public struct Flux2Pipeline: DiffusionPipeline {
         let textIds = buildTextIds(textSeqLen: textSeqLen, axisCount: axisCount)
 
         // 7. Denoising loop
-        // Select transformer function based on mode and resolution
+        // Pick the asset + entrypoint that serves this pass. img2img arrives one of two
+        // ways: as a named entrypoint on the multi-function transformer, or as its own
+        // single-function asset. Which one is decided at load time by whether that asset
+        // exists on disk.
+        let denoiser: CoreAIDiffusionModelFunction
         let fnName: String
         if referenceTokens != nil {
-            let prefix = (mode == .half) ? "img2img_512_" : "img2img_"
-            switch configuration.referenceGrid {
-            case .quarter: fnName = "\(prefix)quarter"
-            case .half: fnName = "\(prefix)half"
-            case .full: fnName = "\(prefix)full"
+            // Name what the bundle does have, not just what it lacks: re-exporting is the
+            // only remedy, so the available set is the actionable part.
+            guard let route = img2imgRoutes[configuration.referenceGrid] else {
+                let available = img2imgRoutes.keys.map(\.rawValue).sorted()
+                throw PipelineLoadError.unsupportedConfiguration(
+                    available.isEmpty
+                        ? "this bundle has no img2img transformer. Export the img2img "
+                            + "components, or use --multifunction to get every grid from "
+                            + "a single asset."
+                        : "this bundle has no img2img transformer for the "
+                            + "\(configuration.referenceGrid) reference grid. Available: "
+                            + "\(available.joined(separator: ", ")).")
             }
+            denoiser = route.function
+            fnName = route.entrypoint
         } else {
+            denoiser = transformer
             fnName = transformerFunctionName
         }
 
@@ -295,7 +342,7 @@ public struct Flux2Pipeline: DiffusionPipeline {
 
             if let emptyEmb = emptyEmbeddings {
                 // Manual CFG: two forward passes, guidance=0 to bypass the distilled path
-                let condOutput = try await transformer.run(
+                let condOutput = try await denoiser.run(
                     floatInputs: [
                         (inputTokens, [1, inputSeqLen, inChannels]),
                         (textEmbeddings, [1, textSeqLen, hiddenDim(textEmbeddings)]),
@@ -305,7 +352,7 @@ public struct Flux2Pipeline: DiffusionPipeline {
                         (textIds, [1, textSeqLen, axisCount]),
                     ], functionName: fnName)
 
-                let uncondOutput = try await transformer.run(
+                let uncondOutput = try await denoiser.run(
                     floatInputs: [
                         (inputTokens, [1, inputSeqLen, inChannels]),
                         (emptyEmb, [1, textSeqLen, hiddenDim(emptyEmb)]),
@@ -330,7 +377,7 @@ public struct Flux2Pipeline: DiffusionPipeline {
                 }
             } else {
                 // Standard single pass with embedded guidance
-                let fullOutput = try await transformer.run(
+                let fullOutput = try await denoiser.run(
                     floatInputs: [
                         (inputTokens, [1, inputSeqLen, inChannels]),
                         (textEmbeddings, [1, textSeqLen, hiddenDim(textEmbeddings)]),
@@ -353,7 +400,11 @@ public struct Flux2Pipeline: DiffusionPipeline {
             if !progressHandler(progress) { break }
         }
 
-        if configuration.lazyModelLoading { await transformer.unloadResources() }
+        if configuration.lazyModelLoading {
+            // Release whichever asset ran; for single-function img2img that is a
+            // separate ~2 GB weight set, not the txt2img transformer.
+            await denoiser.unloadResources()
+        }
 
         // 8. Unpack: (B, H*W, C) → (B, C, H, W)
         var spatialLatents = unpackLatentsSpatialFlatten(

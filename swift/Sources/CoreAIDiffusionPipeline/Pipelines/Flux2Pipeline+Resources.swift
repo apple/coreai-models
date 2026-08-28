@@ -78,6 +78,30 @@ extension Flux2Pipeline {
             preconditionFailure("auto resolved above")
         }
 
+        // Resolve how each reference grid reaches a traced graph.
+        //
+        // A directory can hold *both* forms — `_prepare_assets` merges each export over
+        // the previous metadata, so re-exporting a different component set leaves the old
+        // assets behind. So presence on disk is not sufficient: prefer the multi-function
+        // entrypoint when the transformer declares it, because that reuses the asset this
+        // pipeline already loads instead of a second ~2 GB weight set.
+        let entrypointPrefix = resolvedMode == .half ? "img2img_512_" : "img2img_"
+        let assetPrefix = resolvedMode == .half ? "Transformer_512_img2img" : "Transformer_img2img"
+        var img2imgRoutes: [ReferenceGrid: Img2ImgRoute] = [:]
+        for grid in ReferenceGrid.allCases {
+            let entrypoint = "\(entrypointPrefix)\(grid.rawValue)"
+            if try await transformer.hasFunction(named: entrypoint) {
+                img2imgRoutes[grid] = Img2ImgRoute(function: transformer, entrypoint: entrypoint)
+            } else if let path = Self.resolveAsset(at: url, name: "\(assetPrefix)_\(grid.rawValue)") {
+                // Single-function: its own asset, traced at one concatenated sequence
+                // length, always entered through "main".
+                img2imgRoutes[grid] = Img2ImgRoute(
+                    function: CoreAIDiffusionModelFunction(
+                        modelURL: url.appendingPathComponent(path)),
+                    entrypoint: "main")
+            }
+        }
+
         // Select decoder by mode (explicit name)
         let decoderName: String
         switch resolvedMode {
@@ -129,6 +153,7 @@ extension Flux2Pipeline {
         self.descriptor = descriptor
         self.mode = resolvedMode
         self.transformer = transformer
+        self.img2imgRoutes = img2imgRoutes
         self.textEncoder = textEncoder
         self.decoder = decoder
         self.encoder = encoder

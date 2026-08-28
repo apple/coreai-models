@@ -73,7 +73,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--platform",
         default=None,
         choices=["iOS", "macOS"],
-        help="Target platform. iOS defaults to 512 resolution; macOS defaults to 1024.",
+        help="Target platform. iOS defaults to 512 resolution, --no-multifunction, and "
+        "the half img2img reference grid; macOS defaults to 1024 and the full grid.",
     )
     parser.add_argument(
         "--resolution",
@@ -85,15 +86,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--low-memory",
         action="store_true",
-        help="Include half-resolution VAEs for tiled decode.",
+        help="Include half-resolution VAEs for tiled decode. Redundant for multifunction.",
     )
     parser.add_argument(
         "--multifunction",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=None,
         help="Export FLUX.2 transformer as multi-function .aimodel with 5 functions "
         "(main, half, img2img_quarter/half/full) sharing weights. "
-        "Default: enabled. Use --no-multifunction for separate single-function models.",
+        "Default: enabled. Use --no-multifunction for separate single-function models. "
+        "Ignores --resolution and --low-memory.",
     )
     parser.add_argument(
         "--experimental",
@@ -121,6 +123,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable verbose (DEBUG) logging",
     )
     return parser
+
+
+def _warn(message: str) -> None:
+    """Note a flag whose intent is already met, or met elsewhere, rather than failing.
+
+    Reserved for combinations that are redundant or resolved at runtime. A combination
+    that genuinely cannot be honoured uses ``parser.error`` instead.
+    """
+    logging.getLogger(__name__).warning(message)
 
 
 def _is_hf_id(model: str) -> bool:
@@ -185,8 +196,50 @@ def main() -> None:
     if args.components and args.platform:
         parser.error("Cannot specify both --components and --platform. Use only one.")
 
+    # `--multifunction` defaults to None so an explicit flag is distinguishable from the
+    # default. Without that the iOS guard below cannot tell them apart and would fire on
+    # every iOS export.
+    multifunction_was_explicit = args.multifunction is not None
+    multifunction = args.multifunction if multifunction_was_explicit else True
+
+    # iOS forces single-function: multifunction saves disk but raises peak memory, and
+    # the tradeoff is not negotiable on device. Unlike the two warnings below there is no
+    # runtime recourse -- the asset simply will not have the extra entrypoints -- so an
+    # explicit --multifunction cannot be honoured and is rejected rather than inverted.
+    if args.platform == "iOS" and multifunction_was_explicit and multifunction:
+        parser.error(
+            "--platform iOS implies --no-multifunction (multifunction raises peak memory "
+            "on device), so --multifunction cannot be honoured. Drop --multifunction, or "
+            "omit --platform and pass --components yourself."
+        )
+    if args.platform == "iOS":
+        multifunction = False
+
+    # The next two are warnings, not errors: under multifunction the flags' intent is
+    # already met by a different mechanism, so failing the export would be wrong.
+    if args.platform is None:
+        if args.resolution is not None:
+            _warn(
+                "--resolution only applies with --platform; every component is exported without it."
+            )
+        if args.low_memory:
+            _warn(
+                "--low-memory only applies with --platform; every component is exported without it."
+            )
+    elif multifunction:
+        if args.resolution is not None:
+            _warn(
+                f"--resolution {args.resolution} is not used with multifunction: one asset "
+                "holds both resolutions. Select at runtime with the pipeline's "
+                "--decode-resolution, or export with --no-multifunction."
+            )
+        if args.low_memory:
+            _warn(
+                "--low-memory is redundant with multifunction: the half VAEs are always included."
+            )
+
     if args.components:
-        valid = get_valid_components(pipeline_type, multifunction=args.multifunction)
+        valid = get_valid_components(pipeline_type, multifunction=multifunction)
         invalid = [c for c in args.components if c not in valid]
         if invalid:
             parser.error(
@@ -201,7 +254,16 @@ def main() -> None:
         if resolution is None:
             resolution = 512 if args.platform == "iOS" else 1024
 
-        if args.multifunction:
+        # Single-function img2img needs one asset per reference grid -- each grid is a
+        # different concatenated sequence length, so a different trace, and separate
+        # assets do not share weights (~2 GB each). Export exactly one.
+        #
+        # iOS takes the cheaper grid: it is memory-constrained, which is the same reason
+        # it forces single-function. `half` is a quarter of full's reference tokens
+        # (256 vs 1024 at 512px). Override with --components.
+        img2img_grid = "half" if args.platform == "iOS" else "full"
+
+        if multifunction:
             # Multi-function mode: single transformer has all variants
             target_components = [
                 "transformer",
@@ -216,6 +278,7 @@ def main() -> None:
         elif resolution == 512:
             target_components = [
                 "transformer_512",
+                f"transformer_512_img2img_{img2img_grid}",
                 "text_encoder",
                 "vae_decoder_half",
                 "vae_encoder_half",
@@ -223,6 +286,7 @@ def main() -> None:
         else:
             target_components = [
                 "transformer",
+                f"transformer_img2img_{img2img_grid}",
                 "text_encoder",
                 "vae_decoder",
                 "vae_encoder",
@@ -242,7 +306,7 @@ def main() -> None:
         compression=compression,
         overwrite=args.overwrite,
         include_debug_info=args.include_debug_info,
-        multifunction=args.multifunction,
+        multifunction=multifunction,
     )
 
     if args.dry_run:

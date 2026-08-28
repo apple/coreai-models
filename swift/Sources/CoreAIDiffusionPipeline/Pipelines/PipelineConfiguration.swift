@@ -118,6 +118,7 @@ extension PipelineConfiguration {
         hasher.combine(schedulerType)
         hasher.combine(strength)
         hasher.combine(referenceGrid)
+        hasher.combine(manualCFG)
         hasher.combine(encoderScaleFactor)
         hasher.combine(decoderScaleFactor)
         hasher.combine(decoderShiftFactor)
@@ -136,6 +137,7 @@ extension PipelineConfiguration {
             && lhs.schedulerType == rhs.schedulerType
             && lhs.strength == rhs.strength
             && lhs.referenceGrid == rhs.referenceGrid
+            && lhs.manualCFG == rhs.manualCFG
             && lhs.encoderScaleFactor == rhs.encoderScaleFactor
             && lhs.decoderScaleFactor == rhs.decoderScaleFactor
             && lhs.decoderShiftFactor == rhs.decoderShiftFactor
