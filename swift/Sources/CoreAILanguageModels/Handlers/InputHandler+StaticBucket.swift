@@ -77,7 +77,8 @@ public struct StaticBucketInputFiller: StaticInputHandler {
         guard let descs = bucketDescriptors[key] else {
             throw InferenceRuntimeError.invalidState(
                 "No pre-allocated bucket for (batch=\(batchSize), ctx=\(contextLength)). "
-                    + "Available: \(bucketDescriptors.keys.sorted { ($0.contextBucket, $0.batchSize) < ($1.contextBucket, $1.batchSize) })")
+                    + "Available: \(bucketDescriptors.keys.sorted { ($0.contextBucket, $0.batchSize) < ($1.contextBucket, $1.batchSize) })"
+            )
         }
 
         // Position IDs: UInt16 ascending from alignedStep
@@ -113,7 +114,8 @@ public struct StaticBucketInputFiller: StaticInputHandler {
         }
 
         // Step scalar: Int32
-        if let sName = stepName, descs.step != nil {
+        if let sName = stepName, let sDesc = descs.step {
+            buffers.ensureCapacity(name: sName, descriptor: sDesc)
             try buffers.withMutableBuffer(sName) { array in
                 fillNDArray(&array, as: Int32.self, count: 1) { _ in Int32(alignedStep) }
             }

@@ -133,7 +133,8 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         guard let positionIdsName = posName else {
             throw InferenceRuntimeError.invalidState("No position_ids input found in model descriptor")
         }
-        let maskName: String? = largestExtendDescriptor.inputNames.contains("causal_mask")
+        let maskName: String? =
+            largestExtendDescriptor.inputNames.contains("causal_mask")
             ? "causal_mask" : nil
         let stepInputName: String? = largestExtendDescriptor.inputNames.first(where: {
             $0.contains("step") && !$0.contains("pos")

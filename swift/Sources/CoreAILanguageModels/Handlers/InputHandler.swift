@@ -101,47 +101,30 @@ public enum InputCoverage {
 /// The engine creates this once at init and passes it to `StaticInputHandler.fill()` each step.
 public struct InputBuffers {
     private var buffers: [String: NDArray] = [:]
-    private var descriptors: [String: NDArrayDescriptor] = [:]
     private var pool: [String: [[Int]: NDArray]] = [:]
 
     public init() {}
 
-    /// Register a named input with its descriptor. Allocates initial buffer at batch=1.
-    /// For dynamic descriptors (sequential engine), resolves -1 dims to 1.
-    public mutating func register(name: String, descriptor: NDArrayDescriptor) {
-        descriptors[name] = descriptor
-        let resolved = descriptor.resolvingDynamicDimensions([1, 1])
-        buffers[name] = NDArray(descriptor: resolved)
-    }
-
     /// Pre-allocate a buffer for a specific descriptor shape. Called at init to
-    /// populate the pool with every shape the engine will use. The first call
-    /// for a given name also sets it as the active buffer.
+    /// populate the pool with every shape the engine will use.
+    /// Does NOT set the active buffer — the first ensureCapacity call will move
+    /// the desired shape out of the pool with exclusive ownership.
     public mutating func preAllocate(name: String, descriptor: NDArrayDescriptor) {
         pool[name, default: [:]][descriptor.shape] = NDArray(descriptor: descriptor)
-        if buffers[name] == nil {
-            buffers[name] = pool[name]![descriptor.shape]!
-        }
-    }
-
-    /// Ensure the named buffer has capacity for the given shape.
-    /// Only reallocates if the current shape doesn't match.
-    /// For dynamic descriptors (sequential engine).
-    public mutating func ensureCapacity(name: String, shape: [Int]) {
-        guard let desc = descriptors[name] else { return }
-        let current = buffers[name]
-        let resolved = desc.resolvingDynamicDimensions(shape)
-        if current == nil || current!.shape != resolved.shape {
-            buffers[name] = NDArray(descriptor: resolved)
-        }
     }
 
     /// Swap the active buffer to a pre-allocated one matching the descriptor's shape.
-    /// O(1) pool lookup, zero allocation. Falls back to fresh allocation if not pooled.
+    /// Moves the NDArray out of the pool (sole ownership) so fillNDArray avoids COW.
+    /// The current buffer is parked back into the pool for later reuse.
     public mutating func ensureCapacity(name: String, descriptor: NDArrayDescriptor) {
         if buffers[name]?.shape == descriptor.shape { return }
-        if let pooled = pool[name]?[descriptor.shape] {
-            buffers[name] = pooled
+        // Park current buffer back into pool
+        if let current = buffers.removeValue(forKey: name) {
+            pool[name, default: [:]][current.shape] = current
+        }
+        // Move desired buffer out of pool (removeValue drops the pool's reference)
+        if let moved = pool[name]?.removeValue(forKey: descriptor.shape) {
+            buffers[name] = moved
         } else {
             buffers[name] = NDArray(descriptor: descriptor)
         }
