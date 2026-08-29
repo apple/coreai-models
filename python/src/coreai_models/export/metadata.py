@@ -95,6 +95,15 @@ _METADATA: dict[str, AIModelMetadataFields] = {
             "Source: https://huggingface.co/google/gemma-3-12b-it"
         ),
     ),
+    "google/gemma-3n-E2B-it": AIModelMetadataFields(
+        author="Gemma Team",
+        license="Gemma Terms of Use",
+        model_description=(
+            "Gemma 3n E2B is a ~5B-parameter on-device language model from Google's "
+            "Gemma 3n family using AltUp for efficient inference. "
+            "Source: https://huggingface.co/google/gemma-3n-E2B-it"
+        ),
+    ),
     "mistralai/Mistral-7B-Instruct-v0.3": AIModelMetadataFields(
         author="Mistral AI",
         license="Apache-2.0",

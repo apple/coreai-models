@@ -244,6 +244,16 @@ LLM_PRESETS: list[ModelPreset] = [
         8192,
         _model_type_override="qwen2",
     ),
+    ModelPreset(
+        "gemma-3n-e2b-it",
+        "google/gemma-3n-E2B-it",
+        "gemma3n",
+        "llm",
+        "macOS",
+        "4bit",
+        "float16",
+        32768,
+    ),
     # --- iOS (compression = palettized) ---
     ModelPreset(
         "qwen3-0.6b",
