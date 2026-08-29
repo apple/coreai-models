@@ -7,7 +7,7 @@ Alibaba's Qwen3 models for on-device inference via Core AI.
 | Model      | Parameters | macOS | iOS |
 | ---------- | ---------- | ----- | --- |
 | Qwen3 0.6B | 0.6B       | Yes   | Yes |
-| Qwen3 1.7B | 1.7B       | Yes   | No  |
+| Qwen3 1.7B | 1.7B       | Yes   | Yes |
 | Qwen3 4B   | 4.0B       | Yes   | Yes |
 | Qwen3 8B   | 8.0B       | Yes   | No  |
 
@@ -84,6 +84,7 @@ Perplexity score on the [`WikiText-2`](https://huggingface.co/datasets/EleutherA
 | Qwen3 0.6B | [Mixed 4-bit/8-bit palettized][mixed-4bit-8bit-yaml] | 5.71\*                | iOS      | 30.90            |
 | Qwen3 1.7B | none (`float16`)                                     | 16.00                 | macOS    | 20.96            |
 | Qwen3 1.7B | [4-bit quantized][presets-info]                      | 4.50                  | macOS    | 21.19            |
+| Qwen3 1.7B | [6-bit palettized][qwen3-1.7b-6bit-yaml]             | 6.00                  | iOS      | —                |
 | Qwen3 4B   | none (`float16`)                                     | 16.00                 | macOS    | 16.41            |
 | Qwen3 4B   | [4-bit quantized][presets-info]                      | 4.50                  | macOS    | 18.33            |
 | Qwen3 4B   | none (`float16`)                                     | 16.00                 | iOS      | 16.41            |
@@ -96,3 +97,4 @@ Perplexity score on the [`WikiText-2`](https://huggingface.co/datasets/EleutherA
 [presets-info]: ../README.md#quantization-options
 [mixed-4bit-8bit-yaml]: qwen3_0_6b_mixed_4bit_8bit.yaml
 [qwen3-4b-mixed-yaml]: qwen3_4b_mixed_4bit_8bit.yaml
+[qwen3-1.7b-6bit-yaml]: qwen3_1_7b_6bit.yaml

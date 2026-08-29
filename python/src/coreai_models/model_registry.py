@@ -198,6 +198,17 @@ LLM_PRESETS: list[ModelPreset] = [
         IOS_DEFAULT_MAX_CONTEXT_LENGTH,
     ),
     ModelPreset(
+        "qwen3-1.7b",
+        "Qwen/Qwen3-1.7B",
+        "qwen3",
+        "llm",
+        "iOS",
+        "none",
+        "float16",
+        IOS_DEFAULT_MAX_CONTEXT_LENGTH,
+        compression_config="models/qwen3/qwen3_1_7b_6bit.yaml",
+    ),
+    ModelPreset(
         "qwen3-4b",
         "Qwen/Qwen3-4B",
         "qwen3",
