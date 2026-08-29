@@ -260,7 +260,7 @@ class MuseGlimmerModel(nn.Module):
 
 
 class MuseGlimmerForCausalLM(BaseForCausalLM):
-    _HF_MODEL_CLASS = None  # Not in our transformers version
+    _HF_MODEL_CLASS = None
 
     # Emit a second, prefill-only ``prefill`` entrypoint beside ``main``.
     exports_prefill_graph = True
@@ -673,4 +673,259 @@ class MuseGlimmerForCausalLMWithDrafter(MuseGlimmerForCausalLM):
         }
         for old_key, new_key in encoder_renames.items():
             if old_key in state_dict:
-                state_dict[new_key] = state_dict.pop(old_key)
+
+
+# ---------------------------------------------------------------------------
+# Embeddings variant (takes inputs_embeds instead of input_ids)
+# ---------------------------------------------------------------------------
+
+
+class MuseGlimmerModelEmbeddings(nn.Module):
+    """Variant of MuseGlimmerModel that accepts pre-computed embeddings.
+
+    Skips ``embed_tokens`` and the weight-less RMSNorm on embeddings — the VLM
+    pipeline pre-computes embeddings with scatter-merged vision features.
+    """
+
+    def __init__(self, config) -> None:
+        super().__init__()
+        self.config = config
+        hidden_size = config.hidden_size
+        self.output_multiplier = getattr(config, "output_multiplier", 1.0)
+        self.layers = nn.ModuleList(
+            [TransformerBlock(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+        )
+        self.norm = RMSNorm(hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        inputs_embeds: torch.Tensor,
+        position_ids: torch.IntTensor,
+        cache: KVCache | None = None,
+    ) -> torch.Tensor:
+        h = inputs_embeds
+        for layer in self.layers:
+            h = layer(h, position_ids, cache)
+        h = self.norm(h)
+        if self.output_multiplier != 1.0:
+            h = h * self.output_multiplier
+        return h
+
+
+class MuseGlimmerForCausalLMEmbeddings(BaseForCausalLM):
+    """Engine-compatible Muse Glimmer text decoder (inputs_embeds variant).
+
+    forward(inputs_embeds, position_ids, k_cache, v_cache) -> logits
+    """
+
+    _HF_MODEL_CLASS = None
+
+    @classmethod
+    def _get_reauthored_config(cls, hf_config, max_context_length=None, num_layers=None):
+        text_config = hf_config.text_config if hasattr(hf_config, "text_config") else hf_config
+        if max_context_length is not None:
+            text_config.max_position_embeddings = max_context_length
+        if num_layers is not None:
+            text_config.num_hidden_layers = num_layers
+        return text_config
+
+    @override
+    @classmethod
+    def from_hf(
+        cls,
+        huggingface_model_id: str,
+        max_context_length: int | None = None,
+        target_dtype: torch.dtype = torch.float16,
+        mmap_path: str | None = None,
+        num_layers: int | None = None,
+        disable_embedding_quantization: bool = False,
+    ) -> Self:
+        return cls.from_hf_memory_efficient(
+            huggingface_model_id,
+            max_context_length=max_context_length,
+            target_dtype=target_dtype,
+            mmap_path=mmap_path,
+            num_layers=num_layers,
+            hf_config_attr="text_config",
+            hf_state_dict_prefix="model.language_model.",
+        )
+
+    @override
+    @classmethod
+    def from_hf_memory_efficient(
+        cls,
+        huggingface_model_id: str,
+        max_context_length: int | None = None,
+        target_dtype: torch.dtype = torch.float16,
+        mmap_path: str | None = None,
+        num_layers: int | None = None,
+        hf_config_attr: str | None = "text_config",
+        hf_state_dict_prefix: str = "model.language_model.",
+        disable_embedding_quantization: bool = False,
+    ) -> Self:
+        import re
+
+        model_dir = snapshot_download(
+            huggingface_model_id,
+            allow_patterns=["*.safetensors", "*.safetensors.index.json", "config.json"],
+        )
+
+        with open(os.path.join(model_dir, "config.json")) as f:
+            raw = json.load(f)
+        cfg_dict = raw.get(hf_config_attr, raw) if hf_config_attr else raw
+        hf_config = SimpleNamespace(**cfg_dict) if isinstance(cfg_dict, dict) else cfg_dict
+
+        config = cls._get_reauthored_config(hf_config, max_context_length, num_layers=num_layers)
+        model = cls(config=config, model_device="meta")
+        model.to(dtype=target_dtype)
+
+        safetensors_files = _resolve_safetensors_files(model_dir)
+
+        layer_pattern = re.compile(r"model\.language_model\.layers\.(\d+)\.")
+        from safetensors import safe_open
+
+        per_layer: dict[int, dict[str, str]] = {}
+        shared: dict[str, str] = {}
+        for path in safetensors_files:
+            with safe_open(path, framework="pt", device="cpu") as f:
+                for key in f.keys():  # noqa: SIM118
+                    if key.startswith("model.vision_tower.") or key.startswith("model.vision_"):
+                        continue
+                    match = layer_pattern.match(key)
+                    if match:
+                        layer_idx = int(match.group(1))
+                        if num_layers is not None and layer_idx >= num_layers:
+                            continue
+                        per_layer.setdefault(layer_idx, {})[key] = path
+                    else:
+                        shared[key] = path
+
+        # Load shared params (norm, lm_head — embed_tokens dropped below)
+        shared_dict = _load_tensors_for_keys(shared, target_dtype)
+        normalized: dict[str, torch.Tensor] = {}
+        prefix = "model.language_model."
+        for k, v in shared_dict.items():
+            if k.startswith(prefix):
+                normalized["model." + k[len(prefix) :]] = v
+            else:
+                normalized[k] = v
+        del shared_dict
+
+        # Drop embed_tokens or promote to lm_head.weight for tied embeddings
+        for k in list(normalized.keys()):
+            if "embed_tokens" in k:
+                if getattr(config, "tie_word_embeddings", False):
+                    normalized["lm_head.weight"] = normalized.pop(k)
+                else:
+                    del normalized[k]
+
+        model.load_state_dict(normalized, assign=True, strict=False)
+        del normalized
+        gc.collect()
+
+        # Load one layer at a time
+        for layer_idx in sorted(per_layer.keys()):
+            layer_key_to_file = per_layer.pop(layer_idx)
+            layer_sd = _load_tensors_for_keys(layer_key_to_file, target_dtype)
+            del layer_key_to_file
+            remapped: dict[str, torch.Tensor] = {}
+            for k, v in layer_sd.items():
+                remapped["model." + k[len(prefix) :]] = v
+            del layer_sd
+            model.load_state_dict(remapped, assign=True, strict=False)
+            del remapped
+            gc.collect()
+
+        # qk_norm has no checkpoint weights — initialize to ones (identity RMSNorm)
+        for layer in model.model.layers:
+            layer.self_attn.qk_norm.weight = nn.Parameter(
+                torch.ones(model.config.head_dim, dtype=target_dtype)
+            )
+
+        meta_params = [n for n, p in model.named_parameters() if p.is_meta]
+        if meta_params:
+            raise RuntimeError(f"Parameters not loaded: {meta_params}")
+
+        return model
+
+    @override
+    def _init_model(self, config) -> None:
+        self.model = MuseGlimmerModelEmbeddings(config)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self._softcap = getattr(config, "final_logit_softcapping", None)
+
+    @BaseForCausalLM.cast_logits_bfloat16_to_float16
+    def forward(
+        self,
+        inputs_embeds: torch.Tensor,
+        position_ids: torch.IntTensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+    ) -> torch.Tensor:
+        cache = KVCache(k_cache, v_cache)
+        out = self.model(inputs_embeds, position_ids, cache)
+        logits = self.lm_head(out)
+        if self._softcap:
+            logits = torch.tanh(logits / self._softcap) * self._softcap
+        return logits
+
+    @override
+    def build_reference_inputs(
+        self, config, target_dtype, spec
+    ) -> dict[str, dict[str, torch.Tensor]]:
+        from coreai_models._constants import MAIN_GRAPH_NAME
+
+        hidden = config.hidden_size
+        n_layers = config.num_hidden_layers
+        n_kv = config.num_key_value_heads
+        head_dim = getattr(config, "head_dim", hidden // config.num_attention_heads)
+        max_ctx = getattr(spec, "cache_seq_len", config.max_position_embeddings)
+        qlen = getattr(spec, "query_len", 64)
+        offset = getattr(spec, "offset", 64)
+
+        return {
+            MAIN_GRAPH_NAME: {
+                "inputs_embeds": torch.randn(1, qlen, hidden, dtype=target_dtype),
+                "position_ids": torch.arange(qlen + offset, dtype=torch.int32).unsqueeze(0),
+                "k_cache": torch.zeros(n_layers, 1, n_kv, max_ctx, head_dim, dtype=target_dtype),
+                "v_cache": torch.zeros(n_layers, 1, n_kv, max_ctx, head_dim, dtype=target_dtype),
+            }
+        }
+
+    @override
+    def build_dynamic_shapes(self, config, spec) -> dict[str, dict[str, Any]]:
+        from coreai_models._constants import MAIN_GRAPH_NAME
+
+        max_ctx = getattr(spec, "cache_seq_len", config.max_position_embeddings)
+        qlen = getattr(spec, "query_len", 64)
+        return {
+            MAIN_GRAPH_NAME: {
+                "inputs_embeds": {1: torch.export.Dim("query_len", max=max_ctx - 2)},
+                "position_ids": {1: torch.export.Dim("seq_pos", min=qlen, max=max_ctx - 1)},
+                "k_cache": None,
+                "v_cache": None,
+            }
+        }
+
+    @override
+    def _mutate_state_dict(self: Self, state_dict: dict[str, torch.Tensor]) -> None:
+        # Normalize keys — same two-form handling as MuseGlimmerForCausalLM
+        prefix = "model.language_model."
+        keys = list(state_dict.keys())
+        for key in keys:
+            if key.startswith("model.vision_tower.") or key.startswith("model.vision_"):
+                del state_dict[key]
+            elif key.startswith(prefix):
+                state_dict["model." + key[len(prefix) :]] = state_dict.pop(key)
+            elif (
+                key.startswith("layers.") or key.startswith("norm.") or key == "embed_tokens.weight"
+            ):
+                state_dict["model." + key] = state_dict.pop(key)
+
+        # Drop embed_tokens or promote to lm_head.weight for tied embeddings
+        for k in list(state_dict.keys()):
+            if "embed_tokens" in k:
+                if getattr(self.config, "tie_word_embeddings", False):
+                    state_dict["lm_head.weight"] = state_dict.pop(k)
+                else:
+                    del state_dict[k]
