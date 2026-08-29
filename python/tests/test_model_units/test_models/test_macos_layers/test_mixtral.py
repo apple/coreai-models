@@ -1182,3 +1182,6 @@ class TestMixtralLayers:
 class TestMixtralForCausalLM(ForCausalLMTestBase):
     _toy_model_id = "yujiepan/mixtral-8xtiny-random"
     _model_class = CoreaiTorchMixtralForCausalLM
+    _test_weight_activation_quantization = True
+    # enable once the fix in https://github.com/apple/coreai-optimization/pull/78 is released
+    _test_eager_activation_quantization = False
