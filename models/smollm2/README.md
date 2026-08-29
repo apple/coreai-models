@@ -10,13 +10,6 @@ HuggingFace's SmolLM2 for on-device inference via Core AI.
 | SmolLM2-360M-Instruct | 360M       | Yes   | Yes |
 | SmolLM2-135M-Instruct | 135M       | Yes   | Yes |
 
-## Setup to export models
-
-If you haven't installed `uv`, install it by
-```bash
-brew install uv
-```
-
 ## Export models
 
 ```bash
@@ -82,9 +75,6 @@ Perplexity score on the [`WikiText-2`](https://huggingface.co/datasets/EleutherA
 | 1.7B  | [6-bit palettized][smollm2-6bit-yaml]      | 6.00  | iOS      | 13.63      |
 | 360M  | none (`float16`)                           | 16.00 | macOS    | 18.23      |
 | 135M  | none (`float16`)                           | 16.00 | macOS    | 24.99      |
-
-The iOS 1.7B uses 6-bit palettization (64 centroids). 4-bit palettization (16 centroids)
-is too lossy for this model's weight distribution regardless of which layers are promoted.
 
 [smollm2-yaml]: smollm2_4bit_embedding_excluded.yaml
 [smollm2-6bit-yaml]: smollm2_1_7b_6bit.yaml
