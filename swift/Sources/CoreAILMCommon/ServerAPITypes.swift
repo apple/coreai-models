@@ -277,20 +277,24 @@ public struct ChatCompletionResponse: Encodable, Sendable {
     public struct ResponseMessage: Encodable, Sendable {
         public let role: String
         public let content: String?
+        public let reasoningContent: String?
         public let toolCalls: [ToolCall]?
-        public init(role: String, content: String?, toolCalls: [ToolCall]? = nil) {
+        public init(role: String, content: String?, reasoningContent: String? = nil, toolCalls: [ToolCall]? = nil) {
             self.role = role
             self.content = content
+            self.reasoningContent = reasoningContent
             self.toolCalls = toolCalls
         }
         enum CodingKeys: String, CodingKey {
             case role, content
+            case reasoningContent = "reasoning_content"
             case toolCalls = "tool_calls"
         }
         public func encode(to encoder: Encoder) throws {
             var container = encoder.container(keyedBy: CodingKeys.self)
             try container.encode(role, forKey: .role)
             try container.encode(content, forKey: .content)
+            try container.encodeIfPresent(reasoningContent, forKey: .reasoningContent)
             try container.encodeIfPresent(toolCalls, forKey: .toolCalls)
         }
     }
@@ -351,20 +355,24 @@ public struct ChatCompletionChunk: Encodable, Sendable {
     public struct Delta: Encodable, Sendable {
         public let role: String?
         public let content: String?
+        public let reasoningContent: String?
         public let toolCalls: [ToolCallDelta]?
-        public init(role: String? = nil, content: String? = nil, toolCalls: [ToolCallDelta]? = nil) {
+        public init(role: String? = nil, content: String? = nil, reasoningContent: String? = nil, toolCalls: [ToolCallDelta]? = nil) {
             self.role = role
             self.content = content
+            self.reasoningContent = reasoningContent
             self.toolCalls = toolCalls
         }
         enum CodingKeys: String, CodingKey {
             case role, content
+            case reasoningContent = "reasoning_content"
             case toolCalls = "tool_calls"
         }
         public func encode(to encoder: Encoder) throws {
             var container = encoder.container(keyedBy: CodingKeys.self)
             try container.encodeIfPresent(role, forKey: .role)
             try container.encode(content, forKey: .content)
+            try container.encodeIfPresent(reasoningContent, forKey: .reasoningContent)
             try container.encodeIfPresent(toolCalls, forKey: .toolCalls)
         }
     }

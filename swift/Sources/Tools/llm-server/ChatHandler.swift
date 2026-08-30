@@ -230,12 +230,29 @@ private func handleNonStreamingRequest(chatRequest: ChatCompletionRequest, state
 
     // Raw mode: return unprocessed model output (no thinking strip, no tool parsing)
     var responseContent: String? = text
+    var responseReasoningContent: String? = nil
     var responseToolCalls: [ToolCall]? = nil
     var finishReason = genTokenCount >= requestMaxTokens ? "length" : "stop"
 
     if chatRequest.raw != true {
-        let cleaned = ThinkTagParser.stripReasoning(from: text, format: state.thinkingFormat)
+        // Separate reasoning from text using the streaming parser on the full output
+        var thinkParser = ThinkTagParser(format: state.thinkingFormat)
+        let events = thinkParser.consume(text) + thinkParser.flush()
+        var textParts: [String] = []
+        var reasoningParts: [String] = []
+        for event in events {
+            switch event {
+            case .text(let t):
+                textParts.append(t)
+            case .reasoning(let r):
+                reasoningParts.append(r)
+            }
+        }
+        let cleaned = textParts.joined()
         responseContent = cleaned
+        if !reasoningParts.isEmpty {
+            responseReasoningContent = reasoningParts.joined()
+        }
 
         if chatRequest.tools != nil, var parser = state.makeToolCallParser() {
             let events = parser.consume(cleaned) + parser.flush()
@@ -285,7 +302,7 @@ private func handleNonStreamingRequest(chatRequest: ChatCompletionRequest, state
         choices: [
             .init(
                 index: 0,
-                message: .init(role: "assistant", content: responseContent, toolCalls: responseToolCalls),
+                message: .init(role: "assistant", content: responseContent, reasoningContent: responseReasoningContent, toolCalls: responseToolCalls),
                 finishReason: finishReason
             )
         ],
@@ -435,8 +452,13 @@ private func handleStreamingRequest(chatRequest: ChatCompletionRequest, state: S
                     try await emitChunk(.init(role: nil, content: result.text))
                 } else {
                     for event in thinkParser.consume(result.text) {
-                        if case .text(let delta) = event {
+                        switch event {
+                        case .text(let delta):
                             try await emitText(delta)
+                        case .reasoning(let delta) where !delta.isEmpty:
+                            try await emitChunk(.init(role: nil, content: nil, reasoningContent: delta))
+                        default:
+                            break
                         }
                     }
                 }
@@ -444,8 +466,13 @@ private func handleStreamingRequest(chatRequest: ChatCompletionRequest, state: S
 
             if !isRaw {
                 for event in thinkParser.flush() {
-                    if case .text(let delta) = event {
+                    switch event {
+                    case .text(let delta):
                         try await emitText(delta)
+                    case .reasoning(let delta) where !delta.isEmpty:
+                        try await emitChunk(.init(role: nil, content: nil, reasoningContent: delta))
+                    default:
+                        break
                     }
                 }
 
