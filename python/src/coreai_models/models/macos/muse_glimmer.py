@@ -24,6 +24,7 @@ import gc
 import json
 import os
 from types import SimpleNamespace
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -39,6 +40,7 @@ from coreai_models._constants import (
 )
 from coreai_models.models.base import (
     BaseForCausalLM,
+    TraceSpec,
     _load_tensors_for_keys,
     _resolve_safetensors_files,
 )
@@ -437,6 +439,87 @@ class MuseGlimmerForCausalLM(BaseForCausalLM):
             SLIDING_KEY_CACHE_NAME: "sliding_cache",
             SLIDING_VALUE_CACHE_NAME: "sliding_cache",
         }
+
+    # ------------------------------------------------------------------
+    # Export contract: 4-state hybrid (global dynamic + sliding static)
+    # ------------------------------------------------------------------
+
+    @override
+    def build_reference_inputs(
+        self,
+        config,
+        target_dtype: torch.dtype,
+        spec: TraceSpec,
+    ) -> dict[str, dict[str, Any]]:
+        """Reference tensors for the 4-state SWA export.
+
+        Global caches are dynamic at ``spec.cache_seq_len`` (grow up to context).
+        Sliding caches are STATIC at ``config.sliding_window`` -- they never grow.
+        """
+        n_global = self.model.n_global_layers
+        n_sliding = self.model.n_sliding_layers
+        n_kv_heads = config.num_key_value_heads
+        head_dim = config.head_dim
+        window_size = config.sliding_window
+
+        input_ids = torch.randint(1, config.vocab_size, (1, spec.query_len), dtype=torch.int32)
+        position_ids = torch.arange(spec.query_len + spec.offset, dtype=torch.int32).unsqueeze(0)
+
+        global_k_cache = torch.zeros(
+            n_global, 1, n_kv_heads, spec.cache_seq_len, head_dim, dtype=target_dtype
+        )
+        global_v_cache = torch.zeros(
+            n_global, 1, n_kv_heads, spec.cache_seq_len, head_dim, dtype=target_dtype
+        )
+        sliding_k_cache = torch.zeros(
+            n_sliding, 1, n_kv_heads, window_size, head_dim, dtype=target_dtype
+        )
+        sliding_v_cache = torch.zeros(
+            n_sliding, 1, n_kv_heads, window_size, head_dim, dtype=target_dtype
+        )
+
+        return {
+            MAIN_GRAPH_NAME: {
+                "input_ids": input_ids,
+                "position_ids": position_ids,
+                "global_k_cache": global_k_cache,
+                "global_v_cache": global_v_cache,
+                "sliding_k_cache": sliding_k_cache,
+                "sliding_v_cache": sliding_v_cache,
+            }
+        }
+
+    @override
+    def build_dynamic_shapes(self, config, spec: TraceSpec) -> dict[str, Any]:
+        """Dynamic shapes for the 4-state SWA export.
+
+        Global caches have a dynamic seq dim (like standard KV cache).
+        Sliding caches are pinned to ``config.sliding_window`` (no dynamic dim).
+        """
+        max_ctx = spec.max_context_length
+        seq_dim = KVCache.seq_len_dim()
+
+        shapes: dict[str, Any] = {
+            "input_ids": {1: torch.export.Dim("seq_ids", max=max_ctx - 2)},
+            "position_ids": {1: torch.export.Dim("seq_pos", min=spec.query_len, max=max_ctx - 1)},
+        }
+
+        if spec.caches_are_static:
+            shapes["global_k_cache"] = None
+            shapes["global_v_cache"] = None
+        else:
+            shapes["global_k_cache"] = {
+                seq_dim: torch.export.Dim("gk_seq_len", min=spec.cache_seq_len, max=max_ctx)
+            }
+            shapes["global_v_cache"] = {
+                seq_dim: torch.export.Dim("gv_seq_len", min=spec.cache_seq_len, max=max_ctx)
+            }
+
+        # Sliding caches are static — pinned at window_size
+        shapes["sliding_k_cache"] = None
+        shapes["sliding_v_cache"] = None
+
+        return {MAIN_GRAPH_NAME: shapes}
 
     @override
     def _mutate_state_dict(self: Self, state_dict: dict[str, torch.Tensor]) -> None:

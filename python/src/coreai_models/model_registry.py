@@ -179,6 +179,16 @@ LLM_PRESETS: list[ModelPreset] = [
         131072,
     ),
     ModelPreset(
+        "muse-glimmer-30b-drafter",
+        "meta-models/Muse-Glimmer-30B-assistant",
+        "muse_glimmer",
+        "llm",
+        "macOS",
+        "none",
+        "float16",
+        131072,
+    ),
+    ModelPreset(
         "smollm2-1.7b-instruct",
         "HuggingFaceTB/SmolLM2-1.7B-Instruct",
         "smollm2",

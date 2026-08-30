@@ -149,6 +149,25 @@ _METADATA: dict[str, AIModelMetadataFields] = {
             "Source: https://huggingface.co/openai/gpt-oss-20b"
         ),
     ),
+    "meta-models/Muse-Glimmer-30B": AIModelMetadataFields(
+        author="Meta",
+        license="Apache-2.0",
+        model_description=(
+            "Muse Glimmer 30B is a 30B-parameter on-device agentic language model "
+            "from Meta with sliding/global attention and gated attention. "
+            "Source: https://huggingface.co/meta-models/Muse-Glimmer-30B"
+        ),
+    ),
+    "meta-models/Muse-Glimmer-30B-assistant": AIModelMetadataFields(
+        author="Meta",
+        license="Apache-2.0",
+        model_description=(
+            "Muse Glimmer 30B assistant is a speculative-decoding drafter "
+            "companion for Meta's Muse Glimmer 30B model (5 transformer layers, "
+            "sliding-window only). "
+            "Source: https://huggingface.co/meta-models/Muse-Glimmer-30B-assistant"
+        ),
+    ),
     # ---- VLMs ----
     "Qwen/Qwen3-VL-2B-Instruct": AIModelMetadataFields(
         author="Qwen Team",

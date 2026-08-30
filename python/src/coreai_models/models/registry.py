@@ -103,6 +103,12 @@ class ModelEntry:
     # tokenizer (e.g. a drafter that shares one with its target model), set
     # this to the HF model ID that carries the tokenizer.
     tokenizer_model_id: str | None = None
+    # Speculative decoding: drafter model class, HF checkpoint, and runtime config.
+    # When all three are set, ``--with-drafter`` exports the drafter alongside the
+    # target into the same bundle.
+    drafter_class: type[nn.Module] | None = None
+    drafter_model_id: str | None = None
+    drafter_config: dict | None = None
 
 
 @lru_cache(maxsize=1)
@@ -145,6 +151,12 @@ def _get_registry() -> dict[str, ModelEntry]:
             macos_class=MuseGlimmerForCausalLM,
             hf_config_attr="text_config",
             hf_state_dict_prefix="model.language_model.",
+            drafter_class=MuseGlimmerDrafterForCausalLM,
+            drafter_model_id="meta-models/Muse-Glimmer-30B-assistant",
+            drafter_config={
+                "num_draft_tokens": 5,
+                "shared_embeddings": True,
+            },
         ),
         "muse_glimmer_assistant": ModelEntry(
             macos_class=MuseGlimmerDrafterForCausalLM,

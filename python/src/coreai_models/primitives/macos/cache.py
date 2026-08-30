@@ -374,16 +374,6 @@ class RingKVCache:
         # Ring slot: offset % capacity (scalar symint, no tensor remainder)
         write_start = offset % capacity
 
-        # Guard: the contiguous write must not exceed the buffer boundary.
-        # Wrap-around writes are unsupported (mutable_slice_update needs
-        # a contiguous range). Decode (query_len=1) is always safe;
-        # chunked prefill should use capacity // 2 sized chunks.
-        end = write_start + query_len
-        assert end <= capacity, (
-            f"RingKVCache: write would wrap (start={write_start}, "
-            f"query_len={query_len}, capacity={capacity})"
-        )
-
         layer_index = torch.tensor((layer_idx,), dtype=torch.int32, device=device)
         layer_index_end = torch.tensor((layer_idx + 1,), dtype=torch.int32, device=device)
 

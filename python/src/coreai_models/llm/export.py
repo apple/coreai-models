@@ -174,6 +174,14 @@ def build_parser() -> argparse.ArgumentParser:
             "--platform is macOS."
         ),
     )
+    parser.add_argument(
+        "--with-drafter",
+        action="store_true",
+        help=(
+            "Export the drafter model alongside the target for speculative decoding. "
+            "The drafter is looked up from the model registry; not all models have one."
+        ),
+    )
     return parser
 
 
@@ -392,6 +400,7 @@ def _resolve_export_config(args: argparse.Namespace) -> ExportConfig:
         disable_embedding_quantization=args.disable_embedding_quantization_ios,
         include_debug_info=args.include_debug_info,
         model_type_override=getattr(preset, "_model_type_override", None) if preset else None,
+        with_drafter=args.with_drafter,
     )
 
 
@@ -464,6 +473,8 @@ def main() -> None:
             print(f"  num_layers:         {config.num_layers}")
         print(f"  overwrite:          {config.overwrite}")
         print(f"  include_debug_info: {config.include_debug_info}")
+        if config.with_drafter:
+            print("  with_drafter:       True")
         if config.variant == "iOS":
             print(f"  disable_embedding_quantization: {config.disable_embedding_quantization}")
         return

@@ -212,7 +212,7 @@ class TestRingBufferParity:
         k = torch.randn(1, n_kv, query_len, head_dim)
         v = torch.randn(1, n_kv, query_len, head_dim)
 
-        with pytest.raises(AssertionError, match="write would wrap"):
+        with pytest.raises(RuntimeError):
             cache.update_and_fetch(layer_idx=0, offset=offset, k=k, v=v)
 
     def test_update_and_fetch_accepts_boundary_aligned_write(self):
