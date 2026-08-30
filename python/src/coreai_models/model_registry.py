@@ -123,6 +123,16 @@ LLM_PRESETS: list[ModelPreset] = [
         8192,
     ),
     ModelPreset(
+        "mistral-7b-instruct-v0.3",
+        "mistralai/Mistral-7B-Instruct-v0.3",
+        "mistral",
+        "llm",
+        "iOS",
+        "4bit_weight_palettized_group32",
+        "float16",
+        IOS_DEFAULT_MAX_CONTEXT_LENGTH,
+    ),
+    ModelPreset(
         "mixtral-8x7b-instruct-v0.1",
         "mistralai/Mixtral-8x7B-Instruct-v0.1",
         "mixtral",

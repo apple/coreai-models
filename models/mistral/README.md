@@ -6,7 +6,14 @@ Mistral AI's Mistral models for on-device inference via Core AI.
 
 | Model               | Parameters | macOS | iOS |
 | ------------------- | ---------- | ----- | --- |
-| Mistral 7B Instruct | 7.0B       | Yes   | No  |
+| Mistral 7B Instruct | 7.0B       | Yes   | Yes |
+
+## Gated Access
+This Mistral model is gated on [Hugging Face](https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.3) (HF). You will need to accept the terms of the [license](https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.3), generate a HF token, and add your HF token to your machine before exporting this model.
+```bash
+brew install hf
+hf auth login --token <YOUR_TOKEN_HERE>
+```
 
 ## Setup to export models
 
@@ -26,6 +33,9 @@ uv run coreai.llm.export mistralai/Mistral-7B-Instruct-v0.3
 ```bash
 # Full precision
 uv run coreai.llm.export mistralai/Mistral-7B-Instruct-v0.3 --compression none
+
+# iOS variant
+uv run coreai.llm.export mistralai/Mistral-7B-Instruct-v0.3 --platform iOS
 
 # Custom output directory
 uv run coreai.llm.export mistralai/Mistral-7B-Instruct-v0.3 --output-dir ./my-models/
@@ -73,5 +83,9 @@ Perplexity score on the [`WikiText-2`](https://huggingface.co/datasets/EleutherA
 | ------------------- | ------------------------------------------ | --------------------- | -------- | ---------------- |
 | Mistral 7B Instruct | none (`float16`)                           | 16.00                 | macOS    | 8.29             |
 | Mistral 7B Instruct | [4-bit quantized][p-4bit]                  | 4.50                  | macOS    | 8.41             |
+| Mistral 7B Instruct | none (`float16`)                           | 16.00                 | iOS      | 8.29             |
+| Mistral 7B Instruct | [4-bit palettized (group size 32)][p-4bit] | 4.10\*                | iOS      | 10.46            |
+
+\* BPW computed from exported asset size (`.mlirb` bits ÷ parameter count) and includes the INT8 per-tensor embedding.
 
 [p-4bit]: ../README.md#quantization-options
