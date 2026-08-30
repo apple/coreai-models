@@ -58,8 +58,26 @@ def _register_novel_configs() -> None:
                     elif tc is not None:
                         self.text_config = tc
 
+            class _MuseGlimmerAssistantConfig(PretrainedConfig):
+                model_type = "muse_glimmer_assistant"
+
+                def __init__(self, **kwargs):
+                    kwargs.setdefault("hidden_size", 4096)
+                    kwargs.setdefault("num_attention_heads", 32)
+                    kwargs.setdefault("num_key_value_heads", 8)
+                    kwargs.setdefault("intermediate_size", 14336)
+                    kwargs.setdefault("vocab_size", 262144)
+                    kwargs.setdefault("max_position_embeddings", 131072)
+                    kwargs.setdefault("head_dim", 128)
+                    kwargs.setdefault("rms_norm_eps", 1e-5)
+                    kwargs.setdefault("sliding_window", 2048)
+                    kwargs.setdefault("num_hidden_layers", 5)
+                    kwargs.setdefault("rope_parameters", {"rope_theta": 500000.0})
+                    super().__init__(**kwargs)
+
             AutoConfig.register("muse_glimmer", _MuseGlimmerConfig)
             AutoConfig.register("muse_glimmer_text", _MuseGlimmerTextConfig)
+            AutoConfig.register("muse_glimmer_assistant", _MuseGlimmerAssistantConfig)
     except Exception:
         pass
 
@@ -81,6 +99,10 @@ class ModelEntry:
     #     (e.g. "language_model." for Gemma-3). Stripped before assignment.
     hf_config_attr: str | None = None
     hf_state_dict_prefix: str = ""
+    # Optional override for tokenizer download. When the checkpoint has no
+    # tokenizer (e.g. a drafter that shares one with its target model), set
+    # this to the HF model ID that carries the tokenizer.
+    tokenizer_model_id: str | None = None
 
 
 @lru_cache(maxsize=1)
@@ -94,6 +116,7 @@ def _get_registry() -> dict[str, ModelEntry]:
     from coreai_models.models.macos.mistral import MistralForCausalLM
     from coreai_models.models.macos.mixtral import MixtralForCausalLM
     from coreai_models.models.macos.muse_glimmer import MuseGlimmerForCausalLM
+    from coreai_models.models.macos.muse_glimmer_drafter_ring import MuseGlimmerDrafterForCausalLM
     from coreai_models.models.macos.phi3 import Phi3ForCausalLM
     from coreai_models.models.macos.qwen2 import Qwen2ForCausalLM
     from coreai_models.models.macos.qwen3 import Qwen3ForCausalLM
@@ -122,6 +145,10 @@ def _get_registry() -> dict[str, ModelEntry]:
             macos_class=MuseGlimmerForCausalLM,
             hf_config_attr="text_config",
             hf_state_dict_prefix="model.language_model.",
+        ),
+        "muse_glimmer_assistant": ModelEntry(
+            macos_class=MuseGlimmerDrafterForCausalLM,
+            tokenizer_model_id="meta-models/Muse-Glimmer-30B",
         ),
         "phi3": ModelEntry(
             macos_class=Phi3ForCausalLM,

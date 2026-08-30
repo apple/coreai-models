@@ -376,6 +376,7 @@ async def _async_export_model(config: ExportConfig) -> str:
             hf_config=hf_config,
             compression=config.compression,
             name=output_name,
+            tokenizer_model_id=entry.tokenizer_model_id,
         )
 
     logger.info(f"Export complete: {bundle_path}")

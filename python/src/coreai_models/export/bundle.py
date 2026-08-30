@@ -24,12 +24,19 @@ def bundle_llm_asset(
     hf_config: Any,
     compression: str,
     name: str,
+    tokenizer_model_id: str | None = None,
 ) -> None:
     """Add tokenizer and metadata.json (0.2 schema) to an LLM bundle.
 
     Expects ``{name}.aimodel`` to already exist inside bundle_path.
+
+    Args:
+        tokenizer_model_id: HF model ID to download the tokenizer from.
+            Defaults to *hf_model_id* when ``None``.  Useful for drafters
+            whose checkpoint has no tokenizer (they share the target's).
     """
-    _write_tokenizer(bundle_path / "tokenizer", hf_model_id)
+    tok_id = tokenizer_model_id or hf_model_id
+    _write_tokenizer(bundle_path / "tokenizer", tok_id)
     _write_metadata(bundle_path, hf_model_id, hf_config, compression, name)
 
 
