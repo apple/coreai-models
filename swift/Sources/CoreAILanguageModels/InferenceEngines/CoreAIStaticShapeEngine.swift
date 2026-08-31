@@ -114,7 +114,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         // Compute max query length from function names for prefill threshold
         self.maxQueryLength =
             extendFunctionNames.compactMap { Self.parseFunctionDimensions($0)?.queryLength }
-                .max() ?? 64
+            .max() ?? 64
 
         // Grab largest context length extend function to use the descriptors for allocating largest context length
         // key/value caches.
@@ -152,9 +152,11 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         }
 
         // Discover input names from the largest-context function
-        guard let positionIdsName = Self.resolveInputName(
-            from: largestExtendDescriptor.inputNames, candidates: Self.knownPositionIdNames
-        ) else {
+        guard
+            let positionIdsName = Self.resolveInputName(
+                from: largestExtendDescriptor.inputNames, candidates: Self.knownPositionIdNames
+            )
+        else {
             throw InferenceRuntimeError.invalidState("No position_ids input found in model descriptor")
         }
         let maskName: String? =
