@@ -13,6 +13,7 @@ import ImageIO
 
 extension DecodeResolution: ExpressibleByArgument {}
 extension ReferenceGrid: ExpressibleByArgument {}
+extension GuidanceMode: ExpressibleByArgument {}
 
 @main
 struct DiffusionRunner: AsyncParsableCommand {
@@ -73,8 +74,11 @@ struct DiffusionRunner: AsyncParsableCommand {
     )
     var referenceGrid: ReferenceGrid?
 
-    @Flag(help: "Use manual CFG (two forward passes) for stronger text guidance in img2img")
-    var isManualCFG: Bool = false
+    @Option(
+        help:
+            "Whether the pipeline performs classifier-free guidance itself: distilled (one forward pass, no CFG — the model is guidance-distilled and ignores its guidance input) or manual (two passes interpolated by the pipeline using --guidance-scale — stronger text adherence in img2img, ~2× compute per step). --guidance-scale only has an effect with manual. Default: distilled"
+    )
+    var guidanceMode: GuidanceMode?
 
     @Option(name: .customLong("parity-test"), help: "Path to parity data directory (numpy .npy files)")
     var parityTestDir: String?
@@ -153,7 +157,7 @@ struct DiffusionRunner: AsyncParsableCommand {
             startingImage: startingCGImage,
             strength: strength,
             referenceGrid: referenceGrid ?? .full,
-            isManualCFG: isManualCFG,
+            guidanceMode: guidanceMode ?? .distilled,
             encoderScaleFactor: resolvedDescriptor.encoderScaleFactor ?? 0.18215,
             decoderScaleFactor: resolvedDescriptor.decoderScaleFactor ?? 0.18215,
             decoderShiftFactor: resolvedDescriptor.decoderShiftFactor ?? 0.0,

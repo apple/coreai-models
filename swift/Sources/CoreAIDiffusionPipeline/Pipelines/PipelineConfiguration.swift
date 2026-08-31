@@ -35,6 +35,26 @@ public enum ReferenceGrid: String, Hashable, Sendable, CaseIterable {
     case quarter
 }
 
+/// Whether the pipeline performs classifier-free guidance itself.
+///
+/// FLUX.2 Klein 4B is guidance-distilled and its transformer config sets
+/// `guidance_embeds: false`, so the traced graph's `guidance` input is inert — the model
+/// discards it and produces a usable image from a single unguided pass. Real CFG is
+/// therefore something the pipeline adds on top, not something the model applies.
+public enum GuidanceMode: String, Hashable, Sendable, CaseIterable {
+    /// One forward pass, no classifier-free guidance. The distillation is what makes this
+    /// work without it. `guidanceScale` is unused in this mode.
+    case distilled
+    /// Two forward passes — conditional and unconditional — interpolated by the pipeline
+    /// with `guidanceScale` as the weight. Stronger text adherence in img2img, at ~2× the
+    /// compute per step. This is the only mode in which `guidanceScale` has any effect.
+    case manual
+}
+
+extension GuidanceMode: CustomStringConvertible {
+    public var description: String { rawValue }
+}
+
 /// User-facing configuration for image generation.
 public struct PipelineConfiguration: Hashable, Sendable {
     public var prompt: String
@@ -48,7 +68,7 @@ public struct PipelineConfiguration: Hashable, Sendable {
     public var startingImage: CGImage?
     public var strength: Float
     public var referenceGrid: ReferenceGrid
-    public var isManualCFG: Bool
+    public var guidanceMode: GuidanceMode
 
     // VAE scale factors (from pipeline.json)
     public var encoderScaleFactor: Float
@@ -76,7 +96,7 @@ public struct PipelineConfiguration: Hashable, Sendable {
         startingImage: CGImage? = nil,
         strength: Float = 1.0,
         referenceGrid: ReferenceGrid = .full,
-        isManualCFG: Bool = false,
+        guidanceMode: GuidanceMode = .distilled,
         encoderScaleFactor: Float = 0.18215,
         decoderScaleFactor: Float = 0.18215,
         decoderShiftFactor: Float = 0.0,
@@ -94,7 +114,7 @@ public struct PipelineConfiguration: Hashable, Sendable {
         self.startingImage = startingImage
         self.strength = strength
         self.referenceGrid = referenceGrid
-        self.isManualCFG = isManualCFG
+        self.guidanceMode = guidanceMode
         self.encoderScaleFactor = encoderScaleFactor
         self.decoderScaleFactor = decoderScaleFactor
         self.decoderShiftFactor = decoderShiftFactor
@@ -118,7 +138,7 @@ extension PipelineConfiguration {
         hasher.combine(schedulerType)
         hasher.combine(strength)
         hasher.combine(referenceGrid)
-        hasher.combine(isManualCFG)
+        hasher.combine(guidanceMode)
         hasher.combine(encoderScaleFactor)
         hasher.combine(decoderScaleFactor)
         hasher.combine(decoderShiftFactor)
@@ -137,7 +157,7 @@ extension PipelineConfiguration {
             && lhs.schedulerType == rhs.schedulerType
             && lhs.strength == rhs.strength
             && lhs.referenceGrid == rhs.referenceGrid
-            && lhs.isManualCFG == rhs.isManualCFG
+            && lhs.guidanceMode == rhs.guidanceMode
             && lhs.encoderScaleFactor == rhs.encoderScaleFactor
             && lhs.decoderScaleFactor == rhs.decoderScaleFactor
             && lhs.decoderShiftFactor == rhs.decoderShiftFactor

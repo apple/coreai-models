@@ -316,11 +316,27 @@ public struct Flux2Pipeline: DiffusionPipeline {
             fnName = transformerFunctionName
         }
 
-        // For manual CFG: encode an empty prompt for the unconditional pass
+        // Manual CFG needs an unconditional pass, so encode an empty prompt.
+        //
+        // At exactly 1.0 the interpolation reduces to the conditional pass — the
+        // unconditional term's coefficient is zero — so the second forward pass is provably
+        // wasted. Below 1.0 the blend runs *toward* the unconditional prediction, i.e. 2x
+        // the compute to follow the prompt less, so this gate refuses that too.
+        //
+        // That second half is a deliberate divergence from diffusers, whose
+        // `ClassifierFreeGuidance` guider gates on `not isclose(scale, 1.0)` and so honours
+        // sub-1.0 scales. Widen this to match if a caller ever has a real use for them.
         let emptyEmbeddings: [Float]?
-        if configuration.isManualCFG && guidanceScale > 1.0 {
+        if configuration.guidanceMode == .manual && guidanceScale > 1.0 {
             emptyEmbeddings = try await encodeText("")
         } else {
+            if configuration.guidanceMode == .manual {
+                CLILogger.log(
+                    "⚠️ Flux2Pipeline: --guidance-mode manual needs a guidance scale above 1.0 "
+                        + "(got \(guidanceScale)); falling back to distilled, which applies no "
+                        + "guidance at all. Raise the scale to get the two-pass path.",
+                    component: "Diffusion")
+            }
             emptyEmbeddings = nil
         }
 
@@ -345,7 +361,12 @@ public struct Flux2Pipeline: DiffusionPipeline {
             let output: [Float]
 
             if let emptyEmb = emptyEmbeddings {
-                // Manual CFG: two forward passes, guidance=0 to bypass the distilled path
+                // Manual CFG: two forward passes. The guidance input is 0 only because the
+                // traced signature requires a value — this checkpoint sets
+                // `guidance_embeds: false`, so `guidance_embedder` is nil and
+                // `Flux2TimestepGuidanceEmbeddings` drops the input entirely. Any value
+                // behaves identically; all the guidance here comes from the interpolation
+                // below, not from the model.
                 let condOutput = try await denoiser.run(
                     floatInputs: [
                         (inputTokens, [1, inputSeqLen, inChannels]),
@@ -380,7 +401,8 @@ public struct Flux2Pipeline: DiffusionPipeline {
                     guidanceScale: guidanceScale, into: &cfgBuffer)
                 output = cfgBuffer
             } else {
-                // Standard single pass with embedded guidance
+                // Distilled: one pass, no CFG. `guidanceScale` is passed to satisfy the
+                // traced signature but this checkpoint discards it (see above).
                 let fullOutput = try await denoiser.run(
                     floatInputs: [
                         (inputTokens, [1, inputSeqLen, inChannels]),
