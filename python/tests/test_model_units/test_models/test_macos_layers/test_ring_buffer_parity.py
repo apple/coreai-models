@@ -50,7 +50,7 @@ def _chunked_prefill(model, input_ids, cache, chunk_size):
     for start in range(0, seq_len, chunk_size):
         end = min(start + chunk_size, seq_len)
         chunk = input_ids[:, start:end]
-        pos = torch.arange(start, end).unsqueeze(0)
+        pos = torch.arange(end).unsqueeze(0)
         with torch.no_grad():
             model(chunk, pos, cache)
 
@@ -81,7 +81,7 @@ class TestRingBufferParity:
             pos = prefill_len + i
             tok = decode_tokens[:, i : i + 1]
             with torch.no_grad():
-                out = model(tok, torch.tensor([[pos]]), cache_a)
+                out = model(tok, torch.arange(pos + 1).unsqueeze(0), cache_a)
             ring_logits.append(out[0, 0].clone())
 
         # Path B: full recompute (single prefill of all tokens)
@@ -117,7 +117,7 @@ class TestRingBufferParity:
             for i in range(decode_len):
                 tok = decode_tokens[:, i : i + 1]
                 with torch.no_grad():
-                    out = model(tok, torch.tensor([[prefill_len + i]]), cache)
+                    out = model(tok, torch.arange(prefill_len + i + 1).unsqueeze(0), cache)
                 logits.append(out[0, 0].clone())
             return logits
 
@@ -145,7 +145,7 @@ class TestRingBufferParity:
             pos = 32 + step
             tok = torch.randint(0, config.vocab_size, (1, 1))
             with torch.no_grad():
-                out = model(tok, torch.tensor([[pos]]), cache)
+                out = model(tok, torch.arange(pos + 1).unsqueeze(0), cache)
             assert torch.isfinite(out).all(), f"Non-finite at step {step} (pos {pos})"
 
     def test_chunked_prefill_matches_single_prefill(self):
@@ -170,7 +170,7 @@ class TestRingBufferParity:
 
         # Decode one more token from each
         next_tok = torch.randint(0, config.vocab_size, (1, 1))
-        next_pos = torch.tensor([[seq_len]])
+        next_pos = torch.arange(seq_len + 1).unsqueeze(0)
 
         with torch.no_grad():
             out_a = model(next_tok, next_pos, cache_single)
