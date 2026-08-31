@@ -91,7 +91,7 @@ def _create_per_tensor_symmetric_kv_cache_config(dtype: str) -> dict[str, Any]:
     """KV-cache buffer quantization config for the fused cache-update op.
 
     Args:
-        dtype: coreai-opt dtype name the cache buffer is stored.
+        dtype: coreai-opt dtype name the cache buffer is stored in.
     """
     return {
         "mutable_cache_update_and_fetch": {
