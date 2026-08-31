@@ -428,7 +428,7 @@ class BaseForCausalLM(torch.nn.Module):
         """Optional per-state classification for heterogeneous cache models.
 
         Returns a dict mapping each state name (from :meth:`export_state_names`) to
-        a classification string (e.g. ``"kv_cache"``, ``"sliding_cache"``).  The
+        a classification string (e.g. ``"kv_cache"``, ``"sliding_kv_cache"``).  The
         runtime uses this to allocate caches with different growth policies.
 
         Returns ``None`` by default, meaning all states share the same (standard

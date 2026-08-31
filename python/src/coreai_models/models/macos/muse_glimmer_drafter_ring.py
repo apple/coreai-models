@@ -224,8 +224,8 @@ class MuseGlimmerDrafterForCausalLM(BaseForCausalLM):
     @classmethod
     def export_state_classification(cls) -> dict[str, str]:
         return {
-            SLIDING_KEY_CACHE_NAME: "sliding_cache",
-            SLIDING_VALUE_CACHE_NAME: "sliding_cache",
+            SLIDING_KEY_CACHE_NAME: "sliding_kv_cache",
+            SLIDING_VALUE_CACHE_NAME: "sliding_kv_cache",
         }
 
     # ------------------------------------------------------------------
