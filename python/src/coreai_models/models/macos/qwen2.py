@@ -33,11 +33,12 @@ class Attention(nn.Module):
         self.n_heads = n_heads = config.num_attention_heads
         self.n_kv_heads = n_kv_heads = config.num_key_value_heads
         self.head_dim = head_dim = getattr(config, "head_dim", dim // n_heads)
+        self.attention_bias = getattr(config, "attention_bias", True)
 
         self.qkv_proj = nn.Linear(
             dim,
             n_heads * head_dim + n_kv_heads * head_dim + n_kv_heads * head_dim,
-            bias=True,
+            bias=self.attention_bias,
         )
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
 
@@ -143,6 +144,9 @@ class Qwen2Model(nn.Module):
 class Qwen2ForCausalLM(BaseForCausalLM):
     _HF_MODEL_CLASS = HFQwen2ForCausalLM
 
+    # Emit a second, prefill-only ``prefill`` entrypoint beside ``main``.
+    exports_prefill_graph = True
+
     @override
     def _init_model(self, config: Qwen2Config) -> None:
         self.model = Qwen2Model(config)
@@ -157,9 +161,14 @@ class Qwen2ForCausalLM(BaseForCausalLM):
         position_ids: torch.IntTensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple:
         cache = KVCache(k_cache, v_cache)
         out = self.model(input_ids, position_ids, cache)
+        if self.prefill_mode:
+            # A bare `return` causes torch export to trace a leaf node with value
+            # `None` rather than having no leaf nodes whatsoever. Remedied with
+            # empty tuple.
+            return ()
         return self.lm_head(out)
 
     @override
@@ -177,27 +186,35 @@ class Qwen2ForCausalLM(BaseForCausalLM):
             err = "invalid state_dict"
             raise ValueError(err)
 
+        expects_bias = getattr(self.config, "attention_bias", True)
+
         for i in range(max_layer + 1):
             combined_weight = []
             combined_bias = []
-            need_to_fuse = True
+            has_weights = True
+            has_bias = True
             for proj in ["q_proj", "k_proj", "v_proj"]:
                 weight_key = f"model.layers.{i}.self_attn.{proj}.weight"
                 bias_key = f"model.layers.{i}.self_attn.{proj}.bias"
-                if weight_key not in state_dict or bias_key not in state_dict:
-                    need_to_fuse = False
+                if weight_key not in state_dict:
+                    has_weights = False
                     continue
                 combined_weight.append(state_dict[weight_key])
-                combined_bias.append(state_dict[bias_key])
                 del state_dict[weight_key]
-                del state_dict[bias_key]
-            if need_to_fuse:
+                if bias_key in state_dict:
+                    if expects_bias:
+                        combined_bias.append(state_dict[bias_key])
+                    del state_dict[bias_key]
+                else:
+                    has_bias = False
+            if has_weights and combined_weight:
                 state_dict[f"model.layers.{i}.self_attn.qkv_proj.weight"] = torch.concat(
                     combined_weight, axis=0
                 )
-                state_dict[f"model.layers.{i}.self_attn.qkv_proj.bias"] = torch.concat(
-                    combined_bias, axis=0
-                )
+                if expects_bias and has_bias and combined_bias:
+                    state_dict[f"model.layers.{i}.self_attn.qkv_proj.bias"] = torch.concat(
+                        combined_bias, axis=0
+                    )
 
     def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
         super().load_state_dict(state_dict, strict=strict, assign=assign)

@@ -36,3 +36,27 @@ func encodeWithStates(
         inputs: inputs, states: consume asyncStates,
         outputViews: consume asyncOutputs, to: computeStream)
 }
+
+/// Encode an inference step with no outputs.
+///
+/// The prefill graph only fills the KV cache, so it declares no outputs and there is
+/// nothing to bind. Same states as `encodeWithStates`.
+func encodeWithStatesNoOutputs(
+    function: InferenceFunction,
+    inputs: [String: InferenceFunction.AsyncValue],
+    keyState: inout InferenceFunction.AsyncMutableValue,
+    keyCacheName: String,
+    valState: inout InferenceFunction.AsyncMutableValue,
+    valueCacheName: String,
+    additionalStates: FixedMTLBufferState?,
+    computeStream: ComputeStream
+) throws {
+    var asyncStates = InferenceFunction.AsyncMutableViews()
+    asyncStates.insert(&keyState, for: keyCacheName)
+    asyncStates.insert(&valState, for: valueCacheName)
+    additionalStates?.bind(into: &asyncStates)
+
+    let _ = try function.encode(
+        inputs: inputs, states: consume asyncStates,
+        outputViews: InferenceFunction.AsyncMutableViews(), to: computeStream)
+}

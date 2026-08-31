@@ -203,10 +203,15 @@ class Qwen3MoeModel(nn.Module):
 class Qwen3MoeForCausalLM(BaseForCausalLM):
     _HF_MODEL_CLASS = HFQwen3MoeForCausalLM
 
+    # Emit a second, prefill-only ``prefill`` entrypoint beside ``main``.
+    exports_prefill_graph = True
+
     @override
     def _init_model(self, config: Qwen3MoeConfig) -> None:
         self.model = Qwen3MoeModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        if config.tie_word_embeddings:
+            self.lm_head.weight = self.model.embed_tokens.weight
 
     @BaseForCausalLM.cast_logits_bfloat16_to_float16
     def forward(
@@ -215,9 +220,14 @@ class Qwen3MoeForCausalLM(BaseForCausalLM):
         position_ids: torch.IntTensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple:
         cache = KVCache(k_cache, v_cache)
         out = self.model(input_ids, position_ids, cache)
+        if self.prefill_mode:
+            # A bare `return` causes torch export to trace a leaf node with value
+            # `None` rather than having no leaf nodes whatsoever. Remedied with
+            # empty tuple.
+            return ()
         return self.lm_head(out)
 
     @override
@@ -322,3 +332,8 @@ class Qwen3MoeForCausalLM(BaseForCausalLM):
                     output[0, e] = expert_weight
 
                 state_dict[f"{prefix}.switch_mlp.{proj}.weight"] = output
+
+    def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
+        super().load_state_dict(state_dict, strict=strict, assign=assign)
+        if self.config.tie_word_embeddings:
+            self.lm_head.weight = self.model.embed_tokens.weight

@@ -140,6 +140,11 @@ class Qwen3VLForCausalLM(BaseForCausalLM):
 
     _HF_MODEL_CLASS = HFQwen3VLForConditionalGeneration
 
+    # Emit a second, prefill-only ``prefill`` entrypoint beside ``main``. Only this
+    # class; the Embeddings variant below is exported by `vlm/export.py`, which does
+    # not request a prefill graph.
+    exports_prefill_graph = True
+
     @classmethod
     def _get_reauthored_config(
         cls,
@@ -173,9 +178,14 @@ class Qwen3VLForCausalLM(BaseForCausalLM):
         position_ids: torch.IntTensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple:
         cache = KVCache(k_cache, v_cache)
         out = self.model(input_ids, position_ids, cache)
+        if self.prefill_mode:
+            # A bare `return` causes torch export to trace a leaf node with value
+            # `None` rather than having no leaf nodes whatsoever. Remedied with
+            # empty tuple.
+            return ()
         return self.lm_head(out)
 
     @override

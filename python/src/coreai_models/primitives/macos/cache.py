@@ -88,7 +88,7 @@ class KVCache:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # check query size
         if query_len is None:
-            query_len: int = k.shape[-2]
+            query_len = k.shape[-2]
         torch._check_is_size(query_len, message="int query length >= 0")
         torch._check(query_len <= self._k_cache.size(-2), message="query length <= context size")
         torch._check(query_len <= self._v_cache.size(-2), message="query length <= context size")
@@ -283,3 +283,124 @@ class SSMState:
                 ]
             ),
         )
+
+
+def ring_window_causal_mask(
+    query_len: int,
+    capacity: int,
+    offset: int,
+    window_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Sliding-window causal mask for a ring-buffer KV cache.
+
+    Reconstructs each slot's absolute position from the ring layout and applies
+    causal + window + validity predicates. Companion to RingKVCache.
+
+    Args:
+        query_len: number of query positions in this forward call
+        capacity: ring buffer size (number of physical slots)
+        offset: absolute position of the first query token
+        window_size: sliding window size (typically == capacity)
+        device: target device
+
+    Returns:
+        Boolean mask [query_len, capacity] — True means "attend to this slot"
+    """
+    row = torch.arange(query_len, device=device)
+    q_pos = row.unsqueeze(-1) + offset  # (query_len, 1)
+
+    slot = torch.arange(capacity, device=device)  # (capacity,)
+    last_pos = offset + query_len - 1
+
+    # Reconstruct absolute position stored in each slot.
+    # Avoids tensor aten.remainder (unsupported in CoreAI MLIR).
+    # last_pos % capacity is a scalar symint (sympy Mod) — legal.
+    r = last_pos % capacity
+    diff = r - slot  # (capacity,), range (-capacity, capacity)
+    ring_back = torch.where(diff >= 0, diff, diff + capacity)
+    k_pos = last_pos - ring_back  # (capacity,)
+    k_pos = k_pos.unsqueeze(0)  # (1, capacity)
+
+    causal = k_pos <= q_pos
+    in_window = (q_pos - k_pos) < window_size
+    nonneg = k_pos >= 0
+    return causal & in_window & nonneg
+
+
+class RingKVCache:
+    """Ring-buffer KV cache for sliding window attention layers.
+
+    Fixed-size cache [n_layers, 1, n_kv_heads, capacity, head_dim] that writes
+    at position % capacity and never grows. Use ring_window_causal_mask() to
+    build the attention mask.
+    """
+
+    def __init__(self, k_cache: torch.Tensor, v_cache: torch.Tensor) -> None:
+        self._k_cache = k_cache
+        self._v_cache = v_cache
+
+    def capacity(self) -> int:
+        return self._k_cache.shape[3]
+
+    def update_and_fetch(
+        self,
+        layer_idx: int,
+        offset: int,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        query_len: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Write K/V at ring position, return full cache for this layer.
+
+        The write must not wrap around the ring boundary, i.e.
+        ``(offset % capacity) + query_len <= capacity`` must hold.
+        Decode (query_len=1) always satisfies this. For chunked prefill,
+        choose chunk sizes that align to the capacity boundary (e.g.
+        capacity // 2) so that no single chunk straddles the wrap point.
+
+        Raises:
+            RuntimeError: If the write would wrap around the ring buffer.
+        """
+        if query_len is None:
+            query_len = k.shape[-2]
+        torch._check_is_size(query_len)
+        torch._check_is_size(layer_idx)
+        torch._check(layer_idx < self._k_cache.size(0))
+
+        device = self._k_cache.device
+        capacity = self.capacity()
+
+        # Ring slot: offset % capacity (scalar symint, no tensor remainder)
+        write_start = offset % capacity
+
+        layer_index = torch.tensor((layer_idx,), dtype=torch.int32, device=device)
+        layer_index_end = torch.tensor((layer_idx + 1,), dtype=torch.int32, device=device)
+
+        for cache, update in ((self._k_cache, k), (self._v_cache, v)):
+            mutable_slice_update(
+                x=cache,
+                update=update.unsqueeze(0),
+                begin=torch.cat(
+                    [
+                        layer_index,
+                        torch.tensor((0,), dtype=torch.int32, device=device),
+                        torch.tensor((0,), dtype=torch.int32, device=device),
+                        torch.tensor((write_start,), dtype=torch.int32, device=device),
+                        torch.tensor((0,), dtype=torch.int32, device=device),
+                    ]
+                ),
+                end=torch.cat(
+                    [
+                        layer_index_end,
+                        torch.tensor((cache.size(1),), dtype=torch.int32, device=device),
+                        torch.tensor((cache.size(2),), dtype=torch.int32, device=device),
+                        torch.tensor((write_start + query_len,), dtype=torch.int32, device=device),
+                        torch.tensor((cache.size(4),), dtype=torch.int32, device=device),
+                    ]
+                ),
+            )
+
+        k_out = self._k_cache.narrow(0, layer_idx, 1).squeeze(0)
+        v_out = self._v_cache.narrow(0, layer_idx, 1).squeeze(0)
+        return k_out, v_out

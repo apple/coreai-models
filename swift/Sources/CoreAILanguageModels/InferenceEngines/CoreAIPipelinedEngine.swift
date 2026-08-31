@@ -532,6 +532,14 @@ private struct EngineImpl: ~Copyable {
     let computeStream: ComputeStream
     let device: MTLDevice
 
+    // Prefill chunks run here when the asset has this graph. It produces no logits, so
+    // the last prompt token still goes through `function` to seed sampling.
+    let prefillFunction: InferenceFunction?
+    /// Chunk width used when a prefill graph is present, and the widest query warmup runs
+    /// on it: `config.prefillChunkSize` capped at the context. `chunkThreshold` and
+    /// `prefillChunkSize` apply only to the fallback path through `function`.
+    let prefillMaxQueryLength: Int
+
     // Descriptor metadata
     let inputIdsName: String
     let positionIdsName: String
@@ -741,14 +749,26 @@ private struct EngineImpl: ~Copyable {
                 "Pipelined additional states: \(allFixedNames.joined(separator: ", "))")
         }
 
-        // Create growing logits buffer (reuses TensorStorage+CoreAI.swift)
+        // Without a prefill graph, prefill runs through `function` exactly as before.
+        let prefillMaxQueryLen = prefillQueryLength(
+            prefillChunkSize: config.prefillChunkSize, maxContextLength: config.maxContextLength)
+        let prefillFn = try loadPrefillGraph(
+            from: model, matching: descriptor, mainName: config.function)
+        if prefillFn != nil {
+            CLILogger.log("Found '\(prefillGraphFunctionName)' graph — prefill skips the LM head")
+        }
+
+        // Create growing logits buffer (reuses TensorStorage+CoreAI.swift).
+        // With a prefill graph, `function` only ever sees one token, so a prompt-sized
+        // logits buffer — hundreds of MB at large vocabularies — would go unused.
         let logitsRef = try GrowingLogitsBuffer(
             device: device,
             descriptor: descriptor,
             name: logitsOutputName,
             vocabSize: config.vocabSize,
             maxCapacity: config.maxContextLength,
-            initialCapacity: averageExpectedPromptSize
+            initialCapacity: prefillLogitsInitialCapacity(
+                hasPrefillGraph: prefillFn != nil, averagePromptSize: averageExpectedPromptSize)
         )
 
         // Load inference function
@@ -768,6 +788,8 @@ private struct EngineImpl: ~Copyable {
         self.config = config
         self.options = options
         self.function = fn
+        self.prefillFunction = prefillFn
+        self.prefillMaxQueryLength = prefillMaxQueryLen
         self.pipelineQueue = pipelineQueue
         self.computeStream = computeStream
         self.device = device
@@ -1150,25 +1172,12 @@ private struct EngineImpl: ~Copyable {
             }
         }
 
-        // Split prompt into chunks when it exceeds the chunk threshold.
-        // Skip prefill entirely if prompt is empty (prefix-cached continuation).
+        // Prefill the prompt, then sample from the tokens prefill left behind.
+        // Skip it entirely if the prompt is empty (prefix-cached continuation).
         if !prompt.isEmpty {
-            let prefillTokens: ArraySlice<Int32>
-            if prompt.count > config.chunkThreshold {
-                prefillTokens = try await processChunkedInput(tokens: prompt)
-            } else {
-                let prefillCapacity = max(1, prompt.count)
-                if try logits.ensureCapacity(forContextLength: prefillCapacity) {
-                    let fmt = ByteCountFormatter()
-                    fmt.countStyle = .memory
-                    CLILogger.log(
-                        "Logits buffer grew to capacity \(logits.currentCapacity) (\(fmt.string(fromByteCount: Int64(logits.currentByteCount))))"
-                    )
-                }
-                prefillTokens = prompt[...]
-            }
+            let prefillTokens = try await prefill(prompt: prompt)
 
-            // Process prompt with sampling
+            // Process the remaining prompt tokens with sampling
             try await _encodeNextStepGPU(
                 tokens: prefillTokens,
                 gpuSampler: gpuSampler,
@@ -1564,6 +1573,42 @@ private struct EngineImpl: ~Copyable {
 
     // MARK: - Chunked Prefill
 
+    /// Prefill the part of the prompt that needs no logits, returning the tokens that do.
+    ///
+    /// The caller must run the returned slice through `function` to produce
+    /// logits and seed the decode loop.
+    ///
+    /// With a `prefill` graph, everything but the final token goes through it in chunks:
+    /// it has no LM head, so it can't seed sampling, and one token has to be held back.
+    /// Without one, `function` serves prefill too, chunked only above `chunkThreshold`,
+    /// and the trailing partial chunk carries the logits.
+    private mutating func prefill(prompt: [Int32]) async throws -> ArraySlice<Int32> {
+        if prefillFunction != nil {
+            var head = prompt.dropLast()
+            for chunk in prefillChunkSizes(
+                tokenCount: prompt.count, chunkSize: prefillMaxQueryLength,
+                heldBack: prefillHeldBackTokens(hasPrefillGraph: true))
+            {
+                try await _encodeChunk(tokens: Array(head.prefix(chunk)))
+                head = head.dropFirst(chunk)
+            }
+            return prompt.suffix(1)
+        }
+
+        if prompt.count > config.chunkThreshold {
+            return try await processChunkedInput(tokens: prompt)
+        }
+
+        if try logits.ensureCapacity(forContextLength: max(1, prompt.count)) {
+            let fmt = ByteCountFormatter()
+            fmt.countStyle = .memory
+            CLILogger.log(
+                "Logits buffer grew to capacity \(logits.currentCapacity) (\(fmt.string(fromByteCount: Int64(logits.currentByteCount))))"
+            )
+        }
+        return prompt[...]
+    }
+
     mutating func processChunkedInput(tokens: [Int32]) async throws -> ArraySlice<Int32> {
         let chunkSize = config.prefillChunkSize
         var remainingTokens = tokens[...]
@@ -1579,13 +1624,18 @@ private struct EngineImpl: ~Copyable {
         return remainingTokens
     }
 
+    /// Encode one prefill chunk: KV cache writes only, no sampling.
+    ///
+    /// A chunk needs no logits, so it runs on the prefill graph when the asset has one and
+    /// binds no output. Otherwise `function` runs it and its logits go unread.
     private mutating func _encodeChunk(tokens: [Int32]) async throws {
         let queryLength = tokens.count
         let currentStep = processedTokenCount
+        let graphName = prefillFunction != nil ? prefillGraphFunctionName : config.function
 
         let chunkID = InstrumentsProfiler.beginCustomInterval(
             name: "CoreAIPipelinedChunk",
-            details: "step=\(currentStep) qLen=\(queryLength)"
+            details: "step=\(currentStep) qLen=\(queryLength) graph=\(graphName)"
         )
 
         // Write at the chunk's natural position so each chunk occupies a disjoint
@@ -1630,17 +1680,26 @@ private struct EngineImpl: ~Copyable {
         var valState = unsafe InferenceFunction.AsyncMutableValue(
             unsafeBuffer: valBuffer, byteOffset: 0,
             scalarType: valueCacheScalarType, shape: valShape, strides: valStrides)
-        let logitsShape = [1, queryLength, vocabSize]
-        let logitsStrides = try resolvedStrides(descriptor: logitsBaseDesc, shape: logitsShape)
-
-        try encodeWithStates(
-            function: function, inputs: asyncInputs,
-            keyState: &keyState, keyCacheName: keyCacheName,
-            valState: &valState, valueCacheName: valueCacheName,
-            additionalStates: additionalStates,
-            logitsBuffer: logits.metalBuffer, logitsName: logitsOutputName,
-            logitsShape: logitsShape, logitsStrides: logitsStrides,
-            computeStream: computeStream)
+        if let prefillFn = prefillFunction {
+            try encodeWithStatesNoOutputs(
+                function: prefillFn, inputs: asyncInputs,
+                keyState: &keyState, keyCacheName: keyCacheName,
+                valState: &valState, valueCacheName: valueCacheName,
+                additionalStates: additionalStates,
+                computeStream: computeStream)
+        } else {
+            let logitsShape = [1, queryLength, vocabSize]
+            try encodeWithStates(
+                function: function, inputs: asyncInputs,
+                keyState: &keyState, keyCacheName: keyCacheName,
+                valState: &valState, valueCacheName: valueCacheName,
+                additionalStates: additionalStates,
+                logitsBuffer: logits.metalBuffer, logitsName: logitsOutputName,
+                logitsShape: logitsShape,
+                logitsStrides: try resolvedStrides(
+                    descriptor: logitsBaseDesc, shape: logitsShape),
+                computeStream: computeStream)
+        }
 
         processedTokenCount += queryLength
         step += 1
@@ -1669,17 +1728,24 @@ private struct EngineImpl: ~Copyable {
         // from warming every bucket shape — the jump from none→any is what matters.
         let defaultWarmupLength = 256
 
-        let shapesToWarm: [Int]
+        var shapesToWarm: [Int]
         if queryLength > 0 {
             shapesToWarm = [queryLength]
         } else {
             shapesToWarm = [1, defaultWarmupLength]
         }
+        if prefillFunction != nil {
+            // Multi-token shapes warm the prefill graph, so `function` needs its own
+            // single-token pass.
+            shapesToWarm = shapesToWarm.map { $0 > 1 ? min($0, prefillMaxQueryLength) : $0 }
+            if !shapesToWarm.contains(1) { shapesToWarm.append(1) }
+        }
 
         CLILogger.log("Running warmup for \(shapesToWarm.count) shape(s)")
 
-        let maxShape = shapesToWarm.last ?? 1
-        try logits.ensureCapacity(forContextLength: maxShape)
+        let maxShape = shapesToWarm.max() ?? 1
+        // `function` only produces prompt-wide logits when there's no prefill graph.
+        try logits.ensureCapacity(forContextLength: prefillFunction != nil ? 1 : maxShape)
 
         do {
             let queue = pipelineQueue
@@ -1729,16 +1795,29 @@ private struct EngineImpl: ~Copyable {
             var valState = unsafe InferenceFunction.AsyncMutableValue(
                 unsafeBuffer: valBuffer, byteOffset: 0,
                 scalarType: valueCacheScalarType, shape: vShape, strides: vStrides)
-            let lShape = [1, shape, vocabSize]
-            let lStrides = try resolvedStrides(descriptor: logitsBaseDesc, shape: lShape)
+            // Multi-token shapes must run on the prefill graph when there is one. Not just
+            // to avoid compiling unused kernels: the logits buffer holds a single row in
+            // that case, so a wide warmup on `function` would overrun it.
+            if shape > 1, let prefillFn = prefillFunction {
+                try encodeWithStatesNoOutputs(
+                    function: prefillFn, inputs: asyncInputs,
+                    keyState: &keyState, keyCacheName: keyCacheName,
+                    valState: &valState, valueCacheName: valueCacheName,
+                    additionalStates: additionalStates,
+                    computeStream: computeStream)
+                step += 1
+                continue
+            }
 
+            let lShape = [1, shape, vocabSize]
             try encodeWithStates(
                 function: function, inputs: asyncInputs,
                 keyState: &keyState, keyCacheName: keyCacheName,
                 valState: &valState, valueCacheName: valueCacheName,
                 additionalStates: additionalStates,
                 logitsBuffer: logits.metalBuffer, logitsName: logitsOutputName,
-                logitsShape: lShape, logitsStrides: lStrides,
+                logitsShape: lShape,
+                logitsStrides: try resolvedStrides(descriptor: logitsBaseDesc, shape: lShape),
                 computeStream: computeStream)
 
             // Warm up argmax kernel using pipeline-matched decode buffers

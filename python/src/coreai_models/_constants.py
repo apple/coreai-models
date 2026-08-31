@@ -9,12 +9,22 @@ A leaf module: imported by both ``models/`` and ``export/``, imports nothing fro
 either.
 """
 
-# Graph name for a single-graph (macOS) export. iOS uses its own entrypoint names.
+# Graph name for the decode macOS export, which also serves prefill when no prefill
+# graph is exported. iOS uses its own entrypoint names.
 MAIN_GRAPH_NAME = "main"
+
+# Optional second macOS entrypoint: the prefill graph. Same inputs and states as `main`,
+# but no LM head and no outputs -- it only fills the KV cache. Emitted for models that opt
+# in via `BaseForCausalLM.exports_prefill_graph`; the Swift runner uses it when present.
+PREFILL_GRAPH_NAME = "prefill"
 
 # KV cache names used by the Swift runner
 KEY_CACHE_NAME = "keyCache"
 VALUE_CACHE_NAME = "valueCache"
+
+# Sliding (ring buffer) KV cache names — fixed-size states classified as .slidingCache
+SLIDING_KEY_CACHE_NAME = "slidingKeyCache"
+SLIDING_VALUE_CACHE_NAME = "slidingValueCache"
 
 # Trace-time KV cache sequence length, to bound peak trace memory. At inference the
 # cache size is dynamic.

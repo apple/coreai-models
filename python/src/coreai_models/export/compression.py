@@ -16,6 +16,8 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from datasets import load_dataset
+from tqdm import tqdm
 
 from coreai_models._constants import (
     MAIN_GRAPH_NAME,
@@ -38,14 +40,6 @@ try:
     _HAS_COREAI_OPT = True
 except ImportError:
     _HAS_COREAI_OPT = False
-
-try:
-    from datasets import load_dataset
-    from tqdm import tqdm
-
-    _HAS_DATASETS = True
-except ImportError:
-    _HAS_DATASETS = False
 
 
 def _require_coreai_opt() -> None:
@@ -105,11 +99,6 @@ def get_c4(
         List of tokenized samples, each of shape (1, seq_len) where
         seq_len <= max_sequence_length.
     """
-    if not _HAS_DATASETS:
-        raise ImportError(
-            "The 'datasets' and 'tqdm' packages are required for calibration data. "
-            "Install them with: pip install datasets tqdm"
-        )
 
     dataset = load_dataset(
         "allenai/c4",
@@ -242,8 +231,6 @@ def quantize_pytorch_model(
     prepared_model = quantizer.prepare(example_inputs=inputs, dynamic_shapes=dynamic_shapes)
 
     if run_calibration:
-        if not _HAS_DATASETS:
-            raise ImportError("tqdm is required for calibration progress reporting.")
         logger.info(f"Running calibration with {len(calibration_data) - 1} samples on {device}")
         with quantizer.calibration_mode(), torch.no_grad():
             for sample in tqdm(calibration_data[1:], desc="calibration"):

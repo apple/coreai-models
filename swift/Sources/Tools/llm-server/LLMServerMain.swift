@@ -181,7 +181,9 @@ struct LLMServer: AsyncParsableCommand {
                 print("  POST /v1/completions        (loglikelihood)")
             }
             print("  GET  /v1/models")
+            print("  GET  /v1/stats")
             print("  GET  /health")
+            print("  GET  /ready")
         }
         print("")
 

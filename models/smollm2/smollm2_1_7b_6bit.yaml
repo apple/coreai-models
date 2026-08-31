@@ -1,0 +1,14 @@
+# 6-bit palettization for SmolLM2-1.7B iOS.
+# 64 centroids — middle ground between 4-bit (16) and 8-bit (256).
+kmeans_palettization_config:
+  global_config:
+    op_state_spec:
+      weight:
+        n_bits: 6
+        granularity:
+          type: per_grouped_channel
+          axis: 0
+          group_size: 8
+  module_type_configs:
+    torch.nn.modules.sparse.Embedding: null
+    coreai_models.primitives.ios.embedding.LoadEmbeddings: null

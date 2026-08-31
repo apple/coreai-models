@@ -304,6 +304,25 @@ class BaseForCausalLM(torch.nn.Module):
     # Subclasses must override this with their specific HuggingFace model class
     _HF_MODEL_CLASS: type | None = None
 
+    #: Whether the macOS exporter emits a second, LM-head-less ``prefill`` graph
+    #: beside ``main``. Opt in per model: ``forward`` must honour
+    #: :attr:`prefill_mode`.
+    exports_prefill_graph: bool = False
+
+    #: Set while the exporter traces the prefill graph. See :meth:`set_prefill_mode`.
+    prefill_mode: bool = False
+
+    def set_prefill_mode(self, prefill_mode: bool) -> None:
+        """Toggle prefill mode for the next trace.
+
+        The exporters trace one module twice -- decode, then prefill -- to emit two
+        entrypoints from it. A model that opts into :attr:`exports_prefill_graph` checks
+        :attr:`prefill_mode` in ``forward`` and returns nothing when it is set: the
+        prefill graph only has to fill the KV cache, so the LM head and the tail of the
+        model become dead code.
+        """
+        self.prefill_mode = prefill_mode
+
     @staticmethod
     def cast_logits_bfloat16_to_float16(forward_fn: Callable) -> Callable:
         """Decorator to cast torch.bfloat16 logits outputs to float16.
@@ -378,8 +397,10 @@ class BaseForCausalLM(torch.nn.Module):
     # Export contract
     #
     # Everything the exporters need to trace this model, keyed by graph name. A macOS
-    # model has one graph; iOS has several. These hooks supply only names and tensors;
-    # which callable each graph traces stays the exporter's business.
+    # model has one traced signature; iOS has several. These hooks supply only names and
+    # tensors; which callable each graph traces stays the exporter's business. A macOS
+    # model that opts into `exports_prefill_graph` emits a second entrypoint from that one
+    # signature, differing only in that it declares no outputs.
     #
     # Reference inputs bind to the traced signature, so they must be in its EXACT
     # order. Names are looked up by name, so each list carries only the RELATIVE order
@@ -401,6 +422,19 @@ class BaseForCausalLM(torch.nn.Module):
         kwarg rather than as ordinary inputs/outputs.
         """
         return {MAIN_GRAPH_NAME: (KEY_CACHE_NAME, VALUE_CACHE_NAME)}
+
+    @classmethod
+    def export_state_classification(cls) -> dict[str, str] | None:
+        """Optional per-state classification for heterogeneous cache models.
+
+        Returns a dict mapping each state name (from :meth:`export_state_names`) to
+        a classification string (e.g. ``"kv_cache"``, ``"sliding_kv_cache"``).  The
+        runtime uses this to allocate caches with different growth policies.
+
+        Returns ``None`` by default, meaning all states share the same (standard
+        KV-cache) treatment.
+        """
+        return None
 
     @classmethod
     def export_output_names(cls) -> dict[str, tuple[str, ...]]:
@@ -835,7 +869,10 @@ class BaseForCausalLMForiOS(BaseForCausalLM):
         self.gather_embeddings = GatherEmbeddings()
         self.disable_embedding_quantization = disable_embedding_quantization
 
+    @override
     def set_prefill_mode(self, prefill_mode: bool):
+        # iOS composes the transformer as a submodule, so the flag lives there rather
+        # than on the top-level module.
         self.extend.prefill_mode = prefill_mode
 
     # ------------------------------------------------------------------

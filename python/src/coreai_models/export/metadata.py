@@ -113,6 +113,33 @@ _METADATA: dict[str, AIModelMetadataFields] = {
             "Source: https://huggingface.co/mistralai/Mixtral-8x7B-Instruct-v0.1"
         ),
     ),
+    "HuggingFaceTB/SmolLM2-1.7B-Instruct": AIModelMetadataFields(
+        author="HuggingFace",
+        license="Apache-2.0",
+        model_description=(
+            "SmolLM2-1.7B-Instruct is a 1.7B-parameter instruction-tuned causal "
+            "language model from HuggingFace. "
+            "Source: https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B-Instruct"
+        ),
+    ),
+    "HuggingFaceTB/SmolLM2-360M-Instruct": AIModelMetadataFields(
+        author="HuggingFace",
+        license="Apache-2.0",
+        model_description=(
+            "SmolLM2-360M-Instruct is a 360M-parameter instruction-tuned causal "
+            "language model from HuggingFace. "
+            "Source: https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct"
+        ),
+    ),
+    "HuggingFaceTB/SmolLM2-135M-Instruct": AIModelMetadataFields(
+        author="HuggingFace",
+        license="Apache-2.0",
+        model_description=(
+            "SmolLM2-135M-Instruct is a 135M-parameter instruction-tuned causal "
+            "language model from HuggingFace. "
+            "Source: https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct"
+        ),
+    ),
     "openai/gpt-oss-20b": AIModelMetadataFields(
         author="OpenAI",
         license="Apache-2.0",
@@ -120,6 +147,25 @@ _METADATA: dict[str, AIModelMetadataFields] = {
             "gpt-oss-20b is a 20B-parameter open-weights causal language model "
             "released by OpenAI. "
             "Source: https://huggingface.co/openai/gpt-oss-20b"
+        ),
+    ),
+    "meta-models/Muse-Glimmer-30B": AIModelMetadataFields(
+        author="Meta",
+        license="Apache-2.0",
+        model_description=(
+            "Muse Glimmer 30B is a 30B-parameter on-device agentic language model "
+            "from Meta with sliding/global attention and gated attention. "
+            "Source: https://huggingface.co/meta-models/Muse-Glimmer-30B"
+        ),
+    ),
+    "meta-models/Muse-Glimmer-30B-assistant": AIModelMetadataFields(
+        author="Meta",
+        license="Apache-2.0",
+        model_description=(
+            "Muse Glimmer 30B assistant is a speculative-decoding drafter "
+            "companion for Meta's Muse Glimmer 30B model (5 transformer layers, "
+            "sliding-window only). "
+            "Source: https://huggingface.co/meta-models/Muse-Glimmer-30B-assistant"
         ),
     ),
     # ---- VLMs ----
