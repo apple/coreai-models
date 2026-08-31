@@ -36,7 +36,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     // MARK: Input name resolution
 
     private static let knownPositionIdNames = ["position_ids", "pos_ids"]
-    private static let knownStepNames = ["step"]
+    private static let knownStepNames = ["in_step", "step"]
     private static let knownTransformerInputNames = ["transformer_input"]
 
     private static func resolveInputName(
