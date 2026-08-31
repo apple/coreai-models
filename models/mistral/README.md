@@ -8,13 +8,6 @@ Mistral AI's Mistral models for on-device inference via Core AI.
 | ------------------- | ---------- | ----- | --- |
 | Mistral 7B Instruct | 7.0B       | Yes   | Yes |
 
-## Gated Access
-This Mistral model is gated on [Hugging Face](https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.3) (HF). You will need to accept the terms of the [license](https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.3), generate a HF token, and add your HF token to your machine before exporting this model.
-```bash
-brew install hf
-hf auth login --token <YOUR_TOKEN_HERE>
-```
-
 ## Setup to export models
 
 If you haven't installed `uv`, install it by
