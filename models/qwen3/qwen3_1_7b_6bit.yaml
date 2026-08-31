@@ -1,5 +1,4 @@
 # 6-bit palettization for Qwen3-1.7B iOS.
-# 64 centroids — good quality/speed tradeoff for ~1.7B-parameter models.
 kmeans_palettization_config:
   global_config:
     op_state_spec:
