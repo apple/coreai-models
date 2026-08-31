@@ -108,9 +108,7 @@ LLM_PRESETS: list[ModelPreset] = [
         "4bit_weights_8bit_kv_cache",
         "float16",
         40960,
-        notes=(
-            "INT4 per-block weights and INT8 per-tensor KV cache."
-        ),
+        notes=("INT4 per-block weights and INT8 per-tensor KV cache."),
     ),
     ModelPreset("qwen3-8b", "Qwen/Qwen3-8B", "qwen3", "llm", "macOS", "4bit", "float16", 40960),
     ModelPreset(
