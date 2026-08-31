@@ -20,6 +20,31 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     private static let keyCacheName = "key_cache"
     private static let valueCacheName = "value_cache"
 
+    // MARK: Function name parsing
+
+    private struct FunctionDimensions {
+        let contextLength: Int
+        let queryLength: Int
+    }
+
+    private static func parseFunctionDimensions(_ name: String) -> FunctionDimensions? {
+        let parts = Array(name.split(separator: "_").suffix(2))
+        guard parts.count == 2, let ctx = Int(parts[0]), let ql = Int(parts[1]) else { return nil }
+        return FunctionDimensions(contextLength: ctx, queryLength: ql)
+    }
+
+    // MARK: Input name resolution
+
+    private static let knownPositionIdNames = ["position_ids", "pos_ids"]
+    private static let knownStepNames = ["step"]
+    private static let knownTransformerInputNames = ["transformer_input"]
+
+    private static func resolveInputName(
+        from inputNames: [String], candidates: [String]
+    ) -> String? {
+        candidates.first(where: inputNames.contains)
+    }
+
     public var vocabSize: Int { config.vocabSize }
 
     public let config: ModelConfig
@@ -88,10 +113,8 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
 
         // Compute max query length from function names for prefill threshold
         self.maxQueryLength =
-            extendFunctionNames.compactMap { name -> Int? in
-                let parts = name.split(separator: "_")
-                return parts.last.flatMap { Int($0) }
-            }.max() ?? 64
+            extendFunctionNames.compactMap { Self.parseFunctionDimensions($0)?.queryLength }
+                .max() ?? 64
 
         // Grab largest context length extend function to use the descriptors for allocating largest context length
         // key/value caches.
@@ -129,26 +152,25 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         }
 
         // Discover input names from the largest-context function
-        let posName = largestExtendDescriptor.inputNames.first(where: { $0.contains("pos") })
-        guard let positionIdsName = posName else {
+        guard let positionIdsName = Self.resolveInputName(
+            from: largestExtendDescriptor.inputNames, candidates: Self.knownPositionIdNames
+        ) else {
             throw InferenceRuntimeError.invalidState("No position_ids input found in model descriptor")
         }
         let maskName: String? =
             largestExtendDescriptor.inputNames.contains("causal_mask")
             ? "causal_mask" : nil
-        let stepInputName: String? = largestExtendDescriptor.inputNames.first(where: {
-            $0.contains("step") && !$0.contains("pos")
-        })
+        let stepInputName = Self.resolveInputName(
+            from: largestExtendDescriptor.inputNames, candidates: Self.knownStepNames
+        )
 
         // Build per-bucket descriptors from ALL extend/prompt functions
         var bucketDescs: [StaticBucketInputFiller.BucketKey: StaticBucketInputFiller.BucketDescriptors] = [:]
         for name in extendFunctionNames {
             let desc = try Self.requireDescriptor(model: model, functionName: name)
             let ql = Self.queryLength(descriptor: desc, functionName: name)
-            // Parse context length from function name (extend_256_64 → 256)
-            let nameParts = Array(name.split(separator: "_").suffix(2))
-            guard nameParts.count == 2, let cl = Int(nameParts[0]) else { continue }
-            let key = StaticBucketInputFiller.BucketKey(batchSize: ql, contextBucket: cl)
+            guard let dims = Self.parseFunctionDimensions(name) else { continue }
+            let key = StaticBucketInputFiller.BucketKey(batchSize: ql, contextBucket: dims.contextLength)
 
             guard case .ndArray(let posDesc) = desc.inputDescriptor(of: positionIdsName) else { continue }
             let mDesc: NDArrayDescriptor? = maskName.flatMap {
@@ -276,13 +298,12 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     }
 
     private static func queryLength(descriptor: InferenceFunctionDescriptor, functionName: String) -> Int {
-        if let txName = descriptor.inputNames.first(where: { $0.contains("transformer_input") }),
+        if let txName = resolveInputName(from: descriptor.inputNames, candidates: knownTransformerInputNames),
             case .ndArray(let nd) = descriptor.inputDescriptor(of: txName), nd.shape.count >= 2
         {
             return nd.shape[1]
         }
-        let parts = functionName.split(separator: "_")
-        if let last = parts.last, let seq = Int(last) { return seq }
+        if let dims = parseFunctionDimensions(functionName) { return dims.queryLength }
         return 1
     }
 
@@ -319,9 +340,8 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     private func forwardGraph(numInputTokens: Int, currentPosition: Int, isPrefill: Bool) throws -> String {
         var pairs: [(contextLength: Int, queryLength: Int)] = []
         for name in extendFunctionNames {
-            let parts = Array(name.split(separator: "_").suffix(2))
-            guard parts.count == 2, let maxCtx = Int(parts[0]), let seqLen = Int(parts[1]) else { continue }
-            pairs.append((maxCtx, seqLen))
+            guard let dims = Self.parseFunctionDimensions(name) else { continue }
+            pairs.append((dims.contextLength, dims.queryLength))
         }
 
         let sorted = pairs.sorted { $0.queryLength < $1.queryLength }
@@ -494,9 +514,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         tokensInBatch: Int
     ) async throws -> [String: NDArray] {
         let desc = try functionDescriptor(for: graphName)
-        // Parse context length from graph name to match bucket keys
-        let nameParts = Array(graphName.split(separator: "_").suffix(2))
-        let contextLength = nameParts.count == 2 ? (Int(nameParts[0]) ?? 0) : 0
+        let contextLength = Self.parseFunctionDimensions(graphName)?.contextLength ?? 0
 
         // Fill position_ids, causal_mask, step via the handler
         let context = InputContext.static(
@@ -506,7 +524,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
             slidingWindow: nil,
             contextBucket: contextLength)
         try inputFiller.fill(context, into: &inputBuffers)
-        var inputs = inputBuffers.asDict()
+        var inputs = inputBuffers.borrowedInputs()
 
         // Pass-through constant embedding table
         if desc.inputNames.contains("embedding_table") {
@@ -514,7 +532,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         }
 
         // Gather embeddings for this batch's tokens
-        if let txName = desc.inputNames.first(where: { $0.contains("transformer_input") }) {
+        if let txName = Self.resolveInputName(from: desc.inputNames, candidates: Self.knownTransformerInputNames) {
             let gatherName = "gather_embeddings_\(batchSize)"
             guard gatherFunctionNames.contains(gatherName) else {
                 throw InferenceRuntimeError.invalidState(

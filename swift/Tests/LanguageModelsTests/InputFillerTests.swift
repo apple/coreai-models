@@ -42,13 +42,13 @@ struct StaticInputHandlerTests {
         #expect(result == [1, 2, 3, 4])
     }
 
-    @Test("InputBuffers asDict returns all entries")
-    func buffersAsDict() {
+    @Test("InputBuffers borrowedInputs returns all entries")
+    func buffersBorrowedInputs() {
         var buffers = InputBuffers()
         buffers["a"] = NDArray(shape: [1, 2], scalarType: .int32)
         buffers["b"] = NDArray(shape: [1, 3], scalarType: .int32)
 
-        let dict = buffers.asDict()
+        let dict = buffers.borrowedInputs()
         #expect(dict.count == 2)
         #expect(dict["a"] != nil)
         #expect(dict["b"] != nil)
@@ -255,7 +255,7 @@ extension StaticInputHandlerTests {
         print("    speedup (alloc→IB): \(String(format: "%.1f", allocUs / ibUs))x")
     }
 
-    @Test("Benchmark: asDict() overhead")
+    @Test("Benchmark: borrowedInputs() overhead")
     func benchmarkAsDict() {
         let iterations = 10000
         var buffers = InputBuffers()
@@ -264,13 +264,13 @@ extension StaticInputHandlerTests {
 
         let start = ContinuousClock.now
         for _ in 0..<iterations {
-            let dict = buffers.asDict()
+            let dict = buffers.borrowedInputs()
             _ = dict.count  // prevent optimization
         }
         let us =
             (Double((ContinuousClock.now - start).components.attoseconds) / 1e12
                 + Double((ContinuousClock.now - start).components.seconds) * 1e6) / Double(iterations)
-        print("  asDict() (2 entries): \(String(format: "%.2f", us))us")
+        print("  borrowedInputs() (2 entries): \(String(format: "%.2f", us))us")
     }
 }
 

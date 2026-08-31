@@ -97,6 +97,10 @@ public enum InputCoverage {
 
 // MARK: - New InputHandler Protocol (inout fill pattern)
 
+/// Sentinel value for masked (non-attending) positions in the causal attention mask.
+/// Large negative that becomes ~0 after softmax.
+public let causalMaskSentinel = Float16(-40000)
+
 /// Pre-allocated input buffer set. Owns NDArrays, reused across steps.
 /// The engine creates this once at init and passes it to `StaticInputHandler.fill()` each step.
 public struct InputBuffers {
@@ -130,7 +134,13 @@ public struct InputBuffers {
         }
     }
 
-    /// Access a buffer for in-place filling via fillNDArray.
+    /// Access a buffer by name.
+    ///
+    /// - Warning: The `get` accessor returns a *copy* of the NDArray reference.
+    ///   Holding the result (`let a = buffers[name]`) raises the refcount and
+    ///   forces COW on the next in-place fill. For zero-copy mutation, use
+    ///   `withMutableBuffer(_:body:)` or mutate through the subscript directly
+    ///   (`fillNDArray(&buffers[name]!, ...)`), which routes through `_modify`.
     ///
     /// The `_modify` accessor yields the NDArray in-place from the dictionary
     /// without copying the struct out and back. This avoids COW reference counting
@@ -173,8 +183,14 @@ public struct InputBuffers {
         try body(&buffers[name]!)
     }
 
-    /// O(1) as this returns the backing dictionary directly.
-    public func asDict() -> [String: NDArray] {
+    /// Borrow the current buffer dictionary for a single inference call.
+    ///
+    /// Returns a shallow copy of the dictionary. Because NDArray is a
+    /// reference-type wrapper, the returned values share backing storage
+    /// with this InputBuffers instance. The caller must NOT retain the
+    /// result past the current inference step — doing so lets `fill()`
+    /// on the next step mutate arrays the caller still references.
+    public func borrowedInputs() -> [String: NDArray] {
         buffers
     }
 }

@@ -113,7 +113,7 @@ struct InputPrepBenchmarks {
         let startMask = clock.now
         for step in 0..<iterations {
             fillNDArray(&mask, as: Float16.self, count: 512) { i in
-                i <= step % 512 ? Float16(0) : Float16(-40000)
+                i <= step % 512 ? Float16(0) : causalMaskSentinel
             }
         }
         let maskUs = ((clock.now - startMask) / iterations).inMicroseconds
@@ -124,7 +124,7 @@ struct InputPrepBenchmarks {
         let largeIterations = 100
         let startLarge = clock.now
         for _ in 0..<largeIterations {
-            fillNDArray(&largeMask, as: Float16.self, count: 2048 * 64) { _ in Float16(-40000) }
+            fillNDArray(&largeMask, as: Float16.self, count: 2048 * 64) { _ in causalMaskSentinel }
         }
         let largeUs = ((clock.now - startLarge) / largeIterations).inMicroseconds
         print("[causal_mask_2048x64] fill: \(String(format: "%.1f", largeUs))us/iter")
@@ -266,7 +266,7 @@ struct InputHandlerFuzzTests {
 
         var mask = NDArray(shape: [1, contextLength, 1, tokensInBatch], scalarType: .float16)
         let count = contextLength * tokensInBatch
-        fillNDArray(&mask, as: Float16.self, count: count) { _ in Float16(-40000) }
+        fillNDArray(&mask, as: Float16.self, count: count) { _ in causalMaskSentinel }
 
         let view = mask.mutableView(as: Float16.self)
         view.withUnsafeMutablePointer { ptr, shape, strides in
@@ -291,7 +291,7 @@ struct InputHandlerFuzzTests {
                         "(\(ctx),\(query)) should be unmasked (queryPos=\(queryPos))")
                 } else {
                     #expect(
-                        result[idx] == Float16(-40000),
+                        result[idx] == causalMaskSentinel,
                         "(\(ctx),\(query)) should be masked (queryPos=\(queryPos))")
                 }
             }
@@ -347,12 +347,12 @@ struct InputHandlerStressTests {
         for (step, bucketIdx) in transitions.enumerated() {
             let size = sizes[bucketIdx]
             fillNDArray(&arrays[bucketIdx], as: Float16.self, count: size) { i in
-                i <= step ? Float16(0) : Float16(-40000)
+                i <= step ? Float16(0) : causalMaskSentinel
             }
 
             let values = readNDArray(arrays[bucketIdx], as: Float16.self, count: size)
             for i in 0..<min(size, step + 2) {
-                let expected: Float16 = i <= step ? 0 : Float16(-40000)
+                let expected: Float16 = i <= step ? 0 : causalMaskSentinel
                 #expect(
                     values[i] == expected,
                     "Bucket \(bucketIdx) corruption at step \(step), index \(i)")
@@ -401,13 +401,13 @@ struct InputHandlerStressTests {
         var mask = NDArray(shape: [1, contextLength, 1, 1], scalarType: .float16)
 
         fillNDArray(&mask, as: Float16.self, count: contextLength) { i in
-            Float16(i < contextLength / 2 ? 0 : -40000)
+            i < contextLength / 2 ? Float16(0) : causalMaskSentinel
         }
         let values = readNDArray(mask, as: Float16.self, count: contextLength)
         #expect(values[0] == Float16(0))
         #expect(values[contextLength / 2 - 1] == Float16(0))
-        #expect(values[contextLength / 2] == Float16(-40000))
-        #expect(values[contextLength - 1] == Float16(-40000))
+        #expect(values[contextLength / 2] == causalMaskSentinel)
+        #expect(values[contextLength - 1] == causalMaskSentinel)
     }
 }
 
@@ -528,12 +528,12 @@ struct IncrementalMaskTests {
     func incrementalMatchesFull(contextLength: Int) {
         var fullMask = NDArray(shape: [1, contextLength, 1, 1], scalarType: .float16)
         var incrMask = NDArray(shape: [1, contextLength, 1, 1], scalarType: .float16)
-        fillNDArray(&incrMask, as: Float16.self, count: contextLength) { _ in Float16(-40000) }
+        fillNDArray(&incrMask, as: Float16.self, count: contextLength) { _ in causalMaskSentinel }
 
         let steps = min(64, contextLength)
         for step in 0..<steps {
             fillNDArray(&fullMask, as: Float16.self, count: contextLength) { i in
-                i <= step ? Float16(0) : Float16(-40000)
+                i <= step ? Float16(0) : causalMaskSentinel
             }
 
             let view = incrMask.mutableView(as: Float16.self)
@@ -557,13 +557,13 @@ struct IncrementalMaskTests {
         let startFull = clock.now
         for step in 0..<steps {
             fillNDArray(&fullMask, as: Float16.self, count: contextLength) { i in
-                i <= step ? Float16(0) : Float16(-40000)
+                i <= step ? Float16(0) : causalMaskSentinel
             }
         }
         let fullMs = (clock.now - startFull).inMilliseconds
 
         var incrMask = NDArray(shape: [1, contextLength, 1, 1], scalarType: .float16)
-        fillNDArray(&incrMask, as: Float16.self, count: contextLength) { _ in Float16(-40000) }
+        fillNDArray(&incrMask, as: Float16.self, count: contextLength) { _ in causalMaskSentinel }
         let startIncr = clock.now
         for step in 0..<steps {
             let view = incrMask.mutableView(as: Float16.self)

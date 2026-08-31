@@ -73,6 +73,7 @@ public struct StaticBucketInputFiller: StaticInputHandler {
         let tokensInBatch = context.tokens.count
         let contextLength = context.contextBucket
 
+        // TODO: resolve bucket at graph-selection time to skip per-step lookup
         let key = BucketKey(batchSize: batchSize, contextBucket: contextLength)
         guard let descs = bucketDescriptors[key] else {
             throw InferenceRuntimeError.invalidState(
@@ -98,7 +99,7 @@ public struct StaticBucketInputFiller: StaticInputHandler {
                         for ctx in 0..<shape[1] {
                             for query in 0..<shape[3] {
                                 let offset = ctx &* strides[1] &+ query &* strides[3]
-                                ptr[offset] = Float16(-40000)
+                                ptr[offset] = causalMaskSentinel
                             }
                         }
                         for query in 0..<tokensInBatch {
