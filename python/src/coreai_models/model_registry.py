@@ -128,7 +128,7 @@ LLM_PRESETS: list[ModelPreset] = [
         "mistral",
         "llm",
         "iOS",
-        "4bit_weight_palettized_group32",
+        "4bit_weight_palettized_group8",
         "float16",
         IOS_DEFAULT_MAX_CONTEXT_LENGTH,
     ),

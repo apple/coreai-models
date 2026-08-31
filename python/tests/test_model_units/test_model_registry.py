@@ -115,7 +115,7 @@ def test_output_name_llm_iOS_uses_yaml_stem_when_compression_config_set() -> Non
     [
         (
             "mistral-7b-instruct-v0.3",
-            "mistral_7b_instruct_v0_3_4bit_weight_palettized_group32_static",
+            "mistral_7b_instruct_v0_3_4bit_weight_palettized_group8_static",
         ),
     ],
 )
