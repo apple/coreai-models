@@ -113,6 +113,33 @@ _METADATA: dict[str, AIModelMetadataFields] = {
             "Source: https://huggingface.co/mistralai/Mixtral-8x7B-Instruct-v0.1"
         ),
     ),
+    "HuggingFaceTB/SmolLM2-1.7B-Instruct": AIModelMetadataFields(
+        author="HuggingFace",
+        license="Apache-2.0",
+        model_description=(
+            "SmolLM2-1.7B-Instruct is a 1.7B-parameter instruction-tuned causal "
+            "language model from HuggingFace. "
+            "Source: https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B-Instruct"
+        ),
+    ),
+    "HuggingFaceTB/SmolLM2-360M-Instruct": AIModelMetadataFields(
+        author="HuggingFace",
+        license="Apache-2.0",
+        model_description=(
+            "SmolLM2-360M-Instruct is a 360M-parameter instruction-tuned causal "
+            "language model from HuggingFace. "
+            "Source: https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct"
+        ),
+    ),
+    "HuggingFaceTB/SmolLM2-135M-Instruct": AIModelMetadataFields(
+        author="HuggingFace",
+        license="Apache-2.0",
+        model_description=(
+            "SmolLM2-135M-Instruct is a 135M-parameter instruction-tuned causal "
+            "language model from HuggingFace. "
+            "Source: https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct"
+        ),
+    ),
     "openai/gpt-oss-20b": AIModelMetadataFields(
         author="OpenAI",
         license="Apache-2.0",

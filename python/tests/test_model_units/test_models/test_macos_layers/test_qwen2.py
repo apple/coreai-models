@@ -83,9 +83,9 @@ def _make_qwen2_config(
         intermediate_size=intermediate_size,
         vocab_size=vocab_size,
         max_position_embeddings=max_position_embeddings,
+        rope_theta=10000.0,
+        rope_parameters={"rope_type": "default"},
     )
-    config.rope_scaling = None
-    config.rope_theta = 10000.0
     return config
 
 
@@ -265,6 +265,108 @@ class TestmacOSQwen2ForCausalLM:
         expected_rows = n_heads * head_dim + 2 * n_kv_heads * head_dim
         assert sd["model.layers.0.self_attn.qkv_proj.weight"].shape == (expected_rows, hidden)
         assert sd["model.layers.0.self_attn.qkv_proj.bias"].shape == (expected_rows,)
+
+    def test_attention_bias_false_parity(self):
+        """SmolLM2-style config: attention_bias=False. Verify HF parity."""
+        config = Qwen2Config(
+            hidden_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            num_hidden_layers=2,
+            intermediate_size=128,
+            vocab_size=100,
+            max_position_embeddings=32,
+            attention_bias=False,
+            tie_word_embeddings=True,
+            rope_theta=130000.0,
+            rope_parameters={"rope_type": "default"},
+        )
+
+        hf_model = HFQwen2ForCausalLM(config).to(torch.float32).eval()
+        our_model = Qwen2ForCausalLM(config, model_device="cpu")
+        our_model.to(torch.float32).eval()
+
+        sd = dict(hf_model.state_dict())
+        our_model._mutate_state_dict(sd)
+        our_model.load_state_dict(sd, assign=True, strict=True)
+
+        input_ids = torch.randint(0, 100, (1, 6))
+        position_ids = torch.arange(6, dtype=torch.int32).unsqueeze(0)
+        k_cache, v_cache = KVCache.create_cache_tensors(config, dtype=torch.float32)
+
+        with torch.no_grad():
+            our_out = our_model(input_ids, position_ids, k_cache, v_cache)
+            hf_out = hf_model(input_ids=input_ids, position_ids=position_ids.long())
+
+        torch.testing.assert_close(our_out, hf_out.logits, atol=1e-5, rtol=1e-5)
+
+    def test_mutate_state_dict_no_bias_strips_spurious_keys(self):
+        """When attention_bias=False, spurious zero-bias keys are stripped."""
+        config = Qwen2Config(
+            hidden_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            num_hidden_layers=1,
+            intermediate_size=128,
+            vocab_size=100,
+            max_position_embeddings=32,
+            attention_bias=False,
+            rope_theta=10000.0,
+            rope_parameters={"rope_type": "default"},
+        )
+        our_model = Qwen2ForCausalLM(config, model_device="cpu")
+
+        hidden = 64
+        n_heads = 4
+        n_kv_heads = 2
+        head_dim = hidden // n_heads
+
+        sd = {}
+        sd["model.embed_tokens.weight"] = torch.randn(100, hidden)
+        sd["model.norm.weight"] = torch.randn(hidden)
+        sd["lm_head.weight"] = torch.randn(100, hidden)
+        sd["model.layers.0.self_attn.q_proj.weight"] = torch.randn(n_heads * head_dim, hidden)
+        sd["model.layers.0.self_attn.q_proj.bias"] = torch.zeros(n_heads * head_dim)
+        sd["model.layers.0.self_attn.k_proj.weight"] = torch.randn(n_kv_heads * head_dim, hidden)
+        sd["model.layers.0.self_attn.k_proj.bias"] = torch.zeros(n_kv_heads * head_dim)
+        sd["model.layers.0.self_attn.v_proj.weight"] = torch.randn(n_kv_heads * head_dim, hidden)
+        sd["model.layers.0.self_attn.v_proj.bias"] = torch.zeros(n_kv_heads * head_dim)
+        sd["model.layers.0.self_attn.o_proj.weight"] = torch.randn(hidden, hidden)
+        sd["model.layers.0.mlp.gate_proj.weight"] = torch.randn(128, hidden)
+        sd["model.layers.0.mlp.up_proj.weight"] = torch.randn(128, hidden)
+        sd["model.layers.0.mlp.down_proj.weight"] = torch.randn(hidden, 128)
+        sd["model.layers.0.input_layernorm.weight"] = torch.randn(hidden)
+        sd["model.layers.0.post_attention_layernorm.weight"] = torch.randn(hidden)
+
+        our_model._mutate_state_dict(sd)
+
+        assert "model.layers.0.self_attn.qkv_proj.weight" in sd
+        assert "model.layers.0.self_attn.qkv_proj.bias" not in sd
+        assert "model.layers.0.self_attn.q_proj.bias" not in sd
+
+    def test_tie_word_embeddings(self):
+        """When tie_word_embeddings=True, lm_head shares embedding weights."""
+        config = Qwen2Config(
+            hidden_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            num_hidden_layers=1,
+            intermediate_size=128,
+            vocab_size=100,
+            max_position_embeddings=32,
+            tie_word_embeddings=True,
+            rope_theta=10000.0,
+            rope_parameters={"rope_type": "default"},
+        )
+
+        hf_model = HFQwen2ForCausalLM(config).eval()
+        our_model = Qwen2ForCausalLM(config, model_device="cpu").eval()
+
+        sd = dict(hf_model.state_dict())
+        our_model._mutate_state_dict(sd)
+        our_model.load_state_dict(sd, assign=True, strict=True)
+
+        assert our_model.lm_head.weight is our_model.model.embed_tokens.weight
 
 
 # =============================================================================
