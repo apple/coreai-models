@@ -253,7 +253,7 @@ public struct Flux2Pipeline: DiffusionPipeline {
             if refSide == spatialSide {
                 refPacked = fullRefPacked
             } else {
-                refPacked = subsampleTokens(
+                refPacked = Self.subsampleTokens(
                     fullRefPacked, fromSide: spatialSide, toSide: refSide, channels: inChannels)
             }
             referenceTokens = refPacked
@@ -303,8 +303,8 @@ public struct Flux2Pipeline: DiffusionPipeline {
                 throw PipelineLoadError.unsupportedConfiguration(
                     available.isEmpty
                         ? "this bundle has no img2img transformer. Export the img2img "
-                            + "components, or use --multifunction to get every grid from "
-                            + "a single asset."
+                            + "components, or export without --single-function to get every "
+                            + "grid from a single asset."
                         : "this bundle has no img2img transformer for the "
                             + "\(configuration.referenceGrid) reference grid. Available: "
                             + "\(available.joined(separator: ", ")).")
@@ -318,11 +318,15 @@ public struct Flux2Pipeline: DiffusionPipeline {
 
         // For manual CFG: encode an empty prompt for the unconditional pass
         let emptyEmbeddings: [Float]?
-        if configuration.manualCFG && guidanceScale > 1.0 {
+        if configuration.isManualCFG && guidanceScale > 1.0 {
             emptyEmbeddings = try await encodeText("")
         } else {
             emptyEmbeddings = nil
         }
+
+        // Reused across steps: manual CFG would otherwise allocate a fresh
+        // seqLen*inChannels array on every one.
+        var cfgBuffer = [Float](repeating: 0, count: seqLen * inChannels)
 
         for (step, t) in scheduler.timeSteps.enumerated() {
             let timestepValue = Float(t) / 1000.0
@@ -362,7 +366,6 @@ public struct Flux2Pipeline: DiffusionPipeline {
                         (textIds, [1, textSeqLen, axisCount]),
                     ], functionName: fnName)
 
-                // CFG interpolation: uncond + guidance * (cond - uncond)
                 let condSlice: ArraySlice<Float>
                 let uncondSlice: ArraySlice<Float>
                 if referenceTokens != nil {
@@ -372,9 +375,10 @@ public struct Flux2Pipeline: DiffusionPipeline {
                     condSlice = condOutput[0..<condOutput.count]
                     uncondSlice = uncondOutput[0..<uncondOutput.count]
                 }
-                output = zip(uncondSlice, condSlice).map { u, c in
-                    u + guidanceScale * (c - u)
-                }
+                Self.applyClassifierFreeGuidance(
+                    cond: condSlice, uncond: uncondSlice,
+                    guidanceScale: guidanceScale, into: &cfgBuffer)
+                output = cfgBuffer
             } else {
                 // Standard single pass with embedded guidance
                 let fullOutput = try await denoiser.run(
@@ -616,7 +620,7 @@ public struct Flux2Pipeline: DiffusionPipeline {
     /// half/quarter grids. Channel index encodes intra-patch position, so averaging
     /// per channel keeps corresponding sub-positions aligned.
     /// Input: [fromSide*fromSide, channels], Output: [toSide*toSide, channels]
-    private func subsampleTokens(
+    static func subsampleTokens(
         _ tokens: [Float], fromSide: Int, toSide: Int, channels: Int
     ) -> [Float] {
         let stride = fromSide / toSide
@@ -640,6 +644,27 @@ public struct Flux2Pipeline: DiffusionPipeline {
             }
         }
         return result
+    }
+
+    // MARK: - Classifier-Free Guidance
+
+    /// `uncond + g*(cond - uncond)`, written into `destination` rather than returned.
+    ///
+    /// The caller reuses one buffer across denoising steps; at 1024×1024 each result is
+    /// ~2 MB, so returning a fresh array would allocate one per step.
+    static func applyClassifierFreeGuidance(
+        cond: ArraySlice<Float>, uncond: ArraySlice<Float>,
+        guidanceScale: Float, into destination: inout [Float]
+    ) {
+        // Reusing the buffer means a short input would leave the previous step's values
+        // in the tail rather than merely producing a short array, so require an exact fit.
+        precondition(
+            cond.count == destination.count && uncond.count == destination.count,
+            "CFG expected \(destination.count) noise values, got "
+                + "cond=\(cond.count) uncond=\(uncond.count)")
+        for (offset, (u, c)) in zip(uncond, cond).enumerated() {
+            destination[offset] = u + guidanceScale * (c - u)
+        }
     }
 
     // MARK: - Latent Packing/Unpacking

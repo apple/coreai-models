@@ -521,7 +521,7 @@ FLUX2_MULTIFUNCTION_TRANSFORMER = MultiFunctionComponentSpec(
     quantizable=True,
 )
 
-# When --multifunction is enabled, replace the two separate transformer entries
+# The default (no --single-function): replace the two separate transformer entries
 # with the single multi-function spec.
 FLUX2_MULTIFUNCTION_COMPONENTS: dict[str, ComponentSpec | MultiFunctionComponentSpec] = {
     "transformer": FLUX2_MULTIFUNCTION_TRANSFORMER,

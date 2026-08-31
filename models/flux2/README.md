@@ -29,28 +29,34 @@ uv run coreai.diffusion.export flux2-klein-4b --platform iOS --resolution 1024
 uv run coreai.diffusion.export flux2-klein-4b --platform macOS
 
 # Include half-resolution VAEs for low-memory tiled decode
-# (only meaningful with --no-multifunction; multi-function always includes them)
-uv run coreai.diffusion.export flux2-klein-4b --platform macOS --no-multifunction --low-memory
+# (only affects --single-function exports; the half VAEs are always included otherwise)
+uv run coreai.diffusion.export flux2-klein-4b --platform macOS --single-function --low-memory
 
 # Export all components (default -- no --platform flag)
 uv run coreai.diffusion.export flux2-klein-4b
 ```
 
-### Multi-function vs single-function
+### One asset or several
 
-The main export-time decision — how the transformer is packaged.
+The main export-time decision — how the transformer is packaged. By default you get a
+single asset covering every resolution and reference grid, chosen at runtime. Pass
+`--single-function` to get one asset per resolution/grid instead.
 
-|                 | Multi-function (default)     | Single-function (`--no-multifunction`) |
-| --------------- | ---------------------------- | -------------------------------------- |
-| Assets          | one `Transformer.aimodel`    | one asset per resolution/grid          |
-| Disk            | ~2 GB total                  | ~2 GB **each**                         |
-| Peak memory     | higher                       | lower                                  |
-| Reference grids | all three, chosen at runtime | only the one you exported              |
+|                 | Default                      | `--single-function`           |
+| --------------- | ---------------------------- | ----------------------------- |
+| Assets          | one `Transformer.aimodel`    | one asset per resolution/grid |
+| Disk            | ~2 GB total                  | ~2 GB **each**                |
+| Peak memory     | higher                       | lower                         |
+| Reference grids | all three, chosen at runtime | only the one you exported     |
 
-`--platform iOS` implies `--no-multifunction` (to limit peak memory), 512 resolution, and the
-`half` reference grid; passing `--multifunction` with it is an error. `--resolution` and
-`--low-memory` are inert under multi-function — one asset already covers both
-resolutions and the half VAEs are always included — and both warn.
+The default packages the five variants (`main`, `half`, `img2img_quarter/half/full`) as
+entrypoints in one multi-function `.aimodel` that shares one set of weights, which is why
+it costs ~2 GB total rather than ~2 GB per variant.
+
+`--platform iOS` implies `--single-function` (to limit peak memory), 512 resolution, and
+the `half` reference grid. `--resolution` and `--low-memory` only apply to
+`--single-function` exports — one asset already covers both resolutions and the half VAEs
+are always included — and both warn if passed without it.
 
 ### Image-to-image
 
@@ -58,14 +64,14 @@ Needs a VAE encoder plus an img2img transformer. Reference tokens from your inpu
 are concatenated onto the noise sequence, so adherence comes from `--reference-grid`,
 not from noise blending (`--strength` is ignored).
 
-Multi-function already includes every grid. Single-function needs one chosen at export:
+The default already includes every grid. `--single-function` needs one chosen at export:
 
 ```bash
 # iOS: 512 + half grid, included by default
 uv run coreai.diffusion.export flux2-klein-4b --platform iOS
 
-# Another grid needs --components, which requires --no-multifunction
-uv run coreai.diffusion.export flux2-klein-4b --no-multifunction \
+# Another grid needs --components, which requires --single-function
+uv run coreai.diffusion.export flux2-klein-4b --single-function \
     --components transformer_512 transformer_512_img2img_quarter \
                 text_encoder vae_decoder_half vae_encoder_half
 ```

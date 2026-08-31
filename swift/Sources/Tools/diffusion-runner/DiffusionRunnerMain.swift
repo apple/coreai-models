@@ -74,7 +74,7 @@ struct DiffusionRunner: AsyncParsableCommand {
     var referenceGrid: ReferenceGrid?
 
     @Flag(help: "Use manual CFG (two forward passes) for stronger text guidance in img2img")
-    var manualCfg: Bool = false
+    var isManualCFG: Bool = false
 
     @Option(name: .customLong("parity-test"), help: "Path to parity data directory (numpy .npy files)")
     var parityTestDir: String?
@@ -153,7 +153,7 @@ struct DiffusionRunner: AsyncParsableCommand {
             startingImage: startingCGImage,
             strength: strength,
             referenceGrid: referenceGrid ?? .full,
-            manualCFG: manualCfg,
+            isManualCFG: isManualCFG,
             encoderScaleFactor: resolvedDescriptor.encoderScaleFactor ?? 0.18215,
             decoderScaleFactor: resolvedDescriptor.decoderScaleFactor ?? 0.18215,
             decoderShiftFactor: resolvedDescriptor.decoderShiftFactor ?? 0.0,

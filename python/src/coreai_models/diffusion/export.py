@@ -73,7 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--platform",
         default=None,
         choices=["iOS", "macOS"],
-        help="Target platform. iOS defaults to 512 resolution, --no-multifunction, and "
+        help="Target platform. iOS defaults to 512 resolution, --single-function, and "
         "the half img2img reference grid; macOS defaults to 1024 and the full grid.",
     )
     parser.add_argument(
@@ -86,16 +86,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--low-memory",
         action="store_true",
-        help="Include half-resolution VAEs for tiled decode. Redundant for multifunction.",
+        help="Include half-resolution VAEs for tiled decode. Only applies with "
+        "--single-function; the half VAEs are always included otherwise.",
     )
     parser.add_argument(
-        "--multifunction",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Export FLUX.2 transformer as multi-function .aimodel with 5 functions "
-        "(main, half, img2img_quarter/half/full) sharing weights. "
-        "Default: enabled. Use --no-multifunction for separate single-function models. "
-        "Ignores --resolution and --low-memory.",
+        "--single-function",
+        action="store_true",
+        help="Export the FLUX.2 transformer as one asset per resolution/grid instead of a "
+        "single multi-function .aimodel. Lower peak memory, but ~2 GB per asset and only "
+        "the resolution/grid you export. Default: off (one multi-function asset with 8 "
+        "entrypoints sharing weights). Needed to name a per-resolution transformer in "
+        "--components; implied by --platform iOS.",
     )
     parser.add_argument(
         "--experimental",
@@ -196,26 +197,15 @@ def main() -> None:
     if args.components and args.platform:
         parser.error("Cannot specify both --components and --platform. Use only one.")
 
-    # `--multifunction` defaults to None so an explicit flag is distinguishable from the
-    # default. Without that the iOS guard below cannot tell them apart and would fire on
-    # every iOS export.
-    multifunction_was_explicit = args.multifunction is not None
-    multifunction = args.multifunction if multifunction_was_explicit else True
-
-    # iOS forces single-function: multifunction saves disk but raises peak memory, and
-    # the tradeoff is not negotiable on device. Unlike the two warnings below there is no
-    # runtime recourse -- the asset simply will not have the extra entrypoints -- so an
-    # explicit --multifunction cannot be honoured and is rejected rather than inverted.
-    if args.platform == "iOS" and multifunction_was_explicit and multifunction:
-        parser.error(
-            "--platform iOS implies --no-multifunction (multifunction raises peak memory "
-            "on device), so --multifunction cannot be honoured. Drop --multifunction, or "
-            "omit --platform and pass --components yourself."
-        )
+    # iOS forces single-function: multi-function saves disk but raises peak memory, and
+    # the tradeoff is not negotiable on device. There is no way to ask for the opposite,
+    # so this needs no conflict check -- passing --single-function alongside it is a no-op
+    # that agrees with the platform default.
+    multifunction = not args.single_function
     if args.platform == "iOS":
         multifunction = False
 
-    # The next two are warnings, not errors: under multifunction the flags' intent is
+    # The next two are warnings, not errors: under multi-function the flags' intent is
     # already met by a different mechanism, so failing the export would be wrong.
     if args.platform is None:
         if args.resolution is not None:
@@ -229,21 +219,30 @@ def main() -> None:
     elif multifunction:
         if args.resolution is not None:
             _warn(
-                f"--resolution {args.resolution} is not used with multifunction: one asset "
-                "holds both resolutions. Select at runtime with the pipeline's "
-                "--decode-resolution, or export with --no-multifunction."
+                f"--resolution {args.resolution} is not used without --single-function: one "
+                "asset holds both resolutions. Select at runtime with the pipeline's "
+                "--decode-resolution, or export with --single-function."
             )
         if args.low_memory:
             _warn(
-                "--low-memory is redundant with multifunction: the half VAEs are always included."
+                "--low-memory is redundant without --single-function: the half VAEs are "
+                "always included."
             )
 
     if args.components:
         valid = get_valid_components(pipeline_type, multifunction=multifunction)
         invalid = [c for c in args.components if c not in valid]
         if invalid:
+            # Per-resolution names only exist under --single-function, and that is the
+            # likeliest reason to land here, so name the remedy rather than just the set.
+            hint = (
+                " Per-resolution/grid names (e.g. transformer_512, "
+                "transformer_img2img_full) require --single-function."
+                if multifunction
+                else ""
+            )
             parser.error(
-                f"Invalid components for {pipeline_type}: {invalid}. Valid choices: {valid}"
+                f"Invalid components for {pipeline_type}: {invalid}. Valid choices: {valid}.{hint}"
             )
 
     # Platform-based component selection (FLUX.2 only)

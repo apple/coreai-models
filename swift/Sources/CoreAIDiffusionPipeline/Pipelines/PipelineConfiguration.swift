@@ -48,7 +48,7 @@ public struct PipelineConfiguration: Hashable, Sendable {
     public var startingImage: CGImage?
     public var strength: Float
     public var referenceGrid: ReferenceGrid
-    public var manualCFG: Bool
+    public var isManualCFG: Bool
 
     // VAE scale factors (from pipeline.json)
     public var encoderScaleFactor: Float
@@ -76,7 +76,7 @@ public struct PipelineConfiguration: Hashable, Sendable {
         startingImage: CGImage? = nil,
         strength: Float = 1.0,
         referenceGrid: ReferenceGrid = .full,
-        manualCFG: Bool = false,
+        isManualCFG: Bool = false,
         encoderScaleFactor: Float = 0.18215,
         decoderScaleFactor: Float = 0.18215,
         decoderShiftFactor: Float = 0.0,
@@ -94,7 +94,7 @@ public struct PipelineConfiguration: Hashable, Sendable {
         self.startingImage = startingImage
         self.strength = strength
         self.referenceGrid = referenceGrid
-        self.manualCFG = manualCFG
+        self.isManualCFG = isManualCFG
         self.encoderScaleFactor = encoderScaleFactor
         self.decoderScaleFactor = decoderScaleFactor
         self.decoderShiftFactor = decoderShiftFactor
@@ -118,7 +118,7 @@ extension PipelineConfiguration {
         hasher.combine(schedulerType)
         hasher.combine(strength)
         hasher.combine(referenceGrid)
-        hasher.combine(manualCFG)
+        hasher.combine(isManualCFG)
         hasher.combine(encoderScaleFactor)
         hasher.combine(decoderScaleFactor)
         hasher.combine(decoderShiftFactor)
@@ -137,7 +137,7 @@ extension PipelineConfiguration {
             && lhs.schedulerType == rhs.schedulerType
             && lhs.strength == rhs.strength
             && lhs.referenceGrid == rhs.referenceGrid
-            && lhs.manualCFG == rhs.manualCFG
+            && lhs.isManualCFG == rhs.isManualCFG
             && lhs.encoderScaleFactor == rhs.encoderScaleFactor
             && lhs.decoderScaleFactor == rhs.decoderScaleFactor
             && lhs.decoderShiftFactor == rhs.decoderShiftFactor
