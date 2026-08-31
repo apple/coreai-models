@@ -83,6 +83,7 @@ Perplexity score on the [`WikiText-2`](https://huggingface.co/datasets/EleutherA
 | Qwen3 0.6B | [Mixed 4-bit/8-bit palettized][mixed-4bit-8bit-yaml] | 5.71\*                | iOS      | 30.90            |
 | Qwen3 4B   | none (`float16`)                                     | 16.00                 | macOS    | 16.41            |
 | Qwen3 4B   | [4-bit quantized][presets-info]                      | 4.50                  | macOS    | 18.33            |
+| Qwen3 4B   | [4-bit quantized with INT8 KV cache][presets-info]   | 4.50                  | macOS    | 18.65            |
 | Qwen3 4B   | none (`float16`)                                     | 16.00                 | iOS      | 16.41            |
 | Qwen3 4B   | [Mixed 4-bit/8-bit palettized][qwen3-4b-mixed-yaml]  | 4.89\*                | iOS      | 18.80            |
 | Qwen3 8B   | none (`float16`)                                     | 16.00                 | macOS    | 12.19            |
