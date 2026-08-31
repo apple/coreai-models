@@ -1546,3 +1546,4 @@ class TestQwen3MoeLayers:
 class TestQwen3MoeForCausalLM(ForCausalLMTestBase):
     _toy_model_id = "yujiepan/qwen3-moe-tiny-random"
     _model_class = CoreaiTorchQwen3MoeForCausalLM
+    _test_weight_activation_quantization = True
