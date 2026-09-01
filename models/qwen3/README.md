@@ -40,6 +40,9 @@ uv run coreai.llm.export Qwen/Qwen3-0.6B --num-layers 1 --compression none
 
 # Preview resolved config without exporting
 uv run coreai.llm.export Qwen/Qwen3-0.6B --dry-run
+
+# INT4 Per Block quantized weights and INT8 KV Cache on macOS
+uv run coreai.llm.export qwen3-4b-8bit-kv
 ```
 
 ## Run a Core AI Language Model

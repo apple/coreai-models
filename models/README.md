@@ -87,7 +87,9 @@ KV Cache quantization can be specified for `macOS` models using `coreai-opt`'s `
 ```
 
 
-For more details, please see the `4bit_weights_8bit_kv_cache` preset in [presets.py](../python/src/coreai_models/export/presets.py). Note that KV Cache quantization requires the graph execution_mode mode in `coreai-opt`.
+For more details, please see the `4bit_weights_8bit_kv_cache` preset in [presets.py](../python/src/coreai_models/export/presets.py). Note that KV Cache quantization requires `coreai-opt`'s graph execution_mode mode.
+
+Please see the [Qwen2.5](qwen2/README.md) and [Qwen3](qwen3/README.md) model cards for examples of models exported with KV Cache quantization.
 
 
 ##### Specifying Compression Configs via YAML files
