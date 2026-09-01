@@ -19,6 +19,7 @@ it does run a real conversion and therefore needs ``coreai-torch``.
 
 from __future__ import annotations
 
+import asyncio
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -100,12 +101,17 @@ def _export(*, opts_in: bool) -> tuple[torch.nn.Module, object]:
 
 
 async def _function_descriptors(program) -> dict[str, object]:  # type: ignore[no-untyped-def]
-    """Save the program and read back one descriptor per entrypoint."""
+    """Save the program and read back one descriptor per entrypoint.
+
+    Loads through ``asset.executable()`` rather than ``AIModel.load()`` directly: that
+    scopes the model's resources to this block, so they are released before the temp
+    directory backing them is removed instead of at some later, GC-determined point.
+    """
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "model.aimodel"
-        program.save_asset(path, rt.AIModelAssetMetadata())
-        model = await rt.AIModel.load(path)
-        return {name: model.load_function(name).desc for name in model.function_names}
+        asset = program.save_asset(path, rt.AIModelAssetMetadata())
+        async with asset.executable() as model:
+            return {name: model.load_function(name).desc for name in model.function_names}
 
 
 def _prefill_inputs(config: Qwen3Config) -> tuple[torch.Tensor, torch.Tensor]:
@@ -138,24 +144,24 @@ async def _run_entrypoint(
     k_cache, v_cache = _zeroed_caches()
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "model.aimodel"
-        program.save_asset(path, rt.AIModelAssetMetadata())
-        model = await rt.AIModel.load(path)
-        function = model.load_function(name)
-        state = {
-            KEY_CACHE_NAME: rt.NDArray(data=k_cache),
-            VALUE_CACHE_NAME: rt.NDArray(data=v_cache),
-        }
-        await function(
-            {
-                "input_ids": rt.NDArray(data=input_ids.contiguous()),
-                "position_ids": rt.NDArray(data=position_ids.contiguous()),
-            },
-            state=state,
-        )
-        return (
-            state[KEY_CACHE_NAME].numpy().copy(),
-            state[VALUE_CACHE_NAME].numpy().copy(),
-        )
+        asset = program.save_asset(path, rt.AIModelAssetMetadata())
+        async with asset.executable() as model:
+            function = model.load_function(name)
+            state = {
+                KEY_CACHE_NAME: rt.NDArray(data=k_cache),
+                VALUE_CACHE_NAME: rt.NDArray(data=v_cache),
+            }
+            await function(
+                {
+                    "input_ids": rt.NDArray(data=input_ids.contiguous()),
+                    "position_ids": rt.NDArray(data=position_ids.contiguous()),
+                },
+                state=state,
+            )
+            return (
+                state[KEY_CACHE_NAME].numpy().copy(),
+                state[VALUE_CACHE_NAME].numpy().copy(),
+            )
 
 
 def _torch_prefill(
@@ -179,10 +185,9 @@ def _torch_prefill(
     return k_cache, v_cache
 
 
-@pytest.mark.asyncio
-async def test_prefill_graph_is_emitted_when_opted_in() -> None:
+def test_prefill_graph_is_emitted_when_opted_in() -> None:
     model, program = _export(opts_in=True)
-    descs = await _function_descriptors(program)
+    descs = asyncio.run(_function_descriptors(program))
 
     assert set(descs) == {MAIN_GRAPH_NAME, PREFILL_GRAPH_NAME}
 
@@ -202,10 +207,9 @@ async def test_prefill_graph_is_emitted_when_opted_in() -> None:
     assert model.prefill_mode is False
 
 
-@pytest.mark.asyncio
-async def test_prefill_graph_is_absent_when_opted_out() -> None:
+def test_prefill_graph_is_absent_when_opted_out() -> None:
     model, program = _export(opts_in=False)
-    descs = await _function_descriptors(program)
+    descs = asyncio.run(_function_descriptors(program))
 
     assert set(descs) == {MAIN_GRAPH_NAME}
     assert PREFILL_GRAPH_NAME not in descs
@@ -238,8 +242,7 @@ def _export_flattened() -> tuple[torch.nn.Module, object]:
     return model, export_macos_model(flattened, config, export_config, externalized_model=model)
 
 
-@pytest.mark.asyncio
-async def test_flattened_model_gets_a_trimmed_prefill_graph() -> None:
+def test_flattened_model_gets_a_trimmed_prefill_graph() -> None:
     """Graph-mode quantization hands the exporter a flattened module, which resolved
     ``prefill_mode`` when it was captured, so there is no second trace to take. The
     exporter stages the one decode trace again with its non-state outputs trimmed, which
@@ -248,7 +251,7 @@ async def test_flattened_model_gets_a_trimmed_prefill_graph() -> None:
     """
     _, program = _export_flattened()
 
-    descs = await _function_descriptors(program)
+    descs = asyncio.run(_function_descriptors(program))
     assert set(descs) == {MAIN_GRAPH_NAME, PREFILL_GRAPH_NAME}
 
     prefill, main = descs[PREFILL_GRAPH_NAME], descs[MAIN_GRAPH_NAME]
@@ -258,8 +261,7 @@ async def test_flattened_model_gets_a_trimmed_prefill_graph() -> None:
     assert set(prefill.state_names) == set(main.state_names) == {KEY_CACHE_NAME, VALUE_CACHE_NAME}
 
 
-@pytest.mark.asyncio
-async def test_flattened_prefill_graph_kv_writes_match_torch() -> None:
+def test_flattened_prefill_graph_kv_writes_match_torch() -> None:
     """Trimming the outputs must not take the cache writes with it.
 
     Same check as the eager path's, and the same eager reference: the graph declares no
@@ -268,7 +270,9 @@ async def test_flattened_prefill_graph_kv_writes_match_torch() -> None:
     model, program = _export_flattened()
     input_ids, position_ids = _prefill_inputs(_tiny_config())
 
-    k_coreai, v_coreai = await _run_entrypoint(program, PREFILL_GRAPH_NAME, input_ids, position_ids)
+    k_coreai, v_coreai = asyncio.run(
+        _run_entrypoint(program, PREFILL_GRAPH_NAME, input_ids, position_ids)
+    )
     k_torch, v_torch = _torch_prefill(model, input_ids, position_ids)
 
     written = (slice(None), slice(None), slice(None), slice(0, PREFILL_LEN))
@@ -277,8 +281,7 @@ async def test_flattened_prefill_graph_kv_writes_match_torch() -> None:
     assert_close(v_coreai.astype(np.float32), v_torch.float(), atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.asyncio
-async def test_prefill_graph_kv_writes_match_torch() -> None:
+def test_prefill_graph_kv_writes_match_torch() -> None:
     """The converted prefill graph fills the cache the way eager prefill does.
 
     The shape assertions above would pass just as well for a prefill graph that dropped
@@ -292,7 +295,9 @@ async def test_prefill_graph_kv_writes_match_torch() -> None:
     model, program = _export(opts_in=True)
     input_ids, position_ids = _prefill_inputs(_tiny_config())
 
-    k_coreai, v_coreai = await _run_entrypoint(program, PREFILL_GRAPH_NAME, input_ids, position_ids)
+    k_coreai, v_coreai = asyncio.run(
+        _run_entrypoint(program, PREFILL_GRAPH_NAME, input_ids, position_ids)
+    )
     k_torch, v_torch = _torch_prefill(model, input_ids, position_ids)
 
     # Not vacuous: the prompt's positions really were written, so an all-zeros cache on

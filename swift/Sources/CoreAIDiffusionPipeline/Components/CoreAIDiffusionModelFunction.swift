@@ -12,7 +12,9 @@ import Foundation
 public actor CoreAIDiffusionModelFunction {
     private let modelURL: URL
     private var model: AIModel?
-    private var function: InferenceFunction?
+    /// Cached InferenceFunctions keyed by name. Reusing loaded functions (rather
+    /// than reloading per call) avoids a GPU memory leak — see PR #110.
+    private var functionCache: [String: InferenceFunction] = [:]
     private var isLoaded = false
 
     public init(modelURL: URL) {
@@ -31,14 +33,27 @@ public actor CoreAIDiffusionModelFunction {
         }
 
         self.model = loadedModel
-        self.function = fn
+        self.functionCache["main"] = fn
         self.isLoaded = true
     }
 
     public func unloadResources() {
-        function = nil
+        functionCache.removeAll()
         model = nil
         isLoaded = false
+    }
+
+    /// Whether the model asset declares a function with the given name.
+    ///
+    /// Only looks at the asset's function table. This is so that it does not resolve the
+    /// function, so no weights are materialized. `loadFunction` would make a
+    /// GPU-resident copy of the entire weight set and hold it for the lifetime of this actor.
+    /// The asset is released once this function returns.
+    public func hasFunction(named name: String) async throws -> Bool {
+        if let model { return model.functionNames.contains(name) }
+        let options = SpecializationOptions(preferredComputeUnitKind: .gpu)
+        let probe = try await AIModel(contentsOf: modelURL, options: options)
+        return probe.functionNames.contains(name)
     }
 
     // MARK: - [Float]-based API
@@ -61,6 +76,7 @@ public actor CoreAIDiffusionModelFunction {
             throw CoreAIDiffusionError.functionNotFound(name, modelURL)
         }
         let resolved = nd.resolvingDynamicDimensions(shape)
+        try Self.requireExactCount(data.count, resolved, input: name)
         var array = NDArray(descriptor: resolved)
         Self.packFloatsIntoNDArray(&array, data: data, scalarType: resolved.scalarType)
         return array
@@ -71,6 +87,10 @@ public actor CoreAIDiffusionModelFunction {
     /// The fills below copy `data.count` elements into an array sized by the
     /// descriptor, so a short buffer would leave the tail zeroed and produce silently
     /// wrong output rather than an error.
+    ///
+    /// Runs *after* `resolvingDynamicDimensions`, so a dynamic axis has a concrete
+    /// value by this point and gets checked like any other. The `> 0` guard only
+    /// skips axes the caller left unresolved.
     private static func requireExactCount(
         _ count: Int, _ descriptor: NDArrayDescriptor, input name: String
     ) throws {
@@ -83,12 +103,14 @@ public actor CoreAIDiffusionModelFunction {
         }
     }
 
-    public func run(floatInputs: [([Float], [Int])]) async throws -> [Float] {
-        try await run(inputs: floatInputs.map { .floats($0.0, $0.1) })
+    public func run(
+        floatInputs: [([Float], [Int])], functionName: String = "main"
+    ) async throws -> [Float] {
+        try await run(inputs: floatInputs.map { .floats($0.0, $0.1) }, functionName: functionName)
     }
 
-    public func run(inputs: [ModelInput]) async throws -> [Float] {
-        let fn = try await ensureLoaded()
+    public func run(inputs: [ModelInput], functionName: String = "main") async throws -> [Float] {
+        let fn = try await function(named: functionName)
 
         var namedInputs: [String: NDArray] = [:]
         for (i, name) in fn.descriptor.inputNames.enumerated() where i < inputs.count {
@@ -98,6 +120,7 @@ public actor CoreAIDiffusionModelFunction {
             case .floats(let data, let shape):
                 guard case .ndArray(let nd) = fn.descriptor.inputDescriptor(of: name) else { continue }
                 let resolved = nd.resolvingDynamicDimensions(shape)
+                try Self.requireExactCount(data.count, resolved, input: name)
                 var array = NDArray(descriptor: resolved)
                 Self.packFloatsIntoNDArray(&array, data: data, scalarType: resolved.scalarType)
                 namedInputs[name] = array
@@ -190,8 +213,27 @@ public actor CoreAIDiffusionModelFunction {
     // MARK: - Core inference
 
     private func ensureLoaded() async throws -> InferenceFunction {
-        if function == nil { try await loadResources() }
-        guard let fn = function else { throw CoreAIDiffusionError.notLoaded }
+        try await function(named: "main")
+    }
+
+    /// Return the named InferenceFunction, loading the model and caching the
+    /// function on first use. Throws if the function is absent from the asset.
+    private func function(named name: String) async throws -> InferenceFunction {
+        guard let fn = try await functionIfPresent(named: name) else {
+            throw CoreAIDiffusionError.functionNotFound(name, modelURL)
+        }
+        return fn
+    }
+
+    /// Like `function(named:)` but returns nil (instead of throwing) when the
+    /// function is not present in the model asset.
+    private func functionIfPresent(named name: String) async throws -> InferenceFunction? {
+        if !isLoaded { try await loadResources() }
+        if let cached = functionCache[name] { return cached }
+        guard let mdl = model, let fn = try mdl.loadFunction(named: name) else {
+            return nil
+        }
+        functionCache[name] = fn
         return fn
     }
 
@@ -207,6 +249,7 @@ public actor CoreAIDiffusionModelFunction {
             case .floats(let data, let shape):
                 guard case .ndArray(let nd) = fn.descriptor.inputDescriptor(of: name) else { continue }
                 let resolved = nd.resolvingDynamicDimensions(shape)
+                try Self.requireExactCount(data.count, resolved, input: name)
                 var array = NDArray(descriptor: resolved)
                 Self.packFloatsIntoNDArray(&array, data: data, scalarType: resolved.scalarType)
                 namedInputs[name] = array
@@ -247,24 +290,20 @@ public actor CoreAIDiffusionModelFunction {
 
     /// Read an output NDArray into a dense `[Float]`.
     ///
-    /// Goes through `readNDArray` so a padded output buffer is indexed by stride
-    /// rather than read linearly, matching how inputs are written. The element count
-    /// comes from a same-typed view — `view(as:)` traps when the type disagrees with
-    /// the array's scalar type, so it can't be probed generically.
+    /// Stride-aware so a padded output buffer is indexed by stride rather than read
+    /// linearly, matching how inputs are written. `bfloat16` is stored as `UInt16`
+    /// and needs its own reinterpretation — reading it through a `Float16` view
+    /// yields garbage — so it goes through `flattenBFloat16NDArray`.
     private func ndArrayToFloats(_ array: NDArray) throws -> [Float] {
         switch array.scalarType {
         #if !((os(macOS) || targetEnvironment(macCatalyst)) && arch(x86_64))
-        case .float16, .bfloat16:
-            let count = array.view(as: Float16.self).withUnsafePointer { _, shape, _ in
-                (0..<shape.count).reduce(1) { $0 * shape[$1] }
-            }
-            return readNDArray(array, as: Float16.self, count: count).map { Float($0) }
+        case .float16:
+            return flattenNDArray(array, as: Float16.self)
+        case .bfloat16:
+            return flattenBFloat16NDArray(array)
         #endif
         case .float32:
-            let count = array.view(as: Float.self).withUnsafePointer { _, shape, _ in
-                (0..<shape.count).reduce(1) { $0 * shape[$1] }
-            }
-            return readNDArray(array, as: Float.self, count: count)
+            return flattenNDArray(array, as: Float.self)
         default:
             throw CoreAIDiffusionError.unsupportedOutputScalarType(array.scalarType)
         }
@@ -310,6 +349,13 @@ public actor CoreAIDiffusionModelFunction {
     // MARK: - Stride-aware fill/read helpers
 
     /// Fill an NDArray buffer respecting non-contiguous strides.
+    ///
+    /// - Precondition: `data.count` must not exceed the array's logical capacity.
+    ///   Without it an oversized buffer overruns the allocation on the contiguous
+    ///   path, and on the strided path the index odometer wraps to zero and
+    ///   overwrites from the start. `requireExactCount` catches the recoverable case
+    ///   with a thrown error before this runs; this is the backstop, and mirrors
+    ///   `fillNDArray` in NDArray+Helpers.swift.
     private static func fillStrided<T>(
         _ ptr: UnsafeMutablePointer<T>,
         data: [Float],
@@ -317,6 +363,11 @@ public actor CoreAIDiffusionModelFunction {
         strides: Span<Int>,
         convert: (Float) -> T
     ) {
+        let capacity = (0..<shape.count).reduce(1) { $0 * shape[$1] }
+        precondition(
+            data.count <= capacity,
+            "fillStrided: count \(data.count) exceeds array capacity \(capacity)")
+
         let ndim = shape.count
         if ndim <= 1 {
             for j in 0..<data.count { ptr[j] = convert(data[j]) }
