@@ -35,10 +35,10 @@ public enum ReferenceGrid: String, Hashable, Sendable, CaseIterable {
     case quarter
 }
 
-/// Whether the pipeline performs classifier-free guidance itself.
+/// Whether the pipeline performs classifier-free guidance (CFG) itself.
 ///
 /// FLUX.2 Klein 4B is guidance-distilled and its transformer config sets
-/// `guidance_embeds: false`, so the traced graph's `guidance` input is inert — the model
+/// `guidance_embeds: false`, so the traced graph's `guidance` input is unused. The model
 /// discards it and produces a usable image from a single unguided pass. Real CFG is
 /// therefore something the pipeline adds on top, not something the model applies.
 public enum GuidanceMode: String, Hashable, Sendable, CaseIterable {

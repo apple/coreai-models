@@ -36,11 +36,11 @@ uv run coreai.diffusion.export flux2-klein-4b --platform macOS --single-function
 uv run coreai.diffusion.export flux2-klein-4b
 ```
 
-### One asset or several
+### Transformer Packaging
 
-The main export-time decision — how the transformer is packaged. By default you get a
-single asset covering every resolution and reference grid, chosen at runtime. Pass
-`--single-function` to get one asset per resolution/grid instead.
+There are two ways to export the transformer. By default you get a single asset (`.aimodel`)
+covering every supported resolution and reference grid, chosen at runtime. Pass `--single-function`
+to get one asset per resolution/grid instead.
 
 |                 | Default                      | `--single-function`           |
 | --------------- | ---------------------------- | ----------------------------- |
@@ -50,13 +50,16 @@ single asset covering every resolution and reference grid, chosen at runtime. Pa
 | Reference grids | all three, chosen at runtime | only the one you exported     |
 
 The default packages the five variants (`main`, `half`, `img2img_quarter/half/full`) as
-entrypoints in one multi-function `.aimodel` that shares one set of weights, which is why
-it costs ~2 GB total rather than ~2 GB per variant.
+entrypoints in one multi-function `.aimodel` that shares one set of weights.
+The multi-function transformer saves on disk space by sharing weights, but has a larger
+peak memory footprint during runtime.
 
 `--platform iOS` implies `--single-function` (to limit peak memory), 512 resolution, and
-the `half` reference grid. `--resolution` and `--low-memory` only apply to
-`--single-function` exports — one asset already covers both resolutions and the half VAEs
-are always included — and both warn if passed without it.
+the `half` reference grid. Do not use `--platform iOS` if you intend to use multi-function.
+
+Note that `--resolution` and `--low-memory` only apply to `--single-function` exports.
+The multi-function asset covers both resolutions and always includes the half VAEs, so the
+flags are irrelevant and will produce a warning if passed without `--single-function`.
 
 ### Image-to-image
 
@@ -106,10 +109,10 @@ uv run coreai.diffusion.export flux2-klein-4b --dry-run
 | `vae_encoder`                     | 1024x1024 pixel image to latent (image-to-image)   | macOS              |
 | `vae_encoder_half`                | 512x512 pixel image to latent (image-to-image)     | iOS, macOS+low-mem |
 
-`<grid>` is `full`, `half`, or `quarter` — the reference token grid relative to the
-output grid. At 1024 that is 4096 / 1024 / 256 reference tokens; at 512, 1024 / 256 / 64.
-Fewer tokens is faster and lighter, with coarser guidance. The `transformer*_img2img_*`
-assets exist only for single-function exports; multi-function carries these as named
+`<grid>` is `full`, `half`, or `quarter`: the reference token grid relative to the
+output grid. At 1024x1024 decode resolution, that ends up being 4096 / 1024 / 256 reference tokens. At 512x512, it will be 1024 / 256 / 64.
+Fewer tokens is faster and lighter, but with coarser guidance. The `transformer*_img2img_*`
+assets exist only for single-function exports, whereas multi-function carries these as named
 entrypoints inside `Transformer.aimodel`.
 
 ## Running

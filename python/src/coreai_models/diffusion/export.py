@@ -197,16 +197,13 @@ def main() -> None:
     if args.components and args.platform:
         parser.error("Cannot specify both --components and --platform. Use only one.")
 
-    # iOS forces single-function: multi-function saves disk but raises peak memory, and
-    # the tradeoff is not negotiable on device. There is no way to ask for the opposite,
-    # so this needs no conflict check -- passing --single-function alongside it is a no-op
-    # that agrees with the platform default.
+    # iOS forces single-function: multi-function saves disk but raises peak memory.
+    # Do not use platform=iOS if you want multi-function.
     multifunction = not args.single_function
     if args.platform == "iOS":
         multifunction = False
 
-    # The next two are warnings, not errors: under multi-function the flags' intent is
-    # already met by a different mechanism, so failing the export would be wrong.
+    # Warn of unused flags with multifunction.
     if args.platform is None:
         if args.resolution is not None:
             _warn(
@@ -233,8 +230,7 @@ def main() -> None:
         valid = get_valid_components(pipeline_type, multifunction=multifunction)
         invalid = [c for c in args.components if c not in valid]
         if invalid:
-            # Per-resolution names only exist under --single-function, and that is the
-            # likeliest reason to land here, so name the remedy rather than just the set.
+            # Per-resolution names only exist under --single-function.
             hint = (
                 " Per-resolution/grid names (e.g. transformer_512, "
                 "transformer_img2img_full) require --single-function."
@@ -253,7 +249,7 @@ def main() -> None:
         if resolution is None:
             resolution = 512 if args.platform == "iOS" else 1024
 
-        # Single-function img2img needs one asset per reference grid -- each grid is a
+        # Single-function img2img needs one asset per reference grid. Each grid is a
         # different concatenated sequence length, so a different trace, and separate
         # assets do not share weights (~2 GB each). Export exactly one.
         #

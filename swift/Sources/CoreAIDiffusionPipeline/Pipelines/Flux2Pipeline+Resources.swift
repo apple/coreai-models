@@ -35,10 +35,9 @@ extension Flux2Pipeline {
         }
 
         // Select transformer by mode.
-        // Prefer the multi-function Transformer.aimodel — it holds the "half"
-        // function AND the img2img_512_* functions. Only fall back to the legacy
+        // Prefer the multi-function Transformer.aimodel. Only fall back to the
         // single-function Transformer_512.aimodel when the multi-function model is
-        // absent (or is a legacy full-only model without a "half" function).
+        // absent.
         let transformer: CoreAIDiffusionModelFunction
         let transformerFnName: String
         switch resolvedMode {
@@ -80,11 +79,7 @@ extension Flux2Pipeline {
 
         // Resolve how each reference grid reaches a traced graph.
         //
-        // A directory can hold *both* forms — `_prepare_assets` merges each export over
-        // the previous metadata, so re-exporting a different component set leaves the old
-        // assets behind. So presence on disk is not sufficient: prefer the multi-function
-        // entrypoint when the transformer declares it, because that reuses the asset this
-        // pipeline already loads instead of a second ~2 GB weight set.
+        // Prefer the multi-function transformer when available.
         let entrypointPrefix = resolvedMode == .half ? "img2img_512_" : "img2img_"
         let assetPrefix = resolvedMode == .half ? "Transformer_512_img2img" : "Transformer_img2img"
         var img2imgRoutes: [ReferenceGrid: Img2ImgRoute] = [:]

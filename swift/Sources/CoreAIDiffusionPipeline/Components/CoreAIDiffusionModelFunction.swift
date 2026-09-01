@@ -28,11 +28,11 @@ public actor CoreAIDiffusionModelFunction {
 
         let options = SpecializationOptions(preferredComputeUnitKind: .gpu)
         let loadedModel = try await AIModel(contentsOf: modelURL, options: options)
-        self.model = loadedModel
         guard let fn = try loadedModel.loadFunction(named: "main") else {
             throw CoreAIDiffusionError.functionNotFound("main", modelURL)
         }
 
+        self.model = loadedModel
         self.functionCache["main"] = fn
         self.isLoaded = true
     }
@@ -45,11 +45,10 @@ public actor CoreAIDiffusionModelFunction {
 
     /// Whether the model asset declares a function with the given name.
     ///
-    /// Answers from the asset's function table only — it does not resolve the
+    /// Only looks at the asset's function table. This is so that it does not resolve the
     /// function, so no weights are materialized. `loadFunction` would make a
-    /// GPU-resident copy of the entire weight set (3.5 GB for the FLUX.2
-    /// transformer) and hold it for the lifetime of this actor; opening the
-    /// asset alone costs ~100 MB and is released when this returns.
+    /// GPU-resident copy of the entire weight set and hold it for the lifetime of this actor.
+    /// The asset is released once this function returns.
     public func hasFunction(named name: String) async throws -> Bool {
         if let model { return model.functionNames.contains(name) }
         let options = SpecializationOptions(preferredComputeUnitKind: .gpu)
@@ -364,7 +363,6 @@ public actor CoreAIDiffusionModelFunction {
         strides: Span<Int>,
         convert: (Float) -> T
     ) {
-        // Span.product is internal to CoreAIShared, so fold it here.
         let capacity = (0..<shape.count).reduce(1) { $0 * shape[$1] }
         precondition(
             data.count <= capacity,

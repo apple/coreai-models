@@ -58,10 +58,8 @@ def export_stateless(
             ``dummy_inputs``.
     """
     # This path traces positionally (args=), so all three tuples are bound by order
-    # and a length mismatch misbinds silently -- a dynamic spec would land on the
-    # wrong input, or the last input would go unconstrained. The LLM paths get this
-    # from `BaseForCausalLM.validate_export_contract`; the diffusion path has no
-    # equivalent, so check it here.
+    # and a length mismatch misbinds silently. A dynamic spec would land on the
+    # wrong input, or the last input would go unconstrained.
     if len(input_names) != len(dummy_inputs):
         raise ValueError(
             f"input_names has {len(input_names)} entries but {len(dummy_inputs)} dummy "
@@ -111,7 +109,7 @@ def export_multifunction(
     """Export multiple function variants into a single .aimodel with shared weights.
 
     Each function is a separate static trace of the same model at different input
-    shapes. Weights are shared automatically — disk size equals one copy.
+    shapes. Weights are shared automatically, so disk size equals one copy.
 
     Args:
         functions: List of (entrypoint_name, wrapper, dummy_inputs) tuples.

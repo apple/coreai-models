@@ -318,8 +318,8 @@ public struct Flux2Pipeline: DiffusionPipeline {
 
         // Manual CFG needs an unconditional pass, so encode an empty prompt.
         //
-        // At exactly 1.0 the interpolation reduces to the conditional pass — the
-        // unconditional term's coefficient is zero — so the second forward pass is provably
+        // At exactly 1.0 the interpolation reduces to the conditional pass (the
+        // unconditional term's coefficient is zero) so the second forward pass is
         // wasted. Below 1.0 the blend runs *toward* the unconditional prediction, i.e. 2x
         // the compute to follow the prompt less, so this gate refuses that too.
         //
@@ -362,7 +362,7 @@ public struct Flux2Pipeline: DiffusionPipeline {
 
             if let emptyEmb = emptyEmbeddings {
                 // Manual CFG: two forward passes. The guidance input is 0 only because the
-                // traced signature requires a value — this checkpoint sets
+                // traced signature requires a value. The Flux2 model sets
                 // `guidance_embeds: false`, so `guidance_embedder` is nil and
                 // `Flux2TimestepGuidanceEmbeddings` drops the input entirely. Any value
                 // behaves identically; all the guidance here comes from the interpolation
@@ -427,8 +427,7 @@ public struct Flux2Pipeline: DiffusionPipeline {
         }
 
         if configuration.lazyModelLoading {
-            // Release whichever asset ran; for single-function img2img that is a
-            // separate ~2 GB weight set, not the txt2img transformer.
+            // Release whichever asset ran
             await denoiser.unloadResources()
         }
 
