@@ -494,6 +494,45 @@ async def export_text_bundle(
 # ---------------------------------------------------------------------------
 
 
+def _f16_attention_forward(
+    self, hidden_states, cu_seqlens=None, position_embeddings=None, **kwargs
+):
+    """Dtype-preserving eager attention for Qwen3VLVisionAttention.
+
+    HF's eager path upcasts to fp32 inline twice per layer (RoPE's
+    q/k.float() and softmax(dtype=fp32)); the ANE runs f16 only, so each
+    upcast cuts the compiled graph — 2 cuts x 24 layers left 49 ANE regions
+    whose boundary traffic made the hybrid slower than pure GPU. Keeping the
+    whole layer in the input dtype lets the graph compile to a single region.
+
+    cos/sin arrive pre-tiled to [seq, heads, head_dim] (exact match, zero
+    broadcast); the 1/sqrt(head_dim) scale is folded into q right after RoPE
+    so the [1, H, S, S] score tensor stays bounded for the f16 softmax.
+    """
+    seq_length = hidden_states.shape[0]
+    qkv = self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3)
+    q, k, v = qkv.unbind(0)  # [S, H, D] each
+
+    cos, sin = position_embeddings  # pre-tiled [S, H, D]
+    half = q.shape[-1] // 2
+
+    def rotate_half(x):
+        return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
+
+    q = (q * cos + rotate_half(q) * sin) * self.scaling
+    k = k * cos + rotate_half(k) * sin
+
+    q = q.transpose(0, 1).unsqueeze(0)  # [1, H, S, D]
+    k = k.transpose(0, 1).unsqueeze(0)
+    v = v.transpose(0, 1).unsqueeze(0)
+
+    scores = torch.matmul(q, k.transpose(2, 3))  # [1, H, S, S]
+    attn = torch.softmax(scores, dim=-1)
+    out = torch.matmul(attn, v)  # [1, H, S, D]
+    out = out.transpose(1, 2).reshape(seq_length, -1)  # [S, H*D]
+    return self.proj(out)
+
+
 class StaticVisionEncoder(nn.Module):
     """Vision encoder with pre-computed static position embeddings for a fixed grid.
 
@@ -522,11 +561,23 @@ class StaticVisionEncoder(nn.Module):
         spatial_merge_size: int,
         temporal_patch_size: int,
         num_frames: int = 1,
+        patchified_input: bool = False,
+        linear_patch_embed: bool = False,
+        f16_attention: bool = False,
     ) -> None:
         super().__init__()
         self.patch_embed = visual_model.patch_embed
         self.blocks = visual_model.blocks
         self.merger = visual_model.merger
+        self.patchified_input = patchified_input
+
+        if f16_attention:
+            # Class-level patch (same idiom as _patch_fast_pos_embed_interpolate):
+            # torch.export is only guaranteed to trace the class forward, so an
+            # instance-level override could silently fall back to HF's fp32 path.
+            from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionAttention
+
+            Qwen3VLVisionAttention.forward = _f16_attention_forward
 
         self.image_size = image_size
         self.patch_size = patch_size
@@ -559,12 +610,31 @@ class StaticVisionEncoder(nn.Module):
             seq_len = rotary_pos_emb.shape[0]
             rotary_flat = rotary_pos_emb.reshape(seq_len, -1)
             emb = torch.cat([rotary_flat, rotary_flat], dim=-1)
-            self.register_buffer("rot_cos", emb.cos())
-            self.register_buffer("rot_sin", emb.sin())
+            rot_cos, rot_sin = emb.cos(), emb.sin()
+            if f16_attention:
+                # Pre-tile to [seq, heads, head_dim] so the f16 attention applies
+                # RoPE with exact-shape elementwise ops (no runtime broadcast).
+                num_heads = visual_model.blocks[0].attn.num_heads
+                rot_cos = rot_cos.reshape(seq_len, 1, -1).expand(-1, num_heads, -1).contiguous()
+                rot_sin = rot_sin.reshape(seq_len, 1, -1).expand(-1, num_heads, -1).contiguous()
+            self.register_buffer("rot_cos", rot_cos)
+            self.register_buffer("rot_sin", rot_sin)
 
             total_patches = self.grid_t * self.grid_h * self.grid_w
             cu = torch.tensor([0, total_patches], dtype=torch.int32)
             self.register_buffer("cu_seqlens", cu)
+
+        if linear_patch_embed:
+            # Conv3d with kernel_size == stride sees exactly one window per output
+            # position, so it is an exact Linear over the flattened [c, t, p, p]
+            # patch vector — the form the ANE compiler can map.
+            proj = visual_model.patch_embed.proj
+            linear = nn.Linear(self.patch_dim, proj.out_channels, bias=proj.bias is not None)
+            with torch.no_grad():
+                linear.weight.copy_(proj.weight.reshape(proj.out_channels, -1))
+                if proj.bias is not None:
+                    linear.bias.copy_(proj.bias)
+            self.patch_embed = linear
 
     def _patchify(self, pixel_values: torch.Tensor) -> torch.Tensor:
         """Turn pixels into Qwen's pre-patchified [num_patches, patch_dim].
@@ -598,8 +668,14 @@ class StaticVisionEncoder(nn.Module):
         return x.reshape(self.num_patches, self.patch_dim)
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        # pixel_values: [1, 3, H, W] (NCHW) → patchify → [num_patches, patch_dim]
-        patches = self._patchify(pixel_values)
+        # pixel_values: [1, 3, H, W] (NCHW) → patchify → [num_patches, patch_dim];
+        # patchified_input: [1, num_patches, patch_dim] fed directly (the rank-9
+        # patchify reshape exceeds the ANE compiler's rank-5 limit, so ANE-friendly
+        # exports move it host-side).
+        if self.patchified_input:
+            patches = pixel_values.reshape(self.num_patches, self.patch_dim)
+        else:
+            patches = self._patchify(pixel_values)
         hidden_states = self.patch_embed(patches)  # [num_patches, vision_hidden]
         hidden_states = hidden_states + self.pos_embeds
 
@@ -619,16 +695,21 @@ class StaticVisionEncoder(nn.Module):
 class BatchedF16VisionEncoder(nn.Module):
     """Conform the encoder output to the runner contract shared with embed/main.
 
-    StaticVisionEncoder emits f32 [num_visual_tokens, text_hidden]; PR #65 expects
+    StaticVisionEncoder emits [num_visual_tokens, text_hidden]; PR #65 expects
     f16/bf16 [1, image_token_count, hidden] (a leading batch dim, like embed.aimodel).
-    The vision math stays in f32; only the final result is batched and cast to f16.
+    With `input_cast` the pixels are cast at the graph entry so the encoder can run
+    in that dtype throughout (fp16 math is required for ANE mapping); without it the
+    vision math stays f32 and only the final result is cast.
     """
 
-    def __init__(self, encoder: nn.Module) -> None:
+    def __init__(self, encoder: nn.Module, input_cast: torch.dtype | None = None) -> None:
         super().__init__()
         self.encoder = encoder
+        self.input_cast = input_cast
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        if self.input_cast is not None:
+            pixel_values = pixel_values.to(self.input_cast)
         out = self.encoder(pixel_values)
         if isinstance(out, tuple):
             out = out[0]
@@ -723,6 +804,8 @@ async def export_vision_encoder(
     overwrite: bool,
     num_frames: int = 1,
     include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
+    vision_dtype: str = "f32",
+    ane_friendly: bool = False,
 ) -> str:
     """Export the vision encoder as vision.aimodel and patch metadata.json."""
     if not bundle_path.exists():
@@ -739,6 +822,11 @@ async def export_vision_encoder(
             raise NotImplementedError(
                 "Muse Glimmer vision encoder currently supports single-image only "
                 f"(num_frames=1), got {num_frames}"
+            )
+        if ane_friendly or vision_dtype != "f32":
+            raise NotImplementedError(
+                "The ANE-friendly form and the f16 vision graph are built around "
+                "StaticVisionEncoder, which Muse Glimmer does not go through"
             )
         logging.info(f"Loading {spec.hf_model_id} vision encoder (MuseGlimmerVisionModel)...")
         vision_model = MuseGlimmerVisionModel.from_pretrained(spec.hf_model_id, dtype=torch.float32)
@@ -771,12 +859,17 @@ async def export_vision_encoder(
             spatial_merge_size=spec.spatial_merge_size,
             temporal_patch_size=spec.temporal_patch_size,
             num_frames=num_frames,
+            patchified_input=ane_friendly,
+            linear_patch_embed=ane_friendly,
+            f16_attention=ane_friendly,
         ).eval()
         del hf_model
 
         grid_t = wrapper.grid_t
         num_visual_tokens = spec.num_visual_tokens * grid_t
-        if num_frames == 1:
+        if ane_friendly:
+            pixel_shape = (1, wrapper.num_patches, wrapper.patch_dim)
+        elif num_frames == 1:
             pixel_shape = (1, 3, spec.image_size, spec.image_size)
         else:
             pixel_shape = (1, 3 * num_frames, spec.image_size, spec.image_size)
@@ -807,7 +900,12 @@ async def export_vision_encoder(
 
             wrapper.merger = MergerWrapper(original_merger)
 
-        export_module = BatchedF16VisionEncoder(wrapper).eval()
+        # ---- 5. Export ----
+        if vision_dtype == "f16":
+            wrapper = wrapper.half()
+            export_module = BatchedF16VisionEncoder(wrapper, input_cast=torch.float16).eval()
+        else:
+            export_module = BatchedF16VisionEncoder(wrapper).eval()
 
     # Final-shape sanity check (batched + f16) before export.
     with torch.no_grad():
@@ -921,6 +1019,21 @@ def build_parser() -> argparse.ArgumentParser:
         "Multi-frame exports bake temporal position embeddings for native video support.",
     )
     parser.add_argument(
+        "--vision-dtype",
+        choices=["f32", "f16"],
+        default="f32",
+        help="Vision-encoder math dtype: f16 keeps the whole graph in half "
+        "precision (required for ANE mapping); f32 keeps math in float32 (default)",
+    )
+    parser.add_argument(
+        "--vision-ane-friendly",
+        action="store_true",
+        help="Export the vision encoder in ANE-mappable form: pre-patchified "
+        "[1, num_patches, patch_dim] input (host does patchify), the Conv3d "
+        "patch embed linearized, and dtype-preserving attention (no inline "
+        "fp32 islands, so the graph compiles to a single ANE region)",
+    )
+    parser.add_argument(
         "--list-models",
         action="store_true",
         help="List supported VLM short-names and exit",
@@ -973,6 +1086,8 @@ async def _run(spec: VLMSpec, args: argparse.Namespace) -> Path:
             args.overwrite,
             args.num_frames,
             include_debug_info=args.include_debug_info,
+            vision_dtype=args.vision_dtype,
+            ane_friendly=args.vision_ane_friendly,
         )
     return bundle_path
 
