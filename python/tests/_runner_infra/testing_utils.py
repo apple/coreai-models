@@ -1007,6 +1007,21 @@ class ForCausalLMTestBase:
             if is_gemma
             else "coreai_models.primitives.macos.rms_norm.RMSNorm"
         )
+        moe_switch_linear_spec = {
+            "module_state_spec": {
+                "weight": {
+                    "dtype": "int4",
+                    "qscheme": "symmetric_with_clipping",
+                    "granularity": {
+                        "type": "per_block",
+                        "block_size": [1, 1, 1, 8],
+                        "axis": None,
+                    },
+                },
+            },
+            "op_input_spec": None,
+            "op_output_spec": None,
+        }
         torch_quantization_config = {
             "global_config": {
                 "op_state_spec": weight_qspec_dict,
@@ -1017,6 +1032,7 @@ class ForCausalLMTestBase:
                 "coreai_models.primitives.macos.sdpa.SDPA": None,
                 "coreai_models.primitives.macos.rope.RoPE": None,
                 rms_norm_cls: None,
+                "coreai_models.primitives.macos.switch.SwitchLinear": moe_switch_linear_spec,
             },
             "execution_mode": quantization_mode,
             "calibrate_activations": activation_quantization,

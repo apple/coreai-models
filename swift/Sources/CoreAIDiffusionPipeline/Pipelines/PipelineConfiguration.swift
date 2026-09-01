@@ -22,6 +22,39 @@ extension DecodeResolution: CustomStringConvertible {
     public var description: String { rawValue }
 }
 
+/// Size of the img2img reference-token grid, relative to the output/noise grid
+/// (FLUX.2 reference-token concatenation). A larger grid gives stronger structural
+/// fidelity to the reference at the cost of more compute per step. Token counts are
+/// resolution-dependent: at 1024 the grid side is 64, at 512 it is 32.
+public enum ReferenceGrid: String, Hashable, Sendable, CaseIterable {
+    /// Full grid — matches the output grid 1:1 (64×64=4096 tokens @1024, 32×32=1024 @512). ~2× compute.
+    case full
+    /// Half the linear side — a quarter of the tokens (1024 @1024, 256 @512). Good balance.
+    case half
+    /// Quarter the linear side — 1/16 of the tokens (256 @1024, 64 @512). Fast, coarse guidance.
+    case quarter
+}
+
+/// Whether the pipeline performs classifier-free guidance (CFG) itself.
+///
+/// FLUX.2 Klein 4B is guidance-distilled and its transformer config sets
+/// `guidance_embeds: false`, so the traced graph's `guidance` input is unused. The model
+/// discards it and produces a usable image from a single unguided pass. Real CFG is
+/// therefore something the pipeline adds on top, not something the model applies.
+public enum GuidanceMode: String, Hashable, Sendable, CaseIterable {
+    /// One forward pass, no classifier-free guidance. The distillation is what makes this
+    /// work without it. `guidanceScale` is unused in this mode.
+    case distilled
+    /// Two forward passes — conditional and unconditional — interpolated by the pipeline
+    /// with `guidanceScale` as the weight. Stronger text adherence in img2img, at ~2× the
+    /// compute per step. This is the only mode in which `guidanceScale` has any effect.
+    case manual
+}
+
+extension GuidanceMode: CustomStringConvertible {
+    public var description: String { rawValue }
+}
+
 /// User-facing configuration for image generation.
 public struct PipelineConfiguration: Hashable, Sendable {
     public var prompt: String
@@ -34,6 +67,8 @@ public struct PipelineConfiguration: Hashable, Sendable {
     // Image-to-image
     public var startingImage: CGImage?
     public var strength: Float
+    public var referenceGrid: ReferenceGrid
+    public var guidanceMode: GuidanceMode
 
     // VAE scale factors (from pipeline.json)
     public var encoderScaleFactor: Float
@@ -60,6 +95,8 @@ public struct PipelineConfiguration: Hashable, Sendable {
         schedulerType: SchedulerType = .dpmSolverMultistep,
         startingImage: CGImage? = nil,
         strength: Float = 1.0,
+        referenceGrid: ReferenceGrid = .full,
+        guidanceMode: GuidanceMode = .distilled,
         encoderScaleFactor: Float = 0.18215,
         decoderScaleFactor: Float = 0.18215,
         decoderShiftFactor: Float = 0.0,
@@ -76,6 +113,8 @@ public struct PipelineConfiguration: Hashable, Sendable {
         self.schedulerType = schedulerType
         self.startingImage = startingImage
         self.strength = strength
+        self.referenceGrid = referenceGrid
+        self.guidanceMode = guidanceMode
         self.encoderScaleFactor = encoderScaleFactor
         self.decoderScaleFactor = decoderScaleFactor
         self.decoderShiftFactor = decoderShiftFactor
@@ -98,6 +137,8 @@ extension PipelineConfiguration {
         hasher.combine(guidanceScale)
         hasher.combine(schedulerType)
         hasher.combine(strength)
+        hasher.combine(referenceGrid)
+        hasher.combine(guidanceMode)
         hasher.combine(encoderScaleFactor)
         hasher.combine(decoderScaleFactor)
         hasher.combine(decoderShiftFactor)
@@ -115,6 +156,8 @@ extension PipelineConfiguration {
             && lhs.guidanceScale == rhs.guidanceScale
             && lhs.schedulerType == rhs.schedulerType
             && lhs.strength == rhs.strength
+            && lhs.referenceGrid == rhs.referenceGrid
+            && lhs.guidanceMode == rhs.guidanceMode
             && lhs.encoderScaleFactor == rhs.encoderScaleFactor
             && lhs.decoderScaleFactor == rhs.decoderScaleFactor
             && lhs.decoderShiftFactor == rhs.decoderShiftFactor

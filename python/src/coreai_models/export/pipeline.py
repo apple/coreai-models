@@ -75,6 +75,8 @@ class ExportConfig:
     compression_config_object: Any = field(default=None, repr=False)
     # Override HuggingFace model_type for registry lookup.
     model_type_override: str | None = None
+    # Speculative decoding: export the drafter model alongside the target.
+    with_drafter: bool = False
 
     def __post_init__(self) -> None:
         if self.quantization_mode == "graph" and self.variant != "macOS":
@@ -161,6 +163,15 @@ async def _async_export_model(config: ExportConfig) -> str:
 
     if config.variant == "iOS" and entry.ios_class is None:
         raise ValueError(f"Model '{model_type}' does not support iOS variant")
+
+    if config.with_drafter:
+        if config.variant != "macOS":
+            raise ValueError("--with-drafter is only supported for macOS variant.")
+        if entry.drafter_class is None or entry.drafter_model_id is None:
+            raise ValueError(
+                f"Model '{model_type}' does not have a registered drafter. "
+                "--with-drafter is not supported for this model."
+            )
 
     model_class = entry.macos_class if config.variant == "macOS" else entry.ios_class
 
@@ -369,6 +380,50 @@ async def _async_export_model(config: ExportConfig) -> str:
         # so offload it to a worker thread to keep the event loop responsive.
         metadata = build_aimodel_metadata(config.hf_model_id)
         await asyncio.to_thread(coreai_program.save_asset, aimodel_path, metadata)
+        del coreai_program
+
+        # ---- 6. Export drafter if requested ----
+        drafter_name: str | None = None
+        if config.with_drafter:
+            if entry.drafter_class is None or entry.drafter_model_id is None:
+                raise ValueError(
+                    f"Model '{model_type}' does not have a registered drafter. "
+                    "--with-drafter is not supported for this model."
+                )
+            drafter_name = f"{output_name}_drafter"
+            logger.info(
+                f"Exporting drafter from {entry.drafter_model_id} (target: {config.hf_model_id})..."
+            )
+
+            drafter_model = entry.drafter_class.from_hf(
+                entry.drafter_model_id,
+                max_context_length=max_context_length,
+                target_dtype=target_dtype,
+                target_model_id=config.hf_model_id,
+            )
+            drafter_model = drafter_model.eval()
+
+            drafter_hf_config = drafter_model.config
+            drafter_program = export_macos_model(drafter_model, drafter_hf_config, config)
+            del drafter_model
+
+            drafter_aimodel_path = bundle_path / f"{drafter_name}.aimodel"
+            if drafter_aimodel_path.exists():
+                if config.overwrite:
+                    import shutil
+
+                    shutil.rmtree(drafter_aimodel_path)
+                else:
+                    raise FileExistsError(
+                        f"{drafter_aimodel_path} already exists. Use --overwrite to replace it."
+                    )
+
+            logger.info(f"Saving drafter to {drafter_aimodel_path}...")
+            drafter_metadata = build_aimodel_metadata(entry.drafter_model_id)
+            await asyncio.to_thread(
+                drafter_program.save_asset, drafter_aimodel_path, drafter_metadata
+            )
+            del drafter_program
 
         bundle_llm_asset(
             bundle_path=bundle_path,
@@ -376,6 +431,9 @@ async def _async_export_model(config: ExportConfig) -> str:
             hf_config=hf_config,
             compression=config.compression,
             name=output_name,
+            tokenizer_model_id=entry.tokenizer_model_id,
+            drafter_name=drafter_name,
+            speculative_config=entry.drafter_config if drafter_name else None,
         )
 
     logger.info(f"Export complete: {bundle_path}")

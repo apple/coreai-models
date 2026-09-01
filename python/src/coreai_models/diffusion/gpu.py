@@ -52,7 +52,26 @@ def export_stateless(
 
     Returns:
         An optimized AIProgram ready for saving/compilation.
+
+    Raises:
+        ValueError: If ``input_names`` or ``dynamic_shapes`` disagrees in length with
+            ``dummy_inputs``.
     """
+    # This path traces positionally (args=), so all three tuples are bound by order
+    # and a length mismatch misbinds silently. A dynamic spec would land on the
+    # wrong input, or the last input would go unconstrained.
+    if len(input_names) != len(dummy_inputs):
+        raise ValueError(
+            f"input_names has {len(input_names)} entries but {len(dummy_inputs)} dummy "
+            f"inputs were given: {input_names}"
+        )
+    if dynamic_shapes is not None and len(dynamic_shapes) != len(dummy_inputs):
+        raise ValueError(
+            f"dynamic_shapes has {len(dynamic_shapes)} entries but {len(dummy_inputs)} "
+            "dummy inputs were given. It is a positional tuple, so it needs one entry "
+            "per input (None for a fully static one)."
+        )
+
     wrapper.eval()
 
     def export_fn(module: torch.nn.Module) -> torch.export.ExportedProgram:
@@ -76,6 +95,58 @@ def export_stateless(
         input_names=input_names,
         output_names=output_names,
     )
+    program = converter.to_coreai()
+    program.optimize()
+    return program
+
+
+def export_multifunction(
+    functions: list[tuple[str, torch.nn.Module, tuple[torch.Tensor, ...]]],
+    input_names: tuple[str, ...],
+    output_names: tuple[str, ...],
+    include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
+) -> AIProgram:
+    """Export multiple function variants into a single .aimodel with shared weights.
+
+    Each function is a separate static trace of the same model at different input
+    shapes. Weights are shared automatically, so disk size equals one copy.
+
+    Args:
+        functions: List of (entrypoint_name, wrapper, dummy_inputs) tuples.
+            The wrapper should be the same nn.Module instance (or share weights).
+        input_names: Names for the exported model's inputs (same for all functions).
+        output_names: Names for the exported model's outputs (same for all functions).
+        include_debug_info: When True, the converter runs in ``DEBUG`` mode and embeds debug
+            information in the exported ``.aimodel``. Defaults to ``RELEASE`` mode,
+            which embeds minimum debug information and makes the exported asset smaller.
+
+    Returns:
+        An optimized AIProgram with multiple named functions.
+    """
+    converter = coreai_torch.TorchConverter(
+        mode=(
+            coreai_torch.TorchConverter.Mode.DEBUG
+            if include_debug_info
+            else coreai_torch.TorchConverter.Mode.RELEASE
+        )
+    )
+    coreai_decomp_table = coreai_torch.get_decomp_table()
+
+    for name, wrapper, dummy_inputs in functions:
+        wrapper.eval()
+        logger.info(f"Tracing function '{name}' (seq dims: {[t.shape for t in dummy_inputs[:2]]})")
+
+        with torch.no_grad():
+            exported = torch.export.export(wrapper, args=dummy_inputs)
+        decomposed = exported.run_decompositions(coreai_decomp_table)
+
+        converter.add_exported_program(
+            decomposed,
+            input_names=input_names,
+            output_names=output_names,
+            entrypoint_name=name,
+        )
+
     program = converter.to_coreai()
     program.optimize()
     return program

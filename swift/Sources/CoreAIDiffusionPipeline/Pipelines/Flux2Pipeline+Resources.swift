@@ -34,21 +34,67 @@ extension Flux2Pipeline {
             throw PipelineLoadError.missingComponent("text_encoder")
         }
 
-        // Select transformer by mode (explicit name, not auto-detect)
-        let transformerName: String
+        // Select transformer by mode.
+        // Prefer the multi-function Transformer.aimodel. Only fall back to the
+        // single-function Transformer_512.aimodel when the multi-function model is
+        // absent.
+        let transformer: CoreAIDiffusionModelFunction
+        let transformerFnName: String
         switch resolvedMode {
         case .full, .tiled:
             guard let path = Self.resolveAsset(at: url, name: "Transformer") else {
                 throw PipelineLoadError.missingComponent("Transformer")
             }
-            transformerName = path
+            transformer = CoreAIDiffusionModelFunction(modelURL: url.appendingPathComponent(path))
+            transformerFnName = "main"
         case .half:
-            guard let path = Self.resolveAsset(at: url, name: "Transformer_512") else {
-                throw PipelineLoadError.missingComponent("Transformer_512")
+            if let path = Self.resolveAsset(at: url, name: "Transformer") {
+                let candidate = CoreAIDiffusionModelFunction(
+                    modelURL: url.appendingPathComponent(path))
+                if try await candidate.hasFunction(named: "half") {
+                    // Multi-function model: use its "half" function (img2img uses
+                    // img2img_512_* from the same asset).
+                    transformer = candidate
+                    transformerFnName = "half"
+                } else if let path512 = Self.resolveAsset(at: url, name: "Transformer_512") {
+                    transformer = CoreAIDiffusionModelFunction(
+                        modelURL: url.appendingPathComponent(path512))
+                    transformerFnName = "main"
+                } else {
+                    // Full-only Transformer without a "half" function and no
+                    // Transformer_512 — best effort with "main".
+                    transformer = candidate
+                    transformerFnName = "main"
+                }
+            } else if let path512 = Self.resolveAsset(at: url, name: "Transformer_512") {
+                transformer = CoreAIDiffusionModelFunction(
+                    modelURL: url.appendingPathComponent(path512))
+                transformerFnName = "main"
+            } else {
+                throw PipelineLoadError.missingComponent("Transformer or Transformer_512")
             }
-            transformerName = path
         case .auto:
             preconditionFailure("auto resolved above")
+        }
+
+        // Resolve how each reference grid reaches a traced graph.
+        //
+        // Prefer the multi-function transformer when available.
+        let entrypointPrefix = resolvedMode == .half ? "img2img_512_" : "img2img_"
+        let assetPrefix = resolvedMode == .half ? "Transformer_512_img2img" : "Transformer_img2img"
+        var img2imgRoutes: [ReferenceGrid: Img2ImgRoute] = [:]
+        for grid in ReferenceGrid.allCases {
+            let entrypoint = "\(entrypointPrefix)\(grid.rawValue)"
+            if try await transformer.hasFunction(named: entrypoint) {
+                img2imgRoutes[grid] = Img2ImgRoute(function: transformer, entrypoint: entrypoint)
+            } else if let path = Self.resolveAsset(at: url, name: "\(assetPrefix)_\(grid.rawValue)") {
+                // Single-function: its own asset, traced at one concatenated sequence
+                // length, always entered through "main".
+                img2imgRoutes[grid] = Img2ImgRoute(
+                    function: CoreAIDiffusionModelFunction(
+                        modelURL: url.appendingPathComponent(path)),
+                    entrypoint: "main")
+            }
         }
 
         // Select decoder by mode (explicit name)
@@ -68,8 +114,6 @@ extension Flux2Pipeline {
             preconditionFailure("auto resolved above")
         }
 
-        let transformer = CoreAIDiffusionModelFunction(
-            modelURL: url.appendingPathComponent(transformerName))
         let textEncoder = CoreAIDiffusionModelFunction(
             modelURL: url.appendingPathComponent(textEncoderPath))
         let decoder = CoreAIDiffusionModelFunction(
@@ -104,9 +148,11 @@ extension Flux2Pipeline {
         self.descriptor = descriptor
         self.mode = resolvedMode
         self.transformer = transformer
+        self.img2imgRoutes = img2imgRoutes
         self.textEncoder = textEncoder
         self.decoder = decoder
         self.encoder = encoder
+        self.transformerFunctionName = transformerFnName
         self.tokenizer = tokenizer
         self.batchNormMean = bnMean
         self.batchNormVar = bnVar

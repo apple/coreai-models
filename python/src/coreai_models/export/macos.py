@@ -10,17 +10,22 @@ Exports a PyTorch LLM model to a Core AI AIProgram via:
 torch.export -> decompose -> defunctionalize -> TorchConverter -> optimize.
 
 The result carries one entrypoint, ``main``, or two when the model opts into
-``exports_prefill_graph``: ``main`` for decode, ``prefill`` for the prompt. Both come from
-the same module, traced twice -- the second time with prefill mode on, so it returns
-nothing and the LM head drops out.
+``exports_prefill_graph``: ``main`` for decode, ``prefill`` for the prompt. An eager
+module is traced twice for that -- the second time with prefill mode on, so it returns
+nothing and the LM head drops out. A flattened graph module has no prefill mode left to
+set, so the one trace is staged twice instead, the second time with its non-state
+outputs trimmed off, which leaves the LM head dead.
 """
 
+import copy
+import dataclasses
 import logging
 from typing import Any
 
 import coreai_torch
 import torch
 from coreai.authoring import AIProgram
+from torch.export.graph_signature import ExportGraphSignature, OutputKind
 
 from coreai_models._constants import (
     DEFAULT_INCLUDE_DEBUG_INFO,
@@ -81,6 +86,59 @@ def _set_prefill_mode(module: torch.nn.Module, prefill: bool) -> None:
         setter(prefill)
 
 
+def _drop_user_outputs(
+    exported_program: torch.export.ExportedProgram,
+) -> torch.export.ExportedProgram:
+    """Return the same program with everything but its state writes trimmed off.
+
+    A decode trace ends in a tuple of the KV cache updates (``USER_INPUT_MUTATION``
+    entries, which the converter binds as state) and ``logits``. Dropping the
+    ``USER_OUTPUT`` entries and running DCE leaves the cache writes and kills whatever
+    only fed ``logits`` -- the LM head and the tail of the model -- which is exactly the
+    prefill graph. This is the eager ``prefill_mode`` trace expressed as a graph edit,
+    for a module that was flattened before prefill mode could be set.
+
+    The graph is copied, not edited in place; the state dict rides along by reference, so
+    this costs a graph, not a second set of weights.
+    """
+    specs = exported_program.graph_signature.output_specs
+    keep = [i for i, spec in enumerate(specs) if spec.kind != OutputKind.USER_OUTPUT]
+    if len(keep) == len(specs):
+        return exported_program
+
+    graph = copy.deepcopy(exported_program.graph)
+    output_node = next(node for node in reversed(graph.nodes) if node.op == "output")
+    output_node.args = (tuple(output_node.args[0][i] for i in keep),)
+    graph.eliminate_dead_code()
+    graph_module = torch.fx.GraphModule(exported_program.graph_module, graph)
+
+    return exported_program._update(
+        graph_module,
+        ExportGraphSignature(
+            input_specs=list(exported_program.graph_signature.input_specs),
+            output_specs=[specs[i] for i in keep],
+        ),
+    )
+
+
+def _rename_for_second_entrypoint(externalized_programs: list, graph: torch.fx.Graph) -> list:
+    """Re-badge externalized composite sub-programs for a second entrypoint.
+
+    Each entry becomes one named ``coreai.graph`` in the module, and the name is fixed
+    when the model is patched, so handing the same entries to two entrypoints emits the
+    same symbol twice and the module fails to verify. The eager path re-patches per
+    entrypoint and gets fresh names that way; a flattened model can't be re-patched
+    (its call sites were baked in at capture), so rename the entries instead. Entries
+    whose call sites the trim killed are dropped -- nothing would invoke them.
+    """
+    live = {node.name for node in graph.nodes}
+    return [
+        dataclasses.replace(ext, name=f"{ext.name}_{PREFILL_GRAPH_NAME}")
+        for ext in externalized_programs
+        if any(node in live for node in ext.source_nodes)
+    ]
+
+
 def export_to_coreai(
     model: torch.nn.Module,
     reference_inputs: dict[str, Any],
@@ -124,12 +182,12 @@ def export_to_coreai(
         include_debug_info: When True, the converter runs in ``DEBUG`` mode and embeds debug
             information in the exported ``.aimodel``. Defaults to ``RELEASE`` mode,
             which embeds minimum debug information and makes the exported asset smaller.
-        export_prefill_graph: When True, trace the model a second time with prefill mode
-            on and stage it as the ``prefill`` entrypoint. It shares ``input_names``,
-            ``state_names``, ``reference_inputs`` and ``dynamic_shapes`` with ``main`` and
-            declares no outputs, so everything the KV cache writes don't feed is dropped.
-            Warned about and skipped when ``model`` is flattened, which has no prefill
-            mode left to set.
+        export_prefill_graph: When True, stage a second ``prefill`` entrypoint beside
+            ``main``. It shares ``input_names``, ``state_names``, ``reference_inputs`` and
+            ``dynamic_shapes`` with ``main`` and declares no outputs, so everything the KV
+            cache writes don't feed is dropped. An eager ``model`` is traced a second time
+            with prefill mode on; a flattened ``model``, which has no prefill mode left to
+            set, reuses the decode trace and relies on the trimmed outputs alone.
 
     Returns:
         A AIProgram ready for optimization and compilation.
@@ -185,18 +243,6 @@ def export_to_coreai(
                 "A flattened torch.fx.GraphModule needs an externalized_model handle. "
                 "Call patch_model_for_externalization on the model before quantization."
             )
-        if export_prefill_graph:
-            # The flattened graph resolved `prefill_mode` when it was captured, so the
-            # flag no longer does anything here and a second trace would come out a copy
-            # of `main` -- LM head, `logits` output and all, which the runner rejects.
-            # Emitting nothing is safe: it falls back to `main` for prefill.
-            logger.warning(
-                f"Not exporting the {PREFILL_GRAPH_NAME!r} entrypoint: this model arrives "
-                "flattened from graph-mode quantization, already captured in decode mode, so "
-                "prefill mode can no longer be switched on. Prefill will run on "
-                f"{MAIN_GRAPH_NAME!r} instead, LM head and all. Quantize in eager mode "
-                "(execution_mode: eager, or --quantization-mode eager) to get a prefill graph."
-            )
         exported_program = make_export_fn(prefill=False)(model, pass_inputs_as_kwargs=False)
         externalized_programs = subexport_and_restore(externalized_model, exported_program)
 
@@ -205,8 +251,30 @@ def export_to_coreai(
             input_names=input_names,
             output_names=output_names,
             state_names=state_names,
+            entrypoint_name=MAIN_GRAPH_NAME,
             _externalized_exported_programs=externalized_programs,  # type: ignore[call-arg]
         )
+        if export_prefill_graph:
+            # The flattened graph resolved `prefill_mode` when it was captured, so there is
+            # no flag left to flip and no second trace to take. Stage the same program with
+            # its non-state outputs trimmed instead: the KV cache writes survive as state,
+            # and the LM head that only fed `logits` -- an output the runner rejects on a
+            # prefill graph -- goes dead with it.
+            logger.info(
+                f"Exporting prefill entrypoint {PREFILL_GRAPH_NAME!r} from the flattened "
+                "decode graph with its non-state outputs trimmed."
+            )
+            prefill_program = _drop_user_outputs(exported_program)
+            converter.add_exported_program(
+                prefill_program,
+                input_names=input_names,
+                output_names=(),
+                state_names=state_names,
+                entrypoint_name=PREFILL_GRAPH_NAME,
+                _externalized_exported_programs=_rename_for_second_entrypoint(  # type: ignore[call-arg]
+                    externalized_programs, prefill_program.graph
+                ),
+            )
     elif isinstance(model, torch.nn.Module):
         model.eval()
         converter.add_pytorch_module(
@@ -261,9 +329,9 @@ def export_macos_model(
     2. Exports the model through torch.export -> TorchConverter
     3. Optimizes the resulting AIProgram
 
-    Models that set ``exports_prefill_graph`` get a second ``prefill`` entrypoint,
-    traced from the same module in prefill mode (no LM head). The Swift runner uses
-    it for prefill when it is present and falls back to ``main`` when it is not.
+    Models that set ``exports_prefill_graph`` get a second ``prefill`` entrypoint with no
+    LM head, from the same module. The Swift runner uses it for prefill when it is present
+    and falls back to ``main`` when it is not.
 
     Args:
         model: A loaded PyTorch model (already in the correct dtype). Under

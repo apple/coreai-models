@@ -73,7 +73,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--platform",
         default=None,
         choices=["iOS", "macOS"],
-        help="Target platform. iOS defaults to 512 resolution; macOS defaults to 1024.",
+        help="Target platform. iOS defaults to 512 resolution, --single-function, and "
+        "the half img2img reference grid; macOS defaults to 1024 and the full grid.",
     )
     parser.add_argument(
         "--resolution",
@@ -85,7 +86,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--low-memory",
         action="store_true",
-        help="Include half-resolution VAEs for tiled decode.",
+        help="Include half-resolution VAEs for tiled decode. Only applies with "
+        "--single-function; the half VAEs are always included otherwise.",
+    )
+    parser.add_argument(
+        "--single-function",
+        action="store_true",
+        help="Export the FLUX.2 transformer as one asset per resolution/grid instead of a "
+        "single multi-function .aimodel. Lower peak memory, but ~2 GB per asset and only "
+        "the resolution/grid you export. Default: off (one multi-function asset with 8 "
+        "entrypoints sharing weights). Needed to name a per-resolution transformer in "
+        "--components; implied by --platform iOS.",
     )
     parser.add_argument(
         "--experimental",
@@ -113,6 +124,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable verbose (DEBUG) logging",
     )
     return parser
+
+
+def _warn(message: str) -> None:
+    """Note a flag whose intent is already met, or met elsewhere, rather than failing.
+
+    Reserved for combinations that are redundant or resolved at runtime. A combination
+    that genuinely cannot be honoured uses ``parser.error`` instead.
+    """
+    logging.getLogger(__name__).warning(message)
 
 
 def _is_hf_id(model: str) -> bool:
@@ -177,12 +197,48 @@ def main() -> None:
     if args.components and args.platform:
         parser.error("Cannot specify both --components and --platform. Use only one.")
 
+    # iOS forces single-function: multi-function saves disk but raises peak memory.
+    # Do not use platform=iOS if you want multi-function.
+    multifunction = not args.single_function
+    if args.platform == "iOS":
+        multifunction = False
+
+    # Warn of unused flags with multifunction.
+    if args.platform is None:
+        if args.resolution is not None:
+            _warn(
+                "--resolution only applies with --platform; every component is exported without it."
+            )
+        if args.low_memory:
+            _warn(
+                "--low-memory only applies with --platform; every component is exported without it."
+            )
+    elif multifunction:
+        if args.resolution is not None:
+            _warn(
+                f"--resolution {args.resolution} is not used without --single-function: one "
+                "asset holds both resolutions. Select at runtime with the pipeline's "
+                "--decode-resolution, or export with --single-function."
+            )
+        if args.low_memory:
+            _warn(
+                "--low-memory is redundant without --single-function: the half VAEs are "
+                "always included."
+            )
+
     if args.components:
-        valid = get_valid_components(pipeline_type)
+        valid = get_valid_components(pipeline_type, multifunction=multifunction)
         invalid = [c for c in args.components if c not in valid]
         if invalid:
+            # Per-resolution names only exist under --single-function.
+            hint = (
+                " Per-resolution/grid names (e.g. transformer_512, "
+                "transformer_img2img_full) require --single-function."
+                if multifunction
+                else ""
+            )
             parser.error(
-                f"Invalid components for {pipeline_type}: {invalid}. Valid choices: {valid}"
+                f"Invalid components for {pipeline_type}: {invalid}. Valid choices: {valid}.{hint}"
             )
 
     # Platform-based component selection (FLUX.2 only)
@@ -193,9 +249,31 @@ def main() -> None:
         if resolution is None:
             resolution = 512 if args.platform == "iOS" else 1024
 
-        if resolution == 512:
+        # Single-function img2img needs one asset per reference grid. Each grid is a
+        # different concatenated sequence length, so a different trace, and separate
+        # assets do not share weights (~2 GB each). Export exactly one.
+        #
+        # iOS takes the cheaper grid: it is memory-constrained, which is the same reason
+        # it forces single-function. `half` is a quarter of full's reference tokens
+        # (256 vs 1024 at 512px). Override with --components.
+        img2img_grid = "half" if args.platform == "iOS" else "full"
+
+        if multifunction:
+            # Multi-function mode: single transformer has all variants
+            target_components = [
+                "transformer",
+                "text_encoder",
+                "vae_decoder",
+                "vae_encoder",
+            ]
+            # Always include half VAEs for img2img reference encoding
+            for half in ["vae_decoder_half", "vae_encoder_half"]:
+                if half not in target_components:
+                    target_components.append(half)
+        elif resolution == 512:
             target_components = [
                 "transformer_512",
+                f"transformer_512_img2img_{img2img_grid}",
                 "text_encoder",
                 "vae_decoder_half",
                 "vae_encoder_half",
@@ -203,16 +281,17 @@ def main() -> None:
         else:
             target_components = [
                 "transformer",
+                f"transformer_img2img_{img2img_grid}",
                 "text_encoder",
                 "vae_decoder",
                 "vae_encoder",
             ]
 
-        # --low-memory adds half VAEs for tiled decode
-        if args.low_memory:
-            for half in ["vae_decoder_half", "vae_encoder_half"]:
-                if half not in target_components:
-                    target_components.append(half)
+            # --low-memory adds half VAEs for tiled decode
+            if args.low_memory:
+                for half in ["vae_decoder_half", "vae_encoder_half"]:
+                    if half not in target_components:
+                        target_components.append(half)
 
     config = DiffusionExportConfig(
         hf_model_id=hf_model_id,
@@ -222,6 +301,7 @@ def main() -> None:
         compression=compression,
         overwrite=args.overwrite,
         include_debug_info=args.include_debug_info,
+        multifunction=multifunction,
     )
 
     if args.dry_run:
@@ -233,8 +313,9 @@ def main() -> None:
         if config.components:
             print(f"  components:         {', '.join(config.components)}")
         else:
-            print("  components:         all")
-        print(f"  overwrite:          {config.overwrite}")
+            print("  components:        all")
+        print(f"  multifunction:     {config.multifunction}")
+        print(f"  overwrite:         {config.overwrite}")
         print(f"  include_debug_info: {config.include_debug_info}")
         return
 

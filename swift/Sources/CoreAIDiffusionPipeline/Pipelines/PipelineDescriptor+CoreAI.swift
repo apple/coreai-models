@@ -21,6 +21,7 @@ public enum PipelineLoadError: Error, LocalizedError {
     case missingConfig(String)
     case deprecatedFormat(String)
     case configMismatch(field: String, expected: String, actual: String)
+    case unsupportedConfiguration(String)
 
     public var errorDescription: String? {
         switch self {
@@ -32,6 +33,8 @@ public enum PipelineLoadError: Error, LocalizedError {
             return message
         case .configMismatch(let field, let expected, let actual):
             return "Config mismatch for '\(field)': config says \(expected), model says \(actual)"
+        case .unsupportedConfiguration(let detail):
+            return "Unsupported configuration: \(detail)"
         }
     }
 }

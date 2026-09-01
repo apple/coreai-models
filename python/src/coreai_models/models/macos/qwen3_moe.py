@@ -210,6 +210,8 @@ class Qwen3MoeForCausalLM(BaseForCausalLM):
     def _init_model(self, config: Qwen3MoeConfig) -> None:
         self.model = Qwen3MoeModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        if config.tie_word_embeddings:
+            self.lm_head.weight = self.model.embed_tokens.weight
 
     @BaseForCausalLM.cast_logits_bfloat16_to_float16
     def forward(
@@ -330,3 +332,8 @@ class Qwen3MoeForCausalLM(BaseForCausalLM):
                     output[0, e] = expert_weight
 
                 state_dict[f"{prefix}.switch_mlp.{proj}.weight"] = output
+
+    def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
+        super().load_state_dict(state_dict, strict=strict, assign=assign)
+        if self.config.tie_word_embeddings:
+            self.lm_head.weight = self.model.embed_tokens.weight
