@@ -54,7 +54,7 @@ let response = try await session.respond(to: "What is quantum computing?")
 print(response)
 ```
 
-> **iOS memory requirement:** This model may exceed memory limit when running from an iOS app. If that's the case, try the **Increased Memory Limit** capability ([`com.apple.developer.kernel.increased-memory-limit`](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.developer.kernel.increased-memory-limit)) in your app's entitlements; without it, the app is terminated when the model loads.
+> **iOS memory requirement:** This model may exceed memory limit when running from an iOS app. If that's the case, try adding the ([**increased memory limit**](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.developer.kernel.increased-memory-limit)) to your app's entitlements.
 
 ### On your Mac using built-in Command Line Tool
 
