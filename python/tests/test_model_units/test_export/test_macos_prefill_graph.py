@@ -5,13 +5,13 @@
 
 """Tests for the optional ``prefill`` entrypoint on macOS exports.
 
-A model that sets ``exports_prefill_graph`` gets a second entrypoint traced from the
-same signature with prefill mode on. It must declare no outputs and bind exactly the
-inputs and states ``main`` does, because that is the contract the Swift runner
-validates in ``loadPrefillGraph``. Beyond that shape contract, the KV cache it writes is
-its only product, so one test here executes the graph and checks that cache numerically
-against eager torch. A model that reaches the exporter already flattened can't produce
-one at all, which is also covered.
+A model that sets ``exports_prefill_graph`` gets a second entrypoint from the same
+signature: traced again with prefill mode on when the model is eager, or the one decode
+trace staged again with its non-state outputs trimmed when it arrives flattened. Either
+way it must declare no outputs and bind exactly the inputs and states ``main`` does,
+because that is the contract the Swift runner validates in ``loadPrefillGraph``. Beyond
+that shape contract, the KV cache it writes is its only product, so the tests here
+execute both flavours and check that cache numerically against eager torch.
 
 Exports a tiny randomly-initialised model, so no HuggingFace weights are needed, but
 it does run a real conversion and therefore needs ``coreai-torch``.
@@ -19,7 +19,6 @@ it does run a real conversion and therefore needs ``coreai-torch``.
 
 from __future__ import annotations
 
-import logging
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -39,6 +38,7 @@ try:
     import coreai.runtime as rt
     from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
+    from coreai_models.export.externalize import patch_model_for_externalization
     from coreai_models.export.macos import export_macos_model
     from coreai_models.models.base import TraceSpec
     from coreai_models.models.macos.qwen3 import Qwen3ForCausalLM
@@ -213,11 +213,11 @@ async def test_prefill_graph_is_absent_when_opted_out() -> None:
     assert model.prefill_mode is False
 
 
-@pytest.mark.asyncio
-async def test_flattened_model_gets_no_prefill_graph(caplog: pytest.LogCaptureFixture) -> None:
-    """Graph-mode quantization hands the exporter a flattened module, which resolved
-    ``prefill_mode`` when it was captured. Asking for a prefill entrypoint from one can't
-    work, so the export says so and emits ``main`` alone rather than a second copy of it.
+def _export_flattened() -> tuple[torch.nn.Module, object]:
+    """Export the way graph-mode quantization does: mark, capture, hand over the graph.
+
+    Returns the eager model -- still the export contract's source of truth, and the
+    reference for what prefill should write -- alongside the program.
     """
     config = _tiny_config()
     torch.manual_seed(0)
@@ -225,6 +225,9 @@ async def test_flattened_model_gets_no_prefill_graph(caplog: pytest.LogCaptureFi
     spec = TraceSpec(max_context_length=MAX_CTX, cache_seq_len=MAX_CTX)
     reference_inputs = model.build_reference_inputs(config, torch.float16, spec)[MAIN_GRAPH_NAME]
     dynamic_shapes = model.build_dynamic_shapes(config, spec)[MAIN_GRAPH_NAME]
+    # Marking before capture is what graph-mode quantization does, and it is what leaves
+    # the composite call sites in the flattened graph for the exporter to externalize.
+    patch_model_for_externalization(model)
     with torch.no_grad():
         flattened = torch.export.export(
             model, args=tuple(reference_inputs.values()), dynamic_shapes=dynamic_shapes
@@ -232,11 +235,46 @@ async def test_flattened_model_gets_no_prefill_graph(caplog: pytest.LogCaptureFi
 
     assert model.exports_prefill_graph
     export_config = SimpleNamespace(max_context_length=MAX_CTX, compute_precision="float16")
-    with caplog.at_level(logging.WARNING, logger="coreai_models.export.macos"):
-        program = export_macos_model(flattened, config, export_config, externalized_model=model)
+    return model, export_macos_model(flattened, config, export_config, externalized_model=model)
 
-    assert set(await _function_descriptors(program)) == {MAIN_GRAPH_NAME}
-    assert PREFILL_GRAPH_NAME in caplog.text
+
+@pytest.mark.asyncio
+async def test_flattened_model_gets_a_trimmed_prefill_graph() -> None:
+    """Graph-mode quantization hands the exporter a flattened module, which resolved
+    ``prefill_mode`` when it was captured, so there is no second trace to take. The
+    exporter stages the one decode trace again with its non-state outputs trimmed, which
+    leaves the LM head dead. The result has to satisfy the same runner contract as the
+    twice-traced eager one.
+    """
+    _, program = _export_flattened()
+
+    descs = await _function_descriptors(program)
+    assert set(descs) == {MAIN_GRAPH_NAME, PREFILL_GRAPH_NAME}
+
+    prefill, main = descs[PREFILL_GRAPH_NAME], descs[MAIN_GRAPH_NAME]
+    assert list(prefill.output_names) == []
+    assert list(main.output_names) == ["logits"]
+    assert list(prefill.input_names) == list(main.input_names)
+    assert set(prefill.state_names) == set(main.state_names) == {KEY_CACHE_NAME, VALUE_CACHE_NAME}
+
+
+@pytest.mark.asyncio
+async def test_flattened_prefill_graph_kv_writes_match_torch() -> None:
+    """Trimming the outputs must not take the cache writes with it.
+
+    Same check as the eager path's, and the same eager reference: the graph declares no
+    outputs, so the cache is the only place a mistrimmed graph would show up.
+    """
+    model, program = _export_flattened()
+    input_ids, position_ids = _prefill_inputs(_tiny_config())
+
+    k_coreai, v_coreai = await _run_entrypoint(program, PREFILL_GRAPH_NAME, input_ids, position_ids)
+    k_torch, v_torch = _torch_prefill(model, input_ids, position_ids)
+
+    written = (slice(None), slice(None), slice(None), slice(0, PREFILL_LEN))
+    assert torch.any(k_torch[written] != 0)
+    assert_close(k_coreai.astype(np.float32), k_torch.float(), atol=1e-2, rtol=1e-2)
+    assert_close(v_coreai.astype(np.float32), v_torch.float(), atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.asyncio
