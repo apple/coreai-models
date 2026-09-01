@@ -140,6 +140,8 @@ def _retype_inputs_to_quantized_graph(
             value = value.to(dtype)
         retyped[name] = value
     return retyped
+
+
 def _drop_user_outputs(
     exported_program: torch.export.ExportedProgram,
 ) -> torch.export.ExportedProgram:
