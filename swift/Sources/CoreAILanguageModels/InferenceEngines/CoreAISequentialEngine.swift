@@ -132,13 +132,6 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         guard case .ndArray(let posIdsDesc) = descriptor.inputDescriptor(of: positionIdsName) else {
             throw InferenceRuntimeError.invalidInputType("Cannot get descriptor for '\(positionIdsName)'")
         }
-        self.inputHandler = TokenInputHandler(
-            inputIdsName: inputIdsName,
-            positionIdsName: positionIdsName,
-            inputIdsDescriptor: inputIdsDesc,
-            positionIdsDescriptor: posIdsDesc,
-            useCompactPositionIds: stateHandlers.isAllSlidingCache
-        )
 
         // Extract and validate logits descriptor
         guard case .ndArray(let logitsDesc) = descriptor.outputDescriptor(of: logitsName) else {
@@ -159,6 +152,15 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         self.kvCache = stateHandlers.kvCache
         self.additionalStates = stateHandlers.additionalStates
         self.hasNonTruncatableStates = stateHandlers.hasNonTruncatableStates
+
+        // Create input handler (after stateHandlers to read isAllSlidingCache)
+        self.inputHandler = TokenInputHandler(
+            inputIdsName: inputIdsName,
+            positionIdsName: positionIdsName,
+            inputIdsDescriptor: inputIdsDesc,
+            positionIdsDescriptor: posIdsDesc,
+            useCompactPositionIds: stateHandlers.isAllSlidingCache
+        )
 
         CLILogger.log(
             "KV cache: capacity=\(kvCache.currentCapacity), states=\(kvCache.stateNames)"
@@ -279,21 +281,12 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         let batchSize = tokens.count
         _ = try kvCache.ensureCapacity(forContextLength: processedTokenCount + batchSize)
 
-        if cachedInputBatchSize != batchSize {
-            let resolvedInputDesc = inputIdsDescriptor.resolvingDynamicDimensions([1, batchSize])
-            inputIdsArray = NDArray(descriptor: resolvedInputDesc)
-            cachedInputBatchSize = batchSize
-        }
-        fillNDArray(&inputIdsArray, as: Int32.self, with: tokens)
-
-        let totalPositions = processedTokenCount + batchSize
-        let resolvedPosDesc = positionIdsDescriptor.resolvingDynamicDimensions([1, totalPositions])
-        var positionIds = NDArray(descriptor: resolvedPosDesc)
-        fillNDArray(&positionIds, as: Int32.self, count: totalPositions) { Int32($0) }
+        let context = InputContext.dynamic(tokens: tokens, processedTokenCount: processedTokenCount)
+        let inputs = try await inputHandler.prepare(context)
 
         try await runWithStatesNoOutputs(
             function: prefillFn,
-            inputs: [inputIdsName: inputIdsArray, positionIdsName: positionIds],
+            inputs: inputs,
             primary: kvCache,
             secondary: additionalStates)
 
