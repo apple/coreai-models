@@ -54,6 +54,8 @@ let response = try await session.respond(to: "What is quantum computing?")
 print(response)
 ```
 
+> **iOS memory requirement:** This 7B model exceeds the default per-app memory limit on iOS. To load it in an iOS app, enable the **Increased Memory Limit** capability ([`com.apple.developer.kernel.increased-memory-limit`](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.developer.kernel.increased-memory-limit)) in your app's entitlements; without it, the app is terminated when the model loads.
+
 ### On your Mac using built-in Command Line Tool
 
 ```bash
