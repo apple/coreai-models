@@ -79,6 +79,6 @@ Perplexity score on the [`WikiText-2`](https://huggingface.co/datasets/EleutherA
 | Mistral 7B Instruct | none (`float16`)                           | 16.00                 | iOS      | 8.29             |
 | Mistral 7B Instruct | [4-bit palettized (group size 8)][p-4bit]  | 4.11\*                | iOS      | 9.81             |
 
-\* BPW computed from exported asset size (`.mlirb` bits ÷ parameter count) and includes the INT8 per-tensor embedding.
+\* BPW is computed from exported asset size and includes the INT8 per-tensor quantized embedding.
 
 [p-4bit]: ../README.md#quantization-options
