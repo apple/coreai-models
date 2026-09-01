@@ -1098,7 +1098,7 @@ class ForCausalLMTestBase:
         """Graph-mode export with an INT8 per-tensor quantized KV cache.
 
         Tests INT8 KV Cache recipe: INT4 per-block weights
-        plus an INT8 per-tensor KV cache applied to the fused
+        plus an INT8 per-tensor KV cache applied to the
         ``mutable_cache_update_and_fetch`` op.
 
         Saves the program and confirms the exported key/value
