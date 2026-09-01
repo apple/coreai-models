@@ -40,7 +40,7 @@ uv run coreai.llm.export Qwen/Qwen2.5-1.5B-Instruct --num-layers 1 --compression
 uv run coreai.llm.export Qwen/Qwen2.5-1.5B-Instruct --dry-run
 
 # INT4 per-block quantized weights and INT8 per-tensor quantized KV Cache on macOS
-uv run coreai.llm.export qwen2.5-1.5b-instruct-8bit-kv
+uv run coreai.llm.export Qwen/Qwen2.5-1.5B-Instruct --compression 4bit_weights_8bit_kv_cache
 ```
 
 ## Run a Core AI Language Model
