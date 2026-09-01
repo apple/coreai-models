@@ -86,6 +86,62 @@ def _set_prefill_mode(module: torch.nn.Module, prefill: bool) -> None:
         setter(prefill)
 
 
+def _retype_inputs_to_quantized_graph(
+    reference_inputs: dict[str, Any],
+    model: torch.nn.Module,
+) -> dict[str, Any]:
+    """Cast reference inputs to dtypes that the quantized graph declares. Specifically to
+    handle KV Cache quantization.
+
+    Placeholders are paired with ``reference_inputs`` **positionally**, which is also the
+    property ``export_to_coreai`` already relies on when it exports a graph-mode module
+    with ``pass_inputs_as_kwargs=False``.
+
+    Args:
+        reference_inputs: The contract's reference inputs, keyed by parameter name in
+            forward-signature order.
+        model: The compressed model to be exported. A non-``GraphModule`` (eager mode or no
+            compression) remains untouched.
+
+    Returns:
+        ``reference_inputs`` with each tensor in the dtype the graph declares. The
+        reference caches are all-zeros, so the casts are exact.
+
+    Raises:
+        ValueError: If the graph's tensor placeholders and ``reference_inputs`` disagree
+            in count, i.e. the positional pairing this depends on no longer holds.
+    """
+    if not isinstance(model, torch.fx.GraphModule):
+        return reference_inputs
+
+    placeholders = [
+        node
+        for node in model.graph.nodes
+        if node.op == "placeholder" and isinstance(node.meta.get("val"), torch.Tensor)
+    ]
+    if len(placeholders) != len(reference_inputs):
+        raise ValueError(
+            f"Quantized graph declares {len(placeholders)} tensor input(s) "
+            f"{[n.name for n in placeholders]} but the export contract supplied "
+            f"{len(reference_inputs)} {list(reference_inputs)}. These are paired "
+            "positionally, so the export cannot proceed."
+        )
+
+    retyped: dict[str, Any] = {}
+    for (name, value), node in zip(reference_inputs.items(), placeholders, strict=True):
+        if node.name != name:
+            # Positional pairing is authoritative
+            logger.debug(f"Graph placeholder '{node.name}' pairs with contract input '{name}'")
+        dtype = node.meta["val"].dtype
+        if value.dtype != dtype:
+            logger.info(
+                f"Reference input '{name}': {value.dtype} -> {dtype} to match the quantized graph"
+            )
+            value = value.to(dtype)
+        retyped[name] = value
+    return retyped
+
+
 def _drop_user_outputs(
     exported_program: torch.export.ExportedProgram,
 ) -> torch.export.ExportedProgram:
@@ -366,6 +422,8 @@ def export_macos_model(
     reference_inputs, dynamic_shapes = _build_reference_inputs(
         contract_model, config, target_dtype, max_context_length
     )
+
+    reference_inputs = _retype_inputs_to_quantized_graph(reference_inputs, model)
 
     logger.info("Exporting model to Core AI dialect...")
     coreai_program = export_to_coreai(

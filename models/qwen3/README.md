@@ -40,6 +40,9 @@ uv run coreai.llm.export Qwen/Qwen3-0.6B --num-layers 1 --compression none
 
 # Preview resolved config without exporting
 uv run coreai.llm.export Qwen/Qwen3-0.6B --dry-run
+
+# INT4 Per Block quantized weights and INT8 KV Cache on macOS
+uv run coreai.llm.export Qwen/Qwen3-4B --compression 4bit_weights_8bit_kv_cache
 ```
 
 ## Run a Core AI Language Model
@@ -83,6 +86,7 @@ Perplexity score on the [`WikiText-2`](https://huggingface.co/datasets/EleutherA
 | Qwen3 0.6B | [Mixed 4-bit/8-bit palettized][mixed-4bit-8bit-yaml] | 5.71\*                | iOS      | 30.90            |
 | Qwen3 4B   | none (`float16`)                                     | 16.00                 | macOS    | 16.41            |
 | Qwen3 4B   | [4-bit quantized][presets-info]                      | 4.50                  | macOS    | 18.33            |
+| Qwen3 4B   | [4-bit quantized with INT8 KV cache][presets-info]   | 4.50                  | macOS    | 18.65            |
 | Qwen3 4B   | none (`float16`)                                     | 16.00                 | iOS      | 16.41            |
 | Qwen3 4B   | [Mixed 4-bit/8-bit palettized][qwen3-4b-mixed-yaml]  | 4.89\*                | iOS      | 18.80            |
 | Qwen3 8B   | none (`float16`)                                     | 16.00                 | macOS    | 12.19            |

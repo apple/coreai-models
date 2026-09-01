@@ -86,8 +86,30 @@ LLM_PRESETS: list[ModelPreset] = [
         "float16",
         32768,
     ),
+    ModelPreset(
+        "qwen2.5-1.5b-instruct-8bit-kv",
+        "Qwen/Qwen2.5-1.5B-Instruct",
+        "qwen2.5",
+        "llm",
+        "macOS",
+        "4bit_weights_8bit_kv_cache",
+        "float16",
+        32768,
+        notes="INT4 per-block weights and INT8 per-tensor KV cache.",
+    ),
     ModelPreset("qwen3-0.6b", "Qwen/Qwen3-0.6B", "qwen3", "llm", "macOS", "4bit", "float16", 8192),
     ModelPreset("qwen3-4b", "Qwen/Qwen3-4B", "qwen3", "llm", "macOS", "4bit", "float16", 40960),
+    ModelPreset(
+        "qwen3-4b-8bit-kv",
+        "Qwen/Qwen3-4B",
+        "qwen3",
+        "llm",
+        "macOS",
+        "4bit_weights_8bit_kv_cache",
+        "float16",
+        40960,
+        notes=("INT4 per-block weights and INT8 per-tensor KV cache."),
+    ),
     ModelPreset("qwen3-8b", "Qwen/Qwen3-8B", "qwen3", "llm", "macOS", "4bit", "float16", 40960),
     ModelPreset(
         "qwen3-coder-30b-a3b-instruct",
@@ -603,9 +625,12 @@ def try_lookup_preset_by_hf_id(
         return candidates[0]
     if variant is None:
         macos = [p for p in candidates if p.variant == "macOS"]
-        if len(macos) == 1:
+        if macos:
             return macos[0]
-    return None
+        return None
+    # A variant was requested but several presets share this hf_id+variant.
+    # So prefer the first-registered preset.
+    return candidates[0]
 
 
 def families(model_type: str, *, include_experimental: bool = False) -> list[str]:

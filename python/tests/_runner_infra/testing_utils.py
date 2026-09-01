@@ -826,6 +826,7 @@ class ForCausalLMTestBase:
     _test_kv_cache: bool = True
     _test_weight_activation_quantization: bool = False
     _test_eager_activation_quantization: bool = True
+    _test_kv_cache_quantization: bool = False
 
     @pytest.fixture(autouse=True)
     def _skip_if_hf_unreachable(self) -> None:
@@ -1091,6 +1092,152 @@ class ForCausalLMTestBase:
             )
 
             assert coreai_program is not None, "export_macos_model returned None, conversion failed"
+
+    @pytest.mark.usefixtures("disable_hf_impl_for_coreai")
+    def test_kv_cache_quantization(self) -> None:
+        """Graph-mode export with an INT8 per-tensor quantized KV cache.
+
+        Tests INT8 KV Cache recipe: INT4 per-block weights
+        plus an INT8 per-tensor KV cache applied to the
+        ``mutable_cache_update_and_fetch`` op.
+
+        Saves the program and confirms the exported key/value
+        cache states are INT8.
+        """
+        if not self._test_kv_cache_quantization:
+            pytest.skip("KV cache quantization test not enabled for this model")
+
+        from coreai.authoring import AIModelAsset
+        from coreai.runtime import AIModelAssetMetadata
+
+        from coreai_models._constants import KEY_CACHE_NAME, VALUE_CACHE_NAME
+        from coreai_models.export.compression import quantize_for_export
+        from coreai_models.export.externalize import patch_model_for_externalization
+        from coreai_models.export.macos import export_macos_model
+        from coreai_models.export.pipeline import ExportConfig
+
+        hf_config = transformers.AutoConfig.from_pretrained(self._toy_model_id)
+        is_gemma = "gemma" in self._model_class.__name__.lower()
+        if is_gemma and hasattr(hf_config, "text_config"):
+            hf_config = hf_config.text_config
+
+        # INT4 per-block weights that is the shared base of the `4bit*` presets.
+        weight_qspec_dict = {
+            "weight": {
+                "dtype": "int4",
+                "qscheme": "symmetric_with_clipping",
+                "granularity": {
+                    "type": "per_block",
+                    "block_size": 8,
+                    "axis": 1,
+                },
+            }
+        }
+        rms_norm_cls = (
+            "coreai_models.primitives.macos.rms_norm.RMSNormPlusOne"
+            if is_gemma
+            else "coreai_models.primitives.macos.rms_norm.RMSNorm"
+        )
+        kv_cache_quant_configs = {
+            "mutable_cache_update_and_fetch": {
+                "op_quantizer_config": {
+                    "op_input_spec": {
+                        1: {
+                            "dtype": "int8",
+                            "qscheme": "symmetric",
+                            "granularity": {"type": "per_tensor"},
+                        }
+                    },
+                    "op_output_spec": None,
+                    "op_state_spec": None,
+                },
+            }
+        }
+        torch_quantization_config = {
+            "global_config": {
+                "op_state_spec": weight_qspec_dict,
+                "op_input_spec": None,
+                "op_output_spec": None,
+            },
+            "module_type_configs": {
+                "coreai_models.primitives.macos.sdpa.SDPA": None,
+                "coreai_models.primitives.macos.rope.RoPE": None,
+                rms_norm_cls: None,
+            },
+            # KV cache quantization is graph-mode only.
+            "execution_mode": "graph",
+            "kv_cache_quant_configs": kv_cache_quant_configs,
+            "calibrate_activations": True,
+        }
+
+        def calibration_data_fn() -> list[torch.Tensor]:
+            return [
+                torch.randint(1, hf_config.vocab_size, (1, 16), dtype=torch.int32) for _ in range(3)
+            ]
+
+        max_context_length = 4096
+        target_dtype = torch.float16
+        hf_state_dict_prefix = "language_model." if is_gemma else ""
+        hf_config_attr = "text_config" if is_gemma else None
+
+        def _descriptor_dtype(descriptor: str) -> str:
+            """Pull the dtype token out of a state descriptor string, e.g.
+            ``"NDArray (Int8, 2 x 1 x 32 x 1 x 2048)"`` -> ``"Int8"``."""
+            inside = descriptor[descriptor.index("(") + 1 : descriptor.rindex(")")]
+            return inside.split(",", 1)[0].strip()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            layer_mmap_dir = f"{tmpdir}/layers"
+            os.makedirs(layer_mmap_dir, exist_ok=True)
+            model = self._model_class.from_hf_memory_efficient(
+                self._toy_model_id,
+                max_context_length=max_context_length,
+                target_dtype=target_dtype,
+                mmap_path=layer_mmap_dir,
+                hf_config_attr=hf_config_attr,
+                hf_state_dict_prefix=hf_state_dict_prefix,
+            ).eval()
+
+            patch_model_for_externalization(model)
+            externalized_model = model
+
+            model = quantize_for_export(
+                model,
+                hf_config,
+                target_dtype,
+                dict(torch_quantization_config),
+                calibration_data_fn=calibration_data_fn,
+            )
+
+            export_config = ExportConfig(
+                hf_model_id=self._toy_model_id,
+                max_context_length=max_context_length,
+                quantization_mode="graph",
+            )
+            coreai_program = export_macos_model(
+                model, hf_config, export_config, externalized_model=externalized_model
+            )
+            assert coreai_program is not None, "export_macos_model returned None, conversion failed"
+
+            # KV-specific check: the exported key/value cache states must be INT8.
+            coreai_program.optimize()
+            aimodel_path = Path(tmpdir) / "kv_int8.aimodel"
+            coreai_program.save_asset(aimodel_path, AIModelAssetMetadata())
+            summary = AIModelAsset.load(aimodel_path).summary(include_statistics=False)
+
+            functions_with_cache = 0
+            for function_name in summary.function_names:
+                states = dict(summary.function_states(function_name))
+                if KEY_CACHE_NAME not in states or VALUE_CACHE_NAME not in states:
+                    continue
+                functions_with_cache += 1
+                for cache_name in (KEY_CACHE_NAME, VALUE_CACHE_NAME):
+                    dtype = _descriptor_dtype(states[cache_name])
+                    assert "int8" in dtype.lower(), (
+                        f"{function_name}: {cache_name} exported as {dtype!r}, "
+                        "expected INT8 KV cache"
+                    )
+            assert functions_with_cache > 0, "expected at least one function with KV-cache states"
 
 
 """
