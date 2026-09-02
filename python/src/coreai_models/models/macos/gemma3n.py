@@ -61,8 +61,8 @@ class AltUp(nn.Module):
         )
         # Stack inputs on last dim: [B, S, H, N_in] (static N, dynamic S untouched)
         stacked = torch.stack(copies, dim=-1)
-        # Batched matmul: [B, S, H, N_in] @ [B, S, N_in, N_out] -> [B, S, H, N_out]
-        predictions_stacked = torch.matmul(stacked, all_coefs)
+        # Batched matmul in float32 to guard against accumulation overflow
+        predictions_stacked = torch.matmul(stacked.float(), all_coefs.float()).to(copies[0].dtype)
         # Unstack + residual
         return [predictions_stacked[..., i] + copies[i] for i in range(N)]
 
@@ -376,23 +376,28 @@ class Gemma3nModel(nn.Module):
         return (proj + per_layer) * self.per_layer_input_scale
 
     def _altup_expand(self, h: torch.Tensor) -> list[torch.Tensor]:
-        target_mag = torch.mean(h**2, dim=-1, keepdim=True) ** 0.5
-        eps = torch.tensor(1e-5, device=h.device, dtype=h.dtype)
+        # Compute magnitude in float32 to avoid fp16 overflow in h**2
+        h_f32 = h.float()
+        target_mag = torch.mean(h_f32**2, dim=-1, keepdim=True) ** 0.5
+        eps = torch.tensor(1e-5, device=h.device, dtype=torch.float32)
         copies = [h]
         for proj in self.altup_projections:
             p = proj(h).to(h.dtype)
-            mag = torch.sqrt(torch.maximum(torch.mean(p**2, dim=-1, keepdim=True), eps))
-            copies.append(p * target_mag / mag)
+            p_f32 = p.float()
+            mag = torch.sqrt(torch.maximum(torch.mean(p_f32**2, dim=-1, keepdim=True), eps))
+            copies.append(p * (target_mag / mag).to(h.dtype))
         return copies
 
     def _altup_collapse(self, hidden_states: list[torch.Tensor]) -> torch.Tensor:
-        target_mag = torch.mean(hidden_states[0] ** 2, dim=-1, keepdim=True) ** 0.5
-        eps = torch.tensor(1e-5, device=hidden_states[0].device, dtype=hidden_states[0].dtype)
+        h0_f32 = hidden_states[0].float()
+        target_mag = torch.mean(h0_f32**2, dim=-1, keepdim=True) ** 0.5
+        eps = torch.tensor(1e-5, device=hidden_states[0].device, dtype=torch.float32)
         copies = [hidden_states[0]]
         for i, proj in enumerate(self.altup_unembed_projections):
             p = proj(hidden_states[i + 1]).to(hidden_states[0].dtype)
-            mag = torch.sqrt(torch.maximum(torch.mean(p**2, dim=-1, keepdim=True), eps))
-            copies.append(p * target_mag / mag)
+            p_f32 = p.float()
+            mag = torch.sqrt(torch.maximum(torch.mean(p_f32**2, dim=-1, keepdim=True), eps))
+            copies.append(p * (target_mag / mag).to(hidden_states[0].dtype))
         return torch.mean(torch.stack(copies), dim=0)
 
     def forward(

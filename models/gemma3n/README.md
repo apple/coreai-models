@@ -4,14 +4,21 @@ Google's Gemma 3n for on-device inference via Core AI.
 
 ## Supported Models
 
-| Model           | Parameters          | macOS | iOS |
-| --------------- | ------------------- | ----- | --- |
-| gemma-3n-E2B-it | ~5B (E2B effective) | Yes   | No  |
+| Model           | Parameters           | macOS | iOS |
+| --------------- | -------------------- | ----- | --- |
+| gemma-3n-E2B-it | ~5B  (E2B effective) | Yes   | No  |
+| gemma-3n-E4B-it | ~10B (E4B effective) | Yes   | No  |
+| gemma-3n-E2B    | ~5B  (E2B effective) | Yes   | No  |
+| gemma-3n-E4B    | ~10B (E4B effective) | Yes   | No  |
 
 ## Export models
 
 ```bash
+# E2B (smaller, fits 8GB+ Macs)
 uv run coreai.llm.export google/gemma-3n-E2B-it
+
+# E4B (larger, fits 16GB+ Macs)
+uv run coreai.llm.export google/gemma-3n-E4B-it
 ```
 
 **Options:**
@@ -61,10 +68,13 @@ Perplexity score on the [`WikiText-2`](https://huggingface.co/datasets/EleutherA
 
 | Model           | Compression                       | BPW   | Platform | Perplexity Score |
 | --------------- | --------------------------------- | ----- | -------- | ---------------- |
-| gemma-3n-E2B-it | none (`bfloat16`)                 | 16.00 | macOS    | 30.63            |
-| gemma-3n-E2B-it | [4-bit quantized][presets-info]   | 4.50  | macOS    | 35.57            |
+| gemma-3n-E2B    | none (`bfloat16`)                 | 16.00 | macOS    | 11.66            |
+| gemma-3n-E2B    | [4-bit quantized][presets-info]   | 4.50  | macOS    | 15.77            |
+| gemma-3n-E4B    | none (`bfloat16`)                 | 16.00 | macOS    | 9.83             |
+| gemma-3n-E4B    | [4-bit quantized][presets-info]   | 4.50  | macOS    | 12.46            |
 
-Note: High wikitext perplexity is expected for instruction-tuned models. The probability
-distribution is optimized for dialogue, not raw text prediction.
+Note: Perplexity is measured on base (non-instruct) models. Instruction-tuned models have
+artificially high wikitext perplexity (~30 for E2B-it) because their probability distribution
+is optimized for dialogue, not raw text prediction.
 
 [presets-info]: ../README.md#quantization-options
