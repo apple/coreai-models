@@ -52,6 +52,14 @@ _METADATA: dict[str, AIModelMetadataFields] = {
             "family. Source: https://huggingface.co/Qwen/Qwen3-0.6B"
         ),
     ),
+    "Qwen/Qwen3-1.7B": AIModelMetadataFields(
+        author="Qwen Team",
+        license="Apache-2.0",
+        model_description=(
+            "Qwen3-1.7B is a 1.7B-parameter causal language model from the Qwen3 "
+            "family. Source: https://huggingface.co/Qwen/Qwen3-1.7B"
+        ),
+    ),
     "Qwen/Qwen3-4B": AIModelMetadataFields(
         author="Qwen Team",
         license="Apache-2.0",
