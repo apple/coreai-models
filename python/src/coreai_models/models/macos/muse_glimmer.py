@@ -697,15 +697,26 @@ class MuseGlimmerModelEmbeddings(nn.Module):
         )
         self.norm = RMSNorm(hidden_size, eps=config.rms_norm_eps)
 
+        for idx, layer in enumerate(self.layers):
+            layer.self_attn.cache_slot_idx = idx
+            layer.self_attn.is_sliding = False
+
     def forward(
         self,
         inputs_embeds: torch.Tensor,
         position_ids: torch.IntTensor,
         cache: KVCache | None = None,
     ) -> torch.Tensor:
+        query_len = inputs_embeds.shape[-2]
+        seq_len = position_ids.shape[-1]
+        torch._check_is_size(query_len)
+        torch._check_is_size(seq_len)
+        offset = seq_len - query_len
+        torch._check_is_size(offset)
+
         h = inputs_embeds
         for layer in self.layers:
-            h = layer(h, position_ids, cache)
+            h = layer(h, position_ids, offset, query_len, cache)
         h = self.norm(h)
         if self.output_multiplier != 1.0:
             h = h * self.output_multiplier
