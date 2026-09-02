@@ -72,6 +72,54 @@ _TORCH_MODULE_CONFIGS_4BIT = {
     **_TORCH_MOE_SWITCH_LINEAR_4BIT,
 }
 
+# Building blocks for the graph-mode quantization presets.
+
+_INT4_WEIGHT_SPEC = {
+    "weight": {
+        "dtype": "int4",
+        "qscheme": "symmetric_with_clipping",
+        "granularity": {
+            "type": "per_block",
+            "block_size": 32,
+            "axis": 1,
+        },
+    }
+}
+
+
+def _create_per_tensor_symmetric_kv_cache_config(dtype: str) -> dict[str, Any]:
+    """KV-cache buffer quantization config for the fused cache-update op.
+
+    Args:
+        dtype: coreai-opt dtype name the cache buffer is stored in.
+    """
+    return {
+        "mutable_cache_update_and_fetch": {
+            "op_quantizer_config": {
+                "op_input_spec": {
+                    1: {
+                        "dtype": dtype,
+                        "qscheme": "symmetric",
+                        "granularity": {"type": "per_tensor"},
+                    }
+                },
+                "op_output_spec": None,
+                "op_state_spec": None,
+            },
+        }
+    }
+
+
+_INT4_WEIGHT_ONLY_CONFIG_BASE: dict[str, Any] = {
+    "global_config": {
+        "op_state_spec": _INT4_WEIGHT_SPEC,
+        "op_input_spec": None,
+        "op_output_spec": None,
+    },
+    "module_type_configs": _TORCH_MODULE_CONFIGS_4BIT,
+}
+
+
 MACOS_PRESETS: dict[str, dict[str, Any]] = {
     # ---------------------------------------------------------------
     # No quantization — full precision
@@ -88,25 +136,24 @@ MACOS_PRESETS: dict[str, dict[str, Any]] = {
     "4bit": {
         "torch_quantization_config": {
             "execution_mode": "eager",
-            "global_config": {
-                "op_state_spec": {
-                    "weight": {
-                        "dtype": "int4",
-                        "qscheme": "symmetric_with_clipping",
-                        "granularity": {
-                            "type": "per_block",
-                            "block_size": 32,
-                            "axis": 1,
-                        },
-                    }
-                },
-                "op_input_spec": None,
-                "op_output_spec": None,
-            },
-            "module_type_configs": _TORCH_MODULE_CONFIGS_4BIT,
+            **_INT4_WEIGHT_ONLY_CONFIG_BASE,
         },
         "suffix": "4bit",
         "description": "INT4 symmetric per-block weight quantization (torch pre-export)",
+    },
+    # Same as the above `4bit` preset along with an INT8 per-tensor quantized KV cache.
+    # Note: KV Cache quantization using ``coreai-opt`` requires graph-mode.
+    "4bit_weights_8bit_kv_cache": {
+        "torch_quantization_config": {
+            "execution_mode": "graph",
+            **_INT4_WEIGHT_ONLY_CONFIG_BASE,
+            "kv_cache_quant_configs": _create_per_tensor_symmetric_kv_cache_config("int8"),
+            "calibrate_activations": True,
+        },
+        "suffix": "4bit_weights_8bit_kv_cache",
+        "description": (
+            "INT4 symmetric per-block weight quantization and INT8 per-tensor KV cache (graph mode)"
+        ),
     },
 }
 

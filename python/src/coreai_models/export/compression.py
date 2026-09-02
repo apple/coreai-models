@@ -256,6 +256,8 @@ def quantize_for_export(
     quantization_config: dict,
     calibration_data_fn: Callable[[], list] | None = None,
     mmap_dir: str | None = None,
+    spec: TraceSpec | None = None,
+    export_backend: object | None = None,
 ) -> nn.Module:
     """Apply pre-export torch quantization using the model's own graph contract.
 
@@ -271,8 +273,12 @@ def quantize_for_export(
         calibration_data_fn: Calibration samples; required when the recipe enables
             ``calibrate_activations``.
         mmap_dir: Directory for the quantizer's disk checkpointing.
+        spec: Trace shapes. Defaults to a trace bounded at ``TRACE_KV_CACHE_SEQ_LEN``.
+        export_backend: Backend for the finalized model; see ``quantize_pytorch_model``.
+            Defaults to the CoreAI backend.
     """
-    spec = TraceSpec(max_context_length=TRACE_KV_CACHE_SEQ_LEN)
+    if spec is None:
+        spec = TraceSpec(max_context_length=TRACE_KV_CACHE_SEQ_LEN)
     reference_inputs = model.build_reference_inputs(config, target_dtype, spec)
     dynamic_shapes = model.build_dynamic_shapes(config, spec)
     # Same check the export path runs, so a bad contract fails identically on both.
@@ -312,6 +318,7 @@ def quantize_for_export(
         mmap_dir=mmap_dir,
         cache_seq_len=spec.cache_seq_len,
         state_indices=state_indices,
+        export_backend=export_backend,
     )
 
 

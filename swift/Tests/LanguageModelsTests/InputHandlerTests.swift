@@ -29,7 +29,8 @@ struct InputHandlerTests {
     @Test("InputContext.static creates correct context")
     func staticContext() {
         let tokens: ArraySlice<Int32> = [10, 20][...]
-        let ctx = InputContext.static(tokens: tokens, alignedStep: 10, batchSize: 4, slidingWindow: 256)
+        let ctx = InputContext.static(
+            tokens: tokens, alignedStep: 10, batchSize: 4, slidingWindow: 256, contextBucket: 2048)
         #expect(ctx.tokens.count == 2)
         #expect(ctx.processedTokenCount == 10)
         #expect(ctx.alignedStep == 10)
