@@ -48,7 +48,7 @@ def mutable_slice_update_meta(  # type: ignore
     end: Tensor,
 ):
     """Fake implementation for tracing/meta operations."""
-    return torch.empty(x.shape, dtype=x.dtype)
+    return torch.empty(x.shape, dtype=x.dtype, device=x.device)
 
 
 @torch.library.custom_op("coreai::mutable_cache_update_and_fetch", mutates_args=["x"])
@@ -114,4 +114,4 @@ def mutable_cache_update_and_fetch_meta(  # type: ignore
     if seq_len is not None:
         out_shape[seq_dim] = seq_len
     out_shape.pop(0)  # squeeze layer dim
-    return torch.empty(out_shape, dtype=x.dtype)
+    return torch.empty(out_shape, dtype=x.dtype, device=x.device)

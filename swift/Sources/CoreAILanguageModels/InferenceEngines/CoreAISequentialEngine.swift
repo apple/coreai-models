@@ -46,29 +46,22 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
     private let prefillFunction: InferenceFunction?
 
     // I/O names from descriptor
-    private let inputIdsName: String
-    private let positionIdsName: String
     private let logitsName: String
+
+    // Input handling — handler owns allocation and fill logic
+    private var inputHandler: TokenInputHandler
 
     // State management — handlers own allocation, growth, and reset
     private var kvCache: any SyncStateHandler
     private var additionalStates: FixedNDArrayState?
     private var hasNonTruncatableStates: Bool
 
-    // Descriptors for dynamic shape resolution
-    private let inputIdsDescriptor: NDArrayDescriptor
-    private let positionIdsDescriptor: NDArrayDescriptor
+    // Logits descriptor and buffer
     private let logitsDescriptor: NDArrayDescriptor
-
-    // Persistent state — reused across steps
     private var logitsArray: NDArray
-    // Pre-allocated input_ids reused across decode steps. Only reallocated when
-    // batch size changes (i.e., once when transitioning from prefill to decode).
-    // Saves ~50-100 µs/step worth of `NDArray(descriptor:)` + descriptor resolve
-    // work in the steady state.
-    private var inputIdsArray: NDArray
-    private var cachedInputBatchSize: Int
     private var cachedLogitsBatchSize: Int
+
+    // Ring buffer mode: handled by TokenInputHandler.useCompactPositionIds
 
     // Track processed tokens for incremental inference
     public private(set) var processedTokenCount: Int = 0
@@ -127,21 +120,18 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
                     + "states=\(descriptor.stateNames), outputs=\(descriptor.outputNames)")
         }
 
-        // Extract names
-        self.inputIdsName = descriptor.inputNames[0]
-        self.positionIdsName = descriptor.inputNames[1]
+        // Extract I/O names
+        let inputIdsName = descriptor.inputNames[0]
+        let positionIdsName = descriptor.inputNames[1]
         self.logitsName = descriptor.outputNames[0]
 
-        // Extract and validate input descriptors
+        // Create input handler from descriptors
         guard case .ndArray(let inputIdsDesc) = descriptor.inputDescriptor(of: inputIdsName) else {
             throw InferenceRuntimeError.invalidInputType("Cannot get descriptor for '\(inputIdsName)'")
         }
-        self.inputIdsDescriptor = inputIdsDesc
-
         guard case .ndArray(let posIdsDesc) = descriptor.inputDescriptor(of: positionIdsName) else {
             throw InferenceRuntimeError.invalidInputType("Cannot get descriptor for '\(positionIdsName)'")
         }
-        self.positionIdsDescriptor = posIdsDesc
 
         // Extract and validate logits descriptor
         guard case .ndArray(let logitsDesc) = descriptor.outputDescriptor(of: logitsName) else {
@@ -163,6 +153,15 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         self.additionalStates = stateHandlers.additionalStates
         self.hasNonTruncatableStates = stateHandlers.hasNonTruncatableStates
 
+        // Create input handler (after stateHandlers to read isAllSlidingCache)
+        self.inputHandler = TokenInputHandler(
+            inputIdsName: inputIdsName,
+            positionIdsName: positionIdsName,
+            inputIdsDescriptor: inputIdsDesc,
+            positionIdsDescriptor: posIdsDesc,
+            useCompactPositionIds: stateHandlers.isAllSlidingCache
+        )
+
         CLILogger.log(
             "KV cache: capacity=\(kvCache.currentCapacity), states=\(kvCache.stateNames)"
         )
@@ -175,12 +174,6 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         let initLogitsDesc = logitsDesc.resolvingDynamicDimensions([1, 1, config.vocabSize])
         self.logitsArray = NDArray(descriptor: initLogitsDesc)
         self.cachedLogitsBatchSize = 1
-
-        // Allocate initial input_ids ([1, 1] — decode steady state). Will be
-        // reallocated on first prefill if batch != 1.
-        let initInputDesc = inputIdsDesc.resolvingDynamicDimensions([1, 1])
-        self.inputIdsArray = NDArray(descriptor: initInputDesc)
-        self.cachedInputBatchSize = 1
 
         // Load inference function
         self.prefillFunction = try loadPrefillGraph(
@@ -247,23 +240,8 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
             details: "\(batchSize) tokens at position \(processedTokenCount)"
         )
 
-        // Reuse pre-allocated input_ids when the batch size is unchanged.
-        // Steady-state decode keeps batchSize=1 forever, so this avoids the
-        // `NDArray(descriptor:)` + `resolvingDynamicDimensions` work on every
-        // step — small per call, but compounds over long generations.
-        if cachedInputBatchSize != batchSize {
-            let resolvedInputDesc = inputIdsDescriptor.resolvingDynamicDimensions([1, batchSize])
-            inputIdsArray = NDArray(descriptor: resolvedInputDesc)
-            cachedInputBatchSize = batchSize
-        }
-        fillNDArray(&inputIdsArray, as: Int32.self, with: tokens)
-
-        // Build position_ids: [0, 1, ..., processedTokenCount + batchSize - 1]
-        // Shape grows by 1 each step, so we can't easily pre-allocate this one.
-        let totalPositions = processedTokenCount + batchSize
-        let resolvedPosDesc = positionIdsDescriptor.resolvingDynamicDimensions([1, totalPositions])
-        var positionIds = NDArray(descriptor: resolvedPosDesc)
-        fillNDArray(&positionIds, as: Int32.self, count: totalPositions) { Int32($0) }
+        let context = InputContext.dynamic(tokens: tokens, processedTokenCount: processedTokenCount)
+        let inputs = try await inputHandler.prepare(context)
 
         // Reuse pre-allocated logits when the batch size is unchanged.
         if cachedLogitsBatchSize != batchSize {
@@ -275,7 +253,7 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         // Bind states, build output views, and execute
         try await runWithStates(
             function: function,
-            inputs: [inputIdsName: inputIdsArray, positionIdsName: positionIds],
+            inputs: inputs,
             primary: kvCache,
             secondary: additionalStates,
             outputArray: &logitsArray,
@@ -303,21 +281,12 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         let batchSize = tokens.count
         _ = try kvCache.ensureCapacity(forContextLength: processedTokenCount + batchSize)
 
-        if cachedInputBatchSize != batchSize {
-            let resolvedInputDesc = inputIdsDescriptor.resolvingDynamicDimensions([1, batchSize])
-            inputIdsArray = NDArray(descriptor: resolvedInputDesc)
-            cachedInputBatchSize = batchSize
-        }
-        fillNDArray(&inputIdsArray, as: Int32.self, with: tokens)
-
-        let totalPositions = processedTokenCount + batchSize
-        let resolvedPosDesc = positionIdsDescriptor.resolvingDynamicDimensions([1, totalPositions])
-        var positionIds = NDArray(descriptor: resolvedPosDesc)
-        fillNDArray(&positionIds, as: Int32.self, count: totalPositions) { Int32($0) }
+        let context = InputContext.dynamic(tokens: tokens, processedTokenCount: processedTokenCount)
+        let inputs = try await inputHandler.prepare(context)
 
         try await runWithStatesNoOutputs(
             function: prefillFn,
-            inputs: [inputIdsName: inputIdsArray, positionIdsName: positionIds],
+            inputs: inputs,
             primary: kvCache,
             secondary: additionalStates)
 

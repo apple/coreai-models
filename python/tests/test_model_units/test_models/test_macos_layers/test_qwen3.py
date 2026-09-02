@@ -950,3 +950,4 @@ class TestQwen3ForCausalLM(ForCausalLMTestBase):
     _model_class = CoreaiTorchQwen3ForCausalLM
     _test_weights_tying = True
     _test_weight_activation_quantization = True
+    _test_kv_cache_quantization = True

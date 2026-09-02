@@ -24,6 +24,9 @@ struct SyncStateHandlerSet {
     var additionalStates: FixedNDArrayState?
     /// Whether any state is non-truncatable (triggers full-reset-only mode).
     var hasNonTruncatableStates: Bool
+    /// True when ALL states are sliding caches (ring buffer model).
+    /// The engine uses compact position_ids [offset, ..., offset+queryLen-1] instead of [0, ..., N-1].
+    var isAllSlidingCache: Bool
 }
 
 /// Creates state handlers from a model's function descriptor.
@@ -31,7 +34,6 @@ struct SyncStateHandlerSet {
 /// Classification priority:
 /// 1. Explicit metadata (`"states"` field in metadata.json) — preferred
 /// 2. Shape-based heuristic — dynamic dim → kvCache, static + "cache" in name → slidingCache, else → fixed
-/// 3. Legacy (2 states) — both kvCache, no warning
 enum StateHandlerFactory {
     /// Classify states using metadata or heuristic fallback.
     static func classifyStates(
@@ -49,13 +51,7 @@ enum StateHandlerFactory {
             }
         }
 
-        // Heuristic fallback
-        if names.count == 2 {
-            // Legacy: 2 states = both KV cache (no warning)
-            return names.map { ($0, .kvCache) }
-        }
-
-        // N states: classify by shape + name
+        // Heuristic fallback: classify all states by shape + name
         let classified = names.map { name -> (String, StateKind) in
             (name, inferKind(name: name, descriptor: descriptor))
         }
@@ -172,7 +168,8 @@ enum StateHandlerFactory {
         return SyncStateHandlerSet(
             kvCache: kvCache,
             additionalStates: additionalStates,
-            hasNonTruncatableStates: hasNonTruncatable
+            hasNonTruncatableStates: hasNonTruncatable,
+            isAllSlidingCache: classified.allSatisfy { $0.kind == .slidingCache }
         )
     }
 }

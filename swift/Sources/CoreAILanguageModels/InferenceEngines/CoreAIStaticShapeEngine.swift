@@ -20,6 +20,31 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     private static let keyCacheName = "key_cache"
     private static let valueCacheName = "value_cache"
 
+    // MARK: Function name parsing
+
+    private struct FunctionDimensions {
+        let contextLength: Int
+        let queryLength: Int
+    }
+
+    private static func parseFunctionDimensions(_ name: String) -> FunctionDimensions? {
+        let parts = Array(name.split(separator: "_").suffix(2))
+        guard parts.count == 2, let ctx = Int(parts[0]), let ql = Int(parts[1]) else { return nil }
+        return FunctionDimensions(contextLength: ctx, queryLength: ql)
+    }
+
+    // MARK: Input name resolution
+
+    private static let knownPositionIdNames = ["position_ids", "pos_ids"]
+    private static let knownStepNames = ["in_step", "step"]
+    private static let knownTransformerInputNames = ["transformer_input"]
+
+    private static func resolveInputName(
+        from inputNames: [String], candidates: [String]
+    ) -> String? {
+        candidates.first(where: inputNames.contains)
+    }
+
     public var vocabSize: Int { config.vocabSize }
 
     public let config: ModelConfig
@@ -44,6 +69,10 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     // Fixed size caches shared across all decoding functions.
     private var keyCache: NDArray
     private var valueCache: NDArray
+
+    // Input handler (fills position_ids, causal_mask, step into pre-allocated buffers)
+    private let inputFiller: StaticBucketInputFiller
+    private var inputBuffers: InputBuffers
 
     // Number of tokens already processed in the current sequence.
     public private(set) var processedTokenCount: Int = 0
@@ -84,10 +113,8 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
 
         // Compute max query length from function names for prefill threshold
         self.maxQueryLength =
-            extendFunctionNames.compactMap { name -> Int? in
-                let parts = name.split(separator: "_")
-                return parts.last.flatMap { Int($0) }
-            }.max() ?? 64
+            extendFunctionNames.compactMap { Self.parseFunctionDimensions($0)?.queryLength }
+            .max() ?? 64
 
         // Grab largest context length extend function to use the descriptors for allocating largest context length
         // key/value caches.
@@ -123,6 +150,51 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
             throw InferenceRuntimeError.invalidState(
                 "No KV cache state descriptors found — cannot allocate cache buffers")
         }
+
+        // Discover input names from the largest-context function
+        guard
+            let positionIdsName = Self.resolveInputName(
+                from: largestExtendDescriptor.inputNames, candidates: Self.knownPositionIdNames
+            )
+        else {
+            throw InferenceRuntimeError.invalidState("No position_ids input found in model descriptor")
+        }
+        let maskName: String? =
+            largestExtendDescriptor.inputNames.contains("causal_mask")
+            ? "causal_mask" : nil
+        let stepInputName = Self.resolveInputName(
+            from: largestExtendDescriptor.inputNames, candidates: Self.knownStepNames
+        )
+
+        // Build per-bucket descriptors from ALL extend/prompt functions
+        var bucketDescs: [StaticBucketInputFiller.BucketKey: StaticBucketInputFiller.BucketDescriptors] = [:]
+        for name in extendFunctionNames {
+            let desc = try Self.requireDescriptor(model: model, functionName: name)
+            let ql = Self.queryLength(descriptor: desc, functionName: name)
+            guard let dims = Self.parseFunctionDimensions(name) else { continue }
+            let key = StaticBucketInputFiller.BucketKey(batchSize: ql, contextBucket: dims.contextLength)
+
+            guard case .ndArray(let posDesc) = desc.inputDescriptor(of: positionIdsName) else { continue }
+            let mDesc: NDArrayDescriptor? = maskName.flatMap {
+                if case .ndArray(let d) = desc.inputDescriptor(of: $0) { return d }
+                return nil
+            }
+            let sDesc: NDArrayDescriptor? = stepInputName.flatMap {
+                if case .ndArray(let d) = desc.inputDescriptor(of: $0) { return d }
+                return nil
+            }
+            bucketDescs[key] = .init(positionIds: posDesc, causalMask: mDesc, step: sDesc)
+        }
+
+        self.inputFiller = StaticBucketInputFiller(
+            positionIdsName: positionIdsName,
+            causalMaskName: maskName,
+            stepName: stepInputName,
+            bucketDescriptors: bucketDescs
+        )
+        var buffers = InputBuffers()
+        inputFiller.registerBuffers(into: &buffers)
+        self.inputBuffers = buffers
 
         CLILogger.log("Engine initialized")
     }
@@ -224,14 +296,16 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     /// `transformer_input` descriptor's sequence dimension.
     private func queryLength(of functionName: String) throws -> Int {
         let desc = try functionDescriptor(for: functionName)
-        if let txName = desc.inputNames.first(where: { $0.contains("transformer_input") }),
-            case .ndArray(let nd) = desc.inputDescriptor(of: txName), nd.shape.count >= 2
+        return Self.queryLength(descriptor: desc, functionName: functionName)
+    }
+
+    private static func queryLength(descriptor: InferenceFunctionDescriptor, functionName: String) -> Int {
+        if let txName = resolveInputName(from: descriptor.inputNames, candidates: knownTransformerInputNames),
+            case .ndArray(let nd) = descriptor.inputDescriptor(of: txName), nd.shape.count >= 2
         {
             return nd.shape[1]
         }
-        // Fallback: parse from function name (extend_<ctx>_<seq>)
-        let parts = functionName.split(separator: "_")
-        if let last = parts.last, let seq = Int(last) { return seq }
+        if let dims = parseFunctionDimensions(functionName) { return dims.queryLength }
         return 1
     }
 
@@ -268,9 +342,8 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     private func forwardGraph(numInputTokens: Int, currentPosition: Int, isPrefill: Bool) throws -> String {
         var pairs: [(contextLength: Int, queryLength: Int)] = []
         for name in extendFunctionNames {
-            let parts = Array(name.split(separator: "_").suffix(2))
-            guard parts.count == 2, let maxCtx = Int(parts[0]), let seqLen = Int(parts[1]) else { continue }
-            pairs.append((maxCtx, seqLen))
+            guard let dims = Self.parseFunctionDimensions(name) else { continue }
+            pairs.append((dims.contextLength, dims.queryLength))
         }
 
         let sorted = pairs.sorted { $0.queryLength < $1.queryLength }
@@ -295,34 +368,6 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         return isPrefill
             ? "prompt_opt_\(selected.contextLength)_\(selected.queryLength)"
             : "extend_\(selected.contextLength)_\(selected.queryLength)"
-    }
-
-    // MARK: - Causal Mask
-
-    private static func fillCausalMask(
-        _ view: consuming NDArray.MutableView<LogitsScalarType>,
-        tokensInBatch: Int,
-        alignedStep: Int
-    ) {
-        view.withUnsafeMutablePointer { ptr, shape, strides in
-            // Stride-aware indexing for non-contiguous strides
-            for context in 0..<shape[1] {
-                for query in 0..<shape[3] {
-                    let offset = context &* strides[1] &+ query &* strides[3]
-                    ptr[offset] = LogitsScalarType(-40000.0)
-                }
-            }
-
-            // Unmask positions where attention is allowed
-            for query in 0..<tokensInBatch {
-                let queryPos = alignedStep + query
-                let upperBound = min(queryPos, shape[1] &- 1)
-                for context in 0...upperBound {
-                    let offset = context &* strides[1] &+ query &* strides[3]
-                    ptr[offset] = 0
-                }
-            }
-        }
     }
 
     // MARK: - Generate (primary API)
@@ -471,14 +516,25 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         tokensInBatch: Int
     ) async throws -> [String: NDArray] {
         let desc = try functionDescriptor(for: graphName)
-        var inputs = [String: NDArray]()
+        let contextLength = Self.parseFunctionDimensions(graphName)?.contextLength ?? 0
 
+        // Fill position_ids, causal_mask, step via the handler
+        let context = InputContext.static(
+            tokens: ArraySlice(batchTokens),
+            alignedStep: alignedStep,
+            batchSize: batchSize,
+            slidingWindow: nil,
+            contextBucket: contextLength)
+        try inputFiller.fill(context, into: &inputBuffers)
+        var inputs = inputBuffers.borrowedInputs()
+
+        // Pass-through constant embedding table
         if desc.inputNames.contains("embedding_table") {
             inputs["embedding_table"] = embeddingTable
         }
 
         // Gather embeddings for this batch's tokens
-        if let txName = desc.inputNames.first(where: { $0.contains("transformer_input") }) {
+        if let txName = Self.resolveInputName(from: desc.inputNames, candidates: Self.knownTransformerInputNames) {
             let gatherName = "gather_embeddings_\(batchSize)"
             guard gatherFunctionNames.contains(gatherName) else {
                 throw InferenceRuntimeError.invalidState(
@@ -488,43 +544,6 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
                 throw InferenceRuntimeError.invalidState("Gather '\(gatherName)' returned no output")
             }
             inputs[txName] = gathered
-        }
-
-        // Position IDs
-        guard let posName = desc.inputNames.first(where: { $0.contains("pos") }) else {
-            throw InferenceRuntimeError.invalidState("Graph '\(graphName)' has no position_ids input")
-        }
-        if case .ndArray(let nd) = desc.inputDescriptor(of: posName) {
-            var pos = NDArray(descriptor: nd)
-            let posView = pos.mutableView(as: UInt16.self)
-            guard var posSpan = posView.contiguousElements else {
-                throw InferenceRuntimeError.invalidState("pos array has non-contiguous layout")
-            }
-            for i in 0..<batchSize {
-                posSpan[i] = UInt16(alignedStep + i)
-            }
-            inputs[posName] = pos
-        }
-
-        // Causal mask
-        if case .ndArray(let nd) = desc.inputDescriptor(of: "causal_mask") {
-            var mask = NDArray(descriptor: nd)
-            let maskView = mask.mutableView(as: LogitsScalarType.self)
-            Self.fillCausalMask(maskView, tokensInBatch: tokensInBatch, alignedStep: alignedStep)
-            inputs["causal_mask"] = mask
-        }
-
-        // Step
-        if let stepName = desc.inputNames.first(where: { $0.contains("step") && !$0.contains("pos") }),
-            case .ndArray(let nd) = desc.inputDescriptor(of: stepName)
-        {
-            var step = NDArray(descriptor: nd)
-            let stepView = step.mutableView(as: Int32.self)
-            guard var stepSpan = stepView.contiguousElements else {
-                throw InferenceRuntimeError.invalidState("step array has non-contiguous layout")
-            }
-            stepSpan[0] = Int32(alignedStep)
-            inputs[stepName] = step
         }
 
         return inputs

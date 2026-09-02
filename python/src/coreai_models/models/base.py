@@ -424,6 +424,19 @@ class BaseForCausalLM(torch.nn.Module):
         return {MAIN_GRAPH_NAME: (KEY_CACHE_NAME, VALUE_CACHE_NAME)}
 
     @classmethod
+    def export_state_classification(cls) -> dict[str, str] | None:
+        """Optional per-state classification for heterogeneous cache models.
+
+        Returns a dict mapping each state name (from :meth:`export_state_names`) to
+        a classification string (e.g. ``"kv_cache"``, ``"sliding_kv_cache"``).  The
+        runtime uses this to allocate caches with different growth policies.
+
+        Returns ``None`` by default, meaning all states share the same (standard
+        KV-cache) treatment.
+        """
+        return None
+
+    @classmethod
     def export_output_names(cls) -> dict[str, tuple[str, ...]]:
         """Graph output names per graph, in return order."""
         return {MAIN_GRAPH_NAME: ("logits",)}

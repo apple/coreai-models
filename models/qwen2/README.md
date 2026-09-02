@@ -38,6 +38,9 @@ uv run coreai.llm.export Qwen/Qwen2.5-1.5B-Instruct --num-layers 1 --compression
 
 # Preview resolved config without exporting
 uv run coreai.llm.export Qwen/Qwen2.5-1.5B-Instruct --dry-run
+
+# INT4 per-block quantized weights and INT8 per-tensor quantized KV Cache on macOS
+uv run coreai.llm.export Qwen/Qwen2.5-1.5B-Instruct --compression 4bit_weights_8bit_kv_cache
 ```
 
 ## Run a Core AI Language Model
@@ -75,12 +78,13 @@ Defaults: 512 prompt tokens, 1024 generation tokens, 5 trials. Override with `-p
 
 Perplexity score on the [`WikiText-2`](https://huggingface.co/datasets/EleutherAI/wikitext_document_level) dataset computed using the [lm-evaluation-harness](https://github.com/EleutherAI/lm-evaluation-harness/blob/main/lm_eval/tasks/wikitext/README.md) with the Core AI PyTorch models.
 
-| Model                 | Compression                               | Bits Per Weight (BPW) | Platform | Perplexity Score |
-| --------------------- | ----------------------------------------- | --------------------- | -------- | ---------------- |
-| Qwen2.5 1.5B Instruct | none (`float16`)                          | 16.00                 | macOS    | 12.21            |
-| Qwen2.5 1.5B Instruct | [4-bit quantized][p-4bit]                 | 4.50                  | macOS    | 14.79            |
-| Qwen2.5 1.5B Instruct | none (`float16`)                          | 16.00                 | iOS      | 12.21            |
-| Qwen2.5 1.5B Instruct | [4-bit palettized (group size 8)][p-4bit] | 4.63\*                | iOS      | 14.64            |
+| Model                 | Compression                                  | Bits Per Weight (BPW) | Platform | Perplexity Score |
+| --------------------- | -------------------------------------------- | --------------------- | -------- | ---------------- |
+| Qwen2.5 1.5B Instruct | none (`float16`)                             | 16.00                 | macOS    | 12.21            |
+| Qwen2.5 1.5B Instruct | [4-bit quantized][p-4bit]                    | 4.50                  | macOS    | 14.79            |
+| Qwen2.5 1.5B Instruct | [4-bit quantized with INT8 KV cache][p-4bit] | 4.50                  | macOS    | 15.38            |
+| Qwen2.5 1.5B Instruct | none (`float16`)                             | 16.00                 | iOS      | 12.21            |
+| Qwen2.5 1.5B Instruct | [4-bit palettized (group size 8)][p-4bit]    | 4.63\*                | iOS      | 14.64            |
 
 \* BPW includes the Embedding which is quantized to INT8 per-tensor.
 

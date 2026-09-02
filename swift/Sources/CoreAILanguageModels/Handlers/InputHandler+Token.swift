@@ -18,6 +18,7 @@ public struct TokenInputHandler: SyncInputHandler {
     private let positionIdsName: String
     private let inputIdsDescriptor: NDArrayDescriptor
     private let positionIdsDescriptor: NDArrayDescriptor
+    private let useCompactPositionIds: Bool
 
     private var inputIdsArray: NDArray
     private var cachedBatchSize: Int
@@ -26,12 +27,14 @@ public struct TokenInputHandler: SyncInputHandler {
         inputIdsName: String,
         positionIdsName: String,
         inputIdsDescriptor: NDArrayDescriptor,
-        positionIdsDescriptor: NDArrayDescriptor
+        positionIdsDescriptor: NDArrayDescriptor,
+        useCompactPositionIds: Bool = false
     ) {
         self.inputIdsName = inputIdsName
         self.positionIdsName = positionIdsName
         self.inputIdsDescriptor = inputIdsDescriptor
         self.positionIdsDescriptor = positionIdsDescriptor
+        self.useCompactPositionIds = useCompactPositionIds
         self.inputNames = [inputIdsName, positionIdsName]
 
         let initDesc = inputIdsDescriptor.resolvingDynamicDimensions([1, 1])
@@ -51,10 +54,19 @@ public struct TokenInputHandler: SyncInputHandler {
         }
         fillNDArray(&inputIdsArray, as: Int32.self, with: tokens)
 
-        let totalPositions = context.processedTokenCount + batchSize
-        let resolvedPosDesc = positionIdsDescriptor.resolvingDynamicDimensions([1, totalPositions])
-        var positionIds = NDArray(descriptor: resolvedPosDesc)
-        fillNDArray(&positionIds, as: Int32.self, count: totalPositions) { Int32($0) }
+        let positionIds: NDArray
+        if useCompactPositionIds {
+            let resolvedPosDesc = positionIdsDescriptor.resolvingDynamicDimensions([1, batchSize])
+            var pos = NDArray(descriptor: resolvedPosDesc)
+            fillNDArray(&pos, as: Int32.self, count: batchSize) { Int32(context.processedTokenCount + $0) }
+            positionIds = pos
+        } else {
+            let totalPositions = context.processedTokenCount + batchSize
+            let resolvedPosDesc = positionIdsDescriptor.resolvingDynamicDimensions([1, totalPositions])
+            var pos = NDArray(descriptor: resolvedPosDesc)
+            fillNDArray(&pos, as: Int32.self, count: totalPositions) { Int32($0) }
+            positionIds = pos
+        }
 
         return [
             inputIdsName: inputIdsArray,

@@ -28,8 +28,8 @@ import torch
 from huggingface_hub import snapshot_download
 
 from coreai_models._constants import DEFAULT_INCLUDE_DEBUG_INFO
-from coreai_models.diffusion.components import get_component_registry
-from coreai_models.diffusion.gpu import export_stateless
+from coreai_models.diffusion.components import MultiFunctionComponentSpec, get_component_registry
+from coreai_models.diffusion.gpu import export_multifunction, export_stateless
 from coreai_models.diffusion.models import get_pipeline_type
 from coreai_models.diffusion.presets import PRESETS, list_presets
 from coreai_models.export.compiler import (
@@ -52,6 +52,7 @@ class DiffusionExportConfig:
     overwrite: bool = False
     vae_tile_size: int | None = None
     include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO
+    multifunction: bool = True
 
 
 def export_diffusion(config: DiffusionExportConfig) -> dict[str, str]:
@@ -78,7 +79,9 @@ async def _async_export_diffusion(config: DiffusionExportConfig) -> dict[str, st
     pipeline_type = get_pipeline_type(config.hf_model_id)
     hf_pipe = _load_hf_pipeline(config.hf_model_id, pipeline_type, model_dtype)
 
-    registry = get_component_registry(hf_pipe, pipeline_type=pipeline_type)
+    registry = get_component_registry(
+        hf_pipe, pipeline_type=pipeline_type, multifunction=config.multifunction
+    )
     component_names = config.components or list(registry.keys())
     logger.info(f"Pipeline type: {pipeline_type}, components: {component_names}")
 
@@ -98,7 +101,6 @@ async def _async_export_diffusion(config: DiffusionExportConfig) -> dict[str, st
             continue
 
         spec = registry[name]
-        mlirb_path = output_path / f"{spec.asset_name}.mlirb"
         asset_path = output_path / f"{spec.asset_name}.aimodel"
 
         if asset_path.exists() and not config.overwrite:
@@ -106,23 +108,37 @@ async def _async_export_diffusion(config: DiffusionExportConfig) -> dict[str, st
             results[name] = str(asset_path)
             continue
 
-        logger.info(f"Exporting {name} -> {spec.asset_name}.aimodel")
+        if isinstance(spec, MultiFunctionComponentSpec):
+            logger.info(
+                f"Exporting {name} -> {spec.asset_name}.aimodel "
+                f"(multi-function: {[f.name for f in spec.functions]})"
+            )
+            wrapper = spec.wrapper_fn(hf_pipe)
+            functions = [(fv.name, wrapper, fv.dummy_fn(hf_pipe)) for fv in spec.functions]
+            program = export_multifunction(
+                functions,
+                spec.input_names,
+                spec.output_names,
+                include_debug_info=config.include_debug_info,
+            )
+        else:
+            logger.info(f"Exporting {name} -> {spec.asset_name}.aimodel")
 
-        wrapper = spec.wrapper_fn(hf_pipe)
-        dummy_kwargs: dict[str, Any] = {}
-        if "vae" in name and config.vae_tile_size is not None:
-            dummy_kwargs["tile_size"] = config.vae_tile_size
-        dummy_inputs = spec.dummy_fn(hf_pipe, **dummy_kwargs)
-        dynamic_shapes = spec.dynamic_shapes_fn() if spec.dynamic_shapes_fn else None
+            wrapper = spec.wrapper_fn(hf_pipe)
+            dummy_kwargs: dict[str, Any] = {}
+            if "vae" in name and config.vae_tile_size is not None:
+                dummy_kwargs["tile_size"] = config.vae_tile_size
+            dummy_inputs = spec.dummy_fn(hf_pipe, **dummy_kwargs)
+            dynamic_shapes = spec.dynamic_shapes_fn() if spec.dynamic_shapes_fn else None
 
-        program = export_stateless(
-            wrapper,
-            dummy_inputs,
-            spec.input_names,
-            spec.output_names,
-            dynamic_shapes=dynamic_shapes,
-            include_debug_info=config.include_debug_info,
-        )
+            program = export_stateless(
+                wrapper,
+                dummy_inputs,
+                spec.input_names,
+                spec.output_names,
+                dynamic_shapes=dynamic_shapes,
+                include_debug_info=config.include_debug_info,
+            )
 
         # Optional MLIR quantization
         component_quant = quant_config if spec.quantizable else None
@@ -138,6 +154,7 @@ async def _async_export_diffusion(config: DiffusionExportConfig) -> dict[str, st
         del program
 
         # Clean up leftover .mlirb from older export runs
+        mlirb_path = output_path / f"{spec.asset_name}.mlirb"
         if mlirb_path.exists():
             mlirb_path.unlink()
 

@@ -1293,17 +1293,30 @@ private struct EngineImpl: ~Copyable {
             }
         }
 
-        continuation.yield(lastToken)
+        // NOTE: `lastToken` is deliberately NOT yielded here. A sampled token is
+        // only emitted after the grammar has accepted it (at the top of the loop)
+        // and we've confirmed the acceptance did not terminate the grammar.
+        // Otherwise the grammar's terminal token (e.g. <|endoftext|>, 151643) would
+        // be streamed to the consumer before termination is detected and would leak
+        // into the structured output. This mirrors the CPU ConstrainedDecodingStrategy
+        // fix in #117, which returns nil instead of emitting the terminal token's text.
 
         // Constrained decode loop
-        var generated = 1
+        var generated = 0
         while generated < maxTokens {
             guard !isCancelled.load(ordering: .relaxed) else { break }
             try Task.checkCancellation()
 
-            // Accept previous token in grammar
+            // Accept the most recently sampled token in the grammar.
             if !session.acceptToken(lastToken) { break }
+            // If accepting it terminated the grammar, `lastToken` is the terminal
+            // (stop) token — break WITHOUT emitting it.
             if session.isTerminated { break }
+
+            // `lastToken` is confirmed to be valid structured content — emit it now.
+            continuation.yield(lastToken)
+            generated += 1
+            if generated >= maxTokens { break }
 
             // Check for jump-forward: deterministic grammar segments that can be
             // batch-encoded without per-token sampling (saves N-1 round-trips)
@@ -1334,12 +1347,13 @@ private struct EngineImpl: ~Copyable {
                     }
                 }
 
-                // Yield the jump-forward tokens (deterministic) + the sampled token
+                // Emit the deterministic jump-forward tokens now. The freshly sampled
+                // `lastToken` is deferred to the next iteration's accept/termination
+                // check so a terminal token never leaks into the output.
                 for jt in jumpTokens {
                     continuation.yield(jt)
                 }
-                continuation.yield(lastToken)
-                generated += jumpTokens.count + 1
+                generated += jumpTokens.count
                 continue
             }
 
@@ -1368,8 +1382,7 @@ private struct EngineImpl: ~Copyable {
                 }
             }
 
-            continuation.yield(lastToken)
-            generated += 1
+            // `lastToken` is deferred to the next iteration's accept/termination check.
         }
 
         // Drain: sentinel command buffer to ensure all GPU work completes
