@@ -12,7 +12,9 @@ import Foundation
 /// projector into the decoder's embedding space.
 ///
 /// Owns the vision asset's functions (separate `encode_image` + `project`, or a single fused
-/// `main`) and turns images or video frames into `InputEmbeddings`.
+/// `main`) and turns images or video frames into `InputEmbeddings`. The encoder's pixel input is
+/// `[1, 3, H, W]`, or `[1, num_patches, patch_dim]` for a pre-patchified export, whose patch rows
+/// the host builds (see `PixelInput`).
 final class VisionFrontEnd {
     let visionConfig: VisionConfig
 
@@ -23,6 +25,7 @@ final class VisionFrontEnd {
     private let projectFunction: InferenceFunction
     private let projectFunctionDescriptor: InferenceFunctionDescriptor
     private let visionProjectorFused: Bool
+    private let pixelInput: PixelInput
 
     // MARK: - Image Preprocessor
 
@@ -81,6 +84,17 @@ final class VisionFrontEnd {
             std: (CGFloat(vc.imageStd[0]), CGFloat(vc.imageStd[1]), CGFloat(vc.imageStd[2])),
             rescaleFactor: CGFloat(vc.rescaleFactor)
         )
+
+        let pixelInputName = visionFunctionDescriptor.inputNames[0]
+        guard case .ndArray(let pixelDesc) = visionFunctionDescriptor.inputDescriptor(of: pixelInputName)
+        else {
+            throw InferenceRuntimeError.invalidInputType(
+                "Cannot get descriptor for vision input '\(pixelInputName)'")
+        }
+        self.pixelInput = try PixelInput(declaredShape: pixelDesc.shape, visionConfig: visionConfig)
+        CLILogger.log(
+            "VLM vision input '\(pixelInputName)' \(pixelDesc.shape): "
+                + (pixelInput.patchify == nil ? "CHW pixels" : "host patchify"))
     }
 
     // MARK: - Image Encoding
@@ -89,9 +103,10 @@ final class VisionFrontEnd {
     ///
     /// Pipeline:
     /// 1. Resize to `visionConfig.imageSize`, normalize channels
-    /// 2. Run vision encoder (`encode_image`) to get patch features
-    /// 3. Run projector (`project`) to map features to LLM hidden dimension
-    /// 4. Return as `InputEmbeddings` with placeholder token positions
+    /// 2. Rearrange into patch rows when the encoder takes pre-patchified input
+    /// 3. Run vision encoder (`encode_image`) to get patch features
+    /// 4. Run projector (`project`) to map features to LLM hidden dimension
+    /// 5. Return as `InputEmbeddings` with placeholder token positions
     func encodeImage(cgImage: CGImage) async throws -> InputEmbeddings {
         let encodeSignpost = InstrumentsProfiler.beginCustomInterval(
             name: "CoreAIVLM EncodeImage",
@@ -102,15 +117,11 @@ final class VisionFrontEnd {
         }
 
         // Step 1: Preprocess image to CHW Float32
-        let chwPixels = try imagePreprocessor.preprocessCHW(
-            cgImage: cgImage, strategy: visionConfig.imageStrategy)
+        let chwPixels = try preprocessImage(cgImage: cgImage)
 
-        // Step 2: Run encode_image
-        let encoderOutput = try await runVisionEncoder(pixels: chwPixels)
-
-        // Step 3: Run projector (skip if fused with encoder)
-        let projectedEmbeddings =
-            visionProjectorFused ? encoderOutput : try await runProjector(encoderOutput: encoderOutput)
+        // Steps 2-4: Lay the pixels out as the encoder's input, run encode_image, then the
+        // projector (skipped if fused with encoder)
+        let projectedEmbeddings = try await visionForward(pixels: visionInput(fromCHW: chwPixels))
 
         // The image token positions will be determined during generate() when we know the
         // full token sequence. For now, record the expected token count.
@@ -141,11 +152,8 @@ final class VisionFrontEnd {
         var frameEmbeddings: [InputEmbeddings] = []
 
         for try await frame in video.frames {
-            let chwPixels = try imagePreprocessor.preprocessCHW(
-                cgImage: frame.image, strategy: visionConfig.imageStrategy)
-            let encoderOutput = try await runVisionEncoder(pixels: chwPixels)
-            let projected =
-                visionProjectorFused ? encoderOutput : try await runProjector(encoderOutput: encoderOutput)
+            let chwPixels = try preprocessImage(cgImage: frame.image)
+            let projected = try await visionForward(pixels: visionInput(fromCHW: chwPixels))
             frameEmbeddings.append(
                 try InputEmbeddings(embeddings: projected, embeddingPositions: 0..<projected.shape[1]))
             CLILogger.log("  - encoded video frame \(frameEmbeddings.count)", level: 2)
@@ -160,9 +168,30 @@ final class VisionFrontEnd {
         return concatenated
     }
 
-    /// Run the vision encoder on preprocessed pixel values.
+    // MARK: - Encoder Stages
+
+    /// Preprocess an image into the normalized CHW pixels `visionInput(fromCHW:)` consumes.
+    func preprocessImage(cgImage: CGImage) throws -> [Float] {
+        try imagePreprocessor.preprocessCHW(cgImage: cgImage, strategy: visionConfig.imageStrategy)
+    }
+
+    /// Turn CHW pixels into the buffer the encoder takes: the patch rows of a pre-patchified
+    /// export, or the CHW pixels themselves.
+    func visionInput(fromCHW pixels: [Float]) throws -> [Float] {
+        try pixelInput.buffer(fromCHW: pixels)
+    }
+
+    /// Run the vision encoder, and the projector when it is separate, on a buffer from
+    /// `visionInput(fromCHW:)`.
+    func visionForward(pixels: [Float]) async throws -> NDArray {
+        let encoderOutput = try await runVisionEncoder(pixels: pixels)
+        return visionProjectorFused ? encoderOutput : try await runProjector(encoderOutput: encoderOutput)
+    }
+
+    /// Run the vision encoder on the encoder-ready pixel buffer.
     ///
-    /// - Parameter pixels: Float32 array in CHW layout, shape `[3, H, W]`
+    /// - Parameter pixels: Float32 array matching the encoder's pixel input: CHW `[3, H, W]`, or
+    ///   patch rows from `visionInput(fromCHW:)`
     /// - Returns: NDArray of encoder hidden states
     private func runVisionEncoder(pixels: [Float]) async throws -> NDArray {
         let pixelInputName = visionFunctionDescriptor.inputNames[0]
@@ -175,12 +204,9 @@ final class VisionFrontEnd {
                 "Cannot get descriptor for vision input '\(pixelInputName)'")
         }
 
-        // Shape: [1, 3, imageSize, imageSize]
-        let imageSize = visionConfig.imageSize
-        let resolvedPixelDesc = pixelDesc.resolvingDynamicDimensions([1, 3, imageSize, imageSize])
+        try pixelInput.validate(pixels, name: pixelInputName)
+        let resolvedPixelDesc = pixelDesc.resolvingDynamicDimensions(pixelInput.shape)
         var pixelArray = NDArray(descriptor: resolvedPixelDesc)
-
-        // Fill with CHW pixel data
         fillNDArray(&pixelArray, as: Float.self, with: pixels)
 
         // Resolve output descriptor
@@ -236,5 +262,52 @@ final class VisionFrontEnd {
 
         CLILogger.log("  - project complete, output shape: \(projectedArray.shape)")
         return projectedArray
+    }
+}
+
+// MARK: - Pixel Input
+
+extension VisionFrontEnd {
+    /// The encoder's pixel input, read from its declared shape: the shape it is bound at, and the
+    /// rearrangement the host applies to CHW pixels to fill it.
+    ///
+    /// A rank-4 input is `[1, 3, H, W]` and takes the normalized CHW pixels unchanged. A rank-3
+    /// input is `[1, num_patches, patch_dim]`, the form ANE-mappable exports declare because the
+    /// in-graph patchify exceeds the Neural Engine's rank limit; the host builds its patch rows
+    /// with `VisionPatchify`. Dynamic dimensions resolve to the `[1, 3, H, W]` image shape, and a
+    /// fully static input is bound at its declared shape.
+    struct PixelInput {
+        /// The shape the input is bound at.
+        let shape: [Int]
+        /// The host-side patchify of a rank-3 input; nil when the input takes CHW pixels.
+        let patchify: VisionPatchify?
+
+        init(declaredShape: [Int], visionConfig: VisionConfig) throws {
+            let imageSize = visionConfig.imageSize
+            self.shape =
+                declaredShape.contains(where: { $0 < 0 }) ? [1, 3, imageSize, imageSize] : declaredShape
+            self.patchify =
+                declaredShape.count == 3
+                ? try VisionPatchify(
+                    visionConfig: visionConfig, numPatches: declaredShape[1], patchDim: declaredShape[2])
+                : nil
+        }
+
+        /// The number of floats a buffer bound at `shape` holds.
+        var elementCount: Int { shape.reduce(1, *) }
+
+        /// The buffer this input takes for normalized CHW pixels `[3, imageSize, imageSize]`.
+        func buffer(fromCHW pixels: [Float]) throws -> [Float] {
+            guard let patchify else { return pixels }
+            return try patchify(chw: pixels)
+        }
+
+        /// Throws unless `pixels` fills the input exactly.
+        func validate(_ pixels: [Float], name: String) throws {
+            guard pixels.count == elementCount else {
+                throw InferenceRuntimeError.invalidArgument(
+                    "Vision input '\(name)' takes \(elementCount) floats \(shape), got \(pixels.count)")
+            }
+        }
     }
 }
