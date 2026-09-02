@@ -370,7 +370,9 @@ def palettize_pytorch_model(
     logger.info(f"Palettization config: {config}")
 
     palettizer = KMeansPalettizer(model, config)
-    prepared_model = palettizer.prepare(example_inputs=example_inputs, num_workers=32)
+    # k-means workers are spawned interpreters, each holding a model copy and
+    # peaking around 3 GB; size the pool to memory, not core count.
+    prepared_model = palettizer.prepare(example_inputs=example_inputs, num_workers=6)
 
     finalized_model = palettizer.finalize(prepared_model, backend=export_backend)
 

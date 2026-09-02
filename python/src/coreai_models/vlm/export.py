@@ -106,6 +106,21 @@ SUPPORTED_MODELS: dict[str, VLMSpec] = {
         image_std=(0.26862954, 0.26130258, 0.27577711),
         rescale_factor=1.0,
     ),
+    "qwen3.5-0.8b": VLMSpec(
+        short_name="qwen3.5-0.8b",
+        hf_model_id="Qwen/Qwen3.5-0.8B",
+        output_name="qwen3_5_0p8b",
+        image_token_id=248056,  # <|image_pad|>
+        image_size=448,
+        patch_size=16,
+        spatial_merge_size=2,
+        temporal_patch_size=2,
+        image_mean=(0.5, 0.5, 0.5),
+        image_std=(0.5, 0.5, 0.5),
+        rescale_factor=1.0,
+        image_strategy="stretch",
+        include_image_info=True,
+    ),
 }
 
 
@@ -575,9 +590,8 @@ class StaticVisionEncoder(nn.Module):
             # Class-level patch (same idiom as _patch_fast_pos_embed_interpolate):
             # torch.export is only guaranteed to trace the class forward, so an
             # instance-level override could silently fall back to HF's fp32 path.
-            from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionAttention
-
-            Qwen3VLVisionAttention.forward = _f16_attention_forward
+            # Resolved from the instance so every qwen-vl-family tower works.
+            type(visual_model.blocks[0].attn).forward = _f16_attention_forward
 
         self.image_size = image_size
         self.patch_size = patch_size
@@ -806,6 +820,7 @@ async def export_vision_encoder(
     include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
     vision_dtype: str = "f32",
     ane_friendly: bool = False,
+    vision_compression: str = "none",
 ) -> str:
     """Export the vision encoder as vision.aimodel and patch metadata.json."""
     if not bundle_path.exists():
@@ -836,21 +851,17 @@ async def export_vision_encoder(
         num_visual_tokens = spec.num_visual_tokens
         pixel_shape = (1, 3, spec.image_size, spec.image_size)
     else:
-        # Qwen3-VL: load HF model and wrap with StaticVisionEncoder for
-        # Qwen's 3D patchify + rotary position embeddings.
-        from transformers.models.qwen3_vl.modeling_qwen3_vl import (
-            Qwen3VLForConditionalGeneration as HFModel,
-        )
-        from transformers.models.qwen3_vl.modeling_qwen3_vl import (
-            Qwen3VLVisionModel,
-        )
-
-        _patch_fast_pos_embed_interpolate(Qwen3VLVisionModel)
+        # Qwen VL family: load the checkpoint's own vision tower and wrap it with
+        # StaticVisionEncoder for Qwen's 3D patchify + rotary position embeddings.
+        from transformers import AutoModelForImageTextToText
 
         # ---- 2. Load HF model (vision part only) ----
         logging.info(f"Loading {spec.hf_model_id} for vision encoder extraction...")
-        hf_model = HFModel.from_pretrained(spec.hf_model_id, dtype=torch.float32)
+        hf_model = AutoModelForImageTextToText.from_pretrained(
+            spec.hf_model_id, dtype=torch.float32
+        )
         hf_model = hf_model.eval()
+        _patch_fast_pos_embed_interpolate(type(hf_model.model.visual))
 
         wrapper = StaticVisionEncoder(
             hf_model.model.visual,
@@ -914,6 +925,52 @@ async def export_vision_encoder(
             f"Export module output: {tuple(final_out.shape)} {final_out.dtype} "
             f"(expected (1, {num_visual_tokens}, {text_hidden}) torch.float16)"
         )
+
+    if vision_compression.endswith("-palettized"):
+        from coreai_models.export.compression import palettize_pytorch_model
+
+        n_bits = int(vision_compression.split("bit")[0])
+        logging.info(f"Palettizing the vision encoder ({n_bits}-bit, group 32)...")
+        export_module = palettize_pytorch_model(
+            export_module,
+            (torch.randn(*pixel_shape, dtype=torch.float32),),
+            {
+                "global_config": {
+                    "op_state_spec": {
+                        "weight": {
+                            "n_bits": n_bits,
+                            "granularity": {
+                                "type": "per_grouped_channel",
+                                "axis": 0,
+                                "group_size": 32,
+                            },
+                        }
+                    }
+                }
+            },
+        )
+        logging.info("Vision palettization complete.")
+    elif vision_compression != "none":
+        import copy
+
+        from coreai_models.export.compression import quantize_pytorch_model
+        from coreai_models.export.presets import MACOS_PRESETS
+
+        logging.info(
+            f"Applying {vision_compression} weight-only quantization to the vision encoder..."
+        )
+        quant_cfg = copy.deepcopy(MACOS_PRESETS["4bit"]["torch_quantization_config"])
+        if vision_compression == "8bit":
+            quant_cfg["global_config"]["op_state_spec"]["weight"]["dtype"] = "int8"
+        export_module = quantize_pytorch_model(
+            export_module,
+            (torch.randn(*pixel_shape, dtype=torch.float32),),
+            None,
+            quant_cfg,
+            cache_seq_len=0,
+            state_indices=(),
+        )
+        logging.info("Vision quantization complete.")
 
     reference_inputs = {"pixel_values": torch.randn(*pixel_shape, dtype=torch.float32)}
 
@@ -1034,6 +1091,14 @@ def build_parser() -> argparse.ArgumentParser:
         "fp32 islands, so the graph compiles to a single ANE region)",
     )
     parser.add_argument(
+        "--vision-compression",
+        choices=["none", "4bit", "8bit", "4bit-palettized", "8bit-palettized"],
+        default="none",
+        help="Vision-encoder weight compression: int4/int8 symmetric per-block "
+        "weight-only quantization, or 4/8-bit k-means palettization group 32 "
+        "(the palettized form is the one the ANE path supports; default: none)",
+    )
+    parser.add_argument(
         "--list-models",
         action="store_true",
         help="List supported VLM short-names and exit",
@@ -1088,6 +1153,7 @@ async def _run(spec: VLMSpec, args: argparse.Namespace) -> Path:
             include_debug_info=args.include_debug_info,
             vision_dtype=args.vision_dtype,
             ane_friendly=args.vision_ane_friendly,
+            vision_compression=args.vision_compression,
         )
     return bundle_path
 
