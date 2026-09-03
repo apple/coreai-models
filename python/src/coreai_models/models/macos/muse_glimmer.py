@@ -254,8 +254,7 @@ class MuseGlimmerModel(nn.Module):
                 sliding_mask,
             )
         h = self.norm(h)
-        if self.output_multiplier != 1.0:
-            h = h * self.output_multiplier
+        h = h * self.output_multiplier
         return h
 
 
@@ -308,6 +307,7 @@ class MuseGlimmerForCausalLM(BaseForCausalLM):
         hf_state_dict_prefix: str = "model.language_model.",
         disable_embedding_quantization: bool = False,
     ) -> Self:
+        """Load text decoder weights shard-by-shard, skipping the vision encoder."""
         import re
 
         model_dir = snapshot_download(
@@ -718,8 +718,7 @@ class MuseGlimmerModelEmbeddings(nn.Module):
         for layer in self.layers:
             h = layer(h, position_ids, offset, query_len, cache)
         h = self.norm(h)
-        if self.output_multiplier != 1.0:
-            h = h * self.output_multiplier
+        h = h * self.output_multiplier
         return h
 
 
@@ -774,6 +773,7 @@ class MuseGlimmerForCausalLMEmbeddings(BaseForCausalLM):
         hf_state_dict_prefix: str = "model.language_model.",
         disable_embedding_quantization: bool = False,
     ) -> Self:
+        """Load text decoder weights shard-by-shard, skipping the vision encoder and embed_tokens."""
         import re
 
         model_dir = snapshot_download(

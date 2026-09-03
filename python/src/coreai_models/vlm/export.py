@@ -344,7 +344,6 @@ async def export_text_bundle(
             "merges.txt",
             "*.model",
         ],
-        local_files_only=os.environ.get("HF_LOCAL_ONLY", "") == "1",
     )
     raw_cfg = AutoConfig.from_pretrained(model_dir)
     text_cfg = raw_cfg.text_config

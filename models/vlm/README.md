@@ -10,6 +10,7 @@ supported models are registered in its `SUPPORTED_MODELS` table.
 | Short-name | HuggingFace ID            | Notes                                    |
 |------------|---------------------------|------------------------------------------|
 | `qwen3-vl` | `Qwen/Qwen3-VL-2B-Instruct` | 448×448 vision encoder, f16 text decoder |
+| `muse-glimmer-vl` | `meta-models/Muse-Glimmer-30B` | ViT-G/14 vision encoder, f16 text decoder |
 
 ## Exporting
 

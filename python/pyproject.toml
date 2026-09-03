@@ -95,5 +95,4 @@ addopts = [
 ]
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
-    "flaky: marks tests as flaky (auto-rerun via pytest-rerunfailures)",
 ]
