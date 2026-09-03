@@ -711,64 +711,23 @@ struct DiffusionRunner: AsyncParsableCommand {
 
     // MARK: - Numpy Loader
 
+    /// Shape plus every element widened to `Float`, which is all the comparisons below need.
     struct NpyData {
         let shape: [Int]
         let data: [Float]
     }
 
+    /// Thin adapter over ``CoreAIShared/NpyArray``.
+    ///
+    /// The parsing used to live here. It had three ways to mislead: an unsupported dtype
+    /// (`float16` in particular, which a fp16 reference dump produces) fell through every
+    /// branch and returned silent zeros; Fortran-ordered files were read as row-major,
+    /// which yields plausible garbage rather than an error; and a truncated file trapped on
+    /// a range subscript. The shared reader rejects all three, and reads through a copied
+    /// `Data` slice rather than binding a possibly-unaligned pointer into the original.
     private func loadNpy(_ url: URL) throws -> NpyData {
-        let raw = try Data(contentsOf: url)
-        // Minimal .npy parser: magic, version, header_len, then FORTRAN header, then data
-        guard raw.count > 10, raw[0] == 0x93, raw[1] == 0x4E else {
-            throw CocoaError(.fileReadCorruptFile)
-        }
-        let version = raw[6]
-        let headerLen: Int
-        let headerStart: Int
-        if version == 1 {
-            headerLen = Int(raw[8]) | (Int(raw[9]) << 8)
-            headerStart = 10
-        } else {
-            headerLen = Int(raw[8]) | (Int(raw[9]) << 8) | (Int(raw[10]) << 16) | (Int(raw[11]) << 24)
-            headerStart = 12
-        }
-        let dataStart = headerStart + headerLen
-        let header = String(data: raw[headerStart..<dataStart], encoding: .ascii) ?? ""
-
-        // Parse shape from header: 'shape': (2, 4, 64, 64)
-        let shape = parseShape(from: header)
-
-        // Parse dtype
-        let isFloat32 = header.contains("f4") || header.contains("float32")
-        let isInt64 = header.contains("i8") || header.contains("int64")
-        let isInt32 = header.contains("i4") || header.contains("int32")
-
-        let elementCount = shape.reduce(1, *)
-        var floats = [Float](repeating: 0, count: elementCount)
-
-        raw.withUnsafeBytes { ptr in
-            let dataPtr = ptr.baseAddress! + dataStart
-            if isFloat32 {
-                let src = dataPtr.assumingMemoryBound(to: Float.self)
-                for i in 0..<elementCount { floats[i] = src[i] }
-            } else if isInt64 {
-                let src = dataPtr.assumingMemoryBound(to: Int64.self)
-                for i in 0..<elementCount { floats[i] = Float(src[i]) }
-            } else if isInt32 {
-                let src = dataPtr.assumingMemoryBound(to: Int32.self)
-                for i in 0..<elementCount { floats[i] = Float(src[i]) }
-            }
-        }
-
-        return NpyData(shape: shape, data: floats)
-    }
-
-    private func parseShape(from header: String) -> [Int] {
-        guard let start = header.range(of: "("),
-            let end = header.range(of: ")", range: start.upperBound..<header.endIndex)
-        else { return [] }
-        let shapeStr = header[start.upperBound..<end.lowerBound]
-        return shapeStr.split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+        let array = try NpyArray.load(url)
+        return NpyData(shape: array.shape, data: array.asFloat())
     }
 
     // MARK: - Helpers

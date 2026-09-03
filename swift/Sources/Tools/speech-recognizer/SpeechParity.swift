@@ -113,7 +113,7 @@ struct SpeechParity {
         defer { printCoverage(capture.stats.coverage) }
         guard compareTensors else {
             if compareTokens, let ref = try? reference("ref_tokens.npy") {
-                rows.append(tokenRow(actual: capture.tokens, ref: try ref.asInt32()))
+                rows.append(tokenRow(actual: capture.tokens, ref: ref.asInt32()))
             } else {
                 print("  token row skipped — reference tokens derive from those features")
             }
@@ -143,7 +143,7 @@ struct SpeechParity {
                             + "\(capture.encoderShape[1]) frames as real audio, ref has \(refFrames)",
                         ok: false))
             } else {
-                let refValues = try ref.asFloat()
+                let refValues = ref.asFloat()
                 let common = min(valid, refFrames)
                 var row = metricRow(
                     name: "encoder_hidden_states",
@@ -167,7 +167,7 @@ struct SpeechParity {
         }
 
         if let ref = try? reference("ref_tokens.npy") {
-            rows.append(tokenRow(actual: capture.tokens, ref: try ref.asInt32()))
+            rows.append(tokenRow(actual: capture.tokens, ref: ref.asInt32()))
         }
         rows.append(contentsOf: try firstStepRows(capture.stats.firstStep, resampled: resampled))
         return (rows, capture.text)
@@ -215,7 +215,7 @@ struct SpeechParity {
         ] {
             guard let ref = try? reference(file) else { continue }
             var row = metricRow(
-                name: name, actual: actual, ref: try ref.asFloat(),
+                name: name, actual: actual, ref: ref.asFloat(),
                 psnrFloor: psnr, cosineFloor: cosine)
             if resampled {
                 row.status +=
@@ -270,9 +270,7 @@ struct SpeechParity {
         guard let ref = try? reference("ref_input_features.npy") else {
             return ParityRow(name: name, status: "ref_input_features.npy missing", ok: false)
         }
-        guard let refValues = try? ref.asFloat() else {
-            return ParityRow(name: name, status: "could not read ref_input_features.npy", ok: false)
-        }
+        let refValues = ref.asFloat()
 
         var compared = actual
         var note = ""
@@ -513,119 +511,3 @@ private func cosineSimilarity(_ a: [Float], _ b: [Float]) -> Double {
 ///
 /// The image-segmenter and diffusion-runner tools each carry their own copy of this;
 /// a third is the consistent choice until one is promoted into a shared module.
-private struct NpyArray {
-    enum DType { case float16, float32, int32, int64 }
-    let shape: [Int]
-    let dtype: DType
-    let data: Data
-
-    static func load(_ url: URL) throws -> NpyArray {
-        let raw = try Data(contentsOf: url)
-        guard raw.count > 10, raw[0] == 0x93, raw[1] == 0x4E else {
-            throw ValidationError("not a .npy file: \(url.path)")
-        }
-        let headerLen: Int
-        let headerStart: Int
-        if raw[6] == 1 {
-            headerLen = Int(raw[8]) | (Int(raw[9]) << 8)
-            headerStart = 10
-        } else {
-            headerLen =
-                Int(raw[8]) | (Int(raw[9]) << 8) | (Int(raw[10]) << 16) | (Int(raw[11]) << 24)
-            headerStart = 12
-        }
-        let dataStart = headerStart + headerLen
-        let header = String(data: raw[headerStart..<dataStart], encoding: .ascii) ?? ""
-
-        // Reject column-major files rather than reading them as C-order. numpy writes
-        // `fortran_order: True` for any transposed view (a `permute` in the trace
-        // script is enough), and interpreting that as row-major yields plausible-looking
-        // garbage — near-zero cosine on data that is actually correct. Generators should
-        // pass the array through `np.ascontiguousarray` first.
-        if header.contains("'fortran_order': True") {
-            throw ValidationError(
-                "\(url.lastPathComponent) is Fortran-ordered; re-save it C-contiguous "
-                    + "(np.ascontiguousarray) — this reader only handles row-major data")
-        }
-
-        let dtype: DType
-        if header.contains("f2") {
-            dtype = .float16
-        } else if header.contains("f4") {
-            dtype = .float32
-        } else if header.contains("i4") {
-            dtype = .int32
-        } else if header.contains("i8") {
-            dtype = .int64
-        } else {
-            throw ValidationError("unsupported .npy dtype in \(url.lastPathComponent)")
-        }
-        return NpyArray(
-            shape: Self.parseShape(from: header),
-            dtype: dtype,
-            data: raw.subdata(in: dataStart..<raw.count))
-    }
-
-    private static func parseShape(from header: String) -> [Int] {
-        guard let start = header.range(of: "("),
-            let end = header.range(of: ")", range: start.upperBound..<header.endIndex)
-        else { return [] }
-        return header[start.upperBound..<end.lowerBound]
-            .split(separator: ",")
-            .compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
-    }
-
-    var count: Int { shape.reduce(1, *) }
-
-    func asFloat() throws -> [Float] {
-        let n = count
-        var out = [Float](repeating: 0, count: n)
-        data.withUnsafeBytes { ptr in
-            switch dtype {
-            case .float16:
-                #if !((os(macOS) || targetEnvironment(macCatalyst)) && arch(x86_64))
-                let src = ptr.bindMemory(to: Float16.self)
-                for i in 0..<n { out[i] = Float(src[i]) }
-                #else
-                fatalError("Float16 is not supported on this platform")
-                #endif
-            case .float32:
-                let src = ptr.bindMemory(to: Float.self)
-                for i in 0..<n { out[i] = src[i] }
-            case .int32:
-                let src = ptr.bindMemory(to: Int32.self)
-                for i in 0..<n { out[i] = Float(src[i]) }
-            case .int64:
-                let src = ptr.bindMemory(to: Int64.self)
-                for i in 0..<n { out[i] = Float(src[i]) }
-            }
-        }
-        return out
-    }
-
-    func asInt32() throws -> [Int32] {
-        let n = count
-        var out = [Int32](repeating: 0, count: n)
-        data.withUnsafeBytes { ptr in
-            switch dtype {
-            case .int32:
-                let src = ptr.bindMemory(to: Int32.self)
-                for i in 0..<n { out[i] = src[i] }
-            case .int64:
-                let src = ptr.bindMemory(to: Int64.self)
-                for i in 0..<n { out[i] = Int32(truncatingIfNeeded: src[i]) }
-            case .float32:
-                let src = ptr.bindMemory(to: Float.self)
-                for i in 0..<n { out[i] = Int32(src[i]) }
-            case .float16:
-                #if !((os(macOS) || targetEnvironment(macCatalyst)) && arch(x86_64))
-                let src = ptr.bindMemory(to: Float16.self)
-                for i in 0..<n { out[i] = Int32(src[i]) }
-                #else
-                fatalError("Float16 is not supported on this platform")
-                #endif
-            }
-        }
-        return out
-    }
-}
