@@ -292,7 +292,7 @@ struct ImageSegmenterCLI: AsyncParsableCommand {
 
         // Feed the model Python's tokens (apples-to-apples model parity — Swift
         // tokenizer drift is reported separately by the tokenizer row).
-        let pyTokens = try inputIdsArray.asInt32()
+        let pyTokens = inputIdsArray.asInt32()
         let batchSize = inputIdsArray.shape.first ?? 1
         let sequenceLength = inputIdsArray.shape.count > 1 ? inputIdsArray.shape[1] : pyTokens.count
         let batched = (0..<batchSize).map { batchIndex in
@@ -305,7 +305,7 @@ struct ImageSegmenterCLI: AsyncParsableCommand {
         // Build rows: tokenizer first, then preprocessing, then each model output.
         var rows: [ParityRow] = [
             tokenizerRow(swift: swiftTokens, py: Array(pyTokens.prefix(sequenceLength))),
-            metricRow(name: "pixel_values", actual: actualPixelValues, ref: try refPixelValues.asFloat()),
+            metricRow(name: "pixel_values", actual: actualPixelValues, ref: refPixelValues.asFloat()),
         ]
         for (name, actual) in [
             ("pred_masks", output.predictedMasks),
@@ -543,117 +543,7 @@ struct ImageSegmenterCLI: AsyncParsableCommand {
     }
     #endif
 
-    // MARK: - Parity helpers (.npy reader + CGImage builder + metrics)
-
-    /// Minimal .npy reader covering the dtypes this CLI consumes:
-    /// `float16` / `float32` (model outputs + pixel_values), `int32` (input_ids),
-    /// `uint8` (source_image).
-    private struct NpyArray {
-        enum DType { case float16, float32, int32, uint8 }
-        let shape: [Int]
-        let dtype: DType
-        let data: Data
-
-        static func load(_ url: URL) throws -> NpyArray {
-            let raw = try Data(contentsOf: url)
-            guard raw.count > 10, raw[0] == 0x93, raw[1] == 0x4E else {
-                throw ValidationError("Not a .npy file: \(url.path)")
-            }
-            let version = raw[6]
-            let headerLen: Int
-            let headerStart: Int
-            if version == 1 {
-                headerLen = Int(raw[8]) | (Int(raw[9]) << 8)
-                headerStart = 10
-            } else {
-                headerLen =
-                    Int(raw[8]) | (Int(raw[9]) << 8) | (Int(raw[10]) << 16) | (Int(raw[11]) << 24)
-                headerStart = 12
-            }
-            let dataStart = headerStart + headerLen
-            let header = String(data: raw[headerStart..<dataStart], encoding: .ascii) ?? ""
-
-            let dtype: DType
-            if header.contains("f2") {
-                dtype = .float16
-            } else if header.contains("f4") {
-                dtype = .float32
-            } else if header.contains("i4") {
-                dtype = .int32
-            } else if header.contains("u1") {
-                dtype = .uint8
-            } else {
-                throw ValidationError("Unsupported .npy dtype in \(url.lastPathComponent)")
-            }
-
-            return NpyArray(
-                shape: Self.parseShape(from: header),
-                dtype: dtype,
-                data: raw.subdata(in: dataStart..<raw.count)
-            )
-        }
-
-        private static func parseShape(from header: String) -> [Int] {
-            guard let start = header.range(of: "("),
-                let end = header.range(of: ")", range: start.upperBound..<header.endIndex)
-            else { return [] }
-            return header[start.upperBound..<end.lowerBound]
-                .split(separator: ",")
-                .compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
-        }
-
-        func asFloat() throws -> [Float] {
-            let n = shape.reduce(1, *)
-            var out = [Float](repeating: 0, count: n)
-            data.withUnsafeBytes { ptr in
-                switch dtype {
-                case .float16:
-                    #if !((os(macOS) || targetEnvironment(macCatalyst)) && arch(x86_64))
-                    let src = ptr.bindMemory(to: Float16.self)
-                    for i in 0..<n { out[i] = Float(src[i]) }
-                    #else
-                    fatalError("Float16 is not supported on this platform")
-                    #endif
-                case .float32:
-                    let src = ptr.bindMemory(to: Float.self)
-                    for i in 0..<n { out[i] = src[i] }
-                case .int32:
-                    let src = ptr.bindMemory(to: Int32.self)
-                    for i in 0..<n { out[i] = Float(src[i]) }
-                case .uint8:
-                    let src = ptr.bindMemory(to: UInt8.self)
-                    for i in 0..<n { out[i] = Float(src[i]) }
-                }
-            }
-            return out
-        }
-
-        func asInt32() throws -> [Int32] {
-            guard case .int32 = dtype else {
-                throw ValidationError("Cannot read \(dtype) as Int32")
-            }
-            let n = shape.reduce(1, *)
-            var out = [Int32](repeating: 0, count: n)
-            data.withUnsafeBytes { ptr in
-                let src = ptr.bindMemory(to: Int32.self)
-                for i in 0..<n { out[i] = src[i] }
-            }
-            return out
-        }
-
-        func asUInt8() throws -> [UInt8] {
-            guard case .uint8 = dtype else {
-                throw ValidationError("Cannot read \(dtype) as UInt8")
-            }
-            let n = shape.reduce(1, *)
-            var out = [UInt8](repeating: 0, count: n)
-            data.withUnsafeBytes { ptr in
-                let src = ptr.bindMemory(to: UInt8.self)
-                for i in 0..<n { out[i] = src[i] }
-            }
-            return out
-        }
-    }
+    // MARK: - Parity helpers (CGImage builder + metrics)
 
     /// Build a `CGImage` from an HWC RGB uint8 npy array. Used so the parity test
     /// exercises the same CGImage decode + ImagePreprocessor path as the normal

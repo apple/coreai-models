@@ -19,67 +19,26 @@ public struct VideoWriter {
     }
 
     /// Write frames to an MP4 file using AVFoundation.
+    ///
+    /// Convenience wrapper over ``StreamingVideoWriter`` for callers that already hold
+    /// every frame. Anything producing frames incrementally should use that directly and
+    /// avoid materializing the array.
     public static func writeMP4(
         frames: [CGImage],
         fps: Int,
         to outputURL: URL
     ) async throws {
         guard let firstFrame = frames.first else { return }
-        let width = firstFrame.width
-        let height = firstFrame.height
-
-        // Remove existing file
-        try? FileManager.default.removeItem(at: outputURL)
-
-        let writer = try AVAssetWriter(outputURL: outputURL, fileType: .mp4)
-        let settings: [String: Any] = [
-            AVVideoCodecKey: AVVideoCodecType.h264,
-            AVVideoWidthKey: width,
-            AVVideoHeightKey: height,
-        ]
-        let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
-        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
-            assetWriterInput: input,
-            sourcePixelBufferAttributes: [
-                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32ARGB,
-                kCVPixelBufferWidthKey as String: width,
-                kCVPixelBufferHeightKey as String: height,
-            ]
+        let writer = try StreamingVideoWriter(
+            url: outputURL,
+            width: firstFrame.width,
+            height: firstFrame.height,
+            frameRate: fps
         )
-
-        writer.add(input)
-        writer.startWriting()
-        writer.startSession(atSourceTime: .zero)
-
-        let frameDuration = CMTime(value: 1, timescale: CMTimeScale(fps))
-
-        for (i, frame) in frames.enumerated() {
-            while !input.isReadyForMoreMediaData {
-                try await Task.sleep(for: .milliseconds(10))
-            }
-            guard let pool = adaptor.pixelBufferPool else { continue }
-            var pixelBuffer: CVPixelBuffer?
-            CVPixelBufferPoolCreatePixelBuffer(nil, pool, &pixelBuffer)
-            guard let buffer = pixelBuffer else { continue }
-
-            CVPixelBufferLockBaseAddress(buffer, [])
-            let ctx = CGContext(
-                data: CVPixelBufferGetBaseAddress(buffer),
-                width: width, height: height,
-                bitsPerComponent: 8,
-                bytesPerRow: CVPixelBufferGetBytesPerRow(buffer),
-                space: CGColorSpaceCreateDeviceRGB(),
-                bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue
-            )
-            ctx?.draw(frame, in: CGRect(x: 0, y: 0, width: width, height: height))
-            CVPixelBufferUnlockBaseAddress(buffer, [])
-
-            let presentationTime = CMTime(value: CMTimeValue(i), timescale: frameDuration.timescale)
-            adaptor.append(buffer, withPresentationTime: presentationTime)
+        for frame in frames {
+            try await writer.append(frame)
         }
-
-        input.markAsFinished()
-        await writer.finishWriting()
+        try await writer.finish()
     }
 
     /// Write frames as an animated GIF.
@@ -218,6 +177,10 @@ public struct VideoWriter {
 public enum VideoWriterError: Error, LocalizedError {
     case cannotCreateDestination
     case finalizationFailed
+    case invalidDimensions(width: Int, height: Int)
+    case invalidFrameRate(Int)
+    case writeAfterFinish
+    case writeFailed(Error?)
 
     public var errorDescription: String? {
         switch self {
@@ -225,6 +188,14 @@ public enum VideoWriterError: Error, LocalizedError {
             return "Failed to create image destination for video output"
         case .finalizationFailed:
             return "Failed to finalize video output"
+        case .invalidDimensions(let width, let height):
+            return "Video dimensions must be positive; got \(width)×\(height)"
+        case .invalidFrameRate(let frameRate):
+            return "Video frame rate must be positive; got \(frameRate)"
+        case .writeAfterFinish:
+            return "Cannot append frames after finish() has been called"
+        case .writeFailed(let underlying):
+            return "Video encoding failed: \(underlying?.localizedDescription ?? "unknown error")"
         }
     }
 }
