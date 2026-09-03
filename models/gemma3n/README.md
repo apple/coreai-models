@@ -73,8 +73,6 @@ Perplexity score on the [`WikiText-2`](https://huggingface.co/datasets/EleutherA
 | gemma-3n-E4B    | none (`bfloat16`)                 | 16.00 | macOS    | 9.83             |
 | gemma-3n-E4B    | [4-bit quantized][presets-info]   | 4.50  | macOS    | 12.46            |
 
-Note: Perplexity is measured on base (non-instruct) models. Instruction-tuned models have
-artificially high wikitext perplexity (~30 for E2B-it) because their probability distribution
-is optimized for dialogue, not raw text prediction.
+Note: Perplexity is measured on base (non-instruct) models only.
 
 [presets-info]: ../README.md#quantization-options
