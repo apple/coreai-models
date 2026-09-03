@@ -98,6 +98,7 @@ LLM_PRESETS: list[ModelPreset] = [
         notes="INT4 per-block weights and INT8 per-tensor KV cache.",
     ),
     ModelPreset("qwen3-0.6b", "Qwen/Qwen3-0.6B", "qwen3", "llm", "macOS", "4bit", "float16", 8192),
+    ModelPreset("qwen3-1.7b", "Qwen/Qwen3-1.7B", "qwen3", "llm", "macOS", "4bit", "float16", 32768),
     ModelPreset("qwen3-4b", "Qwen/Qwen3-4B", "qwen3", "llm", "macOS", "4bit", "float16", 40960),
     ModelPreset(
         "qwen3-4b-8bit-kv",
@@ -143,6 +144,16 @@ LLM_PRESETS: list[ModelPreset] = [
         "4bit",
         "float16",
         8192,
+    ),
+    ModelPreset(
+        "mistral-7b-instruct-v0.3",
+        "mistralai/Mistral-7B-Instruct-v0.3",
+        "mistral",
+        "llm",
+        "iOS",
+        "4bit_weight_palettized_group8",
+        "float16",
+        IOS_DEFAULT_MAX_CONTEXT_LENGTH,
     ),
     ModelPreset(
         "mixtral-8x7b-instruct-v0.1",
@@ -309,6 +320,17 @@ LLM_PRESETS: list[ModelPreset] = [
         "4bit_weight_palettized_group8",
         "float16",
         IOS_DEFAULT_MAX_CONTEXT_LENGTH,
+    ),
+    ModelPreset(
+        "qwen3-1.7b",
+        "Qwen/Qwen3-1.7B",
+        "qwen3",
+        "llm",
+        "iOS",
+        "none",
+        "float16",
+        IOS_DEFAULT_MAX_CONTEXT_LENGTH,
+        compression_config="models/qwen3/qwen3_1_7b_6bit.yaml",
     ),
     ModelPreset(
         "qwen3-4b",
