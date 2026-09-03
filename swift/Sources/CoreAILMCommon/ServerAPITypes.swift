@@ -357,7 +357,11 @@ public struct ChatCompletionChunk: Encodable, Sendable {
         public let content: String?
         public let reasoningContent: String?
         public let toolCalls: [ToolCallDelta]?
-        public init(role: String? = nil, content: String? = nil, reasoningContent: String? = nil, toolCalls: [ToolCallDelta]? = nil) {
+        public init(
+            role: String? = nil, content: String? = nil,
+            reasoningContent: String? = nil,
+            toolCalls: [ToolCallDelta]? = nil
+        ) {
             self.role = role
             self.content = content
             self.reasoningContent = reasoningContent

@@ -302,7 +302,11 @@ private func handleNonStreamingRequest(chatRequest: ChatCompletionRequest, state
         choices: [
             .init(
                 index: 0,
-                message: .init(role: "assistant", content: responseContent, reasoningContent: responseReasoningContent, toolCalls: responseToolCalls),
+                message: .init(
+                    role: "assistant", content: responseContent,
+                    reasoningContent: responseReasoningContent,
+                    toolCalls: responseToolCalls
+                ),
                 finishReason: finishReason
             )
         ],
