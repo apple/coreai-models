@@ -3,7 +3,7 @@
 # Use of this source code is governed by a BSD-3-clause license that can
 # be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
-"""Muse Glimmer ViT-G/14 vision encoder for CoreAI export.
+"""Muse Glimmer ViT-G/14 vision encoder for Core AI export.
 
 Standalone re-implementation of the Muse Glimmer perception encoder that
 loads directly from the HF safetensors checkpoint.  The text decoder lives
