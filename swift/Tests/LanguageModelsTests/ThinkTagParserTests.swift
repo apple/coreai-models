@@ -245,7 +245,7 @@ struct ThinkTagParserDetectionTests {
             "<think>": 100, "</think>": 101,
             "<eos>": 2,
         ])
-        let format = CoreAILanguageModel.CoreAIExecutor.detectThinkingFormat(using: tokenizer)
+        let format = detectThinkingFormat(using: tokenizer)
         guard case .tagPair(let open, let close) = format else {
             Issue.record("Expected .tagPair, got \(format)")
             return
@@ -261,7 +261,7 @@ struct ThinkTagParserDetectionTests {
             "<|message|>": 202,
             "<eos>": 2,
         ])
-        let format = CoreAILanguageModel.CoreAIExecutor.detectThinkingFormat(using: tokenizer)
+        let format = detectThinkingFormat(using: tokenizer)
         guard case .agentic(let selfM, let userM, let eom, let eot) = format else {
             Issue.record("Expected .agentic, got \(format)")
             return
@@ -278,7 +278,7 @@ struct ThinkTagParserDetectionTests {
             "<|reasoning_start|>": 300, "<|reasoning_end|>": 301,
             "<eos>": 2,
         ])
-        let format = CoreAILanguageModel.CoreAIExecutor.detectThinkingFormat(using: tokenizer)
+        let format = detectThinkingFormat(using: tokenizer)
         guard case .tagPair(let open, let close) = format else {
             Issue.record("Expected .tagPair, got \(format)")
             return
@@ -290,7 +290,7 @@ struct ThinkTagParserDetectionTests {
     @Test("Plain tokenizer (no special tokens) falls back to <think>")
     func fallbackToThinkTags() {
         let tokenizer = MockTokenizer(vocab: ["<eos>": 2])
-        let format = CoreAILanguageModel.CoreAIExecutor.detectThinkingFormat(using: tokenizer)
+        let format = detectThinkingFormat(using: tokenizer)
         guard case .tagPair(let open, let close) = format else {
             Issue.record("Expected .tagPair, got \(format)")
             return
@@ -307,7 +307,7 @@ struct ThinkTagParserDetectionTests {
             "<|message|>": 202,
             "<eos>": 2,
         ])
-        let format = CoreAILanguageModel.CoreAIExecutor.detectThinkingFormat(using: tokenizer)
+        let format = detectThinkingFormat(using: tokenizer)
         guard case .agentic = format else {
             Issue.record("Expected .agentic (priority), got \(format)")
             return
@@ -320,7 +320,7 @@ struct ThinkTagParserDetectionTests {
             "<|eom|>": 200, "<|eot|>": 201,
             "<eos>": 2,
         ])
-        let format = CoreAILanguageModel.CoreAIExecutor.detectThinkingFormat(using: tokenizer)
+        let format = detectThinkingFormat(using: tokenizer)
         guard case .tagPair = format else {
             Issue.record("Expected .tagPair fallback, got \(format)")
             return
