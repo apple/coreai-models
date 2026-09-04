@@ -543,3 +543,134 @@ class MuseGlimmerForCausalLM(BaseForCausalLM):
         super().load_state_dict(state_dict, strict=strict, assign=assign)
         if getattr(self.config, "tie_word_embeddings", False):
             self.lm_head.weight = self.model.embed_tokens.weight
+
+
+# ---------------------------------------------------------------------------
+# DFlash speculative decoding: fused target + drafter encoder
+# ---------------------------------------------------------------------------
+
+# Output of every 12th layer in the 52-layer target.
+_DEFAULT_TARGET_LAYER_IDS: list[int] = [1, 13, 25, 37, 49]
+
+
+class MuseGlimmerModelWithDrafter(MuseGlimmerModel):
+    """Backbone that also returns hidden states at selected layers.
+
+    The forward signature returns a *tuple*
+    ``(final_hidden, extracted_hidden_states)`` where the second element
+    is a list of ``[1, query_len, hidden_size]`` tensors, one per tap layer.
+    """
+
+    def __init__(self, config, target_layer_ids: list[int] | None = None) -> None:
+        super().__init__(config)
+        self.target_layer_ids: list[int] = (
+            target_layer_ids
+            if target_layer_ids is not None
+            else list(getattr(config, "target_layer_ids", _DEFAULT_TARGET_LAYER_IDS))
+        )
+        self._tap_set = frozenset(self.target_layer_ids)
+
+    # NOTE: keep forward logic in sync with MuseGlimmerModel.forward.
+    def forward(  # type: ignore[override]
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.IntTensor,
+        global_cache: KVCache | None = None,
+        sliding_cache: RingKVCache | None = None,
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        query_len = input_ids.shape[-1]
+        seq_len = position_ids.shape[-1]
+        torch._check_is_size(query_len)
+        torch._check_is_size(seq_len)
+        offset = seq_len - query_len
+        torch._check_is_size(offset)
+
+        h = self.embed_tokens(input_ids)
+        h = h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + self.config.rms_norm_eps)
+
+        sliding_mask = None
+        if sliding_cache is not None:
+            sliding_mask = ring_window_causal_mask(
+                query_len,
+                sliding_cache.capacity(),
+                offset,
+                self.sliding_window,
+                input_ids.device,
+            )
+
+        extracted: list[torch.Tensor] = []
+
+        for idx, layer in enumerate(self.layers):
+            h = layer(
+                h,
+                position_ids,
+                offset,
+                query_len,
+                global_cache,
+                sliding_cache,
+                sliding_mask,
+            )
+            if idx in self._tap_set:
+                extracted.append(h)
+
+        h = self.norm(h)
+        if self.output_multiplier != 1.0:
+            h = h * self.output_multiplier
+        return h, extracted
+
+
+class MuseGlimmerForCausalLMWithDrafter(MuseGlimmerForCausalLM):
+    """Fused target + drafter encoder: produces ``(logits, drafter_features)``.
+
+    The drafter encoder is a simple linear projection + RMSNorm:
+        features = encoder_norm(encoder_fc(cat(h_layer1, h_layer13, ...)))
+    """
+
+    @override
+    def _init_model(self, config) -> None:
+        super()._init_model(config)
+        target_layer_ids = list(getattr(config, "target_layer_ids", _DEFAULT_TARGET_LAYER_IDS))
+        self.model = MuseGlimmerModelWithDrafter(config, target_layer_ids=target_layer_ids)
+
+        encoder_in = len(target_layer_ids) * config.hidden_size
+        encoder_out = getattr(config, "drafter_hidden_size", config.hidden_size)
+        self.encoder_fc = nn.Linear(encoder_in, encoder_out, bias=False)
+        self.encoder_norm = RMSNorm(encoder_out, eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.IntTensor,
+        global_k_cache: torch.Tensor,
+        global_v_cache: torch.Tensor,
+        sliding_k_cache: torch.Tensor,
+        sliding_v_cache: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        global_cache = KVCache(global_k_cache, global_v_cache)
+        sliding_cache = RingKVCache(sliding_k_cache, sliding_v_cache)
+        hidden, extracted = self.model(input_ids, position_ids, global_cache, sliding_cache)
+
+        logits = self.lm_head(hidden)
+        if self._softcap:
+            logits = torch.tanh(logits / self._softcap) * self._softcap
+
+        fused = self.encoder_fc(torch.cat(extracted, dim=-1))
+        drafter_features = self.encoder_norm(fused)
+
+        return logits, drafter_features
+
+    @override
+    @classmethod
+    def export_output_names(cls) -> dict[str, tuple[str, ...]]:
+        return {MAIN_GRAPH_NAME: ("logits", "drafter_features")}
+
+    @override
+    def _mutate_state_dict(self, state_dict: dict[str, torch.Tensor]) -> None:
+        super()._mutate_state_dict(state_dict)
+        encoder_renames = {
+            "encoder.fc.weight": "encoder_fc.weight",
+            "encoder.output_norm_enc.weight": "encoder_norm.weight",
+        }
+        for old_key, new_key in encoder_renames.items():
+            if old_key in state_dict:
+                state_dict[new_key] = state_dict.pop(old_key)
