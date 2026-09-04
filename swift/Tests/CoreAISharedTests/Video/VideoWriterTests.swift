@@ -19,15 +19,7 @@ import Testing
 @Suite("VideoWriter batch API")
 struct VideoWriterTests {
     private func frame(width: Int, height: Int, grey: UInt8) -> CGImage {
-        let context = CGContext(
-            data: nil, width: width, height: height,
-            bitsPerComponent: 8, bytesPerRow: width * 4,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
-        let level = CGFloat(grey) / 255
-        context.setFillColor(red: level, green: level, blue: level, alpha: 1)
-        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
-        return context.makeImage()!
+        VideoTestSupport.solidFrame(width: width, height: height, grey: grey)
     }
 
     private func temporaryURL(_ suffix: String) -> URL {
@@ -139,56 +131,16 @@ struct VideoWriterTests {
 /// preserve dimensions.
 @Suite("Video round trip")
 struct VideoRoundTripTests {
-    /// A solid-colour frame, so codec loss can't be confused with a frame-ordering bug.
     private func frame(width: Int, height: Int, grey: UInt8) -> CGImage {
-        let context = CGContext(
-            data: nil, width: width, height: height,
-            bitsPerComponent: 8, bytesPerRow: width * 4,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
-        let level = CGFloat(grey) / 255
-        context.setFillColor(red: level, green: level, blue: level, alpha: 1)
-        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
-        return context.makeImage()!
+        VideoTestSupport.solidFrame(width: width, height: height, grey: grey)
     }
 
-    /// Black on the left, `grey` on the right. The vertical edge is the point: a wrong row
-    /// stride in the writer shears each row sideways and turns that edge into a diagonal.
     private func splitFrame(width: Int, height: Int, grey: UInt8) -> CGImage {
-        let context = CGContext(
-            data: nil, width: width, height: height,
-            bitsPerComponent: 8, bytesPerRow: width * 4,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
-        context.setFillColor(red: 0, green: 0, blue: 0, alpha: 1)
-        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
-        let level = CGFloat(grey) / 255
-        context.setFillColor(red: level, green: level, blue: level, alpha: 1)
-        context.fill(CGRect(x: width / 2, y: 0, width: width - width / 2, height: height))
-        return context.makeImage()!
+        VideoTestSupport.splitFrame(width: width, height: height, grey: grey)
     }
 
-    /// Mean of the RGB channels over `columns`, across every row.
     private func meanGrey(of image: CGImage, columns: Range<Int>) -> Int {
-        let width = image.width
-        let height = image.height
-        var pixels = [UInt8](repeating: 0, count: width * height * 4)
-        pixels.withUnsafeMutableBytes { raw in
-            let context = CGContext(
-                data: raw.baseAddress, width: width, height: height,
-                bitsPerComponent: 8, bytesPerRow: width * 4,
-                space: CGColorSpaceCreateDeviceRGB(),
-                bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
-            context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
-        }
-        var total = 0
-        for y in 0..<height {
-            for x in columns {
-                let offset = y * width * 4 + x * 4
-                total += Int(pixels[offset]) + Int(pixels[offset + 1]) + Int(pixels[offset + 2])
-            }
-        }
-        return total / (height * columns.count * 3)
+        VideoTestSupport.meanGrey(of: image, columns: columns)
     }
 
     @Test("Every frame written comes back, in order, at the same size")
