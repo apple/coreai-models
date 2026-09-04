@@ -673,6 +673,7 @@ class MuseGlimmerForCausalLMWithDrafter(MuseGlimmerForCausalLM):
         }
         for old_key, new_key in encoder_renames.items():
             if old_key in state_dict:
+                state_dict[new_key] = state_dict.pop(old_key)
 
 
 # ---------------------------------------------------------------------------
