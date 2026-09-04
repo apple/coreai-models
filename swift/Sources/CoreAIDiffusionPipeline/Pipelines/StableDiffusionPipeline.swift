@@ -115,7 +115,11 @@ public struct StableDiffusionPipeline: DiffusionPipeline {
         let batchedEmbShape = [2, 77, textEmbeddings.count / 77]
 
         for (step, timeStep) in schedule.timeSteps.enumerated() {
-            let progress = PipelineProgress(step: step, totalSteps: schedule.timeSteps.count, currentLatent: nil)
+            var previewND = NDArray(shape: latentShape, scalarType: .float32)
+            previewND.mutableView(as: Float.self).withUnsafeMutablePointer { ptr, _, _ in
+                for i in 0..<latents.count { ptr[i] = latents[i] }
+            }
+            let progress = PipelineProgress(step: step, totalSteps: schedule.timeSteps.count, currentLatent: previewND)
             if !progressHandler(progress) { break }
 
             // CFG: batch latents [2, 4, H, W]

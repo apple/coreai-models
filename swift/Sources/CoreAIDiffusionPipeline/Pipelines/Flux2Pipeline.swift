@@ -422,7 +422,14 @@ public struct Flux2Pipeline: DiffusionPipeline {
 
             packedLatents = scheduler.step(output: output, timeStep: t, sample: packedLatents)
 
-            let progress = PipelineProgress(step: step + 1, totalSteps: steps, currentLatent: nil)
+            // Unpack to spatial for preview: (B, H*W, C) → (B, C, H, W)
+            let previewSpatial = unpackLatentsSpatialFlatten(
+                packedLatents, channels: inChannels, height: spatialSide, width: spatialSide)
+            var previewND = NDArray(shape: [1, inChannels, spatialSide, spatialSide], scalarType: .float32)
+            previewND.mutableView(as: Float.self).withUnsafeMutablePointer { ptr, _, _ in
+                for i in 0..<previewSpatial.count { ptr[i] = previewSpatial[i] }
+            }
+            let progress = PipelineProgress(step: step + 1, totalSteps: steps, currentLatent: previewND)
             if !progressHandler(progress) { break }
         }
 

@@ -141,7 +141,11 @@ public struct SD3Pipeline: DiffusionPipeline {
 
             latents = scheduler.step(output: guided, timeStep: t, sample: latents)
 
-            let progress = PipelineProgress(step: step + 1, totalSteps: steps, currentLatent: nil)
+            var previewND = NDArray(shape: latentShape, scalarType: .float32)
+            previewND.mutableView(as: Float.self).withUnsafeMutablePointer { ptr, _, _ in
+                for i in 0..<latents.count { ptr[i] = latents[i] }
+            }
+            let progress = PipelineProgress(step: step + 1, totalSteps: steps, currentLatent: previewND)
             if !progressHandler(progress) { break }
         }
 
