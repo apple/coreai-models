@@ -44,7 +44,7 @@ public struct CoreAILanguageModel: LanguageModel {
     fileprivate let bundle: LanguageBundle
     fileprivate let tokenizer: any Tokenizer
     fileprivate let thinkingFormat: ThinkTagParser.Format
-    fileprivate let toolCallMarkers: (open: String, close: String)?
+    fileprivate let toolCallDetection: ToolCallDetection?
     private let supportsToolCalling: Bool
     fileprivate let supportsReasoning: Bool
     fileprivate let resources: ModelResources
@@ -131,8 +131,8 @@ public struct CoreAILanguageModel: LanguageModel {
         tokenizer: any Tokenizer,
         resources: ModelResources
     ) {
-        let toolCallMarkers = CoreAIExecutor.detectToolCallMarkers(using: tokenizer)
-        let thinkingFormat = CoreAIExecutor.detectThinkingFormat(using: tokenizer)
+        let toolCallDetection = detectToolCallFormat(using: tokenizer)
+        let thinkingFormat = detectThinkingFormat(using: tokenizer)
         self.url = configuration.url
         self.variant = configuration.variant
         self.kvCacheStrategy = configuration.kvCacheStrategy
@@ -140,8 +140,8 @@ public struct CoreAILanguageModel: LanguageModel {
         self.bundle = bundle
         self.tokenizer = tokenizer
         self.thinkingFormat = thinkingFormat
-        self.toolCallMarkers = toolCallMarkers
-        self.supportsToolCalling = toolCallMarkers != nil
+        self.toolCallDetection = toolCallDetection
+        self.supportsToolCalling = toolCallDetection != nil
         self.supportsReasoning = {
             switch thinkingFormat {
             case .agentic: return true
@@ -218,72 +218,6 @@ public struct CoreAILanguageModel: LanguageModel {
 
         public init(configuration: Configuration) throws {
             self.resources = ModelResources.shared(for: configuration)
-        }
-
-        /// Probes the tokenizer for known reasoning formats. Supports both
-        /// tag-pair models (symmetric open/close markers) and agentic models
-        /// that use message routing for chain-of-thought.
-        static func detectThinkingFormat(
-            using tokenizer: any Tokenizer
-        ) -> ThinkTagParser.Format {
-            // Agentic format: to=self/to=user message routing with eom/eot
-            if tokenizer.convertTokenToId("<|eom|>") != nil,
-                tokenizer.convertTokenToId("<|eot|>") != nil,
-                tokenizer.convertTokenToId("<|message|>") != nil
-            {
-                return .agentic(
-                    selfMarker: "to=self<|message|>",
-                    userMarker: "to=user<|message|>",
-                    endOfMessage: "<|eom|>",
-                    endOfTurn: "<|eot|>"
-                )
-            }
-
-            // Tag-pair format: symmetric open/close markers
-            let candidates: [(open: String, close: String)] = [
-                ("<think>", "</think>"),
-                ("<|reasoning_start|>", "<|reasoning_end|>"),
-            ]
-            for pair in candidates {
-                if tokenizer.convertTokenToId(pair.open) != nil,
-                    tokenizer.convertTokenToId(pair.close) != nil
-                {
-                    return .tagPair(open: pair.open, close: pair.close)
-                }
-            }
-            return .tagPair(open: "<think>", close: "</think>")
-        }
-
-        /// Probes the tokenizer for known tool call marker pairs. Each
-        /// candidate tag-pair is verified to exist as special tokens via
-        /// `convertTokenToId(_:)`. Returns nil when the model's tokenizer
-        /// has no tool call tokens at all.
-        ///
-        /// Mistral uses `[TOOL_CALLS]` as a single special token with no
-        /// paired close token; `"\n"` is used as a synthetic close because
-        /// the JSON array is always emitted on a single line. The open marker
-        /// matches the bare token without a trailing space — `parseToolCalls`
-        /// already trims leading whitespace so optional spacing is handled.
-        fileprivate static func detectToolCallMarkers(
-            using tokenizer: any Tokenizer
-        ) -> (open: String, close: String)? {
-            // Standard tag-pair formats — both markers must be special tokens.
-            let tagPairs: [(open: String, close: String)] = [
-                ("<tool_call>", "</tool_call>"),
-                ("<function_calls>", "</function_calls>"),
-            ]
-            for pair in tagPairs
-            where tokenizer.convertTokenToId(pair.open) != nil
-                && tokenizer.convertTokenToId(pair.close) != nil
-            {
-                return pair
-            }
-            // Mistral: [TOOL_CALLS] is a special token but has no paired close token.
-            // Use "\n" as a synthetic close — the JSON array is always on a single line.
-            if tokenizer.convertTokenToId("[TOOL_CALLS]") != nil {
-                return (open: "[TOOL_CALLS]", close: "\n")
-            }
-            return nil
         }
 
         // MARK: - Prewarm (FoundationModels, synchronous)
@@ -406,8 +340,8 @@ public struct CoreAILanguageModel: LanguageModel {
             var thinkParser = ThinkTagParser(format: model.thinkingFormat)
             // Routes tool call markup to .toolCalls(...) channel events.
             // nil when the model's tokenizer has no tool call tokens.
-            var toolCallParser: ToolCallParser? = model.toolCallMarkers.map {
-                ToolCallParser(openMarker: $0.open, closeMarker: $0.close)
+            var toolCallParser: ToolCallParser? = model.toolCallDetection.map {
+                ToolCallParser(openMarker: $0.openMarker, closeMarker: $0.closeMarker, format: $0.format)
             }
             var generatedTokenCount: Int = 0
             var reasoningTokenCount: Int = 0

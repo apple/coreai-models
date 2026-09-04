@@ -134,7 +134,7 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
         // 3. Check added_tokens_decoder for turn-ending special tokens
         //    (e.g. Gemma's <end_of_turn> ID 106, Qwen's <|im_end|>)
         //    Only include tokens whose content matches known turn-ending patterns.
-        let turnEndPatterns = ["end_of_turn", "im_end", "eot_id", "endoftext", "eot_token"]
+        let turnEndPatterns = ["end_of_turn", "im_end", "eot_id", "endoftext", "eot_token", "|eot|"]
         if let addedTokens = json["added_tokens_decoder"] as? [String: Any] {
             for (idString, value) in addedTokens {
                 guard let dict = value as? [String: Any],

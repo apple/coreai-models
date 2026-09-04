@@ -6,7 +6,7 @@ Mistral AI's Mistral models for on-device inference via Core AI.
 
 | Model               | Parameters | macOS | iOS |
 | ------------------- | ---------- | ----- | --- |
-| Mistral 7B Instruct | 7.0B       | Yes   | No  |
+| Mistral 7B Instruct | 7.0B       | Yes   | Yes |
 
 ## Setup to export models
 
@@ -26,6 +26,9 @@ uv run coreai.llm.export mistralai/Mistral-7B-Instruct-v0.3
 ```bash
 # Full precision
 uv run coreai.llm.export mistralai/Mistral-7B-Instruct-v0.3 --compression none
+
+# iOS variant
+uv run coreai.llm.export mistralai/Mistral-7B-Instruct-v0.3 --platform iOS
 
 # Custom output directory
 uv run coreai.llm.export mistralai/Mistral-7B-Instruct-v0.3 --output-dir ./my-models/
@@ -51,6 +54,8 @@ let response = try await session.respond(to: "What is quantum computing?")
 print(response)
 ```
 
+> **iOS memory requirement:** This model may exceed memory limit when running from an iOS app. If that's the case, try adding the ([increased memory limit](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.developer.kernel.increased-memory-limit)) to your app's entitlements.
+
 ### On your Mac using built-in Command Line Tool
 
 ```bash
@@ -73,5 +78,9 @@ Perplexity score on the [`WikiText-2`](https://huggingface.co/datasets/EleutherA
 | ------------------- | ------------------------------------------ | --------------------- | -------- | ---------------- |
 | Mistral 7B Instruct | none (`float16`)                           | 16.00                 | macOS    | 8.29             |
 | Mistral 7B Instruct | [4-bit quantized][p-4bit]                  | 4.50                  | macOS    | 8.41             |
+| Mistral 7B Instruct | none (`float16`)                           | 16.00                 | iOS      | 8.29             |
+| Mistral 7B Instruct | [4-bit palettized (group size 8)][p-4bit]  | 4.11\*                | iOS      | 9.81             |
+
+\* BPW is computed from exported asset size and includes the INT8 per-tensor quantized embedding.
 
 [p-4bit]: ../README.md#quantization-options

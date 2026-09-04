@@ -118,6 +118,7 @@ def _get_registry() -> dict[str, ModelEntry]:
     from coreai_models.models.ios.qwen2 import Qwen2ForCausalLMForiOS
     from coreai_models.models.ios.qwen3 import Qwen3ForCausalLMForiOS
     from coreai_models.models.macos.gemma3_text import Gemma3ForCausalLM
+    from coreai_models.models.macos.gemma3n import Gemma3nForCausalLM
     from coreai_models.models.macos.gpt_oss import GptOssForCausalLM
     from coreai_models.models.macos.mistral import MistralForCausalLM
     from coreai_models.models.macos.mixtral import MixtralForCausalLM
@@ -136,6 +137,11 @@ def _get_registry() -> dict[str, ModelEntry]:
             macos_class=Gemma3ForCausalLM,
             hf_config_attr="text_config",
             hf_state_dict_prefix="language_model.",
+        ),
+        "gemma3n_text": ModelEntry(
+            macos_class=Gemma3nForCausalLM,
+            hf_config_attr="text_config",
+            hf_state_dict_prefix="model.language_model.",
         ),
         "gpt_oss": ModelEntry(
             macos_class=GptOssForCausalLM,
@@ -190,6 +196,7 @@ def _get_registry() -> dict[str, ModelEntry]:
 # Type alias for the remapping dict
 MODEL_TYPE_REMAPPING: dict[str, str] = {
     "gemma3": "gemma3_text",
+    "gemma3n": "gemma3n_text",
     "muse_glimmer": "muse_glimmer_text",
     "qwen2_5": "qwen2",
 }

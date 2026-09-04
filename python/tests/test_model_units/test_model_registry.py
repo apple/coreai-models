@@ -110,6 +110,24 @@ def test_output_name_llm_iOS_uses_yaml_stem_when_compression_config_set() -> Non
     assert _preset_to_output_name(p) == "qwen3_0_6b_mixed_4bit_8bit_static"
 
 
+@pytest.mark.parametrize(
+    ("short_name", "expected"),
+    [
+        (
+            "mistral-7b-instruct-v0.3",
+            "mistral_7b_instruct_v0_3_4bit_weight_palettized_group8_static",
+        ),
+    ],
+)
+def test_output_name_llm_iOS_uses_named_preset_when_no_compression_config(
+    short_name: str, expected: str
+) -> None:
+    """Without a YAML config the iOS name is `<hf_tail>_<compression>_static`."""
+    p = lookup_preset(short_name, model_type="llm", variant="iOS")
+    assert p.compression_config is None
+    assert _preset_to_output_name(p) == expected
+
+
 def test_output_name_llm_iOS_prepends_hf_tail_when_yaml_stem_lacks_it() -> None:
     """A generic recipe stem (no model prefix) must still get the hf tail
     prepended so exports of different models with the same recipe don't
