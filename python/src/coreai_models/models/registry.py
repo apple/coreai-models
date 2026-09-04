@@ -115,6 +115,7 @@ class ModelEntry:
 def _get_registry() -> dict[str, ModelEntry]:
     """Build the model registry (cached singleton). Lazy imports to avoid circular deps."""
     from coreai_models.models.ios.mistral import MistralForCausalLMForiOS
+    from coreai_models.models.ios.olmo2 import Olmo2ForCausalLMForiOS
     from coreai_models.models.ios.qwen2 import Qwen2ForCausalLMForiOS
     from coreai_models.models.ios.qwen3 import Qwen3ForCausalLMForiOS
     from coreai_models.models.macos.gemma3_text import Gemma3ForCausalLM
@@ -123,6 +124,7 @@ def _get_registry() -> dict[str, ModelEntry]:
     from coreai_models.models.macos.mixtral import MixtralForCausalLM
     from coreai_models.models.macos.muse_glimmer import MuseGlimmerForCausalLM
     from coreai_models.models.macos.muse_glimmer_drafter_ring import MuseGlimmerDrafterForCausalLM
+    from coreai_models.models.macos.olmo2 import Olmo2ForCausalLM
     from coreai_models.models.macos.phi3 import Phi3ForCausalLM
     from coreai_models.models.macos.qwen2 import Qwen2ForCausalLM
     from coreai_models.models.macos.qwen3 import Qwen3ForCausalLM
@@ -146,6 +148,10 @@ def _get_registry() -> dict[str, ModelEntry]:
         ),
         "mixtral": ModelEntry(
             macos_class=MixtralForCausalLM,
+        ),
+        "olmo2": ModelEntry(
+            macos_class=Olmo2ForCausalLM,
+            ios_class=Olmo2ForCausalLMForiOS,
         ),
         "muse_glimmer_text": ModelEntry(
             macos_class=MuseGlimmerForCausalLM,
