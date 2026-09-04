@@ -773,7 +773,7 @@ class MuseGlimmerForCausalLMEmbeddings(BaseForCausalLM):
         hf_state_dict_prefix: str = "model.language_model.",
         disable_embedding_quantization: bool = False,
     ) -> Self:
-        """Load text decoder weights shard-by-shard, skipping the vision encoder and embed_tokens."""
+        """Load text decoder weights shard-by-shard, skipping vision encoder and embed_tokens."""
         import re
 
         model_dir = snapshot_download(
