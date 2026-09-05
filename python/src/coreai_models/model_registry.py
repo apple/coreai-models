@@ -335,7 +335,7 @@ DIFFUSION_PRESETS: list[ModelPreset] = [
         "diffusion",
         None,
         "none",
-        "float16",
+        "float32",
         None,
     ),
     ModelPreset(
@@ -345,7 +345,7 @@ DIFFUSION_PRESETS: list[ModelPreset] = [
         "diffusion",
         None,
         "none",
-        "float16",
+        "float32",
         None,
     ),
     ModelPreset(
