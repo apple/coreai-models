@@ -9,7 +9,7 @@ Alibaba's Qwen3 models for on-device inference via Core AI.
 | Qwen3 0.6B | 0.6B       | Yes   | Yes |
 | Qwen3 1.7B | 1.7B       | Yes   | Yes |
 | Qwen3 4B   | 4.0B       | Yes   | Yes |
-| Qwen3 8B   | 8.0B       | Yes   | No  |
+| Qwen3 8B   | 8.0B       | Yes   | Yes |
 
 ## Setup to export models
 

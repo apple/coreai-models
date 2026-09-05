@@ -93,6 +93,16 @@ def test_export_args_iOS_emits_variant_flag() -> None:
     assert args[args.index("--platform") + 1] == "iOS"
 
 
+@pytest.mark.parametrize("short_name", ["qwen3-8b", "mistral-7b-instruct-v0.3"])
+def test_export_args_platform_flag_distinguishes_variants(short_name: str) -> None:
+    """Models registered for both platforms must emit `--platform iOS` only for
+    the iOS variant; macOS is the export tool's default and stays implicit."""
+    macos = _preset_to_export_args(lookup_preset(short_name, model_type="llm", variant="macOS"))
+    ios = _preset_to_export_args(lookup_preset(short_name, model_type="llm", variant="iOS"))
+    assert "--platform" not in macos
+    assert ios[ios.index("--platform") + 1] == "iOS"
+
+
 def test_export_args_diffusion_no_variant_no_context() -> None:
     p = lookup_preset("flux2-klein-4b", model_type="diffusion")
     args = _preset_to_export_args(p)
@@ -113,6 +123,7 @@ def test_output_name_llm_iOS_uses_yaml_stem_when_compression_config_set() -> Non
 @pytest.mark.parametrize(
     ("short_name", "expected"),
     [
+        ("qwen3-8b", "qwen3_8b_4bit_weight_palettized_group32_static"),
         (
             "mistral-7b-instruct-v0.3",
             "mistral_7b_instruct_v0_3_4bit_weight_palettized_group8_static",
@@ -178,6 +189,16 @@ def test_try_lookup_without_type_finds_across_tables() -> None:
 
 def test_try_lookup_prefers_macos_when_ambiguous() -> None:
     p = try_lookup_preset("qwen3-0.6b", model_type="llm")
+    assert p is not None
+    assert p.variant == "macOS"
+
+
+@pytest.mark.parametrize("short_name", ["qwen3-8b", "mistral-7b-instruct-v0.3"])
+def test_try_lookup_bare_short_name_still_resolves_to_macos(short_name: str) -> None:
+    """Adding an iOS variant makes these short-names ambiguous. The export CLI
+    calls try_lookup_preset with variant=None when --platform is omitted, so
+    macOS must keep winning or `uv run coreai.llm.export <name>` would break."""
+    p = try_lookup_preset(short_name, model_type="llm")
     assert p is not None
     assert p.variant == "macOS"
 
