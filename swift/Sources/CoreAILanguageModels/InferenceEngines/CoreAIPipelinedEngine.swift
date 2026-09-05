@@ -168,6 +168,12 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
                 // Detect TRUE divergence before backup (tokens actually differ)
                 let isDivergence = commonPrefix < input.count && commonPrefix < self.history.count
 
+                // Pipelined decode yields the last token without processing it; cap to KV-valid range.
+                if commonPrefix > self.engine.processedTokenCount {
+                    commonPrefix = self.engine.processedTokenCount
+                    resolvedNewTokens = input[commonPrefix...]
+                }
+
                 // Ensure at least 1 token for prefill (seeds the decode loop).
                 // Back up by 1 if the entire input is cached.
                 if resolvedNewTokens.isEmpty && commonPrefix > 0 {
