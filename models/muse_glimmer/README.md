@@ -8,6 +8,16 @@ Meta's Muse Glimmer 30B for on-device agentic tasks via Core AI. Apache 2.0 lice
 |------------------|-----------|---------|-------|-----|
 | Muse-Glimmer-30B | ~29.6B    | 131072  | Yes   | No  |
 
+## Vision-Language Model (VLM)
+
+The VLM variant adds a ViT-G/14 vision encoder for image understanding tasks.
+
+```bash
+uv run coreai.vlm.export muse-glimmer-vl
+```
+
+See [VLM README](../vlm/README.md) for bundle layout and usage.
+
 ## Setup to export models
 
 If you haven't installed `uv`, install it by

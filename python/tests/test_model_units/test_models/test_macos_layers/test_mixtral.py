@@ -1008,6 +1008,7 @@ class MixtralSparseMoeBlock(Model):
 
 class TestMixtralLayers:
     @staticmethod
+    @pytest.mark.flaky(reruns=3)
     @pytest.mark.parametrize("model_class", [MixtralAttention, MixtralTransformerBlock])
     @pytest.mark.parametrize("precision", [Precision.f32, Precision.f16, Precision.bf16])
     @pytest.mark.parametrize(

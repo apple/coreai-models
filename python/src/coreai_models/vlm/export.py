@@ -16,6 +16,7 @@ Exports a vision-language model to Core AI format as a multi-asset bundle
 
 Usage:
     uv run coreai.vlm.export qwen3-vl [--max-context-length 4096] [--num-layers N]
+    uv run coreai.vlm.export muse-glimmer-vl [--max-context-length 4096]
     uv run coreai.vlm.export --list-models
 """
 
@@ -38,6 +39,8 @@ from transformers import AutoConfig, AutoTokenizer
 from coreai_models._constants import DEFAULT_INCLUDE_DEBUG_INFO
 from coreai_models.export.macos import export_to_coreai
 from coreai_models.export.metadata import build_aimodel_metadata
+from coreai_models.models.macos.muse_glimmer import MuseGlimmerForCausalLMEmbeddings
+from coreai_models.models.macos.muse_glimmer_vision import MuseGlimmerVisionModel
 from coreai_models.models.macos.qwen3_vl import Qwen3VLForCausalLMEmbeddings
 
 # Core AI state names for the persistent KV cache.
@@ -90,6 +93,19 @@ SUPPORTED_MODELS: dict[str, VLMSpec] = {
         image_strategy="stretch",
         include_image_info=True,
     ),
+    "muse-glimmer-vl": VLMSpec(
+        short_name="muse-glimmer-vl",
+        hf_model_id="meta-models/Muse-Glimmer-30B",
+        output_name="muse_glimmer_30b_vlm",
+        image_token_id=200092,
+        image_size=448,
+        patch_size=14,
+        spatial_merge_size=2,
+        temporal_patch_size=2,
+        image_mean=(0.48145466, 0.4578275, 0.40821073),  # CLIP normalization
+        image_std=(0.26862954, 0.26130258, 0.27577711),
+        rescale_factor=1.0,
+    ),
 }
 
 
@@ -122,11 +138,10 @@ def load_model_from_safetensors(
 ) -> torch.nn.Module:
     """Load a VL text decoder directly from safetensors, bypassing from_hf_memory_efficient.
 
-    The HF Qwen3-VL checkpoint structure:
-        model.language_model.embed_tokens.weight
-        model.language_model.layers.N.self_attn.q_proj.weight  (etc.)
-        model.language_model.norm.weight
-        model.visual.*  (skipped)
+    Handles two checkpoint layouts:
+      - Qwen3-VL: ``model.language_model.*`` (text), ``model.visual.*`` (vision, skipped)
+      - Muse Glimmer: ``model.language_model.*`` (text), ``model.vision_*`` (vision, skipped),
+        plus a top-level ``lm_head.weight`` outside the language_model prefix.
     """
     # Set config
     text_cfg = model_class._get_reauthored_config(hf_config, max_ctx, num_layers)
@@ -137,6 +152,13 @@ def load_model_from_safetensors(
 
     # Build state dict from safetensors
     prefix = "model.language_model."
+    # Prefixes to skip (vision components from various checkpoint formats)
+    vision_prefixes = (
+        "model.visual.",
+        "model.vision_tower.",
+        "model.vision_adapter.",
+        "model.vision_projection.",
+    )
     layer_pattern = re.compile(r"layers\.(\d+)\.")
     st_files = _get_safetensors_files(model_dir)
 
@@ -144,28 +166,44 @@ def load_model_from_safetensors(
     for path in st_files:
         with safe_open(path, framework="pt", device="cpu") as f:
             for key in f.keys():  # noqa: SIM118 — safe_open has no __iter__/__contains__
-                if key.startswith("model.visual."):
+                if any(key.startswith(vp) for vp in vision_prefixes):
                     continue
-                if not key.startswith(prefix):
-                    continue
-                # Strip "model.language_model." → add "model."
-                # "model.language_model.layers.0.self_attn.q_proj.weight" → "model.layers.0.*"
-                stripped = key[len(prefix) :]  # e.g. "layers.0.self_attn.q_proj.weight"
-                model_key = "model." + stripped  # e.g. "model.layers.0.self_attn.q_proj.weight"
-                # Skip layers beyond num_layers
-                m = layer_pattern.match(stripped)
-                if m and num_layers is not None and int(m.group(1)) >= num_layers:
-                    continue
-                tensor = f.get_tensor(key)
-                if tensor.dtype not in (torch.float16, torch.int8) and "zero_point" not in key:
-                    tensor = tensor.to(dtype)
-                state_dict[model_key] = tensor
+                if key.startswith(prefix):
+                    # Strip "model.language_model." → add "model."
+                    stripped = key[len(prefix) :]
+                    model_key = "model." + stripped
+                    # Skip layers beyond num_layers
+                    m = layer_pattern.match(stripped)
+                    if m and num_layers is not None and int(m.group(1)) >= num_layers:
+                        continue
+                    tensor = f.get_tensor(key)
+                    if tensor.dtype not in (torch.float16, torch.int8) and "zero_point" not in key:
+                        tensor = tensor.to(dtype)
+                    state_dict[model_key] = tensor
+                elif key == "lm_head.weight":
+                    # Muse Glimmer stores lm_head outside the language_model prefix
+                    tensor = f.get_tensor(key)
+                    if tensor.dtype not in (torch.float16, torch.int8):
+                        tensor = tensor.to(dtype)
+                    state_dict[key] = tensor
 
     # Fuse weights via _mutate_state_dict (handles keys in "model.layers.N.*" form)
     model._mutate_state_dict(state_dict)
 
     # Load (strict=False to allow tie_word_embeddings / missing embed_tokens)
     model.load_state_dict(state_dict, assign=True, strict=False)
+
+    # Muse Glimmer: qk_norm has no checkpoint weights — initialize to ones
+    # (identity RMSNorm), matching from_hf_memory_efficient in muse_glimmer.py.
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        for layer in model.model.layers:
+            attn = getattr(layer, "self_attn", None)
+            if attn is not None and hasattr(attn, "qk_norm"):
+                w = attn.qk_norm.weight
+                if w.is_meta:
+                    head_dim = getattr(model.config, "head_dim", None)
+                    if head_dim is not None:
+                        attn.qk_norm.weight = nn.Parameter(torch.ones(head_dim, dtype=dtype))
 
     # Verify no meta params remain
     meta = [n for n, p in model.named_parameters() if p.is_meta]
@@ -199,6 +237,27 @@ class EmbedTokens(torch.nn.Module):
         return self.weight[input_ids]
 
 
+class EmbedTokensNormed(torch.nn.Module):
+    """Token-embedding lookup with weight-less RMSNorm, for Muse Glimmer.
+
+    Muse Glimmer applies a weight-less RMSNorm to embeddings before they enter
+    the transformer. For VLM, this must happen in the embed asset so that text
+    and vision embeddings are in the same normalized space after scatter-merge.
+
+    Input:  input_ids   int32 [1, seq_len]
+    Output: embeddings   f16  [1, seq_len, hidden_size] (normalized)
+    """
+
+    def __init__(self, weight: torch.Tensor, eps: float = 1e-5) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(weight, requires_grad=False)
+        self.eps = eps
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        h = self.weight[input_ids]
+        return h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + self.eps)
+
+
 def _load_embed_weight(model_dir: str) -> torch.Tensor:
     """Read the f16 embed_tokens weight table [vocab, hidden] from safetensors."""
     embed_key = "model.language_model.embed_tokens.weight"
@@ -220,7 +279,10 @@ async def export_embed_model(
     """Export the token-embedding lookup as embed.aimodel (asset role `embedding`)."""
     weight = _load_embed_weight(model_dir)
     vocab_size, hidden_size = weight.shape
-    module = EmbedTokens(weight).eval()
+    if spec.short_name == "muse-glimmer-vl":
+        module = EmbedTokensNormed(weight, eps=1e-5).eval()
+    else:
+        module = EmbedTokens(weight).eval()
 
     seq_len = 64
     input_ids = torch.zeros(1, seq_len, dtype=torch.int32)
@@ -258,6 +320,7 @@ async def export_text_bundle(
     num_layers: int | None,
     output_dir: Path,
     overwrite: bool,
+    compression: str = "none",
     include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
 ) -> Path:
     """Download weights and write the text portion of the VLM bundle.
@@ -290,8 +353,12 @@ async def export_text_bundle(
 
     # ---- 2. Load model directly from safetensors ----
     logging.info("Loading model from safetensors (direct, skips vision encoder)...")
+    if spec.short_name == "muse-glimmer-vl":
+        model_class = MuseGlimmerForCausalLMEmbeddings
+    else:
+        model_class = Qwen3VLForCausalLMEmbeddings
     model = load_model_from_safetensors(
-        model_class=Qwen3VLForCausalLMEmbeddings,
+        model_class=model_class,
         hf_config=raw_cfg,
         model_dir=model_dir,
         max_ctx=max_ctx,
@@ -301,7 +368,24 @@ async def export_text_bundle(
     model = model.eval()
     logging.info("Model loaded.")
 
-    # ---- 3. Build reference inputs (stateful KV: caches are in-place states) ----
+    # ---- 3. Apply quantization (text decoder only) ----
+    if compression != "none":
+        from coreai_models.export.compression import quantize_for_export
+        from coreai_models.export.presets import get_preset
+
+        preset = get_preset(compression)
+        quant_cfg = preset.get("torch_quantization_config")
+        if quant_cfg is None:
+            raise ValueError(
+                f"Preset '{compression}' has no torch_quantization_config. "
+                "VLM text decoder quantization requires a macOS quantization preset."
+            )
+        quant_cfg = dict(quant_cfg)
+        logging.info(f"Applying {compression} quantization to text decoder...")
+        model = quantize_for_export(model, text_cfg, torch.float16, quant_cfg)
+        logging.info("Quantization complete.")
+
+    # ---- 4. Build reference inputs (stateful KV: caches are in-place states) ----
     QUERY_LEN = 64
     OFFSET = 64
     inputs_embeds = torch.randn(1, QUERY_LEN, hidden_size, dtype=torch.float16)
@@ -326,7 +410,7 @@ async def export_text_bundle(
         "v_cache": None,
     }
 
-    # ---- 4. Export (stateful KV: k_cache/v_cache surfaced as in-place states) ----
+    # ---- 5. Export (stateful KV: k_cache/v_cache surfaced as in-place states) ----
     logging.info("Exporting text decoder to CoreAI format (stateful KV)...")
     program = export_to_coreai(
         model,
@@ -340,7 +424,7 @@ async def export_text_bundle(
     logging.info("Optimizing AIProgram...")
     program.optimize()
 
-    # ---- 5. Save bundle ----
+    # ---- 6. Save bundle ----
     bundle_path = output_dir / output_name
     bundle_path.mkdir(parents=True, exist_ok=True)
     aimodel_path = bundle_path / f"{output_name}.aimodel"
@@ -554,6 +638,24 @@ class BatchedF16VisionEncoder(nn.Module):
         return out.unsqueeze(0).to(torch.float16)
 
 
+class CastF16VisionEncoder(nn.Module):
+    """Cast-only wrapper for vision encoders that already output [1, N, hidden].
+
+    MuseGlimmerVisionModel.forward returns [1, N, text_hidden] in f32 — the
+    batch dimension is already present, so we only need the f16 cast.
+    """
+
+    def __init__(self, encoder: nn.Module) -> None:
+        super().__init__()
+        self.encoder = encoder
+
+    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        out = self.encoder(pixel_values)
+        if isinstance(out, tuple):
+            out = out[0]
+        return out.to(torch.float16)
+
+
 def _patch_fast_pos_embed_interpolate(vision_model_cls: type) -> None:
     """Monkeypatch to use Python ints — needed for the init-time pre-computation."""
 
@@ -626,71 +728,89 @@ async def export_vision_encoder(
     include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
 ) -> str:
     """Export the vision encoder as vision.aimodel and patch metadata.json."""
-    from transformers.models.qwen3_vl.modeling_qwen3_vl import (
-        Qwen3VLForConditionalGeneration as HFModel,
-    )
-    from transformers.models.qwen3_vl.modeling_qwen3_vl import (
-        Qwen3VLVisionModel,
-    )
-
-    _patch_fast_pos_embed_interpolate(Qwen3VLVisionModel)
-
     if not bundle_path.exists():
         raise FileNotFoundError(f"Bundle not found: {bundle_path}. Export the text decoder first.")
 
     # ---- 1. Text hidden size (projection target) from the HF config ----
     text_hidden = AutoConfig.from_pretrained(spec.hf_model_id).text_config.hidden_size
 
-    # ---- 2. Load HF model (vision part only) ----
-    logging.info(f"Loading {spec.hf_model_id} for vision encoder extraction...")
-    hf_model = HFModel.from_pretrained(spec.hf_model_id, dtype=torch.float32)
-    hf_model = hf_model.eval()
-
-    wrapper = StaticVisionEncoder(
-        hf_model.model.visual,
-        image_size=spec.image_size,
-        patch_size=spec.patch_size,
-        spatial_merge_size=spec.spatial_merge_size,
-        temporal_patch_size=spec.temporal_patch_size,
-        num_frames=num_frames,
-    ).eval()
-    del hf_model
-
-    grid_t = wrapper.grid_t
-    num_visual_tokens = spec.num_visual_tokens * grid_t
-    if num_frames == 1:
+    if spec.short_name == "muse-glimmer-vl":
+        # Muse Glimmer: use our standalone MuseGlimmerVisionModel which
+        # handles 2D patchify, 2D RoPE, spatial merge, adapter, and
+        # projection internally.  Single-image only (num_frames=1).
+        if num_frames != 1:
+            raise NotImplementedError(
+                "Muse Glimmer vision encoder currently supports single-image only "
+                f"(num_frames=1), got {num_frames}"
+            )
+        logging.info(f"Loading {spec.hf_model_id} vision encoder (MuseGlimmerVisionModel)...")
+        vision_model = MuseGlimmerVisionModel.from_pretrained(spec.hf_model_id, dtype=torch.float32)
+        # MuseGlimmerVisionModel.forward already returns [1, N, text_hidden]
+        # so we only need the f16 cast wrapper (no unsqueeze needed).
+        export_module = CastF16VisionEncoder(vision_model).eval()
+        num_visual_tokens = spec.num_visual_tokens
         pixel_shape = (1, 3, spec.image_size, spec.image_size)
     else:
-        pixel_shape = (1, 3 * num_frames, spec.image_size, spec.image_size)
-
-    # ---- 3. Validate output shape before export ----
-    with torch.no_grad():
-        test_out = wrapper(torch.randn(*pixel_shape, dtype=torch.float32))
-        # merger returns (hidden_states, deepstack_features) in newer transformers
-        if isinstance(test_out, tuple):
-            test_out = test_out[0]
-        logging.info(
-            f"Vision encoder output {tuple(test_out.shape)}; "
-            f"expected [{num_visual_tokens}, {text_hidden}]"
+        # Qwen3-VL: load HF model and wrap with StaticVisionEncoder for
+        # Qwen's 3D patchify + rotary position embeddings.
+        from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+            Qwen3VLForConditionalGeneration as HFModel,
+        )
+        from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+            Qwen3VLVisionModel,
         )
 
-    # ---- 4. Wrap merger to handle tuple output ----
-    if isinstance(wrapper(torch.randn(*pixel_shape)), tuple):
-        original_merger = wrapper.merger
+        _patch_fast_pos_embed_interpolate(Qwen3VLVisionModel)
 
-        class MergerWrapper(nn.Module):
-            def __init__(self, merger):
-                super().__init__()
-                self.merger = merger
+        # ---- 2. Load HF model (vision part only) ----
+        logging.info(f"Loading {spec.hf_model_id} for vision encoder extraction...")
+        hf_model = HFModel.from_pretrained(spec.hf_model_id, dtype=torch.float32)
+        hf_model = hf_model.eval()
 
-            def forward(self, x):
-                out = self.merger(x)
-                return out[0] if isinstance(out, tuple) else out
+        wrapper = StaticVisionEncoder(
+            hf_model.model.visual,
+            image_size=spec.image_size,
+            patch_size=spec.patch_size,
+            spatial_merge_size=spec.spatial_merge_size,
+            temporal_patch_size=spec.temporal_patch_size,
+            num_frames=num_frames,
+        ).eval()
+        del hf_model
 
-        wrapper.merger = MergerWrapper(original_merger)
+        grid_t = wrapper.grid_t
+        num_visual_tokens = spec.num_visual_tokens * grid_t
+        if num_frames == 1:
+            pixel_shape = (1, 3, spec.image_size, spec.image_size)
+        else:
+            pixel_shape = (1, 3 * num_frames, spec.image_size, spec.image_size)
 
-    # ---- 5. Export ----
-    export_module = BatchedF16VisionEncoder(wrapper).eval()
+        # ---- 3. Validate output shape before export ----
+        with torch.no_grad():
+            test_out = wrapper(torch.randn(*pixel_shape, dtype=torch.float32))
+            # merger returns (hidden_states, deepstack_features) in newer transformers
+            if isinstance(test_out, tuple):
+                test_out = test_out[0]
+            logging.info(
+                f"Vision encoder output {tuple(test_out.shape)}; "
+                f"expected [{num_visual_tokens}, {text_hidden}]"
+            )
+
+        # ---- 4. Wrap merger to handle tuple output ----
+        if isinstance(wrapper(torch.randn(*pixel_shape)), tuple):
+            original_merger = wrapper.merger
+
+            class MergerWrapper(nn.Module):
+                def __init__(self, merger):
+                    super().__init__()
+                    self.merger = merger
+
+                def forward(self, x):
+                    out = self.merger(x)
+                    return out[0] if isinstance(out, tuple) else out
+
+            wrapper.merger = MergerWrapper(original_merger)
+
+        export_module = BatchedF16VisionEncoder(wrapper).eval()
 
     # Final-shape sanity check (batched + f16) before export.
     with torch.no_grad():
@@ -825,6 +945,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--compression",
+        default="none",
+        help="Compression preset for the text decoder (e.g. '4bit', 'none'). "
+        "The vision encoder and embedding are always exported at full precision.",
+    )
+    parser.add_argument(
         "--verbose",
         "-v",
         action="store_true",
@@ -841,6 +967,7 @@ async def _run(spec: VLMSpec, args: argparse.Namespace) -> Path:
         num_layers=args.num_layers,
         output_dir=output_dir,
         overwrite=args.overwrite,
+        compression=args.compression,
         include_debug_info=args.include_debug_info,
     )
     if not args.skip_vision:
