@@ -421,6 +421,7 @@ public struct Flux2Pipeline: DiffusionPipeline {
             }
 
             packedLatents = scheduler.step(output: output, timeStep: t, sample: packedLatents)
+            try checkLatentsForNaN(packedLatents, step: step)
 
             let progress = PipelineProgress(step: step + 1, totalSteps: steps, currentLatent: nil)
             if !progressHandler(progress) { break }
