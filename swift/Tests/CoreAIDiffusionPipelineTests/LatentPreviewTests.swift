@@ -24,8 +24,8 @@ final class LatentPreviewTests: XCTestCase {
     }
 
     func testFlux2CoefficientsHave16Channels() {
-        XCTAssertEqual(LatentRGBCoefficients.flux2.channels, 16)
-        XCTAssertEqual(LatentRGBCoefficients.flux2.weights.count, 48)  // 16 * 3
+        XCTAssertEqual(LatentRGBCoefficients.flux2.channels, 32)
+        XCTAssertEqual(LatentRGBCoefficients.flux2.weights.count, 96)  // 16 * 3
         XCTAssertEqual(LatentRGBCoefficients.flux2.bias.count, 3)
     }
 
@@ -51,7 +51,7 @@ final class LatentPreviewTests: XCTestCase {
     }
 
     func testDraftPreview16ChannelLatent() {
-        let shape = [1, 16, 4, 4]
+        let shape = [1, 32, 4, 4]
         let count = shape.reduce(1, *)
         var nd = NDArray(shape: shape, scalarType: .float32)
         nd.mutableView(as: Float.self).withUnsafeMutablePointer { ptr, _, _ in

@@ -76,7 +76,7 @@ public struct SD3Pipeline: DiffusionPipeline {
 
     public func generateImages(
         configuration: PipelineConfiguration,
-        progressHandler: (PipelineProgress) -> Bool
+        progressHandler: ((PipelineProgress) -> Bool)?
     ) async throws -> GenerationResult {
         if !configuration.lazyModelLoading { try await loadResources() }
 
@@ -141,12 +141,17 @@ public struct SD3Pipeline: DiffusionPipeline {
 
             latents = scheduler.step(output: guided, timeStep: t, sample: latents)
 
-            var previewND = NDArray(shape: latentShape, scalarType: .float32)
-            previewND.mutableView(as: Float.self).withUnsafeMutablePointer { ptr, _, _ in
-                for i in 0..<latents.count { ptr[i] = latents[i] }
+            if let progressHandler {
+                // Apply VAE scale/shift so preview coefficients stay in a reasonable range
+                let sf = descriptor.decoderScaleFactor ?? 1.5305
+                let sh = descriptor.decoderShiftFactor ?? 0.0609
+                var previewLatents = NDArray(shape: latentShape, scalarType: .float32)
+                previewLatents.mutableView(as: Float.self).withUnsafeMutablePointer { ptr, _, _ in
+                    for i in 0..<latents.count { ptr[i] = latents[i] / sf + sh }
+                }
+                let progress = PipelineProgress(step: step + 1, totalSteps: steps, currentLatent: previewLatents)
+                if !progressHandler(progress) { break }
             }
-            let progress = PipelineProgress(step: step + 1, totalSteps: steps, currentLatent: previewND)
-            if !progressHandler(progress) { break }
         }
 
         if configuration.lazyModelLoading { await transformer.unloadResources() }

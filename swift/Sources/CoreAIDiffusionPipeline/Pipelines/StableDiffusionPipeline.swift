@@ -83,7 +83,7 @@ public struct StableDiffusionPipeline: DiffusionPipeline {
 
     public func generateImages(
         configuration: PipelineConfiguration,
-        progressHandler: (PipelineProgress) -> Bool
+        progressHandler: ((PipelineProgress) -> Bool)?
     ) async throws -> GenerationResult {
         let scaleFactor = descriptor.decoderScaleFactor ?? 0.18215
         let predictionType = descriptor.predictionType ?? .epsilon
@@ -115,12 +115,16 @@ public struct StableDiffusionPipeline: DiffusionPipeline {
         let batchedEmbShape = [2, 77, textEmbeddings.count / 77]
 
         for (step, timeStep) in schedule.timeSteps.enumerated() {
-            var previewND = NDArray(shape: latentShape, scalarType: .float32)
-            previewND.mutableView(as: Float.self).withUnsafeMutablePointer { ptr, _, _ in
-                for i in 0..<latents.count { ptr[i] = latents[i] }
+            if let progressHandler {
+                let invScale = 1.0 / scaleFactor
+                var previewLatents = NDArray(shape: latentShape, scalarType: .float32)
+                previewLatents.mutableView(as: Float.self).withUnsafeMutablePointer { ptr, _, _ in
+                    for i in 0..<latents.count { ptr[i] = latents[i] * Float(invScale) }
+                }
+                let progress = PipelineProgress(
+                    step: step, totalSteps: schedule.timeSteps.count, currentLatent: previewLatents)
+                if !progressHandler(progress) { break }
             }
-            let progress = PipelineProgress(step: step, totalSteps: schedule.timeSteps.count, currentLatent: previewND)
-            if !progressHandler(progress) { break }
 
             // CFG: batch latents [2, 4, H, W]
             let batchedLatents = latents + latents

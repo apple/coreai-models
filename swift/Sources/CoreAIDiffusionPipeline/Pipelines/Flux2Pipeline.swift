@@ -180,7 +180,7 @@ public struct Flux2Pipeline: DiffusionPipeline {
 
     public func generateImages(
         configuration: PipelineConfiguration,
-        progressHandler: (PipelineProgress) -> Bool
+        progressHandler: ((PipelineProgress) -> Bool)?
     ) async throws -> GenerationResult {
         let steps = configuration.stepCount
         let guidanceScale = configuration.guidanceScale
@@ -422,15 +422,27 @@ public struct Flux2Pipeline: DiffusionPipeline {
 
             packedLatents = scheduler.step(output: output, timeStep: t, sample: packedLatents)
 
-            // Unpack to spatial for preview: (B, H*W, C) → (B, C, H, W)
-            let previewSpatial = unpackLatentsSpatialFlatten(
-                packedLatents, channels: inChannels, height: spatialSide, width: spatialSide)
-            var previewND = NDArray(shape: [1, inChannels, spatialSide, spatialSide], scalarType: .float32)
-            previewND.mutableView(as: Float.self).withUnsafeMutablePointer { ptr, _, _ in
-                for i in 0..<previewSpatial.count { ptr[i] = previewSpatial[i] }
+            if let progressHandler {
+                // Unpack → denorm → unpatchify: [1, 128, 64, 64] → [1, 16, 128, 128]
+                // These are array copies, no model call.
+                let spatial = unpackLatentsSpatialFlatten(
+                    packedLatents, channels: inChannels, height: spatialSide, width: spatialSide)
+                let denormed = applyBatchNormDenorm(
+                    spatial, channels: inChannels, height: spatialSide, width: spatialSide)
+                let unpatchified = Self.unpatchifyLatents(
+                    denormed, channels: inChannels, height: spatialSide, width: spatialSide)
+
+                let vaeChannels = inChannels / 4  // 128 → 16 after patchify
+                let vaeHeight = spatialSide * 2
+                let vaeWidth = spatialSide * 2
+                var previewLatents = NDArray(
+                    shape: [1, vaeChannels, vaeHeight, vaeWidth], scalarType: .float32)
+                previewLatents.mutableView(as: Float.self).withUnsafeMutablePointer { ptr, _, _ in
+                    for i in 0..<unpatchified.count { ptr[i] = unpatchified[i] }
+                }
+                let progress = PipelineProgress(step: step + 1, totalSteps: steps, currentLatent: previewLatents)
+                if !progressHandler(progress) { break }
             }
-            let progress = PipelineProgress(step: step + 1, totalSteps: steps, currentLatent: previewND)
-            if !progressHandler(progress) { break }
         }
 
         if configuration.lazyModelLoading {
