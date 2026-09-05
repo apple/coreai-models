@@ -159,7 +159,7 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
         let maxTokens = request.generationOptions.maximumResponseTokens ?? 512
         var stopTokens = Set<Int32>()
         if let eos = tokenizer.eosTokenId { stopTokens.insert(Int32(eos)) }
-        if let imEnd = tokenizer.convertTokenToId("<|im_end|>") { stopTokens.insert(Int32(imEnd)) }
+        if let imEnd = tokenizer.vocabContains("<|im_end|>") ? tokenizer.convertTokenToId("<|im_end|>") : nil { stopTokens.insert(Int32(imEnd)) }
 
         let stream = try await engine.generate(
             with: embeddedInput,

@@ -145,7 +145,7 @@ public struct CoreAILanguageModel: LanguageModel {
         self.supportsReasoning = {
             switch thinkingFormat {
             case .agentic: return true
-            case .tagPair(let open, _): return tokenizer.convertTokenToId(open) != nil
+            case .tagPair(let open, _): return tokenizer.vocabContains(open)
             }
         }()
         self.resources = resources
@@ -159,7 +159,7 @@ public struct CoreAILanguageModel: LanguageModel {
         // Agentic models: stop on <|eot|> (end of user-facing turn) so the
         // runner doesn't loop through repeated self→user cycles.
         if case .agentic(_, _, _, let eot) = thinkingFormat,
-            let eotId = tokenizer.convertTokenToId(eot)
+            let eotId = tokenizer.vocabContains(eot) ? tokenizer.convertTokenToId(eot) : nil
         {
             if !extraEos.contains(Int32(eotId)) {
                 extraEos.append(Int32(eotId))
@@ -227,9 +227,9 @@ public struct CoreAILanguageModel: LanguageModel {
             using tokenizer: any Tokenizer
         ) -> ThinkTagParser.Format {
             // Agentic format: to=self/to=user message routing with eom/eot
-            if tokenizer.convertTokenToId("<|eom|>") != nil,
-                tokenizer.convertTokenToId("<|eot|>") != nil,
-                tokenizer.convertTokenToId("<|message|>") != nil
+            if tokenizer.vocabContains("<|eom|>"),
+                tokenizer.vocabContains("<|eot|>"),
+                tokenizer.vocabContains("<|message|>")
             {
                 return .agentic(
                     selfMarker: "to=self<|message|>",
@@ -245,8 +245,8 @@ public struct CoreAILanguageModel: LanguageModel {
                 ("<|reasoning_start|>", "<|reasoning_end|>"),
             ]
             for pair in candidates {
-                if tokenizer.convertTokenToId(pair.open) != nil,
-                    tokenizer.convertTokenToId(pair.close) != nil
+                if tokenizer.vocabContains(pair.open),
+                    tokenizer.vocabContains(pair.close)
                 {
                     return .tagPair(open: pair.open, close: pair.close)
                 }
@@ -273,14 +273,14 @@ public struct CoreAILanguageModel: LanguageModel {
                 ("<function_calls>", "</function_calls>"),
             ]
             for pair in tagPairs
-            where tokenizer.convertTokenToId(pair.open) != nil
-                && tokenizer.convertTokenToId(pair.close) != nil
+            where tokenizer.vocabContains(pair.open)
+                && tokenizer.vocabContains(pair.close)
             {
                 return pair
             }
             // Mistral: [TOOL_CALLS] is a special token but has no paired close token.
             // Use "\n" as a synthetic close — the JSON array is always on a single line.
-            if tokenizer.convertTokenToId("[TOOL_CALLS]") != nil {
+            if tokenizer.vocabContains("[TOOL_CALLS]") {
                 return (open: "[TOOL_CALLS]", close: "\n")
             }
             return nil

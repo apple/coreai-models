@@ -6,6 +6,16 @@
 import Foundation
 import Tokenizers
 
+// MARK: - Tokenizer vocabulary probe
+
+extension Tokenizer {
+    /// Whether `token` is a genuine entry in the vocabulary, not an unk-token fallback.
+    func vocabContains(_ token: String) -> Bool {
+        guard let id = convertTokenToId(token) else { return false }
+        return convertIdToToken(id) == token
+    }
+}
+
 /// Streaming parser that detects tool call blocks in the model's token stream.
 public struct ToolCallParser: Sendable {
     public enum Event {
@@ -127,12 +137,12 @@ public func detectToolCallMarkers(using tokenizer: any Tokenizer) -> (open: Stri
         ("<function_calls>", "</function_calls>"),
     ]
     for pair in tagPairs
-    where tokenizer.convertTokenToId(pair.open) != nil
-        && tokenizer.convertTokenToId(pair.close) != nil
+    where tokenizer.vocabContains(pair.open)
+        && tokenizer.vocabContains(pair.close)
     {
         return pair
     }
-    if tokenizer.convertTokenToId("[TOOL_CALLS]") != nil {
+    if tokenizer.vocabContains("[TOOL_CALLS]") {
         return (open: "[TOOL_CALLS]", close: "\n")
     }
     return nil
