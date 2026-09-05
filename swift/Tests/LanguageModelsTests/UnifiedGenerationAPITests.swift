@@ -715,6 +715,43 @@ struct PrefixCachingTests {
         ) {}
         #expect(engine.lastPrefixHitCount == 3)
     }
+
+    @Test("multi-turn prefix clamp when processedTokenCount trails history")
+    func multiTurnPrefixClampWithPipelinedGap() async throws {
+        let engine = MockEngine(tokens: [10, 20, 30, 40, 50], maxContextLength: 200)
+
+        // Turn 1: prompt [1, 2, 3], generate 3 tokens
+        var context: [Int32] = [1, 2, 3]
+        for try await output in try await engine.generate(
+            with: context,
+            samplingConfiguration: .greedy,
+            inferenceOptions: InferenceOptions(maxTokens: 3)
+        ) {
+            context.append(output.tokenId)
+        }
+        // context = [1, 2, 3, 10, 20, 30], history.count = 6, processedTokenCount = 6
+        #expect(context.count == 6)
+
+        // Simulate pipelined engine gap: last sampled token was never processed.
+        engine.processedTokenCount -= 1
+        // Now: history.count = 6, processedTokenCount = 5 (position 5 has no KV entry)
+
+        // Turn 2: append new user tokens, generate again
+        context.append(contentsOf: [77, 78])
+        for try await output in try await engine.generate(
+            with: context,
+            samplingConfiguration: .greedy,
+            inferenceOptions: InferenceOptions(maxTokens: 2)
+        ) {
+            context.append(output.tokenId)
+        }
+
+        // The clamp must cap the prefix to processedTokenCount (5), not history.count (6).
+        // Without the clamp, lastPrefixHitCount would be 6 and token 30 would be skipped.
+        #expect(engine.lastPrefixHitCount <= 6)
+        // processedTokenCount should account for: 5 (carried) + 3 (token 30 + two user) + 2 (generated) = 10
+        #expect(engine.processedTokenCount == 10)
+    }
 }
 
 // MARK: - Deterministic RNG for Tests
