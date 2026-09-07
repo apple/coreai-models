@@ -22,6 +22,8 @@ public struct CoreAIRunner {
     private let bundle: LanguageBundle
     private let engineVariant: String?
     private let kvCacheStrategy: KVCacheStrategy
+    private let prefillChunkSizeOverride: Int?
+    private let prefillChunkThresholdOverride: Int?
 
     // MARK: - Initialization
 
@@ -29,12 +31,16 @@ public struct CoreAIRunner {
     public init(
         contentsOf url: URL,
         variant: String? = nil,
-        kvCacheStrategy: KVCacheStrategy = .auto
+        kvCacheStrategy: KVCacheStrategy = .auto,
+        prefillChunkSize: Int? = nil,
+        prefillChunkThreshold: Int? = nil
     ) throws {
         self.init(
             bundle: try LanguageBundle(at: url),
             variant: variant,
-            kvCacheStrategy: kvCacheStrategy
+            kvCacheStrategy: kvCacheStrategy,
+            prefillChunkSize: prefillChunkSize,
+            prefillChunkThreshold: prefillChunkThreshold
         )
     }
 
@@ -42,11 +48,15 @@ public struct CoreAIRunner {
     public init(
         bundle: LanguageBundle,
         variant: String? = nil,
-        kvCacheStrategy: KVCacheStrategy = .auto
+        kvCacheStrategy: KVCacheStrategy = .auto,
+        prefillChunkSize: Int? = nil,
+        prefillChunkThreshold: Int? = nil
     ) {
         self.bundle = bundle
         self.engineVariant = variant
         self.kvCacheStrategy = kvCacheStrategy
+        self.prefillChunkSizeOverride = prefillChunkSize
+        self.prefillChunkThresholdOverride = prefillChunkThreshold
     }
 
     // MARK: - Engine Creation
@@ -56,10 +66,15 @@ public struct CoreAIRunner {
         let config = makeConfig()
         let configData = try JSONEncoder().encode(config)
 
-        var options = EngineOptions(kvCacheStrategy: kvCacheStrategy)
-        if let variant = engineVariant {
-            options = EngineOptions(variant: variant, kvCacheStrategy: kvCacheStrategy)
-        }
+        let resolvedChunkSize = prefillChunkSizeOverride ?? bundle.language.prefillChunkSize
+        let resolvedThreshold = prefillChunkThresholdOverride ?? bundle.language.prefillChunkThreshold
+
+        let options = EngineOptions(
+            variant: engineVariant,
+            kvCacheStrategy: kvCacheStrategy,
+            prefillChunkSize: resolvedChunkSize,
+            prefillChunkThreshold: resolvedThreshold
+        )
 
         return try await EngineFactory.createEngine(
             config: configData,

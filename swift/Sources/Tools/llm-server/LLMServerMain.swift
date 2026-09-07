@@ -51,6 +51,18 @@ struct LLMServer: AsyncParsableCommand {
     @Option(name: .customLong("kv-cache-initial-capacity"), help: "Initial KV cache capacity in tokens")
     var kvCacheInitialCapacity: Int?
 
+    @Option(
+        name: .customLong("chunk-size"),
+        help: ArgumentHelp("Prefill chunk size in tokens (default: memory-based, use 128 for MoE)", visibility: .hidden)
+    )
+    var chunkSize: Int?
+
+    @Option(
+        name: .customLong("chunk-threshold"),
+        help: ArgumentHelp("Minimum prompt tokens to trigger chunking (default: 2x chunk size)", visibility: .hidden)
+    )
+    var chunkThreshold: Int?
+
     @Flag(name: .customLong("no-thinking"), help: "Disable thinking/reasoning (appends /no_think or sets template)")
     var noThinking: Bool = false
 
@@ -83,7 +95,9 @@ struct LLMServer: AsyncParsableCommand {
         let engineOptions = EngineOptions(
             variant: inferenceEngineVariant,
             kvCacheStrategy: kvCacheStrategy,
-            kvCacheSize: kvCacheInitialCapacity
+            kvCacheSize: kvCacheInitialCapacity,
+            prefillChunkSize: chunkSize,
+            prefillChunkThreshold: chunkThreshold
         )
 
         let modelURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.main)

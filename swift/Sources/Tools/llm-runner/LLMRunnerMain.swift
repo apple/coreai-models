@@ -199,10 +199,18 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     @Option(
         name: .customLong("chunk-size"),
         help: ArgumentHelp(
-            "Prefill chunk threshold for CoreAI — prompts above this are chunked (default: 1024, use 128 for MoE)",
+            "Prefill chunk size in tokens (default: memory-based, use 128 for MoE)",
             visibility: .hidden)
     )
     var chunkSize: Int?
+
+    @Option(
+        name: .customLong("chunk-threshold"),
+        help: ArgumentHelp(
+            "Minimum prompt tokens to trigger chunking (default: 2x chunk size)",
+            visibility: .hidden)
+    )
+    var chunkThreshold: Int?
 
     @Option(name: .customLong("image"), help: "Path to an image file for vision-language models")
     var imagePath: String?
@@ -254,6 +262,9 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         }
         if let c = chunkSize, c <= 0 {
             throw ValidationError("--chunk-size must be > 0")
+        }
+        if let t = chunkThreshold, t <= 0 {
+            throw ValidationError("--chunk-threshold must be > 0")
         }
         if imagePath != nil && videoPath != nil {
             throw ValidationError("--image and --video cannot be used together")
@@ -371,8 +382,10 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             CLILogger.log("Override: COREAI_QUERY_BUCKET_SIZE=\(b)", component: "Main")
         }
         if let c = chunkSize {
-            setenv("COREAI_CHUNK_THRESHOLD", "\(c)", 1)
-            CLILogger.log("Override: COREAI_CHUNK_THRESHOLD=\(c)", component: "Main")
+            CLILogger.log("Override: prefillChunkSize=\(c)", component: "Main")
+        }
+        if let t = chunkThreshold {
+            CLILogger.log("Override: prefillChunkThreshold=\(t)", component: "Main")
         }
 
         CLILogger.log("Starting LLM Runner", component: "Main")
@@ -440,7 +453,9 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         let engineOptions = EngineOptions(
             variant: inferenceEngineVariant,
             kvCacheStrategy: kvCacheStrategy,
-            kvCacheSize: kvCacheInitialCapacity
+            kvCacheSize: kvCacheInitialCapacity,
+            prefillChunkSize: chunkSize,
+            prefillChunkThreshold: chunkThreshold
         )
 
         // Parallel loading: engine compilation + tokenizer are independent.
