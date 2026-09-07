@@ -7,16 +7,22 @@ import glob
 from pathlib import Path
 from typing import Any
 
-import huggingface_hub
 import safetensors
 import torch
+
+from coreai_models._download import download_snapshot
 
 
 def _download_from_huggingface(huggingface_model_id: str) -> Path:
     """
-    Download model from HuggingFace hub then return local path.
+    Download model snapshot then return local path.
 
-    HuggingFace manages local cache, so will not re-download if already cached
+    Despite the legacy name, this may route to either the HuggingFace Hub
+    (default) or the ModelScope hub — the download goes through the unified
+    abstraction in :mod:`coreai_models._download`, which selects the backend
+    via the ``COREAI_DOWNLOAD_BACKEND`` env var
+    (or an explicit backend). The underlying hub manages local cache, so it
+    will not re-download if already cached.
     """
     allow_patterns = [
         "*.json",
@@ -29,7 +35,7 @@ def _download_from_huggingface(huggingface_model_id: str) -> Path:
         "*.jsonl",
         "*.jinja",
     ]
-    path_str = huggingface_hub.snapshot_download(
+    path_str = download_snapshot(
         huggingface_model_id,
         allow_patterns=allow_patterns,
     )

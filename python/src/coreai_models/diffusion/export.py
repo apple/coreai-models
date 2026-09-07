@@ -7,6 +7,7 @@
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -122,6 +123,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Enable verbose (DEBUG) logging",
     )
+    parser.add_argument(
+        "--backend",
+        choices=["huggingface", "modelscope"],
+        default=None,
+        help=(
+            "Model download backend: 'huggingface' (default) or 'modelscope'. "
+            "Can also be set via the COREAI_DOWNLOAD_BACKEND "
+            "environment variables. The modelscope backend requires the 'modelscope' "
+            "package (pip install modelscope)."
+        ),
+    )
     return parser
 
 
@@ -148,6 +160,12 @@ def main() -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+
+    # Propagate the download-backend choice to the environment so every download
+    # call site (pipeline, tokenizer saving) reads the same backend via
+    # coreai_models._download.resolve_backend().
+    if args.backend is not None:
+        os.environ["COREAI_DOWNLOAD_BACKEND"] = args.backend
 
     # --- Registry resolution ---
     hf_model_id = args.model
@@ -316,6 +334,11 @@ def main() -> None:
         print(f"  multifunction:     {config.multifunction}")
         print(f"  overwrite:         {config.overwrite}")
         print(f"  include_debug_info: {config.include_debug_info}")
+        from coreai_models._download import resolve_backend
+
+        effective_backend = resolve_backend(args.backend)
+        source = "--backend flag" if args.backend is not None else "env/default"
+        print(f"  download_backend:  {effective_backend}  (from {source})")
         return
 
     try:

@@ -27,6 +27,7 @@ from pathlib import Path
 
 import torch
 
+from coreai_models._download import resolve_model_path
 from coreai_models.export.macos import export_macos_model, export_to_coreai
 from coreai_models.export.metadata import build_aimodel_metadata
 from coreai_models.export.pipeline import ExportConfig
@@ -357,17 +358,20 @@ def _save_tokenizer(hf_model_id: str, dest: Path) -> None:
     try:
         from transformers import AutoTokenizer
 
-        tok = AutoTokenizer.from_pretrained(hf_model_id)
+        local_path = resolve_model_path(
+            hf_model_id,
+            allow_patterns=["tokenizer.json", "tokenizer_config.json", "chat_template.jinja"],
+        )
+        tok = AutoTokenizer.from_pretrained(local_path)
         tok.save_pretrained(str(dest))
         logger.info("  tokenizer saved to %s", dest)
     except Exception as e:  # noqa: BLE001
         # Some checkpoints (list-valued eos_token_id) break AutoTokenizer.save;
         # fall back to copying the raw tokenizer files from the snapshot.
         logger.warning("  AutoTokenizer.save failed (%s); copying raw files", e)
-        from huggingface_hub import snapshot_download
 
         snap = Path(
-            snapshot_download(
+            resolve_model_path(
                 hf_model_id,
                 allow_patterns=[
                     "tokenizer.json",

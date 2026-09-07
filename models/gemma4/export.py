@@ -48,6 +48,7 @@ from coreai_models._constants import (
     PROMPT_OPT_FUNCTION_NAME,
     TRANSFORMER_INPUT_NAME,
 )
+from coreai_models._download import resolve_model_path
 from coreai_models.export.bundle import bundle_llm_asset
 from coreai_models.export.compression import (
     palettize_pytorch_model,
@@ -108,7 +109,8 @@ def _resolve_eos_token_ids(hf_model_id: str, text_config: Any) -> list[int]:
             ids.append(value)
 
     try:
-        _add(GenerationConfig.from_pretrained(hf_model_id).eos_token_id)
+        local_path = resolve_model_path(hf_model_id, allow_patterns=["generation_config.json"])
+        _add(GenerationConfig.from_pretrained(local_path).eos_token_id)
     except OSError as exc:  # no generation_config.json in the checkpoint
         logger.warning(f"Could not load generation config for eos tokens: {exc}")
 
@@ -192,7 +194,8 @@ def _patch_language_metadata(
 
 def _text_config(hf_model_id: str) -> Any:
     """Load the Gemma 4 text-decoder sub-config."""
-    raw_config = AutoConfig.from_pretrained(hf_model_id)
+    local_path = resolve_model_path(hf_model_id, allow_patterns=["config.json"])
+    raw_config = AutoConfig.from_pretrained(local_path)
     return getattr(raw_config, HF_CONFIG_ATTR, raw_config)
 
 

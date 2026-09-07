@@ -14,6 +14,7 @@ from typing import Any
 from transformers import AutoTokenizer
 
 from coreai_models._constants import METADATA_VERSION, METADATA_VERSION_BATCHED
+from coreai_models._download import resolve_model_path
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +65,22 @@ def bundle_llm_asset(
 
 def _write_tokenizer(dest: Path, hf_model_id: str) -> None:
     logger.info(f"Saving tokenizer from {hf_model_id}...")
-    tokenizer = AutoTokenizer.from_pretrained(hf_model_id)
+    # Resolve to a local snapshot first so the tokenizer is fetched via the
+    # unified download backend (HuggingFace or ModelScope). Limit to tokenizer
+    # files — the full repo (weights etc.) is not needed here.
+    local_path = resolve_model_path(
+        hf_model_id,
+        allow_patterns=[
+            "tokenizer*",
+            "vocab.json",
+            "merges.txt",
+            "*.model",
+            "*.txt",
+            "*.jinja",
+            "*.json",
+        ],
+    )
+    tokenizer = AutoTokenizer.from_pretrained(local_path)
     tokenizer.save_pretrained(str(dest))
 
 

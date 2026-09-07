@@ -158,10 +158,17 @@ class DiffusionGemmaGenerationConfig:
     def from_pretrained(
         cls, model_id: str, cache_dir: str | None = None
     ) -> DiffusionGemmaGenerationConfig:
-        from huggingface_hub import hf_hub_download
+        import os
+
+        from coreai_models._download import resolve_model_path
 
         try:
-            path = hf_hub_download(model_id, "generation_config.json", cache_dir=cache_dir)
+            local_path = resolve_model_path(
+                model_id, allow_patterns=["generation_config.json"], cache_dir=cache_dir
+            )
+            path = os.path.join(local_path, "generation_config.json")
+            if not os.path.isfile(path):
+                return cls()  # fall back to defaults if absent.
         except Exception:  # noqa: BLE001 — fall back to defaults if absent.
             return cls()
         with open(path, encoding="utf-8") as fh:

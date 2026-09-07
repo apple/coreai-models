@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 from pathlib import Path
 
 from coreai_models.segmentation.pipeline import (
@@ -213,6 +214,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Enable verbose (DEBUG) logging.",
     )
+    parser.add_argument(
+        "--backend",
+        choices=["huggingface", "modelscope"],
+        default=None,
+        help=(
+            "Model download backend: 'huggingface' (default) or 'modelscope'. "
+            "Can also be set via the COREAI_DOWNLOAD_BACKEND "
+            "environment variables. The modelscope backend requires the 'modelscope' "
+            "package (pip install modelscope)."
+        ),
+    )
     return parser
 
 
@@ -295,6 +307,12 @@ def main() -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+
+    # Propagate the download-backend choice to the environment so every download
+    # call site (lite/full model, tokenizer, processor) reads the same backend
+    # via coreai_models._download.resolve_backend().
+    if args.backend is not None:
+        os.environ["COREAI_DOWNLOAD_BACKEND"] = args.backend
 
     hf_model_id = _resolve_hf_model_id(args.model)
     image_size = _resolve_image_size(args)
