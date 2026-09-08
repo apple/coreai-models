@@ -140,7 +140,7 @@ public struct SD3Pipeline: DiffusionPipeline {
             }
 
             latents = scheduler.step(output: guided, timeStep: t, sample: latents)
-            try checkLatentsForNaN(latents, step: step)
+            try checkLatentsAreFinite(latents, step: step)
 
             let progress = PipelineProgress(step: step + 1, totalSteps: steps, currentLatent: nil)
             if !progressHandler(progress) { break }

@@ -139,7 +139,7 @@ public struct StableDiffusionPipeline: DiffusionPipeline {
 
             // Scheduler step
             latents = schedule.step(guided, timeStep, latents)
-            try checkLatentsForNaN(latents, step: step)
+            try checkLatentsAreFinite(latents, step: step)
         }
 
         if configuration.lazyModelLoading {
