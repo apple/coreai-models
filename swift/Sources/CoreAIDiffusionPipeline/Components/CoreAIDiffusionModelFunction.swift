@@ -3,6 +3,7 @@
 // Use of this source code is governed by a BSD-3-clause license that can
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
+import Accelerate
 import CoreAI
 import CoreAIShared
 import Foundation
@@ -428,8 +429,6 @@ public enum CoreAIDiffusionError: Error, LocalizedError {
 }
 
 // MARK: - NaN Detection
-
-import Accelerate
 
 func checkLatentsForNaN(_ latents: [Float], step: Int) throws {
     var sum: Float = 0
