@@ -52,6 +52,14 @@ _METADATA: dict[str, AIModelMetadataFields] = {
             "family. Source: https://huggingface.co/Qwen/Qwen3-0.6B"
         ),
     ),
+    "Qwen/Qwen3-1.7B": AIModelMetadataFields(
+        author="Qwen Team",
+        license="Apache-2.0",
+        model_description=(
+            "Qwen3-1.7B is a 1.7B-parameter causal language model from the Qwen3 "
+            "family. Source: https://huggingface.co/Qwen/Qwen3-1.7B"
+        ),
+    ),
     "Qwen/Qwen3-4B": AIModelMetadataFields(
         author="Qwen Team",
         license="Apache-2.0",
@@ -93,6 +101,24 @@ _METADATA: dict[str, AIModelMetadataFields] = {
             "Gemma 3 12B IT is a 12B-parameter instruction-tuned multimodal model "
             "from Google's Gemma 3 family; this export targets the text decoder. "
             "Source: https://huggingface.co/google/gemma-3-12b-it"
+        ),
+    ),
+    "google/gemma-3n-E2B-it": AIModelMetadataFields(
+        author="Gemma Team",
+        license="Gemma Terms of Use",
+        model_description=(
+            "Gemma 3n E2B is a ~5B-parameter on-device language model from Google's "
+            "Gemma 3n family using AltUp for efficient inference. "
+            "Source: https://huggingface.co/google/gemma-3n-E2B-it"
+        ),
+    ),
+    "google/gemma-3n-E4B-it": AIModelMetadataFields(
+        author="Gemma Team",
+        license="Gemma Terms of Use",
+        model_description=(
+            "Gemma 3n E4B is a ~10B-parameter on-device language model from Google's "
+            "Gemma 3n family using AltUp for efficient inference. "
+            "Source: https://huggingface.co/google/gemma-3n-E4B-it"
         ),
     ),
     "mistralai/Mistral-7B-Instruct-v0.3": AIModelMetadataFields(

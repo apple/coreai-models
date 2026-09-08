@@ -120,29 +120,6 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
                     + "states=\(descriptor.stateNames), outputs=\(descriptor.outputNames)")
         }
 
-        // Extract I/O names
-        let inputIdsName = descriptor.inputNames[0]
-        let positionIdsName = descriptor.inputNames[1]
-        self.logitsName = descriptor.outputNames[0]
-
-        // Create input handler from descriptors
-        guard case .ndArray(let inputIdsDesc) = descriptor.inputDescriptor(of: inputIdsName) else {
-            throw InferenceRuntimeError.invalidInputType("Cannot get descriptor for '\(inputIdsName)'")
-        }
-        guard case .ndArray(let posIdsDesc) = descriptor.inputDescriptor(of: positionIdsName) else {
-            throw InferenceRuntimeError.invalidInputType("Cannot get descriptor for '\(positionIdsName)'")
-        }
-
-        // Extract and validate logits descriptor
-        guard case .ndArray(let logitsDesc) = descriptor.outputDescriptor(of: logitsName) else {
-            throw InferenceRuntimeError.invalidOutputType("Cannot get descriptor for '\(logitsName)'")
-        }
-        guard logitsDesc.scalarType == .float16 else {
-            throw InferenceRuntimeError.unsupportedLogitsType(
-                "Only float16 logits supported, got \(logitsDesc.scalarType)")
-        }
-        self.logitsDescriptor = logitsDesc
-
         // Create state handlers from descriptor
         let stateHandlers = try StateHandlerFactory.createSyncHandlers(
             descriptor: descriptor,
@@ -153,13 +130,37 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         self.additionalStates = stateHandlers.additionalStates
         self.hasNonTruncatableStates = stateHandlers.hasNonTruncatableStates
 
-        // Create input handler (after stateHandlers to read isAllSlidingCache)
+        let layout = try InputLayout.analyze(
+            model: model, functionName: config.function, config: config,
+            useCompactPositionIds: stateHandlers.isAllSlidingCache)
+
+        self.logitsName = layout.logitsName
+        let inputIdsName = layout.inputIdsName
+        let positionIdsName = layout.positionIdsName
+
+        // Create input handler from descriptors
+        guard case .ndArray(let inputIdsDesc) = descriptor.inputDescriptor(of: inputIdsName) else {
+            throw InferenceRuntimeError.invalidInputType("Cannot get descriptor for '\(inputIdsName)'")
+        }
+        guard case .ndArray(let posIdsDesc) = descriptor.inputDescriptor(of: positionIdsName) else {
+            throw InferenceRuntimeError.invalidInputType("Cannot get descriptor for '\(positionIdsName)'")
+        }
+
+        guard case .ndArray(let logitsDesc) = descriptor.outputDescriptor(of: logitsName) else {
+            throw InferenceRuntimeError.invalidOutputType("Cannot get descriptor for '\(logitsName)'")
+        }
+        guard logitsDesc.scalarType == .float16 else {
+            throw InferenceRuntimeError.unsupportedLogitsType(
+                "Only float16 logits supported, got \(logitsDesc.scalarType)")
+        }
+        self.logitsDescriptor = logitsDesc
+
         self.inputHandler = TokenInputHandler(
             inputIdsName: inputIdsName,
             positionIdsName: positionIdsName,
             inputIdsDescriptor: inputIdsDesc,
             positionIdsDescriptor: posIdsDesc,
-            useCompactPositionIds: stateHandlers.isAllSlidingCache
+            useCompactPositionIds: layout.positionPolicy == .compact
         )
 
         CLILogger.log(

@@ -549,6 +549,9 @@ private struct EngineImpl: ~Copyable {
     let keyCacheScalarType: NDArray.ScalarType
     let valueCacheScalarType: NDArray.ScalarType
 
+    // Descriptor layout
+    let inputLayout: InputLayout
+
     // Base descriptors for shape resolution (preferredStrides, not contiguous)
     let inputIdsBaseDesc: NDArrayDescriptor
     let positionIdsBaseDesc: NDArrayDescriptor
@@ -640,10 +643,13 @@ private struct EngineImpl: ~Copyable {
         // Additional growing states beyond the primary pair
         let extraGrowingNames = Array(growingNames.dropFirst(2))
 
-        // Extract names
-        let inputIdsName = descriptor.inputNames[0]
-        let positionIdsName = descriptor.inputNames[1]
-        let logitsOutputName = descriptor.outputNames[0]
+        // Analyze descriptor for name resolution and shape policy
+        let layout = try InputLayout.analyze(
+            model: model, functionName: config.function, config: config,
+            useCompactPositionIds: false)
+        let inputIdsName = layout.inputIdsName
+        let positionIdsName = layout.positionIdsName
+        let logitsOutputName = layout.logitsName
 
         // Extract state descriptors for KV cache shape/type
         guard case .ndArray(let keyCacheDesc) = descriptor.stateDescriptor(of: keyCacheName),
@@ -759,16 +765,25 @@ private struct EngineImpl: ~Copyable {
         }
 
         // Create growing logits buffer (reuses TensorStorage+CoreAI.swift).
-        // With a prefill graph, `function` only ever sees one token, so a prompt-sized
-        // logits buffer — hundreds of MB at large vocabularies — would go unused.
+        // Static-logits bundles (S=1 GDN) must match the fixed dim; dynamic models
+        // start at the prompt-size guess and grow.
+        let logitsMaxCapacity: Int
+        let logitsInitialCapacity: Int
+        if case .fixed(let seqLen) = layout.logitsPolicy {
+            logitsMaxCapacity = seqLen
+            logitsInitialCapacity = seqLen
+        } else {
+            logitsMaxCapacity = config.maxContextLength
+            logitsInitialCapacity = prefillLogitsInitialCapacity(
+                hasPrefillGraph: prefillFn != nil, averagePromptSize: averageExpectedPromptSize)
+        }
         let logitsRef = try GrowingLogitsBuffer(
             device: device,
             descriptor: descriptor,
             name: logitsOutputName,
             vocabSize: config.vocabSize,
-            maxCapacity: config.maxContextLength,
-            initialCapacity: prefillLogitsInitialCapacity(
-                hasPrefillGraph: prefillFn != nil, averagePromptSize: averageExpectedPromptSize)
+            maxCapacity: logitsMaxCapacity,
+            initialCapacity: logitsInitialCapacity
         )
 
         // Load inference function
@@ -800,6 +815,7 @@ private struct EngineImpl: ~Copyable {
         self.logitsOutputName = logitsOutputName
         self.keyCacheScalarType = keyCacheDesc.scalarType
         self.valueCacheScalarType = valueCacheDesc.scalarType
+        self.inputLayout = layout
         self.inputIdsBaseDesc = inputIdsDesc
         self.positionIdsBaseDesc = posIdsDesc
         self.logitsBaseDesc = logitsDesc
@@ -1256,7 +1272,9 @@ private struct EngineImpl: ~Copyable {
 
         // Prefill prompt (unconstrained -- grammar doesn't constrain the prompt)
         let prefillTokens: [Int32]
-        if prompt.count > config.chunkThreshold {
+        if case .chunk(let threshold, _) = inputLayout.prefillPolicy,
+            prompt.count > threshold
+        {
             let remaining = try await processChunkedInput(tokens: prompt)
             prefillTokens = Array(remaining)
         } else {
@@ -1580,8 +1598,8 @@ private struct EngineImpl: ~Copyable {
     ///
     /// With a `prefill` graph, everything but the final token goes through it in chunks:
     /// it has no LM head, so it can't seed sampling, and one token has to be held back.
-    /// Without one, `function` serves prefill too, chunked only above `chunkThreshold`,
-    /// and the trailing partial chunk carries the logits.
+    /// Without one, `function` serves prefill too, chunked only above the layout's
+    /// chunk threshold, and the trailing partial chunk carries the logits.
     private mutating func prefill(prompt: [Int32]) async throws -> ArraySlice<Int32> {
         if prefillFunction != nil {
             var head = prompt.dropLast()
@@ -1595,7 +1613,9 @@ private struct EngineImpl: ~Copyable {
             return prompt.suffix(1)
         }
 
-        if prompt.count > config.chunkThreshold {
+        if case .chunk(let threshold, _) = inputLayout.prefillPolicy,
+            prompt.count > threshold
+        {
             return try await processChunkedInput(tokens: prompt)
         }
 
@@ -1610,7 +1630,12 @@ private struct EngineImpl: ~Copyable {
     }
 
     mutating func processChunkedInput(tokens: [Int32]) async throws -> ArraySlice<Int32> {
-        let chunkSize = config.prefillChunkSize
+        let chunkSize: Int
+        if case .chunk(_, let cs) = inputLayout.prefillPolicy {
+            chunkSize = cs
+        } else {
+            chunkSize = config.prefillChunkSize
+        }
         var remainingTokens = tokens[...]
 
         try logits.ensureCapacity(forContextLength: chunkSize)

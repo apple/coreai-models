@@ -35,7 +35,6 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
 
     // MARK: Input name resolution
 
-    private static let knownPositionIdNames = ["position_ids", "pos_ids"]
     private static let knownStepNames = ["in_step", "step"]
     private static let knownTransformerInputNames = ["transformer_input"]
 
@@ -151,14 +150,12 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
                 "No KV cache state descriptors found — cannot allocate cache buffers")
         }
 
-        // Discover input names from the largest-context function
-        guard
-            let positionIdsName = Self.resolveInputName(
-                from: largestExtendDescriptor.inputNames, candidates: Self.knownPositionIdNames
-            )
-        else {
-            throw InferenceRuntimeError.invalidState("No position_ids input found in model descriptor")
-        }
+        // Discover input names from the largest-context function (position_ids via InputLayout)
+        let positionIdsName = try InputLayout.resolveRequired(
+            from: largestExtendDescriptor.inputNames,
+            candidates: InputLayout.knownPositionIdNames,
+            label: "position_ids"
+        )
         let maskName: String? =
             largestExtendDescriptor.inputNames.contains("causal_mask")
             ? "causal_mask" : nil

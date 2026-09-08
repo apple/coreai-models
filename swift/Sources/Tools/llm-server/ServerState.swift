@@ -117,7 +117,8 @@ final class ServerState: @unchecked Sendable {
     let tokenizer: any Tokenizer
     let config: ServerConfig
     let stats = ServerStats()
-    let toolCallMarkers: (open: String, close: String)?
+    let toolCallDetection: ToolCallDetection?
+    let thinkingFormat: ThinkTagParser.Format
     private let _state = Mutex<InternalState>(InternalState())
 
     private struct InternalState {
@@ -134,14 +135,19 @@ final class ServerState: @unchecked Sendable {
         self.engine = engine
         self.tokenizer = tokenizer
         self.config = config
-        self.toolCallMarkers = detectToolCallMarkers(using: tokenizer)
+        self.toolCallDetection = detectToolCallFormat(using: tokenizer)
+        self.thinkingFormat = detectThinkingFormat(using: tokenizer)
     }
 
-    var supportsToolCalling: Bool { toolCallMarkers != nil }
+    var supportsToolCalling: Bool { toolCallDetection != nil }
 
     func makeToolCallParser() -> ToolCallParser? {
-        guard let markers = toolCallMarkers else { return nil }
-        return ToolCallParser(openMarker: markers.open, closeMarker: markers.close)
+        guard let detection = toolCallDetection else { return nil }
+        return ToolCallParser(
+            openMarker: detection.openMarker,
+            closeMarker: detection.closeMarker,
+            format: detection.format
+        )
     }
 
     func tryAcquire() -> Bool {
