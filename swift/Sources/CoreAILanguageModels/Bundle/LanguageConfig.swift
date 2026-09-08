@@ -110,7 +110,7 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
                 }
                 guard let token = tokenString else { continue }
 
-                if let id = tokenizer.convertTokenToId(token) {
+                if let id = tokenizer.vocabContains(token) ? tokenizer.convertTokenToId(token) : nil {
                     let id32 = Int32(id)
                     if id32 != mainEos {
                         result.insert(id32)
@@ -122,7 +122,7 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
         // 2. Check if eos_token is an array (some models list multiple)
         if let eosArray = json["eos_token"] as? [String] {
             for token in eosArray {
-                if let id = tokenizer.convertTokenToId(token) {
+                if let id = tokenizer.vocabContains(token) ? tokenizer.convertTokenToId(token) : nil {
                     let id32 = Int32(id)
                     if id32 != mainEos {
                         result.insert(id32)
@@ -152,7 +152,7 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
         // 4. Check for turn-ending tokens in in top level of config
         for turnEndPattern in turnEndPatterns {
             if let eotToken = json[turnEndPattern] as? String {
-                if let id = tokenizer.convertTokenToId(eotToken) {
+                if let id = tokenizer.vocabContains(eotToken) ? tokenizer.convertTokenToId(eotToken) : nil {
                     let id32 = Int32(id)
                     if id32 != mainEos {
                         result.insert(id32)

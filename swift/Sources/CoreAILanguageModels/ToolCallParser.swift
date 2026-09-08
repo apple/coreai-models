@@ -6,6 +6,16 @@
 import Foundation
 import Tokenizers
 
+// MARK: - Tokenizer vocabulary probe
+
+extension Tokenizer {
+    /// Whether `token` is a genuine entry in the vocabulary, not an unk-token fallback.
+    func vocabContains(_ token: String) -> Bool {
+        guard let id = convertTokenToId(token) else { return false }
+        return convertIdToToken(id) == token
+    }
+}
+
 /// Streaming parser that detects tool call blocks in the model's token stream.
 public struct ToolCallParser: Sendable {
     public enum Event {
@@ -205,8 +215,8 @@ public struct ToolCallDetection: Sendable {
 /// Probes a tokenizer's vocabulary for known tool-call special tokens.
 public func detectToolCallFormat(using tokenizer: any Tokenizer) -> ToolCallDetection? {
     // ATEM special tokens (if a future tokenizer adds them)
-    if tokenizer.convertTokenToId("<atem:function_calls>") != nil,
-        tokenizer.convertTokenToId("</atem:function_calls>") != nil
+    if tokenizer.vocabContains("<atem:function_calls>"),
+        tokenizer.vocabContains("</atem:function_calls>")
     {
         return ToolCallDetection(
             openMarker: "<atem:function_calls>",
@@ -217,10 +227,10 @@ public func detectToolCallFormat(using tokenizer: any Tokenizer) -> ToolCallDete
 
     // ATEM via agentic model signature: <|eom|> + <|eot|> + <|start|> + <|message|>
     // indicate a Meta agentic model that emits ATEM tags as regular text.
-    if tokenizer.convertTokenToId("<|eom|>") != nil,
-        tokenizer.convertTokenToId("<|eot|>") != nil,
-        tokenizer.convertTokenToId("<|start|>") != nil,
-        tokenizer.convertTokenToId("<|message|>") != nil
+    if tokenizer.vocabContains("<|eom|>"),
+        tokenizer.vocabContains("<|eot|>"),
+        tokenizer.vocabContains("<|start|>"),
+        tokenizer.vocabContains("<|message|>")
     {
         return ToolCallDetection(
             openMarker: "<atem:function_calls>",
@@ -234,12 +244,12 @@ public func detectToolCallFormat(using tokenizer: any Tokenizer) -> ToolCallDete
         ("<function_calls>", "</function_calls>"),
     ]
     for pair in tagPairs
-    where tokenizer.convertTokenToId(pair.open) != nil
-        && tokenizer.convertTokenToId(pair.close) != nil
+    where tokenizer.vocabContains(pair.open)
+        && tokenizer.vocabContains(pair.close)
     {
         return ToolCallDetection(openMarker: pair.open, closeMarker: pair.close, format: .json)
     }
-    if tokenizer.convertTokenToId("[TOOL_CALLS]") != nil {
+    if tokenizer.vocabContains("[TOOL_CALLS]") {
         return ToolCallDetection(openMarker: "[TOOL_CALLS]", closeMarker: "\n", format: .json)
     }
     return nil
@@ -249,9 +259,9 @@ public func detectToolCallFormat(using tokenizer: any Tokenizer) -> ToolCallDete
 
 /// Probes a tokenizer's vocabulary for thinking/reasoning markers.
 public func detectThinkingFormat(using tokenizer: any Tokenizer) -> ThinkTagParser.Format {
-    if tokenizer.convertTokenToId("<|eom|>") != nil,
-        tokenizer.convertTokenToId("<|eot|>") != nil,
-        tokenizer.convertTokenToId("<|message|>") != nil
+    if tokenizer.vocabContains("<|eom|>"),
+        tokenizer.vocabContains("<|eot|>"),
+        tokenizer.vocabContains("<|message|>")
     {
         return .agentic(
             selfMarker: "to=self<|message|>",
@@ -266,8 +276,8 @@ public func detectThinkingFormat(using tokenizer: any Tokenizer) -> ThinkTagPars
         ("<|reasoning_start|>", "<|reasoning_end|>"),
     ]
     for pair in candidates {
-        if tokenizer.convertTokenToId(pair.open) != nil,
-            tokenizer.convertTokenToId(pair.close) != nil
+        if tokenizer.vocabContains(pair.open),
+            tokenizer.vocabContains(pair.close)
         {
             return .tagPair(open: pair.open, close: pair.close)
         }
