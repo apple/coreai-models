@@ -34,3 +34,4 @@ python/.venv/
 # Local artifacts
 exports/
 *.jpeg
+output.png
