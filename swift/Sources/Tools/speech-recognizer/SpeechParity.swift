@@ -504,10 +504,3 @@ private func cosineSimilarity(_ a: [Float], _ b: [Float]) -> Double {
     guard na > 0 && nb > 0 else { return na == nb ? 1 : 0 }
     return dot / (na.squareRoot() * nb.squareRoot())
 }
-
-// MARK: - .npy reader
-
-/// Minimal `.npy` reader for the dtypes these traces use.
-///
-/// The image-segmenter and diffusion-runner tools each carry their own copy of this;
-/// a third is the consistent choice until one is promoted into a shared module.

@@ -19,6 +19,16 @@ public struct NpyArray: Sendable {
         case int64
         case uint8
         case bool
+
+        /// Bytes per element on disk.
+        var byteWidth: Int {
+            switch self {
+            case .float16: return 2
+            case .float32, .int32: return 4
+            case .int64: return 8
+            case .uint8, .bool: return 1
+            }
+        }
     }
 
     public let shape: [Int]
@@ -110,11 +120,15 @@ public struct NpyArray: Sendable {
             throw NpyError.unsupportedDType(header, url)
         }
 
-        return NpyArray(
-            shape: parseShape(from: header),
-            dtype: dtype,
-            data: raw.subdata(in: dataStart..<raw.count)
-        )
+        // The accessors size their loops from `shape`, not from the bytes on hand, so a short
+        // payload would read off the end of the buffer. Reject it here and they stay total.
+        let shape = parseShape(from: header)
+        let payload = raw.subdata(in: dataStart..<raw.count)
+        guard payload.count >= shape.reduce(1, *) * dtype.byteWidth else {
+            throw NpyError.truncated(url)
+        }
+
+        return NpyArray(shape: shape, dtype: dtype, data: payload)
     }
 
     private static func parseShape(from header: String) -> [Int] {

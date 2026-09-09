@@ -104,6 +104,16 @@ struct NpyArrayTests {
         #expect(throws: NpyArray.NpyError.self) { try NpyArray.load(url) }
     }
 
+    @Test("A payload shorter than the header promises is refused")
+    func rejectsTruncatedPayload() throws {
+        // The accessors size their loops from `shape`, so letting this through reads off the
+        // end of the buffer — heap garbage under -O rather than a parity failure.
+        let url = try write(
+            npy(descr: "<f4", shape: [2, 3], payload: bytes([Float](arrayLiteral: 1, 2))))
+        defer { try? FileManager.default.removeItem(at: url) }
+        #expect(throws: NpyArray.NpyError.self) { try NpyArray.load(url) }
+    }
+
     @Test("A file that isn't .npy is refused")
     func rejectsNonNpy() throws {
         let url = try write(Data(repeating: 0x41, count: 128))
