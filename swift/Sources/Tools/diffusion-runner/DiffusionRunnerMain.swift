@@ -718,13 +718,6 @@ struct DiffusionRunner: AsyncParsableCommand {
     }
 
     /// Thin adapter over ``CoreAIShared/NpyArray``.
-    ///
-    /// The parsing used to live here. It had three ways to mislead: an unsupported dtype
-    /// (`float16` in particular, which a fp16 reference dump produces) fell through every
-    /// branch and returned silent zeros; Fortran-ordered files were read as row-major,
-    /// which yields plausible garbage rather than an error; and a truncated file trapped on
-    /// a range subscript. The shared reader rejects all three, and reads through a copied
-    /// `Data` slice rather than binding a possibly-unaligned pointer into the original.
     private func loadNpy(_ url: URL) throws -> NpyData {
         let array = try NpyArray.load(url)
         return NpyData(shape: array.shape, data: array.asFloat())
