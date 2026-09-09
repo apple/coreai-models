@@ -10,7 +10,6 @@ import Testing
 
 @Suite("Chunking Configuration", .serialized)
 struct ChunkingConfigTests {
-
     @Test("ModelConfig defaults: memory-based chunkSize, threshold = 2x chunkSize")
     func modelConfigDefaults() throws {
         let config = makeTestConfig()
