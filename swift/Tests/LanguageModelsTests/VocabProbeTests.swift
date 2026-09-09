@@ -70,13 +70,13 @@ struct VocabProbeTests {
         #expect(tok.convertTokenToId("<|eom|>") == 0)
         #expect(!tok.vocabContains("<|eom|>"))
 
-        let format = CoreAILanguageModel.CoreAIExecutor.detectThinkingFormat(using: tok)
+        let format = detectThinkingFormat(using: tok)
         guard case .tagPair(let open, _) = format else {
             Issue.record("Expected tagPair fallback, got agentic")
             return
         }
         #expect(open == "<think>")
-        #expect(detectToolCallMarkers(using: tok) == nil)
+        #expect(detectToolCallFormat(using: tok) == nil)
     }
 
     @Test("genuine tokens: agentic and tool markers detected")
@@ -86,11 +86,11 @@ struct VocabProbeTests {
             "<tool_call>": 4, "</tool_call>": 5,
         ])
 
-        let format = CoreAILanguageModel.CoreAIExecutor.detectThinkingFormat(using: tok)
+        let format = detectThinkingFormat(using: tok)
         guard case .agentic = format else {
             Issue.record("Expected agentic format")
             return
         }
-        #expect(detectToolCallMarkers(using: tok)?.open == "<tool_call>")
+        #expect(detectToolCallFormat(using: tok)?.openMarker == "<tool_call>")
     }
 }
