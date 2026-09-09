@@ -11,10 +11,13 @@ from coreai_models.segmentation.pipeline import (
     export_full,
     export_segmentation,
 )
+from coreai_models.segmentation.video_pipeline import VideoExportConfig, export_video
 
 __all__ = [
     "FullExportConfig",
     "SegmentationExportConfig",
+    "VideoExportConfig",
     "export_full",
     "export_segmentation",
+    "export_video",
 ]
