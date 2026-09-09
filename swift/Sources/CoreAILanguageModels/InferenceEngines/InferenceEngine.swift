@@ -174,10 +174,8 @@ public protocol InferenceConfiguration: Sendable {
 func defaultPrefillChunkSize() -> Int {
     let bytes = ProcessInfo.processInfo.physicalMemory
     let gb = bytes / (1024 * 1024 * 1024)
-    if gb < 24 { return 2048 }
-    if gb <= 64 { return 4096 }
-    if gb <= 128 { return 8192 }
-    return 16384
+    if gb <= 24 { return 2048 }
+    return 4096
 }
 
 extension InferenceConfiguration {
