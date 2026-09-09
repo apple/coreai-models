@@ -145,7 +145,7 @@ public struct CoreAILanguageModel: LanguageModel {
         self.supportsReasoning = {
             switch thinkingFormat {
             case .agentic: return true
-            case .tagPair(let open, _): return tokenizer.convertTokenToId(open) != nil
+            case .tagPair(let open, _): return tokenizer.vocabContains(open)
             }
         }()
         self.resources = resources
@@ -159,7 +159,7 @@ public struct CoreAILanguageModel: LanguageModel {
         // Agentic models: stop on <|eot|> (end of user-facing turn) so the
         // runner doesn't loop through repeated self→user cycles.
         if case .agentic(_, _, _, let eot) = thinkingFormat,
-            let eotId = tokenizer.convertTokenToId(eot)
+            let eotId = tokenizer.vocabContains(eot) ? tokenizer.convertTokenToId(eot) : nil
         {
             if !extraEos.contains(Int32(eotId)) {
                 extraEos.append(Int32(eotId))
