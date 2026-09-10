@@ -299,6 +299,16 @@ LLM_PRESETS: list[ModelPreset] = [
         32768,
         compression_config="models/gemma3n/gemma3n_e2b_4bit_embedding_excluded.yaml",
     ),
+    ModelPreset(
+        "olmo2-1b-instruct",
+        "allenai/OLMo-2-0425-1B-Instruct",
+        "olmo2",
+        "llm",
+        "macOS",
+        "4bit",
+        "float16",
+        4096,
+    ),
     # --- iOS (compression = palettized) ---
     ModelPreset(
         "qwen3-0.6b",
@@ -376,6 +386,17 @@ LLM_PRESETS: list[ModelPreset] = [
         "float16",
         4096,
         _model_type_override="qwen2",
+    ),
+    ModelPreset(
+        "olmo2-1b-instruct",
+        "allenai/OLMo-2-0425-1B-Instruct",
+        "olmo2",
+        "llm",
+        "iOS",
+        "none",
+        "float16",
+        IOS_DEFAULT_MAX_CONTEXT_LENGTH,
+        compression_config="models/olmo2/olmo2_1b_6bit.yaml",
     ),
 ]
 
