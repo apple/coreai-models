@@ -6,7 +6,7 @@ Allen Institute for AI (Ai2)'s OLMo 2 models for on-device inference via Core AI
 
 | Model                    | Parameters | macOS | iOS |
 | ------------------------ | ---------- | ----- | --- |
-| OLMo-2-0425-1B-Instruct | 1B         | Yes   | Yes |
+| OLMo-2-0425-1B-Instruct  | 1B         | Yes   | Yes |
 
 ## Export models
 
