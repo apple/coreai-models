@@ -233,8 +233,8 @@ public final class DPMSolverMultistepScheduler {
         let stepIndex = timeSteps.firstIndex(of: t) ?? timeSteps.count - 1
         let prevTimestep = stepIndex == timeSteps.count - 1 ? 0 : timeSteps[stepIndex + 1]
 
-        let lowerOrderFinal = useLowerOrderFinal && stepIndex == timeSteps.count - 1 && timeSteps.count < 15
-        let lowerOrderSecond = useLowerOrderFinal && stepIndex == timeSteps.count - 2 && timeSteps.count < 15
+        let lowerOrderFinal = useLowerOrderFinal && stepIndex == timeSteps.count - 1
+        let lowerOrderSecond = useLowerOrderFinal && stepIndex == timeSteps.count - 2
         let lowerOrder = lowerOrderStepped < 1 || lowerOrderFinal || lowerOrderSecond
 
         let modelOutput = convertModelOutput(modelOutput: output, timestep: t, sample: sample)
