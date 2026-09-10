@@ -1,5 +1,4 @@
 # 6-bit palettization for OLMo-2-0425-1B iOS.
-# 64 centroids — middle ground between 4-bit (16) and 8-bit (256).
 kmeans_palettization_config:
   global_config:
     op_state_spec:
