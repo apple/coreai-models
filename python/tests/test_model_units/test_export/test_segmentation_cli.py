@@ -20,10 +20,12 @@ from coreai_models.segmentation.export import (
     _SUPPORTED,
     _resolve_hf_model_id,
     _resolve_image_size,
+    _resolve_mode,
     _warn_unused_flags,
     build_parser,
 )
 from coreai_models.segmentation.pipeline import FullExportConfig, SegmentationExportConfig
+from coreai_models.segmentation.video_pipeline import VideoExportConfig
 
 
 def _parse(*argv: str) -> tuple[argparse.ArgumentParser, argparse.Namespace]:
@@ -83,8 +85,65 @@ def test_lite_is_the_default_mode() -> None:
 def test_image_size_defaults_per_mode() -> None:
     _, lite = _parse()
     _, full = _parse("--full")
+    _, video = _parse("--video")
     assert _resolve_image_size(lite) == SegmentationExportConfig.image_size
     assert _resolve_image_size(full) == FullExportConfig.image_size
+    assert _resolve_image_size(video) == VideoExportConfig.image_size
+
+
+# --- --video ---------------------------------------------------------
+
+
+def test_mode_resolves_from_the_flags() -> None:
+    for argv, expected in (((), "lite"), (("--full",), "full"), (("--video",), "video")):
+        _, args = _parse(*argv)
+        assert _resolve_mode(args) == expected
+
+
+def test_full_and_video_are_mutually_exclusive() -> None:
+    """Both set `config` in `main`; without the argparse group, whichever branch
+    ran last would silently win."""
+    parser = build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--full", "--video"])
+
+
+def test_video_only_flags_are_accepted_in_video_mode(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _, args = _parse("--video", "--spatial-slots", "12", "--ptr-slots", "32")
+    with caplog.at_level(logging.WARNING):
+        _warn_unused_flags(args)
+    assert caplog.text == ""
+
+
+def test_dtype_and_max_text_seq_len_apply_in_video_mode(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Video shares these two with the other modes, so they must not warn."""
+    _, args = _parse("--video", "--dtype", "float16", "--max-text-seq-len", "32")
+    with caplog.at_level(logging.WARNING):
+        _warn_unused_flags(args)
+    assert caplog.text == ""
+
+
+def test_warns_on_palettization_flags_in_video_mode(caplog: pytest.LogCaptureFixture) -> None:
+    _, args = _parse("--video", "--n-bits", "4", "--group-size", "16")
+    with caplog.at_level(logging.WARNING):
+        _warn_unused_flags(args)
+    assert "--n-bits" in caplog.text
+    assert "--group-size" in caplog.text
+
+
+@pytest.mark.parametrize("argv", [(), ("--full",)])
+def test_warns_on_video_only_flags_outside_video_mode(
+    argv: tuple[str, ...], caplog: pytest.LogCaptureFixture
+) -> None:
+    _, args = _parse(*argv, "--spatial-slots", "10", "--ptr-slots", "24")
+    with caplog.at_level(logging.WARNING):
+        _warn_unused_flags(args)
+    assert "--spatial-slots" in caplog.text
+    assert "--ptr-slots" in caplog.text
 
 
 def test_explicit_image_size_overrides_mode_default() -> None:
@@ -179,14 +238,21 @@ def test_include_debug_info_can_be_enabled() -> None:
     assert args.include_debug_info is True
 
 
-def test_include_debug_info_reaches_both_config_dataclasses() -> None:
-    """The flag is mode-agnostic, so both branches of ``main`` must carry it."""
-    for config_cls in (SegmentationExportConfig, FullExportConfig):
+def test_include_debug_info_reaches_every_config_dataclass() -> None:
+    """The flag is mode-agnostic, so all three branches of ``main`` must carry it."""
+    for config_cls in (SegmentationExportConfig, FullExportConfig, VideoExportConfig):
         assert config_cls().include_debug_info is False
         assert config_cls(include_debug_info=True).include_debug_info is True
 
 
-@pytest.mark.parametrize("argv", [("--include-debug-info",), ("--full", "--include-debug-info")])
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ("--include-debug-info",),
+        ("--full", "--include-debug-info"),
+        ("--video", "--include-debug-info"),
+    ],
+)
 def test_include_debug_info_is_not_treated_as_mode_specific(
     argv: tuple[str, ...], caplog: pytest.LogCaptureFixture
 ) -> None:

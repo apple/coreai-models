@@ -6,7 +6,7 @@
 """CLI entry point for ``coreai.segmentation.export``.
 
 Currently supports SAM3 (the registry short-name ``sam3`` or the HF id
-``facebook/sam3``). Two export paths share this CLI:
+``facebook/sam3``). Three export paths share this CLI:
 
   * **Lite (default)** — ANE-targeted model split into three independently
     optimizable functions (``image_encode``, ``text_encode``, ``detect``)
@@ -14,9 +14,12 @@ Currently supports SAM3 (the registry short-name ``sam3`` or the HF id
   * **Full (``--full``)** — plain ``transformers.Sam3Model``,
     single ``main`` entrypoint, higher quality at the cost of size and
     on-device speed.
+  * **Video (``--video``)** — ``transformers.Sam3VideoModel`` split into seven
+    functions for detect-and-track. The inference session, memory ring buffer
+    and tracking heuristics stay on the host.
 
-Both paths produce a segmenter bundle directory containing an
-``.aimodel``, a ``tokenizer/`` folder, and a ``metadata.json``.
+All three paths produce a bundle directory containing an ``.aimodel``, a
+``tokenizer/`` folder, and a ``metadata.json``.
 """
 
 from __future__ import annotations
@@ -31,6 +34,7 @@ from coreai_models.segmentation.pipeline import (
     export_full,
     export_segmentation,
 )
+from coreai_models.segmentation.video_pipeline import VideoExportConfig, export_video
 
 # Accepted ``--model`` spellings → canonical HF id. Doubles as the source of
 # truth for the flag's ``choices``, so adding an alias here is all it takes.
@@ -70,8 +74,9 @@ def build_parser() -> argparse.ArgumentParser:
             "Export segmentation models to Core AI format. By default exports "
             "the lite variant targeting iOS via a 3-function bundle "
             "(image_encode / text_encode / detect) with palettized encoders "
-            "+ fp16. Pass --full to instead export the unmodified HF model "
-            "as a single-entrypoint asset."
+            "+ fp16. Pass --full to instead export the unmodified HF image "
+            "model as a single-entrypoint asset, or --video for the 7-function "
+            "detect-and-track bundle."
         ),
     )
     parser.add_argument(
@@ -83,12 +88,22 @@ def build_parser() -> argparse.ArgumentParser:
             "or its HuggingFace id (e.g. 'facebook/sam3')."
         ),
     )
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--full",
         action="store_true",
         help=(
-            "Export the plain HF model with no ANE targeting or palettization. "
+            "Export the plain HF image model with no ANE targeting or palettization. "
             "Single 'main' entrypoint; higher quality at the cost of size and speed."
+        ),
+    )
+    mode.add_argument(
+        "--video",
+        action="store_true",
+        help=(
+            "Export SAM3 video segmentation (Sam3VideoModel) as a 7-function bundle: "
+            "image_encode, text_encode, detect, tracker_encode, tracker_step, "
+            "memory_encode, tracker_mask_init."
         ),
     )
     parser.add_argument(
@@ -108,7 +123,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--image-size",
         type=int,
         default=None,
-        help=("Input resolution. Defaults to 336 (lite) or 1008 (--full). "),
+        help=("Input resolution. Defaults to 336 (lite) or 1008 (--full / --video). "),
     )
     # ---- Lite-only flags -------------------------------------------
     # Mode-specific flags default to None rather than their real default so
@@ -118,7 +133,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-text-seq-len",
         type=int,
         default=None,
-        help="(lite) Static text sequence length used at export time. Default: 32.",
+        help="(lite, video) Static text sequence length used at export time. Default: 32.",
     )
     parser.add_argument(
         "--n-bits",
@@ -144,7 +159,29 @@ def build_parser() -> argparse.ArgumentParser:
         "--dtype",
         choices=["float16", "float32"],
         default=None,
-        help="(--full) Torch dtype to use for the model. Default: float32.",
+        help=(
+            "(--full, --video) Torch dtype for the model. Default: float32 (full), float16 (video)."
+        ),
+    )
+    # ---- Video-only flags -----------------------------------------------
+    parser.add_argument(
+        "--spatial-slots",
+        type=int,
+        default=None,
+        help=(
+            "(--video) Fixed spatial-memory slot count for tracker_step. Must be at "
+            "least max_cond_frame_num + num_maskmem - 1 (10 for facebook/sam3)."
+        ),
+    )
+    parser.add_argument(
+        "--ptr-slots",
+        type=int,
+        default=None,
+        help=(
+            "(--video) Fixed object-pointer slot count for tracker_step. Must be at "
+            "least max_object_pointers_in_encoder (16 for facebook/sam3); the extra "
+            "headroom absorbs pointers from accumulated conditioning frames."
+        ),
     )
     # ---- Shared flags ---------------------------------------------------
     parser.add_argument(
@@ -175,6 +212,15 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _resolve_mode(args: argparse.Namespace) -> str:
+    """``--full`` / ``--video`` are mutually exclusive; absent both, it's lite."""
+    if args.full:
+        return "full"
+    if args.video:
+        return "video"
+    return "lite"
+
+
 def _resolve_image_size(args: argparse.Namespace) -> int:
     """Pick the resolution each mode was designed for when --image-size is omitted.
 
@@ -185,7 +231,23 @@ def _resolve_image_size(args: argparse.Namespace) -> int:
     """
     if args.image_size is not None:
         return args.image_size
-    return FullExportConfig.image_size if args.full else SegmentationExportConfig.image_size
+    return {
+        "lite": SegmentationExportConfig.image_size,
+        "full": FullExportConfig.image_size,
+        "video": VideoExportConfig.image_size,
+    }[_resolve_mode(args)]
+
+
+#: Which modes each mode-specific flag actually reaches. Anything passed
+#: outside its listed modes is silently ignored by the export, so warn.
+_FLAG_MODES = {
+    "max_text_seq_len": {"lite", "video"},
+    "n_bits": {"lite"},
+    "group_size": {"lite"},
+    "dtype": {"full", "video"},
+    "spatial_slots": {"video"},
+    "ptr_slots": {"video"},
+}
 
 
 def _warn_unused_flags(args: argparse.Namespace) -> None:
@@ -196,20 +258,28 @@ def _warn_unused_flags(args: argparse.Namespace) -> None:
     None" means the user passed it explicitly — including when the value they
     passed happens to equal the mode's resolved default.
     """
-    if args.full:
-        # Lite-only flags shouldn't be set in full mode.
-        ignored = [
-            name.replace("_", "-")
-            for name in ("max_text_seq_len", "n_bits", "group_size")
-            if getattr(args, name) is not None
-        ]
-        if ignored:
-            logging.warning(
-                "Ignoring lite-only flag(s) in full mode: %s",
-                ", ".join(f"--{n}" for n in ignored),
-            )
-    elif args.dtype is not None:
-        logging.warning("Ignoring --dtype outside full mode (lite path is fp16).")
+    mode = _resolve_mode(args)
+    ignored = [
+        name.replace("_", "-")
+        for name, modes in _FLAG_MODES.items()
+        if mode not in modes and getattr(args, name, None) is not None
+    ]
+    if ignored:
+        logging.warning(
+            "Ignoring flag(s) that do not apply in %s mode: %s",
+            mode,
+            ", ".join(f"--{n}" for n in ignored),
+        )
+
+
+def _print_dry_run(label: str, config: object, fields: list[str]) -> None:
+    print(f"Dry run — resolved {label} export config:")
+    width = max(len(f) for f in fields) + 1
+    for field in fields:
+        value = getattr(config, field)
+        if field == "output_name" and value is None:
+            continue
+        print(f"  {field + ':':<{width}} {value}")
 
 
 def main() -> None:
@@ -224,72 +294,115 @@ def main() -> None:
 
     hf_model_id = _resolve_hf_model_id(args.model)
     image_size = _resolve_image_size(args)
+    mode = _resolve_mode(args)
     _warn_unused_flags(args)
+    output_dir = args.output_dir or _default_output_dir()
 
-    if args.full:
-        config = FullExportConfig(
+    if mode == "video":
+        video_defaults = VideoExportConfig()
+        video_config = VideoExportConfig(
             hf_model_id=hf_model_id,
             image_size=image_size,
-            dtype=args.dtype or FullExportConfig.dtype,
-            output_dir=args.output_dir or _default_output_dir(),
+            dtype=args.dtype or video_defaults.dtype,
+            spatial_slots=args.spatial_slots or video_defaults.spatial_slots,
+            ptr_slots=args.ptr_slots or video_defaults.ptr_slots,
+            max_text_seq_len=args.max_text_seq_len or video_defaults.max_text_seq_len,
+            output_dir=output_dir,
             output_name=args.output_name,
             overwrite=args.overwrite,
             include_debug_info=args.include_debug_info,
         )
         if args.dry_run:
-            print("Dry run — resolved full export config:")
-            print(f"  model:              {config.hf_model_id}")
-            print(f"  image_size:         {config.image_size}")
-            print(f"  dtype:              {config.dtype}")
-            print(f"  output_dir:         {config.output_dir}")
-            if config.output_name:
-                print(f"  output_name:        {config.output_name}")
-            print(f"  overwrite:          {config.overwrite}")
-            print(f"  include_debug_info: {config.include_debug_info}")
+            _print_dry_run(
+                "video",
+                video_config,
+                [
+                    "hf_model_id",
+                    "image_size",
+                    "dtype",
+                    "spatial_slots",
+                    "ptr_slots",
+                    "max_text_seq_len",
+                    "output_dir",
+                    "output_name",
+                    "overwrite",
+                    "include_debug_info",
+                ],
+            )
             return
-        bundle_path = export_full(config)
+        bundle_path = export_video(video_config)
+    elif mode == "full":
+        full_config = FullExportConfig(
+            hf_model_id=hf_model_id,
+            image_size=image_size,
+            dtype=args.dtype or FullExportConfig.dtype,
+            output_dir=output_dir,
+            output_name=args.output_name,
+            overwrite=args.overwrite,
+            include_debug_info=args.include_debug_info,
+        )
+        if args.dry_run:
+            _print_dry_run(
+                "full",
+                full_config,
+                [
+                    "hf_model_id",
+                    "image_size",
+                    "dtype",
+                    "output_dir",
+                    "output_name",
+                    "overwrite",
+                    "include_debug_info",
+                ],
+            )
+            return
+        bundle_path = export_full(full_config)
     else:
         # Resolve asymmetric defaults from SegmentationExportConfig; --n-bits / --group-size
         # are uniform overrides that apply to BOTH encoders when set.
-        defaults = SegmentationExportConfig()
-        image_n_bits = args.n_bits if args.n_bits is not None else defaults.image_n_bits
-        text_n_bits = args.n_bits if args.n_bits is not None else defaults.text_n_bits
+        lite_defaults = SegmentationExportConfig()
+        image_n_bits = args.n_bits if args.n_bits is not None else lite_defaults.image_n_bits
+        text_n_bits = args.n_bits if args.n_bits is not None else lite_defaults.text_n_bits
         image_group_size = (
-            args.group_size if args.group_size is not None else defaults.image_group_size
+            args.group_size if args.group_size is not None else lite_defaults.image_group_size
         )
         text_group_size = (
-            args.group_size if args.group_size is not None else defaults.text_group_size
+            args.group_size if args.group_size is not None else lite_defaults.text_group_size
         )
 
-        config = SegmentationExportConfig(
+        lite_config = SegmentationExportConfig(
             hf_model_id=hf_model_id,
             image_size=image_size,
-            max_text_seq_len=args.max_text_seq_len or defaults.max_text_seq_len,
+            max_text_seq_len=args.max_text_seq_len or lite_defaults.max_text_seq_len,
             image_n_bits=image_n_bits,
             image_group_size=image_group_size,
             text_n_bits=text_n_bits,
             text_group_size=text_group_size,
-            output_dir=args.output_dir or _default_output_dir(),
+            output_dir=output_dir,
             output_name=args.output_name,
             overwrite=args.overwrite,
             include_debug_info=args.include_debug_info,
         )
         if args.dry_run:
-            print("Dry run — resolved export config:")
-            print(f"  model:              {config.hf_model_id}")
-            print(f"  image_size:         {config.image_size}")
-            print(f"  max_text_seq_len:   {config.max_text_seq_len}")
-            print(f"  image_n_bits:       {config.image_n_bits}")
-            print(f"  image_group_size:   {config.image_group_size}")
-            print(f"  text_n_bits:        {config.text_n_bits}")
-            print(f"  text_group_size:    {config.text_group_size}")
-            print(f"  output_dir:         {config.output_dir}")
-            if config.output_name:
-                print(f"  output_name:        {config.output_name}")
-            print(f"  overwrite:          {config.overwrite}")
-            print(f"  include_debug_info: {config.include_debug_info}")
+            _print_dry_run(
+                "lite",
+                lite_config,
+                [
+                    "hf_model_id",
+                    "image_size",
+                    "max_text_seq_len",
+                    "image_n_bits",
+                    "image_group_size",
+                    "text_n_bits",
+                    "text_group_size",
+                    "output_dir",
+                    "output_name",
+                    "overwrite",
+                    "include_debug_info",
+                ],
+            )
             return
-        bundle_path = export_segmentation(config)
+        bundle_path = export_segmentation(lite_config)
 
     print(f"Export complete: {bundle_path}")
 
