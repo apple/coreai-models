@@ -92,12 +92,17 @@ struct LLMServer: AsyncParsableCommand {
             print("Cleared specialization cache for \(bundle.name) (\(cleared.count) component(s))")
         }
 
+        // Resolve chunking config with CLI flags taking precedence over metadata.json.
+        // A nil result preserves the lower layers (deprecated env var, memory-based default).
+        let resolvedChunkSize = chunkSize ?? bundle.language.prefillChunkSize
+        let resolvedChunkThreshold = chunkThreshold ?? bundle.language.prefillChunkThreshold
+
         let engineOptions = EngineOptions(
             variant: inferenceEngineVariant,
             kvCacheStrategy: kvCacheStrategy,
             kvCacheSize: kvCacheInitialCapacity,
-            prefillChunkSize: chunkSize,
-            prefillChunkThreshold: chunkThreshold
+            prefillChunkSize: resolvedChunkSize,
+            prefillChunkThreshold: resolvedChunkThreshold
         )
 
         let modelURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.main)

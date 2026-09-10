@@ -450,12 +450,18 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         // Create inference engine
         CLILogger.log("Creating inference engine...", component: "Main")
 
+        // Resolve chunking config with CLI flags taking precedence over metadata.json.
+        // A nil result preserves the lower layers (deprecated env var, memory-based default).
+        // Applies to both the standard LLM path (EngineFactory) and the VLM engine below.
+        let resolvedChunkSize = chunkSize ?? bundle.language.prefillChunkSize
+        let resolvedChunkThreshold = chunkThreshold ?? bundle.language.prefillChunkThreshold
+
         let engineOptions = EngineOptions(
             variant: inferenceEngineVariant,
             kvCacheStrategy: kvCacheStrategy,
             kvCacheSize: kvCacheInitialCapacity,
-            prefillChunkSize: chunkSize,
-            prefillChunkThreshold: chunkThreshold
+            prefillChunkSize: resolvedChunkSize,
+            prefillChunkThreshold: resolvedChunkThreshold
         )
 
         // Parallel loading: engine compilation + tokenizer are independent.

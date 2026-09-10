@@ -73,7 +73,10 @@ public struct CoreAIVisionLanguageModel: LanguageModel {
             visionModel: try await visionModelResult,
             embedModel: try await embedModelResult,
             llmModel: try await llmModelResult,
-            options: EngineOptions()
+            options: EngineOptions(
+                prefillChunkSize: bundle.language.prefillChunkSize,
+                prefillChunkThreshold: bundle.language.prefillChunkThreshold
+            )
         )
 
         self.executorConfiguration = CoreAIVLMExecutor.Configuration(

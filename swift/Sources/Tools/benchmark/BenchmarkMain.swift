@@ -99,9 +99,13 @@ struct LLMBenchmark: AsyncParsableCommand {
         let configData = try JSONEncoder().encode(engineConfig)
         print("\n⏳ Preparing AI asset...", terminator: "")
         fflush(stdout)
+        // Resolve chunking config with CLI flags taking precedence over metadata.json.
+        // A nil result preserves the lower layers (deprecated env var, memory-based default).
+        let resolvedChunkSize = chunkSize ?? bundle.language.prefillChunkSize
+        let resolvedChunkThreshold = chunkThreshold ?? bundle.language.prefillChunkThreshold
         let engineOptions = EngineOptions(
-            prefillChunkSize: chunkSize,
-            prefillChunkThreshold: chunkThreshold
+            prefillChunkSize: resolvedChunkSize,
+            prefillChunkThreshold: resolvedChunkThreshold
         )
         let prepareStart = SuspendingClock.now
         let engine = try await EngineFactory.createEngine(

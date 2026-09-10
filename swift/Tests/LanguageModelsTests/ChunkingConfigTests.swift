@@ -92,6 +92,23 @@ struct ChunkingConfigTests {
         #expect(size & (size - 1) == 0)
     }
 
+    @Test("VLMModelConfig surfaces chunking overrides applied to its base config")
+    func vlmConfigForwardsOverrides() throws {
+        // The VLM engine applies EngineOptions overrides onto `base` and reconstructs
+        // the VLMModelConfig; its prefill decision then reads config.prefillChunkSize /
+        // config.chunkThreshold. Verify those overrides surface through the wrapper.
+        var base = makeTestConfig()
+        base.applyChunkingOverrides(prefillChunkSize: 128, prefillChunkThreshold: 384)
+        let vlm = VLMModelConfig(base: base, visionConfig: makeTestVisionConfig())
+        #expect(vlm.prefillChunkSize == 128)
+        #expect(vlm.chunkThreshold == 384)
+
+        // Absent overrides fall through to the memory-based default (2x threshold).
+        let plain = VLMModelConfig(base: makeTestConfig(), visionConfig: makeTestVisionConfig())
+        #expect(plain.prefillChunkSize >= 2048)
+        #expect(plain.chunkThreshold == plain.prefillChunkSize * 2)
+    }
+
     // MARK: - Helpers
 
     private func makeTestConfig() -> ModelConfig {
@@ -99,6 +116,12 @@ struct ChunkingConfigTests {
             name: "test", tokenizer: "test", vocabSize: 1000,
             maxContextLength: 4096, serializedModel: ["test.aimodel"],
             function: "main"
+        )
+    }
+
+    private func makeTestVisionConfig() -> VisionConfig {
+        VisionConfig(
+            imageSize: 224, patchSize: 14, imageTokenCount: 256, imageTokenId: 0
         )
     }
 }
