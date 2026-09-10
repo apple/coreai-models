@@ -13,7 +13,7 @@ import CoreGraphics
 /// Per-model linear projection from latent channels to RGB.
 ///
 /// Fitted by encoding images through the VAE and regressing latent channels
-/// against original RGB values. Stored as a flat [C×3] weight matrix for vDSP.
+/// against original RGB values. Stored as a flat [C×3] weight matrix for BLAS (cblas_sgemm).
 ///
 /// Requires latent coefficients fit for the specific model's VAE, since the
 /// latent-to-RGB mapping differs per model. Fit a set for the model you run and
@@ -26,6 +26,8 @@ import CoreGraphics
 /// diffusion-runner --tune-fit <dir>
 /// ```
 public struct LatentRGBCoefficients: Sendable {
+    /// Fixed RGB output channel count for the latent-to-RGB projection.
+    public static let rgbChannels = 3
     /// Flat row-major [C, 3] — one row per latent channel, columns R/G/B.
     public let weights: [Float]
     /// Per-channel bias [3].
@@ -33,8 +35,8 @@ public struct LatentRGBCoefficients: Sendable {
     public let channels: Int
 
     public init(channels: Int, weights: [Float], bias: [Float]) {
-        precondition(weights.count == channels * 3)
-        precondition(bias.count == 3)
+        precondition(weights.count == channels * Self.rgbChannels)
+        precondition(bias.count == Self.rgbChannels)
         self.channels = channels
         self.weights = weights
         self.bias = bias
@@ -44,8 +46,8 @@ public struct LatentRGBCoefficients: Sendable {
 // MARK: - NDArray → CGImage
 
 extension NDArray {
-    /// Project a latent tensor [1, C, H, W] to an RGB preview via a vDSP matrix
-    /// multiply (latent channels → RGB), then `DiffusionUtilities.pixelsToCGImage`
+    /// Project a latent tensor [1, C, H, W] to an RGB preview via a cblas_sgemm
+    /// (BLAS) matrix multiply (latent channels → RGB), then `DiffusionUtilities.pixelsToCGImage`
     /// for the CHW→CGImage step.
     ///
     /// `coefficients` must match the model's VAE; fit a set via
@@ -56,7 +58,7 @@ extension NDArray {
         return draftProjection(coefficients: coefficients)
     }
 
-    /// Project C-channel latent to 3-channel RGB using vDSP matrix multiply.
+    /// Project C-channel latent to 3-channel RGB using a cblas_sgemm (BLAS) matrix multiply.
     ///
     /// Input:  self = [1, C, H, W] in BCHW layout
     /// Output: [Float] of length 3*H*W in CHW layout (R plane, G plane, B plane)
@@ -74,6 +76,7 @@ extension NDArray {
         guard channels == coefficients.channels else { return nil }
 
         let spatialCount = height * width
+        let rgb = LatentRGBCoefficients.rgbChannels
 
         // Transpose latent from CHW to NxC (HW-major, channel-minor)
         let view = self.view(as: Float.self)
@@ -87,7 +90,7 @@ extension NDArray {
         }
 
         // GEMM: [N, C] × [C, 3] → [N, 3]
-        var nx3 = [Float](repeating: 0, count: spatialCount * 3)
+        var nx3 = [Float](repeating: 0, count: spatialCount * rgb)
         cblas_sgemm(
             CblasRowMajor, CblasNoTrans, CblasNoTrans,
             Int32(spatialCount), 3, Int32(channels),
@@ -100,12 +103,12 @@ extension NDArray {
 
         // Transpose N×3 (interleaved RGB) → CHW (3 planes) and add bias.
         // pixelsToCGImage expects [-1, 1] and applies x*0.5+0.5, so remap.
-        var chw = [Float](repeating: 0, count: 3 * spatialCount)
-        for c in 0..<3 {
+        var chw = [Float](repeating: 0, count: rgb * spatialCount)
+        for c in 0..<rgb {
             let bias = coefficients.bias[c]
             let planeOffset = c * spatialCount
             for p in 0..<spatialCount {
-                let val = nx3[p * 3 + c] + bias
+                let val = nx3[p * rgb + c] + bias
                 chw[planeOffset + p] = val * 2.0 - 1.0
             }
         }

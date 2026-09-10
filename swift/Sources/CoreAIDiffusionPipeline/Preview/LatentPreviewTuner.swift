@@ -117,7 +117,7 @@ public class LatentPreviewTuner {
         let shape = lastLatent.shape
         print("[tune] lastLatent shape=\(shape), data.count=\(lastLatent.data.count)")
         guard shape.count == 4, shape[0] == 1 else {
-            print("[tune] fit failed: shape rank \(shape.count) != 4")
+            print("[tune] fit failed: expected shape [1, C, H, W], got \(shape)")
             return nil
         }
         let channels = shape[1]
@@ -154,68 +154,11 @@ public class LatentPreviewTuner {
             y[p * 3 + 2] = Float(rgbData[p * 3 + 2]) / 255.0
         }
 
-        // X^T X: [C, C]
-        var xtx = [Float](repeating: 0, count: channels * channels)
-        cblas_sgemm(
-            CblasRowMajor, CblasTrans, CblasNoTrans,
-            Int32(channels), Int32(channels), Int32(spatialCount),
-            1.0, x, Int32(channels), x, Int32(channels),
-            0.0, &xtx, Int32(channels)
-        )
-
-        // Add ridge for numerical stability
-        for i in 0..<channels {
-            xtx[i * channels + i] += 1.0
-        }
-        let diag = (0..<channels).map { xtx[$0 * channels + $0] }
         let xRange = x.isEmpty ? (Float(0), Float(0)) : (x.min()!, x.max()!)
         print("[tune] latent range: [\(xRange.0), \(xRange.1)]")
-        print("[tune] XtX diagonal (after ridge): \(diag)")
 
-        // X^T Y: [C, 3]
-        var xty = [Float](repeating: 0, count: channels * 3)
-        cblas_sgemm(
-            CblasRowMajor, CblasTrans, CblasNoTrans,
-            Int32(channels), 3, Int32(spatialCount),
-            1.0, x, Int32(channels), y, 3,
-            0.0, &xty, 3
-        )
-
-        // Solve (X^T X) W = X^T Y via LAPACK (symmetric positive definite)
-        var n = Int32(channels)
-        var lda = n
-        var ldb = n
-        var nrhs = Int32(3)
-        var info = Int32(0)
-        var uplo = Int8(UInt8(ascii: "U"))
-        sposv_(&uplo, &n, &nrhs, &xtx, &lda, &xty, &ldb, &info)
-
-        guard info == 0 else {
-            print("[tune] sposv_ failed: info=\(info) (n=\(channels))")
-            return nil
-        }
-        print("[tune] sposv_ succeeded, computing bias...")
-
-        // xty now contains the solution W: [C, 3]
-        // Compute bias as mean residual
-        var predicted = [Float](repeating: 0, count: spatialCount * 3)
-        cblas_sgemm(
-            CblasRowMajor, CblasNoTrans, CblasNoTrans,
-            Int32(spatialCount), 3, Int32(channels),
-            1.0, x, Int32(channels), xty, 3,
-            0.0, &predicted, 3
-        )
-
-        var bias: [Float] = [0, 0, 0]
-        for c in 0..<3 {
-            var sum: Float = 0
-            for p in 0..<spatialCount {
-                sum += y[p * 3 + c] - predicted[p * 3 + c]
-            }
-            bias[c] = sum / Float(spatialCount)
-        }
-
-        return LatentRGBCoefficients(channels: channels, weights: xty, bias: bias)
+        return Self.solveLeastSquares(
+            x: x, y: y, rowCount: spatialCount, channels: channels, logPrefix: "[tune]")
     }
 
     /// Generate preview PNGs for each recorded step.
@@ -235,14 +178,14 @@ public class LatentPreviewTuner {
                 for i in 0..<data.count { ptr[i] = data[i] }
             }
             if let preview = latentArray.asRGB(coefficients: coefficients) {
-                savePNG(preview, to: outputDir.appendingPathComponent("latent_\(step)_draft.png"))
+                Self.writePNG(preview, to: outputDir.appendingPathComponent("latent_\(step)_draft.png"))
             }
 
             // Full (VAE) preview
             if let vaeDecode {
                 do {
                     let decoded = try await vaeDecode(data, shape)
-                    savePNG(decoded, to: outputDir.appendingPathComponent("latent_\(step)_vae.png"))
+                    Self.writePNG(decoded, to: outputDir.appendingPathComponent("latent_\(step)_vae.png"))
                 } catch {
                     print("[tune] VAE decode failed at step \(step): \(error)")
                 }
@@ -252,10 +195,6 @@ public class LatentPreviewTuner {
         print("[tune] Exported \(latents.count) step previews (\(modes))")
     }
 
-    private func savePNG(_ image: CGImage, to url: URL) {
-        Self.writePNG(image, to: url)
-    }
-
     /// Write a CGImage to disk as a PNG. Shared by the instance and directory paths.
     private static func writePNG(_ image: CGImage, to url: URL) {
         guard let dest = CGImageDestinationCreateWithURL(url as CFURL, "public.png" as CFString, 1, nil) else {
@@ -263,6 +202,81 @@ public class LatentPreviewTuner {
         }
         CGImageDestinationAddImage(dest, image, nil)
         CGImageDestinationFinalize(dest)
+    }
+
+    /// Shared least-squares core for both the in-memory and directory fit paths.
+    ///
+    /// Solves `X · W = Y` for the `[C, 3]` projection `W` via the normal equations
+    /// `(XᵀX + λI) W = Xᵀ Y` (ridge λ = 1) using LAPACK `sposv_`, then derives a
+    /// per-channel `bias` as the mean residual. Callers assemble the design matrices
+    /// themselves, so this works unchanged whether `x`/`y` hold one image's pixels
+    /// (`rowCount == H*W`) or many stacked generations (`rowCount == runs * H*W`).
+    ///
+    /// - Parameters:
+    ///   - x: Row-major `[rowCount, channels]` latent design matrix.
+    ///   - y: Row-major `[rowCount, 3]` target RGB, normalized to `[0, 1]`.
+    ///   - rowCount: Number of rows (pixels), possibly spanning multiple runs.
+    ///   - channels: Latent channel count `C`.
+    ///   - logPrefix: Diagnostic tag (`"[tune]"` or `"[tune-fit]"`).
+    private static func solveLeastSquares(
+        x: [Float], y: [Float], rowCount: Int, channels: Int, logPrefix: String
+    ) -> LatentRGBCoefficients? {
+        // X^T X: [C, C]
+        var xtx = [Float](repeating: 0, count: channels * channels)
+        cblas_sgemm(
+            CblasRowMajor, CblasTrans, CblasNoTrans,
+            Int32(channels), Int32(channels), Int32(rowCount),
+            1.0, x, Int32(channels), x, Int32(channels),
+            0.0, &xtx, Int32(channels)
+        )
+
+        // Add ridge for numerical stability
+        for i in 0..<channels {
+            xtx[i * channels + i] += 1.0
+        }
+
+        // X^T Y: [C, 3]
+        var xty = [Float](repeating: 0, count: channels * 3)
+        cblas_sgemm(
+            CblasRowMajor, CblasTrans, CblasNoTrans,
+            Int32(channels), 3, Int32(rowCount),
+            1.0, x, Int32(channels), y, 3,
+            0.0, &xty, 3
+        )
+
+        // Solve (X^T X) W = X^T Y via LAPACK (symmetric positive definite)
+        var n = Int32(channels)
+        var lda = n
+        var ldb = n
+        var nrhs = Int32(3)
+        var info = Int32(0)
+        var uplo = Int8(UInt8(ascii: "U"))
+        sposv_(&uplo, &n, &nrhs, &xtx, &lda, &xty, &ldb, &info)
+
+        guard info == 0 else {
+            print("\(logPrefix) sposv_ failed: info=\(info) (n=\(channels))")
+            return nil
+        }
+
+        // xty now contains the solution W: [C, 3]. Compute bias as mean residual.
+        var predicted = [Float](repeating: 0, count: rowCount * 3)
+        cblas_sgemm(
+            CblasRowMajor, CblasNoTrans, CblasNoTrans,
+            Int32(rowCount), 3, Int32(channels),
+            1.0, x, Int32(channels), xty, 3,
+            0.0, &predicted, 3
+        )
+
+        var bias: [Float] = [0, 0, 0]
+        for c in 0..<3 {
+            var sum: Float = 0
+            for p in 0..<rowCount {
+                sum += y[p * 3 + c] - predicted[p * 3 + c]
+            }
+            bias[c] = sum / Float(rowCount)
+        }
+
+        return LatentRGBCoefficients(channels: channels, weights: xty, bias: bias)
     }
 
     /// Downsample a CGImage to the target resolution and extract interleaved RGB bytes.
@@ -427,65 +441,8 @@ public class LatentPreviewTuner {
             }
         }
 
-        // Normal equations: W = (X^T X + I)^{-1} X^T Y
-
-        // X^T X: [C, C]
-        var xtx = [Float](repeating: 0, count: channels * channels)
-        cblas_sgemm(
-            CblasRowMajor, CblasTrans, CblasNoTrans,
-            Int32(channels), Int32(channels), Int32(totalN),
-            1.0, x, Int32(channels), x, Int32(channels),
-            0.0, &xtx, Int32(channels)
-        )
-
-        // Ridge regularisation
-        for i in 0..<channels {
-            xtx[i * channels + i] += 1.0
-        }
-
-        // X^T Y: [C, 3]
-        var xty = [Float](repeating: 0, count: channels * 3)
-        cblas_sgemm(
-            CblasRowMajor, CblasTrans, CblasNoTrans,
-            Int32(channels), 3, Int32(totalN),
-            1.0, x, Int32(channels), y, 3,
-            0.0, &xty, 3
-        )
-
-        // Solve via LAPACK sposv_ (symmetric positive definite)
-        var n = Int32(channels)
-        var lda = n
-        var ldb = n
-        var nrhs = Int32(3)
-        var info = Int32(0)
-        var uplo = Int8(UInt8(ascii: "U"))
-        sposv_(&uplo, &n, &nrhs, &xtx, &lda, &xty, &ldb, &info)
-
-        guard info == 0 else {
-            print("[tune-fit] sposv_ failed: info=\(info)")
-            return nil
-        }
-
-        // Compute bias as mean residual
-        var predicted = [Float](repeating: 0, count: totalN * 3)
-        cblas_sgemm(
-            CblasRowMajor, CblasNoTrans, CblasNoTrans,
-            Int32(totalN), 3, Int32(channels),
-            1.0, x, Int32(channels), xty, 3,
-            0.0, &predicted, 3
-        )
-
-        var bias: [Float] = [0, 0, 0]
-        for c in 0..<3 {
-            var sum: Float = 0
-            for p in 0..<totalN {
-                sum += y[p * 3 + c] - predicted[p * 3 + c]
-            }
-            bias[c] = sum / Float(totalN)
-        }
-
-        print("[tune-fit] Fit succeeded")
-        return LatentRGBCoefficients(channels: channels, weights: xty, bias: bias)
+        return solveLeastSquares(
+            x: x, y: y, rowCount: totalN, channels: channels, logPrefix: "[tune-fit]")
     }
 
     // MARK: - Per-Step Draft Export from Directory
@@ -537,7 +494,10 @@ public class LatentPreviewTuner {
                     print("[tune-fit] Could not read \(file.lastPathComponent), skipping")
                     continue
                 }
-                guard shape.count == 4, shape[0] == 1 else { continue }
+                guard shape.count == 4, shape[0] == 1 else {
+                    print("[tune-fit] Skipping \(file.lastPathComponent): unexpected latent shape \(shape)")
+                    continue
+                }
 
                 var latentArray = NDArray(shape: shape, scalarType: .float32)
                 latentArray.mutableView(as: Float.self).withUnsafeMutablePointer { ptr, _, _ in

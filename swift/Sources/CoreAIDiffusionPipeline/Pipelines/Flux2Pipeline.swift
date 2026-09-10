@@ -424,7 +424,7 @@ public struct Flux2Pipeline: DiffusionPipeline {
             try checkLatentsAreFinite(packedLatents, step: step)
 
             if let progressHandler {
-                // Unpack → denorm → unpatchify: [1, 128, 64, 64] → [1, 16, 128, 128]
+                // Unpack → denorm → unpatchify: [1, 128, 64, 64] → [1, 32, 128, 128]
                 // These are array copies, no model call.
                 let spatial = unpackLatentsSpatialFlatten(
                     packedLatents, channels: inChannels, height: spatialSide, width: spatialSide)
@@ -433,7 +433,7 @@ public struct Flux2Pipeline: DiffusionPipeline {
                 let unpatchified = Self.unpatchifyLatents(
                     denormed, channels: inChannels, height: spatialSide, width: spatialSide)
 
-                let vaeChannels = inChannels / 4  // 128 → 16 after patchify
+                let vaeChannels = inChannels / 4  // 128 → 32 after patchify
                 let vaeHeight = spatialSide * 2
                 let vaeWidth = spatialSide * 2
                 var previewLatents = NDArray(
