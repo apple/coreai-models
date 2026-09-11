@@ -65,7 +65,7 @@ Perplexity score on the [`WikiText-2`](https://huggingface.co/datasets/EleutherA
 | 1B    | none (`float16`)                    | 16.00 | macOS    | 17.06      |
 | 1B    | [4-bit quantized][presets-info]     | 4.50  | macOS    | 18.72      |
 | 1B    | none (`float16`)                    | 16.00 | iOS      | 17.09      |
-| 1B    | [6-bit palettized][olmo2-6bit-yaml] | 6.00  | iOS      | 17.19      |
+| 1B    | [6-bit palettized][olmo2-6bit-yaml] | 6.00  | iOS      | 17.09      |
 
 [presets-info]: ../README.md#quantization-options
 [olmo2-6bit-yaml]: olmo2_1b_6bit.yaml
