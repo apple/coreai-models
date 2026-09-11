@@ -22,6 +22,7 @@ from coreai_models._constants import DEFAULT_INCLUDE_DEBUG_INFO
 from coreai_models.diffusion.pipeline import DiffusionExportConfig
 from coreai_models.export.pipeline import ExportConfig
 from coreai_models.llm.export import build_parser
+from coreai_models.segmentation.export import build_parser as build_segmentation_parser
 
 
 def _repo_root() -> Path:
@@ -79,9 +80,9 @@ def test_llm_cli_resolves_the_flag_onto_the_export_config() -> None:
 
 # --- standalone models/*/export.py recipes ----------------------------
 
-# ``models/sam3/export.py`` delegates to the segmentation CLI, so it inherits
-# the flag rather than declaring one.
-_DELEGATING_RECIPES = {"sam3"}
+# ``models/sam3/export.py`` and ``models/sam3_video/export.py`` delegate to the
+# segmentation CLI, so they inherit the flag rather than declaring one.
+_DELEGATING_RECIPES = {"sam3", "sam3_video"}
 
 
 def _standalone_recipes() -> list[Path]:
@@ -97,6 +98,21 @@ def _standalone_recipes() -> list[Path]:
 def test_every_standalone_recipe_is_discovered() -> None:
     # Guards the glob itself: a silently-empty list would make the checks below vacuous.
     assert len(_standalone_recipes()) >= 12
+
+
+@pytest.mark.parametrize("recipe_name", sorted(_DELEGATING_RECIPES))
+def test_delegating_recipe_actually_routes_through_the_shared_cli(recipe_name: str) -> None:
+    """Keep the exemption above honest.
+
+    A recipe is excused from declaring ``--include-debug-info`` only because it
+    hands argv to the segmentation CLI, which declares it. If one ever stopped
+    delegating, the exemption would silently become a hole.
+    """
+    source = (_repo_root() / "models" / recipe_name / "export.py").read_text()
+    assert "coreai_models.segmentation.export" in source, (
+        f"{recipe_name}: exempted as delegating, but does not call the segmentation CLI"
+    )
+    assert "--include-debug-info" in build_segmentation_parser().format_help()
 
 
 @pytest.mark.parametrize("recipe", _standalone_recipes(), ids=lambda p: p.parent.name)

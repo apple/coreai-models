@@ -23,7 +23,7 @@ struct DiffusionRunner: AsyncParsableCommand {
     )
 
     @Option(help: "Path to model directory containing .aimodel components (or pipeline.json)")
-    var model: String
+    var model: String?
 
     @Option(help: "Text prompt for image generation")
     var prompt: String = "a photo of a cat"
@@ -80,21 +80,52 @@ struct DiffusionRunner: AsyncParsableCommand {
     )
     var guidanceMode: GuidanceMode?
 
-    @Option(name: .customLong("parity-test"), help: "Path to parity data directory (numpy .npy files)")
+    @Flag(
+        name: .customLong("clear-coreai-cache"),
+        help: "Clear cached specialization for this model before loading (forces re-specialization)"
+    )
+    var clearCoreAICache: Bool = false
+
+    @Option(
+        name: .customLong("tune-preview"),
+        help:
+            "Phase 1 (collect): record per-step latents and decoded image into <dir> for later fitting. Run once per prompt, then use --tune-fit on the parent directory to fit jointly."
+    )
+    var tunePreviewDir: String?
+
+    @Option(
+        name: .customLong("tune-fit"),
+        help:
+            "Phase 2 (fit): read all collected latent/image pairs from subdirectories of <dir>, fit a single [C, 3] projection jointly, and print the resulting coefficients. No model loading required."
+    )
+    var tuneFitDir: String?
+
+    @Option(
+        name: .customLong("parity-test"),
+        help: ArgumentHelp("Path to parity data directory (numpy .npy files)", visibility: .hidden)
+    )
     var parityTestDir: String?
 
     @Option(
         name: .customLong("trace-inputs"),
-        help: "Path to pipeline trace dir — use Python's noise + embeddings instead of generating")
+        help: ArgumentHelp(
+            "Path to pipeline trace dir — replay Python noise and embeddings instead of generating",
+            visibility: .hidden)
+    )
     var traceInputsDir: String?
 
-    @Flag(
-        name: .customLong("clear-coreai-cache"),
-        help: "Clear Core AI cached specialization for this model before loading (forces re-specialization)"
-    )
-    var clearCoreAICache: Bool = false
-
     func run() async throws {
+        // --tune-fit: fit coefficients from collected pairs, no model needed
+        if let fitDir = tuneFitDir {
+            PreviewTuneHelper.runFit(dir: URL(fileURLWithPath: fitDir))
+            return
+        }
+
+        guard let model else {
+            print("Error: --model is required for generation")
+            throw ExitCode.failure
+        }
+
         let bundleURL = URL(fileURLWithPath: model)
 
         if clearCoreAICache {
@@ -172,9 +203,13 @@ struct DiffusionRunner: AsyncParsableCommand {
             print("Steps: \(effectiveSteps), Guidance: \(effectiveGuidance), Seed: \(seed)")
             print("Image size: \(pipeline.defaultImageSize.width)x\(pipeline.defaultImageSize.height)")
 
+            let tuneHelper = tunePreviewDir.map { PreviewTuneHelper(outputDir: URL(fileURLWithPath: $0)) }
             let start = ContinuousClock.now
 
             let result = try await pipeline.generateImages(configuration: config) { progress in
+                if let tuneHelper {
+                    return tuneHelper.progressHandler(progress)
+                }
                 print("  Step \(progress.step)/\(progress.totalSteps)")
                 return true
             }
@@ -186,6 +221,8 @@ struct DiffusionRunner: AsyncParsableCommand {
                 print("Error: No image generated")
                 throw ExitCode.failure
             }
+
+            if let tuneHelper { tuneHelper.finish(image: image) }
 
             let outputURL = URL(fileURLWithPath: output)
             try saveImage(image, to: outputURL)
@@ -197,9 +234,13 @@ struct DiffusionRunner: AsyncParsableCommand {
             print("Steps: \(effectiveSteps), Guidance: \(effectiveGuidance), Seed: \(seed)")
             print("Image size: \(pipeline.defaultImageSize.width)x\(pipeline.defaultImageSize.height)")
 
+            let tuneHelper = tunePreviewDir.map { PreviewTuneHelper(outputDir: URL(fileURLWithPath: $0)) }
             let start = ContinuousClock.now
 
             let result = try await pipeline.generateImages(configuration: config) { progress in
+                if let tuneHelper {
+                    return tuneHelper.progressHandler(progress)
+                }
                 print("  Step \(progress.step)/\(progress.totalSteps)")
                 return true
             }
@@ -212,6 +253,8 @@ struct DiffusionRunner: AsyncParsableCommand {
                 throw ExitCode.failure
             }
 
+            if let tuneHelper { tuneHelper.finish(image: image) }
+
             let outputURL = URL(fileURLWithPath: output)
             try saveImage(image, to: outputURL)
             print("Saved: \(output)")
@@ -222,9 +265,13 @@ struct DiffusionRunner: AsyncParsableCommand {
             print("Steps: \(effectiveSteps), Guidance: \(effectiveGuidance), Seed: \(seed)")
             print("Image size: \(pipeline.defaultImageSize.width)x\(pipeline.defaultImageSize.height)")
 
+            let tuneHelper = tunePreviewDir.map { PreviewTuneHelper(outputDir: URL(fileURLWithPath: $0)) }
             let start = ContinuousClock.now
 
             let result = try await pipeline.generateImages(configuration: config) { progress in
+                if let tuneHelper {
+                    return tuneHelper.progressHandler(progress)
+                }
                 print("  Step \(progress.step + 1)/\(progress.totalSteps)")
                 return true
             }
@@ -236,6 +283,8 @@ struct DiffusionRunner: AsyncParsableCommand {
                 print("Error: No image generated")
                 throw ExitCode.failure
             }
+
+            if let tuneHelper { tuneHelper.finish(image: image) }
 
             let outputURL = URL(fileURLWithPath: output)
             try saveImage(image, to: outputURL)
