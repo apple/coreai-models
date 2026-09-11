@@ -161,6 +161,7 @@ extension ModelConfig {
             return override
         }
         if ProcessInfo.processInfo.environment["COREAI_CHUNK_THRESHOLD"] != nil {
+            Self._emitDeprecationWarning()
             return prefillChunkSize
         }
         return prefillChunkSize * 2

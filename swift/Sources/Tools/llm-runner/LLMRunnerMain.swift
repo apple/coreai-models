@@ -199,7 +199,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     @Option(
         name: .customLong("chunk-size"),
         help: ArgumentHelp(
-            "Prefill chunk size in tokens (default: memory-based, use 128 for MoE)",
+            "Prefill chunk size in tokens (default: memory-based; 128 is suggested for MoE models)",
             visibility: .hidden)
     )
     var chunkSize: Int?
