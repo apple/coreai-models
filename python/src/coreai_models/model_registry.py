@@ -509,6 +509,13 @@ UTILITY_PRESETS: list[UtilityModel] = [
         "segmentation",
         "models/sam3/export.py",
     ),
+    UtilityModel(
+        "sam3-video",
+        "facebook/sam3",
+        "sam3_video",
+        "segmentation",
+        "models/sam3_video/export.py",
+    ),
     # --- Depth ---
     UtilityModel(
         "depth-anything-3-small",

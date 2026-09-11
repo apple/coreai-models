@@ -47,8 +47,18 @@ public protocol DiffusionPipeline: ResourceManaging {
     /// - Parameters:
     ///   - configuration: Prompt, steps, guidance, seed, etc.
     ///   - progressHandler: Called after each denoising step. Return false to cancel.
+    ///     Defaults to a no-op that always continues.
     func generateImages(
         configuration: PipelineConfiguration,
-        progressHandler: (PipelineProgress) -> Bool
+        progressHandler: ((PipelineProgress) -> Bool)?
     ) async throws -> GenerationResult
+}
+
+extension DiffusionPipeline {
+    /// Convenience: generate without a progress handler.
+    public func generateImages(
+        configuration: PipelineConfiguration
+    ) async throws -> GenerationResult {
+        try await generateImages(configuration: configuration, progressHandler: nil)
+    }
 }
