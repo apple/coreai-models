@@ -110,7 +110,7 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
                 }
                 guard let token = tokenString else { continue }
 
-                if let id = tokenizer.convertTokenToId(token) {
+                if let id = tokenizer.vocabContains(token) ? tokenizer.convertTokenToId(token) : nil {
                     let id32 = Int32(id)
                     if id32 != mainEos {
                         result.insert(id32)
@@ -122,7 +122,7 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
         // 2. Check if eos_token is an array (some models list multiple)
         if let eosArray = json["eos_token"] as? [String] {
             for token in eosArray {
-                if let id = tokenizer.convertTokenToId(token) {
+                if let id = tokenizer.vocabContains(token) ? tokenizer.convertTokenToId(token) : nil {
                     let id32 = Int32(id)
                     if id32 != mainEos {
                         result.insert(id32)
@@ -134,7 +134,7 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
         // 3. Check added_tokens_decoder for turn-ending special tokens
         //    (e.g. Gemma's <end_of_turn> ID 106, Qwen's <|im_end|>)
         //    Only include tokens whose content matches known turn-ending patterns.
-        let turnEndPatterns = ["end_of_turn", "im_end", "eot_id", "endoftext", "eot_token"]
+        let turnEndPatterns = ["end_of_turn", "im_end", "eot_id", "endoftext", "eot_token", "|eot|"]
         if let addedTokens = json["added_tokens_decoder"] as? [String: Any] {
             for (idString, value) in addedTokens {
                 guard let dict = value as? [String: Any],
@@ -152,7 +152,7 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
         // 4. Check for turn-ending tokens in in top level of config
         for turnEndPattern in turnEndPatterns {
             if let eotToken = json[turnEndPattern] as? String {
-                if let id = tokenizer.convertTokenToId(eotToken) {
+                if let id = tokenizer.vocabContains(eotToken) ? tokenizer.convertTokenToId(eotToken) : nil {
                     let id32 = Int32(id)
                     if id32 != mainEos {
                         result.insert(id32)

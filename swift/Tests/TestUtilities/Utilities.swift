@@ -80,6 +80,12 @@ public struct MockTokenizer: Tokenizer, Sendable {
     }
 
     public func convertIdToToken(_ id: Int) -> String? {
+        if !vocab.isEmpty {
+            for (token, tokenId) in vocab where tokenId == id {
+                return token
+            }
+            return nil
+        }
         guard (0...255).contains(id) else { return nil }
         return String(decoding: [UInt8(id)], as: UTF8.self)
     }

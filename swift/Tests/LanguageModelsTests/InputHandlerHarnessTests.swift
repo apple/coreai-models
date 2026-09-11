@@ -64,7 +64,7 @@ private final class BenchMockStateHandler: SyncStateHandler {
 
 // MARK: - Benchmarks
 
-@Suite("Input Preparation Benchmarks", .serialized)
+@Suite("Input Preparation Benchmarks", .serialized, .enabled(if: !CIEnvironment.isVM))
 struct InputPrepBenchmarks {
     @Test("NDArray allocation cost for typical input shapes")
     func allocationCost() {
@@ -413,7 +413,7 @@ struct InputHandlerStressTests {
 
 // MARK: - Memory Pattern Tests
 
-@Suite("Memory Allocation Pattern Tests", .serialized)
+@Suite("Memory Allocation Pattern Tests", .serialized, .enabled(if: !CIEnvironment.isVM))
 struct MemoryPatternTests {
     @Test("Memory growth: 1000 allocations without reuse (anti-pattern)")
     func allocationWithoutReuse() {
@@ -547,7 +547,10 @@ struct IncrementalMaskTests {
         }
     }
 
-    @Test("Incremental mask is faster than full refill for long contexts")
+    @Test(
+        "Incremental mask is faster than full refill for long contexts",
+        .enabled(if: !CIEnvironment.isVM)
+    )
     func incrementalSpeedup() {
         let contextLength = 2048
         let steps = 500
