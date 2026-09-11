@@ -35,6 +35,15 @@ class AIModelMetadataFields:
 # `coreai_models.model_registry`, add a matching entry here.
 _METADATA: dict[str, AIModelMetadataFields] = {
     # ---- LLMs ----
+    "allenai/OLMo-2-0425-1B-Instruct": AIModelMetadataFields(
+        author="Allen Institute for AI",
+        license="Apache-2.0",
+        model_description=(
+            "OLMo-2-0425-1B-Instruct is a 1B-parameter instruction-tuned causal "
+            "language model from Allen Institute for AI's OLMo 2 family. "
+            "Source: https://huggingface.co/allenai/OLMo-2-0425-1B-Instruct"
+        ),
+    ),
     "Qwen/Qwen2.5-1.5B-Instruct": AIModelMetadataFields(
         author="Qwen Team",
         license="Apache-2.0",
