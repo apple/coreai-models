@@ -40,6 +40,8 @@ public struct CoreAILanguageModel: LanguageModel {
     private let url: URL
     private let variant: String?
     private let kvCacheStrategy: KVCacheStrategy
+    private let prefillChunkSizeConfig: Int?
+    private let prefillChunkThresholdConfig: Int?
     fileprivate let samplingConfig: SamplingConfiguration
     fileprivate let bundle: LanguageBundle
     fileprivate let tokenizer: any Tokenizer
@@ -71,7 +73,9 @@ public struct CoreAILanguageModel: LanguageModel {
             kvCacheStrategy: kvCacheStrategy,
             modelIdentifier: bundle.name,
             samplingConfig: samplingConfig,
-            vocabSize: bundle.vocabSize
+            vocabSize: bundle.vocabSize,
+            prefillChunkSize: prefillChunkSizeConfig,
+            prefillChunkThreshold: prefillChunkThresholdConfig
         )
     }
 
@@ -92,13 +96,19 @@ public struct CoreAILanguageModel: LanguageModel {
     /// - Parameter kvCacheStrategy: KV cache memory strategy. Defaults to
     ///   `.auto` (256-token initial size for dynamic models). Pass
     ///   `.fixedSize` to pre-allocate at full `maxContextLength`.
+    /// - Parameter prefillChunkSize: Tokens per prefill chunk, or `nil`
+    ///   to use the model metadata or engine default.
+    /// - Parameter prefillChunkThreshold: Minimum prompt tokens to trigger
+    ///   chunking, or `nil` to use the model metadata or engine default.
     /// - Throws: If the asset bundle is invalid or the tokenizer fails to load.
     ///   With `.eager`, also throws on engine-creation failure.
     public init(
         resourcesAt url: URL,
         mode: LoadMode = .lazy,
         variant: String? = nil,
-        kvCacheStrategy: KVCacheStrategy = .auto
+        kvCacheStrategy: KVCacheStrategy = .auto,
+        prefillChunkSize: Int? = nil,
+        prefillChunkThreshold: Int? = nil
     ) async throws {
         let bundle = try LanguageBundle(at: url)
         let configuration = CoreAIExecutor.Configuration(
@@ -107,7 +117,9 @@ public struct CoreAILanguageModel: LanguageModel {
             kvCacheStrategy: kvCacheStrategy,
             modelIdentifier: bundle.name,
             samplingConfig: .greedy,
-            vocabSize: bundle.vocabSize
+            vocabSize: bundle.vocabSize,
+            prefillChunkSize: prefillChunkSize,
+            prefillChunkThreshold: prefillChunkThreshold
         )
         let resources = ModelResources.shared(for: configuration)
 
@@ -136,6 +148,8 @@ public struct CoreAILanguageModel: LanguageModel {
         self.url = configuration.url
         self.variant = configuration.variant
         self.kvCacheStrategy = configuration.kvCacheStrategy
+        self.prefillChunkSizeConfig = configuration.prefillChunkSize
+        self.prefillChunkThresholdConfig = configuration.prefillChunkThreshold
         self.samplingConfig = configuration.samplingConfig
         self.bundle = bundle
         self.tokenizer = tokenizer
@@ -208,6 +222,8 @@ public struct CoreAILanguageModel: LanguageModel {
             let modelIdentifier: String
             let samplingConfig: SamplingConfiguration
             let vocabSize: Int?
+            let prefillChunkSize: Int?
+            let prefillChunkThreshold: Int?
         }
 
         // MARK: - Properties

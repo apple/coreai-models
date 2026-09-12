@@ -29,6 +29,12 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
     /// Keys are state names from the model descriptor, values are StateKind.
     public let states: [String: StateKind]?
 
+    /// Optional prefill chunk size override from metadata.json.
+    public let prefillChunkSize: Int?
+
+    /// Optional chunk threshold override from metadata.json.
+    public let prefillChunkThreshold: Int?
+
     public init(
         tokenizer: String,
         vocabSize: Int,
@@ -36,7 +42,9 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
         embeddedTokenizer: Bool = true,
         functionMap: FunctionMap? = nil,
         vision: VisionConfig? = nil,
-        states: [String: StateKind]? = nil
+        states: [String: StateKind]? = nil,
+        prefillChunkSize: Int? = nil,
+        prefillChunkThreshold: Int? = nil
     ) {
         self.tokenizer = tokenizer
         self.vocabSize = vocabSize
@@ -45,6 +53,8 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
         self.functionMap = functionMap
         self.vision = vision
         self.states = states
+        self.prefillChunkSize = prefillChunkSize
+        self.prefillChunkThreshold = prefillChunkThreshold
     }
 
     enum CodingKeys: String, CodingKey {
@@ -55,6 +65,8 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
         case functionMap = "function_map"
         case vision
         case states
+        case prefillChunkSize = "prefill_chunk_size"
+        case prefillChunkThreshold = "prefill_chunk_threshold"
     }
 
     public init(from decoder: Swift.Decoder) throws {
@@ -66,6 +78,8 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
         self.functionMap = try c.decodeIfPresent(FunctionMap.self, forKey: .functionMap)
         self.vision = try c.decodeIfPresent(VisionConfig.self, forKey: .vision)
         self.states = try c.decodeIfPresent([String: StateKind].self, forKey: .states)
+        self.prefillChunkSize = try c.decodeIfPresent(Int.self, forKey: .prefillChunkSize)
+        self.prefillChunkThreshold = try c.decodeIfPresent(Int.self, forKey: .prefillChunkThreshold)
     }
 
     // MARK: - Additional Stop Tokens

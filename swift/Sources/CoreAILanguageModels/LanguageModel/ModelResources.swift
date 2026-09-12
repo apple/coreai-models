@@ -160,7 +160,9 @@ final class ModelResources: ResourceManaging {
         let runner = try CoreAIRunner(
             contentsOf: configuration.url,
             variant: configuration.variant,
-            kvCacheStrategy: configuration.kvCacheStrategy
+            kvCacheStrategy: configuration.kvCacheStrategy,
+            prefillChunkSize: configuration.prefillChunkSize,
+            prefillChunkThreshold: configuration.prefillChunkThreshold
         )
         let engine = try await runner.makeInferenceEngine()
         modelLoadSpan.end()

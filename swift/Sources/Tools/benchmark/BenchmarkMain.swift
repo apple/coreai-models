@@ -42,6 +42,20 @@ struct LLMBenchmark: AsyncParsableCommand {
     @Option(name: .customLong("output-json"), help: "Write summary JSON to file")
     var outputJson: String?
 
+    @Option(
+        name: .customLong("chunk-size"),
+        help: ArgumentHelp(
+            "Prefill chunk size in tokens (default: memory-based; 128 is suggested for MoE models)", visibility: .hidden
+        )
+    )
+    var chunkSize: Int?
+
+    @Option(
+        name: .customLong("chunk-threshold"),
+        help: ArgumentHelp("Minimum prompt tokens to trigger chunking (default: 2x chunk size)", visibility: .hidden)
+    )
+    var chunkThreshold: Int?
+
     @Flag(
         name: .customLong("clear-coreai-cache"),
         help: "Clear Core AI cached specialization for this model before loading (forces re-specialization)"
@@ -87,10 +101,19 @@ struct LLMBenchmark: AsyncParsableCommand {
         let configData = try JSONEncoder().encode(engineConfig)
         print("\n⏳ Preparing AI asset...", terminator: "")
         fflush(stdout)
+        // Resolve chunking config with CLI flags taking precedence over metadata.json.
+        // A nil result preserves the lower layers (deprecated env var, memory-based default).
+        let resolvedChunkSize = chunkSize ?? bundle.language.prefillChunkSize
+        let resolvedChunkThreshold = chunkThreshold ?? bundle.language.prefillChunkThreshold
+        let engineOptions = EngineOptions(
+            prefillChunkSize: resolvedChunkSize,
+            prefillChunkThreshold: resolvedChunkThreshold
+        )
         let prepareStart = SuspendingClock.now
         let engine = try await EngineFactory.createEngine(
             config: configData,
-            modelURL: modelURL
+            modelURL: modelURL,
+            options: engineOptions
         )
         let prepareSeconds = (SuspendingClock.now - prepareStart).inSeconds
         let cacheSuffix = cacheHit ? " (cache hit)" : ""

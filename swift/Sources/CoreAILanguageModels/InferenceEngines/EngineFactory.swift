@@ -185,7 +185,7 @@ public struct EngineFactory: Sendable {
         modelURL: URL,
         options: EngineOptions
     ) async throws -> any InferenceEngine {
-        let modelConfig = ModelConfig(
+        var modelConfig = ModelConfig(
             name: config.name,
             tokenizer: config.tokenizer,
             vocabSize: config.vocabSize,
@@ -196,6 +196,11 @@ public struct EngineFactory: Sendable {
             ),
             serializedModel: [modelURL.lastPathComponent],
             function: config.function
+        )
+
+        modelConfig.applyChunkingOverrides(
+            prefillChunkSize: options.prefillChunkSize,
+            prefillChunkThreshold: options.prefillChunkThreshold
         )
 
         switch variant {
@@ -254,6 +259,14 @@ public struct EngineOptions: Sendable {
     /// - `.chunked`: the window size.
     public let kvCacheSize: Int?
 
+    /// Override for the prefill chunk size (tokens per chunk).
+    /// When set, takes precedence over model metadata and engine defaults.
+    public let prefillChunkSize: Int?
+
+    /// Override for the chunk threshold (minimum prompt tokens to trigger chunking).
+    /// When set, takes precedence over model metadata and engine defaults.
+    public let prefillChunkThreshold: Int?
+
     /// Creates an options value with the variant and KV cache settings you specify.
     ///
     /// - Parameters:
@@ -262,14 +275,20 @@ public struct EngineOptions: Sendable {
     ///   - kvCacheStrategy: The KV cache allocation strategy. Defaults to `.auto`.
     ///   - kvCacheSize: The KV cache size in tokens, or `nil` to use the strategy's default size.
     ///     Defaults to `nil`.
+    ///   - prefillChunkSize: Tokens per prefill chunk, or `nil` to use model/engine default.
+    ///   - prefillChunkThreshold: Minimum prompt tokens to trigger chunking, or `nil` for default.
     public init(
         variant: String? = nil,
         kvCacheStrategy: KVCacheStrategy = .auto,
-        kvCacheSize: Int? = nil
+        kvCacheSize: Int? = nil,
+        prefillChunkSize: Int? = nil,
+        prefillChunkThreshold: Int? = nil
     ) {
         self.variant = variant
         self.kvCacheStrategy = kvCacheStrategy
         self.kvCacheSize = kvCacheSize
+        self.prefillChunkSize = prefillChunkSize
+        self.prefillChunkThreshold = prefillChunkThreshold
     }
 
     /// Returns the KV cache size in tokens that the engine uses for a given context length.
