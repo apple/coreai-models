@@ -3,6 +3,7 @@
 # Use of this source code is governed by a BSD-3-clause license that can
 # be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
+import logging
 import math
 import os
 
@@ -10,6 +11,8 @@ import coreai_torch
 import coreai_torch.composite_ops
 import torch
 from typing_extensions import Self
+
+logger = logging.getLogger(__name__)
 
 
 class RoPE(coreai_torch.composite_ops.RoPE):
@@ -260,6 +263,7 @@ class LongRoPE(torch.nn.Module):
         with torch.device("cpu"):
             self.dims = dims
             self.attention_factor = attention_factor
+            self.interleaved = interleaved
 
             if max_position_embeddings <= original_max_position_embeddings:
                 factors = short_factor if short_factor is not None else long_factor
@@ -299,6 +303,9 @@ class LongRoPE(torch.nn.Module):
         betas. This carries the LongRoPE per-dimension frequencies and the
         attention factor into DecomposedRoPE, preserving numerical behavior.
         """
+        # DecomposedRoPE implements split-half rotation only; interleaved has no
+        # decomposed equivalent and would rotate the wrong dimension pairs.
+        assert not self.interleaved, "DecomposedRoPE does not support interleaved rotation"
         return DecomposedRoPE(
             dims=self.dims,
             inv_freq=self._freqs,
@@ -392,9 +399,18 @@ def initialize_rope(
     if use_decomposed:
         if isinstance(rope, LongRoPE):
             return rope.to_decomposed()
-        if rope_type == "default":
+        # DecomposedRoPE implements split-half only, so interleaved has no
+        # decomposed equivalent.
+        if rope_type == "default" and not interleaved:
             return DecomposedRoPE(dims=dims, base=float(base))
-        msg = f"Decomposed RoPE is not supported for rope_type={rope_type!r}"
-        raise NotImplementedError(msg)
+        # No decomposed form for this config (partial rotary with linear/yarn
+        # scaling, or interleaved). Use the composite op: slower on the affected
+        # OS betas but numerically correct, and preserves prior export behavior.
+        logger.warning(
+            "No decomposed RoPE for rope_type=%r interleaved=%s; using composite op.",
+            rope_type,
+            interleaved,
+        )
+        return rope
 
     return rope
