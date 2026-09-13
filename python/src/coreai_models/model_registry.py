@@ -354,6 +354,17 @@ LLM_PRESETS: list[ModelPreset] = [
         compression_config="models/qwen3/qwen3_4b_mixed_4bit_8bit.yaml",
     ),
     ModelPreset(
+        "qwen3-8b",
+        "Qwen/Qwen3-8B",
+        "qwen3",
+        "llm",
+        "iOS",
+        "none",
+        "float16",
+        IOS_DEFAULT_MAX_CONTEXT_LENGTH,
+        compression_config="models/qwen3/qwen3_8b_mixed_4bit_8bit.yaml",
+    ),
+    ModelPreset(
         "smollm2-1.7b-instruct",
         "HuggingFaceTB/SmolLM2-1.7B-Instruct",
         "smollm2",
