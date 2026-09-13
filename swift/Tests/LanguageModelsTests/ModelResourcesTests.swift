@@ -107,6 +107,25 @@ struct ModelResourcesTests {
         #expect(resources.isLoaded)
     }
 
+    @Test(
+        "loadedEngineSupportsGuidedGeneration stays true after loading a logits-only engine"
+    )
+    func guidedGenerationSupportedForLogitsOnlyEngineAfterLoad() async throws {
+        // MockEngine(vocabSize: 100) mirrors StaticShapeEngine: supportsLogits == true,
+        // but it does not conform to ConstrainedGenerationCapable.
+        let resources = ModelResources { MockEngine(vocabSize: 100) }
+
+        // Nothing loaded yet — best-effort reporting defaults to "supported".
+        #expect(resources.loadedEngineSupportsGuidedGeneration == nil)
+
+        _ = try await resources.engine()
+
+        // Regression check: before the fix this incorrectly returned `false` once
+        // an engine was loaded, because `loadedEngineIsConstrainedCapable` (false)
+        // shadowed `loadedEngineSupportsLogits` (true).
+        #expect(resources.loadedEngineSupportsGuidedGeneration == true)
+    }
+
     @Test("unloadResources during an active borrow defers teardown until it finishes")
     func unloadDeferredDuringActiveBorrow() async throws {
         let resources = ModelResources { MockEngine() }
