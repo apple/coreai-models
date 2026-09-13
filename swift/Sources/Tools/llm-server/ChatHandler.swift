@@ -81,6 +81,9 @@ func startServer(state: ServerState, port: Int) async throws {
         configuration: .init(
             address: .hostname("127.0.0.1", port: port)
         ))
+
+    // Process lifecycle is left to the supervising process. TODO: any in-process
+    // idle-exit must first drain in-flight engine work (no drain hook today).
     try await app.run()
 }
 
@@ -100,8 +103,15 @@ private func handleAutoRoute(request: Request, state: ServerState) async throws 
 private func handleChatCompletionsFromBody(body: ByteBuffer, state: ServerState, sessionID: String? = nil) async throws
     -> Response
 {
-    guard state.tryAcquire() else {
-        let err = ErrorResponse(error: .init(message: "Server is busy.", type: "server_error", code: "busy"))
+    // Non-streaming paths release the permit at each return; the streaming path
+    // hands it to the body closure. Release-on-deinit backstops a dropped response.
+    let permit: QueuePermit
+    do {
+        permit = try await state.queue.acquire()
+    } catch let error as ServerError {
+        let err = ErrorResponse(
+            error: .init(
+                message: error.localizedDescription, type: "server_error", code: "queue_full"))
         let data = try JSONEncoder().encode(err)
         return Response(
             status: .tooManyRequests, headers: [.contentType: "application/json"],
@@ -111,7 +121,7 @@ private func handleChatCompletionsFromBody(body: ByteBuffer, state: ServerState,
     do {
         chatRequest = try JSONDecoder().decode(ChatCompletionRequest.self, from: body)
     } catch {
-        state.release()
+        permit.release()
         let err = ErrorResponse(error: .init(message: "\(error)", type: "invalid_request_error", code: nil))
         let data = try JSONEncoder().encode(err)
         return Response(
@@ -121,15 +131,17 @@ private func handleChatCompletionsFromBody(body: ByteBuffer, state: ServerState,
     do {
         let shouldStream = chatRequest.stream ?? false
         if shouldStream {
-            return try await handleStreamingRequest(chatRequest: chatRequest, state: state, sessionID: sessionID)
+            // Ownership of the permit passes to the streaming body closure.
+            return try await handleStreamingRequest(
+                chatRequest: chatRequest, state: state, sessionID: sessionID, permit: permit)
         } else {
             let response = try await handleNonStreamingRequest(
                 chatRequest: chatRequest, state: state, sessionID: sessionID)
-            state.release()
+            permit.release()
             return response
         }
     } catch let error as ServerError {
-        state.release()
+        permit.release()
         let status: HTTPResponse.Status = error.isBadRequest ? .badRequest : .internalServerError
         let err = ErrorResponse(error: .init(message: "\(error)", type: "invalid_request_error", code: nil))
         let data = try JSONEncoder().encode(err)
@@ -137,7 +149,7 @@ private func handleChatCompletionsFromBody(body: ByteBuffer, state: ServerState,
             status: status, headers: [.contentType: "application/json"], body: .init(byteBuffer: ByteBuffer(data: data))
         )
     } catch {
-        state.release()
+        permit.release()
         let err = ErrorResponse(error: .init(message: "\(error)", type: "server_error", code: nil))
         let data = try JSONEncoder().encode(err)
         return Response(
@@ -327,7 +339,9 @@ private func handleNonStreamingRequest(chatRequest: ChatCompletionRequest, state
 
 // MARK: - Streaming (SSE)
 
-private func handleStreamingRequest(chatRequest: ChatCompletionRequest, state: ServerState, sessionID: String? = nil)
+private func handleStreamingRequest(
+    chatRequest: ChatCompletionRequest, state: ServerState, sessionID: String? = nil, permit: QueuePermit
+)
     async throws -> Response
 {
     let requestMaxTokens = chatRequest.maxCompletionTokens ?? chatRequest.maxTokens ?? state.config.defaultMaxTokens
@@ -364,7 +378,9 @@ private func handleStreamingRequest(chatRequest: ChatCompletionRequest, state: S
     }
 
     let responseBody = ResponseBody { writer in
-        defer { state.release() }
+        // The closure owns the permit for the stream's lifetime; release-on-deinit
+        // covers a response the framework drops before entering this closure.
+        defer { permit.release() }
         do {
             let encoder = JSONEncoder()
             let genStart = SuspendingClock().now

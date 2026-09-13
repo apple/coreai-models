@@ -30,14 +30,19 @@ func handleCompletionsFromBody(body: ByteBuffer, state: ServerState) async throw
             status: .notImplemented, headers: [.contentType: "application/json"],
             body: .init(byteBuffer: ByteBuffer(data: data)))
     }
-    guard state.tryAcquire() else {
-        let err = ErrorResponse(error: .init(message: "Server is busy.", type: "server_error", code: "busy"))
+    let permit: QueuePermit
+    do {
+        permit = try await state.queue.acquire()
+    } catch let error as ServerError {
+        let err = ErrorResponse(
+            error: .init(
+                message: error.localizedDescription, type: "server_error", code: "queue_full"))
         let data = try JSONEncoder().encode(err)
         return Response(
             status: .tooManyRequests, headers: [.contentType: "application/json"],
             body: .init(byteBuffer: ByteBuffer(data: data)))
     }
-    defer { state.release() }
+    defer { permit.release() }
     let req: CompletionRequest
     do {
         req = try JSONDecoder().decode(CompletionRequest.self, from: body)

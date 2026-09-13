@@ -68,6 +68,8 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
 
     var processedTokenCount: Int { engine.processedTokenCount }
 
+    var hasRecurrentState: Bool { engine.hasNonTruncatableStates }
+
     init(
         config: ModelConfig,
         preparedModel: PreparedModel,
