@@ -108,6 +108,7 @@ public final class GrowingNDArrayState: SyncStateHandler {
             newCapacity = min(newCapacity * 2, maxCapacity)
         }
 
+        let previousCapacity = currentCapacity
         for (i, name) in stateNames.enumerated() {
             let desc = descriptors[i]
             let newShape = desc.shape.map { $0 < 0 ? newCapacity : $0 }
@@ -119,6 +120,7 @@ public final class GrowingNDArrayState: SyncStateHandler {
         }
 
         currentCapacity = newCapacity
+        CLILogger.log("KV cache grew: \(previousCapacity) -> \(newCapacity)")
         return true
     }
 

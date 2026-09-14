@@ -6,7 +6,6 @@
 import CoreAI
 import CoreAIShared
 import Foundation
-import Synchronization
 
 // MARK: - Prefill Strategy
 
@@ -72,14 +71,14 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
     public private(set) var lastPrefixHitCount: Int = 0
 
     // Track in-flight generation via token (replaces simple bool lock)
-    private let _activeToken = Mutex<GenerationToken?>(nil)
+    private let tokenBox = GenerationTokenBox()
 
-    public var isBusy: Bool { _activeToken.withLock { $0 != nil } }
+    public var isBusy: Bool { tokenBox.isBusy }
 
     /// Clear the engine's active token if it matches the given token.
     /// Called by the iterator when generation finishes or is cancelled.
     func clearTokenIfActive(_ token: GenerationToken) {
-        _activeToken.withLock { if $0 === token { $0 = nil } }
+        tokenBox.clearIfActive(token)
     }
 
     // MARK: - Init
@@ -304,44 +303,33 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         // The prefill graph produces no logits, so hold the final token back for
         // `function`: it is the one whose logits seed sampling. Without one, nothing is
         // held back and the trailing chunk carries the logits.
-        let floor = prefillHeldBackTokens(hasPrefillGraph: prefillFunction != nil)
-        let plan = prefillChunkSizes(
-            tokenCount: tokens.count, chunkSize: chunkSize, heldBack: floor)
+        let heldBack = prefillHeldBackTokens(hasPrefillGraph: prefillFunction != nil)
 
         let chunkSignpost = InstrumentsProfiler.beginCustomInterval(
             name: "CoreAIClean Chunked Prefill",
-            details: "\(tokens.count) tokens in \(plan.count) chunks of \(chunkSize)"
+            details: "\(tokens.count) tokens, chunkSize \(chunkSize)"
         )
-
-        var lastLogits: [LogitsScalarType] = []
-        var remainingTokens = tokens
-
-        for (chunkIndex, currentChunkSize) in plan.enumerated() {
-            let chunkEnd = remainingTokens.startIndex + currentChunkSize
-            let chunk = remainingTokens[remainingTokens.startIndex..<chunkEnd]
-
-            CLILogger.log(
-                "Chunk \(chunkIndex + 1)/\(plan.count): \(chunk.count) tokens at position \(processedTokenCount)"
+        defer {
+            InstrumentsProfiler.endCustomInterval(
+                name: "CoreAIClean Chunked Prefill",
+                signpostID: chunkSignpost
             )
+        }
 
-            if let prefillFn = prefillFunction {
-                try await encodePrefillChunk(chunk, using: prefillFn)
-            } else {
-                lastLogits = try await processTokenBatch(chunk)
+        return try await runChunkedPrefill(
+            tokens: tokens,
+            chunkSize: chunkSize,
+            heldBack: heldBack,
+            vocabSize: config.vocabSize
+        ) { chunk, isHeldBack in
+            // Held-back tail (and every chunk when there is no prefill graph) runs through
+            // `main` for logits; earlier chunks fill the KV cache via the prefill graph.
+            if !isHeldBack, let prefillFn = self.prefillFunction {
+                try await self.encodePrefillChunk(chunk, using: prefillFn)
+                return []
             }
-            remainingTokens = remainingTokens[chunkEnd...]
+            return try await self.processTokenBatch(chunk)
         }
-
-        if !remainingTokens.isEmpty {
-            lastLogits = try await processTokenBatch(remainingTokens)
-        }
-
-        InstrumentsProfiler.endCustomInterval(
-            name: "CoreAIClean Chunked Prefill",
-            signpostID: chunkSignpost
-        )
-
-        return lastTokenLogits(from: lastLogits, vocabSize: config.vocabSize)
     }
 
     /// Process tokens in chunks, returning ALL position logits (not just last token).
@@ -373,10 +361,7 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         inferenceOptions: InferenceOptions
     ) async throws -> GenerationSequence {
         // Cancel any prior generation so its Iterator stops on next poll.
-        _activeToken.withLock {
-            $0?.cancel()
-            $0 = nil
-        }
+        tokenBox.cancelActive()
 
         // Implicit prefix caching: resolve input against history.
         // For hybrid models with recurrent states, we must full-reset on any
@@ -406,7 +391,7 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         }
 
         let token = GenerationToken()
-        _activeToken.withLock { $0 = token }
+        tokenBox.install(token)
         return GenerationSequence(
             engine: self,
             input: input,
@@ -421,7 +406,7 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
     /// Wait for any in-flight generate() Task to finish.
     private func drain() {
         var attempts = 0
-        while _activeToken.withLock({ $0 != nil }) {
+        while tokenBox.isBusy {
             attempts += 1
             if attempts > 5000 {
                 fatalError("Sequential engine drain() timeout — generation Task stuck?")
@@ -431,10 +416,7 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
     }
 
     public func cancel() async throws {
-        _activeToken.withLock {
-            $0?.cancel()
-            $0 = nil
-        }
+        tokenBox.cancelActive()
     }
 
     public func reset(to tokenIndex: Int) async throws {
@@ -446,10 +428,7 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
                 "Partial reset is not supported for hybrid models with recurrent state. "
                     + "Use reset(to: 0) and replay the prefix.")
         }
-        _activeToken.withLock {
-            $0?.cancel()
-            $0 = nil
-        }
+        tokenBox.cancelActive()
         internalReset(to: tokenIndex)
     }
 

@@ -10,7 +10,6 @@ import CoreAI
 import CoreAIShared
 import CoreImage
 import Foundation
-import Synchronization
 
 // MARK: - VLM Model Config
 
@@ -43,7 +42,7 @@ public struct VLMModelConfig: InferenceConfiguration, Codable, Sendable {
 ///
 /// ## Model Contract
 ///
-/// Manages three model functions (potentially from separate `.aimodel` bundles):
+/// Manages four model functions (potentially from separate `.aimodel` bundles):
 ///
 /// 1. **Vision encoder** (`encode_image`):
 ///    - Input: `pixel_values` (Float32, shape `[1, 3, H, W]`)
@@ -99,8 +98,6 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
     // LLM I/O names from descriptor
     private let embeddingsInputName: String
     private let positionIdsName: String
-    private let keyCacheName: String
-    private let valueCacheName: String
     private let logitsName: String
 
     // LLM descriptors for dynamic shape resolution
@@ -110,13 +107,16 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
 
     // MARK: - Persistent State
 
-    private var keyCache: NDArray
-    private var valueCache: NDArray
+    /// KV cache state, managed by the shared state-handler infrastructure
+    /// (allocation, 2x growth, copy-on-grow, reset) — identical to `CoreAISequentialEngine`.
+    private var kvCache: any SyncStateHandler
+    /// Additional non-KV states (nil for the VLM's two-state KV contract; carried for symmetry).
+    private var additionalStates: FixedNDArrayState?
+    /// True if any state is non-truncatable (conv/recurrent). Gates partial `reset(to:)`,
+    /// matching `CoreAISequentialEngine`. False for every current full-attention VLM.
+    private let hasNonTruncatableStates: Bool
     private var logitsArray: NDArray
     private var cachedLogitsBatchSize: Int
-    private var currentKVCapacity: Int
-    private let keyCacheDescriptor: NDArrayDescriptor
-    private let valueCacheDescriptor: NDArrayDescriptor
 
     // Track processed tokens for incremental inference
     public private(set) var processedTokenCount: Int = 0
@@ -127,11 +127,11 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
 
     // MARK: - Generation Token
 
-    private let _activeToken = Mutex<GenerationToken?>(nil)
-    public var isBusy: Bool { _activeToken.withLock { $0 != nil } }
+    private let tokenBox = GenerationTokenBox()
+    public var isBusy: Bool { tokenBox.isBusy }
 
     func clearTokenIfActive(_ token: GenerationToken) {
-        _activeToken.withLock { if $0 === token { $0 = nil } }
+        tokenBox.clearIfActive(token)
     }
 
     // MARK: - Init
@@ -252,8 +252,6 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
         // Extract I/O names
         self.embeddingsInputName = llmDesc.inputNames[0]
         self.positionIdsName = llmDesc.inputNames[1]
-        self.keyCacheName = llmDesc.stateNames[0]
-        self.valueCacheName = llmDesc.stateNames[1]
         self.logitsName = llmDesc.outputNames[0]
 
         // Extract and validate descriptors
@@ -279,34 +277,21 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
         }
         self.logitsDescriptor = logitsDesc
 
-        // Extract KV cache state descriptors
-        guard case .ndArray(let keyCacheDesc) = llmDesc.stateDescriptor(of: keyCacheName),
-            case .ndArray(let valueCacheDesc) = llmDesc.stateDescriptor(of: valueCacheName)
-        else {
-            throw InferenceRuntimeError.invalidOutputType("Cannot get KV cache state descriptors")
-        }
-        self.keyCacheDescriptor = keyCacheDesc
-        self.valueCacheDescriptor = valueCacheDesc
-
-        // Allocate KV cache
-        let isDynamic = keyCacheDesc.shape.contains(where: { $0 < 0 })
-        let initialCapacity: Int
-        if options.kvCacheStrategy == .fixedSize || !isDynamic {
-            initialCapacity = config.maxContextLength
-        } else {
-            initialCapacity = min(256, config.maxContextLength)
-        }
-        self.currentKVCapacity = initialCapacity
-
-        let resolvedKeyDesc = keyCacheDesc.resolvingDynamicDimensions(
-            keyCacheDesc.shape.map { $0 < 0 ? initialCapacity : $0 })
-        let resolvedValueDesc = valueCacheDesc.resolvingDynamicDimensions(
-            valueCacheDesc.shape.map { $0 < 0 ? initialCapacity : $0 })
-        self.keyCache = NDArray(descriptor: resolvedKeyDesc)
-        self.valueCache = NDArray(descriptor: resolvedValueDesc)
+        // Create KV cache state handler(s) from the LLM descriptor, mirroring
+        // CoreAISequentialEngine. The shared factory handles allocation, 2x growth,
+        // copy-on-grow, and reset for both dynamic (growing) and fixed-size KV caches.
+        let stateHandlers = try StateHandlerFactory.createSyncHandlers(
+            descriptor: llmDesc,
+            maxContextLength: config.maxContextLength,
+            options: options
+        )
+        self.kvCache = stateHandlers.kvCache
+        self.additionalStates = stateHandlers.additionalStates
+        self.hasNonTruncatableStates = stateHandlers.hasNonTruncatableStates
 
         CLILogger.log(
-            "VLM KV cache: dynamic=\(isDynamic), initial=\(initialCapacity), key=\(keyCacheDesc.shape) -> \(resolvedKeyDesc.shape)"
+            "VLM KV cache: capacity=\(stateHandlers.kvCache.currentCapacity), "
+                + "states=\(stateHandlers.kvCache.stateNames)"
         )
 
         // Allocate initial logits (1 token)
@@ -702,7 +687,7 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
             throw InferenceRuntimeError.invalidState("Cannot process empty embedding batch")
         }
 
-        try ensureKVCapacity(forContextLength: processedTokenCount + batchSize)
+        _ = try kvCache.ensureCapacity(forContextLength: processedTokenCount + batchSize)
 
         let batchSignpost = InstrumentsProfiler.beginCustomInterval(
             name: "CoreAIVLM Batch",
@@ -723,20 +708,15 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
             cachedLogitsBatchSize = batchSize
         }
 
-        // Build states (KV cache -- persistent, inout)
-        var states = InferenceFunction.MutableViews()
-        states.insert(&keyCache, for: keyCacheName)
-        states.insert(&valueCache, for: valueCacheName)
-
-        // Build output backings (logits -- written in-place)
-        var outputViews = InferenceFunction.MutableViews()
-        outputViews.insert(&logitsArray, for: logitsName)
-
-        // Execute LLM forward pass
-        _ = try await llmFunction.run(
+        // Bind KV cache states, build output views, and execute — shared with
+        // CoreAISequentialEngine via runWithStates (zero-copy state binding).
+        try await runWithStates(
+            function: llmFunction,
             inputs: [embeddingsInputName: embeddings, positionIdsName: positionIds],
-            states: consume states,
-            outputViews: consume outputViews
+            primary: kvCache,
+            secondary: additionalStates,
+            outputArray: &logitsArray,
+            outputName: logitsName
         )
 
         // Read logits from NDArray
@@ -830,27 +810,16 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
         tokens: ArraySlice<Int32>,
         chunkSize: Int
     ) async throws -> [LogitsScalarType] {
-        let totalChunks = (tokens.count + chunkSize - 1) / chunkSize
-
-        var lastLogits: [LogitsScalarType] = []
-        var remainingTokens = tokens
-        var chunkIndex = 0
-
-        while !remainingTokens.isEmpty {
-            let currentChunkSize = min(chunkSize, remainingTokens.count)
-            let chunkEnd = remainingTokens.startIndex + currentChunkSize
-            let chunk = remainingTokens[remainingTokens.startIndex..<chunkEnd]
-
-            CLILogger.log(
-                "VLM decode chunk \(chunkIndex + 1)/\(totalChunks): \(chunk.count) tokens at position \(processedTokenCount)"
-            )
-
-            lastLogits = try await processTokenBatch(chunk)
-            remainingTokens = remainingTokens[chunkEnd...]
-            chunkIndex += 1
+        // The VLM decoder has no prefill graph, so nothing is held back — every chunk runs
+        // through `processTokenBatch` for logits.
+        return try await runChunkedPrefill(
+            tokens: tokens,
+            chunkSize: chunkSize,
+            heldBack: 0,
+            vocabSize: config.vocabSize
+        ) { chunk, _ in
+            try await self.processTokenBatch(chunk)
         }
-
-        return lastTokenLogits(from: lastLogits, vocabSize: config.vocabSize)
     }
 
     // MARK: - Generate (text-only, InferenceEngine protocol)
@@ -860,12 +829,9 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
         samplingConfiguration: SamplingConfiguration,
         inferenceOptions: InferenceOptions
     ) async throws -> GenerationSequence {
-        _activeToken.withLock {
-            $0?.cancel()
-            $0 = nil
-        }
+        tokenBox.cancelActive()
         let token = GenerationToken()
-        _activeToken.withLock { $0 = token }
+        tokenBox.install(token)
         return GenerationSequence(
             engine: self,
             input: input,
@@ -889,12 +855,9 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
         samplingConfiguration: SamplingConfiguration,
         inferenceOptions: InferenceOptions
     ) async throws -> GenerationSequence {
-        _activeToken.withLock {
-            $0?.cancel()
-            $0 = nil
-        }
+        tokenBox.cancelActive()
         let token = GenerationToken()
-        _activeToken.withLock { $0 = token }
+        tokenBox.install(token)
         return GenerationSequence(
             engine: self,
             input: tokens,
@@ -915,15 +878,17 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
         precondition(
             tokenIndex >= 0 && tokenIndex <= processedTokenCount,
             "reset(to: \(tokenIndex)) out of range [0, \(processedTokenCount)]")
+        if tokenIndex != 0 && hasNonTruncatableStates {
+            throw InferenceRuntimeError.invalidState(
+                "Partial reset is not supported for hybrid models with recurrent state. "
+                    + "Use reset(to: 0) and replay the prefix.")
+        }
         if tokenIndex == 0 {
-            _activeToken.withLock {
-                $0?.cancel()
-                $0 = nil
-            }
+            tokenBox.cancelActive()
             let resetSpan = InstrumentsProfiler.beginReset(engine: "CoreAIVLM")
             processedTokenCount = 0
-            zeroFill(&keyCache)
-            zeroFill(&valueCache)
+            kvCache.reset()
+            additionalStates?.reset()
             resetSpan.end()
         } else {
             processedTokenCount = tokenIndex
@@ -931,10 +896,7 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
     }
 
     public func cancel() async throws {
-        _activeToken.withLock {
-            $0?.cancel()
-            $0 = nil
-        }
+        tokenBox.cancelActive()
     }
 
     public func cleanup() {
@@ -949,80 +911,8 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
         _ = try await processTokenBatch(dummyTokens)
         // Reset state after warmup
         processedTokenCount = 0
-        zeroFill(&keyCache)
-        zeroFill(&valueCache)
-    }
-
-    // MARK: - KV Cache (dynamic growth)
-
-    private func ensureKVCapacity(forContextLength needed: Int) throws {
-        guard needed > currentKVCapacity else { return }
-        guard needed <= config.maxContextLength else {
-            throw InferenceRuntimeError.invalidState(
-                "Context length \(needed) exceeds maximum \(config.maxContextLength)")
-        }
-
-        var newCapacity = max(currentKVCapacity, 1)
-        while newCapacity < needed { newCapacity *= 2 }
-        newCapacity = min(newCapacity, config.maxContextLength)
-
-        let resolvedKeyDesc = keyCacheDescriptor.resolvingDynamicDimensions(
-            keyCacheDescriptor.shape.map { $0 < 0 ? newCapacity : $0 })
-        let resolvedValueDesc = valueCacheDescriptor.resolvingDynamicDimensions(
-            valueCacheDescriptor.shape.map { $0 < 0 ? newCapacity : $0 })
-
-        var newKeyCache = NDArray(descriptor: resolvedKeyDesc)
-        var newValueCache = NDArray(descriptor: resolvedValueDesc)
-        _ = newKeyCache.mutableRawView()
-        _ = newValueCache.mutableRawView()
-
-        try Self.copyCache(from: keyCache, to: &newKeyCache)
-        try Self.copyCache(from: valueCache, to: &newValueCache)
-
-        CLILogger.log("VLM KV cache grew: \(currentKVCapacity) -> \(newCapacity)")
-        keyCache = newKeyCache
-        valueCache = newValueCache
-        currentKVCapacity = newCapacity
-    }
-
-    private static func copyCache(from source: NDArray, to destination: inout NDArray) throws {
-        let srcShape = source.shape
-        let dstShape = destination.shape
-        guard let headDim = srcShape.last else {
-            throw InferenceRuntimeError.invalidState("KV cache has empty shape -- cannot copy")
-        }
-        let seqDim = KVCacheFactory.detectSequenceDim(shape: srcShape)
-
-        let numBlocks = srcShape[..<seqDim].reduce(1, *)
-        let oldSeqLen = srcShape[seqDim]
-        let copySize = oldSeqLen * headDim
-
-        let srcBlockStride = srcShape[seqDim...].reduce(1, *)
-        let dstBlockStride = dstShape[seqDim...].reduce(1, *)
-
-        source.view(as: LogitsScalarType.self).withUnsafePointer { srcPtr, _, _ in
-            let dstView = destination.mutableView(as: LogitsScalarType.self)
-            dstView.withUnsafeMutablePointer { dstPtr, _, _ in
-                for block in 0..<numBlocks {
-                    let srcOff = block * srcBlockStride
-                    let dstOff = block * dstBlockStride
-                    dstPtr.advanced(by: dstOff).update(
-                        from: srcPtr.advanced(by: srcOff), count: copySize)
-                }
-            }
-        }
-    }
-
-    // MARK: - Helpers
-
-    private func zeroFill(_ array: inout NDArray) {
-        let count = array.shape.reduce(1, *)
-        let view = array.mutableView(as: LogitsScalarType.self)
-        view.withUnsafeMutablePointer { ptr, _, _ in
-            for i in 0..<count {
-                ptr[i] = 0
-            }
-        }
+        kvCache.reset()
+        additionalStates?.reset()
     }
 }
 
