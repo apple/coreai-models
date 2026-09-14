@@ -9,7 +9,7 @@ Alibaba's Qwen3 models for on-device inference via Core AI.
 | Qwen3 0.6B | 0.6B       | Yes   | Yes |
 | Qwen3 1.7B | 1.7B       | Yes   | Yes |
 | Qwen3 4B   | 4.0B       | Yes   | Yes |
-| Qwen3 8B   | 8.0B       | Yes   | No  |
+| Qwen3 8B   | 8.0B       | Yes   | Yes |
 
 ## Setup to export models
 
@@ -63,6 +63,8 @@ let response = try await session.respond(to: "What is quantum computing?")
 print(response)
 ```
 
+> **iOS memory requirement:** This model may exceed memory limit when running from an iOS app. If that's the case, try adding the ([increased memory limit](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.developer.kernel.increased-memory-limit)) to your app's entitlements.
+
 ### On your Mac using built-in Command Line Tool
 
 ```bash
@@ -95,10 +97,13 @@ Perplexity score on the [`WikiText-2`](https://huggingface.co/datasets/EleutherA
 | Qwen3 4B   | [Mixed 4-bit/8-bit palettized][qwen3-4b-mixed-yaml]  | 4.89\*                | iOS      | 18.80            |
 | Qwen3 8B   | none (`float16`)                                     | 16.00                 | macOS    | 12.19            |
 | Qwen3 8B   | [4-bit quantized][presets-info]                      | 4.50                  | macOS    | 12.90            |
+| Qwen3 8B   | none (`float16`)                                     | 16.00                 | iOS      | 12.19            |
+| Qwen3 8B   | [Mixed 4-bit/8-bit palettized][qwen3-8b-mixed-yaml]  | 4.90\*                | iOS      | 14.83            |
 
 \* BPW includes the Embedding which is quantized to INT8 per-tensor.
 
 [presets-info]: ../README.md#quantization-options
 [mixed-4bit-8bit-yaml]: qwen3_0_6b_mixed_4bit_8bit.yaml
 [qwen3-4b-mixed-yaml]: qwen3_4b_mixed_4bit_8bit.yaml
+[qwen3-8b-mixed-yaml]: qwen3_8b_mixed_4bit_8bit.yaml
 [qwen3-1.7b-6bit-yaml]: qwen3_1_7b_6bit.yaml

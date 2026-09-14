@@ -3,7 +3,9 @@
 // Use of this source code is governed by a BSD-3-clause license that can
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
+import CoreAIShared
 import Foundation
+import Synchronization
 
 // MARK: - Model Source
 
@@ -65,6 +67,10 @@ public struct ModelConfig: InferenceConfiguration, Codable, Sendable {
     // Static-shape-specific (optional)
     var inputMode: InputMode?
 
+    // Chunking overrides (not serialized — injected at runtime)
+    var prefillChunkSizeOverride: Int?
+    var prefillChunkThresholdOverride: Int?
+
     public enum InputMode: String, Codable, Sendable {
         case random
         case allZeros = "all-zeros"
@@ -78,7 +84,9 @@ public struct ModelConfig: InferenceConfiguration, Codable, Sendable {
         source: ModelSource? = nil,
         serializedModel: [String],
         function: String,
-        inputMode: InputMode? = nil
+        inputMode: InputMode? = nil,
+        prefillChunkSize: Int? = nil,
+        prefillChunkThreshold: Int? = nil
     ) {
         self.name = name
         self.tokenizer = tokenizer
@@ -88,6 +96,8 @@ public struct ModelConfig: InferenceConfiguration, Codable, Sendable {
         self.serializedModel = serializedModel
         self.function = function
         self.inputMode = inputMode
+        self.prefillChunkSizeOverride = prefillChunkSize
+        self.prefillChunkThresholdOverride = prefillChunkThreshold
     }
 
     enum CodingKeys: String, CodingKey {
@@ -111,6 +121,8 @@ public struct ModelConfig: InferenceConfiguration, Codable, Sendable {
         self.serializedModel = try c.decode([String].self, forKey: .serializedModel)
         self.function = try c.decodeIfPresent(String.self, forKey: .function) ?? "main"
         self.inputMode = try c.decodeIfPresent(InputMode.self, forKey: .inputMode)
+        self.prefillChunkSizeOverride = nil
+        self.prefillChunkThresholdOverride = nil
     }
 }
 
@@ -123,23 +135,62 @@ extension ModelConfig {
     }
 }
 
-// MARK: - Chunking overrides (--chunk-size / COREAI_CHUNK_THRESHOLD)
+// MARK: - Chunking configuration (layered resolution)
 
 extension ModelConfig {
-    /// Chunk threshold: prompts above this length get chunked (default: 1024).
-    /// Override via `--chunk-size 128` or `COREAI_CHUNK_THRESHOLD=128` for MoE models.
-    public var chunkThreshold: Int {
+    /// Prefill chunk size with layered resolution:
+    /// override → deprecated env var → memory-based default.
+    public var prefillChunkSize: Int {
+        if let override = prefillChunkSizeOverride, override > 0 {
+            return override
+        }
         if let value = ProcessInfo.processInfo.environment["COREAI_CHUNK_THRESHOLD"],
             let size = Int(value), size > 0
         {
+            Self._emitDeprecationWarning()
             return size
         }
-        return 1024
+        return defaultPrefillChunkSize()
     }
 
-    /// Prefill chunk size, clamped to `min(512, chunkThreshold)`.
-    public var prefillChunkSize: Int {
-        return min(512, chunkThreshold)
+    /// Chunk threshold with layered resolution:
+    /// override → default (2× prefillChunkSize).
+    /// When the deprecated env var is active, threshold equals the env var value.
+    public var prefillChunkThreshold: Int {
+        if let override = prefillChunkThresholdOverride, override > 0 {
+            return override
+        }
+        if ProcessInfo.processInfo.environment["COREAI_CHUNK_THRESHOLD"] != nil {
+            Self._emitDeprecationWarning()
+            return prefillChunkSize
+        }
+        return prefillChunkSize * 2
+    }
+
+    /// Protocol conformance: engines read this to decide when to chunk.
+    public var chunkThreshold: Int { prefillChunkThreshold }
+
+    /// Applies runtime overrides from CLI or FM API.
+    public mutating func applyChunkingOverrides(
+        prefillChunkSize: Int?,
+        prefillChunkThreshold: Int?
+    ) {
+        self.prefillChunkSizeOverride = prefillChunkSize
+        self.prefillChunkThresholdOverride = prefillChunkThreshold
+    }
+
+    private static let _deprecationWarned = Mutex(false)
+
+    private static func _emitDeprecationWarning() {
+        _deprecationWarned.withLock { warned in
+            guard !warned else { return }
+            warned = true
+            CLILogger.log(
+                "COREAI_CHUNK_THRESHOLD is deprecated. "
+                    + "Use --chunk-size or metadata.json prefill_chunk_size instead.",
+                component: "ModelConfig"
+            )
+        }
     }
 }
 

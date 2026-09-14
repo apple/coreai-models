@@ -105,9 +105,18 @@ def test_output_name_llm_macos_matches_pipeline_format() -> None:
     assert _preset_to_output_name(p) == "qwen3_0_6b_4bit_dynamic"
 
 
-def test_output_name_llm_iOS_uses_yaml_stem_when_compression_config_set() -> None:
-    p = lookup_preset("qwen3-0.6b", model_type="llm", variant="iOS")
-    assert _preset_to_output_name(p) == "qwen3_0_6b_mixed_4bit_8bit_static"
+@pytest.mark.parametrize(
+    ("short_name", "expected"),
+    [
+        ("qwen3-0.6b", "qwen3_0_6b_mixed_4bit_8bit_static"),
+        ("qwen3-8b", "qwen3_8b_mixed_4bit_8bit_static"),
+    ],
+)
+def test_output_name_llm_iOS_uses_yaml_stem_when_compression_config_set(
+    short_name: str, expected: str
+) -> None:
+    p = lookup_preset(short_name, model_type="llm", variant="iOS")
+    assert _preset_to_output_name(p) == expected
 
 
 @pytest.mark.parametrize(

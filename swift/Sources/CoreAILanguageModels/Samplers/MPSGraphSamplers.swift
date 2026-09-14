@@ -720,6 +720,10 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
     private let topPData: MPSGraphTensorData
     private let minPData: MPSGraphTensorData
 
+    // Pre-allocated neutral penalty buffer (all 1.0 in f16) used by non-penalty
+    // encode paths when the executable was compiled with penalty support.
+    private let neutralPenaltyData: MPSGraphTensorData?
+
     // Constrained sampling — compiled lazily on first applyBitmask: true call.
     private var constrainedExecutable: MPSGraphExecutable?
     private var constrainedBitmaskBuffer: MTLBuffer?
@@ -903,6 +907,52 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
             shape: [1 as NSNumber],
             dataType: .float32
         )
+
+        // Pre-allocate a neutral penalty buffer (all 1.0 in f16) so that
+        // non-penalty encode paths can feed the penalty-enabled executable
+        // without a caller-provided penalty buffer.
+        if penaltyEnabled {
+            let neutralByteCount = vocabSize * MemoryLayout<UInt16>.size
+            guard let neutralBuf = device.makeBuffer(length: neutralByteCount, options: .storageModeShared) else {
+                throw MPSGraphSamplerError.bufferAllocationFailed
+            }
+            // Fill with 1.0 in Float16 (0x3C00)
+            let ptr = neutralBuf.contents().assumingMemoryBound(to: UInt16.self)
+            for i in 0..<vocabSize {
+                ptr[i] = 0x3C00
+            }
+            self.neutralPenaltyData = MPSGraphTensorData(
+                neutralBuf, shape: [1, vocabSize as NSNumber], dataType: .float16)
+        } else {
+            self.neutralPenaltyData = nil
+        }
+    }
+
+    // MARK: - Feed Tensor Ordering
+
+    /// Build the inputs array in the exact order `executable.feedTensors` expects.
+    ///
+    /// MPSGraph's feedTensors order is determined at compile time and may not match
+    /// dictionary insertion order. We match by operation name to ensure each
+    /// MPSGraphTensorData goes to the correct feed position, avoiding type mismatches
+    /// (e.g. f32 scalar data landing where an f16 penalty tensor is expected).
+    private func buildInputs(
+        logitsData: MPSGraphTensorData,
+        penaltyData: MPSGraphTensorData? = nil
+    ) -> [MPSGraphTensorData] {
+        let effectivePenalty = penaltyData ?? neutralPenaltyData
+        return executable.feedTensors!.map { tensor -> MPSGraphTensorData in
+            switch tensor.operation.name {
+            case "logits": return logitsData
+            case "penalty": return effectivePenalty!
+            case "temperature": return temperatureData
+            case "random": return randomData
+            case "topP": return topPData
+            case "minP": return minPData
+            default:
+                fatalError("MPSGraphCompositeSampler: unknown feed tensor '\(tensor.operation.name)'")
+            }
+        }
     }
 
     // MARK: - Constrained Sampling (Lazy)
@@ -1122,15 +1172,7 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
         let outputData = MPSGraphTensorData(
             outputBuffer, shape: [1 as NSNumber], dataType: .int32)
 
-        let tensorDataMap: [MPSGraphTensor: MPSGraphTensorData] = [
-            logitsPlaceholder: logitsData,
-            penaltyPlaceholder!: penaltyData,
-            temperaturePlaceholder: temperatureData,
-            randomPlaceholder: randomData,
-            topPPlaceholder: topPData,
-            minPPlaceholder: minPData,
-        ]
-        let inputs = executable.feedTensors!.map { tensorDataMap[$0]! }
+        let inputs = buildInputs(logitsData: logitsData, penaltyData: penaltyData)
 
         let execDesc = MPSGraphExecutableExecutionDescriptor()
         execDesc.completionHandler = { [outputBuffer, outputOffset] (_, error) in
@@ -1209,7 +1251,7 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
 
         executable.runAsync(
             with: queue,
-            inputs: [logitsData, temperatureData, randomData, topPData, minPData],
+            inputs: buildInputs(logitsData: logitsData),
             results: [outputData],
             executionDescriptor: desc
         )
@@ -1290,7 +1332,7 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
 
         executable.runAsync(
             with: queue,
-            inputs: [logitsData, temperatureData, randomData, topPData, minPData],
+            inputs: buildInputs(logitsData: logitsData),
             results: [outputData],
             executionDescriptor: prefillExecDescriptor
         )
