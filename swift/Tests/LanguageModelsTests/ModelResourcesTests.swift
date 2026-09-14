@@ -126,6 +126,23 @@ struct ModelResourcesTests {
         #expect(resources.loadedEngineSupportsGuidedGeneration == true)
     }
 
+    @Test(
+        "loadedEngineSupportsGuidedGeneration is true for a constrained-capable engine without logits"
+    )
+    func guidedGenerationSupportedForConstrainedOnlyEngineAfterLoad() async throws {
+        // MockConstrainedEngine conforms to ConstrainedGenerationCapable but has
+        // supportsLogits == false — the other branch of the capability OR. Guided
+        // generation must still be reported supported via GPU-side constrained
+        // sampling.
+        let resources = ModelResources { MockConstrainedEngine(scriptedTokens: []) }
+
+        #expect(resources.loadedEngineSupportsGuidedGeneration == nil)
+
+        _ = try await resources.engine()
+
+        #expect(resources.loadedEngineSupportsGuidedGeneration == true)
+    }
+
     @Test("unloadResources during an active borrow defers teardown until it finishes")
     func unloadDeferredDuringActiveBorrow() async throws {
         let resources = ModelResources { MockEngine() }
