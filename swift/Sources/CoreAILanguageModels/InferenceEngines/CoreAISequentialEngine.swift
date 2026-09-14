@@ -35,6 +35,7 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
 
     public var supportsLogits: Bool { true }
     public var vocabSize: Int { config.vocabSize }
+    public var hasRecurrentState: Bool { hasNonTruncatableStates }
     public let config: ModelConfig
 
     // Core AI function handle

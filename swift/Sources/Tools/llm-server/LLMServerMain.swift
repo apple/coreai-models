@@ -65,6 +65,9 @@ struct LLMServer: AsyncParsableCommand {
     )
     var chunkThreshold: Int?
 
+    @Option(name: .customLong("max-queue-depth"), help: "Max requests queued before returning 429 (default: 16)")
+    var maxQueueDepth: Int = 16
+
     @Flag(name: .customLong("no-thinking"), help: "Disable thinking/reasoning (appends /no_think or sets template)")
     var noThinking: Bool = false
 
@@ -76,6 +79,12 @@ struct LLMServer: AsyncParsableCommand {
 
     @Flag(help: "Enable verbose logging")
     var verbose: Bool = false
+
+    func validate() throws {
+        guard maxQueueDepth >= 0 else {
+            throw ValidationError("--max-queue-depth must be >= 0 (got \(maxQueueDepth))")
+        }
+    }
 
     func run() async throws {
         CLILogger.level = verbose ? 1 : 0
@@ -188,7 +197,8 @@ struct LLMServer: AsyncParsableCommand {
             supportsLogprobs: supportsLogprobs,
             maxContextLength: bundle.maxContextLength,
             vocabSize: bundle.vocabSize,
-            additionalEosTokenIds: additionalEosTokenIds
+            additionalEosTokenIds: additionalEosTokenIds,
+            maxQueueDepth: maxQueueDepth
         )
 
         let state = ServerState(
@@ -203,6 +213,7 @@ struct LLMServer: AsyncParsableCommand {
             print("  Logprobs: \(supportsLogprobs ? "supported" : "not supported (use --variant coreai-sequential)")")
             print("  Context: \(bundle.maxContextLength) tokens")
             print("  No-thinking: \(noThinking)")
+            print("  Max queue depth: \(maxQueueDepth)")
             let topKStr = topK.map { "\($0)" } ?? "nil"
             let topPStr = topP.map { "\($0)" } ?? "nil"
             print("  Sampling: temperature=\(temperature), topK=\(topKStr), topP=\(topPStr)")
