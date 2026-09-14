@@ -7,11 +7,7 @@
 
 Everything here runs on a randomly-initialized, heavily downscaled config
 (112x112, 2 backbone layers, 1 memory-attention layer) so no weights are
-downloaded and the whole file runs in seconds. Numerical parity against the
-real checkpoint is the parity harness's job
-(``models/sam3_video/run_video_parity.py``); what these tests pin is the
-*structure*: that the fixed-slot memory bank is mathematically equivalent to
-HF's variable-length one, and that every entrypoint is traceable.
+downloaded and the whole file runs in seconds.
 """
 
 from __future__ import annotations

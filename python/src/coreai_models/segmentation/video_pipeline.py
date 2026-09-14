@@ -715,7 +715,7 @@ async def _async_export_video(config: VideoExportConfig) -> str:
     logger.info("Saved Core AI asset to %s", asset_path)
 
     # Metadata before tokenizer, so a flaky HF fetch can't leave an unloadable bundle.
-    _write_bundle_metadata(bundle_dir, asset_path.name, config)
+    _write_bundle_metadata(bundle_dir, asset_path.name, config, model.config)
     _write_tokenizer(bundle_dir / "tokenizer", config.hf_model_id)
     return str(bundle_dir)
 
@@ -841,14 +841,65 @@ def _resolve_paths(config: VideoExportConfig) -> tuple[Path, Path]:
     return bundle_dir, bundle_dir / f"{name}.aimodel"
 
 
+#: ``Sam3VideoConfig`` fields the host runtime needs, copied into the bundle's ``tracking``
+#: block. None affect the traced graphs; they all govern host-side heuristics. A runtime
+#: that hardcodes the upstream defaults only diverges on a checkpoint that tuned them.
+_TRACKING_FIELDS = (
+    "score_threshold_detection",
+    "det_nms_thresh",
+    "new_det_thresh",
+    "assoc_iou_thresh",
+    "trk_assoc_iou_thresh",
+    "high_conf_thresh",
+    "high_iou_thresh",
+    "recondition_every_nth_frame",
+    "recondition_on_trk_masks",
+    "hotstart_delay",
+    "hotstart_unmatch_thresh",
+    "hotstart_dup_thresh",
+    "suppress_unmatched_only_within_hotstart",
+    "init_trk_keep_alive",
+    "max_trk_keep_alive",
+    "min_trk_keep_alive",
+    "decrease_trk_keep_alive_for_empty_masklets",
+    "suppress_overlapping_based_on_recent_occlusion_threshold",
+    "max_num_objects",
+    "fill_hole_area",
+)
+
+#: Tracker-config fields that decide which stored frames are eligible for the memory bank.
+#: The export pins their sum (``spatial_slots`` is ``max_cond_frame_num + num_maskmem - 1``)
+#: but not the split, so the host cannot recover them from the asset alone.
+_TRACKER_MEMORY_FIELDS = (
+    "num_maskmem",
+    "max_cond_frame_num",
+    "max_object_pointers_in_encoder",
+)
+
+
+def _tracking_metadata(config) -> dict:
+    """Collect the host-side thresholds from a ``Sam3VideoConfig``."""
+    tracking: dict = {}
+    for field in _TRACKING_FIELDS:
+        if hasattr(config, field):
+            tracking[field] = getattr(config, field)
+    tracker_config = config.tracker_config
+    for field in _TRACKER_MEMORY_FIELDS:
+        if hasattr(tracker_config, field):
+            tracking[field] = getattr(tracker_config, field)
+    return tracking
+
+
 def _write_bundle_metadata(
-    bundle_dir: Path, asset_filename: str, config: VideoExportConfig
+    bundle_dir: Path, asset_filename: str, config: VideoExportConfig, model_config
 ) -> None:
     """Write the bundle manifest.
 
     ``runtime`` carries the slot geometry because the host has to pack memory to
     exactly the shapes the graph was traced with; deriving it from the HF config
     at load time would silently break if the export used non-default slots.
+
+    ``tracking`` carries the checkpoint's own heuristic thresholds; see ``_TRACKING_FIELDS``.
     """
     metadata = {
         "metadata_version": "0.2",
@@ -861,6 +912,7 @@ def _write_bundle_metadata(
             "ptr_slots": config.ptr_slots,
             "max_text_seq_len": config.max_text_seq_len,
         },
+        "tracking": _tracking_metadata(model_config),
     }
     metadata_path = bundle_dir / "metadata.json"
     with open(metadata_path, "w") as fh:
