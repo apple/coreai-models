@@ -199,15 +199,10 @@ public struct CoreAILanguageModel: LanguageModel {
         resources.unloadResources()
     }
 
-    /// Whether guided generation is available for this model.
+    /// Whether guided generation is available for this model. Assumes yes
+    /// before an engine is loaded.
     private var isGuidedGenerationSupported: Bool {
-        if let isConstrainedCapable = resources.loadedEngineIsConstrainedCapable {
-            return isConstrainedCapable
-        }
-        if let supportsLogits = resources.loadedEngineSupportsLogits {
-            return supportsLogits
-        }
-        return true
+        resources.loadedEngineSupportsGuidedGeneration ?? true
     }
 
     // MARK: - Executor
@@ -283,7 +278,7 @@ public struct CoreAILanguageModel: LanguageModel {
 
                 // Check if guided generation is requested
                 if let schema = request.schema {
-                    guard engine.supportsLogits || engine is any ConstrainedGenerationCapable else {
+                    guard engine.supportsGuidedGeneration else {
                         throw LanguageModelError.unsupportedCapability(
                             .init(
                                 capability: .guidedGeneration,

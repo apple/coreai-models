@@ -203,6 +203,15 @@ extension InferenceEngine {
 }
 
 extension InferenceEngine {
+    /// Guided/structured generation needs either per-step logits (CPU-side
+    /// constrained decoding) or GPU-side constrained sampling
+    /// (`ConstrainedGenerationCapable`).
+    public var supportsGuidedGeneration: Bool {
+        supportsLogits || self is any ConstrainedGenerationCapable
+    }
+}
+
+extension InferenceEngine {
     /// Default: no prefix hits (engine doesn't track history).
     public var lastPrefixHitCount: Int { 0 }
 }

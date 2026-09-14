@@ -36,18 +36,10 @@ final class ModelResources: ResourceManaging {
 
     var isLoaded: Bool { state.withLock { $0.loaded != nil } }
 
-    /// `supportsLogits` of the resident engine, or `nil` when nothing is loaded.
-    /// Used only for best-effort capability reporting before a load.
-    var loadedEngineSupportsLogits: Bool? {
-        state.withLock { $0.loaded?.supportsLogits }
-    }
-
-    /// Whether the loaded engine supports GPU-side constrained generation, or `nil` when unloaded.
-    var loadedEngineIsConstrainedCapable: Bool? {
-        state.withLock { engine in
-            guard let loaded = engine.loaded else { return nil }
-            return loaded is any ConstrainedGenerationCapable
-        }
+    /// Guided-generation capability of the resident engine, or `nil` when nothing
+    /// is loaded. Mirrors the check the executor enforces per-request.
+    var loadedEngineSupportsGuidedGeneration: Bool? {
+        state.withLock { $0.loaded?.supportsGuidedGeneration }
     }
 
     /// Returns the engine, loading it on first use. Concurrent callers share one
