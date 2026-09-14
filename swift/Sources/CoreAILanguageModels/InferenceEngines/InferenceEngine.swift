@@ -143,6 +143,15 @@ public protocol InferenceEngine: Sendable {
     /// Useful for debugging multi-turn efficiency and verifying prefix caching behavior.
     var lastPrefixHitCount: Int { get }
 
+    /// Whether the engine carries recurrent state (SSM / hybrid models).
+    ///
+    /// Recurrent/conv states summarize the entire prefix and cannot be truncated
+    /// by moving a KV cursor, so token-prefix reuse is impossible: on any rewind
+    /// the engine full-resets and replays the whole prompt. Callers (e.g. the
+    /// server's prefix-reuse accounting) should short-circuit when this is true.
+    /// Defaults to `false`.
+    var hasRecurrentState: Bool { get }
+
     // MARK: - Configuration
 
     associatedtype ConfigType: Codable, InferenceConfiguration
@@ -205,6 +214,10 @@ extension InferenceEngine {
 extension InferenceEngine {
     /// Default: no prefix hits (engine doesn't track history).
     public var lastPrefixHitCount: Int { 0 }
+}
+
+extension InferenceEngine {
+    public var hasRecurrentState: Bool { false }
 }
 
 extension InferenceEngine {

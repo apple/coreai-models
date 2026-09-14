@@ -715,6 +715,86 @@ struct PrefixCachingTests {
         ) {}
         #expect(engine.lastPrefixHitCount == 3)
     }
+
+    // MockEngine embeds the same clamp as CoreAIPipelinedEngine and advances history and
+    // processedTokenCount in lockstep, so the +1 pipelined gap is injected by hand below rather than
+    // produced organically. These tests cover the clamp arithmetic and history/count invariants; the
+    // real engine's KV interaction and the organic gap are exercised by the #234 GPU reproduction.
+    @Test("multi-turn prefix clamp when processedTokenCount trails history")
+    func multiTurnPrefixClampWithPipelinedGap() async throws {
+        let engine = MockEngine(tokens: [10, 20, 30, 40, 50], maxContextLength: 200)
+
+        // Turn 1: prompt [1, 2, 3], generate 3 tokens
+        var context: [Int32] = [1, 2, 3]
+        for try await output in try await engine.generate(
+            with: context,
+            samplingConfiguration: .greedy,
+            inferenceOptions: InferenceOptions(maxTokens: 3)
+        ) {
+            context.append(output.tokenId)
+        }
+        // context = [1, 2, 3, 10, 20, 30], history.count = 6, processedTokenCount = 6
+        #expect(context.count == 6)
+
+        // Simulate pipelined engine gap: last sampled token was never processed.
+        engine.processedTokenCount -= 1
+        // Now: history.count = 6, processedTokenCount = 5 (position 5 has no KV entry)
+
+        // Turn 2: append new user tokens, generate again
+        context.append(contentsOf: [77, 78])
+        for try await output in try await engine.generate(
+            with: context,
+            samplingConfiguration: .greedy,
+            inferenceOptions: InferenceOptions(maxTokens: 2)
+        ) {
+            context.append(output.tokenId)
+        }
+
+        // The clamp must cap the prefix to processedTokenCount (5), not history.count (6).
+        #expect(engine.lastPrefixHitCount == 5)
+        // processedTokenCount should account for: 5 (carried) + 3 (token 30 + two user) + 2 (generated) = 10
+        #expect(engine.processedTokenCount == 10)
+    }
+
+    @Test("five-turn prefix caching with pipelined gap stays consistent")
+    func fiveTurnPrefixCachingWithPipelinedGap() async throws {
+        let engine = MockEngine(tokens: [10, 20, 30, 40, 50], maxContextLength: 2000)
+
+        var context: [Int32] = [1, 2, 3]
+
+        for turn in 1...5 {
+            // Append user tokens for each turn beyond the first
+            if turn > 1 {
+                context.append(contentsOf: [Int32(turn * 100 + 1), Int32(turn * 100 + 2)])
+            }
+
+            let preGenProcessed = engine.processedTokenCount
+            for try await output in try await engine.generate(
+                with: context,
+                samplingConfiguration: .greedy,
+                inferenceOptions: InferenceOptions(maxTokens: 2)
+            ) {
+                context.append(output.tokenId)
+            }
+
+            // Simulate pipelined gap: last token yielded but not processed.
+            engine.processedTokenCount -= 1
+
+            // History must mirror context (no duplicates from missing truncation).
+            #expect(
+                engine.history.tokens.count == context.count,
+                "Turn \(turn): history (\(engine.history.tokens.count)) drifted from context (\(context.count))"
+            )
+
+            // Prefix hit should reuse all prior KV-valid tokens, not trigger divergence.
+            if turn > 1 {
+                #expect(
+                    engine.lastPrefixHitCount == preGenProcessed,
+                    "Turn \(turn): expected prefix hit \(preGenProcessed), got \(engine.lastPrefixHitCount)"
+                )
+            }
+        }
+    }
 }
 
 // MARK: - Deterministic RNG for Tests

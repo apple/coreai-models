@@ -24,6 +24,7 @@ struct ServerConfig: Sendable {
     let maxContextLength: Int
     let vocabSize: Int?
     let additionalEosTokenIds: [Int32]
+    let maxQueueDepth: Int
 }
 
 // MARK: - Server Stats
@@ -117,12 +118,12 @@ final class ServerState: @unchecked Sendable {
     let tokenizer: any Tokenizer
     let config: ServerConfig
     let stats = ServerStats()
+    let queue: RequestQueue
     let toolCallDetection: ToolCallDetection?
     let thinkingFormat: ThinkTagParser.Format
     private let _state = Mutex<InternalState>(InternalState())
 
     private struct InternalState {
-        var generating: Bool = false
         var lastSessionID: String? = nil
         var lastPromptTokens: [Int32] = []
         var prefixHits: Int = 0
@@ -135,6 +136,7 @@ final class ServerState: @unchecked Sendable {
         self.engine = engine
         self.tokenizer = tokenizer
         self.config = config
+        self.queue = RequestQueue(maxDepth: config.maxQueueDepth)
         self.toolCallDetection = detectToolCallFormat(using: tokenizer)
         self.thinkingFormat = detectThinkingFormat(using: tokenizer)
     }
@@ -150,20 +152,16 @@ final class ServerState: @unchecked Sendable {
         )
     }
 
-    func tryAcquire() -> Bool {
-        _state.withLock { s in
-            guard !s.generating else { return false }
-            s.generating = true
-            return true
-        }
-    }
-
-    func release() {
-        _state.withLock { $0.generating = false }
-    }
-
     /// Prepare engine for a new request. Returns the number of prefix tokens reused.
     func prepareForRequest(sessionID: String?, promptTokens: [Int32]) async -> Int {
+        // Recurrent-state models (SSM/hybrid) cannot reuse a token prefix: the
+        // engine full-resets and replays the whole prompt on any rewind. Skip the
+        // prefix-reuse fast path entirely and count it as a miss for honest stats.
+        if engine.hasRecurrentState {
+            _state.withLock { $0.prefixMisses += 1 }
+            return 0
+        }
+
         let action = _state.withLock { s -> PrepareAction in
             guard let sid = sessionID, sid == s.lastSessionID else {
                 s.lastSessionID = sessionID
@@ -235,7 +233,7 @@ final class ServerState: @unchecked Sendable {
 
     /// Readiness snapshot for /ready endpoint.
     func readySnapshot() -> ReadyResponse {
-        let busy = _state.withLock { $0.generating }
+        let busy = queue.isActive
         let usedTokens = engine.processedTokenCount
         let maxTokens = config.maxContextLength
         let utilization = maxTokens > 0 ? Double(usedTokens) / Double(maxTokens) : 0
@@ -283,22 +281,5 @@ enum RequestID {
             return val
         }
         return "coreai-\(n)"
-    }
-}
-
-// MARK: - Server Errors
-
-enum ServerError: Error, LocalizedError {
-    case badRequest(String)
-
-    var isBadRequest: Bool {
-        if case .badRequest = self { return true }
-        return false
-    }
-
-    var errorDescription: String? {
-        switch self {
-        case .badRequest(let msg): return msg
-        }
     }
 }

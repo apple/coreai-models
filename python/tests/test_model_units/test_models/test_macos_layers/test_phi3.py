@@ -21,7 +21,7 @@ from transformers.models.phi3.modeling_phi3 import (
 
 from coreai_models.models.macos.phi3 import Phi3ForCausalLM
 from coreai_models.primitives.macos.cache import KVCache
-from coreai_models.primitives.macos.rope import LongRoPE, initialize_rope
+from coreai_models.primitives.macos.rope import DecomposedRoPE, LongRoPE, initialize_rope
 
 # --- Configs matching each variant's architecture ---
 
@@ -454,3 +454,101 @@ class TestLongRoPE:
             * 1e4 ** (torch.arange(0, 8, 2, dtype=torch.float32) / 8)
         )
         torch.testing.assert_close(rope._freqs, expected)
+
+
+class TestDecomposedPartialRotary:
+    """Partial-rotary models (e.g. Phi-4) use the decomposed RoPE path because
+    the composite op mis-lowers partial-rotary freqs on newer OS betas. These
+    tests lock that the decomposed path preserves LongRoPE scaling exactly —
+    plain decomposed RoPE would silently drop the attention factor and per-dim
+    frequency factors.
+    """
+
+    def test_to_decomposed_matches_longrope(self):
+        """LongRoPE.to_decomposed() reproduces LongRoPE output for partial rotary."""
+        dims = 12  # partial: rotary dims < head_dim (16)
+        lr = LongRoPE(
+            dims=dims,
+            base=10000.0,
+            short_factor=[1.0 + 0.02 * i for i in range(dims // 2)],
+            long_factor=[1.1 + 0.02 * i for i in range(dims // 2)],
+            original_max_position_embeddings=64,
+            max_position_embeddings=64,
+            config_max_position_embeddings=2048,
+        )
+        dec = lr.to_decomposed()
+        assert isinstance(dec, DecomposedRoPE)
+        assert dec.attention_scale > 1.0  # attention factor carried across
+        assert dec._inv_freq is not None  # per-dimension freqs carried across
+
+        for seq_len in (4, 32):
+            x = torch.randn(1, 2, seq_len, 16)
+            position_ids = torch.arange(seq_len, dtype=torch.int32).unsqueeze(0)
+            torch.testing.assert_close(
+                dec(x, position_ids=position_ids),
+                lr(x, position_ids=position_ids),
+                atol=1e-6,
+                rtol=1e-6,
+            )
+
+    def test_initialize_rope_decomposed_matches_composite_longrope(self):
+        """initialize_rope(decomposed=True) matches the composite LongRoPE it replaces."""
+        kwargs = dict(
+            dims=8,
+            scaling_config={
+                "type": "longrope",
+                "short_factor": _SHORT_FACTOR,
+                "long_factor": _LONG_FACTOR,
+            },
+            max_position_embeddings=4096,
+            original_max_position_embeddings=4096,
+            config_max_position_embeddings=131072,
+        )
+        composite = initialize_rope(**kwargs)
+        decomposed = initialize_rope(**kwargs, decomposed=True)
+        assert isinstance(composite, LongRoPE)
+        assert isinstance(decomposed, DecomposedRoPE)
+
+        x = torch.randn(1, 2, 6, 10)  # head_dim 10 > rotary dims 8 (partial)
+        position_ids = torch.arange(6, dtype=torch.int32).unsqueeze(0)
+        torch.testing.assert_close(
+            decomposed(x, position_ids=position_ids),
+            composite(x, position_ids=position_ids),
+            atol=1e-4,
+            rtol=1e-4,
+        )
+
+    def test_initialize_rope_decomposed_plain_when_no_scaling(self):
+        """Without scaling, decomposed path is a plain DecomposedRoPE (no factors)."""
+        rope = initialize_rope(dims=12, base=10000.0, decomposed=True)
+        assert isinstance(rope, DecomposedRoPE)
+        assert rope._inv_freq is None
+        assert rope.attention_scale == 1.0
+
+    def test_phi4_partial_rotary_longrope_wired_to_decomposed(self):
+        """A Phi-4-style partial-rotary + longrope config routes to DecomposedRoPE
+        carrying the LongRoPE scaling (not a plain, scaling-dropping RoPE)."""
+        config = _phi4_mini_config()  # partial_rotary_factor=0.75
+        head_dim = config.hidden_size // config.num_attention_heads
+        rope_dims = int(head_dim * 0.75)
+        config.rope_scaling = {
+            "rope_type": "longrope",
+            "rope_theta": 10000.0,
+            "short_factor": [1.0] * (rope_dims // 2),
+            "long_factor": [1.05] * (rope_dims // 2),
+        }
+        config.original_max_position_embeddings = 32
+        config._native_max_position_embeddings = 1024  # extended context -> attn factor > 1
+
+        model = Phi3ForCausalLM(config, model_device="cpu")
+        rope = model.model.layers[0].self_attn.rope
+        assert isinstance(rope, DecomposedRoPE)
+        assert rope._inv_freq is not None
+        assert rope.attention_scale > 1.0
+
+    def test_phi4_full_rotary_keeps_composite_rope(self):
+        """Full-rotary Phi-3.5 keeps the composite (non-decomposed) RoPE path."""
+        config = _phi35_mini_config()  # partial_rotary_factor=1.0
+        model = Phi3ForCausalLM(config, model_device="cpu")
+        rope = model.model.layers[0].self_attn.rope
+        assert not isinstance(rope, DecomposedRoPE)

@@ -76,7 +76,17 @@ class MockEngine: InferenceEngine, @unchecked Sendable {
         _activeToken.withLock { $0 = token }
 
         // Implicit prefix caching: resolve input against history
-        let (commonPrefix, resolvedNewTokens) = history.resolve(input: input)
+        let (rawCommonPrefix, _) = history.resolve(input: input)
+        var commonPrefix = rawCommonPrefix
+
+        // Pipelined decode yields the last token without processing it; cap to KV-valid range.
+        var resolvedNewTokens = input[commonPrefix...]
+        if commonPrefix > processedTokenCount {
+            commonPrefix = processedTokenCount
+            resolvedNewTokens = input[commonPrefix...]
+            history.truncate(to: commonPrefix)
+        }
+
         lastPrefixHitCount = commonPrefix
 
         if commonPrefix < processedTokenCount {
