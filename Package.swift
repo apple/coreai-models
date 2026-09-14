@@ -36,6 +36,12 @@ let package = Package(
             ]
         ),
         .library(
+            name: "CoreAIVideoSegmentation",
+            targets: [
+                "CoreAIVideoSegmenter"
+            ]
+        ),
+        .library(
             name: "CoreAISpeech",
             targets: ["CoreAISpeech"]
         ),
@@ -82,6 +88,14 @@ let package = Package(
             name: "CoreAIObjectDetector",
             dependencies: ["CoreAIShared"],
             path: "swift/Sources/CoreAIObjectDetector",
+            swiftSettings: [
+                .enableUpcomingFeature("MemberImportVisibility")
+            ]
+        ),
+        .target(
+            name: "CoreAIVideoSegmenter",
+            dependencies: ["CoreAIShared"],
+            path: "swift/Sources/CoreAIVideoSegmenter",
             swiftSettings: [
                 .enableUpcomingFeature("MemberImportVisibility")
             ]
@@ -209,6 +223,18 @@ let package = Package(
             ]
         ),
         .executableTarget(
+            name: "video-segmenter",
+            dependencies: [
+                "CoreAIVideoSegmenter",
+                "CoreAIShared",
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+            ],
+            path: "swift/Sources/Tools/video-segmenter",
+            swiftSettings: [
+                .enableUpcomingFeature("MemberImportVisibility")
+            ]
+        ),
+        .executableTarget(
             name: "diffusion-runner",
             dependencies: [
                 "CoreAIDiffusionPipeline",
@@ -296,6 +322,14 @@ let package = Package(
                 "TestUtilities",
             ],
             path: "swift/Tests/ImageSegmenterTests"
+        ),
+        .testTarget(
+            name: "VideoSegmenterTests",
+            dependencies: [
+                "CoreAIVideoSegmenter",
+                "CoreAIShared",
+            ],
+            path: "swift/Tests/VideoSegmenterTests"
         ),
         .testTarget(
             name: "DiffusionPipelineTests",

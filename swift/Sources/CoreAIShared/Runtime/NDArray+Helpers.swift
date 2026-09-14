@@ -160,6 +160,79 @@ public func fillFloatNDArray(_ array: inout NDArray, with elements: ArraySlice<F
     }
 }
 
+/// Copy `source` into `array` starting at logical element `elementOffset`.
+///
+/// Unlike `fillNDArray`, which fills from index 0 through a per-element closure, this writes
+/// at an offset and `memcpy`s the whole run when the array is contiguous, falling back to a
+/// stride walk only when it is padded for hardware alignment.
+///
+/// - Precondition: `elementOffset + source.count` must not exceed the logical element count.
+public func copyIntoNDArray<T: BitwiseCopyable>(
+    _ array: inout NDArray, as type: T.Type, elementOffset: Int, from source: [T]
+) {
+    copyIntoNDArray(array.mutableRawView(), as: T.self, elementOffset: elementOffset, from: source)
+}
+
+/// Copy `source` into an NDArray's MutableRawView starting at logical element `elementOffset`.
+/// Takes the view as `consuming`, so the caller gives up ownership.
+public func copyIntoNDArray<T: BitwiseCopyable>(
+    _ rawView: consuming NDArray.MutableRawView, as type: T.Type, elementOffset: Int,
+    from source: [T]
+) {
+    guard !source.isEmpty else { return }
+    let view = rawView.view(as: type)
+    view.withUnsafeMutablePointer { ptr, shape, strides in
+        let capacity = shape.product
+        precondition(
+            elementOffset >= 0 && elementOffset + source.count <= capacity,
+            "copyIntoNDArray: [\(elementOffset), \(elementOffset + source.count)) exceeds capacity \(capacity)"
+        )
+
+        if isContiguousRowMajor(shape: shape, strides: strides) {
+            source.withUnsafeBufferPointer { input in
+                (ptr + elementOffset).update(from: input.baseAddress!, count: source.count)
+            }
+            return
+        }
+
+        let rank = shape.count
+        var indices = [Int](repeating: 0, count: rank)
+        var remainder = elementOffset
+        for d in (0..<rank).reversed() {
+            indices[d] = remainder % shape[d]
+            remainder /= shape[d]
+        }
+        var offset = 0
+        for d in 0..<rank { offset += indices[d] * strides[d] }
+        for i in 0..<source.count {
+            ptr[offset] = source[i]
+            var dim = rank - 1
+            while dim >= 0 {
+                indices[dim] += 1
+                offset += strides[dim]
+                if indices[dim] < shape[dim] { break }
+                indices[dim] = 0
+                offset -= strides[dim] * shape[dim]
+                dim -= 1
+            }
+        }
+    }
+}
+
+/// Write `value` into every logical element of `array` in `elementRange`.
+///
+/// Clears memory-bank slots that were valid on the previous call and are not on this one.
+/// Stale slots are harmless numerically, since the key mask suppresses them, but they make
+/// a parity divergence hard to reason about.
+public func clearNDArrayRegion<T: BitwiseCopyable>(
+    _ array: inout NDArray, as type: T.Type, elementRange: Range<Int>, value: T
+) {
+    guard !elementRange.isEmpty else { return }
+    copyIntoNDArray(
+        &array, as: type, elementOffset: elementRange.lowerBound,
+        from: [T](repeating: value, count: elementRange.count))
+}
+
 // MARK: - Flatten Helpers
 
 /// Flatten an NDArray output into `[Float]`, branching on its own scalar type.

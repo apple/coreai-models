@@ -220,3 +220,85 @@ struct StrideAwareFillReadTests {
         #expect(readNDArray(array, as: Float.self, count: count) == values)
     }
 }
+
+// MARK: - copyIntoNDArray / clearNDArrayRegion
+
+/// Both of `copyIntoNDArray`'s paths need pinning: the contiguous `memcpy` and the stride
+/// walk that runs when the array is padded for hardware alignment.
+@Suite("copyIntoNDArray")
+struct CopyIntoNDArrayTests {
+    @Test("Writes at an offset without disturbing its neighbours")
+    func writesAtOffset() {
+        var array = NDArray(shape: [4, 8], scalarType: .float32)
+        fillNDArray(&array, as: Float.self, with: [Float](repeating: -1, count: 32))
+
+        copyIntoNDArray(
+            &array, as: Float.self, elementOffset: 8, from: (0..<8).map { Float($0) })
+
+        let read = readNDArray(array, as: Float.self, count: 32)
+        #expect(Array(read[0..<8]) == [Float](repeating: -1, count: 8))
+        #expect(Array(read[8..<16]) == (0..<8).map { Float($0) })
+        #expect(Array(read[16..<32]) == [Float](repeating: -1, count: 16))
+    }
+
+    @Test("Round-trips a slot layout the memory bank would use")
+    func slotLayout() {
+        // Same shape family as `spatial_memory`: [slots, tokens, 1, dim]. Each slot is
+        // written independently and must come back independently.
+        let slots = 3
+        let tokens = 5
+        let dim = 4
+        let perSlot = tokens * dim
+        var array = NDArray(shape: [slots, tokens, 1, dim], scalarType: .float32)
+        for slot in 0..<slots {
+            let payload = (0..<perSlot).map { Float(slot * 100 + $0) }
+            copyIntoNDArray(
+                &array, as: Float.self, elementOffset: slot * perSlot, from: payload)
+        }
+        let read = readNDArray(array, as: Float.self, count: slots * perSlot)
+        for slot in 0..<slots {
+            let got = Array(read[(slot * perSlot)..<((slot + 1) * perSlot)])
+            #expect(got == (0..<perSlot).map { Float(slot * 100 + $0) }, "slot \(slot)")
+        }
+    }
+
+    @Test("Survives a small innermost dimension, where padding is likely")
+    func smallInnermostDimension() {
+        // A 4-element innermost dimension is where the framework's preferred strides are
+        // most likely to be padded, exercising the non-contiguous fallback.
+        var array = NDArray(shape: [64, 4], scalarType: .float32)
+        let payload = (0..<256).map { Float($0) * 0.5 }
+        copyIntoNDArray(&array, as: Float.self, elementOffset: 0, from: payload)
+        #expect(readNDArray(array, as: Float.self, count: 256) == payload)
+    }
+
+    @Test("An empty source is a no-op")
+    func emptySource() {
+        var array = NDArray(shape: [2, 4], scalarType: .float32)
+        fillNDArray(&array, as: Float.self, with: [Float](repeating: 7, count: 8))
+        copyIntoNDArray(&array, as: Float.self, elementOffset: 4, from: [Float]())
+        #expect(readNDArray(array, as: Float.self, count: 8) == [Float](repeating: 7, count: 8))
+    }
+
+    @Test("clearNDArrayRegion zeroes exactly the requested range")
+    func clearsRange() {
+        // This is how the packer wipes slots that were valid on the previous call and are
+        // not on this one. Over-clearing would destroy live memory in a lower slot.
+        var array = NDArray(shape: [4, 4], scalarType: .float32)
+        fillNDArray(&array, as: Float.self, with: (0..<16).map { Float($0 + 1) })
+        clearNDArrayRegion(&array, as: Float.self, elementRange: 4..<12, value: 0)
+
+        let read = readNDArray(array, as: Float.self, count: 16)
+        #expect(Array(read[0..<4]) == [1, 2, 3, 4])
+        #expect(Array(read[4..<12]) == [Float](repeating: 0, count: 8))
+        #expect(Array(read[12..<16]) == [13, 14, 15, 16])
+    }
+
+    @Test("Clearing an empty range does nothing")
+    func clearEmptyRange() {
+        var array = NDArray(shape: [2, 2], scalarType: .float32)
+        fillNDArray(&array, as: Float.self, with: [1, 2, 3, 4] as [Float])
+        clearNDArrayRegion(&array, as: Float.self, elementRange: 2..<2, value: 0)
+        #expect(readNDArray(array, as: Float.self, count: 4) == [1, 2, 3, 4] as [Float])
+    }
+}
