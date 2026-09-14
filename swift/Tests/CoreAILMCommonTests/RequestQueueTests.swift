@@ -175,6 +175,42 @@ struct RequestQueueTests {
     }
 
     @Test(
+        "Concurrent releases hand the slot back exactly once",
+        .timeLimit(.minutes(1)))
+    func concurrentReleasesReturnSlotOnce() async throws {
+        let queue = RequestQueue(maxDepth: 4)
+        let permit = try await queue.acquire()
+
+        // Enqueue exactly one waiter so a double-return would be observable: if
+        // the slot is handed back more than once, the second hand-back would wake
+        // this waiter (or corrupt isActive) even though nobody re-acquired.
+        let waiter = Task { try await queue.acquire() }
+        try await waitUntil { queue.queuedCount == 1 }
+
+        // Race many release() calls on the same permit. The atomic once-guard must
+        // let exactly one win, so the slot is handed to the single waiter once.
+        await withTaskGroup(of: Void.self) { group in
+            for _ in 0..<50 {
+                group.addTask { permit.release() }
+            }
+        }
+
+        // The single waiter got the slot exactly once; nothing is left queued.
+        let permit1 = try await waiter.value
+        #expect(queue.isActive == true)
+        #expect(queue.queuedCount == 0)
+
+        permit1.release()
+        #expect(queue.isActive == false)
+
+        // Slot is usable again — accounting was not corrupted by the race.
+        let permit2 = try await queue.acquire()
+        #expect(queue.isActive == true)
+        permit2.release()
+        #expect(queue.isActive == false)
+    }
+
+    @Test(
         "Cancelling a queued waiter removes it and frees the slot",
         .timeLimit(.minutes(1)))
     func cancelledWaiterIsRemoved() async throws {

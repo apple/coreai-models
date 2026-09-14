@@ -124,19 +124,20 @@ public final class RequestQueue: Sendable {
 /// is dropped by the server before its writer closure ever runs).
 public final class QueuePermit: Sendable {
     private let queue: RequestQueue
-    private let released = Mutex<Bool>(false)
+    private let released = Atomic<Bool>(false)
 
     fileprivate init(_ queue: RequestQueue) {
         self.queue = queue
     }
 
     public func release() {
-        let shouldRelease = released.withLock { r -> Bool in
-            if r { return false }
-            r = true
-            return true
-        }
-        if shouldRelease { queue.release() }
+        // Flip false -> true atomically; exactly one caller wins the exchange and
+        // hands the slot back. `.relaxed` suffices: the exchange's atomicity (not
+        // its ordering) picks the single winner, and queue.release() takes the
+        // RequestQueue Mutex, which provides the actual cross-thread handoff.
+        let (won, _) = released.compareExchange(
+            expected: false, desired: true, ordering: .relaxed)
+        if won { queue.release() }
     }
 
     deinit { release() }
