@@ -8,21 +8,19 @@ import Foundation
 
 /// Resolves objects that claim the same pixels.
 ///
-/// Three related rules, all ported from `Sam3VideoModel`, applied at different points and
-/// on different data:
+/// Three rules ported from `Sam3VideoModel`, applied at different points and on different
+/// data:
 ///
 /// 1. ``suppressRecentlyOccluded``, before memory encoding, on tracker logits. When two
-///    objects overlap heavily, the one that was occluded more recently is assumed to be
-///    the drifting copy and is blanked.
+///    objects overlap heavily, the one occluded more recently is assumed to be the drifting
+///    copy and is blanked.
 /// 2. ``suppressAreaShrinkage``, also before memory encoding. Applies a pixel-level argmax
-///    and then drops any object that lost most of its area to it, on the reasoning that
-///    such an object was never really there.
+///    and drops any object that lost most of its area to it.
 /// 3. ``applyObjectWiseNonOverlap``, at output time, on binary masks and per-object scores
 ///    rather than logits.
 ///
 /// All three are enforced per prompt group: two prompts may legitimately return overlapping
-/// masks for the same pixels, and forcing them to compete would make "person" and "pillow"
-/// delete each other.
+/// masks, and forcing them to compete would make "person" and "pillow" delete each other.
 enum OcclusionSuppressor {
     /// Logit written over a suppressed mask. `sigmoid(-10)` is 4.5e-5, so it reads as
     /// background everywhere downstream without being an out-of-range sentinel.
@@ -39,14 +37,20 @@ enum OcclusionSuppressor {
     /// real frame index.
     static let alwaysOccluded = 100_000
 
+    /// Index groups that can contend, in prompt-id order. A group of one never competes.
+    private static func contendingGroups(_ promptIDs: [Int]) -> [[Int]] {
+        Set(promptIDs).sorted()
+            .map { group in promptIDs.indices.filter { promptIDs[$0] == group } }
+            .filter { $0.count > 1 }
+    }
+
     // MARK: - 1. Recent-occlusion suppression
 
     /// Blank objects that overlap an object occluded less recently than they were.
     ///
-    /// Port of `_suppress_overlapping_based_on_recent_occlusion`. Also updates each
-    /// object's last-occluded frame, which is the state the next frame's comparison reads:
-    /// an object counts as occluded this frame if its mask is empty *or* it was suppressed
-    /// here.
+    /// Port of `_suppress_overlapping_based_on_recent_occlusion`. Also updates each object's
+    /// last-occluded frame, which the next frame's comparison reads: an object counts as
+    /// occluded this frame if its mask is empty *or* it was suppressed here.
     ///
     /// - Parameters:
     ///   - logits: Tracker mask logits per object, mutated in place.
@@ -65,6 +69,10 @@ enum OcclusionSuppressor {
         parameters: VideoSegmentationParameters
     ) {
         guard !objectIDs.isEmpty else { return }
+        precondition(
+            masks.count == objectIDs.count && logits.count == objectIDs.count
+                && promptIDs.count == objectIDs.count,
+            "suppressRecentlyOccluded: logits, masks, objectIDs and promptIDs must be parallel")
 
         let lastOccluded = objectIDs.map { id in
             session.lastOccludedByObjectID[id]
@@ -72,9 +80,7 @@ enum OcclusionSuppressor {
         }
 
         var suppress = [Bool](repeating: false, count: objectIDs.count)
-        for group in Set(promptIDs).sorted() {
-            let members = promptIDs.indices.filter { promptIDs[$0] == group }
-            guard members.count > 1 else { continue }
+        for members in contendingGroups(promptIDs) {
             markSuppressed(
                 members: members, masks: masks, lastOccluded: lastOccluded,
                 threshold: parameters.suppressOverlappingOcclusionThreshold,
@@ -130,17 +136,22 @@ enum OcclusionSuppressor {
     /// Drop objects that lose most of their area to the pixel-level argmax.
     ///
     /// Port of `_suppress_object_pw_area_shrinkage`, run per prompt group. Returns the
-    /// original masks with whole objects blanked, not the de-overlapped masks; the argmax only
-    /// measures how much of each object was contested.
+    /// original masks with whole objects blanked, not the de-overlapped masks; the argmax
+    /// only measures how much of each object was contested.
     static func suppressAreaShrinkage(
         logits: inout [[Float]], promptIDs: [Int]
     ) {
         guard logits.count > 1 else { return }
-        for group in Set(promptIDs).sorted() {
-            let members = promptIDs.indices.filter { promptIDs[$0] == group }
-            guard members.count > 1 else { continue }
-
+        precondition(
+            promptIDs.count == logits.count,
+            "suppressAreaShrinkage: logits and promptIDs must be parallel")
+        for members in contendingGroups(promptIDs) {
             let pixelCount = logits[members[0]].count
+            // A pixel-level argmax is only defined over fields of the same extent, and every
+            // caller passes one low-resolution field per object.
+            precondition(
+                members.allSatisfy { logits[$0].count == pixelCount },
+                "suppressAreaShrinkage: logits in a prompt group must be the same length")
             // Winner per pixel, by raw logit. Ties go to the lowest index in the group,
             // matching `torch.argmax`.
             var winner = [Int](repeating: members[0], count: pixelCount)
@@ -178,8 +189,8 @@ enum OcclusionSuppressor {
     /// Give each contested pixel to the highest-scoring object in its prompt group.
     ///
     /// Port of `Sam3VideoProcessor._apply_object_wise_non_overlapping_constraints` with
-    /// `background_value = 0`. The scores here are per-object, not per-pixel, so the
-    /// winner of a contested region is the same everywhere the two overlap.
+    /// `background_value = 0`. The scores are per-object, not per-pixel, so the winner of a
+    /// contested region is the same everywhere the two overlap.
     ///
     /// Upstream compares `pixel_nonoverlap > 0`, so an object whose score is exactly zero
     /// loses every pixel, even uncontested ones. Reproduced by the `bestScore[pixel] > 0` test.
@@ -187,11 +198,20 @@ enum OcclusionSuppressor {
         masks: inout [MaskBitset], scores: [Float], promptIDs: [Int]
     ) {
         guard masks.count > 1 else { return }
-        for group in Set(promptIDs).sorted() {
-            let members = promptIDs.indices.filter { promptIDs[$0] == group }
-            guard members.count > 1 else { continue }
-
-            let pixelCount = masks[members[0]].width * masks[members[0]].height
+        precondition(
+            promptIDs.count == masks.count && scores.count == masks.count,
+            "applyObjectWiseNonOverlap: masks, scores and promptIDs must be parallel")
+        for members in contendingGroups(promptIDs) {
+            let width = masks[members[0]].width
+            let height = masks[members[0]].height
+            // Flat pixel indices are only comparable across masks of identical geometry.
+            // Checking both axes, not just the area: two masks with the same pixel count at
+            // different widths would stay in bounds while pitting unrelated locations
+            // against each other, which is a silent wrong answer rather than a crash.
+            precondition(
+                members.allSatisfy { masks[$0].width == width && masks[$0].height == height },
+                "applyObjectWiseNonOverlap: masks in a prompt group must share dimensions")
+            let pixelCount = width * height
             var bestScore = [Float](repeating: 0, count: pixelCount)
             var winner = [Int32](repeating: -1, count: pixelCount)
             // Strict `>` so ties keep the lowest group index, matching `torch.argmax`.
@@ -211,8 +231,6 @@ enum OcclusionSuppressor {
                         losses.append(pixel)
                     }
                 }
-                guard !losses.isEmpty else { continue }
-                let width = masks[member].width
                 for pixel in losses {
                     masks[member][pixel % width, pixel / width] = false
                 }

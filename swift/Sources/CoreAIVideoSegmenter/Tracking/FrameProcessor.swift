@@ -78,9 +78,7 @@ final class FrameProcessor {
             trackerLogits = propagation.maskLogits
             trackerScoreLogits = propagation.objectScoreLogits
             for index in trackerLogits.indices {
-                ConnectedComponents.fillHoles(
-                    &trackerLogits[index], width: shapes.lowResMaskSize,
-                    height: shapes.lowResMaskSize, maxArea: parameters.fillHoleArea)
+                fillHoles(&trackerLogits[index])
             }
         }
 
@@ -114,6 +112,12 @@ final class FrameProcessor {
         var plan: TrackerUpdatePlan
         /// Scores assigned to objects created or removed on this frame.
         var newScores: [Int: Float]
+    }
+
+    private func fillHoles(_ logits: inout [Float]) {
+        ConnectedComponents.fillHoles(
+            &logits, width: shapes.lowResMaskSize, height: shapes.lowResMaskSize,
+            maxArea: parameters.fillHoleArea)
     }
 
     // MARK: - Detection
@@ -187,10 +191,9 @@ final class FrameProcessor {
         let existing = objectIDsSnapshot.count
         if existing + newIndices.count > parameters.maxNumObjects {
             let keepCount = max(0, parameters.maxNumObjects - existing)
-            plan.droppedDueToObjectLimit = newIndices.count - keepCount
             CLILogger.log(
                 "Frame \(frameIndex): hit max_num_objects (\(parameters.maxNumObjects)); dropping "
-                    + "\(plan.droppedDueToObjectLimit) of \(newIndices.count) new detections.")
+                    + "\(newIndices.count - keepCount) of \(newIndices.count) new detections.")
             newIndices =
                 newIndices
                 .sorted { detections.scores[$0] > detections.scores[$1] }
@@ -267,10 +270,9 @@ final class FrameProcessor {
     /// Where a reconditioned object's memory mask comes from.
     ///
     /// `trackerMask` is not "the tracker mask captured now" but "whatever the tracker mask is
-    /// when memory is encoded". Upstream stores a view into `tracker_low_res_masks_global`
-    /// here, and occlusion suppression mutates that tensor in place between capture and use, so
-    /// a reconditioned object that is also suppressed contributes a blanked mask. Holding a
-    /// copy taken before suppression would silently reinstate it.
+    /// when memory is encoded": occlusion suppression mutates that tensor in place between
+    /// capture and use, so holding a copy taken before suppression would silently reinstate a
+    /// mask upstream blanks.
     private enum ReconditionSource {
         case trackerMask
         case detectionMask([Float])
@@ -278,10 +280,9 @@ final class FrameProcessor {
 
     /// Port of `_prepare_recondition_masks`.
     ///
-    /// The two modes are opposites and the flag name reads backwards at a glance:
-    /// `reconditionOnTrkMasks == true` means "the detector agrees, so reinforce memory
-    /// with what the *tracker* produced"; false means "the detector disagrees, so overwrite
-    /// with the *detection*".
+    /// The flag name reads backwards: `reconditionOnTrkMasks == true` means "the detector
+    /// agrees, so reinforce memory with what the *tracker* produced"; false means "the
+    /// detector disagrees, so overwrite with the *detection*".
     private func prepareReconditionMasks(
         session: VideoInferenceSession,
         detections: MergedDetections,
@@ -292,9 +293,9 @@ final class FrameProcessor {
         var reconditioned: Set<Int> = []
         for (trackID, detectionIndex) in candidates.sorted(by: { $0.key < $1.key }) {
             guard let objectIndex = session.registry.existingIndex(of: trackID) else { continue }
-            // Note this compares a raw logit against a probability-shaped threshold, which
-            // is what upstream does; `tracker_obj_scores_global` is not passed through a
-            // sigmoid first. In practice it admits any object with a positive score.
+            // Upstream compares a raw logit against a probability-shaped threshold:
+            // `tracker_obj_scores_global` is not passed through a sigmoid first. In practice
+            // it admits any object with a positive score.
             guard objectIndex < trackerScoreLogits.count,
                 trackerScoreLogits[objectIndex] > parameters.highConfThresh
             else { continue }
@@ -357,8 +358,8 @@ final class FrameProcessor {
             }
         }
         // Sorted so removal order, and therefore the index renumbering, is deterministic.
-        // Upstream iterates a set, whose order is arbitrary; the end state is the same either
-        // way because each removal is independent.
+        // Upstream iterates a set, whose order is arbitrary; the end state is the same
+        // either way.
         for objectID in plan.newlyRemovedObjectIDs.sorted() {
             session.removeObject(objectID)
         }
@@ -368,11 +369,10 @@ final class FrameProcessor {
 
     /// Port of `build_outputs` plus the metadata bookkeeping at the end of `forward`.
     ///
-    /// Both zips below run the post-execution object list against pre-execution arrays, and
-    /// truncate at the shorter. That is upstream's own indexing: `build_outputs` and
-    /// `_det_track_one_frame` both read `inference_session.obj_ids` after the execution phase
-    /// has already mutated it. It is exact whenever nothing was removed this frame, since new
-    /// ids fall past the end of the tracker arrays and are filled in from detections below.
+    /// Both zips below run the post-execution object list against pre-execution arrays and
+    /// truncate at the shorter, which is upstream's own indexing. It is exact whenever
+    /// nothing was removed this frame, since new ids fall past the end of the tracker arrays
+    /// and are filled in from detections below.
     private func buildOutputs(
         session: VideoInferenceSession,
         frameIndex: Int,
@@ -393,9 +393,7 @@ final class FrameProcessor {
         // was seeded from it.
         for (objectID, detectionIndex) in zip(plan.newObjectIDs, plan.newDetectionIndices) {
             var mask = detections.maskLogits[detectionIndex]
-            ConnectedComponents.fillHoles(
-                &mask, width: shapes.lowResMaskSize, height: shapes.lowResMaskSize,
-                maxArea: parameters.fillHoleArea)
+            fillHoles(&mask)
             maskByObjectID[objectID] = mask
         }
 
@@ -428,7 +426,6 @@ final class FrameProcessor {
         return RawFrameOutput(
             frameIndex: frameIndex,
             maskLogitsByObjectID: maskByObjectID,
-            objectIDs: maskByObjectID.keys.sorted(),
             scoreByObjectID: session.scoreByObjectID,
             trackerScoreByObjectID: trackerScores,
             suppressedObjectIDs: session.suppressedObjectIDsByFrame[frameIndex] ?? [])

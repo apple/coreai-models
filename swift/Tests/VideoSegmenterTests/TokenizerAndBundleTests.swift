@@ -11,12 +11,11 @@ import Testing
 
 @Suite("CLIPTokenizer attention mask")
 struct TokenizerTests {
-    /// A vocabulary of whole single-letter words.
+    /// A vocabulary of whole single-letter words, with the ids real CLIP gives them.
     ///
     /// CLIP's BPE appends `</w>` to the last character of a token and then merges pairs;
     /// with no merge table a one-letter word is already terminal, so it looks up directly.
-    /// That keeps this suite self-contained: it tests the masking rule, not BPE, and BPE
-    /// is unchanged from the shipped image-segmenter tokenizer.
+    /// That keeps this suite self-contained: it tests the masking rule, not BPE.
     private func tokenizer() throws -> CLIPTokenizer {
         try CLIPTokenizer(
             vocab: [
@@ -27,16 +26,6 @@ struct TokenizerTests {
                 "c</w>": 1615,
             ],
             merges: [])
-    }
-
-    /// The tokenizer shipped in the exported bundle, when it is present.
-    private func bundledTokenizer() -> CLIPTokenizer? {
-        let root = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()  // VideoSegmenterTests
-            .deletingLastPathComponent()  // Tests
-            .deletingLastPathComponent()  // swift
-        let folder = root.appending(path: "exports/sam3_video_float16/tokenizer")
-        return try? CLIPTokenizer(folder: folder)
     }
 
     @Test("A one-word prompt is SOT, the word, EOT, then padding")
@@ -86,21 +75,81 @@ struct TokenizerTests {
             tokenizer.encode("a b c", contextLength: 32)
                 == tokenizer.encodeWithMask("a b c", contextLength: 32).ids)
     }
+}
 
-    @Test("The real vocabulary reproduces what HF emits for a multi-word prompt")
-    func realVocabulary() throws {
-        // Captured from `AutoTokenizer.from_pretrained("exports/sam3_video_float16/tokenizer")`
-        // with `padding="max_length", max_length=32`. Skipped when the bundle is absent,
-        // so this suite still runs on a machine that has not exported one.
-        guard let tokenizer = bundledTokenizer() else { return }
+@Suite("CLIPTokenizer BPE")
+struct TokenizerBPETests {
+    /// A toy vocabulary whose merge table actually merges.
+    ///
+    /// The suite above passes `merges: []` and single-letter words, so `bpe` returns at its
+    /// `chars.count == 1` early exit and the merge loop never runs. These fixtures are the
+    /// smallest thing that exercises it.
+    private enum Toy {
+        /// Merge rank is list position; the lowest-ranked matching pair merges first.
+        static let merges: [(String, String)] = [
+            ("b", "c</w>"),  // rank 0
+            ("a", "b"),  // rank 1
+            ("a", "t</w>"),  // rank 2
+            ("c", "at</w>"),  // rank 3
+        ]
 
-        let person = tokenizer.encodeWithMask("person", contextLength: 32)
-        #expect(person.ids.prefix(3) == [49406, 2533, 49407])
-        #expect(person.attentionMask.reduce(0, +) == 3)
+        /// Holds an id for both outcomes of the "abc" race below, so a wrong merge order
+        /// shows up as different ids rather than as tokens silently dropped by `compactMap`.
+        static let vocab: [String: Int32] = [
+            "<|startoftext|>": 49406,
+            "<|endoftext|>": 49407,
+            "a": 100,
+            "ab": 101,
+            "c</w>": 102,
+            "bc</w>": 103,
+            "cat</w>": 200,
+        ]
 
-        let car = tokenizer.encodeWithMask("a red car", contextLength: 32)
-        #expect(car.ids.prefix(5) == [49406, 320, 736, 1615, 49407])
-        #expect(car.attentionMask.reduce(0, +) == 5)
+        static func tokenizer() throws -> CLIPTokenizer {
+            try CLIPTokenizer(vocab: vocab, merges: merges)
+        }
+    }
+
+    @Test("A word whose merges chain all the way collapses to a single token")
+    func mergesToSingleToken() throws {
+        // `["c", "a", "t</w>"]`, rank 2 gives `["c", "at</w>"]`, rank 3 gives `["cat</w>"]`.
+        // This is the shape "person" has in the real vocabulary: one id, not six.
+        let (ids, mask) = try Toy.tokenizer().encodeWithMask("cat", contextLength: 8)
+        #expect(ids.prefix(3) == [49406, 200, 49407])
+        #expect(mask.reduce(0, +) == 3)
+    }
+
+    @Test("The lowest-rank pair merges first, even when a later pair also matches")
+    func mergeRankOrder() throws {
+        // "abc" is `["a", "b", "c</w>"]` and both ("a","b") and ("b","c</w>") match. Rank 0
+        // wins, giving `["a", "bc</w>"]` = [100, 103]; merging ("a","b") first would give
+        // `["ab", "c</w>"]` = [101, 102].
+        let ids = try Toy.tokenizer().encode("abc", contextLength: 8)
+        #expect(ids.prefix(4) == [49406, 100, 103, 49407])
+    }
+
+    @Test("A tokenizer.json on disk loads to the same tokenizer as the in-memory init")
+    func loadsFromFolder() throws {
+        let folder = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+
+        // A one-element entry among the merges: `init(folder:)` skips malformed pairs, and
+        // skipping must not shift the ranks of the valid ones that follow.
+        let merges: [[String]] = [["junk"]] + Toy.merges.map { [$0.0, $0.1] }
+        let json = try JSONSerialization.data(
+            withJSONObject: [
+                "model": ["vocab": Toy.vocab.mapValues(Int.init), "merges": merges]
+            ])
+        try json.write(to: folder.appending(path: "tokenizer.json"))
+
+        let loaded = try CLIPTokenizer(folder: folder)
+        let expected = try Toy.tokenizer()
+        for prompt in ["cat", "abc", "c", "a cat"] {
+            #expect(
+                loaded.encode(prompt, contextLength: 8) == expected.encode(prompt, contextLength: 8),
+                "\(prompt)")
+        }
     }
 }
 
@@ -109,9 +158,9 @@ struct TemporalIndexTests {
     @Test("A conditioning frame maps to the last row, not to -1")
     func conditioningWraps() {
         // HF writes `memory_temporal_positional_encoding[offset - 1]`, and a conditioning
-        // frame's offset is 0, which in Python is the last row. Getting this wrong
-        // gives every conditioning memory the wrong temporal encoding, which the graph
-        // cannot flag because the index is still in range.
+        // frame's offset is 0, which in Python is the last row. Getting this wrong gives
+        // every conditioning memory the wrong temporal encoding, which the graph cannot flag
+        // because the index is still in range.
         #expect(MemoryBankPacker.temporalIndex(forOffset: 0, numMaskmem: 7) == 6)
     }
 
@@ -124,6 +173,26 @@ struct TemporalIndexTests {
 
 @Suite("VideoSegmenterBundle metadata")
 struct BundleMetadataTests {
+    /// A minimal `video_segmenter` metadata document, plus whatever extra top-level blocks
+    /// the caller needs.
+    private func bundle(
+        imageSize: Int = 1008, extraBlocks: String = ""
+    ) throws -> VideoSegmenterBundle {
+        try bundle(
+            """
+            {
+              "metadata_version": "0.2",
+              "kind": "video_segmenter",
+              "name": "sam3_video_float16",
+              "assets": {"main": "sam3_video_float16.aimodel"},
+              "runtime": {
+                "image_size": \(imageSize), "spatial_slots": 10,
+                "ptr_slots": 24, "max_text_seq_len": 32
+              }\(extraBlocks)
+            }
+            """)
+    }
+
     private func bundle(_ json: String) throws -> VideoSegmenterBundle {
         try VideoSegmenterBundle(
             bundle: ModelBundle(
@@ -131,22 +200,9 @@ struct BundleMetadataTests {
                 bundlePath: URL(fileURLWithPath: "/tmp/does-not-need-to-exist")))
     }
 
-    private let minimal = """
-        {
-          "metadata_version": "0.2",
-          "kind": "video_segmenter",
-          "name": "sam3_video_float16",
-          "assets": {"main": "sam3_video_float16.aimodel"},
-          "runtime": {
-            "image_size": 1008, "spatial_slots": 10,
-            "ptr_slots": 24, "max_text_seq_len": 32
-          }
-        }
-        """
-
     @Test("The runtime block is parsed")
     func geometry() throws {
-        let parsed = try bundle(minimal)
+        let parsed = try bundle()
         #expect(parsed.geometry.imageSize == 1008)
         #expect(parsed.geometry.spatialSlots == 10)
         #expect(parsed.geometry.ptrSlots == 24)
@@ -156,7 +212,7 @@ struct BundleMetadataTests {
     @Test("A bundle without a tracking block keeps the upstream defaults")
     func defaultsWithoutTracking() throws {
         // The shipped export predates the tracking block, so this is the path it takes.
-        let parameters = try bundle(minimal).parameters()
+        let parameters = try bundle().parameters()
         #expect(parameters.hotstartDelay == 15)
         #expect(parameters.scoreThresholdDetection == 0.5)
         #expect(parameters.numMaskmem == 7)
@@ -166,19 +222,11 @@ struct BundleMetadataTests {
     @Test("A partial tracking block overrides only what it names")
     func partialOverride() throws {
         let parsed = try bundle(
-            """
-            {
-              "metadata_version": "0.2",
-              "kind": "video_segmenter",
-              "name": "x",
-              "assets": {"main": "x.aimodel"},
-              "runtime": {
-                "image_size": 336, "spatial_slots": 10,
-                "ptr_slots": 24, "max_text_seq_len": 32
-              },
-              "tracking": {"hotstart_delay": 0, "score_threshold_detection": 0.25}
-            }
-            """)
+            imageSize: 336,
+            extraBlocks: """
+                ,
+                  "tracking": {"hotstart_delay": 0, "score_threshold_detection": 0.25}
+                """)
         let parameters = parsed.parameters()
         #expect(parameters.hotstartDelay == 0)
         #expect(parameters.scoreThresholdDetection == 0.25)
@@ -192,19 +240,12 @@ struct BundleMetadataTests {
         caller.hotstartDelay = 99
         caller.maxNumObjects = 5
 
-        let parsed = try bundle(
-            """
-            {
-              "metadata_version": "0.2", "kind": "video_segmenter", "name": "x",
-              "assets": {"main": "x.aimodel"},
-              "runtime": {"image_size": 1008, "spatial_slots": 10, "ptr_slots": 24,
-                          "max_text_seq_len": 32},
-              "tracking": {"hotstart_delay": 3}
-            }
-            """)
-        let parameters = parsed.parameters(overriding: caller)
+        let parameters = try bundle(extraBlocks: #","tracking": {"hotstart_delay": 3}"#)
+            .parameters(overriding: caller)
         #expect(parameters.hotstartDelay == 3, "the bundle knows its own checkpoint")
-        #expect(parameters.maxNumObjects == 5, "the caller's value survives where the bundle is silent")
+        #expect(
+            parameters.maxNumObjects == 5,
+            "the caller's value survives where the bundle is silent")
     }
 
     @Test("A missing runtime block is rejected with an actionable message")

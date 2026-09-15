@@ -20,15 +20,15 @@ struct PackedMemory {
 
 /// Selects each object's eligible memories and packs them into the graph's fixed slots.
 ///
-/// HF builds the tracker's memory with a variable-length `torch.cat`, so its length changes
-/// every frame and per object. A traced graph takes one shape, so this uses a fixed bank plus
-/// an additive key mask. Packing valid entries at the front in any order is safe because
-/// cross-attention is permutation-invariant over keys, RoPE repeats the same per-slot pattern
-/// across spatial slots, and masked slots contribute nothing.
+/// HF builds the tracker's memory with a variable-length `torch.cat`. A traced graph takes
+/// one shape, so this uses a fixed bank plus an additive key mask. Packing valid entries at
+/// the front in any order is safe because cross-attention is permutation-invariant over keys,
+/// RoPE repeats the same per-slot pattern across spatial slots, and masked slots contribute
+/// nothing.
 ///
 /// `gatherMemoryFrames` and `objectPointers` are ports of `_gather_memory_frame_outputs` and
-/// `_get_object_pointers` in `modeling_sam3_tracker_video.py`, so which memories are eligible
-/// cannot drift from upstream even though the layout does.
+/// `_get_object_pointers`, so which memories are eligible cannot drift from upstream even
+/// though the layout does.
 @VideoSegmentationActor
 final class MemoryBankPacker {
     private let shapes: VideoSegmentationEngine.Shapes
@@ -37,16 +37,14 @@ final class MemoryBankPacker {
     /// Slots written on the previous call, so only those need clearing on this one.
     private var previousSpatialSlots = 0
     private var previousPointerSlots = 0
-    /// Emitted at most once per video; the condition is a property of the export, not of
-    /// the frame, so repeating it per frame per object would bury the log.
+    /// Emitted at most once per video: the condition is a property of the export, not of the
+    /// frame, so repeating it per object would bury the log.
     private var warnedAboutPointerOverflow = false
 
-    /// Slot capacities and per-slot element counts, all derived from the traced shapes.
     private var spatialSlotElements: Int { shapes.memoryTokenCount * shapes.memoryDim }
     private var pointerSlotElements: Int { shapes.hiddenDim }
 
     init(
-        engine: VideoSegmentationEngine,
         shapes: VideoSegmentationEngine.Shapes,
         parameters: VideoSegmentationParameters,
         packed: PackedMemory
@@ -121,8 +119,10 @@ final class MemoryBankPacker {
                     "Object \(objectIndex) has more than \(shapes.spatialSlots) spatial memories "
                         + "on frame \(frameIndex). Re-export with a larger --spatial-slots.")
             }
-            write(features, into: &packed.spatialMemory, slot: slot)
-            write(position, into: &packed.spatialMemoryPosition, slot: slot)
+            write(features, into: &packed.spatialMemory, slot: slot, stride: spatialSlotElements)
+            write(
+                position, into: &packed.spatialMemoryPosition, slot: slot,
+                stride: spatialSlotElements)
             temporalIndices[slot] = Int32(
                 Self.temporalIndex(forOffset: offset, numMaskmem: parameters.numMaskmem))
             valid[slot] = 1
@@ -154,7 +154,7 @@ final class MemoryBankPacker {
     ///
     /// Returns `(relativeTemporalOffset, output)` pairs. Conditioning frames carry offset 0;
     /// recent frames carry their distance. A `nil` output is a gap the caller skips, kept in
-    /// the list rather than filtered so the offsets stay attached to the right entries.
+    /// the list so the offsets stay attached to the right entries.
     static func gatherMemoryFrames(
         history: ObjectOutputHistory,
         frameIndex: Int,
@@ -168,8 +168,8 @@ final class MemoryBankPacker {
             (0, history.conditioning[$0])
         }
         // Most recent last, matching upstream's `range(num_maskmem - 1, 0, -1)`. Order is
-        // irrelevant to the packed bank but is preserved so a slot-by-slot comparison
-        // against a reference lines up.
+        // irrelevant to the packed bank but preserved so a slot-by-slot comparison against a
+        // reference lines up.
         for offset in stride(from: parameters.numMaskmem - 1, to: 0, by: -1) {
             let previousFrame = reverse ? frameIndex + offset : frameIndex - offset
             let output =
@@ -242,7 +242,9 @@ final class MemoryBankPacker {
         var temporalPositions = [Float](repeating: 0, count: shapes.ptrSlots)
         var valid = [Float](repeating: 0, count: shapes.ptrSlots)
         for (slot, offset) in offsets.enumerated() {
-            writePointer(pointers[slot], slot: slot)
+            write(
+                MemoryPayload(reading: pointers[slot], limit: pointerSlotElements),
+                into: &packed.objectPointers, slot: slot, stride: pointerSlotElements)
             temporalPositions[slot] = Float(offset) / maxTemporalDifference
             valid[slot] = 1
         }
@@ -295,22 +297,12 @@ final class MemoryBankPacker {
 
     // MARK: - Slot writes
 
-    private func write(_ payload: MemoryPayload, into array: inout NDArray, slot: Int) {
+    private func write(
+        _ payload: MemoryPayload, into array: inout NDArray, slot: Int, stride: Int
+    ) {
         #if !((os(macOS) || targetEnvironment(macCatalyst)) && arch(x86_64))
         copyIntoNDArray(
-            &array, as: Float16.self, elementOffset: slot * spatialSlotElements,
-            from: payload.values)
-        #else
-        fatalError("Float16 is not supported on this platform")
-        #endif
-    }
-
-    private func writePointer(_ pointer: NDArray, slot: Int) {
-        #if !((os(macOS) || targetEnvironment(macCatalyst)) && arch(x86_64))
-        let values = readNDArray(pointer, as: Float16.self, count: pointerSlotElements)
-        copyIntoNDArray(
-            &packed.objectPointers, as: Float16.self,
-            elementOffset: slot * pointerSlotElements, from: values)
+            &array, as: Float16.self, elementOffset: slot * stride, from: payload.values)
         #else
         fatalError("Float16 is not supported on this platform")
         #endif

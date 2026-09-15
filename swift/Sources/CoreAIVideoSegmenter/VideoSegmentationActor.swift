@@ -9,8 +9,7 @@ import Foundation
 ///
 /// The loop is inherently sequential: frame N's tracker reads the memory frame N-1 wrote, and
 /// every stage shares one mutable `VideoInferenceSession`. Giving each component its own actor
-/// would mean passing that session across isolation boundaries it cannot safely cross, so they
-/// all share this one.
+/// would mean passing that session across isolation boundaries it cannot safely cross.
 ///
 /// ``VideoSegmentationEngine`` is deliberately not on this actor: it owns no per-frame state,
 /// so a caller can unload the asset without serializing against a running frame loop.

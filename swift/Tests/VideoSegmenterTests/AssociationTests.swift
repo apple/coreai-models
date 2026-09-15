@@ -59,15 +59,17 @@ struct AssociatorTests {
         #expect(result.emptyTrackIDs == [2])
     }
 
-    @Test("A detection covered by a track is not new")
-    func coveredDetectionIsNotNew() {
+    @Test("A detection covered by a track is not new, but may recondition it")
+    func coveredDetection() {
         let result = Associator.associate(
             detections: detections([(stripe(0..<5), 0.95, 0)]),
-            trackMasks: [stripe(0..<5)], trackIDs: [1], trackPromptIDs: [0],
+            trackMasks: [stripe(0..<5)], trackIDs: [7], trackPromptIDs: [0],
             parameters: .default)
         #expect(result.newDetectionIndices.isEmpty)
-        #expect(result.detectionToMatchedTrackIDs[0] == [1])
+        #expect(result.detectionToMatchedTrackIDs[0] == [7])
         #expect(result.unmatchedTrackIDs.isEmpty)
+        // Confident and well-overlapping, so it is also a reconditioning candidate.
+        #expect(result.trackIDToHighConfidenceDetection[7] == 0)
     }
 
     @Test("The loose and strict thresholds disagree independently")
@@ -94,15 +96,6 @@ struct AssociatorTests {
         #expect(result.newDetectionIndices == [0])
         #expect(result.detectionToMatchedTrackIDs[0] == [])
         #expect(result.unmatchedTrackIDs == [1])
-    }
-
-    @Test("A confident, well-overlapping detection becomes a reconditioning candidate")
-    func reconditioningCandidate() {
-        let result = Associator.associate(
-            detections: detections([(stripe(0..<5), 0.95, 0)]),
-            trackMasks: [stripe(0..<5)], trackIDs: [7], trackPromptIDs: [0],
-            parameters: .default)
-        #expect(result.trackIDToHighConfidenceDetection[7] == 0)
     }
 
     @Test("A new detection is never also a reconditioning candidate")
@@ -191,8 +184,8 @@ struct OcclusionSuppressorTests {
     @Test("A zero-scored object loses even its uncontested pixels")
     func zeroScoreLosesEverything() {
         // Upstream tests `pixel_nonoverlap > 0` on a field built from the object's own
-        // score, so a score of exactly 0 fails the test everywhere. Surprising, but it is
-        // the behaviour, and a track only reaches 0 when it has no recorded score at all.
+        // score, so a score of exactly 0 fails the test everywhere. Surprising, but a track
+        // only reaches 0 when it has no recorded score at all.
         var masks = [MaskBitset(width: 4, height: 1), MaskBitset(width: 4, height: 1)]
         masks[0][0, 0] = true
         masks[1][3, 0] = true

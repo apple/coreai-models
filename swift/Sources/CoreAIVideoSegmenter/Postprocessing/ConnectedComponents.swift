@@ -7,16 +7,14 @@ import Foundation
 
 /// 8-connected component labelling and the mask cleanup built on it.
 ///
-/// Port of `fill_holes_in_mask_scores` and `_get_connected_components_with_padding` in
-/// `modeling_sam3_video.py`. Upstream routes the labelling through an optional
-/// `kernels-community/cv-utils` CUDA kernel and, when it is not installed, returns fake
-/// component areas of `H*W + 1`, which makes both cleanup steps no-ops without saying so.
-/// This implementation is always present, so a bundle run here gets the cleanup the model
-/// was tuned with. Set ``VideoSegmentationParameters/fillHoleArea`` to 0 to reproduce a
-/// Python run that was missing the kernel.
+/// Port of `fill_holes_in_mask_scores` and `_get_connected_components_with_padding`. Upstream
+/// routes the labelling through an optional `kernels-community/cv-utils` CUDA kernel and,
+/// when it is not installed, returns fake component areas of `H*W + 1`, which silently
+/// no-ops both cleanup steps. This implementation is always present, so set
+/// ``VideoSegmentationParameters/fillHoleArea`` to 0 to reproduce a Python run that was
+/// missing the kernel.
 ///
-/// 8-connectivity matches SAM 2's `get_connected_components`, which documents it
-/// explicitly and is what `cc_2d` implements.
+/// 8-connectivity matches SAM 2's `get_connected_components`.
 enum ConnectedComponents {
     /// Per-pixel component area for the set pixels of `mask`. Unset pixels get 0.
     ///
@@ -30,8 +28,7 @@ enum ConnectedComponents {
         func find(_ start: Int32) -> Int32 {
             var node = start
             while parent[Int(node)] != node {
-                // Path halving: point each node at its grandparent while climbing. Keeps the
-                // trees flat without a second pass.
+                // Path halving: point each node at its grandparent while climbing.
                 parent[Int(node)] = parent[Int(parent[Int(node)])]
                 node = parent[Int(node)]
             }
@@ -41,8 +38,7 @@ enum ConnectedComponents {
             let rootA = find(a)
             let rootB = find(b)
             if rootA == rootB { return }
-            // Always attach the larger index under the smaller so roots stay stable and
-            // the labelling is deterministic.
+            // Attach the larger index under the smaller so the labelling is deterministic.
             if rootA < rootB { parent[Int(rootB)] = rootA } else { parent[Int(rootA)] = rootB }
         }
 
@@ -83,9 +79,6 @@ enum ConnectedComponents {
     /// remove_sprinkles=True)`. The two sentinel values (`0.1` and `-0.1`) are upstream's:
     /// the mask stays a logit field, so a filled hole becomes weakly positive rather than
     /// saturated.
-    ///
-    /// The foreground threshold is `min(maxArea, foregroundArea / 2)` and is recomputed after
-    /// hole filling, which is what keeps a genuinely tiny object from deleting itself.
     static func fillHoles(_ logits: inout [Float], width: Int, height: Int, maxArea: Int) {
         guard maxArea > 0 else { return }
         let count = width * height
@@ -99,8 +92,9 @@ enum ConnectedComponents {
             logits[index] = 0.1
         }
 
-        // Foreground: components of `logits > 0` up to the smaller of `maxArea` and half
-        // the mask's own area become weakly negative.
+        // Foreground: components of `logits > 0` up to the smaller of `maxArea` and half the
+        // mask's own area become weakly negative. Halving is what keeps a genuinely tiny
+        // object from deleting itself.
         var foreground = [Bool](repeating: false, count: count)
         var foregroundArea = 0
         for index in 0..<count where logits[index] > 0 {

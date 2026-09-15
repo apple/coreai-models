@@ -21,7 +21,6 @@ struct ObjectRegistry {
     private var indexByID: [Int: Int] = [:]
 
     var count: Int { ids.count }
-    var isEmpty: Bool { ids.isEmpty }
 
     /// Index of `id`, registering it at the end if new.
     ///
@@ -41,8 +40,6 @@ struct ObjectRegistry {
 
     func id(at index: Int) -> Int { ids[index] }
 
-    func contains(_ id: Int) -> Bool { indexByID[id] != nil }
-
     /// Remove `id` and report the surviving indices in their old order, so callers can
     /// compact parallel arrays with `newStorage = survivors.map { oldStorage[$0] }`.
     ///
@@ -54,10 +51,5 @@ struct ObjectRegistry {
         ids = survivors.map { ids[$0] }
         indexByID = Dictionary(uniqueKeysWithValues: ids.enumerated().map { ($1, $0) })
         return survivors
-    }
-
-    mutating func removeAll() {
-        ids.removeAll()
-        indexByID.removeAll()
     }
 }

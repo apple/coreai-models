@@ -11,15 +11,6 @@ import Foundation
 ///
 /// Everything above this type is host logic: the inference session, the memory ring
 /// buffer, and the tracking heuristics. This is the only place that touches `AIModel`.
-///
-/// Two deliberate choices in the signatures below:
-///
-/// * Tensors that go straight from one graph to the next stay as `NDArray` handles rather
-///   than being flattened to `[Float]`. `vision_feat_0` alone is 2.6 M elements and is fed
-///   to `tracker_step` once per tracked object per frame, so a host round-trip would be
-///   repeated for every object.
-/// * `tracker_encode` also emits `vision_pos_0` and `vision_pos_1`, which no other
-///   entrypoint consumes. They are left unread.
 public actor VideoSegmentationEngine: ResourceManaging {
     /// Entrypoint names, in the order the exporter declares them.
     public enum Function {
@@ -53,8 +44,6 @@ public actor VideoSegmentationEngine: ResourceManaging {
         public let imageSize: Int
         /// Text token count `text_encode` was traced at.
         public let textSequenceLength: Int
-        /// Detector query count.
-        public let queryCount: Int
         /// Side of the detector's and tracker's low-resolution masks.
         public let lowResMaskSize: Int
         /// Side of the `memory_encode` mask input.
@@ -82,8 +71,7 @@ public actor VideoSegmentationEngine: ResourceManaging {
     /// Load and specialize the asset, then resolve its shapes.
     ///
     /// A static multi-function asset commits workspace for every declared function on the
-    /// first `loadFunction`, so all seven are resolved here rather than on demand; deferring
-    /// them would cost the same memory and add a first-use stall.
+    /// first `loadFunction`, so resolving all seven here costs no more memory than deferring.
     public func loadResources() async throws {
         guard loaded == nil else { return }
         let prepared = try await PreparedModel.prepare(at: modelURL)
@@ -132,30 +120,27 @@ public actor VideoSegmentationEngine: ResourceManaging {
 
     /// ViT backbone. `pixelValues` is planar CHW at `shapes.imageSize`, already normalized.
     public func imageEncode(pixelValues: [Float]) async throws -> NDArray {
-        var array = NDArray(descriptor: try arrayDescriptor(Function.imageEncode, input: "pixel_values"))
-        fillFloatNDArray(&array, with: pixelValues)
-        let outputs = try await invoke(Function.imageEncode, ["pixel_values": array])
-        return try output(outputs, "last_hidden_state", from: Function.imageEncode)
+        let outputs = try await invoke(
+            Function.imageEncode,
+            ["pixel_values": try input(Function.imageEncode, "pixel_values", pixelValues)])
+        return try outputs("last_hidden_state")
     }
 
     /// CLIP text tower. Run once per distinct prompt for the whole video.
     ///
     /// Returns the attention mask alongside the features because `detect` needs the same
-    /// mask on every frame, so there is no point rebuilding it per frame per prompt.
+    /// mask on every frame.
     public func textEncode(
         inputIDs: [Int32], attentionMask: [Int32]
     ) async throws -> PromptEncoding {
-        var ids = NDArray(descriptor: try arrayDescriptor(Function.textEncode, input: "input_ids"))
-        fillNDArray(&ids, as: Int32.self, with: inputIDs)
-        var mask = NDArray(
-            descriptor: try arrayDescriptor(Function.textEncode, input: "attention_mask"))
-        fillNDArray(&mask, as: Int32.self, with: attentionMask)
-
+        let mask = try input(Function.textEncode, "attention_mask", attentionMask)
         let outputs = try await invoke(
-            Function.textEncode, ["input_ids": ids, "attention_mask": mask])
-        return PromptEncoding(
-            textFeatures: try output(outputs, "text_features", from: Function.textEncode),
-            attentionMask: mask)
+            Function.textEncode,
+            [
+                "input_ids": try input(Function.textEncode, "input_ids", inputIDs),
+                "attention_mask": mask,
+            ])
+        return PromptEncoding(textFeatures: try outputs("text_features"), attentionMask: mask)
     }
 
     /// FPN + DETR + mask decoder, for one prompt.
@@ -170,10 +155,10 @@ public actor VideoSegmentationEngine: ResourceManaging {
                 "attention_mask": prompt.attentionMask,
             ])
         return DetectOutputs(
-            predictedMasks: try output(outputs, "pred_masks", from: Function.detect),
-            predictedBoxes: try output(outputs, "pred_boxes", from: Function.detect),
-            predictedLogits: try output(outputs, "pred_logits", from: Function.detect),
-            presenceLogits: try output(outputs, "presence_logits", from: Function.detect))
+            predictedMasks: try outputs("pred_masks"),
+            predictedBoxes: try outputs("pred_boxes"),
+            predictedLogits: try outputs("pred_logits"),
+            presenceLogits: try outputs("presence_logits"))
     }
 
     /// Tracker FPN neck plus the two pre-projected decoder levels.
@@ -181,10 +166,10 @@ public actor VideoSegmentationEngine: ResourceManaging {
         let outputs = try await invoke(
             Function.trackerEncode, ["last_hidden_state": lastHiddenState])
         return TrackerFeatures(
-            level0: try output(outputs, "vision_feat_0", from: Function.trackerEncode),
-            level1: try output(outputs, "vision_feat_1", from: Function.trackerEncode),
-            level2: try output(outputs, "vision_feat_2", from: Function.trackerEncode),
-            positionLevel2: try output(outputs, "vision_pos_2", from: Function.trackerEncode))
+            level0: try outputs("vision_feat_0"),
+            level1: try outputs("vision_feat_1"),
+            level2: try outputs("vision_feat_2"),
+            positionLevel2: try outputs("vision_pos_2"))
     }
 
     /// Memory attention plus the SAM mask decoder, for one object on one frame.
@@ -210,48 +195,38 @@ public actor VideoSegmentationEngine: ResourceManaging {
                 "ptr_valid": memory.pointerValid,
             ])
         return TrackerStepOutputs(
-            predictedMasks: try output(outputs, "pred_masks", from: Function.trackerStep),
-            highResolutionMasks: try output(outputs, "high_res_masks", from: Function.trackerStep),
-            objectPointer: try output(outputs, "object_pointer", from: Function.trackerStep),
-            objectScoreLogits: try output(
-                outputs, "object_score_logits", from: Function.trackerStep))
+            predictedMasks: try outputs("pred_masks"),
+            highResolutionMasks: try outputs("high_res_masks"),
+            objectPointer: try outputs("object_pointer"),
+            objectScoreLogits: try outputs("object_score_logits"))
     }
 
     /// Encode one predicted mask into a spatial memory slot.
     ///
-    /// `maskLogits` must already be at `shapes.memoryMaskSize`. Upstream `_encode_new_memory`
-    /// resizes whatever it is handed, and it is handed two different resolutions depending
-    /// on the caller; a traced graph accepts one, so normalizing is the host's job.
+    /// `maskLogits` must already be at `shapes.memoryMaskSize`: upstream `_encode_new_memory`
+    /// resizes whatever it is handed, but a traced graph accepts one resolution.
     ///
     /// `binarize` reproduces `is_mask_from_pts`, which upstream computes as `any(...)` over
-    /// the batch, so one newly seeded object turns it on for every object encoded on that
-    /// frame.
+    /// the batch, so one newly seeded object turns it on for every object on that frame.
     public func memoryEncode(
         visionFeatureLevel2: NDArray,
         maskLogits: [Float],
         objectScoreLogit: Float,
         binarize: Bool
     ) async throws -> EncodedMemory {
-        var mask = NDArray(descriptor: try arrayDescriptor(Function.memoryEncode, input: "mask_logits"))
-        fillFloatNDArray(&mask, with: maskLogits)
-        var score = NDArray(
-            descriptor: try arrayDescriptor(Function.memoryEncode, input: "object_score_logits"))
-        fillFloatNDArray(&score, with: [objectScoreLogit])
-        var flag = NDArray(
-            descriptor: try arrayDescriptor(Function.memoryEncode, input: "binarize_mask"))
-        fillFloatNDArray(&flag, with: [binarize ? 1 : 0])
-
+        let function = Function.memoryEncode
         let outputs = try await invoke(
-            Function.memoryEncode,
+            function,
             [
                 "vision_feat_2": visionFeatureLevel2,
-                "mask_logits": mask,
-                "object_score_logits": score,
-                "binarize_mask": flag,
+                "mask_logits": try input(function, "mask_logits", maskLogits),
+                "object_score_logits": try input(
+                    function, "object_score_logits", [objectScoreLogit]),
+                "binarize_mask": try input(function, "binarize_mask", [binarize ? 1 : 0] as [Float]),
             ])
         return EncodedMemory(
-            features: try output(outputs, "maskmem_features", from: Function.memoryEncode),
-            positionEncoding: try output(outputs, "maskmem_pos_enc", from: Function.memoryEncode))
+            features: try outputs("maskmem_features"),
+            positionEncoding: try outputs("maskmem_pos_enc"))
     }
 
     /// Seed a track from a detection mask, producing only its object pointer.
@@ -261,18 +236,16 @@ public actor VideoSegmentationEngine: ResourceManaging {
     public func trackerMaskInit(
         features: TrackerFeatures, maskInput: [Float]
     ) async throws -> NDArray {
-        var mask = NDArray(
-            descriptor: try arrayDescriptor(Function.trackerMaskInit, input: "mask_input"))
-        fillFloatNDArray(&mask, with: maskInput)
+        let function = Function.trackerMaskInit
         let outputs = try await invoke(
-            Function.trackerMaskInit,
+            function,
             [
                 "vision_feat_0": features.level0,
                 "vision_feat_1": features.level1,
                 "vision_feat_2": features.level2,
-                "mask_input": mask,
+                "mask_input": try input(function, "mask_input", maskInput),
             ])
-        return try output(outputs, "object_pointer", from: Function.trackerMaskInit)
+        return try outputs("object_pointer")
     }
 
     /// A zero-filled input array for `function`'s `input`, for the memory packer to fill.
@@ -282,26 +255,52 @@ public actor VideoSegmentationEngine: ResourceManaging {
 
     // MARK: - Invocation
 
-    private func invoke(_ name: String, _ inputs: [String: NDArray]) async throws
-        -> [String: NDArray]
-    {
+    /// One call's outputs, carrying the function name so a lookup can report it.
+    private struct FunctionOutputs {
+        let function: String
+        let arrays: [String: NDArray]
+
+        func callAsFunction(_ name: String) throws -> NDArray {
+            guard let array = arrays[name] else {
+                throw VideoSegmentationError.missingOutput(function: function, name: name)
+            }
+            return array
+        }
+    }
+
+    private func invoke(
+        _ name: String, _ inputs: [String: NDArray]
+    ) async throws -> FunctionOutputs {
         let state = try require()
-        try validate(name, inputs, against: state.descriptors[name]!)
+        let descriptor = state.descriptors[name]!
+        try validate(name, inputs, against: descriptor)
         var raw = try await state.functions[name]!.run(inputs: inputs)
-        var outputs: [String: NDArray] = [:]
-        for output in state.descriptors[name]!.outputNames {
+        var arrays: [String: NDArray] = [:]
+        for output in descriptor.outputNames {
             if let array = raw.remove(output)?.ndArray {
-                outputs[output] = array
+                arrays[output] = array
             }
         }
-        return outputs
+        return FunctionOutputs(function: name, arrays: arrays)
+    }
+
+    /// A zero-filled array shaped for `function`'s `input`, then filled with `values`.
+    private func input(_ function: String, _ name: String, _ values: [Float]) throws -> NDArray {
+        var array = NDArray(descriptor: try arrayDescriptor(function, input: name))
+        fillFloatNDArray(&array, with: values)
+        return array
+    }
+
+    private func input(_ function: String, _ name: String, _ values: [Int32]) throws -> NDArray {
+        var array = NDArray(descriptor: try arrayDescriptor(function, input: name))
+        fillNDArray(&array, as: Int32.self, with: values)
+        return array
     }
 
     /// Reject shape mismatches before they reach the runtime.
     ///
-    /// A static Core AI function handed a wrongly shaped input does not raise: it kills the
-    /// process with SIGKILL and no traceback. The descriptors are right here, so the check is
-    /// cheap insurance against a failure that is otherwise very hard to debug.
+    /// A static Core AI function handed a wrongly shaped input does not raise: it SIGKILLs
+    /// the process with no traceback.
     private func validate(
         _ name: String, _ inputs: [String: NDArray], against descriptor: InferenceFunctionDescriptor
     ) throws {
@@ -333,15 +332,6 @@ public actor VideoSegmentationEngine: ResourceManaging {
         return loaded
     }
 
-    private func output(
-        _ outputs: [String: NDArray], _ name: String, from function: String
-    ) throws -> NDArray {
-        guard let array = outputs[name] else {
-            throw VideoSegmentationError.missingOutput(function: function, name: name)
-        }
-        return array
-    }
-
     private func arrayDescriptor(_ function: String, input: String) throws -> NDArrayDescriptor {
         let state = try require()
         guard let functionDescriptor = state.descriptors[function],
@@ -357,53 +347,58 @@ public actor VideoSegmentationEngine: ResourceManaging {
 
     /// Read every geometric constant the host needs off the traced descriptors.
     ///
-    /// Nothing here is hardcoded from the 1008 export: a 336 "lite" variant would report its
-    /// own grid and the packer would follow. What is checked is internal agreement, because a
+    /// Nothing is hardcoded from the 1008 export: a 336 "lite" variant would report its own
+    /// grid and the packer would follow. What is checked is internal agreement, because a
     /// mismatch between two entrypoints is the failure mode that SIGKILLs.
+    ///
+    /// Every lookup that is about to be indexed states its expected rank, so a re-export that
+    /// changes a layout throws here rather than trapping on an out-of-range subscript.
     private static func resolveShapes(
         _ descriptors: [String: InferenceFunctionDescriptor]
     ) throws -> Shapes {
-        func shape(_ function: String, input: String) throws -> [Int] {
+        func checked(_ shape: [Int], _ rank: Int?, _ what: String) throws -> [Int] {
+            if let rank, shape.count != rank {
+                throw VideoSegmentationError.unsupportedGeometry(
+                    "\(what) has rank \(shape.count) \(shape); this runtime expects rank \(rank).")
+            }
+            return shape
+        }
+        func shape(_ function: String, input: String, rank: Int? = nil) throws -> [Int] {
             guard let descriptor = descriptors[function],
                 case .ndArray(let array) = descriptor.inputDescriptor(of: input)
             else {
                 throw VideoSegmentationError.unsupportedGeometry(
                     "\(function) has no array input '\(input)'.")
             }
-            return array.shape
+            return try checked(array.shape, rank, "\(function) input '\(input)'")
         }
-        func outputShape(_ function: String, _ name: String) throws -> [Int] {
+        func outputShape(_ function: String, _ name: String, rank: Int? = nil) throws -> [Int] {
             guard let descriptor = descriptors[function],
                 case .ndArray(let array) = descriptor.outputDescriptor(of: name)
             else {
                 throw VideoSegmentationError.unsupportedGeometry(
                     "\(function) has no array output '\(name)'.")
             }
-            return array.shape
+            return try checked(array.shape, rank, "\(function) output '\(name)'")
         }
 
-        let pixelValues = try shape(Function.imageEncode, input: "pixel_values")
-        guard pixelValues.count == 4, pixelValues[2] == pixelValues[3] else {
+        let pixelValues = try shape(Function.imageEncode, input: "pixel_values", rank: 4)
+        guard pixelValues[2] == pixelValues[3] else {
             throw VideoSegmentationError.unsupportedGeometry(
                 "image_encode expects a square [1, 3, S, S] input; got \(pixelValues).")
         }
-        let inputIDs = try shape(Function.textEncode, input: "input_ids")
-        let predictedLogits = try outputShape(Function.detect, "pred_logits")
-        let predictedMasks = try outputShape(Function.detect, "pred_masks")
-        let spatialMemory = try shape(Function.trackerStep, input: "spatial_memory")
-        let objectPointers = try shape(Function.trackerStep, input: "object_pointers")
-        let highResolution = try outputShape(Function.trackerStep, "high_res_masks")
-        let memoryMask = try shape(Function.memoryEncode, input: "mask_logits")
+        let inputIDs = try shape(Function.textEncode, input: "input_ids", rank: 2)
+        let predictedMasks = try outputShape(Function.detect, "pred_masks", rank: 4)
+        let spatialMemory = try shape(Function.trackerStep, input: "spatial_memory", rank: 4)
+        let objectPointers = try shape(Function.trackerStep, input: "object_pointers", rank: 3)
+        let highResolution = try outputShape(Function.trackerStep, "high_res_masks", rank: 4)
+        let memoryMask = try shape(Function.memoryEncode, input: "mask_logits", rank: 4)
 
-        guard spatialMemory.count == 4 else {
-            throw VideoSegmentationError.unsupportedGeometry(
-                "tracker_step expects [slots, HW, 1, mem_dim] spatial memory; got \(spatialMemory).")
-        }
-        guard memoryMask.count == 4, memoryMask[2] == memoryMask[3] else {
+        guard memoryMask[2] == memoryMask[3] else {
             throw VideoSegmentationError.unsupportedGeometry(
                 "memory_encode expects a square mask input; got \(memoryMask).")
         }
-        guard predictedMasks.count == 4, predictedMasks[2] == predictedMasks[3] else {
+        guard predictedMasks[2] == predictedMasks[3] else {
             throw VideoSegmentationError.unsupportedGeometry(
                 "detect expects square masks; got \(predictedMasks).")
         }
@@ -411,7 +406,6 @@ public actor VideoSegmentationEngine: ResourceManaging {
         let shapes = Shapes(
             imageSize: pixelValues[2],
             textSequenceLength: inputIDs[1],
-            queryCount: predictedLogits[1],
             lowResMaskSize: predictedMasks[2],
             memoryMaskSize: memoryMask[2],
             highResMaskSize: highResolution[2],
@@ -422,19 +416,26 @@ public actor VideoSegmentationEngine: ResourceManaging {
             ptrSlots: objectPointers[0])
 
         // Cross-entrypoint agreement. The tracker's low-res mask must line up with the
-        // detector's for association to compare them, and `memory_encode`'s score input has
-        // a trailing singleton that is easy to get wrong.
-        let trackerLowRes = try outputShape(Function.trackerStep, "pred_masks")
+        // detector's for association to compare them.
+        let trackerLowRes = try outputShape(Function.trackerStep, "pred_masks", rank: 4)
         guard trackerLowRes[2] == shapes.lowResMaskSize else {
             throw VideoSegmentationError.unsupportedGeometry(
                 "tracker_step emits \(trackerLowRes[2])px masks but detect emits "
                     + "\(shapes.lowResMaskSize)px; association compares the two.")
         }
-        let maskInit = try shape(Function.trackerMaskInit, input: "mask_input")
+        let maskInit = try shape(Function.trackerMaskInit, input: "mask_input", rank: 4)
         guard maskInit[2] == shapes.lowResMaskSize else {
             throw VideoSegmentationError.unsupportedGeometry(
                 "tracker_mask_init takes \(maskInit[2])px masks but detections are "
                     + "\(shapes.lowResMaskSize)px.")
+        }
+        // `DetectionDecoder` thresholds the flattened logits and then slices `pred_masks` by
+        // the surviving indices, so one logit per mask is what keeps that slice in range.
+        let predictedLogits = try outputShape(Function.detect, "pred_logits")
+        guard predictedLogits.reduce(1, *) == predictedMasks[1] else {
+            throw VideoSegmentationError.unsupportedGeometry(
+                "detect emits pred_logits\(predictedLogits) but \(predictedMasks[1]) masks; "
+                    + "the decoder indexes one into the other.")
         }
         let scoreInput = try shape(Function.memoryEncode, input: "object_score_logits")
         let scoreOutput = try outputShape(Function.trackerStep, "object_score_logits")
@@ -443,7 +444,7 @@ public actor VideoSegmentationEngine: ResourceManaging {
                 "memory_encode takes object_score_logits\(scoreInput) but tracker_step emits "
                     + "\(scoreOutput).")
         }
-        let encodedMemory = try outputShape(Function.memoryEncode, "maskmem_features")
+        let encodedMemory = try outputShape(Function.memoryEncode, "maskmem_features", rank: 3)
         guard encodedMemory[0] == shapes.memoryTokenCount, encodedMemory[2] == shapes.memoryDim
         else {
             throw VideoSegmentationError.unsupportedGeometry(
@@ -473,7 +474,8 @@ public struct DetectOutputs: Sendable {
     public let presenceLogits: NDArray
 }
 
-/// The four `tracker_encode` outputs anything downstream actually reads.
+/// The `tracker_encode` outputs anything downstream reads. `vision_pos_0` and `vision_pos_1`
+/// are also emitted but no entrypoint consumes them.
 public struct TrackerFeatures: Sendable {
     public let level0: NDArray
     public let level1: NDArray

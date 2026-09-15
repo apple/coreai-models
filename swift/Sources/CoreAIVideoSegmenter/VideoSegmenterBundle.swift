@@ -9,14 +9,12 @@ import Foundation
 /// A `kind: video_segmenter` model bundle: the asset, the tokenizer, and the slot
 /// geometry the host has to pack memory to.
 ///
-/// The `runtime` block is required. The host builds fixed-capacity memory-bank tensors
-/// whose shapes must match what the graph was traced with, and deriving those from a
-/// hardcoded default would break silently the moment somebody re-exports with
-/// `--spatial-slots`.
+/// The `runtime` block is required: the host builds fixed-capacity memory-bank tensors whose
+/// shapes must match what the graph was traced with, and a hardcoded default would break
+/// silently the moment somebody re-exports with `--spatial-slots`.
 ///
 /// The `tracking` block is optional and carries the `Sam3VideoConfig` thresholds. A bundle
-/// without it gets ``VideoSegmentationParameters``'s defaults, which are the upstream config's
-/// own defaults.
+/// without it gets ``VideoSegmentationParameters``'s defaults.
 public struct VideoSegmenterBundle: Sendable {
     public let bundle: ModelBundle
     public let modelURL: URL
@@ -81,35 +79,36 @@ public struct VideoSegmenterBundle: Sendable {
         else { return base }
 
         var parameters = base
-        tracking.scoreThresholdDetection.map { parameters.scoreThresholdDetection = $0 }
-        tracking.detNmsThresh.map { parameters.detNmsThresh = $0 }
-        tracking.newDetThresh.map { parameters.newDetThresh = $0 }
-        tracking.assocIouThresh.map { parameters.assocIouThresh = $0 }
-        tracking.trkAssocIouThresh.map { parameters.trkAssocIouThresh = $0 }
-        tracking.highConfThresh.map { parameters.highConfThresh = $0 }
-        tracking.highIouThresh.map { parameters.highIouThresh = $0 }
-        tracking.reconditionEveryNthFrame.map { parameters.reconditionEveryNthFrame = $0 }
-        tracking.reconditionOnTrkMasks.map { parameters.reconditionOnTrkMasks = $0 }
-        tracking.hotstartDelay.map { parameters.hotstartDelay = $0 }
-        tracking.hotstartUnmatchThresh.map { parameters.hotstartUnmatchThresh = $0 }
-        tracking.hotstartDupThresh.map { parameters.hotstartDupThresh = $0 }
-        tracking.suppressUnmatchedOnlyWithinHotstart.map {
-            parameters.suppressUnmatchedOnlyWithinHotstart = $0
+        func apply<T>(_ value: T?, _ field: WritableKeyPath<VideoSegmentationParameters, T>) {
+            if let value { parameters[keyPath: field] = value }
         }
-        tracking.initTrkKeepAlive.map { parameters.initTrkKeepAlive = $0 }
-        tracking.maxTrkKeepAlive.map { parameters.maxTrkKeepAlive = $0 }
-        tracking.minTrkKeepAlive.map { parameters.minTrkKeepAlive = $0 }
-        tracking.decreaseTrkKeepAliveForEmptyMasklets.map {
-            parameters.decreaseTrkKeepAliveForEmptyMasklets = $0
-        }
-        tracking.suppressOverlappingOcclusionThreshold.map {
-            parameters.suppressOverlappingOcclusionThreshold = $0
-        }
-        tracking.maxNumObjects.map { parameters.maxNumObjects = $0 }
-        tracking.fillHoleArea.map { parameters.fillHoleArea = $0 }
-        tracking.numMaskmem.map { parameters.numMaskmem = $0 }
-        tracking.maxCondFrameNum.map { parameters.maxCondFrameNum = $0 }
-        tracking.maxObjectPointers.map { parameters.maxObjectPointers = $0 }
+        apply(tracking.scoreThresholdDetection, \.scoreThresholdDetection)
+        apply(tracking.detNmsThresh, \.detNmsThresh)
+        apply(tracking.newDetThresh, \.newDetThresh)
+        apply(tracking.assocIouThresh, \.assocIouThresh)
+        apply(tracking.trkAssocIouThresh, \.trkAssocIouThresh)
+        apply(tracking.highConfThresh, \.highConfThresh)
+        apply(tracking.highIouThresh, \.highIouThresh)
+        apply(tracking.reconditionEveryNthFrame, \.reconditionEveryNthFrame)
+        apply(tracking.reconditionOnTrkMasks, \.reconditionOnTrkMasks)
+        apply(tracking.hotstartDelay, \.hotstartDelay)
+        apply(tracking.hotstartUnmatchThresh, \.hotstartUnmatchThresh)
+        apply(tracking.hotstartDupThresh, \.hotstartDupThresh)
+        apply(tracking.suppressUnmatchedOnlyWithinHotstart, \.suppressUnmatchedOnlyWithinHotstart)
+        apply(tracking.initTrkKeepAlive, \.initTrkKeepAlive)
+        apply(tracking.maxTrkKeepAlive, \.maxTrkKeepAlive)
+        apply(tracking.minTrkKeepAlive, \.minTrkKeepAlive)
+        apply(
+            tracking.decreaseTrkKeepAliveForEmptyMasklets,
+            \.decreaseTrkKeepAliveForEmptyMasklets)
+        apply(
+            tracking.suppressOverlappingOcclusionThreshold,
+            \.suppressOverlappingOcclusionThreshold)
+        apply(tracking.maxNumObjects, \.maxNumObjects)
+        apply(tracking.fillHoleArea, \.fillHoleArea)
+        apply(tracking.numMaskmem, \.numMaskmem)
+        apply(tracking.maxCondFrameNum, \.maxCondFrameNum)
+        apply(tracking.maxObjectPointers, \.maxObjectPointers)
         return parameters
     }
 

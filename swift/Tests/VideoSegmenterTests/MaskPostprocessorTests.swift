@@ -37,7 +37,6 @@ struct LowResolutionMaskTests {
         RawFrameOutput(
             frameIndex: 0,
             maskLogitsByObjectID: masks,
-            objectIDs: masks.keys.sorted(),
             scoreByObjectID: masks.mapValues { _ in 0.9 },
             trackerScoreByObjectID: masks.mapValues { _ in 0.8 },
             suppressedObjectIDs: suppressed)
