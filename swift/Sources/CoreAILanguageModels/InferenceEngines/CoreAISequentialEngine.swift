@@ -528,14 +528,12 @@ extension CoreAISequentialEngine.GenerationSequence {
             self.generationToken = generationToken
             self.inputTokens = input
             self.generationStartOffset = input.count
-            if let forced = inferenceOptions.forcedContinuation {
-                self.maxTokens = forced.count
-            } else {
-                self.maxTokens = Swift.min(
-                    inferenceOptions.maxTokens ?? Int.max,
-                    Swift.max(0, engine.config.maxContextLength - input.count)
-                )
-            }
+            self.maxTokens = SequentialIterator.clampMaxTokens(
+                requested: inferenceOptions.maxTokens,
+                forcedCount: inferenceOptions.forcedContinuation?.count,
+                inputCount: input.count,
+                maxContextLength: engine.config.maxContextLength
+            )
         }
 
         deinit {
@@ -655,14 +653,13 @@ extension CoreAISequentialEngine.GenerationSequence {
                     return nil
                 }
 
-                let nextToken: Int32
-                if let forced = forcedContinuation {
-                    nextToken = forced[step]
-                } else {
-                    var mutableLogits = logitBuffer
-                    nextToken = samplingConfiguration.fallbackSampler(
-                        from: &mutableLogits, tokenHistory: inputTokens[generationStartOffset...])
-                }
+                let nextToken = SequentialIterator.nextToken(
+                    fromLogits: logitBuffer,
+                    forced: forcedContinuation,
+                    step: step,
+                    sampling: samplingConfiguration,
+                    tokenHistory: inputTokens[generationStartOffset...]
+                )
 
                 inputTokens.append(nextToken)
                 step += 1
