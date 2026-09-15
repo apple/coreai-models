@@ -110,6 +110,35 @@ public struct CLIPTokenizer: Sendable {
         return ids
     }
 
+    /// Encode `text` and report which slots hold real tokens.
+    ///
+    /// The pad token is `<|endoftext|>`, the same id that ends a real sequence, so the ids
+    /// alone can't tell padding from content. A prompt longer than `contextLength` is
+    /// truncated with `eotTokenId` forced into the last slot, making the mask all ones.
+    public func encodeWithMask(
+        _ text: String, contextLength: Int = 77
+    ) -> (ids: [Int32], attentionMask: [Int32]) {
+        let cleaned = whitespaceClean(text).lowercased()
+        let wordTokens = tokenize(cleaned)
+
+        var ids: [Int32] = [Self.sotTokenId]
+        ids += wordTokens.compactMap { encoder[$0] }
+        ids.append(Self.eotTokenId)
+
+        if ids.count > contextLength {
+            ids = Array(ids.prefix(contextLength))
+            ids[contextLength - 1] = Self.eotTokenId
+        }
+
+        let realCount = ids.count
+        while ids.count < contextLength {
+            ids.append(Self.eotTokenId)
+        }
+
+        let attentionMask = (0..<contextLength).map { Int32($0 < realCount ? 1 : 0) }
+        return (ids, attentionMask)
+    }
+
     // MARK: - Private
 
     private func tokenize(_ text: String) -> [String] {
