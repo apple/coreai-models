@@ -114,8 +114,12 @@ extension Flux2Pipeline {
             preconditionFailure("auto resolved above")
         }
 
-        let textEncoder = CoreAIDiffusionModelFunction(
-            modelURL: url.appendingPathComponent(textEncoderPath))
+        // Resolve compiled assets; report a missing text encoder up front.
+        let textEncoderURL = ModelBundle.resolveAssetURL(textEncoderPath, in: url)
+        guard FileManager.default.fileExists(atPath: textEncoderURL.path) else {
+            throw PipelineLoadError.missingComponent("text_encoder")
+        }
+        let textEncoder = CoreAIDiffusionModelFunction(modelURL: textEncoderURL)
         let decoder = CoreAIDiffusionModelFunction(
             modelURL: url.appendingPathComponent(decoderName))
 
@@ -131,7 +135,11 @@ extension Flux2Pipeline {
         }
         let encoder: CoreAIDiffusionModelFunction?
         if let name = encoderName {
-            encoder = CoreAIDiffusionModelFunction(modelURL: url.appendingPathComponent(name))
+            // Optional component: nil when absent so supportsImageToImage is accurate.
+            let encoderURL = ModelBundle.resolveAssetURL(name, in: url)
+            encoder = FileManager.default.fileExists(atPath: encoderURL.path)
+                ? CoreAIDiffusionModelFunction(modelURL: encoderURL)
+                : nil
         } else {
             encoder = nil
         }
