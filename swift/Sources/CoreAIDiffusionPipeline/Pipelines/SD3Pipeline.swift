@@ -109,7 +109,8 @@ public struct SD3Pipeline: DiffusionPipeline {
         // 3. Initial noise
         var latents = generateNoise(
             count: latentShape.reduce(1, *),
-            seed: configuration.seed)
+            seed: configuration.seed,
+            sourceType: .torch)
 
         // 4. Scheduler (SD3 flow matching; plain shift, no dynamic mu)
         let scheduler = DiscreteFlowScheduler(
