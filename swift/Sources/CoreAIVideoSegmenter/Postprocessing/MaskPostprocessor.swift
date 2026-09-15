@@ -25,6 +25,18 @@ struct MaskPostprocessor {
     private let emitLowResolutionMasks: Bool
     private let resampler: BilinearResampler
 
+    /// Reused across every object on every frame: the upsampled mask is megabytes at video
+    /// resolution and is thrown away as soon as `MaskBitset` has thresholded it.
+    private final class Buffers {
+        var upsampled: [Float]
+        var scratch: [Float]
+        init(pixels: Int, scratchCount: Int) {
+            upsampled = [Float](repeating: 0, count: pixels)
+            scratch = [Float](repeating: 0, count: scratchCount)
+        }
+    }
+    private let buffers: Buffers
+
     init(
         lowResolutionSize: Int, videoWidth: Int, videoHeight: Int,
         emitLowResolutionMasks: Bool = false
@@ -40,6 +52,8 @@ struct MaskPostprocessor {
             sourceWidth: lowResolutionSize, sourceHeight: lowResolutionSize,
             destinationWidth: videoWidth, destinationHeight: videoHeight,
             antialias: false)
+        self.buffers = Buffers(
+            pixels: videoWidth * videoHeight, scratchCount: resampler.scratchCount)
     }
 
     /// Reads the session's prompt map and hidden-object set, so it shares the frame loop's
@@ -63,9 +77,15 @@ struct MaskPostprocessor {
         for objectID in candidates {
             guard !hidden.contains(objectID) else { continue }
             guard let logits = raw.maskLogitsByObjectID[objectID] else { continue }
-            let upsampled = resampler.resample(logits)
+            logits.withUnsafeBufferPointer { input in
+                buffers.upsampled.withUnsafeMutableBufferPointer { output in
+                    buffers.scratch.withUnsafeMutableBufferPointer { scratch in
+                        resampler.resample(input, into: output, scratch: scratch)
+                    }
+                }
+            }
             let mask = MaskBitset(
-                thresholding: upsampled, width: videoWidth, height: videoHeight)
+                thresholding: buffers.upsampled, width: videoWidth, height: videoHeight)
             // Objects whose mask upsampled to nothing are dropped, not reported empty.
             guard !mask.isEmpty else { continue }
 

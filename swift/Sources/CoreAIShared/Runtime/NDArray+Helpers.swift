@@ -162,9 +162,8 @@ public func fillFloatNDArray(_ array: inout NDArray, with elements: ArraySlice<F
 
 /// Copy `source` into `array` starting at logical element `elementOffset`.
 ///
-/// Unlike `fillNDArray`, which fills from index 0 through a per-element closure, this writes
-/// at an offset and `memcpy`s the whole run when the array is contiguous, falling back to a
-/// stride walk only when it is padded for hardware alignment.
+/// The other `fillNDArray` overloads start at index 0, so packing into slot `k` of a
+/// fixed-slot tensor needs this.
 ///
 /// - Precondition: `elementOffset + source.count` must not exceed the logical element count.
 public func copyIntoNDArray<T: BitwiseCopyable>(
@@ -180,18 +179,57 @@ public func copyIntoNDArray<T: BitwiseCopyable>(
     from source: [T]
 ) {
     guard !source.isEmpty else { return }
+    writeNDArrayRegion(
+        rawView, as: type, label: "copyIntoNDArray",
+        elementOffset: elementOffset, count: source.count,
+        bulk: { destination, count in
+            source.withUnsafeBufferPointer { destination.update(from: $0.baseAddress!, count: count) }
+        },
+        element: { source[$0] })
+}
+
+/// Write `value` into every logical element of `array` in `elementRange`.
+///
+/// The offset-aware sibling of `fillNDArray(_:as:with:)`, which can only write from element 0.
+public func fillNDArray<T: BitwiseCopyable>(
+    _ array: inout NDArray, as type: T.Type, elementRange: Range<Int>, with value: T
+) {
+    fillNDArray(array.mutableRawView(), as: type, elementRange: elementRange, with: value)
+}
+
+/// MutableRawView overload of the region fill.
+public func fillNDArray<T: BitwiseCopyable>(
+    _ rawView: consuming NDArray.MutableRawView, as type: T.Type, elementRange: Range<Int>,
+    with value: T
+) {
+    guard !elementRange.isEmpty else { return }
+    writeNDArrayRegion(
+        rawView, as: type, label: "fillNDArray",
+        elementOffset: elementRange.lowerBound, count: elementRange.count,
+        bulk: { destination, count in destination.update(repeating: value, count: count) },
+        element: { _ in value })
+}
+
+/// Write `count` logical elements into `rawView` starting at element `elementOffset`.
+///
+/// `bulk` takes the contiguous fast path; `element` feeds the stride walk used when the array
+/// is padded for hardware alignment.
+@inline(__always)
+private func writeNDArrayRegion<T: BitwiseCopyable>(
+    _ rawView: consuming NDArray.MutableRawView, as type: T.Type, label: StaticString,
+    elementOffset: Int, count: Int,
+    bulk: (UnsafeMutablePointer<T>, Int) -> Void,
+    element: (Int) -> T
+) {
     let view = rawView.view(as: type)
     view.withUnsafeMutablePointer { ptr, shape, strides in
         let capacity = shape.product
         precondition(
-            elementOffset >= 0 && elementOffset + source.count <= capacity,
-            "copyIntoNDArray: [\(elementOffset), \(elementOffset + source.count)) exceeds capacity \(capacity)"
-        )
+            elementOffset >= 0 && elementOffset + count <= capacity,
+            "\(label): [\(elementOffset), \(elementOffset + count)) exceeds capacity \(capacity)")
 
         if isContiguousRowMajor(shape: shape, strides: strides) {
-            source.withUnsafeBufferPointer { input in
-                (ptr + elementOffset).update(from: input.baseAddress!, count: source.count)
-            }
+            bulk(ptr + elementOffset, count)
             return
         }
 
@@ -204,8 +242,8 @@ public func copyIntoNDArray<T: BitwiseCopyable>(
         }
         var offset = 0
         for d in 0..<rank { offset += indices[d] * strides[d] }
-        for i in 0..<source.count {
-            ptr[offset] = source[i]
+        for i in 0..<count {
+            ptr[offset] = element(i)
             var dim = rank - 1
             while dim >= 0 {
                 indices[dim] += 1
@@ -217,20 +255,6 @@ public func copyIntoNDArray<T: BitwiseCopyable>(
             }
         }
     }
-}
-
-/// Write `value` into every logical element of `array` in `elementRange`.
-///
-/// Clears memory-bank slots that were valid on the previous call and are not on this one.
-/// Stale slots are harmless numerically, since the key mask suppresses them, but they make
-/// a parity divergence hard to reason about.
-public func clearNDArrayRegion<T: BitwiseCopyable>(
-    _ array: inout NDArray, as type: T.Type, elementRange: Range<Int>, value: T
-) {
-    guard !elementRange.isEmpty else { return }
-    copyIntoNDArray(
-        &array, as: type, elementOffset: elementRange.lowerBound,
-        from: [T](repeating: value, count: elementRange.count))
 }
 
 // MARK: - Flatten Helpers
