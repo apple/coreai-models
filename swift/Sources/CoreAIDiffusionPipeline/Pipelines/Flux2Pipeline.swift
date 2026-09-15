@@ -224,7 +224,7 @@ public struct Flux2Pipeline: DiffusionPipeline {
         // 4. Generate noise [1, inChannels, spatialSide, spatialSide]
         let latentShape = [1, inChannels, spatialSide, spatialSide]
         let latentCount = latentShape.reduce(1, *)
-        let noise = generateNoise(count: latentCount, seed: configuration.seed)
+        let noise = generateNoise(count: latentCount, seed: configuration.seed, sourceType: .torch)
         let noisePacked = packLatentsSpatialFlatten(
             noise, channels: inChannels, height: spatialSide, width: spatialSide)
 
