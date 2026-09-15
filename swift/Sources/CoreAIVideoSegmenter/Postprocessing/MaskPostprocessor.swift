@@ -9,9 +9,9 @@ import Foundation
 
 /// Turns a frame's low-resolution mask logits into the objects a caller sees.
 ///
-/// Port of `Sam3VideoProcessor.postprocess_outputs`. Four steps, in this order, and the
-/// order matters: upsample to video resolution and binarize, drop empty and hidden
-/// objects, resolve overlaps within each prompt group, then derive boxes.
+/// Port of `Sam3VideoProcessor.postprocess_outputs`. Four steps, and the order matters:
+/// upsample to video resolution and binarize, drop empty and hidden objects, resolve
+/// overlaps within each prompt group, then derive boxes.
 struct MaskPostprocessor {
     /// Surviving objects plus, when asked for, the mask logits they came from.
     struct Postprocessed {
@@ -45,9 +45,8 @@ struct MaskPostprocessor {
         self.videoWidth = videoWidth
         self.videoHeight = videoHeight
         self.emitLowResolutionMasks = emitLowResolutionMasks
-        // Note: no antialiasing. Upstream calls `interpolate(..., mode="bilinear",
-        // align_corners=False)` here without the flag, unlike the resizes inside the
-        // tracker.
+        // No antialiasing: upstream calls `interpolate(..., mode="bilinear",
+        // align_corners=False)` here without the flag, unlike the resizes inside the tracker.
         self.resampler = BilinearResampler(
             sourceWidth: lowResolutionSize, sourceHeight: lowResolutionSize,
             destinationWidth: videoWidth, destinationHeight: videoHeight,
@@ -77,13 +76,7 @@ struct MaskPostprocessor {
         for objectID in candidates {
             guard !hidden.contains(objectID) else { continue }
             guard let logits = raw.maskLogitsByObjectID[objectID] else { continue }
-            logits.withUnsafeBufferPointer { input in
-                buffers.upsampled.withUnsafeMutableBufferPointer { output in
-                    buffers.scratch.withUnsafeMutableBufferPointer { scratch in
-                        resampler.resample(input, into: output, scratch: scratch)
-                    }
-                }
-            }
+            resampler.resample(logits, into: &buffers.upsampled, scratch: &buffers.scratch)
             let mask = MaskBitset(
                 thresholding: buffers.upsampled, width: videoWidth, height: videoHeight)
             // Objects whose mask upsampled to nothing are dropped, not reported empty.
@@ -99,12 +92,11 @@ struct MaskPostprocessor {
         guard !ids.isEmpty else { return Postprocessed() }
 
         // Boxes come from the masks before overlap resolution. Upstream computes
-        // `masks_to_boxes` and only then applies the non-overlap constraint, so a box can
-        // be slightly larger than the mask it labels. Kept that way for parity.
+        // `masks_to_boxes` and only then applies the non-overlap constraint, so a box can be
+        // slightly larger than the mask it labels. Kept that way for parity.
         let boxes = masks.map(\.boundingBox)
 
-        // Overlaps are resolved by tracker score, not detection score, and only within a
-        // prompt group: "person" and "pillow" are allowed to claim the same pixels.
+        // Overlaps are resolved by tracker score, not detection score.
         OcclusionSuppressor.applyObjectWiseNonOverlap(
             masks: &masks, scores: trackerScores, promptIDs: promptIDs)
 

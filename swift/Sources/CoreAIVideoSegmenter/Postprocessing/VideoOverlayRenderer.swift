@@ -10,9 +10,9 @@ import Foundation
 
 /// Draws a frame's tracked objects over the source image.
 ///
-/// Colours come from ``OverlayPalette/color(forID:)``, which is a pure function of the
-/// object id rather than of its position in the array. A track that survives an occlusion
-/// and comes back keeps its colour; one that appears alongside it does not steal it.
+/// Colours come from ``OverlayPalette/color(forID:)``, a pure function of the object id
+/// rather than of its position in the array, so a track that survives an occlusion keeps its
+/// colour.
 struct VideoOverlayRenderer {
     private let parameters: VideoSegmentationParameters
 
@@ -20,10 +20,8 @@ struct VideoOverlayRenderer {
         self.parameters = parameters
     }
 
-    /// Composite `objects` onto `frame`, returning a new image at the same size.
-    ///
-    /// Returns `frame` unchanged when there is nothing to draw, so a caller can pipe every
-    /// frame through this without special-casing empty ones.
+    /// Composite `objects` onto `frame`, returning a new image at the same size. Returns
+    /// `frame` unchanged when there is nothing to draw.
     func render(_ objects: [TrackedObject], onto frame: CGImage) -> CGImage {
         guard !objects.isEmpty else { return frame }
         let width = frame.width
@@ -43,8 +41,8 @@ struct VideoOverlayRenderer {
         }
 
         // Core Graphics puts the origin at the bottom left; masks and boxes are top-left.
-        // Flipping the whole context once here keeps every draw below in image
-        // coordinates, including the text, which would otherwise render upside down.
+        // Flipping the whole context once keeps every draw below in image coordinates,
+        // including the text, which would otherwise render upside down.
         context.translateBy(x: 0, y: CGFloat(height))
         context.scaleBy(x: 1, y: -1)
 
@@ -70,8 +68,7 @@ struct VideoOverlayRenderer {
     /// Build one translucent RGBA layer holding every object's fill.
     ///
     /// Composited as a single image rather than one draw per object: at 1080p with eight
-    /// tracks that is one blend instead of eight, and the per-object alpha blend below
-    /// gives the same result as stacking translucent layers.
+    /// tracks that is one blend instead of eight.
     private func maskOverlay(_ objects: [TrackedObject], width: Int, height: Int) -> CGImage? {
         let alpha = max(0, min(1, parameters.maskOpacity))
         guard alpha > 0 else { return nil }

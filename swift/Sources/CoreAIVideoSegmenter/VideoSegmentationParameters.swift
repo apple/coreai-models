@@ -11,8 +11,7 @@ import Foundation
 /// The tracking fields mirror `transformers.Sam3VideoConfig` field for field, defaults
 /// included, because the exported asset holds only tensor kernels; every threshold below
 /// governs host-side logic that HF reads off the model config at load time. A bundle can
-/// override them through a `tracking` block in its `metadata.json`; see
-/// ``VideoSegmenterBundle``.
+/// override them through a `tracking` block in its `metadata.json`.
 public struct VideoSegmentationParameters: Sendable {
     // MARK: - Detection
 
@@ -22,9 +21,8 @@ public struct VideoSegmentationParameters: Sendable {
     /// Mask-IoU threshold for detection NMS. `det_nms_thresh`. Zero disables NMS.
     ///
     /// HF runs NMS through an optional `kernels-community/cv-utils` kernel and silently
-    /// keeps every above-threshold detection when it isn't installed. This runtime always
-    /// has NMS available, so set this to 0 when comparing against a Python run that was
-    /// missing the kernel.
+    /// keeps every above-threshold detection when it isn't installed. Set this to 0 when
+    /// comparing against a Python run that was missing the kernel.
     public var detNmsThresh: Float = 0.1
 
     /// Probability threshold for promoting a detection to a new tracked object.
@@ -56,11 +54,9 @@ public struct VideoSegmentationParameters: Sendable {
     /// replaces it with the detection mask (detector as correction).
     /// `recondition_on_trk_masks`.
     ///
-    /// This defaults to the checkpoint's value, not the class's. `Sam3VideoConfig` declares
-    /// `True`, but `facebook/sam3`'s `config.json` sets it to `False`, and it is the only
-    /// field where the two disagree. Getting it wrong is invisible until a reconditioning
-    /// frame lands, after which every frame's memory is conditioned on the wrong mask.
-    /// Bundles exported with a `tracking` block carry the real value and override this.
+    /// Defaults to the checkpoint's value, not the class's: `Sam3VideoConfig` declares `True`
+    /// but `facebook/sam3`'s `config.json` sets it to `False`, the only field where the two
+    /// disagree. Bundles exported with a `tracking` block carry the real value.
     public var reconditionOnTrkMasks: Bool = false
 
     // MARK: - Hotstart
@@ -103,10 +99,9 @@ public struct VideoSegmentationParameters: Sendable {
 
     // MARK: - Tracker memory geometry
 
-    // These three come from `Sam3TrackerVideoConfig`, not `Sam3VideoConfig`, and they
-    // decide which stored frames are eligible for the memory bank. The exported asset pins
-    // their sum (`spatial_slots` is `max_cond_frame_num + num_maskmem - 1`) but not the
-    // split, so they have to be carried separately.
+    // These three come from `Sam3TrackerVideoConfig`, not `Sam3VideoConfig`. The exported
+    // asset pins their sum (`spatial_slots` is `max_cond_frame_num + num_maskmem - 1`) but
+    // not the split, so they have to be carried separately.
 
     /// Total mask-memory frames: the current one plus `num_maskmem - 1` recent.
     /// `num_maskmem`.
@@ -123,8 +118,7 @@ public struct VideoSegmentationParameters: Sendable {
     /// Maximum area of a connected component that gets filled (background) or removed
     /// (foreground). `fill_hole_area`. Zero disables both.
     ///
-    /// Like ``detNmsThresh``, HF no-ops this without `kernels-community/cv-utils`. Set to
-    /// 0 to reproduce a Python run made without it.
+    /// Like ``detNmsThresh``, HF no-ops this without `kernels-community/cv-utils`.
     public var fillHoleArea: Int = 16
 
     // MARK: - Preprocessing
@@ -156,8 +150,7 @@ public struct VideoSegmentationParameters: Sendable {
     /// upsample to video size.
     ///
     /// Off by default because it is 82,944 floats per object per frame. On, it separates a
-    /// tracker disagreement from an upsampling one: matching low-resolution masks with
-    /// differing final masks means the two upsampled differently.
+    /// tracker disagreement from an upsampling one.
     public var emitLowResolutionMasks: Bool = false
 
     public init() {}

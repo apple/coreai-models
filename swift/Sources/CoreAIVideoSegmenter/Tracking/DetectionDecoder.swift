@@ -81,12 +81,11 @@ enum DetectionDecoder {
         return merged
     }
 
-    /// Greedy mask-IoU non-maximum suppression, returning the surviving indices in
-    /// descending-score order.
+    /// Greedy mask-IoU non-maximum suppression, returning the surviving indices in input
+    /// order.
     ///
     /// Port of `nms_masks`, which prefilters by score and then defers to
-    /// `cv_utils_kernel.generic_nms`. That kernel is a standard greedy NMS over the
-    /// supplied IoU matrix; the caller here has already applied the score prefilter, so
+    /// `cv_utils_kernel.generic_nms`. The caller has already applied the score prefilter, so
     /// only the greedy pass remains.
     static func nonMaximumSuppression(
         masks: [MaskBitset], scores: [Float], iouThreshold: Float

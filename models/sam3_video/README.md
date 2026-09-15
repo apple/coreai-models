@@ -80,7 +80,7 @@ the whole video.
 | `tracker_encode` | no                         |
 | `text_encode`    | once per prompt, per video |
 
-## The Swift runtime (PENDING: this is design only)
+## The Swift runtime
 
 `swift/Sources/CoreAIVideoSegmenter` mimics the HF logic in Swift, and the
 `video-segmenter` tool drives it end to end:

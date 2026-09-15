@@ -41,9 +41,9 @@ public struct VideoSegmentationFrame: Sendable {
 
     /// Wall clock spent processing this frame.
     ///
-    /// Measured around the frame's own work, not between emissions. Hotstart holds the first
-    /// `hotstartDelay` results back and flushes the backlog at the end of the video, so timing
-    /// the gap between emissions would report that buffering rather than the model.
+    /// Measured around the frame's own work, not between emissions: hotstart holds the first
+    /// `hotstartDelay` results back, so timing the gap between emissions would report that
+    /// buffering rather than the model.
     public let processingTime: Duration
 }
 
@@ -52,8 +52,7 @@ public struct VideoSegmentationFrame: Sendable {
 /// Detections for one frame, merged across every prompt.
 ///
 /// Port of what `_merge_detections_from_prompts` returns, minus `bbox`: nothing downstream
-/// reads the detector's boxes. Association, reconditioning, seeding, and the output
-/// builder all work off `mask`, and the boxes the caller finally sees come from
+/// reads the detector's boxes, and the boxes the caller finally sees come from
 /// `masks_to_boxes` on the upsampled mask.
 struct MergedDetections {
     /// Low-resolution mask logits, one flat `size * size` buffer per detection.
@@ -78,7 +77,6 @@ struct TrackerUpdatePlan {
     var newlyRemovedObjectIDs: Set<Int> = []
     var trackIDToHighConfidenceDetection: [Int: Int] = [:]
     var reconditionedObjectIDs: Set<Int> = []
-    var droppedDueToObjectLimit = 0
 }
 
 /// The per-frame model output before postprocessing. Port of `Sam3VideoSegmentationOutput`.
@@ -86,7 +84,6 @@ struct RawFrameOutput {
     let frameIndex: Int
     /// Object id to low-resolution mask logits.
     var maskLogitsByObjectID: [Int: [Float]]
-    var objectIDs: [Int]
     var scoreByObjectID: [Int: Float]
     var trackerScoreByObjectID: [Int: Float]
     var suppressedObjectIDs: Set<Int>

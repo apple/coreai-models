@@ -28,7 +28,6 @@ struct FramePreprocessor {
         var width = 0
         var height = 0
         var resampler: BilinearResampler?
-        /// Sized alongside the resampler, since it depends only on the source geometry.
         var scratch: [Float] = []
     }
     private let cache = Cache()
@@ -70,8 +69,7 @@ struct FramePreprocessor {
     /// Preprocess interleaved 8-bit samples directly.
     ///
     /// `channelStride` is 4 for RGBA and 3 for packed RGB. The second form is what the
-    /// preprocessing tests feed in, so they can hold the decoder constant and measure
-    /// only this stage.
+    /// preprocessing tests feed in, so they can hold the decoder constant.
     func preprocess(
         interleavedRGB bytes: [UInt8], width: Int, height: Int, channelStride: Int
     ) -> [Float] {
@@ -101,18 +99,11 @@ struct FramePreprocessor {
             vDSP_vfltu8(
                 bytes.baseAddress! + channel, channelStride, &plane, 1, vDSP_Length(sourcePixels))
 
-            resized.withUnsafeMutableBufferPointer { output in
-                plane.withUnsafeBufferPointer { input in
-                    cache.scratch.withUnsafeMutableBufferPointer { scratch in
-                        resampler.resample(input, into: output, scratch: scratch)
-                    }
-                }
-            }
+            resampler.resample(plane, into: &resized, scratch: &cache.scratch)
 
-            // torchvision resizes a uint8 tensor as uint8: it interpolates and then
-            // rounds back to integers, so its `pixel_values` land exactly on the 0-255
-            // grid (verified: every element is within 8e-6 of an integer). Skipping this
-            // leaves a uniform ~0.25-code-value bias against the reference.
+            // torchvision resizes a uint8 tensor as uint8: it interpolates and then rounds
+            // back to integers. Skipping this leaves a uniform ~0.25-code-value bias against
+            // the reference.
             vvnintf(&resized, resized, &elementCount)
 
             // Fold rescale and normalize into one affine pass: (x / 255 - m) / s.

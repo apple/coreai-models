@@ -81,8 +81,7 @@ struct FramePreprocessingTests {
     @Test("Rounding onto the 0-255 grid is what torchvision does")
     func roundsOntoCodeValueGrid() {
         // Every output must be reachable as (n/255 - 0.5)/0.5 for integer n, which is what
-        // resizing a uint8 tensor and casting back produces. Dropping the round leaves a
-        // uniform quarter-code-value bias against the reference.
+        // resizing a uint8 tensor and casting back produces.
         let actual = preprocessor().preprocess(
             interleavedRGB: sourceRGB, width: 4, height: 3, channelStride: 3)
         for value in actual {

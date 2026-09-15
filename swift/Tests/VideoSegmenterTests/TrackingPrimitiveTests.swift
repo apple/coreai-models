@@ -32,15 +32,8 @@ struct ObjectRegistryTests {
         #expect(registry.existingIndex(of: 12) == 1)
         #expect(registry.existingIndex(of: 13) == 2)
         #expect(registry.existingIndex(of: 11) == nil)
-    }
-
-    @Test("The survivor list is exactly what compacts a parallel array")
-    func survivorsCompactStorage() {
-        var registry = ObjectRegistry()
-        for id in [10, 11, 12, 13] { registry.index(of: id) }
-        let storage = ["a", "b", "c", "d"]
-        let survivors = registry.remove(11)!
-        #expect(survivors.map { storage[$0] } == ["a", "c", "d"])
+        // The survivor list is exactly what compacts a parallel array.
+        #expect(survivors?.map { ["a", "b", "c", "d"][$0] } == ["a", "c", "d"])
     }
 
     @Test("Removing an unknown id is a no-op, not an error")
@@ -62,9 +55,8 @@ struct ConnectedComponentsTests {
 
     @Test("Diagonal neighbours join, because cc_2d is 8-connected")
     func eightConnectivity() {
-        // SAM 2's `get_connected_components` documents 8-connectivity and `cc_2d`
-        // implements it. Under 4-connectivity these two pixels would be separate
-        // components of area 1 each, and sprinkle removal would delete both.
+        // Under 4-connectivity these two pixels would be separate components of area 1 each,
+        // and sprinkle removal would delete both.
         let mask = boolMask([
             "#..",
             ".#.",
@@ -122,9 +114,8 @@ struct ConnectedComponentsTests {
 
     @Test("A tiny object does not delete itself")
     func halfAreaGuard() {
-        // The foreground threshold is `min(maxArea, totalForeground / 2)`, which is what
-        // stops a genuinely small object from being read as a speck. Here the whole mask
-        // is 3 pixels, so the threshold is 1 rather than the configured 16.
+        // The foreground threshold is `min(maxArea, totalForeground / 2)`. Here the whole
+        // mask is 3 pixels, so the threshold is 1 rather than the configured 16.
         var logits = [Float](repeating: -1, count: 100)
         logits[11] = 1
         logits[12] = 1
@@ -162,8 +153,7 @@ struct DetectionDecoderTests {
         // inf/inf = NaN. The detector's logits are unbounded, so the branch matters.
         #expect(DetectionDecoder.sigmoid(0) == 0.5)
         #expect(DetectionDecoder.sigmoid(100) == 1)
-        // Not exactly zero: the negative branch keeps the denormal rather than
-        // underflowing, which is the point of branching on the sign.
+        // Not exactly zero: the negative branch keeps the denormal rather than underflowing.
         #expect(DetectionDecoder.sigmoid(-100) < 1e-40)
         #expect(DetectionDecoder.sigmoid(-100) >= 0)
         #expect(DetectionDecoder.sigmoid(-100).isNaN == false)

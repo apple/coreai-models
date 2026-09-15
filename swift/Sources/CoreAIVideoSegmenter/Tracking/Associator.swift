@@ -11,8 +11,7 @@ import Foundation
 /// Port of `Sam3VideoModel._associate_det_trk`. The two IoU thresholds are easy to conflate:
 /// `assocIouThresh` (loose, 0.1) decides whether a detection is covered by some track and so
 /// is not new, while `trkAssocIouThresh` (strict, 0.5) decides whether a track was seen this
-/// frame and so is not unmatched. The same pair can be matched by the first test and unmatched
-/// by the second.
+/// frame. The same pair can be matched by the first test and unmatched by the second.
 enum Associator {
     struct Result {
         /// Detection indices that should become new objects.
@@ -45,7 +44,7 @@ enum Associator {
         if trackMasks.isEmpty {
             // Nothing to match against, so every detection is new. This branch skips the
             // `newDetThresh` score gate the general path applies, as upstream does; that is
-            // how the first frame seeds tracks from detections below the new-object threshold.
+            // how the first frame seeds tracks from sub-threshold detections.
             result.newDetectionIndices = Array(0..<detections.count)
             return result
         }
@@ -98,9 +97,9 @@ enum Associator {
                 continue
             }
 
-            // Reconditioning candidate: confident enough, overlapping enough, and mapped
-            // to its single best track. Later detections overwrite earlier ones for the
-            // same track, which is upstream's behaviour.
+            // Reconditioning candidate: confident enough, overlapping enough, and mapped to
+            // its single best track. Later detections overwrite earlier ones for the same
+            // track, which is upstream's behaviour.
             guard detections.scores[detection] >= parameters.highConfThresh else { continue }
             guard let best = row.indices.max(by: { row[$0] < row[$1] }) else { continue }
             if row[best] >= parameters.highIouThresh {

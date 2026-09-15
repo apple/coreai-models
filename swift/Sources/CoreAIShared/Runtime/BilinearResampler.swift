@@ -139,13 +139,13 @@ public struct BilinearResampler: Sendable {
             vDSP_Length(destinationWidth))
     }
 
-    /// Resample a row-major `sourceHeight × sourceWidth` buffer.
+    /// Resample into a caller-owned destination, reusing `scratch` across calls.
     ///
-    /// Allocates both the result and the scratch on every call. Fine for one-shot use; use
-    /// `resample(_:into:scratch:)` on anything that runs per frame.
-    public func resample(_ source: [Float]) -> [Float] {
-        var destination = [Float](repeating: 0, count: destinationHeight * destinationWidth)
-        var scratch = [Float](repeating: 0, count: scratchCount)
+    /// The array-level form of `resample(_:into:scratch:)`. Per-frame callers keep both
+    /// buffers alive and pay no allocation here.
+    public func resample(
+        _ source: [Float], into destination: inout [Float], scratch: inout [Float]
+    ) {
         source.withUnsafeBufferPointer { input in
             destination.withUnsafeMutableBufferPointer { output in
                 scratch.withUnsafeMutableBufferPointer { scratch in
@@ -153,6 +153,16 @@ public struct BilinearResampler: Sendable {
                 }
             }
         }
+    }
+
+    /// Resample a row-major `sourceHeight × sourceWidth` buffer.
+    ///
+    /// Allocates both the result and the scratch on every call. Fine for one-shot use; use
+    /// `resample(_:into:scratch:)` on anything that runs per frame.
+    public func resample(_ source: [Float]) -> [Float] {
+        var destination = [Float](repeating: 0, count: destinationHeight * destinationWidth)
+        var scratch = [Float](repeating: 0, count: scratchCount)
+        resample(source, into: &destination, scratch: &scratch)
         return destination
     }
 }

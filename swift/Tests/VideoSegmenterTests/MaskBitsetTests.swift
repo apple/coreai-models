@@ -36,9 +36,9 @@ struct MaskBitsetTests {
 
     @Test("IoU of two empty masks is 0, not 1")
     func emptyIoU() {
-        // `mask_iou` clamps the union to a minimum of 1 rather than special-casing empty,
-        // so two empty masks score 0. Association depends on that: it must treat two
-        // occluded tracks as unrelated, not as a perfect match.
+        // `mask_iou` clamps the union to a minimum of 1 rather than special-casing empty.
+        // Association depends on it: two occluded tracks must read as unrelated, not as a
+        // perfect match.
         let empty = MaskBitset(width: 8, height: 8)
         #expect(empty.iou(empty) == 0)
     }
@@ -60,8 +60,8 @@ struct MaskBitsetTests {
 
     @Test("IoU survives a mask wider than one 64-bit word")
     func iouAcrossWords() {
-        // 100x3 is 300 bits, so the set pixels straddle word boundaries, the case a
-        // naive per-word loop gets wrong.
+        // 100x3 is 300 bits, so the set pixels straddle word boundaries — the case a naive
+        // per-word loop gets wrong.
         var a = MaskBitset(width: 100, height: 3)
         var b = MaskBitset(width: 100, height: 3)
         for x in 0..<100 {
@@ -75,26 +75,20 @@ struct MaskBitsetTests {
 
     @Test("boundingBox reports inclusive extremes, like masks_to_boxes")
     func boundingBox() {
-        let bitset = mask([
+        // `torchvision.ops.masks_to_boxes` returns [x0, y0, x1, y1] of the extreme set
+        // pixels, so a 2x2 block spans 1 unit, not 2, and one pixel spans 0.
+        let block = mask([
             "....",
             ".##.",
             ".##.",
             "....",
         ])
-        // `torchvision.ops.masks_to_boxes` returns [x0, y0, x1, y1] of the extreme set
-        // pixels, so a 2x2 block spans 1 unit, not 2.
-        #expect(bitset.boundingBox == CGRect(x: 1, y: 1, width: 1, height: 1))
-    }
+        #expect(block.boundingBox == CGRect(x: 1, y: 1, width: 1, height: 1))
 
-    @Test("boundingBox of one pixel is a zero-sized rect at that pixel")
-    func singlePixelBox() {
-        var bitset = MaskBitset(width: 10, height: 10)
-        bitset[7, 3] = true
-        #expect(bitset.boundingBox == CGRect(x: 7, y: 3, width: 0, height: 0))
-    }
+        var single = MaskBitset(width: 10, height: 10)
+        single[7, 3] = true
+        #expect(single.boundingBox == CGRect(x: 7, y: 3, width: 0, height: 0))
 
-    @Test("boundingBox of an empty mask is zero")
-    func emptyBox() {
         #expect(MaskBitset(width: 10, height: 10).boundingBox == .zero)
     }
 

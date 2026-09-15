@@ -89,8 +89,8 @@ struct HotstartTests {
 
     @Test("A long-established track is never removed by the unmatch rule")
     func sparesEstablishedTracks() {
-        // The whole point of the hotstart window: a track that predates it has earned the
-        // benefit of the doubt, however long the detector loses sight of it.
+        // The point of the hotstart window: a track that predates it has earned the benefit
+        // of the doubt, however long the detector loses sight of it.
         var parameters = VideoSegmentationParameters.default
         parameters.hotstartDelay = 5
         parameters.hotstartUnmatchThresh = 3
@@ -160,8 +160,15 @@ struct HotstartTests {
 @VideoSegmentationActor
 struct MemorySelectionTests {
     /// A history with the given conditioning and non-conditioning frames, each carrying a
-    /// payload so the packer treats it as usable.
+    /// payload so the packer treats it as usable. The selection code never dereferences
+    /// `objectPointer`, so a bare zero-filled array stands in and no live asset is needed.
     private func history(conditioning: [Int], nonConditioning: [Int]) -> ObjectOutputHistory {
+        func stub() -> StoredFrameOutput {
+            StoredFrameOutput(
+                predictedMasks: nil,
+                objectPointer: NDArray(shape: [1, 1, 4], scalarType: .float16),
+                objectScoreLogit: 0)
+        }
         var history = ObjectOutputHistory()
         for frame in conditioning {
             history.conditioningOrder.append(frame)
@@ -171,15 +178,6 @@ struct MemorySelectionTests {
             history.nonConditioning[frame] = stub()
         }
         return history
-    }
-
-    /// The selection code under test never dereferences `objectPointer`, so a bare
-    /// zero-filled array stands in and the tests need no live Core AI asset.
-    private func stub() -> StoredFrameOutput {
-        StoredFrameOutput(
-            predictedMasks: nil,
-            objectPointer: NDArray(shape: [1, 1, 4], scalarType: .float16),
-            objectScoreLogit: 0)
     }
 
     @Test("Under the cap, every conditioning frame is selected")
@@ -235,9 +233,9 @@ struct MemorySelectionTests {
 
     @Test("An unselected conditioning frame can still be picked up as a recent memory")
     func unselectedConditioningIsReachable() {
-        // `_gather_memory_frame_outputs` falls back to `unselected_conditioning_outputs`
-        // for the recent window. Without that, a conditioning frame that lost the
-        // closest-N contest would vanish from the bank entirely even though it is adjacent.
+        // `_gather_memory_frame_outputs` falls back to `unselected_conditioning_outputs` for
+        // the recent window. Without it, a conditioning frame that lost the closest-N contest
+        // would vanish from the bank entirely even though it is adjacent.
         var parameters = VideoSegmentationParameters.default
         parameters.numMaskmem = 3  // offsets 2, 1
         parameters.maxCondFrameNum = 1
@@ -245,8 +243,6 @@ struct MemorySelectionTests {
         let entries = MemoryBankPacker.gatherMemoryFrames(
             history: history(conditioning: [0, 9], nonConditioning: []),
             frameIndex: 10, reverse: false, parameters: parameters)
-        // Frame 9 wins the single conditioning slot; frame 0 is unselected and is not one
-        // frame back, so offset 1 resolves to frame 9's entry only if it were unselected.
         #expect(entries[0].offset == 0)
         #expect(entries.count == 3)
     }
