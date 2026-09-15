@@ -51,6 +51,26 @@ struct ComponentTests {
         #expect(count == 100)
     }
 
+    // MARK: - CoreAIDiffusionModelFunction
+
+    @Test("loadResources throws promptly on a missing file rather than hanging")
+    func loadResourcesMissingFileThrows() async {
+        let fn = CoreAIDiffusionModelFunction(
+            modelURL: URL(filePath: "/nonexistent.aimodel"))
+        await #expect(throws: CoreAIDiffusionError.self) {
+            try await fn.loadResources()
+        }
+    }
+
+    @Test("hasFunction throws promptly on a missing file rather than hanging")
+    func hasFunctionMissingFileThrows() async {
+        let fn = CoreAIDiffusionModelFunction(
+            modelURL: URL(filePath: "/nonexistent.aimodel"))
+        await #expect(throws: CoreAIDiffusionError.self) {
+            _ = try await fn.hasFunction(named: "main")
+        }
+    }
+
     // MARK: - CoreAIDenoiser
 
     @Test("Denoiser requires function to be loaded")
