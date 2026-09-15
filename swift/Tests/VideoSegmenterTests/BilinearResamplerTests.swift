@@ -157,4 +157,60 @@ struct BilinearResamplerTests {
             }
         }
     }
+
+    /// The two internal paths — `vDSP_vlint` when the `Float` control vector is exact, and
+    /// the transposing one otherwise — have to agree, because which one a resize takes
+    /// depends on whether its ratio happens to be a binary fraction, and nothing about the
+    /// call site says so. Sizes here are wide enough for a `Float` coordinate to lose
+    /// fractional precision, which the 4x4 cases above cannot see.
+    @Test("Both internal paths agree on a wide source")
+    func pathsAgree() {
+        // A sawtooth, so neighbouring samples differ by the full range and any error in the
+        // interpolation fraction shows up at full scale instead of being averaged away.
+        func sawtooth(_ count: Int) -> [Float] { (0..<count).map { Float($0 % 37) } }
+
+        for (sourceSide, destinationWidth, destinationHeight) in [
+            (1920, 1008, 1008),  // FramePreprocessor, a non-binary ratio
+            (252, 1920, 1080),  // MaskPostprocessor, also non-binary
+            (252, 1008, 1008),  // exact ratio, so this one takes the vDSP_vlint path
+        ] {
+            let resampler = BilinearResampler(
+                sourceWidth: sourceSide, sourceHeight: sourceSide,
+                destinationWidth: destinationWidth, destinationHeight: destinationHeight)
+            let source = sawtooth(sourceSide * sourceSide)
+            let actual = resampler.resample(source)
+
+            // Recomputed here in Double, the way the weight tables are, so this is a check
+            // against the definition rather than against either path.
+            let horizontalScale = Double(sourceSide) / Double(destinationWidth)
+            let verticalScale = Double(sourceSide) / Double(destinationHeight)
+            func tap(_ index: Int, _ scale: Double) -> (Int, Int, Double) {
+                let position = max(0.0, scale * (Double(index) + 0.5) - 0.5)
+                let low = min(Int(position), sourceSide - 1)
+                let high = low < sourceSide - 1 ? low + 1 : low
+                return (low, high, position - Double(low))
+            }
+            var worst: Float = 0
+            for row in stride(from: 0, to: destinationHeight, by: 7) {
+                let (top, bottom, rowFraction) = tap(row, verticalScale)
+                for column in stride(from: 0, to: destinationWidth, by: 7) {
+                    let (left, right, columnFraction) = tap(column, horizontalScale)
+                    func sample(_ r: Int, _ c: Int) -> Double {
+                        Double(source[r * sourceSide + c])
+                    }
+                    let upper =
+                        sample(top, left) * (1 - columnFraction)
+                        + sample(top, right) * columnFraction
+                    let lower =
+                        sample(bottom, left) * (1 - columnFraction)
+                        + sample(bottom, right) * columnFraction
+                    let expected = Float(upper * (1 - rowFraction) + lower * rowFraction)
+                    worst = max(worst, abs(actual[row * destinationWidth + column] - expected))
+                }
+            }
+            #expect(
+                worst < 1e-4,
+                "\(sourceSide)^2 -> \(destinationWidth)x\(destinationHeight) drifted by \(worst)")
+        }
+    }
 }

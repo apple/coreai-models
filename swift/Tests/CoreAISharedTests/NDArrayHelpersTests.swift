@@ -221,7 +221,7 @@ struct StrideAwareFillReadTests {
     }
 }
 
-// MARK: - copyIntoNDArray / clearNDArrayRegion
+// MARK: - copyIntoNDArray / region fill
 
 /// Both of `copyIntoNDArray`'s paths need pinning: the contiguous `memcpy` and the stride
 /// walk that runs when the array is padded for hardware alignment.
@@ -280,13 +280,13 @@ struct CopyIntoNDArrayTests {
         #expect(readNDArray(array, as: Float.self, count: 8) == [Float](repeating: 7, count: 8))
     }
 
-    @Test("clearNDArrayRegion zeroes exactly the requested range")
+    @Test("Region fill zeroes exactly the requested range")
     func clearsRange() {
         // This is how the packer wipes slots that were valid on the previous call and are
         // not on this one. Over-clearing would destroy live memory in a lower slot.
         var array = NDArray(shape: [4, 4], scalarType: .float32)
         fillNDArray(&array, as: Float.self, with: (0..<16).map { Float($0 + 1) })
-        clearNDArrayRegion(&array, as: Float.self, elementRange: 4..<12, value: 0)
+        fillNDArray(&array, as: Float.self, elementRange: 4..<12, with: 0)
 
         let read = readNDArray(array, as: Float.self, count: 16)
         #expect(Array(read[0..<4]) == [1, 2, 3, 4])
@@ -294,11 +294,40 @@ struct CopyIntoNDArrayTests {
         #expect(Array(read[12..<16]) == [13, 14, 15, 16])
     }
 
-    @Test("Clearing an empty range does nothing")
+    @Test("Region fill writes a non-zero value through the strided path")
+    func fillsNonZeroWhenPadded() {
+        // Explicit strides so the padded branch is guaranteed to run; a non-zero value catches
+        // a fill that writes zeros regardless of `value`.
+        var array = NDArray(shape: [64, 4], scalarType: .float32, strides: [8, 1])
+        #expect(array.strides == [8, 1], "the padded layout must survive construction")
+        fillNDArray(&array, as: Float.self, count: 256) { _ in -1 }
+        fillNDArray(&array, as: Float.self, elementRange: 6..<250, with: 3.5)
+
+        let read = readNDArray(array, as: Float.self, count: 256)
+        #expect(Array(read[0..<6]) == [Float](repeating: -1, count: 6))
+        #expect(Array(read[6..<250]) == [Float](repeating: 3.5, count: 244))
+        #expect(Array(read[250..<256]) == [Float](repeating: -1, count: 6))
+    }
+
+    @Test("Copying at an offset survives a padded layout")
+    func copiesWhenPadded() {
+        // The `copyIntoNDArray` counterpart: same padded layout, pinning its stride walk.
+        var array = NDArray(shape: [64, 4], scalarType: .float32, strides: [8, 1])
+        fillNDArray(&array, as: Float.self, count: 256) { _ in -1 }
+        let payload = (0..<100).map { Float($0) * 0.25 }
+        copyIntoNDArray(&array, as: Float.self, elementOffset: 13, from: payload)
+
+        let read = readNDArray(array, as: Float.self, count: 256)
+        #expect(Array(read[0..<13]) == [Float](repeating: -1, count: 13))
+        #expect(Array(read[13..<113]) == payload)
+        #expect(Array(read[113..<256]) == [Float](repeating: -1, count: 143))
+    }
+
+    @Test("Filling an empty range does nothing")
     func clearEmptyRange() {
         var array = NDArray(shape: [2, 2], scalarType: .float32)
         fillNDArray(&array, as: Float.self, with: [1, 2, 3, 4] as [Float])
-        clearNDArrayRegion(&array, as: Float.self, elementRange: 2..<2, value: 0)
+        fillNDArray(&array, as: Float.self, elementRange: 2..<2, with: 0)
         #expect(readNDArray(array, as: Float.self, count: 4) == [1, 2, 3, 4] as [Float])
     }
 }

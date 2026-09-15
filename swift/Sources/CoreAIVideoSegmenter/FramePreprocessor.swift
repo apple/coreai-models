@@ -28,6 +28,8 @@ struct FramePreprocessor {
         var width = 0
         var height = 0
         var resampler: BilinearResampler?
+        /// Sized alongside the resampler, since it depends only on the source geometry.
+        var scratch: [Float] = []
     }
     private let cache = Cache()
 
@@ -99,7 +101,13 @@ struct FramePreprocessor {
             vDSP_vfltu8(
                 bytes.baseAddress! + channel, channelStride, &plane, 1, vDSP_Length(sourcePixels))
 
-            resized = resampler.resample(plane)
+            resized.withUnsafeMutableBufferPointer { output in
+                plane.withUnsafeBufferPointer { input in
+                    cache.scratch.withUnsafeMutableBufferPointer { scratch in
+                        resampler.resample(input, into: output, scratch: scratch)
+                    }
+                }
+            }
 
             // torchvision resizes a uint8 tensor as uint8: it interpolates and then
             // rounds back to integers, so its `pixel_values` land exactly on the 0-255
@@ -132,6 +140,7 @@ struct FramePreprocessor {
         cache.width = sourceWidth
         cache.height = sourceHeight
         cache.resampler = built
+        cache.scratch = [Float](repeating: 0, count: built.scratchCount)
         return built
     }
 }

@@ -316,9 +316,12 @@ final class MemoryBankPacker {
         #endif
     }
 
+    /// Wipe slots that were valid on the previous call and are not on this one. Stale slots
+    /// are harmless numerically, since the key mask suppresses them, but they make a parity
+    /// divergence hard to reason about.
     private func clearHalfRegion(_ array: inout NDArray, _ range: Range<Int>) {
         #if !((os(macOS) || targetEnvironment(macCatalyst)) && arch(x86_64))
-        clearNDArrayRegion(&array, as: Float16.self, elementRange: range, value: 0)
+        fillNDArray(&array, as: Float16.self, elementRange: range, with: 0)
         #else
         fatalError("Float16 is not supported on this platform")
         #endif

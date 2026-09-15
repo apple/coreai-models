@@ -3,6 +3,7 @@
 // Use of this source code is governed by a BSD-3-clause license that can
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
+import Accelerate
 import CoreAI
 import CoreAIShared
 import Foundation
@@ -27,6 +28,10 @@ final class TrackerLoop {
     private let imageToLowRes: BilinearResampler
     private let highResToMemory: BilinearResampler
     private let lowResToMemory: BilinearResampler
+
+    /// Scratch shared by all four resamplers: only one is ever in use at a time, and this
+    /// actor is the only thing touching them.
+    private var scratch: [Float]
 
     /// Scale and bias `_use_mask_as_output` applies to turn a binary mask into logits.
     private static let maskOutScale: Float = 20
@@ -58,6 +63,25 @@ final class TrackerLoop {
             sourceWidth: shapes.lowResMaskSize, sourceHeight: shapes.lowResMaskSize,
             destinationWidth: shapes.memoryMaskSize, destinationHeight: shapes.memoryMaskSize,
             antialias: true)
+        self.scratch = [Float](
+            repeating: 0,
+            count: max(
+                lowResToImage.scratchCount, imageToLowRes.scratchCount,
+                highResToMemory.scratchCount, lowResToMemory.scratchCount))
+    }
+
+    /// Resample through the shared scratch, so the only per-object allocation left is the
+    /// destination the caller goes on to keep.
+    private func resample(
+        _ resampler: BilinearResampler, _ source: [Float], into destination: inout [Float]
+    ) {
+        source.withUnsafeBufferPointer { input in
+            destination.withUnsafeMutableBufferPointer { output in
+                scratch.withUnsafeMutableBufferPointer { scratch in
+                    resampler.resample(input, into: output, scratch: scratch)
+                }
+            }
+        }
     }
 
     struct Propagation {
@@ -282,12 +306,16 @@ final class TrackerLoop {
     /// the stored value is only re-read if the same frame is revisited. The image-resolution
     /// mask and the score are what the memory encoder consumes.
     private func maskAsOutput(_ mask: MaskBitset, maskFloats: [Float]) -> MaskAsOutput {
-        let upscaled = lowResToImage.resample(maskFloats)
-        var highResolution = [Float](repeating: 0, count: upscaled.count)
-        for index in upscaled.indices {
-            highResolution[index] = upscaled[index] * Self.maskOutScale + Self.maskOutBias
+        var highResolution = [Float](repeating: 0, count: highResPixels)
+        resample(lowResToImage, maskFloats, into: &highResolution)
+        var scale = Self.maskOutScale
+        var bias = Self.maskOutBias
+        highResolution.withUnsafeMutableBufferPointer {
+            vDSP_vsmsa(
+                $0.baseAddress!, 1, &scale, &bias, $0.baseAddress!, 1, vDSP_Length($0.count))
         }
-        let lowResolution = imageToLowRes.resample(highResolution)
+        var lowResolution = [Float](repeating: 0, count: lowResPixels)
+        resample(imageToLowRes, highResolution, into: &lowResolution)
         // `is_obj_appearing` tests the *prompt* mask, not the resampled one.
         let appearing = !mask.isEmpty
         return MaskAsOutput(
@@ -324,10 +352,15 @@ final class TrackerLoop {
             // resolutions depending on the caller. A traced graph takes one, so the host
             // normalizes to `memoryMaskSize` first. Both callers resize *up*, where
             // antialiasing is a no-op, so this stays a single plain bilinear pass.
-            let mask =
-                alreadyAtMemoryResolution
-                ? highResolutionMasks[position]
-                : resampler.resample(highResolutionMasks[position])
+            let mask: [Float]
+            if alreadyAtMemoryResolution {
+                mask = highResolutionMasks[position]
+            } else {
+                var resampled = [Float](
+                    repeating: 0, count: shapes.memoryMaskSize * shapes.memoryMaskSize)
+                resample(resampler, highResolutionMasks[position], into: &resampled)
+                mask = resampled
+            }
 
             let encoded = try await engine.memoryEncode(
                 visionFeatureLevel2: features.level2,
