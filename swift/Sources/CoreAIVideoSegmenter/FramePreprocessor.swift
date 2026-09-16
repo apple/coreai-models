@@ -10,27 +10,20 @@ import Foundation
 
 /// Turns a decoded frame into the planar CHW tensor `image_encode` expects.
 ///
-/// Deliberately not `CoreAIShared.ImagePreprocessor`, which the image segmenter uses: that
-/// resizes by drawing through a `CGContext` at `.high` interpolation, a Lanczos-family kernel
-/// on 8-bit samples, while `Sam3VideoVideoProcessor` resizes with plain bilinear in float. For
-/// a single image the difference is invisible; across a tracked video it compounds, because
-/// every frame's input feeds the memory bank.
-///
-/// So: convert to float at native resolution first, resample in float, normalize last.
-struct FramePreprocessor {
+/// Separate from `CoreAIShared.ImagePreprocessor`. That one resizes through a `CGContext` on
+/// 8-bit samples where `Sam3VideoVideoProcessor` resizes with plain bilinear in float. The
+/// difference is invisible on one image but compounds over a tracked video, since every
+/// frame's input feeds the memory bank.
+final class FramePreprocessor {
     let targetSize: Int
     let mean: (Float, Float, Float)
     let standardDeviation: (Float, Float, Float)
 
-    /// Resamplers are keyed by source size and rebuilt only when it changes, which for a
-    /// video is once.
-    private final class Cache {
-        var width = 0
-        var height = 0
-        var resampler: BilinearResampler?
-        var scratch: [Float] = []
-    }
-    private let cache = Cache()
+    /// Resamplers are keyed by source size. For a video that means one build.
+    private var cachedWidth = 0
+    private var cachedHeight = 0
+    private var cachedResampler: BilinearResampler?
+    private var scratch: [Float] = []
 
     init(
         targetSize: Int,
@@ -58,18 +51,21 @@ struct FramePreprocessor {
         else {
             throw ImagePreprocessorError.renderFailed
         }
-        // Drawn at native size: this is a format conversion, not a resize.
+        // Drawn at native size: a format conversion, with the resize left to the resampler.
         context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
-        let pixels = base.bindMemory(to: UInt8.self, capacity: width * height * 4)
-        return preprocess(
-            interleavedRGB: UnsafeBufferPointer(start: pixels, count: width * height * 4),
-            width: width, height: height, channelStride: 4)
+        // `base` belongs to the context, so keep it alive for as long as the pointer is read.
+        return withExtendedLifetime(context) {
+            let pixels = base.bindMemory(to: UInt8.self, capacity: width * height * 4)
+            return preprocess(
+                interleavedRGB: UnsafeBufferPointer(start: pixels, count: width * height * 4),
+                width: width, height: height, channelStride: 4)
+        }
     }
 
     /// Preprocess interleaved 8-bit samples directly.
     ///
-    /// `channelStride` is 4 for RGBA and 3 for packed RGB. The second form is what the
-    /// preprocessing tests feed in, so they can hold the decoder constant.
+    /// `channelStride` is 4 for RGBA and 3 for packed RGB. The preprocessing tests feed
+    /// packed RGB to hold the decoder constant.
     func preprocess(
         interleavedRGB bytes: [UInt8], width: Int, height: Int, channelStride: Int
     ) -> [Float] {
@@ -82,6 +78,16 @@ struct FramePreprocessor {
         interleavedRGB bytes: UnsafeBufferPointer<UInt8>,
         width: Int, height: Int, channelStride: Int
     ) -> [Float] {
+        precondition(width > 0 && height > 0, "FramePreprocessor needs a non-empty frame")
+        precondition(channelStride >= 3, "FramePreprocessor needs at least three channels")
+        // `vDSP_vfltu8` walks the last sample at `(pixels - 1) * stride + channel`, so the
+        // buffer has to cover the third channel of the final pixel.
+        precondition(
+            bytes.count >= (width * height - 1) * channelStride + 3,
+            "FramePreprocessor needs \((width * height - 1) * channelStride + 3) bytes for "
+                + "\(width)x\(height) at stride \(channelStride), got \(bytes.count)")
+        guard let base = bytes.baseAddress else { return [] }
+
         let resampler = resampler(sourceWidth: width, sourceHeight: height)
         let sourcePixels = width * height
         let targetPixels = targetSize * targetSize
@@ -96,15 +102,18 @@ struct FramePreprocessor {
         for channel in 0..<3 {
             // De-interleave, staying in 0-255 so the rounding below lands on the same
             // grid torchvision uses.
-            vDSP_vfltu8(
-                bytes.baseAddress! + channel, channelStride, &plane, 1, vDSP_Length(sourcePixels))
+            vDSP_vfltu8(base + channel, channelStride, &plane, 1, vDSP_Length(sourcePixels))
 
-            resampler.resample(plane, into: &resized, scratch: &cache.scratch)
+            resampler.resample(plane, into: &resized, scratch: &scratch)
 
             // torchvision resizes a uint8 tensor as uint8: it interpolates and then rounds
-            // back to integers. Skipping this leaves a uniform ~0.25-code-value bias against
+            // back to integers. Matching that removes a uniform ~0.25-code-value bias against
             // the reference.
-            vvnintf(&resized, resized, &elementCount)
+            resized.withUnsafeMutableBufferPointer { buffer in
+                if let address = buffer.baseAddress {
+                    vvnintf(address, address, &elementCount)
+                }
+            }
 
             // Fold rescale and normalize into one affine pass: (x / 255 - m) / s.
             var slope = 1 / (255 * deviations[channel])
@@ -119,19 +128,19 @@ struct FramePreprocessor {
     }
 
     private func resampler(sourceWidth: Int, sourceHeight: Int) -> BilinearResampler {
-        if let existing = cache.resampler, cache.width == sourceWidth, cache.height == sourceHeight {
+        if let existing = cachedResampler, cachedWidth == sourceWidth, cachedHeight == sourceHeight {
             return existing
         }
-        // `antialias: false` matches the video processor, and every real clip upscales to
-        // 1008 anyway, where the flag makes no difference.
+        // `antialias: false` matches the video processor. Every real clip upscales to 1008,
+        // where the flag has no effect.
         let built = BilinearResampler(
             sourceWidth: sourceWidth, sourceHeight: sourceHeight,
             destinationWidth: targetSize, destinationHeight: targetSize,
             antialias: false)
-        cache.width = sourceWidth
-        cache.height = sourceHeight
-        cache.resampler = built
-        cache.scratch = [Float](repeating: 0, count: built.scratchCount)
+        cachedWidth = sourceWidth
+        cachedHeight = sourceHeight
+        cachedResampler = built
+        scratch = [Float](repeating: 0, count: built.scratchCount)
         return built
     }
 }

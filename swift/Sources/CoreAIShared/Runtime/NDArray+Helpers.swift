@@ -162,8 +162,8 @@ public func fillFloatNDArray(_ array: inout NDArray, with elements: ArraySlice<F
 
 /// Copy `source` into `array` starting at logical element `elementOffset`.
 ///
-/// The other `fillNDArray` overloads start at index 0, so packing into slot `k` of a
-/// fixed-slot tensor needs this.
+/// The offset is what lets a caller pack slot `k` of a fixed-slot tensor; the other
+/// `fillNDArray` overloads start at index 0.
 ///
 /// - Precondition: `elementOffset + source.count` must not exceed the logical element count.
 public func copyIntoNDArray<T: BitwiseCopyable>(
@@ -173,7 +173,6 @@ public func copyIntoNDArray<T: BitwiseCopyable>(
 }
 
 /// Copy `source` into an NDArray's MutableRawView starting at logical element `elementOffset`.
-/// Takes the view as `consuming`, so the caller gives up ownership.
 public func copyIntoNDArray<T: BitwiseCopyable>(
     _ rawView: consuming NDArray.MutableRawView, as type: T.Type, elementOffset: Int,
     from source: [T]
@@ -190,14 +189,14 @@ public func copyIntoNDArray<T: BitwiseCopyable>(
 
 /// Write `value` into every logical element of `array` in `elementRange`.
 ///
-/// The offset-aware sibling of `fillNDArray(_:as:with:)`, which can only write from element 0.
+/// The offset-aware sibling of `fillNDArray(_:as:with:)`, which writes from element 0.
 public func fillNDArray<T: BitwiseCopyable>(
     _ array: inout NDArray, as type: T.Type, elementRange: Range<Int>, with value: T
 ) {
     fillNDArray(array.mutableRawView(), as: type, elementRange: elementRange, with: value)
 }
 
-/// MutableRawView overload of the region fill.
+/// MutableRawView overload of ``fillNDArray(_:as:elementRange:with:)``.
 public func fillNDArray<T: BitwiseCopyable>(
     _ rawView: consuming NDArray.MutableRawView, as type: T.Type, elementRange: Range<Int>,
     with value: T

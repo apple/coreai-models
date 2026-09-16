@@ -18,7 +18,7 @@ public enum GraphNames {
     public static let textEncode = "text_encode"
     public static let detect = "detect"
     // Video segmenter (SAM3 video export). Shares the three names above with the
-    // image segmenter, so `trackerStep` is what tells the two apart.
+    // image segmenter. The following are unique to video.
     public static let trackerEncode = "tracker_encode"
     public static let trackerStep = "tracker_step"
     public static let memoryEncode = "memory_encode"
@@ -45,7 +45,7 @@ public enum ModelStructure: Equatable, Sendable, CustomStringConvertible {
     case multiFunctionSegmenter
 
     /// Seven-function SAM3 video segmenter.
-    /// Identified by `tracker_step`, which no other export produces.
+    /// Identified by `tracker_step`, which is unique to this export.
     case videoSegmenter
 
     public var description: String {
@@ -81,7 +81,7 @@ public enum ModelStructure: Equatable, Sendable, CustomStringConvertible {
     /// - `chunkedStatic` → prefer `.neuralEngine`
     /// - `dynamic` → prefer `.gpu` + `expectFrequentReshapes`
     /// - `multiFunctionSegmenter` → prefer `.neuralEngine`
-    /// - `videoSegmenter` → prefer `.gpu`, without `expectFrequentReshapes`
+    /// - `videoSegmenter` → prefer `.gpu`, with static shapes
     public var specializationOptions: SpecializationOptions {
         switch self {
         case .chunkedStatic, .multiFunctionSegmenter:
@@ -264,9 +264,7 @@ public struct PreparedModel: Sendable {
             return .chunkedStatic(batchSize: batchSize)
         }
 
-        // Must be checked before the image segmenter below: this asset also declares
-        // image_encode / text_encode / detect, and the looser test would specialize it
-        // for the Neural Engine, which cannot compile two of its graphs.
+        // Checked before the image segmenter below.
         if graphSet.contains(GraphNames.trackerStep) {
             return .videoSegmenter
         }

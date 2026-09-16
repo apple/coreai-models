@@ -9,12 +9,8 @@ import Foundation
 
 /// Half-precision payload held on the host between frames.
 ///
-/// Encoded memory leaves `memory_encode` as fp16 and goes straight back into `tracker_step`
-/// as fp16, so it is never interpreted here. Keeping it as `Float16` rather than widening
-/// halves the memory bank's footprint.
-///
-/// `limit` caps how much is read, for callers writing into a fixed-size slot: the packer
-/// copies `values` wholesale, so a longer-than-expected array would spill into the next slot.
+/// `limit` caps how much is read. The packer copies `values` wholesale into a fixed-size
+/// slot, so a longer array would spill into the next one.
 struct MemoryPayload: Sendable {
     #if !((os(macOS) || targetEnvironment(macCatalyst)) && arch(x86_64))
     let values: [Float16]
@@ -34,26 +30,25 @@ struct MemoryPayload: Sendable {
 
 /// One object's stored result for one frame.
 ///
-/// Deliberately smaller than HF's equivalent dict. Upstream keeps `high_res_masks` (1008²
-/// floats, 4 MB) forever and never reads it back; the memory encoder consumes the in-flight
-/// value on the frame it is produced. Dropping it is what makes a long video fit.
+/// Smaller than HF's equivalent dict, which retains `high_res_masks` (4 MB a frame) for the
+/// whole video. Dropping those is what makes a long video fit.
 struct StoredFrameOutput {
-    /// Low-resolution mask logits. Only re-read when a frame is revisited and the object
-    /// already has a conditioning output there, so it is pruned aggressively.
+    /// Low-resolution mask logits. Read back only when a frame is revisited, so pruning
+    /// drops these early.
     var predictedMasks: [Float]?
     /// `(1, 1, hidden)` pointer, fed to `tracker_step` as one of the pointer slots.
     var objectPointer: NDArray
     var objectScoreLogit: Float
-    /// Set after the frame's memory encoding pass; absent until then.
+    /// Set by the frame's memory encoding pass.
     var memoryFeatures: MemoryPayload?
     var memoryPositionEncoding: MemoryPayload?
 }
 
 /// Per-object output history, split the way `output_dict_per_obj` is.
 ///
-/// The conditioning / non-conditioning split is not bookkeeping: `_select_closest_cond_frames`
-/// picks from the first, `_gather_memory_frame_outputs` walks a fixed recent window of the
-/// second, and reconditioning promotes an entry from one to the other mid-frame.
+/// The split drives behaviour. `_select_closest_cond_frames` picks from the conditioning
+/// side while `_gather_memory_frame_outputs` walks a recent window of the other.
+/// Reconditioning moves an entry across mid-frame.
 struct ObjectOutputHistory {
     /// Frames where the object was seeded or reconditioned. Insertion-ordered, because
     /// `_get_object_pointers` iterates them in that order.
@@ -69,8 +64,8 @@ struct ObjectOutputHistory {
         if isConditioning {
             if conditioning[frame] == nil { conditioningOrder.append(frame) }
             conditioning[frame] = output
-            // A frame is in exactly one bucket. Promoting without this leaves a stale
-            // copy that `_gather_memory_frame_outputs` could pick up as a recent memory.
+            // A frame belongs to exactly one bucket. A stale copy left behind would show up
+            // in `_gather_memory_frame_outputs` as a recent memory.
             nonConditioning[frame] = nil
         } else {
             nonConditioning[frame] = output
@@ -85,8 +80,8 @@ struct ObjectOutputHistory {
         conditioning[frame] = existing
     }
 
-    /// Attach a frame's encoded memory to whichever bucket holds it. A reconditioned object
-    /// was promoted to conditioning a moment ago, so neither bucket can be assumed.
+    /// Attach a frame's encoded memory to whichever bucket holds it. Reconditioning may have
+    /// moved the object a moment ago, so the bucket is resolved here.
     mutating func attachMemory(
         features: MemoryPayload, positionEncoding: MemoryPayload, at frame: Int
     ) {
@@ -101,10 +96,9 @@ struct ObjectOutputHistory {
 
     /// Drop history that can no longer be read.
     ///
-    /// Upstream never prunes, which does not survive a long video. The window is derived
-    /// from what the two readers can still reach: `_gather_memory_frame_outputs` looks back
-    /// `numMaskmem - 1` frames, `_get_object_pointers` looks back `maxObjectPointers - 1`.
-    /// Conditioning entries are kept whole — pointers iterate all of them, and there are few.
+    /// Upstream retains everything, which a long video outgrows. The window covers what the
+    /// two readers can still reach. Conditioning entries are kept whole. Pointers iterate all
+    /// of them and there are few.
     mutating func prune(before frame: Int, memoryWindow: Int, pointerWindow: Int) {
         let memoryFloor = frame - memoryWindow
         let pointerFloor = frame - pointerWindow
@@ -118,9 +112,8 @@ struct ObjectOutputHistory {
             }
         }
         for key in conditioningOrder where key < memoryFloor {
-            // Keep the pointer and the memory (a conditioning frame can be selected from
-            // any distance), but the stored low-res mask is only read when that exact frame
-            // is revisited, which forward propagation never does.
+            // Keep the pointer and the memory, since a conditioning frame can be selected
+            // from any distance. Only the low-res mask is unreachable once the frame is past.
             conditioning[key]?.predictedMasks = nil
         }
     }
@@ -134,8 +127,8 @@ struct MaskPrompt {
 /// Host-side state for one video.
 ///
 /// Port of `Sam3VideoInferenceSession` plus the per-object tracker state HF keeps inside
-/// `Sam3TrackerVideoInferenceSession`. Everything here is plain data; the logic that reads
-/// it lives in `Tracking/`.
+/// `Sam3TrackerVideoInferenceSession`. Plain data only. The logic that reads it lives in
+/// `Tracking/`.
 @VideoSegmentationActor
 final class VideoInferenceSession {
     let videoWidth: Int
@@ -175,7 +168,7 @@ final class VideoInferenceSession {
     var keepAliveByObjectID: [Int: Int] = [:]
     var removedObjectIDs: Set<Int> = []
     var suppressedObjectIDsByFrame: [Int: Set<Int>] = [:]
-    /// Objects hotstart removed at any point; the postprocessor hides them retroactively.
+    /// Objects hotstart removed at any point. The postprocessor hides them retroactively.
     var hotstartRemovedObjectIDs: Set<Int> = []
 
     // MARK: - Frame cache
@@ -222,15 +215,24 @@ final class VideoInferenceSession {
         return index
     }
 
-    /// Remove an object and every trace of it, compacting the parallel storage.
+    /// Remove an object, compacting the parallel storage and dropping its per-object metadata.
     ///
     /// Port of `Sam3VideoInferenceSession.remove_object`. Upstream resets the whole session
-    /// when the last object goes; clearing here is equivalent and keeps prompt state.
+    /// when the last object goes. Clearing per-object state has the same effect and keeps
+    /// the prompts.
+    ///
+    /// `removedObjectIDs`, `hotstartRemovedObjectIDs` and `overlapFramesByPair` survive as
+    /// tombstones, since the hotstart rules and the postprocessor still read them for ids
+    /// that are gone.
     func removeObject(_ id: Int) {
         guard let survivors = registry.remove(id) else { return }
         histories = survivors.map { histories[$0] }
         promptIDByObjectID[id] = nil
         lastOccludedByObjectID[id] = nil
+        scoreByObjectID[id] = nil
+        firstFrameByObjectID[id] = nil
+        unmatchedFramesByObjectID[id] = nil
+        keepAliveByObjectID[id] = nil
         objectsWithNewInputs.removeAll { $0 == id }
     }
 

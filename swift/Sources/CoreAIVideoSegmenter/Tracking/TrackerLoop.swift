@@ -13,8 +13,8 @@ import Foundation
 /// Port of `Sam3TrackerVideoModel.forward`, `_run_single_frame_inference`,
 /// `_use_mask_as_output`, and `_batch_encode_memories`.
 ///
-/// Point prompts are not implemented: SAM 3's video path only ever seeds a track from a
-/// detection mask, in `_tracker_add_new_objects`.
+/// Mask prompts only: SAM 3's video path seeds a track from a detection mask, in
+/// `_tracker_add_new_objects`.
 @VideoSegmentationActor
 final class TrackerLoop {
     private let engine: VideoSegmentationEngine
@@ -92,8 +92,8 @@ final class TrackerLoop {
         var objectScoreLogit: Float
     }
 
-    /// The weight-free part of `_use_mask_as_output`, which has no object pointer of its own;
-    /// that comes from `tracker_mask_init`.
+    /// The weight-free part of `_use_mask_as_output`. The object pointer comes separately,
+    /// from `tracker_mask_init`.
     private struct MaskAsOutput {
         var predictedMasks: [Float]
         var highResolutionMasks: [Float]
@@ -103,8 +103,8 @@ final class TrackerLoop {
     /// Propagate every registered object through `frameIndex`.
     ///
     /// - Parameter runMemoryEncoder: Encode this frame's memory as part of the pass. False
-    ///   on the plain propagation call, where memory is deferred until the planning phase
-    ///   has resolved non-overlap; true when a new object was just seeded.
+    ///   on the plain propagation call, which defers memory until the planning phase has
+    ///   resolved non-overlap. True when a new object was just seeded.
     func propagate(
         session: VideoInferenceSession,
         frameIndex: Int,
@@ -112,20 +112,16 @@ final class TrackerLoop {
         reverse: Bool,
         runMemoryEncoder: Bool
     ) async throws -> Propagation {
-        // Upstream mutates its `reverse` argument inside the object loop and the change
-        // leaks into every later object in the same call. Reproduced deliberately: a
-        // freshly seeded object forces forward tracking, and that then applies to the
-        // objects after it.
+        // Upstream mutates its `reverse` argument inside the object loop. The change carries
+        // to every later object in the same call, so a freshly seeded object forces forward
+        // tracking for the objects after it. Matched here.
         var reverse = reverse
 
         var propagation = Propagation(
             maskLogits: Array(repeating: [], count: session.objectCount),
             objectScoreLogits: Array(repeating: 0, count: session.objectCount))
 
-        var memoryIndices: [Int] = []
-        var memoryMasks: [[Float]] = []
-        var memoryScores: [Float] = []
-        var memoryFromMask: [Bool] = []
+        var memoryInputs: [MemoryEncodingInput] = []
 
         for objectIndex in 0..<session.objectCount {
             let objectID = session.registry.id(at: objectIndex)
@@ -136,8 +132,7 @@ final class TrackerLoop {
             if !hasNewInputs, hasConditioningOutput,
                 let stored = session.histories[objectIndex].conditioning[frameIndex]
             {
-                // Already computed on this frame as a conditioning output, so reuse it
-                // rather than re-running the tracker.
+                // Already computed on this frame as a conditioning output, so reuse it.
                 guard let masks = stored.predictedMasks else {
                     throw VideoSegmentationError.invalidConfiguration(
                         "Object \(objectID) has a conditioning output on frame \(frameIndex) with "
@@ -176,10 +171,12 @@ final class TrackerLoop {
             propagation.objectScoreLogits[objectIndex] = result.objectScoreLogit
 
             if runMemoryEncoder, parameters.numMaskmem > 0 {
-                memoryIndices.append(objectIndex)
-                memoryMasks.append(result.highResolutionMasks)
-                memoryScores.append(result.objectScoreLogit)
-                memoryFromMask.append(maskPrompt != nil)
+                memoryInputs.append(
+                    MemoryEncodingInput(
+                        objectIndex: objectIndex,
+                        mask: result.highResolutionMasks,
+                        scoreLogit: result.objectScoreLogit,
+                        fromMask: maskPrompt != nil))
             }
 
             if !isInitialConditioningFrame {
@@ -188,18 +185,16 @@ final class TrackerLoop {
         }
 
         try await encodeMemories(
-            session: session, frameIndex: frameIndex, objectIndices: memoryIndices,
-            highResolutionMasks: memoryMasks, scoreLogits: memoryScores,
-            fromMask: memoryFromMask)
+            session: session, frameIndex: frameIndex, inputs: memoryInputs)
 
         return propagation
     }
 
     /// Encode memory for every object from the frame's final, de-overlapped masks.
     ///
-    /// Port of `_tracker_update_memories`'s second half. Distinct from the pass inside
-    /// ``propagate``: the masks are low-resolution, the score is derived from mask area
-    /// rather than from the decoder, and binarization is always off.
+    /// Port of `_tracker_update_memories`'s second half. Unlike the pass inside ``propagate``
+    /// the masks are low-resolution, the score comes from mask area, and binarization is
+    /// off.
     func encodeFinalMemories(
         session: VideoInferenceSession,
         frameIndex: Int,
@@ -208,22 +203,22 @@ final class TrackerLoop {
         guard !maskLogits.isEmpty else { return }
         // Mask area stands in for an object score, exactly as upstream:
         // `torch.where((high_res_masks > 0).any(...), 10.0, -10.0)`.
-        let scores = maskLogits.map { logits in
-            logits.contains { $0 > 0 } ? -Self.maskOutBias : Self.maskOutBias
+        let inputs = maskLogits.enumerated().map { objectIndex, logits in
+            MemoryEncodingInput(
+                objectIndex: objectIndex,
+                mask: logits,
+                scoreLogit: logits.contains { $0 > 0 } ? -Self.maskOutBias : Self.maskOutBias,
+                fromMask: false)
         }
         try await encodeMemories(
-            session: session, frameIndex: frameIndex,
-            objectIndices: Array(maskLogits.indices),
-            highResolutionMasks: maskLogits, scoreLogits: scores,
-            fromMask: [Bool](repeating: false, count: maskLogits.count),
+            session: session, frameIndex: frameIndex, inputs: inputs,
             sourceIsLowResolution: true)
     }
 
     /// Seed tracks from detection masks, then re-run the tracker with memory encoding on.
     ///
-    /// Port of `_tracker_add_new_objects`. The re-run covers every object, not just the new
-    /// ones, which also overwrites the memory the planning phase just wrote — upstream's
-    /// behaviour, and the expensive part.
+    /// Port of `_tracker_add_new_objects`. Upstream's re-run covers every object, which also
+    /// overwrites the memory the planning phase just wrote. This is the expensive step.
     func addNewObjects(
         session: VideoInferenceSession,
         frameIndex: Int,
@@ -234,8 +229,8 @@ final class TrackerLoop {
     ) async throws {
         for (objectID, logits) in zip(newObjectIDs, newObjectMaskLogits) {
             let objectIndex = session.index(ofObject: objectID)
-            // `>= 0.5` on raw mask logits. `nextDown` turns the bitset's strict `>` into
-            // exactly that, with no float slop.
+            // `>= 0.5` on raw mask logits, expressed through the bitset's strict `>` by
+            // stepping the threshold one ULP down.
             let mask = MaskBitset(
                 thresholding: logits, width: shapes.lowResMaskSize,
                 height: shapes.lowResMaskSize, above: Float(0.5).nextDown)
@@ -264,13 +259,13 @@ final class TrackerLoop {
         let features = try session.features(forFrame: frameIndex)
 
         if let maskPrompt {
-            // Seeding path: only the object pointer needs the network, and everything else
-            // in `_use_mask_as_output` is weight-free arithmetic on the prompt mask.
+            // Seeding path: only the object pointer needs the network. The rest of
+            // `_use_mask_as_output` is weight-free arithmetic on the prompt mask.
             let maskFloats = maskPrompt.mask.toBytes().map { Float($0) }
             let pointer = try await engine.trackerMaskInit(
                 features: features, maskInput: maskFloats)
             let derived = maskAsOutput(maskPrompt.mask, maskFloats: maskFloats)
-            // Consumed; drop it so a long video doesn't accumulate one prompt per seeding.
+            // Consumed, so drop it. A long video accumulates one prompt per seeding.
             session.histories[objectIndex].maskInputs[frameIndex] = nil
             return SingleFrameResult(
                 predictedMasks: derived.predictedMasks,
@@ -291,22 +286,19 @@ final class TrackerLoop {
     }
 
     /// The weight-free half of `_use_mask_as_output`.
-    ///
-    /// The low-resolution output is effectively write-only during forward propagation:
-    /// `build_outputs` shows a new object its detection mask, and the stored value is only
-    /// re-read if the same frame is revisited.
     private func maskAsOutput(_ mask: MaskBitset, maskFloats: [Float]) -> MaskAsOutput {
         var highResolution = [Float](repeating: 0, count: highResPixels)
         resample(lowResToImage, maskFloats, into: &highResolution)
         var scale = Self.maskOutScale
         var bias = Self.maskOutBias
         highResolution.withUnsafeMutableBufferPointer {
-            vDSP_vsmsa(
-                $0.baseAddress!, 1, &scale, &bias, $0.baseAddress!, 1, vDSP_Length($0.count))
+            if let base = $0.baseAddress {
+                vDSP_vsmsa(base, 1, &scale, &bias, base, 1, vDSP_Length($0.count))
+            }
         }
         var lowResolution = [Float](repeating: 0, count: lowResPixels)
         resample(imageToLowRes, highResolution, into: &lowResolution)
-        // `is_obj_appearing` tests the *prompt* mask, not the resampled one.
+        // `is_obj_appearing` tests the prompt mask, ahead of the resample.
         let appearing = !mask.isEmpty
         return MaskAsOutput(
             predictedMasks: lowResolution,
@@ -316,41 +308,43 @@ final class TrackerLoop {
 
     // MARK: - Memory encoding
 
+    /// One object's contribution to a frame's memory-encoding pass.
+    private struct MemoryEncodingInput {
+        let objectIndex: Int
+        let mask: [Float]
+        let scoreLogit: Float
+        let fromMask: Bool
+    }
+
     /// Encode one memory per object and attach it to that object's stored frame output.
     ///
-    /// `binarize` is `any(fromMask)` across the batch, not per object: upstream computes
-    /// `is_mask_from_pts` once for the whole batch. That coupling changes the numbers, so it
-    /// is preserved.
+    /// `binarize` is `any(fromMask)` across the batch: upstream computes `is_mask_from_pts`
+    /// once for the whole batch. That coupling moves the numbers, so it is matched here.
     private func encodeMemories(
         session: VideoInferenceSession,
         frameIndex: Int,
-        objectIndices: [Int],
-        highResolutionMasks: [[Float]],
-        scoreLogits: [Float],
-        fromMask: [Bool],
+        inputs: [MemoryEncodingInput],
         sourceIsLowResolution: Bool = false
     ) async throws {
-        guard !objectIndices.isEmpty else { return }
+        guard !inputs.isEmpty else { return }
         let features = try session.features(forFrame: frameIndex)
-        let binarize = fromMask.contains(true)
+        let binarize = inputs.contains { $0.fromMask }
         let resampler = sourceIsLowResolution ? lowResToMemory : highResToMemory
 
-        for (position, objectIndex) in objectIndices.enumerated() {
-            // Upstream resizes inside `_encode_new_memory`, which is handed two different
-            // resolutions depending on the caller. A traced graph takes one, so the host
-            // normalizes to `memoryMaskSize` first. Both callers resize *up*, where
-            // antialiasing is a no-op, so this stays a single plain bilinear pass.
+        for input in inputs {
+            // Upstream resizes inside `_encode_new_memory`, at whichever of two resolutions
+            // the caller supplies. A traced graph takes one, so the host normalizes first.
             var mask = [Float](
                 repeating: 0, count: shapes.memoryMaskSize * shapes.memoryMaskSize)
-            resample(resampler, highResolutionMasks[position], into: &mask)
+            resample(resampler, input.mask, into: &mask)
 
             let encoded = try await engine.memoryEncode(
                 visionFeatureLevel2: features.level2,
                 maskLogits: mask,
-                objectScoreLogit: scoreLogits[position],
+                objectScoreLogit: input.scoreLogit,
                 binarize: binarize)
 
-            session.histories[objectIndex].attachMemory(
+            session.histories[input.objectIndex].attachMemory(
                 features: MemoryPayload(reading: encoded.features),
                 positionEncoding: MemoryPayload(reading: encoded.positionEncoding),
                 at: frameIndex)

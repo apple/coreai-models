@@ -34,10 +34,6 @@ public enum OverlayPalette {
     }
 
     /// Stable color for a tracked object id.
-    ///
-    /// Steps the hue by the golden ratio's fractional part rather than dividing the wheel
-    /// by a count: the total is unknown mid-video, and consecutive ids, which is what new
-    /// tracks get, stay far apart instead of nearly on top of each other.
     public static func color(forID id: Int) -> (UInt8, UInt8, UInt8) {
         let hue = (Float(id) * 0.618_033_99).truncatingRemainder(dividingBy: 1.0)
         return hsvToRGB(h: hue < 0 ? hue + 1 : hue, s: 0.85, v: 0.95)

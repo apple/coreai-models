@@ -11,10 +11,10 @@ import Foundation
 /// Port of the `_obj_id_to_idx` / `_obj_idx_to_id` / `obj_ids` trio in
 /// `Sam3VideoInferenceSession`. Two invariants:
 ///
-/// * `ids` order is meaningful. Tracker masks come back one row per index, and association,
-///   suppression, and the output builder all zip that row order against `ids`.
-/// * Removing an object renumbers every index above it, so per-object storage has to be
-///   compacted in lockstep. Leaving a hole would misattribute every later object's memory.
+/// * `ids` order is meaningful. Tracker masks come back one row per index. Association,
+///   suppression and the output builder all zip that row order against `ids`.
+/// * Removing an object renumbers every index above it, so per-object storage is compacted
+///   in lockstep. A hole would misattribute every later object's memory.
 struct ObjectRegistry {
     /// Object ids in the order they were first seen.
     private(set) var ids: [Int] = []
@@ -23,9 +23,6 @@ struct ObjectRegistry {
     var count: Int { ids.count }
 
     /// Index of `id`, registering it at the end if new.
-    ///
-    /// Returns the new index and whether it was just created, so the caller can grow its
-    /// parallel storage in the same step.
     @discardableResult
     mutating func index(of id: Int) -> (index: Int, isNew: Bool) {
         if let existing = indexByID[id] { return (existing, false) }
@@ -43,8 +40,8 @@ struct ObjectRegistry {
     /// Remove `id` and report the surviving indices in their old order, so callers can
     /// compact parallel arrays with `newStorage = survivors.map { oldStorage[$0] }`.
     ///
-    /// Returns `nil` when `id` was never registered, matching `remove_object`, which
-    /// quietly does nothing for an unknown id.
+    /// Returns `nil` for an id that was never registered, matching `remove_object`'s
+    /// treatment of an unknown id as a no-op.
     mutating func remove(_ id: Int) -> [Int]? {
         guard let removed = indexByID[id] else { return nil }
         let survivors = (0..<ids.count).filter { $0 != removed }

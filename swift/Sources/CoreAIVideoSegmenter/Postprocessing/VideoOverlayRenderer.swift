@@ -10,9 +10,8 @@ import Foundation
 
 /// Draws a frame's tracked objects over the source image.
 ///
-/// Colours come from ``OverlayPalette/color(forID:)``, a pure function of the object id
-/// rather than of its position in the array, so a track that survives an occlusion keeps its
-/// colour.
+/// Colours come from ``OverlayPalette/color(forID:)``. It keys off the object id alone, so a
+/// track that survives an occlusion keeps its colour.
 struct VideoOverlayRenderer {
     private let parameters: VideoSegmentationParameters
 
@@ -40,9 +39,9 @@ struct VideoOverlayRenderer {
             context.draw(overlay, in: CGRect(x: 0, y: 0, width: width, height: height))
         }
 
-        // Core Graphics puts the origin at the bottom left; masks and boxes are top-left.
-        // Flipping the whole context once keeps every draw below in image coordinates,
-        // including the text, which would otherwise render upside down.
+        // Core Graphics puts the origin at the bottom left. Masks and boxes are top-left,
+        // so flipping once here puts every draw below into image coordinates. Text
+        // included.
         context.translateBy(x: 0, y: CGFloat(height))
         context.scaleBy(x: 1, y: -1)
 
@@ -66,17 +65,25 @@ struct VideoOverlayRenderer {
     }
 
     /// Build one translucent RGBA layer holding every object's fill.
-    ///
-    /// Composited as a single image rather than one draw per object: at 1080p with eight
-    /// tracks that is one blend instead of eight.
     private func maskOverlay(_ objects: [TrackedObject], width: Int, height: Int) -> CGImage? {
         let alpha = max(0, min(1, parameters.maskOpacity))
         guard alpha > 0 else { return nil }
         let inverse = 1 - alpha
 
-        var pixels = [UInt8](repeating: 0, count: width * height * 4)
-        pixels.withUnsafeMutableBufferPointer { buffer in
-            guard let base = buffer.baseAddress else { return }
+        // Blend straight into the context's own zero-filled backing store, so the layer costs
+        // no host-side buffer and no copy into `CGDataProvider`.
+        guard
+            let context = CGContext(
+                data: nil, width: width, height: height,
+                bitsPerComponent: 8, bytesPerRow: 0,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue),
+            let data = context.data
+        else { return nil }
+
+        return withExtendedLifetime(context) { () -> CGImage? in
+            let base = data.bindMemory(to: UInt8.self, capacity: context.bytesPerRow * height)
+            let bytesPerRow = context.bytesPerRow
             for object in objects {
                 guard object.mask.width == width, object.mask.height == height else { continue }
                 let (r, g, b) = OverlayPalette.color(forID: object.id)
@@ -86,7 +93,8 @@ struct VideoOverlayRenderer {
                 let green = Float(g) * alpha
                 let blue = Float(b) * alpha
                 object.mask.forEachSetIndex { index in
-                    let offset = index * 4
+                    let y = index / width
+                    let offset = y * bytesPerRow + (index - y * width) * 4
                     base[offset] = UInt8(min(255, red + Float(base[offset]) * inverse))
                     base[offset + 1] = UInt8(min(255, green + Float(base[offset + 1]) * inverse))
                     base[offset + 2] = UInt8(min(255, blue + Float(base[offset + 2]) * inverse))
@@ -94,25 +102,18 @@ struct VideoOverlayRenderer {
                         min(255, (alpha + Float(base[offset + 3]) / 255 * inverse) * 255))
                 }
             }
+            return context.makeImage()
         }
-
-        guard let provider = CGDataProvider(data: Data(pixels) as CFData) else { return nil }
-        return CGImage(
-            width: width, height: height,
-            bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: width * 4,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
-            provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)
     }
 
-    /// `#id prompt 0.92` on a filled chip above the box, tucked inside the frame when the
-    /// box is at the top edge.
+    /// `#id prompt 0.92` on a filled chip above the box, moved inside the frame when the box
+    /// sits at the top edge.
     private func drawLabel(for object: TrackedObject, in context: CGContext, imageHeight: Int) {
         let text = "#\(object.id) \(object.prompt) \(String(format: "%.2f", object.score))"
         let fontSize = max(11, min(28, parameters.strokeWidth * 5))
         let font = CTFontCreateWithName("Helvetica-Bold" as CFString, fontSize, nil)
-        // Core Text attribute names rather than the AppKit/UIKit ones, so this file stays
-        // buildable on both platforms without importing a UI framework.
+        // Core Text attribute names keep this file buildable on macOS and iOS with no UI
+        // framework import.
         let attributes: [NSAttributedString.Key: Any] = [
             NSAttributedString.Key(kCTFontAttributeName as String): font,
             NSAttributedString.Key(kCTForegroundColorAttributeName as String):
@@ -126,7 +127,7 @@ struct VideoOverlayRenderer {
         let chipWidth = bounds.width + padding * 2
         let chipHeight = bounds.height + padding * 2
         var chipY = object.box.minY - chipHeight
-        if chipY < 0 { chipY = object.box.minY }  // box hugs the top; put the chip inside
+        if chipY < 0 { chipY = object.box.minY }
 
         let (r, g, b) = OverlayPalette.color(forID: object.id)
         context.setFillColor(
@@ -134,13 +135,15 @@ struct VideoOverlayRenderer {
         context.fill(
             CGRect(x: object.box.minX, y: chipY, width: chipWidth, height: chipHeight))
 
-        // The context is already y-flipped for image coordinates, so flip once more
-        // locally or the glyphs come out mirrored.
+        // The context is already y-flipped for image coordinates, so flip once more locally
+        // to draw glyphs upright.
         context.saveGState()
         context.textMatrix = .identity
         context.translateBy(x: object.box.minX + padding, y: chipY + chipHeight - padding)
         context.scaleBy(x: 1, y: -1)
-        context.textPosition = CGPoint(x: 0, y: -bounds.minY - bounds.height)
+        // The translate lands on the bottom-left of the padded interior and the flip points
+        // local y up. A baseline of `-bounds.minY` then puts descenders on the padding.
+        context.textPosition = CGPoint(x: 0, y: -bounds.minY)
         CTLineDraw(line, context)
         context.restoreGState()
     }

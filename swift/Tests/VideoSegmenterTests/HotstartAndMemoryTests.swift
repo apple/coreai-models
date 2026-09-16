@@ -282,3 +282,62 @@ struct MemorySelectionTests {
         #expect(maxPointers == 3, "capped by the video length, not the config")
     }
 }
+
+@Suite("MemoryBankPacker configuration")
+@VideoSegmentationActor
+struct MemoryBankConfigurationTests {
+    /// Shapes sized so only the parameter under test can make `init` refuse. The bank stays
+    /// unallocated because `init` validates before touching it.
+    private func shapes(spatialSlots: Int = 64) -> VideoSegmentationEngine.Shapes {
+        VideoSegmentationEngine.Shapes(
+            imageSize: 1008, textSequenceLength: 32, lowResMaskSize: 252, memoryMaskSize: 252,
+            highResMaskSize: 1008, memoryTokenCount: 4, memoryDim: 4, hiddenDim: 4,
+            spatialSlots: spatialSlots, ptrSlots: 24)
+    }
+
+    private func packed() -> PackedMemory {
+        func stub() -> NDArray { NDArray(shape: [1, 1, 4], scalarType: .float16) }
+        return PackedMemory(
+            spatialMemory: stub(), spatialMemoryPosition: stub(), spatialTemporalIndex: stub(),
+            spatialValid: stub(), objectPointers: stub(), pointerTemporalPosition: stub(),
+            pointerValid: stub())
+    }
+
+    private func makePacker(_ mutate: (inout VideoSegmentationParameters) -> Void) throws
+        -> MemoryBankPacker
+    {
+        var parameters = VideoSegmentationParameters.default
+        mutate(&parameters)
+        return try MemoryBankPacker(
+            shapes: shapes(), parameters: parameters, packed: packed())
+    }
+
+    @Test("The default configuration is accepted")
+    func defaultsAccepted() throws {
+        _ = try makePacker { _ in }
+    }
+
+    @Test("num_maskmem of zero is refused, since the temporal index divides by it")
+    func rejectsZeroMaskmem() {
+        #expect(throws: VideoSegmentationError.self) {
+            try makePacker { $0.numMaskmem = 0 }
+        }
+    }
+
+    @Test("max_cond_frame_num below two is refused")
+    func rejectsSmallCondFrameCap() {
+        // `_select_closest_cond_frames` takes the nearest before and the nearest at-or-after
+        // before honouring the cap, so a cap of 1 yields two entries and the slot budget
+        // computed from it would be short.
+        #expect(throws: VideoSegmentationError.self) {
+            try makePacker { $0.maxCondFrameNum = 1 }
+        }
+    }
+
+    @Test("An unbounded max_cond_frame_num is refused by a fixed-slot bank")
+    func rejectsUnboundedCondFrameCap() {
+        #expect(throws: VideoSegmentationError.self) {
+            try makePacker { $0.maxCondFrameNum = -1 }
+        }
+    }
+}

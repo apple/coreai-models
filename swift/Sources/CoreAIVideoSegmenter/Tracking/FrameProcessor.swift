@@ -14,9 +14,9 @@ import Foundation
 /// `run_tracker_update_execution_phase`, `build_outputs`, and `forward`.
 ///
 /// The phase split is load-bearing. Planning resolves every heuristic and encodes memory
-/// from the de-overlapped masks; only then does execution mutate the object set. Merging
-/// the two would let a track that is about to be removed contribute memory, or a track
-/// that is about to be created miss this frame's memory.
+/// from the de-overlapped masks. Only then does execution mutate the object set. That keeps
+/// a track pending removal out of the memory bank, and puts a track pending creation into it
+/// for this frame.
 @VideoSegmentationActor
 final class FrameProcessor {
     private let engine: VideoSegmentationEngine
@@ -52,7 +52,7 @@ final class FrameProcessor {
         totalFrames: Int,
         reverse: Bool
     ) async throws -> RawFrameOutput {
-        // 1. One ViT pass, shared by the detector and the tracker exactly as upstream.
+        // One ViT pass, shared by the detector and the tracker as upstream does.
         let pixels = try preprocessor.preprocess(image)
         let backbone = try await timed(VideoSegmentationEngine.Function.imageEncode) {
             try await engine.imageEncode(pixelValues: pixels)
@@ -82,24 +82,23 @@ final class FrameProcessor {
             }
         }
 
-        // 3. Plan. Runs every heuristic and encodes this frame's memory.
+        // Plan: run every heuristic and encode this frame's memory.
         let planning = try await plan(
             session: session, frameIndex: frameIndex, reverse: reverse,
             detections: detections, trackerLogits: &trackerLogits,
             trackerScoreLogits: trackerScoreLogits)
 
-        // 4. Execute: seed new objects, drop removed ones.
+        // Execute: seed new objects, drop removed ones.
         try await execute(
             session: session, frameIndex: frameIndex, totalFrames: totalFrames,
             reverse: reverse, detections: detections, plan: planning.plan)
 
-        // 5. Emit.
         let output = buildOutputs(
             session: session, frameIndex: frameIndex, detections: detections,
             trackerLogits: trackerLogits, trackerScoreLogits: trackerScoreLogits,
             plan: planning.plan, newScores: planning.newScores)
 
-        // 6. Shed history nothing can reach any more. Upstream never does this.
+        // Shed history no reader can reach. Upstream retains it for the whole video.
         session.prune(
             currentFrame: frameIndex,
             memoryWindow: max(parameters.numMaskmem, 1),
@@ -159,9 +158,9 @@ final class FrameProcessor {
 
     /// Port of `run_tracker_update_planning_phase`.
     ///
-    /// Mutates `trackerLogits`: occlusion suppression and the area-shrinkage rule both
-    /// blank objects in place, and the blanked masks are what get encoded into memory and
-    /// reported as output.
+    /// Mutates `trackerLogits`. Occlusion suppression and the area-shrinkage rule both blank
+    /// objects in place. Those blanked masks are what get encoded into memory and reported as
+    /// output.
     private func plan(
         session: VideoInferenceSession,
         frameIndex: Int,
@@ -202,8 +201,7 @@ final class FrameProcessor {
         }
         plan.newDetectionIndices = newIndices
 
-        // Ids are assigned by position, so the sort above is the only thing that may
-        // reorder them.
+        // Ids are assigned by position, so the sort above fixes their order.
         let firstNewID = session.maxObjectID + 1
         plan.newObjectIDs = (0..<newIndices.count).map { firstNewID + $0 }
         for (objectID, detectionIndex) in zip(plan.newObjectIDs, newIndices) {
@@ -247,9 +245,8 @@ final class FrameProcessor {
                 reconditionedMasks: reconditionedMasks, promptIDs: trackPromptIDs)
         }
 
-        // Score bookkeeping. New objects inherit their detection score; removed ones are
-        // pushed far negative but kept in the map, which is how upstream keeps output
-        // assembly uniform.
+        // New objects inherit their detection score. Removed ones are pushed far negative
+        // and kept in the map, which is what keeps upstream's output assembly uniform.
         var newScores: [Int: Float] = [:]
         for (objectID, detectionIndex) in zip(plan.newObjectIDs, newIndices) {
             let score = detections.scores[detectionIndex]
@@ -269,9 +266,8 @@ final class FrameProcessor {
 
     /// Where a reconditioned object's memory mask comes from.
     ///
-    /// `trackerMask` is not "the tracker mask captured now" but "whatever the tracker mask is
-    /// when memory is encoded": occlusion suppression mutates that tensor in place between
-    /// capture and use, so holding a copy taken before suppression would silently reinstate a
+    /// `trackerMask` resolves at encode time rather than capture time. Occlusion suppression
+    /// mutates that tensor in place in between, so a copy taken beforehand would reinstate a
     /// mask upstream blanks.
     private enum ReconditionSource {
         case trackerMask
@@ -280,9 +276,8 @@ final class FrameProcessor {
 
     /// Port of `_prepare_recondition_masks`.
     ///
-    /// The flag name reads backwards: `reconditionOnTrkMasks == true` means "the detector
-    /// agrees, so reinforce memory with what the *tracker* produced"; false means "the
-    /// detector disagrees, so overwrite with the *detection*".
+    /// The flag reads backwards from its name: `reconditionOnTrkMasks == true` reinforces
+    /// memory with the tracker's mask, false overwrites it with the detection's.
     private func prepareReconditionMasks(
         session: VideoInferenceSession,
         detections: MergedDetections,
@@ -293,9 +288,8 @@ final class FrameProcessor {
         var reconditioned: Set<Int> = []
         for (trackID, detectionIndex) in candidates.sorted(by: { $0.key < $1.key }) {
             guard let objectIndex = session.registry.existingIndex(of: trackID) else { continue }
-            // Upstream compares a raw logit against a probability-shaped threshold:
-            // `tracker_obj_scores_global` is not passed through a sigmoid first. In practice
-            // it admits any object with a positive score.
+            // Upstream compares the raw `tracker_obj_scores_global` logit against a
+            // probability-shaped threshold, which admits any object with a positive score.
             guard objectIndex < trackerScoreLogits.count,
                 trackerScoreLogits[objectIndex] > parameters.highConfThresh
             else { continue }
@@ -323,8 +317,8 @@ final class FrameProcessor {
     ) async throws {
         var masks = trackerLogits
         for (objectIndex, source) in reconditionedMasks {
-            // `.trackerMask` resolves against the tracker logits as they are now, after
-            // suppression. See `ReconditionSource`.
+            // `.trackerMask` resolves against the post-suppression tracker logits. See
+            // `ReconditionSource`.
             if case .detectionMask(let mask) = source { masks[objectIndex] = mask }
             // A reconditioned object's frame becomes a conditioning frame, which changes
             // both what the memory bank may select and which pointers are eligible.
@@ -357,9 +351,8 @@ final class FrameProcessor {
                     reverse: reverse)
             }
         }
-        // Sorted so removal order, and therefore the index renumbering, is deterministic.
-        // Upstream iterates a set, whose order is arbitrary; the end state is the same
-        // either way.
+        // Sorted so removal order is deterministic, and with it the index renumbering.
+        // Upstream iterates a set and reaches the same end state in arbitrary order.
         for objectID in plan.newlyRemovedObjectIDs.sorted() {
             session.removeObject(objectID)
         }
@@ -370,9 +363,7 @@ final class FrameProcessor {
     /// Port of `build_outputs` plus the metadata bookkeeping at the end of `forward`.
     ///
     /// Both zips below run the post-execution object list against pre-execution arrays and
-    /// truncate at the shorter, which is upstream's own indexing. It is exact whenever
-    /// nothing was removed this frame, since new ids fall past the end of the tracker arrays
-    /// and are filled in from detections below.
+    /// truncate at the shorter, matching upstream's indexing.
     private func buildOutputs(
         session: VideoInferenceSession,
         frameIndex: Int,
@@ -389,8 +380,8 @@ final class FrameProcessor {
             maskByObjectID[objectID] = mask
         }
 
-        // New objects show their *detection* mask, not what the tracker produced when it
-        // was seeded from it.
+        // New objects show their detection mask, ahead of the tracker's own output for the
+        // frame that seeded them.
         for (objectID, detectionIndex) in zip(plan.newObjectIDs, plan.newDetectionIndices) {
             var mask = detections.maskLogits[detectionIndex]
             fillHoles(&mask)
@@ -406,8 +397,8 @@ final class FrameProcessor {
             maskByObjectID[objectID] = detections.maskLogits[detectionIndex]
         }
 
-        // Tracker scores for the frame, as probabilities. New objects are written first
-        // and the tracker's own scores second, matching upstream's update order.
+        // Tracker scores for the frame, as probabilities. New objects first, then the
+        // tracker's own scores, matching upstream's update order.
         var trackerScores = session.trackerScoreByFrame[frameIndex] ?? [:]
         for (objectID, score) in newScores { trackerScores[objectID] = score }
         for (objectID, logit) in zip(currentObjectIDs, trackerScoreLogits) {
@@ -415,14 +406,14 @@ final class FrameProcessor {
         }
         session.trackerScoreByFrame[frameIndex] = trackerScores
 
-        // Hotstart hides removed objects retroactively, which only makes sense when the
-        // output was delayed long enough for the decision to precede the display.
+        // Hotstart hides removed objects retroactively. That only works while the output is
+        // delayed long enough for the decision to precede the display.
         if parameters.hotstartEnabled {
             session.hotstartRemovedObjectIDs.formUnion(session.removedObjectIDs)
         }
 
-        // Keyed off the mask map, not the registry: a removed object keeps its entry for
-        // this frame and is hidden by the postprocessor, exactly as upstream does.
+        // Keyed off the mask map: as upstream does, a removed object keeps its entry for
+        // this frame and the postprocessor hides it.
         return RawFrameOutput(
             frameIndex: frameIndex,
             maskLogitsByObjectID: maskByObjectID,

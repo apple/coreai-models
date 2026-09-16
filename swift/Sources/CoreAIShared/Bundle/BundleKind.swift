@@ -13,8 +13,8 @@ public enum BundleKind: String, Codable, Sendable, CaseIterable {
     case vlm
     case diffusion
     case segmenter
-    /// Text-promptable video segmentation (SAM 3 video). Separate from `segmenter`
-    /// because the bundle carries a `runtime` block with the memory-bank geometry.
+    /// Text-promptable video segmentation (SAM 3 video). Its own kind because the bundle
+    /// carries a `runtime` block with the memory-bank geometry.
     case videoSegmenter = "video_segmenter"
     case speechRecognizer = "speech_recognizer"
 }

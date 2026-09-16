@@ -133,11 +133,11 @@ struct VideoSegmenterCLI: AsyncParsableCommand {
         if verbose { CLILogger.level = 1 }
 
         if clearCoreAICache {
-            let cleared = try PreparedModel.clearCache(at: URL(fileURLWithPath: model))
+            let cleared = try PreparedModel.clearCache(at: URL(fileURLWithPath: expand(model)))
             print("Cleared the specialization cache for \(cleared.count) asset(s).")
         }
 
-        let segmenter = try await VideoSegmenter(resourcesAt: model, parameters: overrides())
+        let segmenter = try await VideoSegmenter(resourcesAt: expand(model), parameters: overrides())
 
         print("Preparing asset...", terminator: "")
         fflush(stdout)
@@ -154,7 +154,8 @@ struct VideoSegmenterCLI: AsyncParsableCommand {
         }
 
         if let parityDirectory = parity {
-            try await runParity(segmenter: segmenter, directory: URL(fileURLWithPath: parityDirectory))
+            try await runParity(
+                segmenter: segmenter, directory: URL(fileURLWithPath: expand(parityDirectory)))
             return
         }
         try await runSegmentation(segmenter: segmenter)
@@ -287,7 +288,7 @@ struct VideoSegmenterCLI: AsyncParsableCommand {
         var results: [Int: [TrackedObject]] = [:]
         var lowResolution: [Int: [[Float]]] = [:]
         // Ask for the pre-upsample logits when the reference has them, so a disagreement
-        // can be attributed to the tracker or to the upsample rather than guessed at.
+        // can be attributed to the tracker or to the upsample.
         var parityParameters = await segmenter.parameters
         parityParameters.emitLowResolutionMasks =
             reference.lowResolutionMasks(at: reference.frameIndices[0]) != nil
@@ -296,10 +297,8 @@ struct VideoSegmenterCLI: AsyncParsableCommand {
         fillHoleArea.map { parityParameters.fillHoleArea = $0 }
         hotstartDelay.map { parityParameters.hotstartDelay = $0 }
         reconditionEvery.map { parityParameters.reconditionEveryNthFrame = $0 }
-        // Prefer the frames PyTorch itself decoded. Without them both stacks decode the
-        // same file with different libraries, and the resulting colour difference of
-        // roughly 0.65 code values on tagged media shows up as a mask difference that
-        // has nothing to do with this port.
+        // Prefer the frames PyTorch itself decoded, which holds the decoder constant. See
+        // `ParityReference` for the size of the AVFoundation/PyAV difference.
         if let frames = try reference.decodedFrames() {
             print("Frames: \(frames.count) PNGs from the reference (decoder held constant)")
             for try await frame in segmenter.segment(
@@ -311,7 +310,7 @@ struct VideoSegmenterCLI: AsyncParsableCommand {
         } else {
             print("Frames: decoding \(reference.videoURL.path) with AVFoundation")
             print(
-                "  NOTE: the reference has no frames/ directory, so decoder differences are\n"
+                "  The reference has no frames/ directory, so decoder differences are\n"
                     + "  folded into the numbers below. Re-dump with one to remove them.")
             for try await frame in segmenter.segment(
                 videoAt: reference.videoURL, prompts: reference.prompts,
@@ -368,10 +367,10 @@ struct VideoSegmenterCLI: AsyncParsableCommand {
 
         print(String(repeating: "-", count: 72))
         if worstLowResDelta > 0 {
-            // The `lowres` column is the honest measure of the port. The final masks add
-            // an upsample and a threshold on top, and a logit near zero crosses that
-            // threshold on an arbitrarily small difference, which is why a frame can
-            // show a large box delta at a tiny logit delta.
+            // The `lowres` column measures the port alone. The final masks add an upsample
+            // and a threshold, and a logit near zero crosses that threshold on an
+            // arbitrarily small difference, which is how a tiny logit delta becomes a large
+            // box delta.
             print(
                 "Worst mask-logit difference before upsampling: "
                     + String(format: "%.4f", worstLowResDelta))
@@ -384,9 +383,9 @@ struct VideoSegmenterCLI: AsyncParsableCommand {
         }
         print("\(failures) of \(reference.frameCount) frames outside tolerance.")
         if detNmsThresh != 0 || fillHoleArea != 0 {
-            // The single most common cause of a spurious parity failure.
+            // The most common cause of a spurious parity failure.
             print(
-                "Note: the Python reference no-ops NMS and hole filling when "
+                "The Python reference no-ops NMS and hole filling when "
                     + "kernels-community/cv-utils is not installed. If that was the case, rerun "
                     + "with --det-nms-thresh 0 --fill-hole-area 0.")
         }
@@ -404,7 +403,7 @@ struct VideoSegmenterCLI: AsyncParsableCommand {
         expected: [ParityReference.Object], actual: [TrackedObject]
     ) -> Comparison {
         var comparison = Comparison()
-        comparison.idsMatch = expected.map(\.id) == actual.map(\.id).sorted()
+        comparison.idsMatch = expected.map(\.id).sorted() == actual.map(\.id).sorted()
         guard comparison.idsMatch else {
             comparison.minIoU = 0
             return comparison
@@ -484,10 +483,9 @@ actor FrameCollector {
 
         if verbose {
             let ids = objects.map { "#\($0.id)" }.joined(separator: " ")
-            // This frame's own time, then the running total of those times, not wall
-            // clock. `segment()` yields into an unbounded stream buffer, so the frame loop
-            // can run ahead of this consumer and a timestamp taken here would say when the
-            // result was collected rather than when it was computed.
+            // This frame's own time, then the running total of those times. `segment()`
+            // lets the frame loop run a bounded distance ahead of this consumer, so a
+            // timestamp here would report collection time, not compute time.
             print(
                 "  frame \(frame.frameIndex): \(objects.count) object(s) \(ids)"
                     .padding(toLength: 46, withPad: " ", startingAt: 0)

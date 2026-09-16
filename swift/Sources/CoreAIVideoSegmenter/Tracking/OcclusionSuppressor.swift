@@ -8,36 +8,25 @@ import Foundation
 
 /// Resolves objects that claim the same pixels.
 ///
-/// Three rules ported from `Sam3VideoModel`, applied at different points and on different
-/// data:
+/// Three rules ported from `Sam3VideoModel`. ``suppressRecentlyOccluded`` and
+/// ``suppressAreaShrinkage`` run on tracker logits before memory encoding,
+/// ``applyObjectWiseNonOverlap`` on binary masks at output time.
 ///
-/// 1. ``suppressRecentlyOccluded``, before memory encoding, on tracker logits. When two
-///    objects overlap heavily, the one occluded more recently is assumed to be the drifting
-///    copy and is blanked.
-/// 2. ``suppressAreaShrinkage``, also before memory encoding. Applies a pixel-level argmax
-///    and drops any object that lost most of its area to it.
-/// 3. ``applyObjectWiseNonOverlap``, at output time, on binary masks and per-object scores
-///    rather than logits.
-///
-/// All three are enforced per prompt group: two prompts may legitimately return overlapping
-/// masks, and forcing them to compete would make "person" and "pillow" delete each other.
+/// All three apply per prompt group, so overlapping "person" and "pillow" masks coexist.
 enum OcclusionSuppressor {
-    /// Logit written over a suppressed mask. `sigmoid(-10)` is 4.5e-5, so it reads as
-    /// background everywhere downstream without being an out-of-range sentinel.
+    /// Logit written over a suppressed mask.
     static let noObjectLogit: Float = -10
 
     /// Fraction of its own area an object must retain through the pixel-level argmax.
     static let shrinkThreshold: Float = 0.3
 
-    /// Frame index standing in for "never occluded". Must stay negative: the rule below
-    /// requires the *other* object to have been occluded at some point, tested as `> -1`.
+    /// Frame index standing in for "never occluded".
     static let neverOccluded = -1
 
-    /// Frame index standing in for "removed by hotstart, always loses". Larger than any
-    /// real frame index.
+    /// Frame index standing in for "removed by hotstart, always loses".
     static let alwaysOccluded = 100_000
 
-    /// Index groups that can contend, in prompt-id order. A group of one never competes.
+    /// Index groups that can contend, in prompt-id order. Groups of one are dropped.
     private static func contendingGroups(_ promptIDs: [Int]) -> [[Int]] {
         Set(promptIDs).sorted()
             .map { group in promptIDs.indices.filter { promptIDs[$0] == group } }
@@ -48,9 +37,9 @@ enum OcclusionSuppressor {
 
     /// Blank objects that overlap an object occluded less recently than they were.
     ///
-    /// Port of `_suppress_overlapping_based_on_recent_occlusion`. Also updates each object's
-    /// last-occluded frame, which the next frame's comparison reads: an object counts as
-    /// occluded this frame if its mask is empty *or* it was suppressed here.
+    /// Port of `_suppress_overlapping_based_on_recent_occlusion`. Also records which objects
+    /// were occluded this frame, meaning their mask came back empty or they were suppressed
+    /// here. The next frame's comparison reads that.
     ///
     /// - Parameters:
     ///   - logits: Tracker mask logits per object, mutated in place.
@@ -102,9 +91,9 @@ enum OcclusionSuppressor {
 
     /// The pairwise rule itself, over one prompt group.
     ///
-    /// For every pair `i < j` overlapping above `threshold`, the one occluded more recently
-    /// loses, but only if the winner was itself occluded at some point (`> neverOccluded`).
-    /// Two objects that have both always been visible simply coexist.
+    /// Of two objects overlapping above `threshold`, the one occluded more recently loses.
+    /// The winner must have been occluded at some point too, so two objects that have both
+    /// stayed visible coexist.
     private static func markSuppressed(
         members: [Int],
         masks: [MaskBitset],
@@ -113,7 +102,7 @@ enum OcclusionSuppressor {
         reverse: Bool,
         into suppress: inout [Bool]
     ) {
-        // Tracking backwards inverts the comparison: "more recent" is a lower frame index.
+        // Tracking backwards makes "more recent" a lower frame index.
         func losesTo(_ a: Int, _ b: Int) -> Bool { reverse ? a < b : a > b }
 
         for outer in 0..<members.count {
@@ -135,9 +124,9 @@ enum OcclusionSuppressor {
 
     /// Drop objects that lose most of their area to the pixel-level argmax.
     ///
-    /// Port of `_suppress_object_pw_area_shrinkage`, run per prompt group. Returns the
-    /// original masks with whole objects blanked, not the de-overlapped masks; the argmax
-    /// only measures how much of each object was contested.
+    /// Port of `_suppress_object_pw_area_shrinkage`, run per prompt group. The argmax only
+    /// measures how much of each object was contested. What comes back is the original masks
+    /// with whole objects blanked.
     static func suppressAreaShrinkage(
         logits: inout [[Float]], promptIDs: [Int]
     ) {
@@ -147,8 +136,6 @@ enum OcclusionSuppressor {
             "suppressAreaShrinkage: logits and promptIDs must be parallel")
         for members in contendingGroups(promptIDs) {
             let pixelCount = logits[members[0]].count
-            // A pixel-level argmax is only defined over fields of the same extent, and every
-            // caller passes one low-resolution field per object.
             precondition(
                 members.allSatisfy { logits[$0].count == pixelCount },
                 "suppressAreaShrinkage: logits in a prompt group must be the same length")
@@ -189,11 +176,10 @@ enum OcclusionSuppressor {
     /// Give each contested pixel to the highest-scoring object in its prompt group.
     ///
     /// Port of `Sam3VideoProcessor._apply_object_wise_non_overlapping_constraints` with
-    /// `background_value = 0`. The scores are per-object, not per-pixel, so the winner of a
-    /// contested region is the same everywhere the two overlap.
+    /// `background_value = 0`.
     ///
-    /// Upstream compares `pixel_nonoverlap > 0`, so an object whose score is exactly zero
-    /// loses every pixel, even uncontested ones. Reproduced by the `bestScore[pixel] > 0` test.
+    /// Upstream compares `pixel_nonoverlap > 0`, so an object scoring exactly zero loses every
+    /// pixel, uncontested ones included. The `bestScore[pixel] > 0` test matches that.
     static func applyObjectWiseNonOverlap(
         masks: inout [MaskBitset], scores: [Float], promptIDs: [Int]
     ) {
@@ -204,10 +190,8 @@ enum OcclusionSuppressor {
         for members in contendingGroups(promptIDs) {
             let width = masks[members[0]].width
             let height = masks[members[0]].height
-            // Flat pixel indices are only comparable across masks of identical geometry.
-            // Checking both axes, not just the area: two masks with the same pixel count at
-            // different widths would stay in bounds while pitting unrelated locations
-            // against each other, which is a silent wrong answer rather than a crash.
+            // Both axes, because equal pixel counts at different widths stay in bounds while
+            // comparing unrelated locations.
             precondition(
                 members.allSatisfy { masks[$0].width == width && masks[$0].height == height },
                 "applyObjectWiseNonOverlap: masks in a prompt group must share dimensions")

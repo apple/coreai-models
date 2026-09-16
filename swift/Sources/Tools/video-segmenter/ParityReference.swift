@@ -23,15 +23,13 @@ import ImageIO
 /// <dir>/frame_0000_masks.npy     uint8  [N, ceil(H*W/8)]  numpy.packbits, MSB first
 /// ```
 ///
-/// Masks are bit-packed because at video resolution a boolean array is eight times larger
-/// for no extra information: a 51-frame 1080p clip with five tracks is 65 MB packed
-/// against 520 MB raw.
+/// Masks are bit-packed: at video resolution a boolean array carries the same information
+/// eight times over, and a 51-frame 1080p clip with five tracks is 65 MB packed against
+/// 520 MB raw.
 ///
-/// The PNGs matter: AVFoundation and PyAV do not decode the same file to the same pixels.
-/// With the colour space tagged they differ by about 0.65 code values on average, and by
-/// 3.7 when the container leaves it unset. That is a real difference between the two
-/// stacks but it is not a difference in the port, so parity reads the frames rather than
-/// decoding them.
+/// The PNGs matter. AVFoundation and PyAV decode the same file to different pixels: about
+/// 0.65 code values apart on average with the colour space tagged, 3.7 when the container
+/// leaves it unset. That gap belongs to the two decoders, so parity reads the dumped frames.
 struct ParityReference {
     struct Object {
         let id: Int
@@ -77,10 +75,13 @@ struct ParityReference {
                 "manifest.json is malformed: \(error)")
         }
         // The manifest records the clip it was produced from; resolve a relative path
-        // against the reference directory so the pair can be moved together.
-        let recorded = URL(fileURLWithPath: manifest.video)
+        // against the reference directory so the pair can be moved together. Tested on the
+        // recorded string, since `URL(fileURLWithPath:)` resolves against the working
+        // directory and always reports an absolute path.
         self.videoURL =
-            recorded.path.hasPrefix("/") ? recorded : directory.appending(path: manifest.video)
+            manifest.video.hasPrefix("/")
+            ? URL(fileURLWithPath: manifest.video)
+            : directory.appending(path: manifest.video)
         guard FileManager.default.fileExists(atPath: videoURL.path) else {
             throw VideoSegmentationError.parityReferenceInvalid(
                 "manifest.json points at \(videoURL.path), which does not exist.")
@@ -130,8 +131,8 @@ struct ParityReference {
 
     /// Mask logits at the model's own resolution, ordered like `objects(at:)`.
     ///
-    /// Present only when the dump included them. Comparing these instead of the final
-    /// binary masks separates a tracker difference from an upsampling difference.
+    /// Present only when the dump included them. They separate a tracker difference from an
+    /// upsampling difference, which the final binary masks conflate.
     func lowResolutionMasks(at frame: Int) -> (values: [Float], side: Int)? {
         let url = directory.appending(path: String(format: "frame_%04d_lowres.npy", frame))
         guard let array = try? NpyArray.load(url), array.shape.count == 3 else { return nil }
@@ -144,8 +145,8 @@ struct ParityReference {
 
     /// The exact frames PyTorch decoded, when the dump included them.
     ///
-    /// Returning `nil` means falling back to decoding ``videoURL``, which reintroduces
-    /// the decoder difference; the CLI says so when it happens.
+    /// `nil` sends the caller back to decoding ``videoURL``, which reintroduces the decoder
+    /// difference; the CLI reports that when it happens.
     func decodedFrames() throws -> [CGImage]? {
         guard let folder = manifest.frameImages else { return nil }
         let directory = self.directory.appending(path: folder)

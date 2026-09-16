@@ -9,11 +9,10 @@ import Foundation
 
 /// Turns a frame's low-resolution mask logits into the objects a caller sees.
 ///
-/// Port of `Sam3VideoProcessor.postprocess_outputs`. Four steps, and the order matters:
-/// upsample to video resolution and binarize, drop empty and hidden objects, resolve
-/// overlaps within each prompt group, then derive boxes.
+/// Port of `Sam3VideoProcessor.postprocess_outputs`. The step order is load-bearing:
+/// boxes come from the masks as they stand before overlap resolution.
 struct MaskPostprocessor {
-    /// Surviving objects plus, when asked for, the mask logits they came from.
+    /// Surviving objects plus the mask logits they came from, when requested.
     struct Postprocessed {
         var objects: [TrackedObject] = []
         var lowResolutionMasks: [[Float]] = []
@@ -26,7 +25,7 @@ struct MaskPostprocessor {
     private let resampler: BilinearResampler
 
     /// Reused across every object on every frame: the upsampled mask is megabytes at video
-    /// resolution and is thrown away as soon as `MaskBitset` has thresholded it.
+    /// resolution and lives only until `MaskBitset` has thresholded it.
     private final class Buffers {
         var upsampled: [Float]
         var scratch: [Float]
@@ -45,8 +44,8 @@ struct MaskPostprocessor {
         self.videoWidth = videoWidth
         self.videoHeight = videoHeight
         self.emitLowResolutionMasks = emitLowResolutionMasks
-        // No antialiasing: upstream calls `interpolate(..., mode="bilinear",
-        // align_corners=False)` here without the flag, unlike the resizes inside the tracker.
+        // Upstream calls `interpolate(..., mode="bilinear", align_corners=False)` here with
+        // antialiasing off, unlike the resizes inside the tracker.
         self.resampler = BilinearResampler(
             sourceWidth: lowResolutionSize, sourceHeight: lowResolutionSize,
             destinationWidth: videoWidth, destinationHeight: videoHeight,
@@ -55,16 +54,14 @@ struct MaskPostprocessor {
             pixels: videoWidth * videoHeight, scratchCount: resampler.scratchCount)
     }
 
-    /// Reads the session's prompt map and hidden-object set, so it shares the frame loop's
-    /// isolation rather than taking copies of both per frame.
+    /// Reads the session's prompt map and hidden-object set directly, sharing the frame
+    /// loop's isolation so neither needs copying per frame.
     @VideoSegmentationActor
     func postprocess(_ raw: RawFrameOutput, session: VideoInferenceSession) -> Postprocessed {
-        // Sorted ids, so output order is stable frame to frame regardless of how the
-        // registry happens to be arranged.
+        // Sorted ids keep output order stable frame to frame, whatever order the registry
+        // holds.
         let candidates = raw.maskLogitsByObjectID.keys.sorted()
         guard !candidates.isEmpty else { return Postprocessed() }
-
-        let hidden = raw.suppressedObjectIDs.union(session.hotstartRemovedObjectIDs)
 
         var ids: [Int] = []
         var masks: [MaskBitset] = []
@@ -74,12 +71,14 @@ struct MaskPostprocessor {
         var lowResolution: [[Float]] = []
 
         for objectID in candidates {
-            guard !hidden.contains(objectID) else { continue }
+            guard !raw.suppressedObjectIDs.contains(objectID),
+                !session.hotstartRemovedObjectIDs.contains(objectID)
+            else { continue }
             guard let logits = raw.maskLogitsByObjectID[objectID] else { continue }
             resampler.resample(logits, into: &buffers.upsampled, scratch: &buffers.scratch)
             let mask = MaskBitset(
                 thresholding: buffers.upsampled, width: videoWidth, height: videoHeight)
-            // Objects whose mask upsampled to nothing are dropped, not reported empty.
+            // An object whose mask upsampled to nothing is dropped from the frame.
             guard !mask.isEmpty else { continue }
 
             ids.append(objectID)
@@ -91,12 +90,11 @@ struct MaskPostprocessor {
         }
         guard !ids.isEmpty else { return Postprocessed() }
 
-        // Boxes come from the masks before overlap resolution. Upstream computes
-        // `masks_to_boxes` and only then applies the non-overlap constraint, so a box can be
-        // slightly larger than the mask it labels. Kept that way for parity.
+        // Upstream boxes the masks before resolving overlap, so a box can be slightly
+        // larger than the mask it labels.
         let boxes = masks.map(\.boundingBox)
 
-        // Overlaps are resolved by tracker score, not detection score.
+        // Overlaps are resolved by tracker score, matching upstream.
         OcclusionSuppressor.applyObjectWiseNonOverlap(
             masks: &masks, scores: trackerScores, promptIDs: promptIDs)
 

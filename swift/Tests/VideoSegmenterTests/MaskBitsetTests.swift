@@ -121,4 +121,20 @@ struct MaskBitsetTests {
         #expect(restored == original)
         #expect(restored.area == original.area)
     }
+
+    @Test("Thresholding a slice matches thresholding the equivalent array")
+    func sliceMatchesArray() {
+        // The slice initializer packs straight out of the slice's own buffer, so this pins
+        // that it still starts at the slice's lower bound.
+        let stacked = (0..<48).map { Float($0 % 12) - 5.5 }
+        let second = stacked[12..<24]
+        #expect(
+            MaskBitset(thresholding: second, width: 4, height: 3)
+                == MaskBitset(thresholding: Array(second), width: 4, height: 3))
+
+        let third = stacked[24..<36]
+        #expect(
+            MaskBitset(thresholding: third, width: 4, height: 3, above: -2)
+                == MaskBitset(thresholding: Array(third), width: 4, height: 3, above: -2))
+    }
 }

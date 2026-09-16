@@ -28,9 +28,9 @@ import Foundation
 /// ## Hotstart delay
 ///
 /// SAM 3 buffers its first `hotstartDelay` frames (15 by default) before emitting anything,
-/// because a track it removes on frame 20 must never have been shown on frame 8. The decoded
-/// frames are held too, roughly 124 MB at 1080p. Set `hotstartDelay` to 0 to disable both the
-/// delay and the removal rules that need it.
+/// so that a track it removes on frame 20 was never shown on frame 8. That costs roughly
+/// 124 MB at 1080p. Set `hotstartDelay` to 0 to turn off both the delay and the removal
+/// rules that depend on it.
 @VideoSegmentationActor
 public final class VideoSegmenter: ResourceManaging {
     private let bundle: VideoSegmenterBundle
@@ -41,6 +41,8 @@ public final class VideoSegmenter: ResourceManaging {
     private var shapes: VideoSegmentationEngine.Shapes?
     private var packer: MemoryBankPacker?
     private var tracker: TrackerLoop?
+    /// In-flight load, so concurrent callers build one packer and tracker between them.
+    private var loadTask: Task<Void, Error>?
 
     /// Cumulative wall clock per Core AI entrypoint from the most recent run.
     public private(set) var lastRunTimings: [String: Double] = [:]
@@ -49,16 +51,16 @@ public final class VideoSegmenter: ResourceManaging {
     ///
     /// - Parameters:
     ///   - path: Bundle directory holding `metadata.json`, the `.aimodel`, and `tokenizer/`.
-    ///   - parameters: Overrides applied *under* the bundle's own `tracking` block, so a
-    ///     bundle that declares its thresholds still wins. Pass per-run overrides to
-    ///     ``segment(videoAt:prompts:maxFrames:parameters:)`` instead.
+    ///   - parameters: Overrides applied under the bundle's own `tracking` block, so a
+    ///     bundle that declares its thresholds wins. For per-run overrides, see
+    ///     ``segment(videoAt:prompts:maxFrames:parameters:)``.
     public init(
         resourcesAt path: String,
         parameters: VideoSegmentationParameters = .default
     ) async throws {
         let bundle = try VideoSegmenterBundle(from: path)
         self.bundle = bundle
-        self.parameters = bundle.parameters(overriding: parameters)
+        self.parameters = try bundle.parameters(overriding: parameters)
         self.tokenizer = try CLIPTokenizer(folder: bundle.tokenizerFolder)
         self.engine = VideoSegmentationEngine(modelURL: bundle.modelURL)
     }
@@ -66,6 +68,19 @@ public final class VideoSegmenter: ResourceManaging {
     /// Load and specialize the asset. Called implicitly on first use.
     public func loadResources() async throws {
         guard shapes == nil else { return }
+        if let loadTask { return try await loadTask.value }
+        let task = Task { try await performLoad() }
+        loadTask = task
+        do {
+            try await task.value
+        } catch {
+            loadTask = nil
+            throw error
+        }
+        loadTask = nil
+    }
+
+    private func performLoad() async throws {
         try await engine.loadResources()
         guard let resolved = await engine.shapes else {
             throw VideoSegmentationError.invalidConfiguration(
@@ -86,25 +101,32 @@ public final class VideoSegmenter: ResourceManaging {
                     + "/ \(resolved.textSequenceLength).")
         }
 
-        let packed = try await MemoryBankPacker.makePacked(engine: engine)
-        let packer = try MemoryBankPacker(
-            shapes: resolved, parameters: parameters, packed: packed)
+        let packer = try await makePacker(shapes: resolved, parameters: parameters)
         self.shapes = resolved
         self.packer = packer
         self.tracker = TrackerLoop(
             engine: engine, shapes: resolved, parameters: parameters, packer: packer)
     }
 
+    /// Allocate a memory bank at `shapes` and wrap it in a packer for `parameters`.
+    private func makePacker(
+        shapes: VideoSegmentationEngine.Shapes, parameters: VideoSegmentationParameters
+    ) async throws -> MemoryBankPacker {
+        let packed = try await MemoryBankPacker.makePacked(engine: engine)
+        return try MemoryBankPacker(shapes: shapes, parameters: parameters, packed: packed)
+    }
+
     /// Release the asset. The next call reloads it.
     public func unloadResources() async {
+        loadTask?.cancel()
+        loadTask = nil
         await engine.unloadResources()
         shapes = nil
         packer = nil
         tracker = nil
     }
 
-    /// Run every entrypoint once on zeros, so the first frame isn't paying for kernel
-    /// compilation.
+    /// Load the asset, then run ``VideoSegmentationEngine/warmup()``.
     public func warmup() async throws {
         try await loadResources()
         try await engine.warmup()
@@ -112,9 +134,9 @@ public final class VideoSegmenter: ResourceManaging {
 
     /// Segment and track `prompts` through an already-decoded frame sequence.
     ///
-    /// The frames are consumed in the order given and their indices are their positions. Use
-    /// this to hold the video decoder constant: AVFoundation and PyAV disagree by about 0.65
-    /// code values on average even on colour-tagged media, enough to move a mask boundary.
+    /// The frames are consumed in the order given and their indices are their positions.
+    /// Use this to hold the video decoder constant. See ``ParityReference`` for the size of
+    /// the AVFoundation/PyAV difference.
     public nonisolated func segment(
         frames: [CGImage],
         prompts: [String],
@@ -125,11 +147,10 @@ public final class VideoSegmenter: ResourceManaging {
 
     /// Segment and track `prompts` through the video at `url`, one result per frame.
     ///
-    /// Results arrive in frame order but lag the decoder by `hotstartDelay` frames; the
+    /// Results arrive in frame order but lag the decoder by `hotstartDelay` frames. The
     /// backlog is flushed when the video ends.
     ///
-    /// Nonisolated so a caller can start the stream without an `await`: the frame loop it
-    /// spawns hops onto the actor, and everything read here is immutable.
+    /// Nonisolated so a caller can start the stream without an `await`.
     public nonisolated func segment(
         videoAt url: URL,
         prompts: [String],
@@ -145,21 +166,16 @@ public final class VideoSegmenter: ResourceManaging {
         maxFrames: Int?,
         overrides: VideoSegmentationParameters?
     ) -> AsyncThrowingStream<VideoSegmentationFrame, Error> {
-        AsyncThrowingStream { continuation in
-            let task = Task {
-                do {
-                    try await run(
-                        source: source, prompts: prompts, maxFrames: maxFrames,
-                        parameters: overrides ?? self.parameters,
-                        emit: { continuation.yield($0) })
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
-                }
-            }
-            continuation.onTermination = { _ in task.cancel() }
+        backpressuredStream(depth: Self.streamDepth) { yield in
+            try await self.run(
+                source: source, prompts: prompts, maxFrames: maxFrames, overrides: overrides,
+                emit: yield)
         }
     }
+
+    /// Unconsumed frames the stream will hold. Each carries a decoded `CGImage`. This is the
+    /// knob that keeps a slow consumer from growing the backlog without limit.
+    private nonisolated static let streamDepth = 4
 
     /// Where a run's frames come from.
     private enum FrameSource {
@@ -189,14 +205,21 @@ public final class VideoSegmenter: ResourceManaging {
             frameRate: max(1, Int(metadata.nominalFrameRate.rounded())))
 
         var written = 0
-        // Encoding is serialized behind the writer actor while the next frame's inference
-        // runs, so the two overlap without an explicit pipeline.
-        for try await frame in segment(
-            videoAt: source, prompts: prompts, maxFrames: maxFrames, parameters: effective)
-        {
-            await onFrame?(frame)
-            try await writer.append(renderer.render(frame.objects, onto: frame.image))
-            written += 1
+        // Encoding serializes behind the writer actor while the next frame's inference runs,
+        // so the two overlap with no explicit pipeline.
+        do {
+            for try await frame in segment(
+                videoAt: source, prompts: prompts, maxFrames: maxFrames, parameters: effective)
+            {
+                await onFrame?(frame)
+                try await writer.append(renderer.render(frame.objects, onto: frame.image))
+                written += 1
+            }
+        } catch {
+            // An unfinished AVAssetWriter leaves a file with no moov atom, so close it before
+            // the error propagates. `finish()` is idempotent.
+            _ = try? await writer.finish()
+            throw error
         }
         try await writer.finish()
         return written
@@ -206,19 +229,31 @@ public final class VideoSegmenter: ResourceManaging {
 
     /// Port of `Sam3VideoModel.propagate_in_video_iterator`, forward only.
     ///
-    /// Reverse propagation is plumbed through the heuristics but has no entry point here: it
-    /// needs the whole video resident, which is the opposite of how this streams.
+    /// Reverse propagation is plumbed through the heuristics but has no entry point here,
+    /// since it would need the whole video resident.
     private func run(
         source: FrameSource,
         prompts: [String],
         maxFrames: Int?,
-        parameters: VideoSegmentationParameters,
-        emit: (VideoSegmentationFrame) -> Void
+        overrides: VideoSegmentationParameters?,
+        emit: (VideoSegmentationFrame) async -> Void
     ) async throws {
         guard !prompts.isEmpty else { throw VideoSegmentationError.noPrompts }
         try await loadResources()
-        guard let shapes, let tracker else {
+        guard let shapes, let tracker = self.tracker else {
             throw VideoSegmentationError.invalidConfiguration("Engine failed to initialize.")
+        }
+        let parameters = overrides ?? self.parameters
+
+        // `packer` and `tracker` were built from the loaded parameters. Both read tracking
+        // knobs, so per-run overrides need their own pair.
+        let runTracker: TrackerLoop
+        if let overrides {
+            let packer = try await makePacker(shapes: shapes, parameters: overrides)
+            runTracker = TrackerLoop(
+                engine: engine, shapes: shapes, parameters: overrides, packer: packer)
+        } else {
+            runTracker = tracker
         }
 
         let width: Int
@@ -247,13 +282,13 @@ public final class VideoSegmenter: ResourceManaging {
         }
 
         let processor = FrameProcessor(
-            engine: engine, shapes: shapes, parameters: parameters, tracker: tracker)
+            engine: engine, shapes: shapes, parameters: parameters, tracker: runTracker)
         let postprocessor = MaskPostprocessor(
             lowResolutionSize: shapes.lowResMaskSize, videoWidth: width, videoHeight: height,
             emitLowResolutionMasks: parameters.emitLowResolutionMasks)
 
-        // The hotstart buffer holds decoded frames as well as results: the renderer needs
-        // the source image, and re-decoding it later would mean a second pass over the file.
+        // The hotstart buffer holds decoded frames alongside results, since the renderer
+        // needs the source image and re-decoding would mean a second pass over the file.
         var buffer: [(raw: RawFrameOutput, image: CGImage, elapsed: Duration)] = []
 
         func handle(_ image: CGImage, index: Int) async throws {
@@ -265,13 +300,13 @@ public final class VideoSegmenter: ResourceManaging {
             let elapsed = ContinuousClock.now - started
 
             guard parameters.hotstartEnabled else {
-                emit(finish(raw, image, elapsed))
+                await emit(finish(raw, image, elapsed))
                 return
             }
             buffer.append((raw, image, elapsed))
             if buffer.count >= parameters.hotstartDelay {
                 let (oldest, oldestImage, oldestElapsed) = buffer.removeFirst()
-                emit(finish(oldest, oldestImage, oldestElapsed))
+                await emit(finish(oldest, oldestImage, oldestElapsed))
             }
         }
 
@@ -298,11 +333,10 @@ public final class VideoSegmenter: ResourceManaging {
             }
         }
 
-        // End of video: flush whatever the delay is still holding. Postprocessed last on
-        // purpose, so `hotstartRemovedObjectIDs` has seen every removal and a track removed
+        // Flush whatever the delay is still holding. Postprocessed last, so a track dropped
         // at the very end is hidden in the buffered frames too.
         for (raw, image, elapsed) in buffer {
-            emit(finish(raw, image, elapsed))
+            await emit(finish(raw, image, elapsed))
         }
         lastRunTimings = processor.timings
     }

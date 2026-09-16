@@ -9,9 +9,8 @@ import Foundation
 /// A `kind: video_segmenter` model bundle: the asset, the tokenizer, and the slot
 /// geometry the host has to pack memory to.
 ///
-/// The `runtime` block is required: the host builds fixed-capacity memory-bank tensors whose
-/// shapes must match what the graph was traced with, and a hardcoded default would break
-/// silently the moment somebody re-exports with `--spatial-slots`.
+/// The `runtime` block is required. The host builds fixed-capacity memory-bank tensors that
+/// have to match what the graph was traced with, and `--spatial-slots` makes that per-export.
 ///
 /// The `tracking` block is optional and carries the `Sam3VideoConfig` thresholds. A bundle
 /// without it gets ``VideoSegmentationParameters``'s defaults.
@@ -52,9 +51,15 @@ public struct VideoSegmenterBundle: Sendable {
         self.modelURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.main)
         self.tokenizerFolder = bundle.bundlePath.appending(path: "tokenizer")
 
-        guard let runtime = try? JSONDecoder().decode(RuntimeEnvelope.self, from: bundle.raw),
-            let geometry = runtime.runtime
-        else {
+        let runtime: RuntimeEnvelope
+        do {
+            runtime = try JSONDecoder().decode(RuntimeEnvelope.self, from: bundle.raw)
+        } catch {
+            throw VideoSegmentationError.invalidConfiguration(
+                "\(bundle.bundlePath.lastPathComponent)/metadata.json has a malformed 'runtime' "
+                    + "block: \(error)")
+        }
+        guard let geometry = runtime.runtime else {
             throw VideoSegmentationError.invalidConfiguration(
                 "\(bundle.bundlePath.lastPathComponent)/metadata.json has no 'runtime' block. "
                     + "A video_segmenter bundle must declare image_size, spatial_slots, "
@@ -71,12 +76,22 @@ public struct VideoSegmenterBundle: Sendable {
 
     /// Parameters with any `tracking` overrides from metadata.json applied on top of
     /// `base`. Absent keys keep their value from `base`.
-    public func parameters(overriding base: VideoSegmentationParameters = .default)
+    ///
+    /// - Throws: ``VideoSegmentationError/invalidConfiguration(_:)`` when a `tracking` block
+    ///   is present but malformed, so a bad threshold surfaces rather than silently reverting
+    ///   to a default.
+    public func parameters(overriding base: VideoSegmentationParameters = .default) throws
         -> VideoSegmentationParameters
     {
-        guard let envelope = try? JSONDecoder().decode(TrackingEnvelope.self, from: bundle.raw),
-            let tracking = envelope.tracking
-        else { return base }
+        let envelope: TrackingEnvelope
+        do {
+            envelope = try JSONDecoder().decode(TrackingEnvelope.self, from: bundle.raw)
+        } catch {
+            throw VideoSegmentationError.invalidConfiguration(
+                "\(bundle.bundlePath.lastPathComponent)/metadata.json has a malformed 'tracking' "
+                    + "block: \(error)")
+        }
+        guard let tracking = envelope.tracking else { return base }
 
         var parameters = base
         func apply<T>(_ value: T?, _ field: WritableKeyPath<VideoSegmentationParameters, T>) {
@@ -122,8 +137,8 @@ public struct VideoSegmenterBundle: Sendable {
         let tracking: Tracking?
     }
 
-    /// Every field optional so a partial `tracking` block is legal and an unfamiliar key
-    /// from a newer exporter is ignored rather than fatal.
+    /// Every field optional, so a partial `tracking` block is legal and an unfamiliar key
+    /// from a newer exporter is skipped.
     private struct Tracking: Decodable {
         let scoreThresholdDetection: Float?
         let detNmsThresh: Float?

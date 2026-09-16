@@ -26,7 +26,7 @@ public enum VideoSegmentationError: Error, CustomStringConvertible, LocalizedErr
         case .missingOutput(let function, let name):
             return "'\(function)' returned no output named '\(name)'."
         case .shapeMismatch(let function, let input, let expected, let actual):
-            // Detailed because a shape mismatch SIGKILLs the process with no traceback.
+            // Spelled out, since a shape mismatch SIGKILLs with no traceback of its own.
             return
                 "\(function): input '\(input)' has shape \(actual), but the graph was traced "
                 + "with \(expected)."

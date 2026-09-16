@@ -21,14 +21,11 @@ struct PackedMemory {
 /// Selects each object's eligible memories and packs them into the graph's fixed slots.
 ///
 /// HF builds the tracker's memory with a variable-length `torch.cat`. A traced graph takes
-/// one shape, so this uses a fixed bank plus an additive key mask. Packing valid entries at
-/// the front in any order is safe because cross-attention is permutation-invariant over keys,
-/// RoPE repeats the same per-slot pattern across spatial slots, and masked slots contribute
-/// nothing.
+/// one shape, so this uses a fixed bank plus an additive key mask. Slot order carries no
+/// meaning, since cross-attention is permutation-invariant over keys.
 ///
-/// `gatherMemoryFrames` and `objectPointers` are ports of `_gather_memory_frame_outputs` and
-/// `_get_object_pointers`, so which memories are eligible cannot drift from upstream even
-/// though the layout does.
+/// Only the layout diverges from upstream. `gatherMemoryFrames` and `objectPointers` port
+/// `_gather_memory_frame_outputs` and `_get_object_pointers`.
 @VideoSegmentationActor
 final class MemoryBankPacker {
     private let shapes: VideoSegmentationEngine.Shapes
@@ -37,8 +34,8 @@ final class MemoryBankPacker {
     /// Slots written on the previous call, so only those need clearing on this one.
     private var previousSpatialSlots = 0
     private var previousPointerSlots = 0
-    /// Emitted at most once per video: the condition is a property of the export, not of the
-    /// frame, so repeating it per object would bury the log.
+    /// Emitted at most once per video. The condition belongs to the export, so a per-object
+    /// repeat would bury the log.
     private var warnedAboutPointerOverflow = false
 
     private var spatialSlotElements: Int { shapes.memoryTokenCount * shapes.memoryDim }
@@ -53,9 +50,25 @@ final class MemoryBankPacker {
         self.parameters = parameters
         self.packed = packed
 
-        // The spatial half of the bank is exact, not a budget: HF can populate at most
-        // `max_cond_frame_num` conditioning memories plus `num_maskmem - 1` recent ones.
-        // An asset exported with fewer slots would silently drop real memories, so refuse.
+        // `temporalIndex` takes `offset - 1` modulo this, and a conditioning frame arrives
+        // with offset 0.
+        guard parameters.numMaskmem > 0 else {
+            throw VideoSegmentationError.invalidConfiguration(
+                "num_maskmem must be positive, got \(parameters.numMaskmem).")
+        }
+        // Upstream `_select_closest_cond_frames` honours the cap only after taking the
+        // nearest conditioning frame on each side of the current one. A cap below 2 therefore
+        // still yields 2 entries. A cap of -1 means unbounded, which a fixed bank cannot
+        // express.
+        guard parameters.maxCondFrameNum >= 2 else {
+            throw VideoSegmentationError.invalidConfiguration(
+                "max_cond_frame_num must be at least 2 for a fixed-slot memory bank, got "
+                    + "\(parameters.maxCondFrameNum).")
+        }
+
+        // The spatial half of the bank is an exact count: HF populates at most
+        // `max_cond_frame_num` conditioning memories plus `num_maskmem - 1` recent ones. An
+        // asset exported with fewer slots would silently drop real memories.
         let required = parameters.maxCondFrameNum + parameters.numMaskmem - 1
         guard shapes.spatialSlots >= required else {
             throw VideoSegmentationError.unsupportedGeometry(
@@ -82,8 +95,8 @@ final class MemoryBankPacker {
 
     /// Fill the bank for one object on one frame and hand back the shared tensors.
     ///
-    /// The returned `PackedMemory` aliases this packer's storage, so it is only valid until
-    /// the next `pack` call, which is exactly the lifetime `tracker_step` needs.
+    /// The returned `PackedMemory` aliases this packer's storage and stays valid until the
+    /// next `pack` call, which is the lifetime `tracker_step` needs.
     func pack(
         history: ObjectOutputHistory,
         objectIndex: Int,
@@ -129,7 +142,7 @@ final class MemoryBankPacker {
             slot += 1
         }
 
-        // Clear whatever the previous object left in the slots this one does not use.
+        // Clear the slots the previous object filled beyond this one's count.
         if slot < previousSpatialSlots {
             let range = (slot * spatialSlotElements)..<(previousSpatialSlots * spatialSlotElements)
             clearHalfRegion(&packed.spatialMemory, range)
@@ -143,18 +156,18 @@ final class MemoryBankPacker {
 
     /// Row of `memory_temporal_positional_encoding` a memory at `offset` should use.
     ///
-    /// HF indexes it as `[relative_temporal_offset - 1]`. Conditioning frames arrive with
-    /// offset 0, so that is Python's `[-1]`, the last row rather than an error. Swift has no
-    /// negative indexing and the graph gathers with a plain index, so wrap into range here.
+    /// HF indexes it as `[relative_temporal_offset - 1]`. A conditioning frame at offset 0
+    /// therefore reads Python's `[-1]`, the last row. The graph has no negative indexing, so
+    /// the wrap happens here.
     nonisolated static func temporalIndex(forOffset offset: Int, numMaskmem: Int) -> Int {
         ((offset - 1) % numMaskmem + numMaskmem) % numMaskmem
     }
 
     /// Port of `Sam3TrackerVideoModel._gather_memory_frame_outputs`.
     ///
-    /// Returns `(relativeTemporalOffset, output)` pairs. Conditioning frames carry offset 0;
-    /// recent frames carry their distance. A `nil` output is a gap the caller skips, kept in
-    /// the list so the offsets stay attached to the right entries.
+    /// Returns `(relativeTemporalOffset, output)` pairs. Conditioning frames carry offset 0
+    /// and recent frames carry their distance. A `nil` output marks a gap the caller skips,
+    /// held in the list to keep each offset attached to its entry.
     static func gatherMemoryFrames(
         history: ObjectOutputHistory,
         frameIndex: Int,
@@ -167,9 +180,9 @@ final class MemoryBankPacker {
         var entries: [(offset: Int, output: StoredFrameOutput?)] = selected.map {
             (0, history.conditioning[$0])
         }
-        // Most recent last, matching upstream's `range(num_maskmem - 1, 0, -1)`. Order is
-        // irrelevant to the packed bank but preserved so a slot-by-slot comparison against a
-        // reference lines up.
+        // Most recent last, matching upstream's `range(num_maskmem - 1, 0, -1)`. The packed
+        // bank is order-insensitive. Preserving the order keeps a slot-by-slot reference
+        // comparison aligned.
         for offset in stride(from: parameters.numMaskmem - 1, to: 0, by: -1) {
             let previousFrame = reverse ? frameIndex + offset : frameIndex - offset
             let output =
@@ -216,9 +229,9 @@ final class MemoryBankPacker {
             reverse: reverse, parameters: parameters)
 
         if pointers.count > shapes.ptrSlots {
-            // The spatial half of the bank is exactly sized, but this half is a budget:
-            // HF's conditioning-frame pointer branch has no cap, so a long video with
-            // frequent reconditioning can exceed it. Keep the temporally closest.
+            // This half of the bank is a budget rather than an exact count. HF's
+            // conditioning-frame pointer branch is uncapped, so a long video with frequent
+            // reconditioning can overflow it. Keep the temporally closest.
             if !warnedAboutPointerOverflow {
                 warnedAboutPointerOverflow = true
                 CLILogger.log(
@@ -237,7 +250,7 @@ final class MemoryBankPacker {
         }
 
         // Upstream divides by `max_object_pointers_to_use - 1`, which is zero on a
-        // single-frame video. Clamp rather than emit infinities into the graph.
+        // single-frame video. Clamped to 1 to keep infinities out of the graph.
         let maxTemporalDifference = Float(max(1, maxPointers - 1))
         var temporalPositions = [Float](repeating: 0, count: shapes.ptrSlots)
         var valid = [Float](repeating: 0, count: shapes.ptrSlots)
@@ -273,8 +286,8 @@ final class MemoryBankPacker {
         var offsets: [Int] = []
         var pointers: [NDArray] = []
 
-        // Conditioning frames, in registration order, restricted to the past (or the
-        // future when tracking backwards). HF does this whenever `not self.training`.
+        // Conditioning frames in registration order, limited to the past. Tracking backwards
+        // limits them to the future instead. Matches HF's `not self.training` branch.
         for frame in history.conditioningOrder {
             let eligible = reverse ? frame >= frameIndex : frame <= frameIndex
             guard eligible, let output = history.conditioning[frame] else { continue }
@@ -282,9 +295,8 @@ final class MemoryBankPacker {
             pointers.append(output.objectPointer)
         }
 
-        // Then a contiguous look-back over non-conditioning frames. The `break` on an
-        // out-of-range index is upstream's, and it stops the scan rather than skipping, so
-        // a video boundary truncates the pointer set.
+        // Then a contiguous look-back over non-conditioning frames. Upstream `break`s on an
+        // out-of-range index, so a video boundary truncates the pointer set.
         for difference in 1..<max(1, maxPointers) {
             let reference = reverse ? frameIndex + difference : frameIndex - difference
             if reference < 0 || reference >= totalFrames { break }
@@ -308,9 +320,8 @@ final class MemoryBankPacker {
         #endif
     }
 
-    /// Wipe slots that were valid on the previous call and are not on this one. Stale slots
-    /// are harmless numerically, since the key mask suppresses them, but they make a parity
-    /// divergence hard to reason about.
+    /// Wipe slots that were valid on the previous call and are not on this one. The key mask
+    /// already suppresses them numerically, but clearing keeps a parity divergence readable.
     private func clearHalfRegion(_ array: inout NDArray, _ range: Range<Int>) {
         #if !((os(macOS) || targetEnvironment(macCatalyst)) && arch(x86_64))
         fillNDArray(&array, as: Float16.self, elementRange: range, with: 0)

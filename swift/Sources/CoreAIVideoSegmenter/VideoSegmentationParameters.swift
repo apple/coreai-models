@@ -9,9 +9,9 @@ import Foundation
 /// Runtime knobs for video segmentation.
 ///
 /// The tracking fields mirror `transformers.Sam3VideoConfig` field for field, defaults
-/// included, because the exported asset holds only tensor kernels; every threshold below
-/// governs host-side logic that HF reads off the model config at load time. A bundle can
-/// override them through a `tracking` block in its `metadata.json`.
+/// included. Every threshold below governs host-side logic that HF reads off the model
+/// config at load time. A bundle can override them through a `tracking` block in its
+/// `metadata.json`.
 public struct VideoSegmentationParameters: Sendable {
     // MARK: - Detection
 
@@ -20,9 +20,8 @@ public struct VideoSegmentationParameters: Sendable {
 
     /// Mask-IoU threshold for detection NMS. `det_nms_thresh`. Zero disables NMS.
     ///
-    /// HF runs NMS through an optional `kernels-community/cv-utils` kernel and silently
-    /// keeps every above-threshold detection when it isn't installed. Set this to 0 when
-    /// comparing against a Python run that was missing the kernel.
+    /// HF runs NMS through an optional `kernels-community/cv-utils` kernel and keeps every
+    /// above-threshold detection without it. Set this to 0 to compare against such a run.
     public var detNmsThresh: Float = 0.1
 
     /// Probability threshold for promoting a detection to a new tracked object.
@@ -47,16 +46,16 @@ public struct VideoSegmentationParameters: Sendable {
 
     // MARK: - Reconditioning
 
-    /// Recondition every Nth frame; 0 disables. `recondition_every_nth_frame`.
+    /// Recondition every Nth frame, or 0 to disable. `recondition_every_nth_frame`.
     public var reconditionEveryNthFrame: Int = 16
 
-    /// True strengthens memory with the tracked mask (detector as validation); false
-    /// replaces it with the detection mask (detector as correction).
+    /// True strengthens memory with the tracked mask, treating the detector as validation.
+    /// False replaces it with the detection mask, treating the detector as correction.
     /// `recondition_on_trk_masks`.
     ///
-    /// Defaults to the checkpoint's value, not the class's: `Sam3VideoConfig` declares `True`
-    /// but `facebook/sam3`'s `config.json` sets it to `False`, the only field where the two
-    /// disagree. Bundles exported with a `tracking` block carry the real value.
+    /// Defaults to the checkpoint's value: `Sam3VideoConfig` declares `True` while
+    /// `facebook/sam3`'s `config.json` sets `False`, the one field where the two disagree.
+    /// Bundles with a `tracking` block carry the exported value.
     public var reconditionOnTrkMasks: Bool = false
 
     // MARK: - Hotstart
@@ -84,7 +83,7 @@ public struct VideoSegmentationParameters: Sendable {
     /// Floor for the keep-alive counter. `min_trk_keep_alive`.
     public var minTrkKeepAlive: Int = -1
 
-    /// Decrement keep-alive for tracks the tracker returned empty. Off upstream.
+    /// Decrement keep-alive for tracks the tracker returned empty. Upstream default is off.
     /// `decrease_trk_keep_alive_for_empty_masklets`.
     public var decreaseTrkKeepAliveForEmptyMasklets: Bool = false
 
@@ -99,9 +98,8 @@ public struct VideoSegmentationParameters: Sendable {
 
     // MARK: - Tracker memory geometry
 
-    // These three come from `Sam3TrackerVideoConfig`, not `Sam3VideoConfig`. The exported
-    // asset pins their sum (`spatial_slots` is `max_cond_frame_num + num_maskmem - 1`) but
-    // not the split, so they have to be carried separately.
+    // These three come from `Sam3TrackerVideoConfig`. The exported asset pins their sum
+    // as `spatial_slots` but leaves the split open, so each is carried separately.
 
     /// Total mask-memory frames: the current one plus `num_maskmem - 1` recent.
     /// `num_maskmem`.
@@ -118,7 +116,7 @@ public struct VideoSegmentationParameters: Sendable {
     /// Maximum area of a connected component that gets filled (background) or removed
     /// (foreground). `fill_hole_area`. Zero disables both.
     ///
-    /// Like ``detNmsThresh``, HF no-ops this without `kernels-community/cv-utils`.
+    /// Like ``detNmsThresh``, HF no-ops this when `kernels-community/cv-utils` is absent.
     public var fillHoleArea: Int = 16
 
     // MARK: - Preprocessing
@@ -149,8 +147,8 @@ public struct VideoSegmentationParameters: Sendable {
     /// Also report each object's mask logits at the model's own resolution, before the
     /// upsample to video size.
     ///
-    /// Off by default because it is 82,944 floats per object per frame. On, it separates a
-    /// tracker disagreement from an upsampling one.
+    /// Off by default, at 82,944 floats per object per frame. On, it separates a tracker
+    /// disagreement from an upsampling one.
     public var emitLowResolutionMasks: Bool = false
 
     public init() {}

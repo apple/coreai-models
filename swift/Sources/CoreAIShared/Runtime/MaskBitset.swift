@@ -8,9 +8,8 @@ import Foundation
 
 /// A binary mask packed one pixel per bit, row-major.
 ///
-/// Tracking is dominated by set arithmetic over masks: association, NMS and occlusion
-/// suppression are all pairwise IoU matrices, and each runs once per frame. Packed, both
-/// intersection and union fall out of `nonzeroBitCount` without needing Accelerate.
+/// Association, NMS and occlusion suppression are all pairwise IoU matrices, each run once
+/// per frame. Packed, intersection and union both reduce to `nonzeroBitCount`.
 public struct MaskBitset: Sendable, Equatable {
     public let width: Int
     public let height: Int
@@ -25,32 +24,14 @@ public struct MaskBitset: Sendable, Equatable {
 
     /// Threshold a row-major float buffer: `value > threshold` becomes a set bit.
     ///
-    /// The comparison is strictly greater to match HF, which binarizes mask logits with
-    /// `mask > 0` throughout; `>=` would flip every exactly-zero pixel.
+    /// Strictly greater, matching HF's `mask > 0` binarization; `>=` would set every
+    /// exactly-zero pixel.
     public init(thresholding values: [Float], width: Int, height: Int, above threshold: Float = 0) {
         self.init(width: width, height: height)
         precondition(
             values.count >= width * height,
             "MaskBitset needs \(width * height) values, got \(values.count)")
-        let count = width * height
-        words.withUnsafeMutableBufferPointer { output in
-            values.withUnsafeBufferPointer { input in
-                var index = 0
-                var wordIndex = 0
-                while index < count {
-                    let end = min(index + 64, count)
-                    var word: UInt64 = 0
-                    var bit: UInt64 = 1
-                    for i in index..<end {
-                        if input[i] > threshold { word |= bit }
-                        bit <<= 1
-                    }
-                    output[wordIndex] = word
-                    wordIndex += 1
-                    index = end
-                }
-            }
-        }
+        values.withUnsafeBufferPointer { setBits(from: $0, above: threshold) }
     }
 
     /// Threshold a sub-range of a larger row-major buffer, one mask out of a stacked
@@ -58,15 +39,47 @@ public struct MaskBitset: Sendable, Equatable {
     public init(
         thresholding values: ArraySlice<Float>, width: Int, height: Int, above threshold: Float = 0
     ) {
-        self.init(thresholding: Array(values), width: width, height: height, above: threshold)
+        self.init(width: width, height: height)
+        precondition(
+            values.count >= width * height,
+            "MaskBitset needs \(width * height) values, got \(values.count)")
+        values.withUnsafeBufferPointer { setBits(from: $0, above: threshold) }
+    }
+
+    /// Shared body of the thresholding initializers, taking the buffer both `Array` and
+    /// `ArraySlice` expose so a slice packs from its own storage.
+    private mutating func setBits(from input: UnsafeBufferPointer<Float>, above threshold: Float) {
+        let count = width * height
+        words.withUnsafeMutableBufferPointer { output in
+            var index = 0
+            var wordIndex = 0
+            while index < count {
+                let end = min(index + 64, count)
+                var word: UInt64 = 0
+                var bit: UInt64 = 1
+                for i in index..<end {
+                    if input[i] > threshold { word |= bit }
+                    bit <<= 1
+                }
+                output[wordIndex] = word
+                wordIndex += 1
+                index = end
+            }
+        }
     }
 
     public subscript(x: Int, y: Int) -> Bool {
         get {
+            precondition(
+                x >= 0 && x < width && y >= 0 && y < height,
+                "MaskBitset(\(x), \(y)) is outside \(width)x\(height)")
             let index = y * width + x
             return words[index >> 6] & (1 << UInt64(index & 63)) != 0
         }
         set {
+            precondition(
+                x >= 0 && x < width && y >= 0 && y < height,
+                "MaskBitset(\(x), \(y)) is outside \(width)x\(height)")
             let index = y * width + x
             if newValue {
                 words[index >> 6] |= 1 << UInt64(index & 63)
@@ -90,8 +103,8 @@ public struct MaskBitset: Sendable, Equatable {
 
     /// Intersection over union, matching `modeling_sam3_video.mask_iou`.
     ///
-    /// HF clamps the union to a minimum of 1, so empty-vs-empty scores 0 rather than
-    /// dividing by zero. Association therefore treats two empty masks as unrelated.
+    /// HF clamps the union to a minimum of 1, so empty-vs-empty scores 0 and association
+    /// reads two empty masks as unrelated.
     public func iou(_ other: MaskBitset) -> Float {
         precondition(
             width == other.width && height == other.height,
@@ -109,8 +122,8 @@ public struct MaskBitset: Sendable, Equatable {
 
     /// Tight bounding box of the set pixels, top-left origin. Empty masks give `.zero`.
     ///
-    /// `torchvision.ops.masks_to_boxes` reports inclusive extremes, so a single set pixel is
-    /// a zero-sized rect. Kept that way so the values compare directly against a reference.
+    /// `torchvision.ops.masks_to_boxes` reports inclusive extremes, so a single set pixel
+    /// gives a zero-sized rect. Matched here so the values compare against a reference.
     public var boundingBox: CGRect {
         var minX = width
         var minY = height
@@ -157,6 +170,9 @@ public struct MaskBitset: Sendable, Equatable {
     public init(packedBits: [UInt8], width: Int, height: Int) {
         self.init(width: width, height: height)
         let count = width * height
+        precondition(
+            packedBits.count >= (count + 7) / 8,
+            "MaskBitset needs \((count + 7) / 8) packed bytes, got \(packedBits.count)")
         for index in 0..<count {
             let byte = packedBits[index >> 3]
             if byte & (0x80 >> UInt8(index & 7)) != 0 {

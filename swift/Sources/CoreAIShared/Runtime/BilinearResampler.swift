@@ -9,12 +9,11 @@ import Foundation
 /// Separable bilinear resampling of a planar `Float` image, matching
 /// `torch.nn.functional.interpolate(mode: "bilinear", align_corners: false)`.
 ///
-/// Construct once per (source, destination) pair and reuse; the weight tables are the only
-/// setup cost. Per-frame callers should use `resample(_:into:scratch:)` — the allocating
-/// overload is a convenience, not the fast path.
+/// Construct once per (source, destination) pair and reuse it. Per-frame callers should take
+/// `resample(_:into:scratch:)` and pass in their own storage.
 ///
-/// `antialias` widens the filter when downsampling, the way PIL and
-/// `torchvision.transforms.Resize` do. Upsampling ignores it.
+/// `antialias` widens the filter when downsampling to match PIL and
+/// `torchvision.transforms.Resize`. Upsampling ignores it.
 public struct BilinearResampler: Sendable {
     public let sourceWidth: Int
     public let sourceHeight: Int
@@ -36,8 +35,7 @@ public struct BilinearResampler: Sendable {
         self.sourceHeight = sourceHeight
         self.destinationWidth = destinationWidth
         self.destinationHeight = destinationHeight
-        // Only the horizontal axis needs a control vector; the vertical pass walks whole
-        // contiguous rows and reads `starts`/`values` directly.
+        // Only the horizontal axis needs a control vector.
         self.horizontal = Weights(
             sourceSize: sourceWidth, destinationSize: destinationWidth, antialias: antialias,
             buildControlVector: true)
@@ -51,11 +49,8 @@ public struct BilinearResampler: Sendable {
         sourceWidth == destinationWidth && sourceHeight == destinationHeight
     }
 
-    /// True when the horizontal pass has to go the long way round. See `resampleTransposing`.
-    ///
-    /// This is the common case. Only a two-tap resize whose ratio is a binary fraction avoids
-    /// it, which in practice means the tracker's 4x mask upsamples on a patch-16 export; a
-    /// patch-14 export scales by 3.5 and transposes throughout.
+    /// True when the horizontal pass goes through `resampleTransposing` rather than
+    /// `applyAcrossRows`. The common case.
     private var transposes: Bool { horizontal.maxTaps > 2 || !horizontal.controlIsExact }
 
     /// Elements of caller-owned storage `resample(_:into:scratch:)` needs.
@@ -70,9 +65,8 @@ public struct BilinearResampler: Sendable {
 
     /// Resample a row-major `sourceHeight × sourceWidth` buffer into caller-owned storage.
     ///
-    /// `scratch` must hold at least `scratchCount` elements and may be reused across calls;
-    /// its contents are not meaningful afterwards. This is the overload the per-frame paths
-    /// use, since at video resolution every buffer here is megabytes.
+    /// `scratch` must hold at least `scratchCount` elements. Reuse it across calls and treat
+    /// its contents as undefined.
     public func resample(
         _ source: UnsafeBufferPointer<Float>,
         into destination: UnsafeMutableBufferPointer<Float>,
@@ -101,8 +95,8 @@ public struct BilinearResampler: Sendable {
             return
         }
 
-        // Horizontal first, so the vertical pass runs over the smaller of the two widths
-        // when downscaling and the taps stay whole contiguous rows either way.
+        // Horizontal first. The vertical pass then runs over the narrower rows when
+        // downscaling.
         horizontal.applyAcrossRows(
             input: input, inputStride: sourceWidth,
             output: workspace, outputStride: destinationWidth,
@@ -111,14 +105,12 @@ public struct BilinearResampler: Sendable {
             input: workspace, output: output, rowWidth: destinationWidth)
     }
 
-    /// The path for everything `vDSP_vlint` cannot do exactly: an antialiased downsample,
-    /// whose widened filter reads a contiguous run of source columns from an irregularly
-    /// spaced start, and any resize whose control vector would lose precision, per
-    /// `Weights.controlIsExact`.
+    /// The horizontal pass for two kinds of resize `applyAcrossRows` cannot handle:
+    /// antialiased downsamples needing more than two taps, and resizes whose control vector
+    /// loses precision.
     ///
-    /// Transposing turns the horizontal taps back into whole contiguous rows, so both axes
-    /// run through `applyDownColumns`. Vertical goes first because whichever axis shrinks
-    /// should shrink before the transposes have to move it.
+    /// Transposing turns the horizontal taps into contiguous rows, so both axes run through
+    /// `applyDownColumns`.
     private func resampleTransposing(
         input: UnsafePointer<Float>,
         output: UnsafeMutablePointer<Float>,
@@ -139,10 +131,7 @@ public struct BilinearResampler: Sendable {
             vDSP_Length(destinationWidth))
     }
 
-    /// Resample into a caller-owned destination, reusing `scratch` across calls.
-    ///
-    /// The array-level form of `resample(_:into:scratch:)`. Per-frame callers keep both
-    /// buffers alive and pay no allocation here.
+    /// The array form of `resample(_:into:scratch:)`, No allocation.
     public func resample(
         _ source: [Float], into destination: inout [Float], scratch: inout [Float]
     ) {
@@ -157,8 +146,7 @@ public struct BilinearResampler: Sendable {
 
     /// Resample a row-major `sourceHeight × sourceWidth` buffer.
     ///
-    /// Allocates both the result and the scratch on every call. Fine for one-shot use; use
-    /// `resample(_:into:scratch:)` on anything that runs per frame.
+    /// Allocates the result and the scratch on every call for one-shot use.
     public func resample(_ source: [Float]) -> [Float] {
         var destination = [Float](repeating: 0, count: destinationHeight * destinationWidth)
         var scratch = [Float](repeating: 0, count: scratchCount)
@@ -171,9 +159,8 @@ public struct BilinearResampler: Sendable {
 
 /// Per-output-index filter taps along one axis.
 ///
-/// Stored as a dense `destinationSize × maxTaps` table with a start index and live tap
-/// count per output. Rows near an edge use fewer taps than the interior; padding to a
-/// fixed stride keeps the indexing uniform at the cost of a few unused slots.
+/// A dense `destinationSize × maxTaps` table with a start index and tap count per output.
+/// Outputs near an edge use fewer taps and leave the spare slots unused.
 private struct Weights: Sendable {
     let destinationSize: Int
     let maxTaps: Int
@@ -183,20 +170,16 @@ private struct Weights: Sendable {
     let counts: [Int]
     /// `destinationSize * maxTaps` coefficients, normalized to sum to 1 per output.
     let values: [Float]
-    /// Source coordinate per output, the control vector `vDSP_vlint` interpolates from: the
-    /// same taps as `values`, in the form Accelerate can apply a whole row at a time. Built
+    /// Source coordinate per output. `vDSP_vlint` reads this as its control vector. Built
     /// only for the horizontal axis of a two-tap resize.
     let positions: [Float]
     /// First output whose second tap falls off the end of the row. See `applyAcrossRows`.
     let clampedFrom: Int
-    /// True when `positions` drives `vDSP_vlint` to the same taps the `Double` weights carry.
+    /// True when `vDSP_vlint` reproduces the taps in `values` exactly.
     ///
-    /// `vDSP_vlint` recovers the interpolation fraction from a single `Float` coordinate, so
-    /// its precision is set by the magnitude of that coordinate rather than by the fraction.
-    /// At video widths the fraction quantizes coarsely enough to shift a 0-255 sample by a
-    /// few hundredths of a code value — enough to flip `FramePreprocessor`'s rounding and
-    /// drift from torch. The error is exactly zero when the resize ratio is a binary
-    /// fraction, so this is checked per resize rather than assumed either way.
+    /// It recovers the interpolation fraction from a single `Float` coordinate. At video
+    /// widths that loses enough precision to flip `FramePreprocessor`'s rounding. The error
+    /// is zero for a binary-fraction resize ratio, so this is measured per resize.
     let controlIsExact: Bool
 
     init(sourceSize: Int, destinationSize: Int, antialias: Bool, buildControlVector: Bool) {
@@ -236,7 +219,7 @@ private struct Weights: Sendable {
             self.starts = starts
             self.counts = counts
             self.values = values
-            // Multi-tap rows go through the transposing path, which needs no control vector.
+            // Multi-tap rows take the transposing path, which needs no control vector.
             self.positions = []
             self.clampedFrom = destinationSize
             self.controlIsExact = false
@@ -244,8 +227,7 @@ private struct Weights: Sendable {
         }
 
         // Plain bilinear: two taps, matching `area_pixel_compute_source_index` with
-        // `align_corners=false`. The clamp is on the position, not the index, so a negative
-        // source position pins to the first pixel instead of inventing one past the edge.
+        // `align_corners=false`.
         self.maxTaps = 2
         var starts = [Int](repeating: 0, count: destinationSize)
         var counts = [Int](repeating: 2, count: destinationSize)
@@ -264,16 +246,16 @@ private struct Weights: Sendable {
             if buildControlVector {
                 let control = Float(position)
                 positions[index] = control
-                // The clamped tail is filled rather than interpolated, so only the
-                // interpolated outputs — exactly those with `high != low` — matter here.
+                // Only the interpolated outputs matter. The clamped tail bypasses
+                // `vDSP_vlint`.
                 if high != low {
                     let recovered = control - Float(low)
                     if Int(control) != low || recovered != Float(fraction) { exact = false }
                 }
             }
             if high == low {
-                // Last row/column: torch reuses the same sample for both taps, which is
-                // the same as folding both weights onto it.
+                // Last row/column: torch reuses the same sample for both taps, so fold
+                // both weights onto it.
                 values[index * 2] = 1.0
                 values[index * 2 + 1] = 0.0
             }
@@ -283,22 +265,19 @@ private struct Weights: Sendable {
         self.values = values
         self.positions = positions
         self.controlIsExact = exact
-        // `vDSP_vlint` reads `A[trunc(p) + 1]` unconditionally, so outputs landing on the
-        // last source sample would read one element past the row. Positions rise with the
-        // index, so those are always a trailing run: find where it starts and fill it
-        // instead. The bound uses the rounded `Float`, since that is what `vDSP_vlint`
-        // truncates.
+        // `vDSP_vlint` reads `A[trunc(p) + 1]` unconditionally, so an output landing on the
+        // last source sample would read past the row. Those outputs form a trailing run that
+        // `applyAcrossRows` fills instead.
         self.clampedFrom =
             buildControlVector
             ? (positions.firstIndex { $0 >= Float(sourceSize - 1) } ?? destinationSize)
             : destinationSize
     }
 
-    /// Resample each row independently, two Accelerate calls per row.
+    /// Resample each row independently with two Accelerate calls.
     ///
-    /// Two-tap only: `vDSP_vlint` interpolates straight from a source coordinate, which is
-    /// both the weight table and the inner loop. Multi-tap resizes transpose instead and use
-    /// `applyDownColumns`.
+    /// Two-tap only. `vDSP_vlint` interpolates straight from the control vector, so `values`
+    /// goes unused here.
     func applyAcrossRows(
         input: UnsafePointer<Float>, inputStride: Int,
         output: UnsafeMutablePointer<Float>, outputStride: Int,
@@ -326,8 +305,7 @@ private struct Weights: Sendable {
     }
 
     /// Resample down the columns. Each tap is a whole contiguous row scaled by one
-    /// coefficient, so this is a handful of vDSP calls per output row rather than a
-    /// per-pixel loop.
+    /// coefficient.
     func applyDownColumns(
         input: UnsafePointer<Float>,
         output: UnsafeMutablePointer<Float>,
@@ -342,13 +320,12 @@ private struct Weights: Sendable {
 
             if maxTaps == 2 {
                 guard counts[index] > 1 else {
-                    // Clamped edge: the table folds both weights onto one sample, so the
-                    // coefficient is exactly 1 and this is a copy.
+                    // Clamped edge: the table folds both weights onto one sample. The
+                    // coefficient is 1 and this is a copy.
                     destinationRow.update(from: sourceRow, count: rowWidth)
                     continue
                 }
-                // `A + f * (B - A)` in one pass, where vsmul plus vsma is two passes and two
-                // writes over what is the memory-bound axis when upsampling.
+                // `A + f * (B - A)` in one pass, where vsmul plus vsma would be two.
                 var fraction = values[base + 1]
                 vDSP_vintb(
                     sourceRow, 1, sourceRow + rowWidth, 1, &fraction, destinationRow, 1, length)

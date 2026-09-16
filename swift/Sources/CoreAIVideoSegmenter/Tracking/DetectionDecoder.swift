@@ -14,9 +14,8 @@ import Foundation
 enum DetectionDecoder {
     /// Decode one prompt's detections.
     ///
-    /// The logits are read first and thresholded before any mask is touched. `pred_masks` is
-    /// `[1, 200, 288, 288]`, 66 MB as `Float`, and only a handful of the 200 queries usually
-    /// survive, so converting just their slices saves most of that per prompt per frame.
+    /// Logits are read and thresholded before any mask is touched, so only the surviving
+    /// slices of the 66 MB `pred_masks` are ever converted.
     static func decode(
         _ outputs: DetectOutputs,
         promptID: Int,
@@ -51,8 +50,7 @@ enum DetectionDecoder {
                 masks: masks,
                 scores: candidates.map { probabilities[$0] },
                 iouThreshold: parameters.detNmsThresh)
-            // Upstream zeroes the suppressed probabilities and re-thresholds, which is the
-            // same as dropping them: `pred_probs[0][~keep] = 0.0` then
+            // Equivalent to upstream's `pred_probs[0][~keep] = 0.0` followed by
             // `pred_probs > score_threshold_detection`.
             candidates = keep.map { candidates[$0] }
             maskLogits = keep.map { maskLogits[$0] }
@@ -68,8 +66,8 @@ enum DetectionDecoder {
 
     /// Concatenate per-prompt detections in prompt-id order.
     ///
-    /// Port of `_merge_detections_from_prompts`. Order matters downstream: new objects are
-    /// numbered by their position here, so a reordering would renumber every track.
+    /// Port of `_merge_detections_from_prompts`. Order is load-bearing downstream: new
+    /// objects are numbered by their position here.
     static func merge(_ perPrompt: [MergedDetections]) -> MergedDetections {
         var merged = MergedDetections()
         for detections in perPrompt {
@@ -85,35 +83,37 @@ enum DetectionDecoder {
     /// order.
     ///
     /// Port of `nms_masks`, which prefilters by score and then defers to
-    /// `cv_utils_kernel.generic_nms`. The caller has already applied the score prefilter, so
-    /// only the greedy pass remains.
+    /// `cv_utils_kernel.generic_nms`. The caller applies the score prefilter. Only the greedy
+    /// pass is here.
     static func nonMaximumSuppression(
         masks: [MaskBitset], scores: [Float], iouThreshold: Float
     ) -> [Int] {
         precondition(masks.count == scores.count, "NMS: masks and scores must be parallel")
-        // Ties broken by index so the result does not depend on sort stability.
+        // Ties broken by index, keeping the result independent of sort stability.
         let order = scores.indices.sorted {
             scores[$0] == scores[$1] ? $0 < $1 : scores[$0] > scores[$1]
         }
         var suppressed = [Bool](repeating: false, count: masks.count)
         var kept: [Int] = []
-        for candidate in order where !suppressed[candidate] {
+        // Only the tail of `order` needs testing: IoU is symmetric, so an earlier kept mask
+        // above the threshold would already have suppressed this candidate.
+        for (position, candidate) in order.enumerated() where !suppressed[candidate] {
             kept.append(candidate)
-            for other in order where other != candidate && !suppressed[other] {
+            for other in order[(position + 1)...] where !suppressed[other] {
                 if masks[candidate].iou(masks[other]) >= iouThreshold {
                     suppressed[other] = true
                 }
             }
         }
-        // Restore input order: downstream indexes detections positionally and expects the
-        // prompt's own ordering, not the score ordering.
+        // Restore input order: downstream indexes detections positionally against the
+        // prompt's own ordering.
         return kept.sorted()
     }
 
     @inline(__always)
     static func sigmoid(_ x: Float) -> Float {
-        // Branch on the sign so the exponent argument is never positive; `exp` of a large
-        // positive logit overflows to infinity and turns the result into NaN.
+        // Branch on the sign to keep the exponent argument negative. `exp` of a large
+        // positive logit overflows to infinity and yields NaN.
         if x >= 0 {
             return 1 / (1 + Foundation.exp(-x))
         }

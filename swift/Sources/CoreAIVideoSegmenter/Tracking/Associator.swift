@@ -8,10 +8,10 @@ import Foundation
 
 /// Matches this frame's detections against the existing masklets.
 ///
-/// Port of `Sam3VideoModel._associate_det_trk`. The two IoU thresholds are easy to conflate:
-/// `assocIouThresh` (loose, 0.1) decides whether a detection is covered by some track and so
-/// is not new, while `trkAssocIouThresh` (strict, 0.5) decides whether a track was seen this
-/// frame. The same pair can be matched by the first test and unmatched by the second.
+/// Port of `Sam3VideoModel._associate_det_trk`. Two IoU thresholds with distinct jobs. The
+/// loose `assocIouThresh` (0.1) decides whether some track already covers a detection. The
+/// strict `trkAssocIouThresh` (0.5) decides whether a track was seen this frame. The same
+/// pair can pass the first and fail the second.
 enum Associator {
     struct Result {
         /// Detection indices that should become new objects.
@@ -39,12 +39,15 @@ enum Associator {
         trackPromptIDs: [Int],
         parameters: VideoSegmentationParameters
     ) -> Result {
+        precondition(
+            trackMasks.count == trackIDs.count && trackIDs.count == trackPromptIDs.count,
+            "Associator: trackMasks, trackIDs and trackPromptIDs must be parallel")
         var result = Result()
 
         if trackMasks.isEmpty {
-            // Nothing to match against, so every detection is new. This branch skips the
-            // `newDetThresh` score gate the general path applies, as upstream does; that is
-            // how the first frame seeds tracks from sub-threshold detections.
+            // Nothing to match against, so every detection is new. Upstream skips the
+            // `newDetThresh` score gate on this branch, which is how the first frame seeds
+            // tracks from sub-threshold detections.
             result.newDetectionIndices = Array(0..<detections.count)
             return result
         }
@@ -59,8 +62,8 @@ enum Associator {
             return result
         }
 
-        // Full IoU matrix, zeroed across prompt groups so a "person" detection can never
-        // claim a "dog" track.
+        // Full IoU matrix, zeroed across prompt groups so a "person" detection stays within
+        // the "person" tracks.
         var ious = [[Float]](
             repeating: [Float](repeating: 0, count: trackMasks.count), count: detections.count)
         for detection in 0..<detections.count {
@@ -70,7 +73,7 @@ enum Associator {
         }
 
         // A track is unmatched when it has area but no detection reaches the strict
-        // threshold. Empty tracks are reported separately: they are occluded, not lost.
+        // threshold. Empty tracks are reported separately, as occluded.
         for (track, id) in trackIDs.enumerated() {
             if trackMasks[track].isEmpty {
                 result.emptyTrackIDs.append(id)
@@ -93,13 +96,12 @@ enum Associator {
                 detections.scores[detection] >= parameters.newDetThresh && matchedTracks.isEmpty
             if isNew {
                 result.newDetectionIndices.append(detection)
-                // A new detection cannot also recondition an existing track.
                 continue
             }
 
-            // Reconditioning candidate: confident enough, overlapping enough, and mapped to
-            // its single best track. Later detections overwrite earlier ones for the same
-            // track, which is upstream's behaviour.
+            // Reconditioning candidate: confident enough, overlapping enough and mapped to
+            // its single best track. As upstream does, a later detection overwrites an
+            // earlier one for the same track.
             guard detections.scores[detection] >= parameters.highConfThresh else { continue }
             guard let best = row.indices.max(by: { row[$0] < row[$1] }) else { continue }
             if row[best] >= parameters.highIouThresh {

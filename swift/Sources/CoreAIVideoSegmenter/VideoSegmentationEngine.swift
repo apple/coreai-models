@@ -9,8 +9,8 @@ import Foundation
 
 /// The seven Core AI entrypoints of a SAM 3 video asset, behind typed calls.
 ///
-/// Everything above this type is host logic: the inference session, the memory ring
-/// buffer, and the tracking heuristics. This is the only place that touches `AIModel`.
+/// The single point of contact with `AIModel`. Everything above it is host logic: the
+/// inference session, the memory ring buffer, and the tracking heuristics.
 public actor VideoSegmentationEngine: ResourceManaging {
     /// Entrypoint names, in the order the exporter declares them.
     public enum Function {
@@ -30,6 +30,9 @@ public actor VideoSegmentationEngine: ResourceManaging {
 
     private let modelURL: URL
     private var loaded: Loaded?
+    /// In-flight load. Concurrent callers suspended at `prepare` share one asset instead of
+    /// each preparing their own.
+    private var loadTask: Task<Void, Error>?
 
     private struct Loaded {
         let model: AIModel
@@ -37,8 +40,7 @@ public actor VideoSegmentationEngine: ResourceManaging {
         let descriptors: [String: InferenceFunctionDescriptor]
     }
 
-    /// Shapes read off the asset at load time, so the host packs to what was traced
-    /// rather than to what it assumes.
+    /// Shapes read off the asset at load time, so the host packs to what was traced.
     public struct Shapes: Sendable, Equatable {
         /// Square input resolution of `image_encode`.
         public let imageSize: Int
@@ -71,9 +73,22 @@ public actor VideoSegmentationEngine: ResourceManaging {
     /// Load and specialize the asset, then resolve its shapes.
     ///
     /// A static multi-function asset commits workspace for every declared function on the
-    /// first `loadFunction`, so resolving all seven here costs no more memory than deferring.
+    /// first `loadFunction`, so loading all seven here costs no extra memory.
     public func loadResources() async throws {
         guard loaded == nil else { return }
+        if let loadTask { return try await loadTask.value }
+        let task = Task { try await performLoad() }
+        loadTask = task
+        do {
+            try await task.value
+        } catch {
+            loadTask = nil
+            throw error
+        }
+        loadTask = nil
+    }
+
+    private func performLoad() async throws {
         let prepared = try await PreparedModel.prepare(at: modelURL)
         guard prepared.structure == .videoSegmenter else {
             throw VideoSegmentationError.invalidConfiguration(
@@ -99,12 +114,13 @@ public actor VideoSegmentationEngine: ResourceManaging {
     }
 
     public func unloadResources() async {
+        loadTask?.cancel()
+        loadTask = nil
         loaded = nil
         shapes = nil
     }
 
-    /// Run every entrypoint once on zeros so the first real frame isn't paying for
-    /// kernel compilation.
+    /// Run every entrypoint once on zeros, moving kernel compilation off the first frame.
     public func warmup() async throws {
         let state = try require()
         for name in Function.all {
@@ -128,8 +144,8 @@ public actor VideoSegmentationEngine: ResourceManaging {
 
     /// CLIP text tower. Run once per distinct prompt for the whole video.
     ///
-    /// Returns the attention mask alongside the features because `detect` needs the same
-    /// mask on every frame.
+    /// Returns the attention mask alongside the features, since `detect` needs the same mask
+    /// on every frame.
     public func textEncode(
         inputIDs: [Int32], attentionMask: [Int32]
     ) async throws -> PromptEncoding {
@@ -174,8 +190,7 @@ public actor VideoSegmentationEngine: ResourceManaging {
 
     /// Memory attention plus the SAM mask decoder, for one object on one frame.
     ///
-    /// Internal because `PackedMemory` is: the memory bank's layout is a consequence of
-    /// how this asset was traced, not something a caller should be assembling.
+    /// Internal because `PackedMemory` is. ``MemoryBankPacker`` owns that layout.
     func trackerStep(
         features: TrackerFeatures, memory: PackedMemory
     ) async throws -> TrackerStepOutputs {
@@ -203,8 +218,8 @@ public actor VideoSegmentationEngine: ResourceManaging {
 
     /// Encode one predicted mask into a spatial memory slot.
     ///
-    /// `maskLogits` must already be at `shapes.memoryMaskSize`: upstream `_encode_new_memory`
-    /// resizes whatever it is handed, but a traced graph accepts one resolution.
+    /// `maskLogits` must already be at `shapes.memoryMaskSize`, since a traced graph accepts
+    /// one resolution where upstream `_encode_new_memory` resizes whatever it is handed.
     ///
     /// `binarize` reproduces `is_mask_from_pts`, which upstream computes as `any(...)` over
     /// the batch, so one newly seeded object turns it on for every object on that frame.
@@ -231,7 +246,7 @@ public actor VideoSegmentationEngine: ResourceManaging {
 
     /// Seed a track from a detection mask, producing only its object pointer.
     ///
-    /// The rest of `_use_mask_as_output` is weight-free and stays on the host; see
+    /// The rest of `_use_mask_as_output` is weight-free and stays on the host, in
     /// `TrackerLoop.maskAsOutput`.
     public func trackerMaskInit(
         features: TrackerFeatures, maskInput: [Float]
@@ -299,8 +314,8 @@ public actor VideoSegmentationEngine: ResourceManaging {
 
     /// Reject shape mismatches before they reach the runtime.
     ///
-    /// A static Core AI function handed a wrongly shaped input does not raise: it SIGKILLs
-    /// the process with no traceback.
+    /// A static Core AI function handed a wrongly shaped input SIGKILLs the process with no
+    /// traceback, so the check has to happen here.
     private func validate(
         _ name: String, _ inputs: [String: NDArray], against descriptor: InferenceFunctionDescriptor
     ) throws {
@@ -347,12 +362,9 @@ public actor VideoSegmentationEngine: ResourceManaging {
 
     /// Read every geometric constant the host needs off the traced descriptors.
     ///
-    /// Nothing is hardcoded from the 1008 export: a 336 "lite" variant would report its own
-    /// grid and the packer would follow. What is checked is internal agreement, because a
-    /// mismatch between two entrypoints is the failure mode that SIGKILLs.
-    ///
-    /// Every lookup that is about to be indexed states its expected rank, so a re-export that
-    /// changes a layout throws here rather than trapping on an out-of-range subscript.
+    /// Everything comes from the descriptors, so a 336 "lite" variant reports its own grid
+    /// and the packer follows. What this checks is agreement between entrypoints. That
+    /// mismatch SIGKILLs at run time.
     private static func resolveShapes(
         _ descriptors: [String: InferenceFunctionDescriptor]
     ) throws -> Shapes {
@@ -465,8 +477,8 @@ public struct PromptEncoding: Sendable {
 
 /// `detect` outputs, kept as device arrays.
 ///
-/// `pred_masks` is `[1, queries, 288, 288]`, 66 MB as `Float` at 200 queries. Callers read
-/// the logits first and pull only the surviving mask slices.
+/// `pred_masks` is 66 MB as `Float` at 200 queries, so callers read the logits first and
+/// pull only the surviving mask slices.
 public struct DetectOutputs: Sendable {
     public let predictedMasks: NDArray
     public let predictedBoxes: NDArray
@@ -474,8 +486,8 @@ public struct DetectOutputs: Sendable {
     public let presenceLogits: NDArray
 }
 
-/// The `tracker_encode` outputs anything downstream reads. `vision_pos_0` and `vision_pos_1`
-/// are also emitted but no entrypoint consumes them.
+/// The `tracker_encode` outputs downstream reads. The graph also emits `vision_pos_0` and
+/// `vision_pos_1`, which no entrypoint consumes.
 public struct TrackerFeatures: Sendable {
     public let level0: NDArray
     public let level1: NDArray

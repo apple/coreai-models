@@ -6,17 +6,14 @@
 import CoreAIShared
 import Foundation
 
-/// Removes tracks that never settle: ones the detector stops confirming, and duplicates
-/// of an earlier track.
+/// Removes tracks that never settle: ones the detector stops confirming and duplicates of an
+/// earlier track.
 ///
-/// Port of `Sam3VideoModel._process_hotstart`. Both rules only fire for tracks that first
-/// appeared inside the hotstart window; a track older than that has earned the benefit of the
-/// doubt.
+/// Port of `Sam3VideoModel._process_hotstart`. Both rules fire only for tracks that first
+/// appeared inside the hotstart window. Older tracks are exempt.
 ///
-/// The keep-alive counter is a separate, always-on mechanism on the same bookkeeping: matched
-/// frames raise it toward `maxTrkKeepAlive`, unmatched ones lower it toward
-/// `minTrkKeepAlive`, and a track at or below zero is suppressed for the frame rather than
-/// removed outright.
+/// The keep-alive counter is a separate, always-on mechanism over the same bookkeeping. A
+/// track whose counter runs out is suppressed for the frame but stays in the registry.
 @VideoSegmentationActor
 enum HotstartHeuristics {
     /// Mutates the session's hotstart bookkeeping and returns the ids removed on this
@@ -36,8 +33,8 @@ enum HotstartHeuristics {
         // Everything before this frame is "outside the hotstart window".
         let hotstartBoundary =
             reverse ? frameIndex + parameters.hotstartDelay : frameIndex - parameters.hotstartDelay
-        /// Upstream's `obj_first_frame_idx[x]` raises for an object with no record; this
-        /// defaults to the current frame instead of failing the video.
+        // Upstream's `obj_first_frame_idx[x]` raises for an object with no record. Here it
+        // defaults to the current frame.
         func firstSeen(_ id: Int) -> Int { session.firstFrameByObjectID[id] ?? frameIndex }
         func withinHotstart(_ id: Int) -> Bool {
             reverse ? firstSeen(id) < hotstartBoundary : firstSeen(id) > hotstartBoundary
@@ -46,7 +43,7 @@ enum HotstartHeuristics {
             session.removedObjectIDs.contains(id) || newlyRemoved.contains(id)
         }
 
-        // Step 1: record first sightings and seed keep-alive.
+        // Record first sightings and seed keep-alive.
         for id in newObjectIDs {
             if session.firstFrameByObjectID[id] == nil {
                 session.firstFrameByObjectID[id] = frameIndex
@@ -54,8 +51,6 @@ enum HotstartHeuristics {
             session.keepAliveByObjectID[id] = parameters.initTrkKeepAlive
         }
 
-        // Matched frames raise the counter, unmatched ones lower it, each clamped to its own
-        // bound.
         func adjustKeepAlive(_ id: Int, by delta: Int) {
             let current = session.keepAliveByObjectID[id] ?? parameters.initTrkKeepAlive
             session.keepAliveByObjectID[id] =
@@ -64,9 +59,8 @@ enum HotstartHeuristics {
                 : max(parameters.minTrkKeepAlive, current + delta)
         }
 
-        // A track counts as matched if any detection claimed it. Using the
-        // detection-to-track map avoids recomputing areas to distinguish "occluded" from
-        // "gone", which is the distinction `emptyTrackIDs` already carries.
+        // A track counts as matched if any detection claimed it. `emptyTrackIDs` already
+        // separates "occluded" from "gone".
         var matched: Set<Int> = []
         for tracks in detectionToMatchedTrackIDs.values { matched.formUnion(tracks) }
         for id in matched { adjustKeepAlive(id, by: 1) }
@@ -78,12 +72,8 @@ enum HotstartHeuristics {
             for id in emptyTrackIDs { adjustKeepAlive(id, by: -1) }
         }
 
-        // Step 2: drop tracks unmatched for too long inside the window, and suppress tracks
-        // whose keep-alive has run out.
-        //
-        // Sorted so removal is deterministic. Upstream iterates a `defaultdict`, which is
-        // also deterministic but in a different order; the two only differ when two objects
-        // would be removed on the same frame, and both are removed either way.
+        // Drop tracks unmatched for too long inside the window, and suppress tracks whose
+        // keep-alive has run out. Sorted for deterministic removal.
         for id in session.unmatchedFramesByObjectID.keys.sorted() {
             guard let frames = session.unmatchedFramesByObjectID[id], !isGone(id) else { continue }
             if frames.count >= parameters.hotstartUnmatchThresh, withinHotstart(id) {
@@ -92,18 +82,21 @@ enum HotstartHeuristics {
                     "Removing object \(id) at frame \(frameIndex): unmatched on frames \(frames)")
             }
             let keepAlive = session.keepAliveByObjectID[id] ?? parameters.initTrkKeepAlive
+            // The flag reads as a restriction but upstream uses it as an off switch:
+            // `modeling_sam3_video.py` gates on `not suppress_unmatched_only_within_hotstart`.
             if keepAlive <= 0, !parameters.suppressUnmatchedOnlyWithinHotstart, !isGone(id) {
                 suppressed.insert(id)
             }
         }
 
-        // Step 3: record overlaps. Two tracks overlap when the same detection claims both;
-        // the later-appearing one is the candidate duplicate.
+        // Record overlaps. Two tracks overlap when the same detection claims both, and the
+        // later-appearing one is the candidate duplicate.
+        //
+        // Walked in detection-id order. Ids are unique, so the traversal cannot depend on
+        // dictionary layout.
         let bySeenOrder: (Int, Int) -> Bool = { firstSeen($0) < firstSeen($1) }
-        for tracks in detectionToMatchedTrackIDs.values.sorted(by: {
-            ($0.first ?? -1) < ($1.first ?? -1)
-        }) {
-            guard tracks.count >= 2,
+        for detection in detectionToMatchedTrackIDs.keys.sorted() {
+            guard let tracks = detectionToMatchedTrackIDs[detection], tracks.count >= 2,
                 let anchor = reverse
                     ? tracks.max(by: bySeenOrder) : tracks.min(by: bySeenOrder)
             else { continue }
@@ -113,8 +106,8 @@ enum HotstartHeuristics {
             }
         }
 
-        // Step 4: drop duplicates that have overlapped for long enough, again only inside
-        // the hotstart window.
+        // Drop duplicates that have overlapped for long enough, again only inside the
+        // hotstart window.
         for pair in session.overlapFramesByPair.keys.sorted(by: {
             ($0.firstAppearing, $0.duplicate) < ($1.firstAppearing, $1.duplicate)
         }) {

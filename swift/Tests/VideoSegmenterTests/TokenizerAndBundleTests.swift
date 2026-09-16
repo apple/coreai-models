@@ -71,9 +71,23 @@ struct TokenizerTests {
     @Test("encode agrees with encodeWithMask on the ids")
     func encodeMatches() throws {
         let tokenizer = try tokenizer()
-        #expect(
-            tokenizer.encode("a b c", contextLength: 32)
-                == tokenizer.encodeWithMask("a b c", contextLength: 32).ids)
+        // Both share one implementation, so this pins the padded, exact-fit and truncated
+        // lengths together rather than only the common case.
+        for contextLength in [32, 5, 3] {
+            #expect(
+                tokenizer.encode("a b c", contextLength: contextLength)
+                    == tokenizer.encodeWithMask("a b c", contextLength: contextLength).ids,
+                "contextLength \(contextLength)")
+        }
+    }
+
+    @Test("A non-positive context length yields nothing instead of trapping")
+    func emptyContext() throws {
+        let tokenizer = try tokenizer()
+        #expect(tokenizer.encode("a b c", contextLength: 0).isEmpty)
+        let (ids, mask) = tokenizer.encodeWithMask("a b c", contextLength: -1)
+        #expect(ids.isEmpty)
+        #expect(mask.isEmpty)
     }
 }
 
@@ -227,7 +241,7 @@ struct BundleMetadataTests {
                 ,
                   "tracking": {"hotstart_delay": 0, "score_threshold_detection": 0.25}
                 """)
-        let parameters = parsed.parameters()
+        let parameters = try parsed.parameters()
         #expect(parameters.hotstartDelay == 0)
         #expect(parameters.scoreThresholdDetection == 0.25)
         #expect(parameters.newDetThresh == 0.7, "untouched keys keep their default")
@@ -256,6 +270,14 @@ struct BundleMetadataTests {
                 {"metadata_version": "0.2", "kind": "video_segmenter", "name": "x",
                  "assets": {"main": "x.aimodel"}}
                 """)
+        }
+    }
+
+    @Test("A malformed tracking block is reported rather than replaced by defaults")
+    func malformedTracking() throws {
+        let parsed = try bundle(extraBlocks: #","tracking": {"hotstart_delay": "soon"}"#)
+        #expect(throws: VideoSegmentationError.self) {
+            try parsed.parameters()
         }
     }
 

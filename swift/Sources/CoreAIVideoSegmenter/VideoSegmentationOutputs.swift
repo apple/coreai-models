@@ -9,7 +9,7 @@ import Foundation
 
 /// One tracked object on one frame.
 public struct TrackedObject: Sendable {
-    /// Stable id for the masklet; survives across frames until the track ends.
+    /// Stable id for the masklet, held until the track ends.
     public let id: Int
     /// Text prompt that discovered this object.
     public let prompt: String
@@ -30,20 +30,18 @@ public struct VideoSegmentationFrame: Sendable {
     public let frameIndex: Int
     /// Surviving objects, ordered by id.
     public let objects: [TrackedObject]
-    /// The source frame, so callers can composite without decoding twice.
+    /// The source frame, so a caller can composite against it directly.
     public let image: CGImage
 
     /// Per-object mask logits at the model's low resolution, ordered like `objects`.
     ///
-    /// Empty unless ``VideoSegmentationParameters/emitLowResolutionMasks`` is set. See
-    /// that flag for why it exists.
+    /// Empty unless ``VideoSegmentationParameters/emitLowResolutionMasks`` is set.
     public let lowResolutionMasks: [[Float]]
 
     /// Wall clock spent processing this frame.
     ///
-    /// Measured around the frame's own work, not between emissions: hotstart holds the first
-    /// `hotstartDelay` results back, so timing the gap between emissions would report that
-    /// buffering rather than the model.
+    /// Measured around the frame's own work. Hotstart holds the first `hotstartDelay`
+    /// results back, so the gap between emissions would report that buffering.
     public let processingTime: Duration
 }
 
@@ -51,9 +49,8 @@ public struct VideoSegmentationFrame: Sendable {
 
 /// Detections for one frame, merged across every prompt.
 ///
-/// Port of what `_merge_detections_from_prompts` returns, minus `bbox`: nothing downstream
-/// reads the detector's boxes, and the boxes the caller finally sees come from
-/// `masks_to_boxes` on the upsampled mask.
+/// Port of what `_merge_detections_from_prompts` returns, minus `bbox`. The boxes a caller
+/// sees come from `masks_to_boxes` on the upsampled mask.
 struct MergedDetections {
     /// Low-resolution mask logits, one flat `size * size` buffer per detection.
     var maskLogits: [[Float]] = []
