@@ -101,6 +101,9 @@ public final class VideoSegmenter: ResourceManaging {
         }
 
         let packer = try await makePacker(shapes: resolved, parameters: parameters)
+        // A concurrent `unloadResources` cancels this task, and committing afterwards would
+        // silently undo it.
+        try Task.checkCancellation()
         self.shapes = resolved
         self.packer = packer
         self.tracker = TrackerLoop(
@@ -146,7 +149,7 @@ public final class VideoSegmenter: ResourceManaging {
 
     /// Segment and track `prompts` through the video at `url`, one result per frame.
     ///
-    /// Results arrive in frame order but lag the decoder by `hotstartDelay` frames. The
+    /// Results arrive in frame order but lag the decoder by `hotstartDelay - 1` frames. The
     /// backlog is flushed when the video ends.
     ///
     /// Nonisolated so a caller can start the stream without an `await`.

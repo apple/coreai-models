@@ -40,7 +40,7 @@ public struct VideoSegmentationFrame: Sendable {
 
     /// Wall clock spent processing this frame.
     ///
-    /// Measured around the frame's own work. Hotstart holds the first `hotstartDelay`
+    /// Measured around the frame's own work. Hotstart holds the first `hotstartDelay - 1`
     /// results back, so the gap between emissions would report that buffering.
     public let processingTime: Duration
 }

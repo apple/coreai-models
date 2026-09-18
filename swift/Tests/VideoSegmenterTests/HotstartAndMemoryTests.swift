@@ -642,3 +642,214 @@ struct BuildOutputsPairingTests {
         #expect(output.maskLogitsByObjectID[3] == [99], "seeded from its detection mask")
     }
 }
+
+/// The slot-writing half of the packer. `MemoryBankPacker selection` covers *which* memories
+/// are chosen; this covers where they land, what temporal index they carry, and whether a
+/// slot the previous object filled is cleared before the next one reads the bank.
+@Suite("MemoryBankPacker packing")
+@VideoSegmentationActor
+struct MemoryBankPackingTests {
+    private static let spatialSlots = 8
+    private static let ptrSlots = 4
+    /// `memoryTokenCount * memoryDim` and `hiddenDim` from ``shapes()``.
+    private static let slotElements = 16
+    private static let pointerElements = 4
+
+    private func shapes() -> VideoSegmentationEngine.Shapes {
+        VideoSegmentationEngine.Shapes(
+            imageSize: 1008, textSequenceLength: 32, lowResMaskSize: 252, memoryMaskSize: 252,
+            highResMaskSize: 1008, memoryTokenCount: 4, memoryDim: 4, hiddenDim: 4,
+            spatialSlots: Self.spatialSlots, ptrSlots: Self.ptrSlots)
+    }
+
+    /// A bank at its real element counts. The configuration suite gets away with `[1, 1, 4]`
+    /// stubs because `init` never writes; `pack` does, and would trip `copyIntoNDArray`'s
+    /// capacity precondition on an undersized tensor.
+    private func packed() -> PackedMemory {
+        func half(_ count: Int) -> NDArray { NDArray(shape: [count], scalarType: .float16) }
+        func float(_ count: Int) -> NDArray { NDArray(shape: [count], scalarType: .float32) }
+        return PackedMemory(
+            spatialMemory: half(Self.spatialSlots * Self.slotElements),
+            spatialMemoryPosition: half(Self.spatialSlots * Self.slotElements),
+            spatialTemporalIndex: NDArray(shape: [Self.spatialSlots], scalarType: .int32),
+            spatialSlotOccupancy: float(Self.spatialSlots),
+            objectPointers: half(Self.ptrSlots * Self.pointerElements),
+            pointerTemporalPosition: float(Self.ptrSlots),
+            pointerSlotOccupancy: float(Self.ptrSlots))
+    }
+
+    private func parameters(
+        numMaskmem: Int = 3, maxCondFrameNum: Int = 2, maxObjectPointers: Int = 4
+    ) -> VideoSegmentationParameters {
+        var parameters = VideoSegmentationParameters.default
+        parameters.numMaskmem = numMaskmem
+        parameters.maxCondFrameNum = maxCondFrameNum
+        parameters.maxObjectPointers = maxObjectPointers
+        return parameters
+    }
+
+    private func makePacker(
+        _ parameters: VideoSegmentationParameters
+    ) throws -> MemoryBankPacker {
+        try MemoryBankPacker(shapes: shapes(), parameters: parameters, packed: packed())
+    }
+
+    /// Every element of the payload carries `value`, so a packed slot can be traced back to
+    /// the frame that produced it. `memory: false` models a frame stored but not yet encoded.
+    private func stored(_ value: Float, memory: Bool = true) -> StoredFrameOutput {
+        func filled(_ count: Int) -> NDArray {
+            var array = NDArray(shape: [count], scalarType: .float16)
+            fillFloatNDArray(&array, with: [Float](repeating: value, count: count))
+            return array
+        }
+        var output = StoredFrameOutput(
+            predictedMasks: nil, objectPointer: filled(Self.pointerElements),
+            objectScoreLogit: value)
+        if memory {
+            let payload = MemoryPayload(reading: filled(Self.slotElements))
+            output.memoryFeatures = payload
+            output.memoryPositionEncoding = payload
+        }
+        return output
+    }
+
+    private func history(
+        conditioning: [(frame: Int, value: Float)],
+        nonConditioning: [(frame: Int, value: Float, memory: Bool)] = []
+    ) -> ObjectOutputHistory {
+        var history = ObjectOutputHistory()
+        for entry in conditioning {
+            history.store(stored(entry.value), at: entry.frame, conditioning: true)
+        }
+        for entry in nonConditioning {
+            history.store(
+                stored(entry.value, memory: entry.memory), at: entry.frame, conditioning: false)
+        }
+        return history
+    }
+
+    private func slot(_ index: Int, of array: NDArray, stride: Int) -> [Float] {
+        Array(flattenAsFloat(array)[(index * stride)..<((index + 1) * stride)])
+    }
+
+    @Test("Memories fill slots from zero, and a frame without encoded memory is skipped")
+    func packsEligibleMemoriesIntoLeadingSlots() throws {
+        let packer = try makePacker(parameters())
+        // numMaskmem 3 gives recent offsets 2 then 1, i.e. frames 8 then 9. Frame 9 was
+        // stored but never encoded, so it must not consume a slot.
+        let result = try packer.pack(
+            history: history(
+                conditioning: [(0, 100)],
+                nonConditioning: [(8, 8, true), (9, 9, false)]),
+            objectIndex: 0, frameIndex: 10, totalFrames: 50, reverse: false)
+
+        #expect(flattenAsFloat(result.spatialSlotOccupancy) == [1, 1, 0, 0, 0, 0, 0, 0])
+        #expect(slot(0, of: result.spatialMemory, stride: Self.slotElements).allSatisfy { $0 == 100 })
+        #expect(slot(1, of: result.spatialMemory, stride: Self.slotElements).allSatisfy { $0 == 8 })
+        // Position encodings are written in lockstep with the features.
+        #expect(
+            slot(1, of: result.spatialMemoryPosition, stride: Self.slotElements)
+                .allSatisfy { $0 == 8 })
+    }
+
+    @Test("A conditioning frame takes the last temporal row, a recent frame takes offset - 1")
+    func writesTemporalIndices() throws {
+        let packer = try makePacker(parameters())
+        let result = try packer.pack(
+            history: history(conditioning: [(0, 100)], nonConditioning: [(8, 8, true)]),
+            objectIndex: 0, frameIndex: 10, totalFrames: 50, reverse: false)
+
+        let indices = readNDArray(result.spatialTemporalIndex, as: Int32.self, count: Self.spatialSlots)
+        // Offset 0 is Python's `[-1]`, which wraps to numMaskmem - 1 = 2. Offset 2 gives 1.
+        // Getting this wrong reads a neighbouring row of the positional encoding, which is a
+        // plausible-looking result rather than a crash.
+        #expect(indices[0] == 2)
+        #expect(indices[1] == 1)
+        #expect(indices.dropFirst(2).allSatisfy { $0 == 0 })
+    }
+
+    @Test("Slots the previous object filled are cleared before the next object is packed")
+    func clearsStaleSlotsBetweenObjects() throws {
+        // The bank is shared across objects within a frame. Without the clear, object B
+        // inherits object A's bytes in the slots B does not reach. The key mask hides them
+        // from the graph, so this only ever surfaces as a parity divergence.
+        let packer = try makePacker(parameters())
+        _ = try packer.pack(
+            history: history(
+                conditioning: [(0, 100)],
+                nonConditioning: [(8, 8, true), (9, 9, true)]),
+            objectIndex: 0, frameIndex: 10, totalFrames: 50, reverse: false)
+
+        let result = try packer.pack(
+            history: history(conditioning: [(0, 55)]),
+            objectIndex: 1, frameIndex: 10, totalFrames: 50, reverse: false)
+
+        #expect(flattenAsFloat(result.spatialSlotOccupancy) == [1, 0, 0, 0, 0, 0, 0, 0])
+        #expect(slot(0, of: result.spatialMemory, stride: Self.slotElements).allSatisfy { $0 == 55 })
+        for stale in 1...2 {
+            #expect(
+                slot(stale, of: result.spatialMemory, stride: Self.slotElements)
+                    .allSatisfy { $0 == 0 },
+                "slot \(stale) still holds the previous object's memory")
+            #expect(
+                slot(stale, of: result.spatialMemoryPosition, stride: Self.slotElements)
+                    .allSatisfy { $0 == 0 })
+        }
+    }
+
+    @Test("Pointer slots carry the offset normalised by the pointer budget")
+    func writesPointerTemporalPositions() throws {
+        let packer = try makePacker(parameters())
+        let result = try packer.pack(
+            history: history(
+                conditioning: [(2, 2)],
+                nonConditioning: [(7, 7, true), (8, 8, true), (9, 9, true)]),
+            objectIndex: 0, frameIndex: 10, totalFrames: 50, reverse: false)
+
+        // Conditioning frame 2 is 8 back, then the contiguous look-back gives 1, 2, 3.
+        // maxObjectPointers 4 makes the divisor 3.
+        let positions = flattenAsFloat(result.pointerTemporalPosition)
+        #expect(flattenAsFloat(result.pointerSlotOccupancy) == [1, 1, 1, 1])
+        #expect(zip(positions, [8.0 / 3, 1.0 / 3, 2.0 / 3, 1]).allSatisfy { abs($0 - $1) < 1e-6 })
+    }
+
+    @Test("More pointers than slots keeps the temporally closest and drops the furthest")
+    func trimsPointerOverflow() throws {
+        let packer = try makePacker(parameters())
+        // Five eligible pointers for four slots: conditioning frames 0 and 1 at offsets 10
+        // and 9, then the look-back at 1, 2, 3. Offset 10 is furthest and loses.
+        let result = try packer.pack(
+            history: history(
+                conditioning: [(0, 0), (1, 1)],
+                nonConditioning: [(7, 7, true), (8, 8, true), (9, 9, true)]),
+            objectIndex: 0, frameIndex: 10, totalFrames: 50, reverse: false)
+
+        let positions = flattenAsFloat(result.pointerTemporalPosition)
+        #expect(flattenAsFloat(result.pointerSlotOccupancy) == [1, 1, 1, 1])
+        // Survivors stay in offset order rather than closeness order, so 9 leads.
+        #expect(zip(positions, [3, 1.0 / 3, 2.0 / 3, 1]).allSatisfy { abs($0 - $1) < 1e-6 })
+    }
+
+    @Test("Pointer slots left over from a longer history are cleared")
+    func clearsStalePointerSlots() throws {
+        let packer = try makePacker(parameters())
+        _ = try packer.pack(
+            history: history(
+                conditioning: [(2, 2)],
+                nonConditioning: [(7, 7, true), (8, 8, true), (9, 9, true)]),
+            objectIndex: 0, frameIndex: 10, totalFrames: 50, reverse: false)
+
+        let result = try packer.pack(
+            history: history(conditioning: [(2, 44)]),
+            objectIndex: 1, frameIndex: 10, totalFrames: 50, reverse: false)
+
+        #expect(flattenAsFloat(result.pointerSlotOccupancy) == [1, 0, 0, 0])
+        #expect(slot(0, of: result.objectPointers, stride: Self.pointerElements).allSatisfy { $0 == 44 })
+        for stale in 1...3 {
+            #expect(
+                slot(stale, of: result.objectPointers, stride: Self.pointerElements)
+                    .allSatisfy { $0 == 0 },
+                "pointer slot \(stale) still holds the previous object's pointer")
+        }
+    }
+}

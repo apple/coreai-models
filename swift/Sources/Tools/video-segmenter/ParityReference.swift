@@ -74,6 +74,10 @@ struct ParityReference {
             throw VideoSegmentationError.parityReferenceInvalid(
                 "manifest.json is malformed: \(error)")
         }
+        guard !manifest.frames.isEmpty else {
+            throw VideoSegmentationError.parityReferenceInvalid(
+                "manifest.json lists no frames.")
+        }
         // The manifest records the clip it was produced from; resolve a relative path
         // against the reference directory so the pair can be moved together. Tested on the
         // recorded string, since `URL(fileURLWithPath:)` resolves against the working

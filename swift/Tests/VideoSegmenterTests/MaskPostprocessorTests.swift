@@ -123,3 +123,88 @@ struct LowResolutionMaskTests {
         #expect(result.lowResolutionMasks.isEmpty)
     }
 }
+
+/// Boxes are taken from the masks *before* `applyObjectWiseNonOverlap` eats the loser's
+/// contested pixels, so a box can be wider than the mask it labels. The two steps are
+/// adjacent lines in `postprocess` and swapping them compiles, runs, and changes the
+/// rendered output — hence a test rather than only the comment that is already there.
+@Suite("MaskPostprocessor box and overlap ordering")
+@VideoSegmentationActor
+struct BoxBeforeNonOverlapTests {
+    private static let lowResolutionSide = 4
+    private static let videoSide = 8
+
+    /// One value per low-resolution column, repeated down every row, so the upsampled mask
+    /// is a band of full-height columns and the overlap is easy to reason about.
+    private func columns(_ values: [Float]) -> [Float] {
+        var field: [Float] = []
+        for _ in 0..<Self.lowResolutionSide { field.append(contentsOf: values) }
+        return field
+    }
+
+    /// Both objects share a prompt, which is what puts them in the same contending group.
+    private func makeSession(_ ids: [Int]) -> VideoInferenceSession {
+        let session = VideoInferenceSession(
+            videoWidth: Self.videoSide, videoHeight: Self.videoSide)
+        for id in ids {
+            session.index(ofObject: id)
+            session.promptIDByObjectID[id] = session.addPrompt("cat")
+        }
+        return session
+    }
+
+    private func postprocess(
+        _ masks: [Int: [Float]], trackerScores: [Int: Float]
+    ) -> MaskPostprocessor.Postprocessed {
+        let session = makeSession(masks.keys.sorted())
+        let raw = RawFrameOutput(
+            frameIndex: 0,
+            maskLogitsByObjectID: masks,
+            scoreByObjectID: masks.mapValues { _ in 0.9 },
+            trackerScoreByObjectID: trackerScores,
+            suppressedObjectIDs: [])
+        return MaskPostprocessor(
+            lowResolutionSize: Self.lowResolutionSide,
+            videoWidth: Self.videoSide, videoHeight: Self.videoSide
+        ).postprocess(raw, session: session)
+    }
+
+    @Test("The loser of an overlap keeps the box it had before its mask was eaten")
+    func boxPredatesOverlapResolution() throws {
+        // Two overlapping bands in one prompt group. 20 has the lower tracker score, so the
+        // pixel-level argmax hands the contested columns to 10.
+        let left = columns([4, 4, 4, -4])
+        let right = columns([-4, 4, 4, 4])
+
+        let contested = postprocess(
+            [10: left, 20: right], trackerScores: [10: 0.9, 20: 0.1])
+        // The same object with no one to lose to, as the reference for "unshrunk".
+        let alone = postprocess([20: right], trackerScores: [20: 0.1])
+
+        #expect(contested.objects.count == 2)
+        let loser = try #require(contested.objects.first { $0.id == 20 })
+        let reference = try #require(alone.objects.first { $0.id == 20 })
+
+        // The mask really did shrink, otherwise the box assertion below proves nothing.
+        #expect(loser.mask.area < reference.mask.area)
+        // ...but the box is byte-for-byte the one it would have had alone. Computing boxes
+        // after the suppression would tighten this onto the surviving columns.
+        #expect(loser.box == reference.box)
+        #expect(loser.box.width > loser.mask.boundingBox.width)
+    }
+
+    @Test("The winner of an overlap is unaffected in both mask and box")
+    func winnerIsUntouched() throws {
+        let left = columns([4, 4, 4, -4])
+        let right = columns([-4, 4, 4, 4])
+
+        let contested = postprocess(
+            [10: left, 20: right], trackerScores: [10: 0.9, 20: 0.1])
+        let alone = postprocess([10: left], trackerScores: [10: 0.9])
+
+        let winner = try #require(contested.objects.first { $0.id == 10 })
+        let reference = try #require(alone.objects.first { $0.id == 10 })
+        #expect(winner.mask.area == reference.mask.area)
+        #expect(winner.box == reference.box)
+    }
+}

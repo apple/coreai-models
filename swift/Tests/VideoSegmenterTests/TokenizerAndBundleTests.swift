@@ -248,6 +248,85 @@ struct BundleMetadataTests {
         #expect(parsed.geometry.imageSize == 336)
     }
 
+    /// Every key ``VideoSegmenterBundle/Tracking`` understands, and the value the fixture
+    /// assigns it. Kept in the test rather than derived, so adding a field to the fixture
+    /// forces someone to come here and wire up the assertion below.
+    private static let expectedTrackingKeys: Set<String> = [
+        "score_threshold_detection", "det_nms_thresh", "new_det_thresh", "assoc_iou_thresh",
+        "trk_assoc_iou_thresh", "high_conf_thresh", "high_iou_thresh",
+        "suppress_overlapping_based_on_recent_occlusion_threshold",
+        "recondition_every_nth_frame", "hotstart_delay", "hotstart_unmatch_thresh",
+        "hotstart_dup_thresh", "init_trk_keep_alive", "max_trk_keep_alive",
+        "min_trk_keep_alive", "max_num_objects", "fill_hole_area", "num_maskmem",
+        "max_cond_frame_num", "max_object_pointers_in_encoder", "recondition_on_trk_masks",
+        "suppress_unmatched_only_within_hotstart",
+        "decrease_trk_keep_alive_for_empty_masklets",
+    ]
+
+    /// The shared fixture, also read by `test_video_export.py`. It is the one written-down
+    /// list joining the exporter's `_TRACKING_FIELDS` to this side's `CodingKeys`; without it
+    /// the two lists are maintained independently and drift with no CI signal.
+    private func trackingFixture() throws -> (json: String, keys: Set<String>) {
+        let url = try #require(
+            Bundle.module.url(forResource: "tracking_keys", withExtension: "json"))
+        let data = try Data(contentsOf: url)
+        let decoded = try #require(
+            try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        return (String(decoding: data, as: UTF8.self), Set(decoded.keys))
+    }
+
+    @Test("The shared fixture names exactly the keys this side understands")
+    func fixtureMatchesTheKeysSwiftUnderstands() throws {
+        // Fails when the exporter gains a tracking field and the fixture is regenerated but
+        // `Tracking.CodingKeys` is not. The Python half of this pair asserts the fixture
+        // against `_tracking_metadata`, so a field added on either side breaks a build until
+        // all three agree.
+        let fixture = try trackingFixture()
+        #expect(fixture.keys == Self.expectedTrackingKeys)
+    }
+
+    @Test("Every key the exporter emits reaches its parameter")
+    func fullTrackingBlockIsWiredUp() throws {
+        // A typo in a `CodingKeys` raw value, or an `apply(...)` pointed at the wrong keypath,
+        // silently leaves the checkpoint's own threshold on the default -- there is no decode
+        // error, because every field is optional by design.
+        //
+        // The fixture's values are all distinct and all differ from the defaults, so a crossed
+        // wire between two same-typed fields fails too. Its floats are exactly representable
+        // in binary, so the JSON round-trip cannot introduce a rounding difference.
+        let fixture = try trackingFixture()
+        let parsed = try bundle(extraBlocks: ",\n  \"tracking\": \(fixture.json)")
+        let parameters = try parsed.parameters()
+
+        #expect(parameters.scoreThresholdDetection == 0.125)
+        #expect(parameters.detNmsThresh == 0.375)
+        #expect(parameters.newDetThresh == 0.625)
+        #expect(parameters.assocIouThresh == 0.875)
+        #expect(parameters.trkAssocIouThresh == 0.0625)
+        #expect(parameters.highConfThresh == 0.1875)
+        #expect(parameters.highIouThresh == 0.3125)
+        // The one key whose Swift name is not a transliteration of the JSON key.
+        #expect(parameters.suppressOverlappingOcclusionThreshold == 0.4375)
+
+        #expect(parameters.reconditionEveryNthFrame == 101)
+        #expect(parameters.hotstartDelay == 102)
+        #expect(parameters.hotstartUnmatchThresh == 103)
+        #expect(parameters.hotstartDupThresh == 104)
+        #expect(parameters.initTrkKeepAlive == 105)
+        #expect(parameters.maxTrkKeepAlive == 106)
+        #expect(parameters.minTrkKeepAlive == 107)
+        #expect(parameters.maxNumObjects == 108)
+        #expect(parameters.fillHoleArea == 109)
+        #expect(parameters.numMaskmem == 110)
+        #expect(parameters.maxCondFrameNum == 111)
+        // `max_object_pointers_in_encoder`, shortened on this side.
+        #expect(parameters.maxObjectPointers == 112)
+
+        #expect(parameters.reconditionOnTrkMasks == true)
+        #expect(parameters.suppressUnmatchedOnlyWithinHotstart == false)
+        #expect(parameters.decreaseTrkKeepAliveForEmptyMasklets == true)
+    }
+
     @Test("Caller overrides apply underneath the bundle's own values")
     func bundleWinsOverCaller() throws {
         var caller = VideoSegmentationParameters.default

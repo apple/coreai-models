@@ -3,6 +3,7 @@
 // Use of this source code is governed by a BSD-3-clause license that can
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
+import CoreAI
 import Testing
 
 @testable import CoreAIShared
@@ -198,5 +199,99 @@ struct DetectionDecoderTests {
         #expect(merged.count == 3)
         #expect(merged.promptIDs == [0, 1, 1])
         #expect(merged.scores == [0.9, 0.8, 0.7])
+    }
+
+    // MARK: - decode
+
+    /// `decode` reads its tensors through `flattenAsFloat`/`floatElements` and never touches
+    /// the engine, so the whole detector core runs on hand-built arrays.
+    private func outputs(queries: [Float], presence: Float, masks: [[Float]]) -> DetectOutputs {
+        var predictedLogits = NDArray(shape: [1, queries.count], scalarType: .float32)
+        fillFloatNDArray(&predictedLogits, with: queries)
+        var presenceLogits = NDArray(shape: [1], scalarType: .float32)
+        fillFloatNDArray(&presenceLogits, with: [presence])
+        var predictedMasks = NDArray(shape: [1, masks.count, 2, 2], scalarType: .float32)
+        fillFloatNDArray(&predictedMasks, with: masks.flatMap { $0 })
+        // `decode` ignores boxes; the tracker takes its boxes from the masks instead.
+        return DetectOutputs(
+            predictedMasks: predictedMasks,
+            predictedBoxes: NDArray(shape: [1, masks.count, 4], scalarType: .float32),
+            predictedLogits: predictedLogits,
+            presenceLogits: presenceLogits)
+    }
+
+    private func parameters(threshold: Float, nms: Float) -> VideoSegmentationParameters {
+        var parameters = VideoSegmentationParameters.default
+        parameters.scoreThresholdDetection = threshold
+        parameters.detNmsThresh = nms
+        return parameters
+    }
+
+    @Test("A detection score is the query logit gated by the prompt's presence logit")
+    func decodeScoresArePresenceGated() {
+        // `pred_probs * presence.sigmoid()`. A plain `sigmoid(logit)` would put this at
+        // 0.881 and silently admit detections upstream rejects.
+        let decoded = DetectionDecoder.decode(
+            outputs(queries: [2], presence: 1, masks: [[1, 1, -1, -1]]),
+            promptID: 0, maskSize: 2, parameters: parameters(threshold: 0.1, nms: 0))
+        #expect(decoded.count == 1)
+        let expected = DetectionDecoder.sigmoid(2) * DetectionDecoder.sigmoid(1)
+        #expect(abs(decoded.scores[0] - expected) < 1e-6)
+        #expect(abs(expected - 0.643914) < 1e-5)
+    }
+
+    @Test("Only queries above the score threshold survive")
+    func decodeFiltersByThreshold() {
+        // Presence is high enough to be a near no-op, isolating the per-query filter.
+        let decoded = DetectionDecoder.decode(
+            outputs(
+                queries: [3, -3, 1], presence: 8,
+                masks: [[1, -1, -1, -1], [-1, 1, -1, -1], [-1, -1, 1, -1]]),
+            promptID: 7, maskSize: 2, parameters: parameters(threshold: 0.5, nms: 0))
+        // sigmoid(3) = 0.953 and sigmoid(1) = 0.731 clear 0.5; sigmoid(-3) = 0.047 does not.
+        #expect(decoded.count == 2)
+        #expect(decoded.promptIDs == [7, 7])
+        #expect(decoded.maskLogits == [[1, -1, -1, -1], [-1, -1, 1, -1]])
+    }
+
+    @Test("The presence gate can reject a query its own logit would have passed")
+    func decodePresenceGateCanReject() {
+        // One logit, two prompts: the detector says "this looks like the object" while the
+        // presence head says "the object is not in this frame". Upstream lets presence win.
+        let masks = [[Float]]([[1, 1, -1, -1]])
+        let confident = DetectionDecoder.decode(
+            outputs(queries: [2], presence: 5, masks: masks),
+            promptID: 0, maskSize: 2, parameters: parameters(threshold: 0.5, nms: 0))
+        let absent = DetectionDecoder.decode(
+            outputs(queries: [2], presence: -2, masks: masks),
+            promptID: 0, maskSize: 2, parameters: parameters(threshold: 0.5, nms: 0))
+        #expect(confident.count == 1)
+        #expect(absent.count == 0)
+    }
+
+    @Test("An NMS drop re-indexes masks, logits, scores and prompt IDs together")
+    func decodeKeepsArraysParallelAcrossNMS() {
+        // The four arrays are re-indexed by hand after NMS. If one is missed, a surviving
+        // detection keeps its own score while rendering the dropped query's mask.
+        let decoded = DetectionDecoder.decode(
+            outputs(
+                queries: [3, 2, 1], presence: 8,
+                // Queries 0 and 1 are the same mask (IoU 1.0); query 2 is disjoint.
+                masks: [[1, 1, -1, -1], [1, 1, -1, -1], [-1, -1, -1, 1]]),
+            promptID: 3, maskSize: 2, parameters: parameters(threshold: 0.1, nms: 0.5))
+
+        #expect(decoded.count == 2)
+        #expect(decoded.maskLogits.count == 2)
+        #expect(decoded.masks.count == 2)
+        #expect(decoded.promptIDs == [3, 3])
+        // Query 1 loses to the higher-scoring query 0. The survivor at position 1 must be
+        // query 2 in every array, not query 1 in some of them.
+        #expect(decoded.maskLogits[1] == [-1, -1, -1, 1])
+        #expect(decoded.masks[1].area == 1)
+        let expected = [
+            DetectionDecoder.sigmoid(3) * DetectionDecoder.sigmoid(8),
+            DetectionDecoder.sigmoid(1) * DetectionDecoder.sigmoid(8),
+        ]
+        #expect(zip(decoded.scores, expected).allSatisfy { abs($0 - $1) < 1e-6 })
     }
 }

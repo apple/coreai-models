@@ -329,7 +329,10 @@ let package = Package(
                 "CoreAIVideoSegmenter",
                 "CoreAIShared",
             ],
-            path: "swift/Tests/VideoSegmenterTests"
+            path: "swift/Tests/VideoSegmenterTests",
+            resources: [
+                .copy("Resources/tracking_keys.json")
+            ]
         ),
         .testTarget(
             name: "DiffusionPipelineTests",

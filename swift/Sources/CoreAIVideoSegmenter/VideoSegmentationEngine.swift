@@ -108,6 +108,9 @@ public actor VideoSegmentationEngine: ResourceManaging {
             functions[name] = function
             descriptors[name] = descriptor
         }
+        // A concurrent `unloadResources` cancels this task, and committing afterwards would
+        // silently undo it.
+        try Task.checkCancellation()
         self.loaded = Loaded(
             model: prepared.model, functions: functions, descriptors: descriptors)
         self.shapes = try Self.resolveShapes(descriptors)
