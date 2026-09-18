@@ -137,7 +137,8 @@ extension Flux2Pipeline {
         if let name = encoderName {
             // Optional component: nil when absent so supportsImageToImage is accurate.
             let encoderURL = ModelBundle.resolveAssetURL(name, in: url)
-            encoder = FileManager.default.fileExists(atPath: encoderURL.path)
+            encoder =
+                FileManager.default.fileExists(atPath: encoderURL.path)
                 ? CoreAIDiffusionModelFunction(modelURL: encoderURL)
                 : nil
         } else {
