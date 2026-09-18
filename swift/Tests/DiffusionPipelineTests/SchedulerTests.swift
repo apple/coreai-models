@@ -75,6 +75,121 @@ struct RNGTests {
         let mean = samples.reduce(0, +) / Float(samples.count)
         #expect(abs(mean - 5.0) < 0.2)
     }
+
+    // MARK: - Torch RNG parity with Python torch.randn
+    //
+    // Expected values come from PyTorch's CPU generator. To regenerate an array, run its
+    // `// Reference:` snippet under `torch.Generator().manual_seed(<seed>)`.
+
+    // Reference: torch.manual_seed(42); [torch.randn(1, dtype=torch.float64).item() for _ in range(8)]
+    @Test("Torch scalar path matches Python reference (seed=42)")
+    func torchScalarParity() {
+        var rng = TorchRandomSource(seed: 42)
+        let expected: [Double] = [
+            0.3366903544, 0.1288094051, 0.2344623634, 0.2303330279,
+            -1.1228563767, -0.1863282993, 2.2082013356, -0.6379970568,
+        ]
+        for (i, exp) in expected.enumerated() {
+            let got = rng.nextNormal(mean: 0, stdev: 1)
+            #expect(abs(got - exp) < 1e-6, "scalar[\(i)]: got \(got), expected \(exp)")
+        }
+    }
+
+    // Reference: torch.manual_seed(42); torch.randn(32, dtype=torch.float32)
+    @Test("Torch batch path matches Python torch.randn (seed=42, count=32)")
+    func torchBatchParity32() {
+        var rng = TorchRandomSource(seed: 42)
+        let expected: [Float] = [
+            1.9269150496, 1.4872841835, 0.9007171988, -2.1055214405,
+            0.6784184575, -1.2345449924, -0.0430674814, -1.6046669483,
+            -0.7521361709, 1.6487228870, -0.3924786448, -1.4036067724,
+            -0.7278812528, -0.5594298840, -0.7688389421, 0.7624453902,
+            1.6423169374, -0.1595973223, -0.4973974824, 0.4395892322,
+            -0.7581311464, 1.0783176422, 0.8008005023, 1.6806205511,
+            1.2791243792, 1.2964228392, 0.6104664803, 1.3347377777,
+            -0.2316243201, 0.0417594910, -0.2515752614, 0.8598585129,
+        ]
+        let got = rng.normalArray([32], mean: 0, stdev: 1)
+        for (i, (g, e)) in zip(got, expected).enumerated() {
+            #expect(abs(g - e) < 1e-4, "batch[\(i)]: got \(g), expected \(e)")
+        }
+    }
+
+    // Reference: torch.manual_seed(42); torch.randn(16, dtype=torch.float32)
+    @Test("Torch batch path boundary (exactly 16 elements)")
+    func torchBatchBoundary16() {
+        var rng = TorchRandomSource(seed: 42)
+        let expected: [Float] = [
+            1.9269150496, 1.4872841835, 0.9007171988, -2.1055214405,
+            0.6784184575, -1.2345449924, -0.0430674814, -1.6046669483,
+            -0.7521361709, 1.6487228870, -0.3924786448, -1.4036067724,
+            -0.7278812528, -0.5594298840, -0.7688389421, 0.7624453902,
+        ]
+        let got = rng.normalArray([16], mean: 0, stdev: 1)
+        for (i, (g, e)) in zip(got, expected).enumerated() {
+            #expect(abs(g - e) < 1e-4, "boundary[\(i)]: got \(g), expected \(e)")
+        }
+    }
+
+    // Reference: torch.manual_seed(42); torch.randn(17, dtype=torch.float32)
+    @Test("Torch batch path remainder (17 elements)")
+    func torchBatchRemainder17() {
+        var rng = TorchRandomSource(seed: 42)
+        let expected: [Float] = [
+            1.9269150496, -0.1595973223, -0.4973974824, 0.4395892322,
+            -0.7581311464, 1.0783176422, 0.8008005023, 1.6806205511,
+            0.3558597863, 1.2964228392, 0.6104664803, 1.3347377777,
+            -0.2316243201, 0.0417594910, -0.2515752614, 0.8598585129,
+            -0.3097269237,
+        ]
+        let got = rng.normalArray([17], mean: 0, stdev: 1)
+        for (i, (g, e)) in zip(got, expected).enumerated() {
+            #expect(abs(g - e) < 1e-4, "remainder[\(i)]: got \(g), expected \(e)")
+        }
+    }
+
+    // Reference: torch.manual_seed(0); torch.randn(32, dtype=torch.float32)
+    @Test("Torch batch path matches Python torch.randn (seed=0, count=32)")
+    func torchBatchParity0() {
+        var rng = TorchRandomSource(seed: 0)
+        let expected: [Float] = [
+            -1.1258398294, -1.1523602009, -0.2505785823, -0.4338788390,
+            0.8487103581, 0.6920092106, -0.3160127699, -2.1152195930,
+            0.3222749233, -1.2633347511, 0.3499831855, 0.3081339002,
+            0.1198415086, 1.2376579046, 1.1167771816, -0.2472776473,
+            -1.3526537418, -1.6959313154, 0.5666505098, 0.7935084105,
+            0.5988394618, -1.5550950766, -0.3413603008, 1.8530061245,
+            0.7501894236, -0.5854971409, -0.1733970195, 0.1834779233,
+            1.3893661499, 1.5863343477, 0.9462983608, -0.8436768055,
+        ]
+        let got = rng.normalArray([32], mean: 0, stdev: 1)
+        for (i, (g, e)) in zip(got, expected).enumerated() {
+            #expect(abs(g - e) < 1e-4, "batch[\(i)]: got \(g), expected \(e)")
+        }
+    }
+
+    // Reference: torch.manual_seed(42); t = torch.randn([1,16,16,16], dtype=torch.float32)
+    @Test("Torch batch path realistic shape (4096 elements, seed=42)")
+    func torchBatchRealisticShape() {
+        var rng = TorchRandomSource(seed: 42)
+        let got = rng.normalArray([1, 16, 16, 16], mean: 0, stdev: 1)
+        #expect(got.count == 4096)
+
+        let expectedFirst: [Float] = [
+            1.9269150496, 1.4872841835, 0.9007171988, -2.1055214405,
+            0.6784184575, -1.2345449924, -0.0430674814, -1.6046669483,
+        ]
+        let expectedLast: [Float] = [
+            1.5869791508, 0.1421326697, 0.3760589659, -0.7916260362,
+            2.6677629948, -0.1403129250, 0.9416193962, -0.0118428767,
+        ]
+        for (i, (g, e)) in zip(got.prefix(8), expectedFirst).enumerated() {
+            #expect(abs(g - e) < 1e-4, "first[\(i)]: got \(g), expected \(e)")
+        }
+        for (i, (g, e)) in zip(got.suffix(8), expectedLast).enumerated() {
+            #expect(abs(g - e) < 1e-4, "last[\(i)]: got \(g), expected \(e)")
+        }
+    }
 }
 
 @Suite("Schedulers")

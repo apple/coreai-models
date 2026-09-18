@@ -11,6 +11,8 @@ public enum RandomSourceType: Sendable {
 }
 
 /// Generate Gaussian noise (mean 0, stdev 1) using the specified random source.
+/// `.torch` routes through `normalArray` to match `torch.randn` (batch-16 fill),
+/// not the scalar `nextNormal()` loop.
 public func generateNoise(count: Int, seed: UInt32, sourceType: RandomSourceType = .numPy) -> [Float] {
     switch sourceType {
     case .numPy:
@@ -18,7 +20,7 @@ public func generateNoise(count: Int, seed: UInt32, sourceType: RandomSourceType
         return (0..<count).map { _ in Float(rng.nextNormal()) }
     case .torch:
         var rng = TorchRandomSource(seed: seed)
-        return (0..<count).map { _ in Float(rng.nextNormal()) }
+        return rng.normalArray([count])
     case .nvidia:
         var rng = NvRandomSource(seed: seed)
         return (0..<count).map { _ in Float(rng.nextNormal()) }
