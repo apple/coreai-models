@@ -67,9 +67,13 @@ final class FrameProcessor {
 
         // 2. Propagate existing tracks. Memory encoding is deferred to the planning phase,
         // which first has to resolve non-overlap.
+        //
+        // The order the tracker's arrays are indexed by. `execute` may add or remove objects
+        // before the outputs are built, and a removal renumbers the registry underneath them.
+        let trackedObjectIDs = session.objectIDs
         var trackerLogits: [[Float]] = []
         var trackerScoreLogits: [Float] = []
-        if !session.objectIDs.isEmpty {
+        if !trackedObjectIDs.isEmpty {
             let propagation = try await timed(VideoSegmentationEngine.Function.trackerStep) {
                 try await tracker.propagate(
                     session: session, frameIndex: frameIndex, totalFrames: totalFrames,
@@ -95,14 +99,20 @@ final class FrameProcessor {
 
         let output = buildOutputs(
             session: session, frameIndex: frameIndex, detections: detections,
+            trackedObjectIDs: trackedObjectIDs,
             trackerLogits: trackerLogits, trackerScoreLogits: trackerScoreLogits,
             plan: planning.plan, newScores: planning.newScores)
 
-        // Shed history no reader can reach. Upstream retains it for the whole video.
-        session.prune(
+        // Shed history no reader can reach; upstream keeps it for the whole video. The
+        // conditioning horizons are counts because reconditioning runs on a cadence.
+        let memoryWindow = max(parameters.numMaskmem, 1)
+        let conditioningMemoryCapacity = parameters.maxCondFrameNum + memoryWindow
+        try session.prune(
             currentFrame: frameIndex,
-            memoryWindow: max(parameters.numMaskmem, 1),
-            pointerWindow: max(parameters.maxObjectPointers, parameters.numMaskmem))
+            memoryWindow: memoryWindow,
+            pointerWindow: max(parameters.maxObjectPointers, parameters.numMaskmem),
+            conditioningCapacity: max(shapes.ptrSlots, conditioningMemoryCapacity),
+            conditioningMemoryCapacity: conditioningMemoryCapacity)
         return output
     }
 
@@ -362,21 +372,24 @@ final class FrameProcessor {
 
     /// Port of `build_outputs` plus the metadata bookkeeping at the end of `forward`.
     ///
-    /// Both zips below run the post-execution object list against pre-execution arrays and
-    /// truncate at the shorter, matching upstream's indexing.
-    private func buildOutputs(
+    /// Slight divergence from transformers to fix mask/score misalignment when an object
+    /// is removed mid-frame. See (`modeling_sam3_video.py:1669` and `:1678`).
+    func buildOutputs(
         session: VideoInferenceSession,
         frameIndex: Int,
         detections: MergedDetections,
+        trackedObjectIDs: [Int],
         trackerLogits: [[Float]],
         trackerScoreLogits: [Float],
         plan: TrackerUpdatePlan,
         newScores: [Int: Float]
     ) -> RawFrameOutput {
         var maskByObjectID: [Int: [Float]] = [:]
-        let currentObjectIDs = session.objectIDs
+        // A removed object is kept out of the mask map here. The postprocessor only hides
+        // hotstart removals, so with hotstart off it would otherwise render one last frame.
+        let removed = plan.newlyRemovedObjectIDs
 
-        for (objectID, mask) in zip(currentObjectIDs, trackerLogits) {
+        for (objectID, mask) in zip(trackedObjectIDs, trackerLogits) where !removed.contains(objectID) {
             maskByObjectID[objectID] = mask
         }
 
@@ -401,7 +414,8 @@ final class FrameProcessor {
         // tracker's own scores, matching upstream's update order.
         var trackerScores = session.trackerScoreByFrame[frameIndex] ?? [:]
         for (objectID, score) in newScores { trackerScores[objectID] = score }
-        for (objectID, logit) in zip(currentObjectIDs, trackerScoreLogits) {
+        for (objectID, logit) in zip(trackedObjectIDs, trackerScoreLogits)
+        where !removed.contains(objectID) {
             trackerScores[objectID] = DetectionDecoder.sigmoid(logit)
         }
         session.trackerScoreByFrame[frameIndex] = trackerScores
@@ -412,8 +426,8 @@ final class FrameProcessor {
             session.hotstartRemovedObjectIDs.formUnion(session.removedObjectIDs)
         }
 
-        // Keyed off the mask map: as upstream does, a removed object keeps its entry for
-        // this frame and the postprocessor hides it.
+        // The postprocessor keys off the mask map, which no longer holds this frame's
+        // removals.
         return RawFrameOutput(
             frameIndex: frameIndex,
             maskLogitsByObjectID: maskByObjectID,

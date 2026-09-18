@@ -57,7 +57,7 @@ the `tracking` block records the checkpoint's heuristic thresholds.
 | `--dtype`              | `float16` or `float32`                       | `float16`              |
 | `--image-size`         | Input resolution. Must match the checkpoint. | `1008`                 |
 | `--spatial-slots`      | Spatial memory slots per object              | `10`                   |
-| `--ptr-slots`          | Object-pointer slots per object              | `24`                   |
+| `--ptr-slots`          | Object-pointer slots per object              | `96`                   |
 | `--output-dir`         | Bundle destination                           | `<repo-root>/exports/` |
 | `--output-name`        | Custom bundle directory name                 | derived                |
 | `--overwrite`          | Replace an existing bundle                   | off                    |
@@ -109,10 +109,7 @@ for try await frame in segmenter.segment(videoAt: sourceURL, prompts: ["person"]
 }
 ```
 
-Frames arrive `hotstart_delay` (15) behind the decoder, because a track removed on frame
-20 must never have been shown on frame 8. That means 15 decoded frames are held as well,
-about 124 MB at 1080p. `--hotstart-delay 0` turns off both the delay and the removal rules
-that need it.
+The default hot-start delay is 15 frames. Set `--hotstart-delay 0` to turn it off."
 
 ## Supported models
 

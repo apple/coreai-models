@@ -12,10 +12,12 @@ struct PackedMemory {
     var spatialMemory: NDArray
     var spatialMemoryPosition: NDArray
     var spatialTemporalIndex: NDArray
-    var spatialValid: NDArray
+    /// One element per spatial slot, 1 for a slot holding a real memory and 0 for padding.
+    var spatialSlotOccupancy: NDArray
     var objectPointers: NDArray
     var pointerTemporalPosition: NDArray
-    var pointerValid: NDArray
+    /// One element per pointer slot, 1 for occupied and 0 for padding.
+    var pointerSlotOccupancy: NDArray
 }
 
 /// Selects each object's eligible memories and packs them into the graph's fixed slots.
@@ -87,10 +89,10 @@ final class MemoryBankPacker {
             spatialMemoryPosition: try await engine.makeInput(
                 for: step, named: "spatial_memory_pos"),
             spatialTemporalIndex: try await engine.makeInput(for: step, named: "spatial_tpos_idx"),
-            spatialValid: try await engine.makeInput(for: step, named: "spatial_valid"),
+            spatialSlotOccupancy: try await engine.makeInput(for: step, named: "spatial_valid"),
             objectPointers: try await engine.makeInput(for: step, named: "object_pointers"),
             pointerTemporalPosition: try await engine.makeInput(for: step, named: "ptr_tpos"),
-            pointerValid: try await engine.makeInput(for: step, named: "ptr_valid"))
+            pointerSlotOccupancy: try await engine.makeInput(for: step, named: "ptr_valid"))
     }
 
     /// Fill the bank for one object on one frame and hand back the shared tensors.
@@ -120,7 +122,7 @@ final class MemoryBankPacker {
             history: history, frameIndex: frameIndex, reverse: reverse, parameters: parameters)
 
         var temporalIndices = [Int32](repeating: 0, count: shapes.spatialSlots)
-        var valid = [Float](repeating: 0, count: shapes.spatialSlots)
+        var occupancy = [Float](repeating: 0, count: shapes.spatialSlots)
         var slot = 0
         for (offset, output) in entries {
             guard let output,
@@ -138,7 +140,7 @@ final class MemoryBankPacker {
                 stride: spatialSlotElements)
             temporalIndices[slot] = Int32(
                 Self.temporalIndex(forOffset: offset, numMaskmem: parameters.numMaskmem))
-            valid[slot] = 1
+            occupancy[slot] = 1
             slot += 1
         }
 
@@ -151,7 +153,7 @@ final class MemoryBankPacker {
         previousSpatialSlots = slot
 
         fillNDArray(&packed.spatialTemporalIndex, as: Int32.self, with: temporalIndices)
-        fillFloatNDArray(&packed.spatialValid, with: valid)
+        fillFloatNDArray(&packed.spatialSlotOccupancy, with: occupancy)
     }
 
     /// Row of `memory_temporal_positional_encoding` a memory at `offset` should use.
@@ -253,13 +255,13 @@ final class MemoryBankPacker {
         // single-frame video. Clamped to 1 to keep infinities out of the graph.
         let maxTemporalDifference = Float(max(1, maxPointers - 1))
         var temporalPositions = [Float](repeating: 0, count: shapes.ptrSlots)
-        var valid = [Float](repeating: 0, count: shapes.ptrSlots)
+        var occupancy = [Float](repeating: 0, count: shapes.ptrSlots)
         for (slot, offset) in offsets.enumerated() {
             write(
                 MemoryPayload(reading: pointers[slot], limit: pointerSlotElements),
                 into: &packed.objectPointers, slot: slot, stride: pointerSlotElements)
             temporalPositions[slot] = Float(offset) / maxTemporalDifference
-            valid[slot] = 1
+            occupancy[slot] = 1
         }
 
         if offsets.count < previousPointerSlots {
@@ -269,7 +271,7 @@ final class MemoryBankPacker {
         previousPointerSlots = offsets.count
 
         fillFloatNDArray(&packed.pointerTemporalPosition, with: temporalPositions)
-        fillFloatNDArray(&packed.pointerValid, with: valid)
+        fillFloatNDArray(&packed.pointerSlotOccupancy, with: occupancy)
     }
 
     /// Port of `Sam3TrackerVideoModel._get_object_pointers` in non-streaming mode.
@@ -320,7 +322,7 @@ final class MemoryBankPacker {
         #endif
     }
 
-    /// Wipe slots that were valid on the previous call and are not on this one. The key mask
+    /// Wipe slots that were occupied on the previous call and are not on this one. The key mask
     /// already suppresses them numerically, but clearing keeps a parity divergence readable.
     private func clearHalfRegion(_ array: inout NDArray, _ range: Range<Int>) {
         #if !((os(macOS) || targetEnvironment(macCatalyst)) && arch(x86_64))

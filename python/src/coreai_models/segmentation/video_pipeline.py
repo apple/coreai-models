@@ -70,7 +70,7 @@ class VideoExportConfig:
     image_size: int = 1008
     dtype: str = "float16"  # "float16" | "float32"
     spatial_slots: int = 10
-    ptr_slots: int = 24
+    ptr_slots: int = 96
     max_text_seq_len: int = 32
     output_dir: str = "exports"
     output_name: str | None = None

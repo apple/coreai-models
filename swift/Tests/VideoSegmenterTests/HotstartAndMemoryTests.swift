@@ -4,6 +4,7 @@
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
 import CoreAI
+import Foundation
 import Testing
 
 @testable import CoreAIShared
@@ -286,8 +287,6 @@ struct MemorySelectionTests {
 @Suite("MemoryBankPacker configuration")
 @VideoSegmentationActor
 struct MemoryBankConfigurationTests {
-    /// Shapes sized so only the parameter under test can make `init` refuse. The bank stays
-    /// unallocated because `init` validates before touching it.
     private func shapes(spatialSlots: Int = 64) -> VideoSegmentationEngine.Shapes {
         VideoSegmentationEngine.Shapes(
             imageSize: 1008, textSequenceLength: 32, lowResMaskSize: 252, memoryMaskSize: 252,
@@ -299,8 +298,8 @@ struct MemoryBankConfigurationTests {
         func stub() -> NDArray { NDArray(shape: [1, 1, 4], scalarType: .float16) }
         return PackedMemory(
             spatialMemory: stub(), spatialMemoryPosition: stub(), spatialTemporalIndex: stub(),
-            spatialValid: stub(), objectPointers: stub(), pointerTemporalPosition: stub(),
-            pointerValid: stub())
+            spatialSlotOccupancy: stub(), objectPointers: stub(), pointerTemporalPosition: stub(),
+            pointerSlotOccupancy: stub())
     }
 
     private func makePacker(_ mutate: (inout VideoSegmentationParameters) -> Void) throws
@@ -339,5 +338,307 @@ struct MemoryBankConfigurationTests {
         #expect(throws: VideoSegmentationError.self) {
             try makePacker { $0.maxCondFrameNum = -1 }
         }
+    }
+}
+
+@Suite("ObjectOutputHistory pruning")
+@VideoSegmentationActor
+struct HistoryPruningTests {
+    private static let ptrSlots = 24
+
+    private func parameters() -> VideoSegmentationParameters {
+        var parameters = VideoSegmentationParameters.default
+        parameters.numMaskmem = 7
+        parameters.maxCondFrameNum = 4
+        parameters.maxObjectPointers = 16
+        return parameters
+    }
+
+    private func capacity(_ parameters: VideoSegmentationParameters) -> Int {
+        max(Self.ptrSlots, memoryCapacity(parameters))
+    }
+
+    private func memoryCapacity(_ parameters: VideoSegmentationParameters) -> Int {
+        parameters.maxCondFrameNum + parameters.numMaskmem
+    }
+
+    private func payload() -> MemoryPayload {
+        MemoryPayload(reading: NDArray(shape: [1, 1, 4], scalarType: .float16))
+    }
+
+    /// One frame in the real write order: store, promote if reconditioning, attach memory.
+    /// `objectScoreLogit` carries the frame so a packed slot can be traced to its source.
+    private func advance(
+        _ history: inout ObjectOutputHistory, to frame: Int, reconditioning: Bool = true
+    ) {
+        history.store(
+            StoredFrameOutput(
+                predictedMasks: [0],
+                objectPointer: NDArray(shape: [1, 1, 4], scalarType: .float16),
+                objectScoreLogit: Float(frame)),
+            at: frame, conditioning: false)
+        if reconditioning { history.promoteToConditioning(frame: frame) }
+        history.attachMemory(features: payload(), positionEncoding: payload(), at: frame)
+    }
+
+    private func prune(
+        _ history: inout ObjectOutputHistory, at frame: Int,
+        _ parameters: VideoSegmentationParameters
+    ) {
+        history.prune(
+            before: frame, memoryWindow: parameters.numMaskmem,
+            pointerWindow: max(parameters.maxObjectPointers, parameters.numMaskmem),
+            conditioningCapacity: capacity(parameters),
+            conditioningMemoryCapacity: memoryCapacity(parameters))
+    }
+
+    /// What reaches the spatial bank: `packSpatial` skips entries missing either payload,
+    /// so a slot is just its frame plus whether it still carries memory.
+    private func slots(
+        _ history: ObjectOutputHistory, frameIndex: Int, _ parameters: VideoSegmentationParameters
+    ) -> [String] {
+        MemoryBankPacker.gatherMemoryFrames(
+            history: history, frameIndex: frameIndex, reverse: false, parameters: parameters
+        ).map { entry in
+            guard let output = entry.output, output.memoryFeatures != nil,
+                output.memoryPositionEncoding != nil
+            else { return "\(entry.offset):empty" }
+            return "\(entry.offset):\(output.objectScoreLogit)"
+        }
+    }
+
+    /// The offsets surviving `packPointers`, which keeps the `ptrSlots` closest. An offset
+    /// identifies its frame uniquely, so equal offsets mean equal pointers.
+    private func pointerSlots(
+        _ history: ObjectOutputHistory, frameIndex: Int, _ parameters: VideoSegmentationParameters
+    ) -> [Int] {
+        let (offsets, _, _) = MemoryBankPacker.objectPointers(
+            history: history, frameIndex: frameIndex, totalFrames: 10_000, reverse: false,
+            parameters: parameters)
+        guard offsets.count > Self.ptrSlots else { return offsets }
+        return offsets.indices
+            .sorted { abs(offsets[$0]) < abs(offsets[$1]) }
+            .prefix(Self.ptrSlots)
+            .sorted()
+            .map { offsets[$0] }
+    }
+
+    @Test(
+        "Pruning never changes what the packer would pack",
+        arguments: [1, 16])
+    func pruningIsBitExact(reconditionEvery: Int) {
+        // The claim behind dropping conditioning history: a forward pass can never read
+        // what prune removes. 16 is the shipped cadence, 1 the worst case for growth.
+        let parameters = parameters()
+        var pruned = ObjectOutputHistory()
+        var retained = ObjectOutputHistory()
+
+        for frame in 0..<600 {
+            // Both banks are read at the top of a frame, before that frame's own entry lands.
+            #expect(
+                slots(pruned, frameIndex: frame, parameters)
+                    == slots(retained, frameIndex: frame, parameters),
+                "spatial bank diverged at frame \(frame), cadence \(reconditionEvery)")
+            #expect(
+                pointerSlots(pruned, frameIndex: frame, parameters)
+                    == pointerSlots(retained, frameIndex: frame, parameters),
+                "pointer bank diverged at frame \(frame), cadence \(reconditionEvery)")
+
+            let reconditioning = frame % reconditionEvery == 0
+            advance(&pruned, to: frame, reconditioning: reconditioning)
+            advance(&retained, to: frame, reconditioning: reconditioning)
+            prune(&pruned, at: frame, parameters)
+        }
+
+        #expect(retained.conditioningOrder.count == (600 + reconditionEvery - 1) / reconditionEvery)
+        #expect(pruned.conditioningOrder.count <= capacity(parameters))
+    }
+
+    @Test("Conditioning history stays bounded when every frame reconditions")
+    func conditioningStaysBounded() {
+        let parameters = parameters()
+        var history = ObjectOutputHistory()
+        for frame in 0..<2_000 {
+            advance(&history, to: frame)
+            prune(&history, at: frame, parameters)
+        }
+
+        #expect(history.conditioningOrder.count <= capacity(parameters))
+        #expect(history.conditioning.count <= capacity(parameters))
+        #expect(history.framesTracked.count <= capacity(parameters))
+
+        // The megabyte-scale half expires on the shorter memory horizon.
+        let withMemory = history.conditioning.values.filter { $0.memoryFeatures != nil }
+        #expect(withMemory.count <= memoryCapacity(parameters))
+        let withMasks = history.conditioning.values.filter { $0.predictedMasks != nil }
+        #expect(withMasks.count <= parameters.numMaskmem + 1)
+    }
+
+    @Test("A conditioning frame keeps its pointer after its memory expires")
+    func pointerOutlivesMemory() {
+        // Horizons differ on purpose: a pointer is kilobytes and stays reachable far
+        // longer than the memory it came with.
+        let parameters = parameters()
+        var history = ObjectOutputHistory()
+        for frame in 0...20 {
+            advance(&history, to: frame)
+            prune(&history, at: frame, parameters)
+        }
+        #expect(history.conditioning[5] != nil, "still inside the pointer budget")
+        #expect(history.conditioning[5]?.memoryFeatures == nil, "outside the memory budget")
+        #expect(history.conditioning[18]?.memoryFeatures != nil, "inside the memory budget")
+    }
+
+    @Test("Pruning backwards is refused rather than silently dropping reachable history")
+    func rejectsBackwardPrune() throws {
+        let session = VideoInferenceSession(videoWidth: 64, videoHeight: 64)
+        try session.prune(
+            currentFrame: 10, memoryWindow: 7, pointerWindow: 16, conditioningCapacity: 24,
+            conditioningMemoryCapacity: 11)
+        try session.prune(
+            currentFrame: 10, memoryWindow: 7, pointerWindow: 16, conditioningCapacity: 24,
+            conditioningMemoryCapacity: 11)
+        #expect(throws: VideoSegmentationError.self) {
+            try session.prune(
+                currentFrame: 9, memoryWindow: 7, pointerWindow: 16, conditioningCapacity: 24,
+                conditioningMemoryCapacity: 11)
+        }
+    }
+}
+
+@Suite("buildOutputs object pairing")
+@VideoSegmentationActor
+struct BuildOutputsPairingTests {
+    /// Tiny geometry so a mask is one float. `buildOutputs` only reaches `lowResMaskSize` and
+    /// the parameters, never the engine, so no asset has to load.
+    private func shapes() -> VideoSegmentationEngine.Shapes {
+        VideoSegmentationEngine.Shapes(
+            imageSize: 8, textSequenceLength: 4, lowResMaskSize: 1, memoryMaskSize: 1,
+            highResMaskSize: 1, memoryTokenCount: 4, memoryDim: 4, hiddenDim: 4,
+            spatialSlots: 64, ptrSlots: 24)
+    }
+
+    private func makeProcessor(hotstartEnabled: Bool) throws -> FrameProcessor {
+        var parameters = VideoSegmentationParameters.default
+        parameters.hotstartDelay = hotstartEnabled ? 15 : 0  // `hotstartEnabled` is derived
+        parameters.fillHoleArea = 0  // leave detection masks byte-identical
+        let shapes = shapes()
+        let engine = VideoSegmentationEngine(modelURL: URL(fileURLWithPath: "/nonexistent"))
+        func stub() -> NDArray { NDArray(shape: [1, 1, 4], scalarType: .float16) }
+        let packer = try MemoryBankPacker(
+            shapes: shapes, parameters: parameters,
+            packed: PackedMemory(
+                spatialMemory: stub(), spatialMemoryPosition: stub(), spatialTemporalIndex: stub(),
+                spatialSlotOccupancy: stub(), objectPointers: stub(),
+                pointerTemporalPosition: stub(), pointerSlotOccupancy: stub()))
+        return FrameProcessor(
+            engine: engine, shapes: shapes, parameters: parameters,
+            tracker: TrackerLoop(
+                engine: engine, shapes: shapes, parameters: parameters, packer: packer))
+    }
+
+    /// A session tracking `ids`, in registration order.
+    private func session(tracking ids: [Int]) -> VideoInferenceSession {
+        let session = VideoInferenceSession(videoWidth: 8, videoHeight: 8)
+        for id in ids { session.index(ofObject: id) }
+        return session
+    }
+
+    /// Each object's mask and score logit encode its own id, so a mis-pairing is legible.
+    private func maskLogits(for ids: [Int]) -> [[Float]] { ids.map { [Float($0)] } }
+    private func scoreLogits(for ids: [Int]) -> [Float] { ids.map { Float($0) } }
+
+    @Test("A mid-list removal leaves every survivor holding its own mask")
+    func removalDoesNotShiftMasks() throws {
+        // The bug this guards: `execute` removes object 2, `ObjectRegistry.remove` compacts the
+        // registry, and a post-removal zip hands object 3 the mask computed for object 2.
+        let processor = try makeProcessor(hotstartEnabled: true)
+        let tracked = [1, 2, 3]
+        let session = session(tracking: tracked)
+
+        var plan = TrackerUpdatePlan()
+        plan.newlyRemovedObjectIDs = [2]
+        session.removeObject(2)  // what `execute` already did by the time outputs are built
+
+        let output = processor.buildOutputs(
+            session: session, frameIndex: 0, detections: MergedDetections(),
+            trackedObjectIDs: tracked,
+            trackerLogits: maskLogits(for: tracked), trackerScoreLogits: scoreLogits(for: tracked),
+            plan: plan, newScores: [:])
+
+        #expect(output.maskLogitsByObjectID[1] == [1])
+        #expect(output.maskLogitsByObjectID[3] == [3], "object 3 must not inherit object 2's mask")
+        #expect(output.maskLogitsByObjectID[2] == nil, "the removed object emits no mask")
+    }
+
+    @Test("A mid-list removal leaves every survivor holding its own tracker score")
+    func removalDoesNotShiftScores() throws {
+        // The second zip, which would otherwise be fixed only by accident.
+        let processor = try makeProcessor(hotstartEnabled: true)
+        let tracked = [1, 2, 3]
+        let session = session(tracking: tracked)
+
+        var plan = TrackerUpdatePlan()
+        plan.newlyRemovedObjectIDs = [2]
+        session.removeObject(2)
+
+        let output = processor.buildOutputs(
+            session: session, frameIndex: 0, detections: MergedDetections(),
+            trackedObjectIDs: tracked,
+            trackerLogits: maskLogits(for: tracked), trackerScoreLogits: scoreLogits(for: tracked),
+            plan: plan, newScores: [:])
+
+        #expect(output.trackerScoreByObjectID[1] == DetectionDecoder.sigmoid(1))
+        #expect(
+            output.trackerScoreByObjectID[3] == DetectionDecoder.sigmoid(3),
+            "object 3 must not inherit object 2's score")
+    }
+
+    @Test("A removed object emits no mask even with hotstart disabled")
+    func removedObjectHiddenWithoutHotstart() throws {
+        // `MaskPostprocessor` only filters `hotstartRemovedObjectIDs`, which stays empty when
+        // hotstart is off, so `buildOutputs` has to drop the removal itself.
+        let processor = try makeProcessor(hotstartEnabled: false)
+        let tracked = [1, 2]
+        let session = session(tracking: tracked)
+
+        var plan = TrackerUpdatePlan()
+        plan.newlyRemovedObjectIDs = [2]
+        session.removeObject(2)
+
+        let output = processor.buildOutputs(
+            session: session, frameIndex: 0, detections: MergedDetections(),
+            trackedObjectIDs: tracked,
+            trackerLogits: maskLogits(for: tracked), trackerScoreLogits: scoreLogits(for: tracked),
+            plan: plan, newScores: [:])
+
+        #expect(output.maskLogitsByObjectID[2] == nil)
+        #expect(session.hotstartRemovedObjectIDs.isEmpty)
+    }
+
+    @Test("With no removal every object keeps its own mask, new objects included")
+    func additionsArePairedUnchanged() throws {
+        // New objects are appended after the tracker ran, so the zip stops short of them and
+        // the detection-mask override fills them in.
+        let processor = try makeProcessor(hotstartEnabled: true)
+        let tracked = [1, 2]
+        let session = session(tracking: tracked)
+        session.index(ofObject: 3)
+
+        var plan = TrackerUpdatePlan()
+        plan.newObjectIDs = [3]
+        plan.newDetectionIndices = [0]
+        var detections = MergedDetections()
+        detections.maskLogits = [[99]]
+
+        let output = processor.buildOutputs(
+            session: session, frameIndex: 0, detections: detections,
+            trackedObjectIDs: tracked,
+            trackerLogits: maskLogits(for: tracked), trackerScoreLogits: scoreLogits(for: tracked),
+            plan: plan, newScores: [:])
+
+        #expect(output.maskLogitsByObjectID[1] == [1])
+        #expect(output.maskLogitsByObjectID[2] == [2])
+        #expect(output.maskLogitsByObjectID[3] == [99], "seeded from its detection mask")
     }
 }

@@ -22,7 +22,7 @@ struct VideoSegmenterCLI: AsyncParsableCommand {
     var model: String
 
     @Option(name: .long, help: "Path to the input video (mp4, mov, ...).")
-    var video: String?
+    var inputVideo: String?
 
     @Option(name: .long, help: "Text prompt describing an object to track. Repeatable.")
     var prompt: [String] = []
@@ -112,8 +112,8 @@ struct VideoSegmenterCLI: AsyncParsableCommand {
 
     func validate() throws {
         if parity == nil {
-            guard video != nil else {
-                throw ValidationError("--video is required (unless --parity is set).")
+            guard inputVideo != nil else {
+                throw ValidationError("--input-video is required (unless --parity is set).")
             }
             guard !prompt.isEmpty else {
                 throw ValidationError("At least one --prompt is required.")
@@ -137,7 +137,8 @@ struct VideoSegmenterCLI: AsyncParsableCommand {
             print("Cleared the specialization cache for \(cleared.count) asset(s).")
         }
 
-        let segmenter = try await VideoSegmenter(resourcesAt: expand(model), parameters: overrides())
+        let segmenter = try await VideoSegmenter(
+            resourcesAt: expand(model), parameters: overrides(), pinning: applyTrackingFlags)
 
         print("Preparing asset...", terminator: "")
         fflush(stdout)
@@ -161,14 +162,20 @@ struct VideoSegmenterCLI: AsyncParsableCommand {
         try await runSegmentation(segmenter: segmenter)
     }
 
-    /// Parameters assembled from the flags. Anything left `nil` keeps the bundle's value.
-    private func overrides() -> VideoSegmentationParameters {
-        var parameters = VideoSegmentationParameters.default
+    /// Tracking flags the user passed explicitly. Applied after the bundle's `tracking`
+    /// block, since metadata.json declares most of these and would otherwise win.
+    private func applyTrackingFlags(to parameters: inout VideoSegmentationParameters) {
         scoreThreshold.map { parameters.scoreThresholdDetection = $0 }
         detNmsThresh.map { parameters.detNmsThresh = $0 }
         fillHoleArea.map { parameters.fillHoleArea = $0 }
         hotstartDelay.map { parameters.hotstartDelay = $0 }
         reconditionEvery.map { parameters.reconditionEveryNthFrame = $0 }
+    }
+
+    /// Parameters assembled from the flags. Anything left `nil` keeps the bundle's value.
+    private func overrides() -> VideoSegmentationParameters {
+        var parameters = VideoSegmentationParameters.default
+        applyTrackingFlags(to: &parameters)
         parameters.maskOpacity = maskOpacity
         parameters.drawBoxes = boxes
         parameters.drawLabels = labels
@@ -178,7 +185,7 @@ struct VideoSegmenterCLI: AsyncParsableCommand {
     // MARK: - Segmentation
 
     private func runSegmentation(segmenter: VideoSegmenter) async throws {
-        let sourceURL = URL(fileURLWithPath: expand(video!))
+        let sourceURL = URL(fileURLWithPath: expand(inputVideo!))
         guard FileManager.default.fileExists(atPath: sourceURL.path) else {
             throw ValidationError("No video at \(sourceURL.path)")
         }
@@ -292,11 +299,7 @@ struct VideoSegmenterCLI: AsyncParsableCommand {
         var parityParameters = await segmenter.parameters
         parityParameters.emitLowResolutionMasks =
             reference.lowResolutionMasks(at: reference.frameIndices[0]) != nil
-        scoreThreshold.map { parityParameters.scoreThresholdDetection = $0 }
-        detNmsThresh.map { parityParameters.detNmsThresh = $0 }
-        fillHoleArea.map { parityParameters.fillHoleArea = $0 }
-        hotstartDelay.map { parityParameters.hotstartDelay = $0 }
-        reconditionEvery.map { parityParameters.reconditionEveryNthFrame = $0 }
+        applyTrackingFlags(to: &parityParameters)
         // Prefer the frames PyTorch itself decoded, which holds the decoder constant. See
         // `ParityReference` for the size of the AVFoundation/PyAV difference.
         if let frames = try reference.decodedFrames() {

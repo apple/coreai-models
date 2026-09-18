@@ -204,10 +204,10 @@ public actor VideoSegmentationEngine: ResourceManaging {
                 "spatial_memory": memory.spatialMemory,
                 "spatial_memory_pos": memory.spatialMemoryPosition,
                 "spatial_tpos_idx": memory.spatialTemporalIndex,
-                "spatial_valid": memory.spatialValid,
+                "spatial_valid": memory.spatialSlotOccupancy,
                 "object_pointers": memory.objectPointers,
                 "ptr_tpos": memory.pointerTemporalPosition,
-                "ptr_valid": memory.pointerValid,
+                "ptr_valid": memory.pointerSlotOccupancy,
             ])
         return TrackerStepOutputs(
             predictedMasks: try outputs("pred_masks"),

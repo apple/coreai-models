@@ -24,13 +24,6 @@ import Foundation
 ///     print(frame.frameIndex, frame.objects.map(\.id))
 /// }
 /// ```
-///
-/// ## Hotstart delay
-///
-/// SAM 3 buffers its first `hotstartDelay` frames (15 by default) before emitting anything,
-/// so that a track it removes on frame 20 was never shown on frame 8. That costs roughly
-/// 124 MB at 1080p. Set `hotstartDelay` to 0 to turn off both the delay and the removal
-/// rules that depend on it.
 @VideoSegmentationActor
 public final class VideoSegmenter: ResourceManaging {
     private let bundle: VideoSegmenterBundle
@@ -54,13 +47,19 @@ public final class VideoSegmenter: ResourceManaging {
     ///   - parameters: Overrides applied under the bundle's own `tracking` block, so a
     ///     bundle that declares its thresholds wins. For per-run overrides, see
     ///     ``segment(videoAt:prompts:maxFrames:parameters:)``.
+    ///   - pinning: Applied after the bundle, for settings that must outrank it such as an
+    ///     explicit command-line flag. The packer and tracker are built from the result, so
+    ///     this is the only way to override a field the bundle declares.
     public init(
         resourcesAt path: String,
-        parameters: VideoSegmentationParameters = .default
+        parameters: VideoSegmentationParameters = .default,
+        pinning: ((inout VideoSegmentationParameters) -> Void)? = nil
     ) async throws {
         let bundle = try VideoSegmenterBundle(from: path)
         self.bundle = bundle
-        self.parameters = try bundle.parameters(overriding: parameters)
+        var resolved = try bundle.parameters(overriding: parameters)
+        pinning?(&resolved)
+        self.parameters = resolved
         self.tokenizer = try CLIPTokenizer(folder: bundle.tokenizerFolder)
         self.engine = VideoSegmentationEngine(modelURL: bundle.modelURL)
     }

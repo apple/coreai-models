@@ -94,12 +94,11 @@ struct ObjectOutputHistory {
         }
     }
 
-    /// Drop history that can no longer be read.
-    ///
-    /// Upstream retains everything, which a long video outgrows. The window covers what the
-    /// two readers can still reach. Conditioning entries are kept whole. Pointers iterate all
-    /// of them and there are few.
-    mutating func prune(before frame: Int, memoryWindow: Int, pointerWindow: Int) {
+    /// Drop history the packer can no longer reach.
+    mutating func prune(
+        before frame: Int, memoryWindow: Int, pointerWindow: Int, conditioningCapacity: Int,
+        conditioningMemoryCapacity: Int
+    ) {
         let memoryFloor = frame - memoryWindow
         let pointerFloor = frame - pointerWindow
         for key in nonConditioning.keys {
@@ -111,10 +110,30 @@ struct ObjectOutputHistory {
                 nonConditioning[key]?.predictedMasks = nil
             }
         }
+
+        // Conditioning memories expire by count
+        let memoryExcess = conditioningOrder.count - conditioningMemoryCapacity
+        if memoryExcess > 0 {
+            for key in conditioningOrder.prefix(memoryExcess) {
+                conditioning[key]?.memoryFeatures = nil
+                conditioning[key]?.memoryPositionEncoding = nil
+            }
+        }
+        // Only read back on the frame that produced them.
         for key in conditioningOrder where key < memoryFloor {
-            // Keep the pointer and the memory, since a conditioning frame can be selected
-            // from any distance. Only the low-res mask is unreachable once the frame is past.
             conditioning[key]?.predictedMasks = nil
+        }
+
+        // Remove oldest conditioning frames when there are no longer usable
+        let excess = conditioningOrder.count - conditioningCapacity
+        if excess > 0 {
+            for key in conditioningOrder.prefix(excess) { conditioning[key] = nil }
+            conditioningOrder.removeFirst(excess)
+        }
+
+        // Only read at the frame being processed.
+        for key in framesTracked.keys where key < pointerFloor {
+            framesTracked[key] = nil
         }
     }
 }
@@ -177,6 +196,9 @@ final class VideoInferenceSession {
     /// `max_vision_features_cache_size` default of 1.
     var cachedFrameIndex: Int?
     var cachedFeatures: TrackerFeatures?
+
+    /// Guards `prune`'s forward-only assumption.
+    private var lastPrunedFrame: Int?
 
     struct OverlapPair: Hashable {
         let firstAppearing: Int
@@ -251,10 +273,24 @@ final class VideoInferenceSession {
     }
 
     /// Drop history no reader can reach any more, for every object.
-    func prune(currentFrame: Int, memoryWindow: Int, pointerWindow: Int) {
+    ///
+    /// Forward-only: `_select_closest_cond_frames` looks on both sides of `currentFrame`, so
+    /// revisiting an older frame would reach entries an earlier call already dropped.
+    func prune(
+        currentFrame: Int, memoryWindow: Int, pointerWindow: Int, conditioningCapacity: Int,
+        conditioningMemoryCapacity: Int
+    ) throws {
+        if let lastPrunedFrame, currentFrame < lastPrunedFrame {
+            throw VideoSegmentationError.invalidConfiguration(
+                "Pruning ran backwards, from frame \(lastPrunedFrame) to \(currentFrame). "
+                    + "History retention assumes a forward-only frame loop.")
+        }
+        lastPrunedFrame = currentFrame
         for index in histories.indices {
             histories[index].prune(
-                before: currentFrame, memoryWindow: memoryWindow, pointerWindow: pointerWindow)
+                before: currentFrame, memoryWindow: memoryWindow, pointerWindow: pointerWindow,
+                conditioningCapacity: conditioningCapacity,
+                conditioningMemoryCapacity: conditioningMemoryCapacity)
         }
     }
 }
