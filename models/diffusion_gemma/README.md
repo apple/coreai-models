@@ -34,11 +34,3 @@ uv run coreai.diffusion_llm.export \
     --canvas-length 256 --compression 4bit \
     --output-dir ./exports/
 ```
-
-For the Swift `llm-runner`, export a static-shape encoder at a fixed prompt length:
-```bash
-uv run coreai.diffusion_llm.export \
-    --model google/diffusiongemma-26b-a4b-it \
-    --canvas-length 32 --enc-len 17 --static-encoder \
-    --compression 4bit --output-dir ./exports/
-```
