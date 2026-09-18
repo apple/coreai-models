@@ -87,7 +87,7 @@ the whole video.
 
 ```sh
 swift run video-segmenter --model exports/sam3_video_float16 \
-    --video clip.mp4 --prompt person --prompt dog --output out.mp4
+    --input-video clip.mp4 --prompt person --prompt dog --output out.mp4
 ```
 
 That writes an mp4 with each object's mask, box, and `#id prompt score` caption composited
