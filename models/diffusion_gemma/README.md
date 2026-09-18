@@ -29,7 +29,7 @@ brew install uv
 
 Export the encoder + decoder bundle (4-bit weight quantization is the practical target at this size):
 ```bash
-uv run coreai.diffusion_llm.export \
+uv run models/diffusion_gemma/export.py \
     --model google/diffusiongemma-26b-a4b-it \
     --canvas-length 256 --compression 4bit \
     --output-dir ./exports/

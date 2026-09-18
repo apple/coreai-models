@@ -49,7 +49,6 @@ dependencies = [
 "coreai.llm.eval" = "coreai_models.llm.eval:main"
 "coreai.vlm.export" = "coreai_models.vlm.export:main"
 "coreai.diffusion.export" = "coreai_models.diffusion.export:main"
-"coreai.diffusion_llm.export" = "coreai_models.diffusion_llm.export:main"
 "coreai.model.registry" = "coreai_models.model_registry:main"
 
 [tool.hatch.build.targets.wheel]

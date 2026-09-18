@@ -3,14 +3,15 @@
 # Use of this source code is governed by a BSD-3-clause license that can
 # be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
-"""Unit tests for the DiffusionGemma export module + the parity script.
+"""Unit tests for the DiffusionGemma export script.
 
-Pure helpers are tested directly; the weight-loading / export paths are
-exercised with mocks so no 26B checkpoint is required. The PyTorch parity
-script lives under ``internal/parity`` (a dev tool, not part of the package),
-so it is loaded by path.
+The export script is co-located at ``models/diffusion_gemma/export.py`` (not part
+of the installed package), so it is loaded by path. Pure helpers are tested
+directly; the weight-loading / export paths are exercised with mocks so no 26B
+checkpoint is required.
 """
 
+import importlib.util
 import json
 import sys
 import tempfile
@@ -20,7 +21,13 @@ from unittest import mock
 
 import torch
 
-from coreai_models.diffusion_llm import export as export_dg
+# The export script is co-located under models/, loaded by path.
+_REPO_ROOT = Path(__file__).resolve().parents[5]
+_spec = importlib.util.spec_from_file_location(
+    "diffusion_gemma_export", _REPO_ROOT / "models/diffusion_gemma/export.py"
+)
+export_dg = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(export_dg)
 
 # ---------------------------------------------------------------------------
 # Pure helpers

@@ -12,7 +12,7 @@ Produces a bundle with .aimodel components plus tokenizer + metadata:
                      (self-conditioning is folded into this graph)
 
 Usage:
-    uv run coreai.diffusion_llm.export \\
+    uv run models/diffusion_gemma/export.py \\
         --model google/diffusiongemma-26b-a4b-it \\
         --max-ctx 4096 --canvas-length 256 --output-dir ./exports/
 """
@@ -370,7 +370,7 @@ def _save_tokenizer(hf_model_id: str, dest: Path) -> None:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="coreai_models.diffusion_llm.export",
+        prog="export.py",
         description="Export DiffusionGemma to Core AI .aimodel (encoder + decoder).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
