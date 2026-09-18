@@ -144,11 +144,14 @@ class DiffusionGemmaGenerationConfig:
     max_denoising_steps: int = 48
     canvas_length: int = 256
     confidence_threshold: float = 0.005
+    # Reserved for follow-up: parsed and written to metadata, but not yet consumed
+    # — the stop check currently uses fixed 1-step stability, not this threshold.
     stability_threshold: int = 1
     t_max: float = 0.8
     t_min: float = 0.4
     entropy_bound: float = 0.1
-    # image_token_id doubles as the MASK token during diffusion.
+    # Reserved for follow-up: image_token_id doubles as the MASK token, but the
+    # canvas is currently random-initialized rather than mask-initialized.
     mask_token_id: int = 258880
 
     @classmethod

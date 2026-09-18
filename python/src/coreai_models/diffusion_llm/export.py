@@ -12,7 +12,7 @@ Produces a bundle with .aimodel components plus tokenizer + metadata:
                      (self-conditioning is folded into this graph)
 
 Usage:
-    python -m coreai_models.diffusion_llm.export \\
+    uv run coreai.diffusion_llm.export \\
         --model google/diffusiongemma-26b-a4b-it \\
         --max-ctx 4096 --canvas-length 256 --output-dir ./exports/
 """
