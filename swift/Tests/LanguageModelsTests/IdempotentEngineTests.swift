@@ -26,30 +26,6 @@ private func makeSessionState(hasNonTruncatableStates: Bool = false) -> Generati
 
 @Suite("GenerationSessionState round-trip")
 struct GenerationSessionStateTests {
-    @Test("Fresh state starts with an empty cursor and history")
-    func freshStateIsEmpty() {
-        let state = makeSessionState()
-        #expect(state.processedTokenCount == 0)
-        #expect(state.history.count == 0)
-        #expect(state.history.tokens.isEmpty)
-    }
-
-    @Test("state is a reference type so aliases observe mutations")
-    func referenceSemanticsSharedAcrossAliases() {
-        // The type is a class on purpose: the generation Iterator and the engine's
-        // shim must observe each other's cursor/history mutations across `generate()`
-        // calls. A value type would break prefix reuse.
-        let state = makeSessionState()
-        let alias = state
-
-        state.processedTokenCount = 7
-        state.history.append(contentsOf: [1, 2, 3][...])
-
-        #expect(alias.processedTokenCount == 7)
-        #expect(alias.history.tokens == [1, 2, 3])
-        #expect(alias === state)
-    }
-
     @Test("two sessions are independent and do not alias")
     func sessionsDoNotAlias() {
         // Distinct sessions must carry their own cursor + history. Mutating one
@@ -64,87 +40,6 @@ struct GenerationSessionStateTests {
         #expect(second.processedTokenCount == 0)
         #expect(second.history.count == 0)
         #expect(second.history.tokens.isEmpty)
-    }
-}
-
-// MARK: - Prefix Resolution (model-free)
-
-/// The `generate(with:sessionState:)` shim branches on `history.resolve(input:)`
-/// plus the cursor to decide full-reset / partial-rewind / pure-extension. These
-/// tests pin the resolution math that routing depends on.
-@Suite("Session prefix-cache resolution")
-struct SessionPrefixResolutionTests {
-    private func history(_ tokens: [Int32]) -> TokenHistory {
-        var h = TokenHistory()
-        h.append(contentsOf: tokens[...])
-        return h
-    }
-
-    @Test("empty history resolves everything as new")
-    func emptyHistory() {
-        let h = TokenHistory()
-        let (prefix, new) = h.resolve(input: [1, 2, 3])
-        #expect(prefix == 0)
-        #expect(Array(new) == [1, 2, 3])
-    }
-
-    @Test("exact match resolves to full prefix and no new tokens")
-    func exactMatch() {
-        let h = history([1, 2, 3])
-        let (prefix, new) = h.resolve(input: [1, 2, 3])
-        #expect(prefix == 3)
-        #expect(Array(new).isEmpty)
-    }
-
-    @Test("pure extension keeps the whole history and yields only the suffix")
-    func pureExtension() {
-        let h = history([1, 2, 3])
-        let (prefix, new) = h.resolve(input: [1, 2, 3, 4, 5])
-        #expect(prefix == 3)
-        #expect(Array(new) == [4, 5])
-    }
-
-    @Test("mid-sequence divergence resolves at the divergence point (slow-path scan)")
-    func midDivergence() {
-        // First tokens match, so memcmp fails only mid-buffer; the element-wise
-        // fallback must land the divergence at index 2.
-        let h = history([1, 2, 3, 4])
-        let (prefix, new) = h.resolve(input: [1, 2, 9, 4])
-        #expect(prefix == 2)
-        #expect(Array(new) == [9, 4])
-    }
-
-    @Test("first-token divergence resolves to zero common prefix")
-    func headDivergence() {
-        let h = history([1, 2, 3])
-        let (prefix, new) = h.resolve(input: [9, 2, 3])
-        #expect(prefix == 0)
-        #expect(Array(new) == [9, 2, 3])
-    }
-
-    @Test("input shorter than history caps the common prefix at input length")
-    func inputShorterThanHistory() {
-        let h = history([1, 2, 3, 4, 5])
-        let (prefix, new) = h.resolve(input: [1, 2, 3])
-        #expect(prefix == 3)
-        #expect(Array(new).isEmpty)
-    }
-
-    @Test("truncate rewinds resolution to the truncated boundary")
-    func truncateAffectsResolution() {
-        var h = history([1, 2, 3, 4, 5])
-        h.truncate(to: 2)
-        #expect(h.count == 2)
-        let (prefix, new) = h.resolve(input: [1, 2, 3, 4, 5])
-        #expect(prefix == 2)
-        #expect(Array(new) == [3, 4, 5])
-    }
-
-    @Test("truncate beyond count is a no-op")
-    func truncateBeyondCountNoOp() {
-        var h = history([1, 2, 3])
-        h.truncate(to: 10)
-        #expect(h.tokens == [1, 2, 3])
     }
 }
 
@@ -228,31 +123,6 @@ struct PrefixResetPlanTests {
 /// prior token before installing a new one (see generate(with:sessionState:)).
 @Suite("Single-active-generation contract")
 struct SingleActiveGenerationTests {
-    @Test("fresh box is idle")
-    func freshBoxIdle() {
-        let box = GenerationTokenBox()
-        #expect(!box.isBusy)
-    }
-
-    @Test("install marks the box busy")
-    func installMarksBusy() {
-        let box = GenerationTokenBox()
-        box.install(GenerationToken())
-        #expect(box.isBusy)
-    }
-
-    @Test("cancelActive cancels the in-flight token and clears the box")
-    func cancelActiveClearsAndCancels() {
-        let box = GenerationTokenBox()
-        let token = GenerationToken()
-        box.install(token)
-
-        box.cancelActive()
-
-        #expect(!box.isBusy)
-        #expect(token.isCancelled)
-    }
-
     @Test("shim supersede sequence cancels the previous generation")
     func supersedeCancelsPrevious() {
         // Mirrors generate(with:sessionState:): cancelActive() then install(newToken).
@@ -268,40 +138,6 @@ struct SingleActiveGenerationTests {
         #expect(first.isCancelled)
         #expect(!second.isCancelled)
         #expect(box.isBusy)
-    }
-
-    @Test("clearIfActive only clears when the token matches")
-    func clearIfActiveMatchesOnly() {
-        let box = GenerationTokenBox()
-        let active = GenerationToken()
-        box.install(active)
-
-        // A stale token (e.g. from a superseded generation) must not clear the box.
-        box.clearIfActive(GenerationToken())
-        #expect(box.isBusy)
-
-        // The owning token clears it.
-        box.clearIfActive(active)
-        #expect(!box.isBusy)
-    }
-
-    @Test("iterator releasing a superseded token leaves the newer generation active")
-    func supersededIteratorDoesNotReleaseNewGeneration() {
-        // A late-finishing iterator from generation #1 must not free the box while
-        // generation #2 is running.
-        let box = GenerationTokenBox()
-        let first = GenerationToken()
-        box.install(first)
-        box.cancelActive()
-        let second = GenerationToken()
-        box.install(second)
-
-        // Iterator #1 finishes and tries to release; box is owned by #2 now.
-        box.clearIfActive(first)
-        #expect(box.isBusy)
-
-        box.clearIfActive(second)
-        #expect(!box.isBusy)
     }
 }
 

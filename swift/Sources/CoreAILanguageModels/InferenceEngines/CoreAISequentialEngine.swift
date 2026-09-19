@@ -51,7 +51,7 @@ public final class CoreAISequentialEngine: InferenceEngine, IdempotentEngine, @u
     // Input handling — handler owns allocation and fill logic
     private var inputHandler: TokenInputHandler
 
-    // Engine options — retained so `makeSessionState()` can build fresh state handlers.
+    /// Retained to build per-session state handlers in `makeSessionState()`.
     private let options: EngineOptions
 
     // Per-request mutable state. The `generate()` shim owns one internal session and
