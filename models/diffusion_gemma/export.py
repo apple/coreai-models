@@ -14,7 +14,7 @@ Produces a bundle with .aimodel components plus tokenizer + metadata:
 Usage:
     uv run models/diffusion_gemma/export.py \\
         --model google/diffusiongemma-26b-a4b-it \\
-        --max-ctx 4096 --canvas-length 256 --output-dir ./exports/
+        --max-context-length 4096 --canvas-length 256 --output-dir ./exports/
 """
 
 from __future__ import annotations
@@ -60,7 +60,7 @@ def _rm(path: Path, overwrite: bool) -> None:
 
 def export_diffusion_gemma(
     hf_model_id: str,
-    max_ctx: int = 4096,
+    max_context_length: int = 4096,
     canvas_length: int = 256,
     compression: str = "none",
     output_dir: str = "./exports",
@@ -69,7 +69,7 @@ def export_diffusion_gemma(
     overwrite: bool = False,
     compute_precision: str = "bfloat16",
     encoder_only: bool = False,
-    enc_len: int = _TRACE_ENC_CTX,
+    encoder_len: int = _TRACE_ENC_CTX,
     static_encoder: bool = False,
 ) -> str:
     """Export DiffusionGemma to a Core AI bundle."""
@@ -87,7 +87,10 @@ def export_diffusion_gemma(
     # -- Encoder (autoregressive, fills the KV cache) ------------------------
     logger.info("Loading + exporting ENCODER ...")
     encoder = load_diffusion_gemma_encoder(
-        hf_model_id, target_dtype=dtype, max_context_length=max_ctx, num_layers=num_layers
+        hf_model_id,
+        target_dtype=dtype,
+        max_context_length=max_context_length,
+        num_layers=num_layers,
     )
     if compression and compression != "none":
         encoder = _quantize_encoder(encoder, compression, dtype)
@@ -99,13 +102,15 @@ def export_diffusion_gemma(
     _rm(enc_path, overwrite)
 
     if static_encoder:
-        # Static-shape prefill encoder (fixed sequence length = enc_len). MPSGraph's
+        # Static-shape prefill encoder (fixed sequence length = encoder_len). MPSGraph's
         # dynamic shape-function inference crashes in the Swift runtime on the dynamic
         # graph, so the Swift runner requires a static export. The cache is sized to
-        # enc_len and surfaced as keyCache/valueCache state.
-        ids0 = torch.zeros(1, enc_len, dtype=torch.int32)
-        pos0 = torch.arange(enc_len, dtype=torch.int32).unsqueeze(0)
-        kc = torch.zeros(n_layers_eff, 1, cache_n_kv, enc_len, cache_hd, dtype=dtype)
+        # encoder_len and surfaced as keyCache/valueCache state.
+        ids0 = torch.zeros(1, encoder_len, dtype=torch.int32)
+        pos0 = torch.arange(encoder_len, dtype=torch.int32).unsqueeze(0)
+        kc = torch.zeros(
+            n_layers_eff, 1, cache_n_kv, encoder_len, cache_hd, dtype=dtype
+        )
         vc = torch.zeros_like(kc)
         enc_prog = export_to_coreai(
             encoder,
@@ -118,7 +123,7 @@ def export_diffusion_gemma(
     else:
         export_cfg = ExportConfig(
             hf_model_id=hf_model_id,
-            max_context_length=max_ctx,
+            max_context_length=max_context_length,
             compute_precision=compute_precision,
             compression=compression,
         )
@@ -137,7 +142,7 @@ def export_diffusion_gemma(
             text_cfg,
             gen_cfg,
             full_cfg,
-            max_ctx,
+            max_context_length,
             canvas_length,
             compression,
             num_layers,
@@ -148,12 +153,14 @@ def export_diffusion_gemma(
 
     # -- Decoder (bidirectional canvas denoiser, self-conditioning folded in) -
     logger.info("Loading + exporting DECODER ...")
-    decoder = load_diffusion_gemma_decoder(hf_model_id, target_dtype=dtype, num_layers=num_layers)
+    decoder = load_diffusion_gemma_decoder(
+        hf_model_id, target_dtype=dtype, num_layers=num_layers
+    )
     h = text_cfg.hidden_size
     decoder_input_ids = torch.zeros(1, canvas_length, dtype=torch.int32)
     prev_soft_embeds = torch.zeros(1, canvas_length, h, dtype=dtype)
     pos = torch.arange(canvas_length, dtype=torch.int32).unsqueeze(0)
-    enc_k = torch.zeros(n_layers_eff, 1, cache_n_kv, enc_len, cache_hd, dtype=dtype)
+    enc_k = torch.zeros(n_layers_eff, 1, cache_n_kv, encoder_len, cache_hd, dtype=dtype)
     enc_v = torch.zeros_like(enc_k)
     temperature = torch.tensor([0.8], dtype=torch.float32)
     dec_inputs = {
@@ -168,7 +175,9 @@ def export_diffusion_gemma(
     if compression and compression != "none":
         decoder = _quantize_decoder(decoder, compression, dec_inputs)
 
-    dec_prog = export_to_coreai(decoder, dec_inputs, output_names=("logits", "soft_embeds"))
+    dec_prog = export_to_coreai(
+        decoder, dec_inputs, output_names=("logits", "soft_embeds")
+    )
     dec_path = bundle / "decoder.aimodel"
     _rm(dec_path, overwrite)
     dec_prog.save_asset(dec_path, meta)
@@ -182,7 +191,7 @@ def export_diffusion_gemma(
         text_cfg,
         gen_cfg,
         full_cfg,
-        max_ctx,
+        max_context_length,
         canvas_length,
         compression,
         num_layers,
@@ -199,7 +208,7 @@ def _write_bundle_metadata(
     text_cfg,
     gen_cfg,
     full_cfg,
-    max_ctx,
+    max_context_length,
     canvas_length,
     compression,
     num_layers,
@@ -217,7 +226,7 @@ def _write_bundle_metadata(
         "language": {
             "tokenizer": "tokenizer",
             "vocab_size": text_cfg.vocab_size,
-            "max_context_length": max_ctx,
+            "max_context_length": max_context_length,
             "embedded_tokenizer": True,
         },
         "diffusion": {
@@ -259,7 +268,9 @@ def _quantize_encoder(encoder, compression, dtype):
     preset = get_preset(compression)
     quant_cfg = preset.get("torch_quantization_config")
     if quant_cfg is None:
-        logger.warning("Compression '%s' has no torch_quantization_config; skipping", compression)
+        logger.warning(
+            "Compression '%s' has no torch_quantization_config; skipping", compression
+        )
         return encoder
     quant_cfg = dict(quant_cfg)
 
@@ -315,7 +326,9 @@ def _quantize_decoder(decoder, compression, dec_inputs):
     preset = get_preset(compression)
     quant_cfg = preset.get("torch_quantization_config")
     if quant_cfg is None:
-        logger.warning("Compression '%s' has no torch_quantization_config; skipping", compression)
+        logger.warning(
+            "Compression '%s' has no torch_quantization_config; skipping", compression
+        )
         return decoder
     quant_cfg = dict(quant_cfg)
 
@@ -358,7 +371,11 @@ def _save_tokenizer(hf_model_id: str, dest: Path) -> None:
         snap = Path(
             snapshot_download(
                 hf_model_id,
-                allow_patterns=["tokenizer.json", "tokenizer_config.json", "chat_template.jinja"],
+                allow_patterns=[
+                    "tokenizer.json",
+                    "tokenizer_config.json",
+                    "chat_template.jinja",
+                ],
             )
         )
         for f in ("tokenizer.json", "tokenizer_config.json", "chat_template.jinja"):
@@ -375,17 +392,28 @@ def _build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--model", required=True, help="HuggingFace model ID")
-    parser.add_argument("--max-ctx", type=int, default=4096, help="Encoder KV-cache max context")
-    parser.add_argument("--canvas-length", type=int, default=256, help="Canvas length")
-    parser.add_argument("--compression", default="none", help="Compression preset or 'none'")
     parser.add_argument(
-        "--compute-precision", choices=["float16", "bfloat16", "float32"], default="bfloat16"
+        "--max-context-length",
+        type=int,
+        default=4096,
+        help="Encoder KV-cache max context",
+    )
+    parser.add_argument("--canvas-length", type=int, default=256, help="Canvas length")
+    parser.add_argument(
+        "--compression", default="none", help="Compression preset or 'none'"
+    )
+    parser.add_argument(
+        "--compute-precision",
+        choices=["float16", "bfloat16", "float32"],
+        default="bfloat16",
     )
     parser.add_argument("--output-dir", default="./exports")
     parser.add_argument("--output-name", default=None)
-    parser.add_argument("--num-layers", type=int, default=None, help="Truncate to N layers (smoke)")
     parser.add_argument(
-        "--enc-len",
+        "--num-layers", type=int, default=None, help="Truncate to N layers (smoke)"
+    )
+    parser.add_argument(
+        "--encoder-len",
         type=int,
         default=_TRACE_ENC_CTX,
         help="Fixed encoder-context length baked into the decoder cross-attention (must match "
@@ -399,7 +427,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--static-encoder",
         action="store_true",
-        help="Export a static-shape (fixed enc-len) prefill encoder. Required for the Swift "
+        help="Export a static-shape (fixed encoder-len) prefill encoder. Required for the Swift "
         "llm-runner, whose MPSGraph path does not support the dynamic-shape encoder.",
     )
     parser.add_argument("--overwrite", action="store_true")
@@ -415,7 +443,7 @@ def main() -> None:
     )
     result = export_diffusion_gemma(
         hf_model_id=args.model,
-        max_ctx=args.max_ctx,
+        max_context_length=args.max_context_length,
         canvas_length=args.canvas_length,
         compression=args.compression,
         output_dir=args.output_dir,
@@ -424,7 +452,7 @@ def main() -> None:
         overwrite=args.overwrite,
         compute_precision=args.compute_precision,
         encoder_only=args.encoder_only,
-        enc_len=args.enc_len,
+        encoder_len=args.encoder_len,
         static_encoder=args.static_encoder,
     )
     print(f"Export complete: {result}")

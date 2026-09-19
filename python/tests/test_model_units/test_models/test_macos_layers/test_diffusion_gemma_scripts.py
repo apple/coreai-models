@@ -52,10 +52,10 @@ def test_rm_removes_existing_dir_only_when_overwrite() -> None:
 
 def test_build_parser_parses_diffusion_args() -> None:
     args = export_dg._build_parser().parse_args(
-        ["--model", "m", "--enc-len", "17", "--static-encoder", "--compression", "4bit"]
+        ["--model", "m", "--encoder-len", "17", "--static-encoder", "--compression", "4bit"]
     )
     assert args.model == "m"
-    assert args.enc_len == 17
+    assert args.encoder_len == 17
     assert args.static_encoder is True
     assert args.compression == "4bit"
 
@@ -76,7 +76,7 @@ def test_write_bundle_metadata_contents() -> None:
             full_cfg.text_config,
             DiffusionGemmaGenerationConfig(),
             full_cfg,
-            max_ctx=4096,
+            max_context_length=4096,
             canvas_length=32,
             compression="4bit",
             num_layers=None,
@@ -105,7 +105,7 @@ def test_write_bundle_metadata_encoder_only_omits_decoder() -> None:
             full_cfg.text_config,
             DiffusionGemmaGenerationConfig(),
             full_cfg,
-            max_ctx=64,
+            max_context_length=64,
             canvas_length=32,
             compression="none",
             num_layers=2,
@@ -219,7 +219,7 @@ def test_export_full_orchestration_mocked() -> None:
             output_name="dg",
             compression="4bit",
             canvas_length=8,
-            enc_len=4,
+            encoder_len=4,
             num_layers=2,
             static_encoder=True,
         )
@@ -267,13 +267,13 @@ def test_export_quantize_encoder_decoder_mocked() -> None:
     tiny = _tiny_text_config()
     enc = DiffusionGemmaEncoder(tiny)
     dec = DiffusionGemmaDecoder(tiny)
-    canvas, enc_len, n_kv, hd = 8, 4, tiny.cache_num_key_value_heads, tiny.cache_head_dim
+    canvas, encoder_len, n_kv, hd = 8, 4, tiny.cache_num_key_value_heads, tiny.cache_head_dim
     dec_inputs = {
         "decoder_input_ids": torch.zeros(1, canvas, dtype=torch.int32),
         "prev_soft_embeds": torch.zeros(1, canvas, tiny.hidden_size),
         "position_ids": torch.arange(canvas, dtype=torch.int32).unsqueeze(0),
-        "encoder_k": torch.zeros(tiny.num_hidden_layers, 1, n_kv, enc_len, hd),
-        "encoder_v": torch.zeros(tiny.num_hidden_layers, 1, n_kv, enc_len, hd),
+        "encoder_k": torch.zeros(tiny.num_hidden_layers, 1, n_kv, encoder_len, hd),
+        "encoder_v": torch.zeros(tiny.num_hidden_layers, 1, n_kv, encoder_len, hd),
         "temperature": torch.tensor([0.8]),
     }
     with (
