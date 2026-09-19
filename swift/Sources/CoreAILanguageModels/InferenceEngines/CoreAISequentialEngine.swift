@@ -29,12 +29,12 @@ enum PrefillStrategy {
 ///
 /// KV cache NDArrays start small (256 tokens) and grow dynamically with 2× expansion.
 /// Passed as `states` on every forward pass; the model graph updates them in-place.
-public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable {
+public final class CoreAISequentialEngine: InferenceEngine, IdempotentEngine, @unchecked Sendable {
     public typealias ConfigType = ModelConfig
 
     public var supportsLogits: Bool { true }
     public var vocabSize: Int { config.vocabSize }
-    public var hasRecurrentState: Bool { hasNonTruncatableStates }
+    public var hasRecurrentState: Bool { session.hasNonTruncatableStates }
     public let config: ModelConfig
 
     // Core AI function handle
@@ -51,10 +51,13 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
     // Input handling — handler owns allocation and fill logic
     private var inputHandler: TokenInputHandler
 
-    // State management — handlers own allocation, growth, and reset
-    private var kvCache: any SyncStateHandler
-    private var additionalStates: FixedNDArrayState?
-    private var hasNonTruncatableStates: Bool
+    /// Retained to build per-session state handlers in `makeSessionState()`.
+    private let options: EngineOptions
+
+    // Per-request mutable state. The `generate()` shim owns one internal session and
+    // reuses it across calls, preserving implicit prefix-cache reuse and reset(to:)
+    // semantics. Idempotent callers pass their own session instead.
+    private let session: GenerationSessionState
 
     // Logits descriptor and buffer
     private let logitsDescriptor: NDArrayDescriptor
@@ -63,11 +66,9 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
 
     // Ring buffer mode: handled by TokenInputHandler.useCompactPositionIds
 
-    // Track processed tokens for incremental inference
-    public private(set) var processedTokenCount: Int = 0
+    // Track processed tokens for incremental inference (delegated to the shim session).
+    public var processedTokenCount: Int { session.processedTokenCount }
 
-    // Token history for implicit prefix caching
-    private var history = TokenHistory()
     public private(set) var lastPrefixHitCount: Int = 0
 
     // Track in-flight generation via token (replaces simple bool lock)
@@ -126,9 +127,12 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
             maxContextLength: config.maxContextLength,
             options: options
         )
-        self.kvCache = stateHandlers.kvCache
-        self.additionalStates = stateHandlers.additionalStates
-        self.hasNonTruncatableStates = stateHandlers.hasNonTruncatableStates
+        self.options = options
+        self.session = GenerationSessionState(
+            kvCache: stateHandlers.kvCache,
+            additionalStates: stateHandlers.additionalStates,
+            hasNonTruncatableStates: stateHandlers.hasNonTruncatableStates
+        )
 
         let layout = try InputLayout.analyze(
             model: model, functionName: config.function, config: config,
@@ -164,9 +168,9 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         )
 
         CLILogger.log(
-            "KV cache: capacity=\(kvCache.currentCapacity), states=\(kvCache.stateNames)"
+            "KV cache: capacity=\(stateHandlers.kvCache.currentCapacity), states=\(stateHandlers.kvCache.stateNames)"
         )
-        if let additional = additionalStates {
+        if let additional = stateHandlers.additionalStates {
             CLILogger.log(
                 "Additional persistent states: \(additional.stateNames.joined(separator: ", "))")
         }
@@ -228,20 +232,24 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
     // MARK: - Token Batch Processing
 
     /// Process a batch of tokens in a single forward pass.
-    private func processTokenBatch(_ tokens: ArraySlice<Int32>) async throws -> [LogitsScalarType] {
+    private func processTokenBatch(
+        _ tokens: ArraySlice<Int32>, sessionState: GenerationSessionState
+    ) async throws -> [LogitsScalarType] {
         let batchSize = tokens.count
         guard batchSize > 0 else {
             throw InferenceRuntimeError.invalidState("Cannot process empty token batch")
         }
 
-        _ = try kvCache.ensureCapacity(forContextLength: processedTokenCount + batchSize)
+        _ = try sessionState.kvCache.ensureCapacity(
+            forContextLength: sessionState.processedTokenCount + batchSize)
 
         let batchSignpost = InstrumentsProfiler.beginCustomInterval(
             name: "CoreAIClean Batch",
-            details: "\(batchSize) tokens at position \(processedTokenCount)"
+            details: "\(batchSize) tokens at position \(sessionState.processedTokenCount)"
         )
 
-        let context = InputContext.dynamic(tokens: tokens, processedTokenCount: processedTokenCount)
+        let context = InputContext.dynamic(
+            tokens: tokens, processedTokenCount: sessionState.processedTokenCount)
         let inputs = try await inputHandler.prepare(context)
 
         // Reuse pre-allocated logits when the batch size is unchanged.
@@ -255,8 +263,8 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         try await runWithStates(
             function: function,
             inputs: inputs,
-            primary: kvCache,
-            secondary: additionalStates,
+            primary: sessionState.kvCache,
+            secondary: sessionState.additionalStates,
             outputArray: &logitsArray,
             outputName: logitsName
         )
@@ -265,7 +273,7 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         let totalLogits = batchSize * config.vocabSize
         let logitBuffer = readNDArray(logitsArray, as: LogitsScalarType.self, count: totalLogits)
 
-        processedTokenCount += batchSize
+        sessionState.processedTokenCount += batchSize
 
         InstrumentsProfiler.endCustomInterval(
             name: "CoreAIClean Batch",
@@ -277,28 +285,32 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
 
     /// Run one prefill chunk on the prefill graph: KV cache writes only, no logits.
     private func encodePrefillChunk(
-        _ tokens: ArraySlice<Int32>, using prefillFn: InferenceFunction
+        _ tokens: ArraySlice<Int32>, using prefillFn: InferenceFunction,
+        sessionState: GenerationSessionState
     ) async throws {
         let batchSize = tokens.count
-        _ = try kvCache.ensureCapacity(forContextLength: processedTokenCount + batchSize)
+        _ = try sessionState.kvCache.ensureCapacity(
+            forContextLength: sessionState.processedTokenCount + batchSize)
 
-        let context = InputContext.dynamic(tokens: tokens, processedTokenCount: processedTokenCount)
+        let context = InputContext.dynamic(
+            tokens: tokens, processedTokenCount: sessionState.processedTokenCount)
         let inputs = try await inputHandler.prepare(context)
 
         try await runWithStatesNoOutputs(
             function: prefillFn,
             inputs: inputs,
-            primary: kvCache,
-            secondary: additionalStates)
+            primary: sessionState.kvCache,
+            secondary: sessionState.additionalStates)
 
-        processedTokenCount += batchSize
+        sessionState.processedTokenCount += batchSize
     }
 
     // MARK: - Chunked Prefill
 
     private func processChunkedPrompt(
         tokens: ArraySlice<Int32>,
-        chunkSize: Int
+        chunkSize: Int,
+        sessionState: GenerationSessionState
     ) async throws -> [LogitsScalarType] {
         // The prefill graph produces no logits, so hold the final token back for
         // `function`: it is the one whose logits seed sampling. Without one, nothing is
@@ -325,10 +337,10 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
             // Held-back tail (and every chunk when there is no prefill graph) runs through
             // `main` for logits; earlier chunks fill the KV cache via the prefill graph.
             if !isHeldBack, let prefillFn = self.prefillFunction {
-                try await self.encodePrefillChunk(chunk, using: prefillFn)
+                try await self.encodePrefillChunk(chunk, using: prefillFn, sessionState: sessionState)
                 return []
             }
-            return try await self.processTokenBatch(chunk)
+            return try await self.processTokenBatch(chunk, sessionState: sessionState)
         }
     }
 
@@ -336,7 +348,8 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
     /// Used for batched PPL evaluation where every position's logits are needed.
     func processChunkedPromptAllLogits(
         tokens: ArraySlice<Int32>,
-        chunkSize: Int
+        chunkSize: Int,
+        sessionState: GenerationSessionState
     ) async throws -> [LogitsScalarType] {
         var allLogits: [LogitsScalarType] = []
         var remainingTokens = tokens
@@ -345,7 +358,7 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
             let currentChunkSize = min(chunkSize, remainingTokens.count)
             let chunkEnd = remainingTokens.startIndex + currentChunkSize
             let chunk = remainingTokens[remainingTokens.startIndex..<chunkEnd]
-            let chunkLogits = try await processTokenBatch(chunk)
+            let chunkLogits = try await processTokenBatch(chunk, sessionState: sessionState)
             allLogits.append(contentsOf: chunkLogits)
             remainingTokens = remainingTokens[chunkEnd...]
         }
@@ -355,49 +368,19 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
 
     // MARK: - Generate (primary API)
 
+    /// Shim over the idempotent generate path: drives generation on the engine's single
+    /// internal session, preserving today's implicit prefix-cache reuse and reset(to:)
+    /// semantics for existing callers.
     public func generate(
         with input: [TokenId],
         samplingConfiguration: SamplingConfiguration,
         inferenceOptions: InferenceOptions
     ) async throws -> GenerationSequence {
-        // Cancel any prior generation so its Iterator stops on next poll.
-        tokenBox.cancelActive()
-
-        // Implicit prefix caching: resolve input against history.
-        // For hybrid models with recurrent states, we must full-reset on any
-        // rewind because recurrent state summarizes the whole prefix and cannot
-        // be truncated by moving a KV cursor. Future: checkpoint/restore.
-        if history.count > 0 {
-            let (commonPrefix, _) = history.resolve(input: input)
-            if hasNonTruncatableStates {
-                // Hybrid model: recurrent state can't be partially rewound.
-                // Full reset and replay the entire prompt.
-                if commonPrefix < history.count || processedTokenCount >= input.count {
-                    internalReset(to: 0)
-                }
-                lastPrefixHitCount = 0
-            } else if commonPrefix < input.count && commonPrefix < history.count {
-                // Divergence: input differs from history. Full reset needed.
-                internalReset(to: 0)
-                lastPrefixHitCount = commonPrefix
-            } else if processedTokenCount >= input.count {
-                // Pure extension: all input tokens match history. Rewind for seeding.
-                let resetTo = Swift.max(0, commonPrefix - 1)
-                internalReset(to: resetTo)
-                lastPrefixHitCount = commonPrefix
-            } else {
-                lastPrefixHitCount = commonPrefix
-            }
-        }
-
-        let token = GenerationToken()
-        tokenBox.install(token)
-        return GenerationSequence(
-            engine: self,
-            input: input,
+        try await generate(
+            with: input,
+            sessionState: session,
             samplingConfiguration: samplingConfiguration,
-            inferenceOptions: inferenceOptions,
-            generationToken: token
+            inferenceOptions: inferenceOptions
         )
     }
 
@@ -421,29 +404,29 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
 
     public func reset(to tokenIndex: Int) async throws {
         precondition(
-            tokenIndex >= 0 && tokenIndex <= processedTokenCount,
-            "reset(to: \(tokenIndex)) out of range [0, \(processedTokenCount)]")
-        if tokenIndex != 0 && hasNonTruncatableStates {
+            tokenIndex >= 0 && tokenIndex <= session.processedTokenCount,
+            "reset(to: \(tokenIndex)) out of range [0, \(session.processedTokenCount)]")
+        if tokenIndex != 0 && session.hasNonTruncatableStates {
             throw InferenceRuntimeError.invalidState(
                 "Partial reset is not supported for hybrid models with recurrent state. "
                     + "Use reset(to: 0) and replay the prefix.")
         }
         tokenBox.cancelActive()
-        internalReset(to: tokenIndex)
+        internalReset(to: tokenIndex, sessionState: session)
     }
 
     /// Internal reset without cancelling the active generation token.
-    /// Used by the Iterator when it detects a prefix mismatch mid-generation.
-    func internalReset(to tokenIndex: Int) {
+    /// Used by `reset(to:)` and the prefix-cache routing in `generate(with:sessionState:)`.
+    func internalReset(to tokenIndex: Int, sessionState: GenerationSessionState) {
         let resetSpan = InstrumentsProfiler.beginReset(engine: "CoreAIClean")
         if tokenIndex == 0 {
-            processedTokenCount = 0
-            history.clear()
-            kvCache.reset()
-            additionalStates?.reset()
+            sessionState.processedTokenCount = 0
+            sessionState.history.clear()
+            sessionState.kvCache.reset()
+            sessionState.additionalStates?.reset()
         } else {
-            processedTokenCount = tokenIndex
-            history.truncate(to: tokenIndex)
+            sessionState.processedTokenCount = tokenIndex
+            sessionState.history.truncate(to: tokenIndex)
         }
         resetSpan.end()
     }
@@ -457,6 +440,96 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
     // MARK: - Helpers
 }
 
+// MARK: - Idempotent Engine Conformance
+
+extension CoreAISequentialEngine {
+    /// Mint a fresh, independent per-request state (fresh KV cache + empty history).
+    package func makeSessionState() throws -> GenerationSessionState {
+        let stateHandlers = try StateHandlerFactory.createSyncHandlers(
+            descriptor: functionDescriptor,
+            maxContextLength: config.maxContextLength,
+            options: options)
+        return GenerationSessionState(
+            kvCache: stateHandlers.kvCache,
+            additionalStates: stateHandlers.additionalStates,
+            hasNonTruncatableStates: stateHandlers.hasNonTruncatableStates)
+    }
+
+    /// Drive generation over the caller-supplied state instead of engine-owned state.
+    package func generate(
+        with input: [TokenId],
+        sessionState: GenerationSessionState,
+        samplingConfiguration: SamplingConfiguration,
+        inferenceOptions: InferenceOptions
+    ) async throws -> GenerationSequence {
+        // Cancel any prior generation so its Iterator stops on next poll.
+        tokenBox.cancelActive()
+
+        // Implicit prefix caching: resolve input against history.
+        // For hybrid models with recurrent states, we must full-reset on any
+        // rewind because recurrent state summarizes the whole prefix and cannot
+        // be truncated by moving a KV cursor. Future: checkpoint/restore.
+        if sessionState.history.count > 0 {
+            let (commonPrefix, _) = sessionState.history.resolve(input: input)
+            let plan = Self.prefixResetPlan(
+                commonPrefix: commonPrefix,
+                historyCount: sessionState.history.count,
+                processedTokenCount: sessionState.processedTokenCount,
+                inputCount: input.count,
+                hasNonTruncatableStates: sessionState.hasNonTruncatableStates
+            )
+            if let resetTo = plan.resetTo {
+                internalReset(to: resetTo, sessionState: sessionState)
+            }
+            lastPrefixHitCount = plan.prefixHitCount
+        }
+
+        let token = GenerationToken()
+        tokenBox.install(token)
+        return GenerationSequence(
+            engine: self,
+            input: input,
+            sessionState: sessionState,
+            samplingConfiguration: samplingConfiguration,
+            inferenceOptions: inferenceOptions,
+            generationToken: token
+        )
+    }
+
+    /// Pure decision for the implicit prefix-cache routing in `generate(with:sessionState:)`.
+    ///
+    /// Given the common-prefix length resolved against the session history and the
+    /// current cursor state, decides how far to rewind the KV cache and what to
+    /// report as the prefix hit count. `resetTo == nil` means no reset is needed.
+    ///
+    /// Extracted so the four-way routing can be unit-tested without a compiled model;
+    /// the logic is equivalent to the inline decision it replaced.
+    static func prefixResetPlan(
+        commonPrefix: Int,
+        historyCount: Int,
+        processedTokenCount: Int,
+        inputCount: Int,
+        hasNonTruncatableStates: Bool
+    ) -> (resetTo: Int?, prefixHitCount: Int) {
+        if hasNonTruncatableStates {
+            // Hybrid model: recurrent state can't be partially rewound.
+            // Full reset and replay the entire prompt.
+            if commonPrefix < historyCount || processedTokenCount >= inputCount {
+                return (0, 0)
+            }
+            return (nil, 0)
+        } else if commonPrefix < inputCount && commonPrefix < historyCount {
+            // Divergence: input differs from history. Full reset needed.
+            return (0, commonPrefix)
+        } else if processedTokenCount >= inputCount {
+            // Pure extension: all input tokens match history. Rewind for seeding.
+            return (Swift.max(0, commonPrefix - 1), commonPrefix)
+        } else {
+            return (nil, commonPrefix)
+        }
+    }
+}
+
 extension CoreAISequentialEngine {
     /// Async sequence of `InferenceOutput` produced by `generate()`.
     public struct GenerationSequence: InferenceOutputSequence {
@@ -465,6 +538,7 @@ extension CoreAISequentialEngine {
 
         let engine: CoreAISequentialEngine
         let input: [CoreAISequentialEngine.TokenId]
+        let sessionState: GenerationSessionState
         let samplingConfiguration: SamplingConfiguration
         let inferenceOptions: InferenceOptions
         let generationToken: GenerationToken
@@ -482,6 +556,7 @@ extension CoreAISequentialEngine {
             Iterator(
                 engine: engine,
                 input: input,
+                sessionState: sessionState,
                 samplingConfiguration: samplingConfiguration,
                 inferenceOptions: inferenceOptions,
                 stopReasonStore: stopReasonStore,
@@ -497,6 +572,7 @@ extension CoreAISequentialEngine.GenerationSequence {
         public typealias Failure = Error
 
         private let engine: CoreAISequentialEngine
+        private let sessionState: GenerationSessionState
         private let samplingConfiguration: SamplingConfiguration
         private let returnsLogits: Bool
         private let forcedContinuation: [CoreAISequentialEngine.TokenId]?
@@ -515,12 +591,14 @@ extension CoreAISequentialEngine.GenerationSequence {
         init(
             engine: CoreAISequentialEngine,
             input: [CoreAISequentialEngine.TokenId],
+            sessionState: GenerationSessionState,
             samplingConfiguration: SamplingConfiguration,
             inferenceOptions: InferenceOptions,
             stopReasonStore: StopReasonStore,
             generationToken: GenerationToken
         ) {
             self.engine = engine
+            self.sessionState = sessionState
             self.samplingConfiguration = samplingConfiguration.normalized()
             self.returnsLogits = inferenceOptions.includeLogits
             self.forcedContinuation = inferenceOptions.forcedContinuation
@@ -579,13 +657,16 @@ extension CoreAISequentialEngine.GenerationSequence {
                 switch strategy {
                 case .chunked(let chunkSize):
                     allLogits = try await engine.processChunkedPromptAllLogits(
-                        tokens: allTokens[...], chunkSize: chunkSize)
+                        tokens: allTokens[...], chunkSize: chunkSize, sessionState: sessionState)
                 case .wholeBatch:
-                    allLogits = try await engine.processTokenBatch(allTokens[...])
+                    allLogits = try await engine.processTokenBatch(
+                        allTokens[...], sessionState: sessionState)
                 case .oneAtATime:
                     var collected: [LogitsScalarType] = []
                     for j in allTokens.indices {
-                        collected.append(contentsOf: try await engine.processTokenBatch(allTokens[j...j]))
+                        collected.append(
+                            contentsOf: try await engine.processTokenBatch(
+                                allTokens[j...j], sessionState: sessionState))
                     }
                     allLogits = collected
                 }
@@ -607,7 +688,7 @@ extension CoreAISequentialEngine.GenerationSequence {
                 batchedLogitsBuffer = buffer
 
                 // Update engine state
-                engine.history.append(contentsOf: allTokens[...])
+                sessionState.history.append(contentsOf: allTokens[...])
 
                 // Yield first result
                 let logits = buffer[step]
@@ -619,32 +700,35 @@ extension CoreAISequentialEngine.GenerationSequence {
             do {
                 try Task.checkCancellation()
 
-                guard engine.processedTokenCount < inputTokens.count else {
+                guard sessionState.processedTokenCount < inputTokens.count else {
                     throw InferenceRuntimeError.invalidState("No new tokens to process")
                 }
 
-                let oldProcessedCount = engine.processedTokenCount
-                let newTokens = inputTokens[engine.processedTokenCount...]
+                let oldProcessedCount = sessionState.processedTokenCount
+                let newTokens = inputTokens[sessionState.processedTokenCount...]
                 let strategy = engine.selectPrefillStrategy(newTokenCount: newTokens.count)
 
                 let logitBuffer: [LogitsScalarType]
                 switch strategy {
                 case .chunked(let chunkSize):
-                    logitBuffer = try await engine.processChunkedPrompt(tokens: newTokens, chunkSize: chunkSize)
+                    logitBuffer = try await engine.processChunkedPrompt(
+                        tokens: newTokens, chunkSize: chunkSize, sessionState: sessionState)
                 case .wholeBatch:
-                    let allLogits = try await engine.processTokenBatch(newTokens)
+                    let allLogits = try await engine.processTokenBatch(
+                        newTokens, sessionState: sessionState)
                     logitBuffer = lastTokenLogits(from: allLogits, vocabSize: engine.config.vocabSize)
                 case .oneAtATime:
                     var lastLogits: [LogitsScalarType] = []
                     for j in newTokens.indices {
-                        lastLogits = try await engine.processTokenBatch(newTokens[j...j])
+                        lastLogits = try await engine.processTokenBatch(
+                            newTokens[j...j], sessionState: sessionState)
                     }
                     logitBuffer = lastLogits
                 }
 
                 // Update history with newly processed tokens
-                let processedSlice = inputTokens[oldProcessedCount..<engine.processedTokenCount]
-                engine.history.append(contentsOf: processedSlice)
+                let processedSlice = inputTokens[oldProcessedCount..<sessionState.processedTokenCount]
+                sessionState.history.append(contentsOf: processedSlice)
 
                 // Check cancellation after inference step
                 if generationToken.isCancelled {
