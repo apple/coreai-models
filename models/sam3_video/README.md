@@ -57,7 +57,7 @@ the `tracking` block records the checkpoint's heuristic thresholds.
 | `--dtype`              | `float16` or `float32`                       | `float16`              |
 | `--image-size`         | Input resolution. Must match the checkpoint. | `1008`                 |
 | `--spatial-slots`      | Spatial memory slots per object              | `10`                   |
-| `--ptr-slots`          | Object-pointer slots per object              | `24`                   |
+| `--ptr-slots`          | Object-pointer slots per object              | `96`                   |
 | `--output-dir`         | Bundle destination                           | `<repo-root>/exports/` |
 | `--output-name`        | Custom bundle directory name                 | derived                |
 | `--overwrite`          | Replace an existing bundle                   | off                    |
@@ -80,14 +80,14 @@ the whole video.
 | `tracker_encode` | no                         |
 | `text_encode`    | once per prompt, per video |
 
-## The Swift runtime (PENDING: this is design only)
+## The Swift runtime
 
 `swift/Sources/CoreAIVideoSegmenter` mimics the HF logic in Swift, and the
 `video-segmenter` tool drives it end to end:
 
 ```sh
 swift run video-segmenter --model exports/sam3_video_float16 \
-    --video clip.mp4 --prompt person --prompt dog --output out.mp4
+    --input-video clip.mp4 --prompt person --prompt dog --output out.mp4
 ```
 
 That writes an mp4 with each object's mask, box, and `#id prompt score` caption composited
@@ -109,10 +109,7 @@ for try await frame in segmenter.segment(videoAt: sourceURL, prompts: ["person"]
 }
 ```
 
-Frames arrive `hotstart_delay` (15) behind the decoder, because a track removed on frame
-20 must never have been shown on frame 8. That means 15 decoded frames are held as well,
-about 124 MB at 1080p. `--hotstart-delay 0` turns off both the delay and the removal rules
-that need it.
+The default hot-start delay is 15 frames. Set `--hotstart-delay 0` to turn it off."
 
 ## Supported models
 

@@ -7,14 +7,13 @@
 
 Everything here runs on a randomly-initialized, heavily downscaled config
 (112x112, 2 backbone layers, 1 memory-attention layer) so no weights are
-downloaded and the whole file runs in seconds. Numerical parity against the
-real checkpoint is the parity harness's job
-(``models/sam3_video/run_video_parity.py``); what these tests pin is the
-*structure*: that the fixed-slot memory bank is mathematically equivalent to
-HF's variable-length one, and that every entrypoint is traceable.
+downloaded and the whole file runs in seconds.
 """
 
 from __future__ import annotations
+
+import json
+from pathlib import Path
 
 import pytest
 
@@ -22,10 +21,13 @@ torch = pytest.importorskip("torch")
 transformers = pytest.importorskip("transformers")
 
 from coreai_models.segmentation.video_pipeline import (  # noqa: E402
+    _TRACKER_MEMORY_FIELDS,
+    _TRACKING_FIELDS,
     ENTRYPOINT_IO,
     MASK_NEG,
     VideoExportConfig,
     _memory_attention,
+    _tracking_metadata,
     _validate_slots,
     build_example_inputs,
     build_modules,
@@ -35,6 +37,14 @@ from coreai_models.segmentation.video_pipeline import (  # noqa: E402
 IMAGE_SIZE = 112
 SPATIAL_SLOTS = 10
 PTR_SLOTS = 6
+
+#: Shared with the Swift runtime's `VideoSegmenterBundle metadata` suite, which drives the
+#: same keys through `parameters()`. It is the one written-down list joining the field
+#: tuples below to Swift's `Tracking.CodingKeys`; the two are otherwise maintained
+#: independently and drift with no CI signal.
+TRACKING_KEYS_FIXTURE = (
+    Path(__file__).parents[4] / "swift/Tests/VideoSegmenterTests/Resources/tracking_keys.json"
+)
 
 
 def _tiny_config() -> transformers.Sam3VideoConfig:
@@ -256,3 +266,28 @@ def test_ptr_slots_below_encoder_capacity_is_rejected(tiny_model):
 
 def test_default_slots_satisfy_the_shipped_checkpoint(tiny_model):
     _validate_slots(VideoExportConfig(), tiny_model.config.tracker_config)
+
+
+# --- bundle metadata -------------------------------------------------------
+
+
+def test_tracking_metadata_matches_the_shared_fixture(tiny_model):
+    """Pins the exporter's emitted keys to the fixture the Swift runtime reads.
+
+    Without this the two key lists -- ``_TRACKING_FIELDS`` here and ``Tracking.CodingKeys``
+    on the Swift side -- are maintained by hand with nothing joining them. Adding a field
+    here and forgetting Swift produces no error at all: every field in the bundle's
+    ``tracking`` block is optional by design, so the runtime silently ignores the new key
+    and keeps its own default for a threshold the checkpoint meant to override.
+    """
+    assert TRACKING_KEYS_FIXTURE.is_file(), f"missing fixture at {TRACKING_KEYS_FIXTURE}"
+    fixture = json.loads(TRACKING_KEYS_FIXTURE.read_text())
+    assert set(_tracking_metadata(tiny_model.config)) == set(fixture)
+
+
+def test_tracking_metadata_emits_every_declared_field(tiny_model):
+    """``_tracking_metadata`` reads each field behind a ``hasattr`` guard, so a field
+    renamed upstream drops out of the bundle silently. ``transformers`` is a floating
+    ``>=5.5.0,<6.0``, so a routine dependency bump can trigger that with no code change."""
+    tracking = _tracking_metadata(tiny_model.config)
+    assert set(tracking) == set(_TRACKING_FIELDS) | set(_TRACKER_MEMORY_FIELDS)

@@ -33,6 +33,12 @@ public enum OverlayPalette {
         return hsvToRGB(h: Float(index) / Float(count), s: 0.85, v: 0.95)
     }
 
+    /// Stable color for a tracked object id.
+    public static func color(forID id: Int) -> (UInt8, UInt8, UInt8) {
+        let hue = (Float(id) * 0.618_033_99).truncatingRemainder(dividingBy: 1.0)
+        return hsvToRGB(h: hue < 0 ? hue + 1 : hue, s: 0.85, v: 0.95)
+    }
+
     /// HSV → RGB, all components in [0, 1].
     public static func hsvToRGB(h: Float, s: Float, v: Float) -> (UInt8, UInt8, UInt8) {
         let h6 = h * 6

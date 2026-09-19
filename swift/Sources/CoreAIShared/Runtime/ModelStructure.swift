@@ -17,6 +17,12 @@ public enum GraphNames {
     public static let imageEncode = "image_encode"
     public static let textEncode = "text_encode"
     public static let detect = "detect"
+    // Video segmenter (SAM3 video export). Shares the three names above with the
+    // image segmenter. The following are unique to video.
+    public static let trackerEncode = "tracker_encode"
+    public static let trackerStep = "tracker_step"
+    public static let memoryEncode = "memory_encode"
+    public static let trackerMaskInit = "tracker_mask_init"
 }
 
 /// Represents the detected structure of a Core AI model.
@@ -38,6 +44,10 @@ public enum ModelStructure: Equatable, Sendable, CustomStringConvertible {
     /// Identified by presence of `image_encode`, `text_encode`, and `detect` graphs.
     case multiFunctionSegmenter
 
+    /// Seven-function SAM3 video segmenter.
+    /// Identified by `tracker_step`, which is unique to this export.
+    case videoSegmenter
+
     public var description: String {
         switch self {
         case .chunkedStatic(let batchSize):
@@ -46,6 +56,8 @@ public enum ModelStructure: Equatable, Sendable, CustomStringConvertible {
             return "dynamic"
         case .multiFunctionSegmenter:
             return "multiFunctionSegmenter"
+        case .videoSegmenter:
+            return "videoSegmenter"
         }
     }
 
@@ -54,11 +66,12 @@ public enum ModelStructure: Equatable, Sendable, CustomStringConvertible {
     /// - `chunkedStatic` → NeuralEngine
     /// - `dynamic` → GPU
     /// - `multiFunctionSegmenter` → NeuralEngine
+    /// - `videoSegmenter` → GPU
     public var preferredDevice: String {
         switch self {
         case .chunkedStatic, .multiFunctionSegmenter:
             return "NeuralEngine"
-        case .dynamic:
+        case .dynamic, .videoSegmenter:
             return "GPU"
         }
     }
@@ -68,6 +81,7 @@ public enum ModelStructure: Equatable, Sendable, CustomStringConvertible {
     /// - `chunkedStatic` → prefer `.neuralEngine`
     /// - `dynamic` → prefer `.gpu` + `expectFrequentReshapes`
     /// - `multiFunctionSegmenter` → prefer `.neuralEngine`
+    /// - `videoSegmenter` → prefer `.gpu`, with static shapes
     public var specializationOptions: SpecializationOptions {
         switch self {
         case .chunkedStatic, .multiFunctionSegmenter:
@@ -76,6 +90,9 @@ public enum ModelStructure: Equatable, Sendable, CustomStringConvertible {
             var opts = SpecializationOptions(preferredComputeUnitKind: .gpu)
             opts.expectFrequentReshapes = true
             return opts
+        case .videoSegmenter:
+            // TODO: the optimized export will need different specialization options.
+            return SpecializationOptions(preferredComputeUnitKind: .gpu)
         }
     }
 }
@@ -245,6 +262,11 @@ public struct PreparedModel: Sendable {
         if !extendFunctions.isEmpty && graphSet.contains(GraphNames.loadEmbeddings) {
             let batchSize = extractBatchSize(from: extendFunctions.first!) ?? 1
             return .chunkedStatic(batchSize: batchSize)
+        }
+
+        // Checked before the image segmenter below.
+        if graphSet.contains(GraphNames.trackerStep) {
+            return .videoSegmenter
         }
 
         // Multi-function segmenter (e.g. optimized SAM3 — image_encode / text_encode / detect).

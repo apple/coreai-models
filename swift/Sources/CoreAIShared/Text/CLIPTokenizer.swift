@@ -91,6 +91,28 @@ public struct CLIPTokenizer: Sendable {
     ///
     /// Pads with `eotTokenId` to match SAM3's `torch.zeros`-then-fill behavior.
     public func encode(_ text: String, contextLength: Int = 77) -> [Int32] {
+        encodeIDs(text, contextLength: contextLength).ids
+    }
+
+    /// Encode `text` and report which slots hold real tokens.
+    ///
+    /// The pad token is `<|endoftext|>`, the same id that ends a real sequence, so the ids
+    /// alone can't tell padding from content. A prompt longer than `contextLength` is
+    /// truncated with `eotTokenId` forced into the last slot, making the mask all ones.
+    public func encodeWithMask(
+        _ text: String, contextLength: Int = 77
+    ) -> (ids: [Int32], attentionMask: [Int32]) {
+        let (ids, realCount) = encodeIDs(text, contextLength: contextLength)
+        let attentionMask = (0..<ids.count).map { Int32($0 < realCount ? 1 : 0) }
+        return (ids, attentionMask)
+    }
+
+    /// Tokenize, truncate and pad to `contextLength`, reporting how many leading slots came
+    /// from the prompt. A `contextLength` of zero or less yields nothing.
+    private func encodeIDs(
+        _ text: String, contextLength: Int
+    ) -> (ids: [Int32], realCount: Int) {
+        guard contextLength > 0 else { return ([], 0) }
         let cleaned = whitespaceClean(text).lowercased()
         let wordTokens = tokenize(cleaned)
 
@@ -103,11 +125,11 @@ public struct CLIPTokenizer: Sendable {
             ids[contextLength - 1] = Self.eotTokenId
         }
 
+        let realCount = ids.count
         while ids.count < contextLength {
             ids.append(Self.eotTokenId)
         }
-
-        return ids
+        return (ids, realCount)
     }
 
     // MARK: - Private
