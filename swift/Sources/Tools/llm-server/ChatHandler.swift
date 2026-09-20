@@ -169,8 +169,20 @@ private func handleChatCompletionsRoute(request: Request, state: ServerState, se
 
 // MARK: - Non-Streaming
 
-private func handleNonStreamingRequest(chatRequest: ChatCompletionRequest, state: ServerState, sessionID: String? = nil)
-    async throws -> Response
+/// Instrumented outcome of a non-streaming chat generation.
+struct ChatCompletionOutcome {
+    let response: ChatCompletionResponse
+    let prefixReuseTokens: Int
+    let ttftSeconds: Double
+    let totalSeconds: Double
+    let genTokenCount: Int
+    let promptTokenCount: Int
+}
+
+/// The full non-streaming chat generation core, shared by the HTTP handler and `--replay`.
+/// Returns the assembled response plus per-request instrumentation.
+func runChatCompletion(chatRequest: ChatCompletionRequest, state: ServerState, sessionID: String? = nil)
+    async throws -> ChatCompletionOutcome
 {
     let requestMaxTokens = chatRequest.maxCompletionTokens ?? chatRequest.maxTokens ?? state.config.defaultMaxTokens
     guard requestMaxTokens > 0 else {
@@ -334,7 +346,21 @@ private func handleNonStreamingRequest(chatRequest: ChatCompletionRequest, state
         systemFingerprint: state.systemFingerprint
     )
 
-    let data = try JSONEncoder().encode(response)
+    return ChatCompletionOutcome(
+        response: response,
+        prefixReuseTokens: prefixReused,
+        ttftSeconds: promptSeconds,
+        totalSeconds: totalSeconds,
+        genTokenCount: genTokenCount,
+        promptTokenCount: promptTokens.count
+    )
+}
+
+private func handleNonStreamingRequest(chatRequest: ChatCompletionRequest, state: ServerState, sessionID: String? = nil)
+    async throws -> Response
+{
+    let outcome = try await runChatCompletion(chatRequest: chatRequest, state: state, sessionID: sessionID)
+    let data = try JSONEncoder().encode(outcome.response)
     return Response(
         status: .ok,
         headers: [.contentType: "application/json"],
@@ -344,17 +370,41 @@ private func handleNonStreamingRequest(chatRequest: ChatCompletionRequest, state
 
 // MARK: - Streaming (SSE)
 
-private func handleStreamingRequest(
-    chatRequest: ChatCompletionRequest, state: ServerState, sessionID: String? = nil, permit: QueuePermit
-)
-    async throws -> Response
+/// Inputs prepared for a streaming generation. Split out so bad-request guards throw before
+/// any SSE framing is emitted (and reused by `--replay`).
+struct PreparedStream {
+    let requestID: String
+    let promptTokenCount: Int
+    let promptTokensInt32: [Int32]
+    let input: Input
+    let samplingConfig: SamplingConfiguration
+    let stopSequences: StopSequences
+    let requestMaxTokens: Int
+    let prefixReuseTokens: Int
+}
+
+/// Instrumented outcome of a streaming chat generation.
+struct StreamingOutcome {
+    let prefixReuseTokens: Int
+    let ttftSeconds: Double
+    let totalSeconds: Double
+    let genTokenCount: Int
+    let promptTokenCount: Int
+    let finishReason: String
+    let systemFingerprint: String?
+}
+
+/// Preflight for the streaming path: tokenize, validate, and prime the prefix cache. Throws
+/// `ServerError.badRequest` for oversized prompts / non-positive max_tokens so callers can map
+/// to HTTP 400 before opening the stream.
+func prepareStreaming(chatRequest: ChatCompletionRequest, state: ServerState, sessionID: String? = nil) async throws
+    -> PreparedStream
 {
     let requestMaxTokens = chatRequest.maxCompletionTokens ?? chatRequest.maxTokens ?? state.config.defaultMaxTokens
     guard requestMaxTokens > 0 else {
         throw ServerError.badRequest("max_tokens must be positive")
     }
     let requestID = RequestID.next()
-    let created = Int(Date().timeIntervalSince1970)
 
     let samplingConfig = state.makeSamplingConfig(
         temperature: chatRequest.temperature,
@@ -386,169 +436,190 @@ private func handleStreamingRequest(
         CLILogger.log("[\(requestID)] prefix reuse: \(prefixReused) tokens cached", component: "Server")
     }
 
+    return PreparedStream(
+        requestID: requestID, promptTokenCount: promptTokens.count, promptTokensInt32: promptTokensInt32,
+        input: input, samplingConfig: samplingConfig, stopSequences: stopSequences,
+        requestMaxTokens: requestMaxTokens, prefixReuseTokens: prefixReused)
+}
+
+/// The streaming generation core, shared by the HTTP SSE handler and `--replay`. Drives the
+/// incremental token loop with per-chunk think/tool parsing, delivering each `Delta` to `emit`,
+/// and returns per-request instrumentation. Emits neither the leading role chunk nor the trailing
+/// done/`[DONE]` frames — those are SSE framing owned by the HTTP handler.
+func runStreamingLoop(
+    prepared: PreparedStream, chatRequest: ChatCompletionRequest, state: ServerState,
+    emit: (ChatCompletionChunk.Delta) async throws -> Void
+) async throws -> StreamingOutcome {
+    let genStart = SuspendingClock().now
+
+    let strategy: any DecodingStrategy
+    if let schema = chatRequest.responseFormat?.extractedSchema {
+        strategy = ConstrainedDecodingStrategy(jsonSchema: schema, vocabSize: state.config.vocabSize)
+    } else {
+        strategy = VanillaDecodingStrategy()
+    }
+
+    let tokenStream = try await strategy.decode(
+        from: prepared.input,
+        tokenizer: state.tokenizer,
+        inferenceEngine: state.engine,
+        samplingConfiguration: prepared.samplingConfig,
+        options: InferenceOptions(maxTokens: prepared.requestMaxTokens),
+        stopSequences: prepared.stopSequences
+    )
+
+    var thinkParser = ThinkTagParser(format: state.thinkingFormat)
+    var toolParser = state.makeToolCallParser()
+    var tokenCount = 0
+    var hasToolCalls = false
+    var toolCallIndex = 0
+    var toolCallNames: [String] = []
+    var promptSeconds: Double = 0
+    let isRaw = chatRequest.raw == true
+
+    // Process tool parser events: emit text as content, tool calls as deltas
+    func emitToolEvents(_ events: [ToolCallParser.Event]) async throws {
+        for event in events {
+            switch event {
+            case .text(let t) where !t.isEmpty:
+                try await emit(.init(role: nil, content: t))
+            case .toolCall(let id, let name, let argsJSON):
+                hasToolCalls = true
+                toolCallNames.append(name)
+                let tcDelta = ToolCallDelta(
+                    index: toolCallIndex, id: id, type: "function",
+                    function: .init(name: name, arguments: argsJSON))
+                try await emit(.init(role: nil, content: nil, toolCalls: [tcDelta]))
+                toolCallIndex += 1
+            default: break
+            }
+        }
+    }
+
+    // Process text through the tool parser (or emit directly if no tool support)
+    func emitText(_ text: String) async throws {
+        guard !text.isEmpty else { return }
+        if var tp = toolParser {
+            let events = tp.consume(text)
+            toolParser = tp
+            try await emitToolEvents(events)
+        } else {
+            try await emit(.init(role: nil, content: text))
+        }
+    }
+
+    for try await result in tokenStream {
+        if tokenCount == 0 {
+            let ttft = SuspendingClock().now - genStart
+            promptSeconds = Double(ttft.components.seconds) + Double(ttft.components.attoseconds) / 1e18
+        }
+        tokenCount += 1
+        if isRaw {
+            try await emit(.init(role: nil, content: result.text))
+        } else {
+            for event in thinkParser.consume(result.text) {
+                switch event {
+                case .text(let delta):
+                    try await emitText(delta)
+                case .reasoning(let delta) where !delta.isEmpty:
+                    try await emit(.init(role: nil, content: nil, reasoningContent: delta))
+                default:
+                    break
+                }
+            }
+        }
+    }
+
+    if !isRaw {
+        for event in thinkParser.flush() {
+            switch event {
+            case .text(let delta):
+                try await emitText(delta)
+            case .reasoning(let delta) where !delta.isEmpty:
+                try await emit(.init(role: nil, content: nil, reasoningContent: delta))
+            default:
+                break
+            }
+        }
+
+        if var tp = toolParser {
+            try await emitToolEvents(tp.flush())
+            toolParser = tp
+        }
+    }
+
+    let finishReason = tokenCount >= prepared.requestMaxTokens ? "length" : (hasToolCalls ? "tool_calls" : "stop")
+
+    let elapsed = SuspendingClock().now - genStart
+    let totalSeconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
+    let genSeconds = totalSeconds - promptSeconds
+    let prefillTps = promptSeconds > 0 ? Double(prepared.promptTokenCount) / promptSeconds : 0
+    let genTps = genSeconds > 0 ? Double(tokenCount) / genSeconds : 0
+    var logLine =
+        "\(ts()) [\(prepared.requestID)] stream: \(prepared.promptTokenCount)t prefill \(String(format: "%.1f", prefillTps)) t/s, \(tokenCount)t gen \(String(format: "%.1f", genTps)) t/s (\(String(format: "%.2f", totalSeconds))s) [\(finishReason)]"
+    if !toolCallNames.isEmpty {
+        logLine += " → \(toolCallNames.count) tool call(s)"
+        if CLILogger.level > 0 {
+            logLine += ": \(toolCallNames.joined(separator: ", "))"
+        }
+    }
+    print(logLine)
+    state.stats.record(
+        promptTokens: prepared.promptTokenCount, genTokens: tokenCount, promptSeconds: promptSeconds,
+        genSeconds: genSeconds, totalSeconds: totalSeconds, toolCalls: toolCallNames.count)
+    state.recordPromptTokens(prepared.promptTokensInt32)
+    if !toolCallNames.isEmpty {
+        state.recordToolCalls(toolCallNames)
+    }
+
+    return StreamingOutcome(
+        prefixReuseTokens: prepared.prefixReuseTokens,
+        ttftSeconds: promptSeconds,
+        totalSeconds: totalSeconds,
+        genTokenCount: tokenCount,
+        promptTokenCount: prepared.promptTokenCount,
+        finishReason: finishReason,
+        systemFingerprint: state.systemFingerprint
+    )
+}
+
+private func handleStreamingRequest(
+    chatRequest: ChatCompletionRequest, state: ServerState, sessionID: String? = nil, permit: QueuePermit
+)
+    async throws -> Response
+{
+    // Preflight throws for bad requests before any SSE framing (mapped to HTTP 400 upstream).
+    let prepared = try await prepareStreaming(chatRequest: chatRequest, state: state, sessionID: sessionID)
+    let created = Int(Date().timeIntervalSince1970)
+
     let responseBody = ResponseBody { writer in
         // The closure owns the permit for the stream's lifetime; release-on-deinit
         // covers a response the framework drops before entering this closure.
         defer { permit.release() }
         do {
             let encoder = JSONEncoder()
-            let genStart = SuspendingClock().now
 
-            let roleChunk = ChatCompletionChunk(
-                id: requestID, object: "chat.completion.chunk", created: created, model: state.config.modelName,
-                choices: [.init(index: 0, delta: .init(role: "assistant", content: nil), finishReason: nil)],
-                systemFingerprint: state.systemFingerprint
-            )
-            if let data = try? encoder.encode(roleChunk), let json = String(data: data, encoding: .utf8) {
-                try await writer.write(ByteBuffer(string: "data: \(json)\n\n"))
-            }
-
-            let strategy: any DecodingStrategy
-            if let schema = chatRequest.responseFormat?.extractedSchema {
-                strategy = ConstrainedDecodingStrategy(jsonSchema: schema, vocabSize: state.config.vocabSize)
-            } else {
-                strategy = VanillaDecodingStrategy()
-            }
-
-            let tokenStream = try await strategy.decode(
-                from: input,
-                tokenizer: state.tokenizer,
-                inferenceEngine: state.engine,
-                samplingConfiguration: samplingConfig,
-                options: InferenceOptions(maxTokens: requestMaxTokens),
-                stopSequences: stopSequences
-            )
-
-            var thinkParser = ThinkTagParser(format: state.thinkingFormat)
-            var toolParser = state.makeToolCallParser()
-            var tokenCount = 0
-            var hasToolCalls = false
-            var toolCallIndex = 0
-            var toolCallNames: [String] = []
-            var promptSeconds: Double = 0
-            let isRaw = chatRequest.raw == true
-
-            // Emit a single SSE chunk (text content or tool call delta)
-            func emitChunk(_ delta: ChatCompletionChunk.Delta) async throws {
+            func writeDelta(_ delta: ChatCompletionChunk.Delta, finishReason: String? = nil) async throws {
                 let chunk = ChatCompletionChunk(
-                    id: requestID, object: "chat.completion.chunk", created: created,
+                    id: prepared.requestID, object: "chat.completion.chunk", created: created,
                     model: state.config.modelName,
-                    choices: [.init(index: 0, delta: delta, finishReason: nil)],
+                    choices: [.init(index: 0, delta: delta, finishReason: finishReason)],
                     systemFingerprint: state.systemFingerprint)
-                if let data = try? encoder.encode(chunk),
-                    let json = String(data: data, encoding: .utf8)
-                {
+                if let data = try? encoder.encode(chunk), let json = String(data: data, encoding: .utf8) {
                     try await writer.write(ByteBuffer(string: "data: \(json)\n\n"))
                 }
             }
 
-            // Process tool parser events: emit text as content, tool calls as deltas
-            func emitToolEvents(_ events: [ToolCallParser.Event]) async throws {
-                for event in events {
-                    switch event {
-                    case .text(let t) where !t.isEmpty:
-                        try await emitChunk(.init(role: nil, content: t))
-                    case .toolCall(let id, let name, let argsJSON):
-                        hasToolCalls = true
-                        toolCallNames.append(name)
-                        let tcDelta = ToolCallDelta(
-                            index: toolCallIndex, id: id, type: "function",
-                            function: .init(name: name, arguments: argsJSON))
-                        try await emitChunk(.init(role: nil, content: nil, toolCalls: [tcDelta]))
-                        toolCallIndex += 1
-                    default: break
-                    }
-                }
-            }
+            try await writeDelta(.init(role: "assistant", content: nil))
 
-            // Process text through the tool parser (or emit directly if no tool support)
-            func emitText(_ text: String) async throws {
-                guard !text.isEmpty else { return }
-                if var tp = toolParser {
-                    let events = tp.consume(text)
-                    toolParser = tp
-                    try await emitToolEvents(events)
-                } else {
-                    try await emitChunk(.init(role: nil, content: text))
-                }
-            }
+            let outcome = try await runStreamingLoop(
+                prepared: prepared, chatRequest: chatRequest, state: state, emit: { try await writeDelta($0) })
 
-            for try await result in tokenStream {
-                if tokenCount == 0 {
-                    let ttft = SuspendingClock().now - genStart
-                    promptSeconds = Double(ttft.components.seconds) + Double(ttft.components.attoseconds) / 1e18
-                }
-                tokenCount += 1
-                if isRaw {
-                    try await emitChunk(.init(role: nil, content: result.text))
-                } else {
-                    for event in thinkParser.consume(result.text) {
-                        switch event {
-                        case .text(let delta):
-                            try await emitText(delta)
-                        case .reasoning(let delta) where !delta.isEmpty:
-                            try await emitChunk(.init(role: nil, content: nil, reasoningContent: delta))
-                        default:
-                            break
-                        }
-                    }
-                }
-            }
-
-            if !isRaw {
-                for event in thinkParser.flush() {
-                    switch event {
-                    case .text(let delta):
-                        try await emitText(delta)
-                    case .reasoning(let delta) where !delta.isEmpty:
-                        try await emitChunk(.init(role: nil, content: nil, reasoningContent: delta))
-                    default:
-                        break
-                    }
-                }
-
-                if var tp = toolParser {
-                    try await emitToolEvents(tp.flush())
-                    toolParser = tp
-                }
-            }
-
-            let finishReason = tokenCount >= requestMaxTokens ? "length" : (hasToolCalls ? "tool_calls" : "stop")
-            let doneChunk = ChatCompletionChunk(
-                id: requestID, object: "chat.completion.chunk", created: created, model: state.config.modelName,
-                choices: [.init(index: 0, delta: .init(role: nil, content: nil), finishReason: finishReason)],
-                systemFingerprint: state.systemFingerprint
-            )
-            if let data = try? encoder.encode(doneChunk), let json = String(data: data, encoding: .utf8) {
-                try await writer.write(ByteBuffer(string: "data: \(json)\n\n"))
-            }
+            try await writeDelta(.init(role: nil, content: nil), finishReason: outcome.finishReason)
             try await writer.write(ByteBuffer(string: "data: [DONE]\n\n"))
-
-            let elapsed = SuspendingClock().now - genStart
-            let totalSeconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
-            let genSeconds = totalSeconds - promptSeconds
-            let prefillTps = promptSeconds > 0 ? Double(promptTokens.count) / promptSeconds : 0
-            let genTps = genSeconds > 0 ? Double(tokenCount) / genSeconds : 0
-            var logLine =
-                "\(ts()) [\(requestID)] stream: \(promptTokens.count)t prefill \(String(format: "%.1f", prefillTps)) t/s, \(tokenCount)t gen \(String(format: "%.1f", genTps)) t/s (\(String(format: "%.2f", totalSeconds))s) [\(finishReason)]"
-            if !toolCallNames.isEmpty {
-                logLine += " → \(toolCallNames.count) tool call(s)"
-                if CLILogger.level > 0 {
-                    logLine += ": \(toolCallNames.joined(separator: ", "))"
-                }
-            }
-            print(logLine)
-            state.stats.record(
-                promptTokens: promptTokens.count, genTokens: tokenCount, promptSeconds: promptSeconds,
-                genSeconds: genSeconds, totalSeconds: totalSeconds, toolCalls: toolCallNames.count)
-            state.recordPromptTokens(promptTokensInt32)
-            if !toolCallNames.isEmpty {
-                state.recordToolCalls(toolCallNames)
-            }
-
             try await writer.finish(nil)
         } catch {
-            print("\(ts()) [\(requestID)] stream error: \(error)")
+            print("\(ts()) [\(prepared.requestID)] stream error: \(error)")
             try? await writer.write(ByteBuffer(string: "data: [DONE]\n\n"))
             try? await writer.finish(nil)
         }

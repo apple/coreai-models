@@ -42,6 +42,16 @@ struct LLMServer: AsyncParsableCommand {
     @Option(name: .customLong("min-p"), help: "Default Min-P sampling")
     var minP: Double?
 
+    @Option(
+        name: .customLong("replay"),
+        help:
+            "Process a JSONL request file and exit, without binding a port (functional testing without the serving surface; see CoreAILMCommon/ReplayTypes)"
+    )
+    var replayPath: String?
+
+    @Option(name: .customLong("replay-output"), help: "Write replay results JSONL here (default: stdout)")
+    var replayOutput: String?
+
     @Option(name: .customLong("variant"), help: "Engine variant: auto, coreai-pipelined, coreai-sequential")
     var inferenceEngineVariant: String = "default"
 
@@ -224,6 +234,11 @@ struct LLMServer: AsyncParsableCommand {
             tokenizer: tokenizer,
             config: config
         )
+
+        if let replayPath {
+            try await ReplayRunner.run(inputPath: replayPath, outputPath: replayOutput, state: state)
+            return
+        }
 
         if verbose {
             print("Model: \(modelName)")
