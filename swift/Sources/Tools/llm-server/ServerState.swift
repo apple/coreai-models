@@ -28,6 +28,8 @@ struct ServerConfig: Sendable {
     let vocabSize: Int?
     let additionalEosTokenIds: [Int32]
     let maxQueueDepth: Int
+    /// Vision configuration when serving a VLM bundle; nil for text-only models.
+    let visionConfig: VisionConfig?
 }
 
 // MARK: - Server Stats
@@ -172,6 +174,12 @@ final class ServerState: @unchecked Sendable {
     }
 
     var supportsToolCalling: Bool { toolCallDetection != nil }
+
+    /// True when serving a VLM bundle (vision config present).
+    var isVLM: Bool { config.visionConfig != nil }
+
+    /// The engine as a multimodal engine, when it supports image input.
+    var multimodalEngine: (any MultimodalInferenceEngine)? { engine as? any MultimodalInferenceEngine }
 
     func makeToolCallParser() -> ToolCallParser? {
         guard let detection = toolCallDetection else { return nil }

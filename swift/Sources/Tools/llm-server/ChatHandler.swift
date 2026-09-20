@@ -30,7 +30,8 @@ func startServer(state: ServerState, port: Int) async throws {
                 ModelsResponse.ModelInfo(
                     id: state.config.modelName,
                     created: Int(Date().timeIntervalSince1970),
-                    ownedBy: "coreai"
+                    ownedBy: "coreai",
+                    supportsVision: state.isVLM ? true : nil
                 )
             ]
         )
@@ -184,6 +185,10 @@ struct ChatCompletionOutcome {
 func runChatCompletion(chatRequest: ChatCompletionRequest, state: ServerState, sessionID: String? = nil)
     async throws -> ChatCompletionOutcome
 {
+    // Vision-language request with an image: run the multimodal core instead.
+    if state.isVLM && VLMChatSupport.hasImage(in: chatRequest.messages) {
+        return try await runVLMCompletion(chatRequest: chatRequest, state: state)
+    }
     let requestMaxTokens = chatRequest.maxCompletionTokens ?? chatRequest.maxTokens ?? state.config.defaultMaxTokens
     guard requestMaxTokens > 0 else {
         throw ServerError.badRequest("max_tokens must be positive")
