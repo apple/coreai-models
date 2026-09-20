@@ -160,9 +160,13 @@ public final class GrowingNDArrayState: SyncStateHandler {
 
         switch source.scalarType {
         case .float16, .bfloat16:
-            source.view(as: Float16.self).withUnsafePointer { srcPtr, _, _ in
-                var dstView = destination.mutableView(as: Float16.self)
-                dstView.withUnsafeMutablePointer { dstPtr, _, _ in
+            // KV states are 16-bit and this is a raw block copy, so reinterpret the bytes as
+            // UInt16. A typed `view(as: Float16.self)` traps on a BFloat16 array (the scalar
+            // types must match), and the element values are copied verbatim either way.
+            source.rawView().withUnsafeBytes { srcRaw, _, _ in
+                let srcPtr = srcRaw.assumingMemoryBound(to: UInt16.self)
+                destination.mutableRawView().withUnsafeMutableBytes { dstRaw, _, _ in
+                    let dstPtr = dstRaw.assumingMemoryBound(to: UInt16.self)
                     for block in 0..<numBlocks {
                         dstPtr.advanced(by: block * dstBlockStride).update(
                             from: srcPtr.advanced(by: block * srcBlockStride), count: copyElements)
@@ -191,9 +195,10 @@ func zeroFillNDArray(_ array: inout NDArray) {
     let count = array.shape.reduce(1, *)
     switch array.scalarType {
     case .float16, .bfloat16:
-        var view = array.mutableView(as: Float16.self)
-        view.withUnsafeMutablePointer { ptr, _, _ in
-            memset(ptr, 0, count * MemoryLayout<Float16>.size)
+        // Both 16-bit types zero to an all-zero bit pattern, so a raw view avoids the
+        // scalar-type trap a typed `mutableView(as: Float16.self)` hits on a BFloat16 array.
+        array.mutableRawView().withUnsafeMutableBytes { ptr, _, _ in
+            memset(ptr, 0, count * MemoryLayout<UInt16>.size)
         }
     case .float32:
         var view = array.mutableView(as: Float.self)
