@@ -186,7 +186,10 @@ private func handleNonStreamingRequest(chatRequest: ChatCompletionRequest, state
         minP: nil
     )
 
-    let promptTokens = tokenizeMessages(chatRequest.messages, tools: chatRequest.tools, state: state)
+    let reasoningEffort = ReasoningEffort.resolve(
+        request: chatRequest.reasoningEffort, default: state.config.defaultReasoningEffort)
+    let promptTokens = tokenizeMessages(
+        chatRequest.messages, tools: chatRequest.tools, reasoningEffort: reasoningEffort, state: state)
     let stopSequences = buildStopSequences(from: chatRequest, state: state)
     let input: Input = .tokens(promptTokens)
 
@@ -358,7 +361,10 @@ private func handleStreamingRequest(
         minP: nil
     )
 
-    let promptTokens = tokenizeMessages(chatRequest.messages, tools: chatRequest.tools, state: state)
+    let reasoningEffort = ReasoningEffort.resolve(
+        request: chatRequest.reasoningEffort, default: state.config.defaultReasoningEffort)
+    let promptTokens = tokenizeMessages(
+        chatRequest.messages, tools: chatRequest.tools, reasoningEffort: reasoningEffort, state: state)
     let stopSequences = buildStopSequences(from: chatRequest, state: state)
     let input: Input = .tokens(promptTokens)
 
@@ -556,7 +562,8 @@ private func handleStreamingRequest(
 // MARK: - Helpers
 
 private func tokenizeMessages(
-    _ messages: [ChatMessage], tools: [ToolDefinition]? = nil, state: ServerState
+    _ messages: [ChatMessage], tools: [ToolDefinition]? = nil,
+    reasoningEffort: String? = nil, state: ServerState
 ) -> [Int] {
     var templateMessages: [[String: any Sendable]] = []
     for msg in messages {
@@ -608,8 +615,10 @@ private func tokenizeMessages(
     }
 
     do {
+        let additionalContext = ReasoningEffort.templateContext(reasoningEffort)
         let tokens = try state.tokenizer.applyChatTemplate(
-            messages: templateMessages, tools: toolSpecs)
+            messages: templateMessages, tools: toolSpecs,
+            additionalContext: additionalContext.isEmpty ? nil : additionalContext)
         return tokens
     } catch {
         CLILogger.log("applyChatTemplate failed: \(error)", component: "Server")

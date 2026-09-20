@@ -20,6 +20,8 @@ struct ServerConfig: Sendable {
     let defaultTopK: Int?
     let defaultMinP: Double?
     let noThinking: Bool
+    /// Default `reasoning_effort` applied when a request omits it. `nil` leaves the template default.
+    let defaultReasoningEffort: String?
     let supportsLogprobs: Bool
     let maxContextLength: Int
     let vocabSize: Int?

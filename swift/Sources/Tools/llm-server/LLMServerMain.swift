@@ -68,8 +68,14 @@ struct LLMServer: AsyncParsableCommand {
     @Option(name: .customLong("max-queue-depth"), help: "Max requests queued before returning 429 (default: 16)")
     var maxQueueDepth: Int = 16
 
-    @Flag(name: .customLong("no-thinking"), help: "Disable thinking/reasoning (appends /no_think or sets template)")
+    @Flag(name: .customLong("no-thinking"), help: "Disable thinking/reasoning (alias for --reasoning-default none)")
     var noThinking: Bool = false
+
+    @Option(
+        name: .customLong("reasoning-default"),
+        help: "Default reasoning_effort when a request omits it (none, low, medium, high)."
+    )
+    var reasoningDefault: String?
 
     @Flag(
         name: .customLong("clear-coreai-cache"),
@@ -194,6 +200,7 @@ struct LLMServer: AsyncParsableCommand {
             defaultTopK: topK,
             defaultMinP: minP,
             noThinking: noThinking,
+            defaultReasoningEffort: reasoningDefault ?? (noThinking ? ReasoningEffort.none : nil),
             supportsLogprobs: supportsLogprobs,
             maxContextLength: bundle.maxContextLength,
             vocabSize: bundle.vocabSize,

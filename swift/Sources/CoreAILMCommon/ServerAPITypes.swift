@@ -22,6 +22,9 @@ public struct ChatCompletionRequest: Decodable, Sendable {
     public let toolChoice: ToolChoice?
     public let parallelToolCalls: Bool?
     public let raw: Bool?
+    /// Reasoning-effort control, OpenAI-compatible. Canonical values are none, low, medium, high;
+    /// other values pass through to the model's chat template.
+    public let reasoningEffort: String?
 
     enum CodingKeys: String, CodingKey {
         case model, messages, temperature, stream, stop, tools, raw
@@ -32,6 +35,7 @@ public struct ChatCompletionRequest: Decodable, Sendable {
         case responseFormat = "response_format"
         case toolChoice = "tool_choice"
         case parallelToolCalls = "parallel_tool_calls"
+        case reasoningEffort = "reasoning_effort"
     }
 
     public init(from decoder: Decoder) throws {
@@ -49,6 +53,7 @@ public struct ChatCompletionRequest: Decodable, Sendable {
         toolChoice = try container.decodeIfPresent(ToolChoice.self, forKey: .toolChoice)
         parallelToolCalls = try container.decodeIfPresent(Bool.self, forKey: .parallelToolCalls)
         raw = try container.decodeIfPresent(Bool.self, forKey: .raw)
+        reasoningEffort = try container.decodeIfPresent(String.self, forKey: .reasoningEffort)
 
         if let arr = try? container.decode([String].self, forKey: .stop) {
             stop = arr
