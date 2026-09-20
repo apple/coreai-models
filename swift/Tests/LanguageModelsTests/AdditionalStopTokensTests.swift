@@ -140,6 +140,26 @@ struct AdditionalStopTokensTests {
         #expect(ids == [106])
     }
 
+    @Test("Phi exported bundle stops on <|end|> via tokenizer.json")
+    func phiExportedBundleEnd() throws {
+        // Phi-4-mini ends assistant turns with <|end|> (ID 200020) while its main
+        // EOS is <|endoftext|>, and save_pretrained keeps <|end|> in tokenizer.json.
+        let ids = try Self.stopIds(
+            config: """
+                {
+                  "eos_token": "<eos>"
+                }
+                """,
+            tokenizerJSON: """
+                {
+                  "added_tokens": [
+                    { "id": 200020, "content": "<|end|>", "special": true }
+                  ]
+                }
+                """)
+        #expect(ids == [200020])
+    }
+
     @Test("tokenizer.json non-special turn token is ignored")
     func tokenizerJSONNonSpecialIgnored() throws {
         let ids = try Self.stopIds(

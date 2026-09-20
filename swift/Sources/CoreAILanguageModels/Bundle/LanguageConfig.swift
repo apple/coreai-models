@@ -152,9 +152,9 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
         }
 
         // 3. Check added_tokens_decoder for turn-ending special tokens
-        //    (e.g. Gemma's <end_of_turn> ID 106, Qwen's <|im_end|>)
+        //    (e.g. Gemma's <end_of_turn> ID 106, Qwen's <|im_end|>, Phi's <|end|>)
         //    Only include tokens whose content matches known turn-ending patterns.
-        let turnEndPatterns = ["end_of_turn", "im_end", "eot_id", "endoftext", "eot_token", "|eot|"]
+        let turnEndPatterns = ["end_of_turn", "im_end", "eot_id", "endoftext", "eot_token", "|eot|", "|end|"]
         if let addedTokens = json["added_tokens_decoder"] as? [String: Any] {
             for (idString, value) in addedTokens {
                 guard let dict = value as? [String: Any],
@@ -185,7 +185,7 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
         //    Fast tokenizers saved via save_pretrained store their added
         //    specials here and drop added_tokens_decoder from
         //    tokenizer_config.json, so this recovers Gemma's <end_of_turn>
-        //    (ID 106) in exported bundles.
+        //    (ID 106) and Phi's <|end|> (ID 200020) in exported bundles.
         let tokenizerURL = tokenizerDir.appending(path: "tokenizer.json")
         if let tokenizerData = try? Data(contentsOf: tokenizerURL),
             let tokenizerJSON = try? JSONSerialization.jsonObject(with: tokenizerData) as? [String: Any],
