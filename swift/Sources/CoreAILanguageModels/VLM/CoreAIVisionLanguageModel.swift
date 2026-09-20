@@ -63,11 +63,22 @@ public struct CoreAIVisionLanguageModel: LanguageModel {
                 "Expected a vision-language engine for a VLM bundle, got \(type(of: engine))")
         }
 
+        let tokenizer = try await tokenizerResult
+
+        // Turn-end tokens the model stops on beyond the main EOS (e.g. Gemma's
+        // <end_of_turn>, Phi's <|end|>), resolved once at load like the text server does.
+        var additionalStopTokenIds: [Int32] = []
+        if let tokenizerDir = bundle.tokenizerPath {
+            additionalStopTokenIds = LanguageConfig.additionalStopTokenIds(
+                from: tokenizerDir, tokenizer: tokenizer)
+        }
+
         self.executorConfiguration = CoreAIVLMExecutor.Configuration(
             bundleURL: url,
             engine: vlmEngine,
-            tokenizer: try await tokenizerResult,
-            visionConfig: visionConfig
+            tokenizer: tokenizer,
+            visionConfig: visionConfig,
+            additionalStopTokenIds: additionalStopTokenIds
         )
     }
 }
@@ -82,6 +93,7 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
         let engine: CoreAISequentialVLMEngine
         let tokenizer: any Tokenizer
         let visionConfig: VisionConfig
+        let additionalStopTokenIds: [Int32]
 
         public static func == (lhs: Configuration, rhs: Configuration) -> Bool {
             lhs.bundleURL == rhs.bundleURL
@@ -94,11 +106,13 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
     private let engine: CoreAISequentialVLMEngine
     private let tokenizer: any Tokenizer
     private let visionConfig: VisionConfig
+    private let additionalStopTokenIds: [Int32]
 
     public init(configuration: Configuration) throws {
         self.engine = configuration.engine
         self.tokenizer = configuration.tokenizer
         self.visionConfig = configuration.visionConfig
+        self.additionalStopTokenIds = configuration.additionalStopTokenIds
     }
 
     public nonisolated(nonsending) func respond(
@@ -149,6 +163,7 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
         if let imEnd = tokenizer.vocabContains("<|im_end|>") ? tokenizer.convertTokenToId("<|im_end|>") : nil {
             stopTokens.insert(Int32(imEnd))
         }
+        stopTokens.formUnion(additionalStopTokenIds)
 
         let stream = try await engine.generate(
             with: embeddedInput,
