@@ -121,6 +121,19 @@ public struct SamplingConfiguration: Sendable, Equatable, Hashable {
     /// instrumentation of discrete steps.
     public let combined: Bool
 
+    /// Seed for reproducible sampling.
+    ///
+    /// - **nil**: The engine samples with the system generator; output is not reproducible.
+    /// - **set**: Sampling uses a seeded, deterministic generator, so the same seed, prompt, and
+    ///   logits reproduce the same tokens on repeated runs. This does not guarantee determinism
+    ///   across machines or runtime environments.
+    ///
+    /// Each generation step derives its own generator from `(seed, step)`, so reproducibility
+    /// does not depend on a running generator's stream position. It therefore survives prefix
+    /// reuse, reset, and cancellation. Greedy sampling (temperature 0) is already deterministic
+    /// and ignores this field.
+    public let seed: UInt64?
+
     /// Creates a new sampling configuration with validation.
     ///
     /// - Parameters:
@@ -131,6 +144,7 @@ public struct SamplingConfiguration: Sendable, Equatable, Hashable {
     ///   - repetitionPenalty: Optional repetition penalty factor. Must be >= 1.0 if set.
     ///   - repetitionPenaltyWindow: Optional window size. Must be > 0 if set.
     ///   - combined: Whether to combine sampling with logit inference. Defaults to true.
+    ///   - seed: Optional seed for reproducible sampling. Defaults to nil (system generator).
     public init(
         temperature: Double,
         topK: Int? = nil,
@@ -138,7 +152,8 @@ public struct SamplingConfiguration: Sendable, Equatable, Hashable {
         minP: Double? = nil,
         repetitionPenalty: Double? = nil,
         repetitionPenaltyWindow: Int? = nil,
-        combined: Bool = true
+        combined: Bool = true,
+        seed: UInt64? = nil
     ) {
         precondition(temperature >= 0, "Temperature must be non-negative.")
         precondition(topK == nil || topK! > 0, "TopK must be positive if set.")
@@ -158,6 +173,7 @@ public struct SamplingConfiguration: Sendable, Equatable, Hashable {
         self.repetitionPenalty = repetitionPenalty
         self.repetitionPenaltyWindow = repetitionPenaltyWindow
         self.combined = combined
+        self.seed = seed
     }
 
     /// A predefined configuration for deterministic, greedy token generation.
@@ -299,7 +315,8 @@ public struct SamplingConfiguration: Sendable, Equatable, Hashable {
             minP: effectiveMinP,
             repetitionPenalty: repetitionPenalty,
             repetitionPenaltyWindow: repetitionPenaltyWindow,
-            combined: combined
+            combined: combined,
+            seed: seed
         )
     }
 }
@@ -311,14 +328,16 @@ extension SamplingConfiguration {
     /// - Temperature == 0: Greedy (argmax)
     /// - Otherwise: Composite sampler with Float32 internal math
     ///
-    /// - Parameter logits: Mutable array of Float16 logits. May be modified during sampling.
+    /// - Parameters:
+    ///   - logits: Mutable array of Float16 logits. May be modified during sampling.
+    ///   - step: Generation step index, used to derive this step's generator when `seed` is set.
     /// - Returns: The sampled token ID.
-    public func fallbackSampler(from logits: inout [LogitsScalarType]) -> Int32 {
+    public func fallbackSampler(from logits: inout [LogitsScalarType], step: Int = 0) -> Int32 {
         precondition(
             !needsRepetitionPenalty,
             "Use fallbackSampler(from:tokenHistory:) when repetition penalty is configured"
         )
-        return CompositeSampler.sample(from: &logits, config: self)
+        return sampleToken(from: &logits, step: step)
     }
 
     /// Samples the next token with repetition penalty applied first.
@@ -329,8 +348,13 @@ extension SamplingConfiguration {
     /// - Parameters:
     ///   - logits: Mutable array of Float16 logits. May be modified during sampling.
     ///   - tokenHistory: Recent token IDs for repetition penalty.
+    ///   - step: Generation step index, used to derive this step's generator when `seed` is set.
     /// - Returns: The sampled token ID.
-    public func fallbackSampler(from logits: inout [LogitsScalarType], tokenHistory: some Collection<Int32>) -> Int32 {
+    public func fallbackSampler(
+        from logits: inout [LogitsScalarType],
+        tokenHistory: some Collection<Int32>,
+        step: Int = 0
+    ) -> Int32 {
         if needsRepetitionPenalty {
             let window = repetitionPenaltyWindow.map { min($0, tokenHistory.count) } ?? tokenHistory.count
             let recentTokens = tokenHistory.suffix(window)
@@ -340,6 +364,22 @@ extension SamplingConfiguration {
                 penalty: Float(repetitionPenalty!)
             )
         }
-        return CompositeSampler.sample(from: &logits, config: self)
+        return sampleToken(from: &logits, step: step)
+    }
+
+    /// Samples a token from already-prepared logits (repetition penalty / masking, if any,
+    /// applied by the caller), routing through the seed.
+    ///
+    /// With `seed` set, each step derives its own `SeededRandomNumberGenerator` from
+    /// `(seed, step)`, so the sampled token is reproducible and independent of any running
+    /// generator's stream position. With `seed` nil, the system generator is used. Greedy
+    /// (temperature 0) is argmax and ignores the generator. Used by both `fallbackSampler` and
+    /// the constrained-decoding path so seeded sampling is reproducible everywhere.
+    public func sampleToken(from logits: inout [LogitsScalarType], step: Int) -> Int32 {
+        guard let seed else {
+            return CompositeSampler.sample(from: &logits, config: self)
+        }
+        var rng = SeededRandomNumberGenerator(seed: seed &+ UInt64(bitPattern: Int64(step)))
+        return CompositeSampler.sample(from: &logits, config: self, using: &rng)
     }
 }

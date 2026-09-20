@@ -218,7 +218,7 @@ public struct ConstrainedGenerator: DecodingStrategy {
             }
             _ = session.applyMask(to: &maskedLogits)
 
-            let bestToken = CompositeSampler.sample(from: &maskedLogits, config: samplingConfiguration)
+            let bestToken = samplingConfiguration.sampleToken(from: &maskedLogits, step: generatedTokens.count)
 
             if !session.acceptToken(bestToken) { break }
 
