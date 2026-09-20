@@ -247,11 +247,18 @@ public struct CoreAILanguageModel: LanguageModel {
         ) async throws {
             // Tokenization span
             let tokenizationSpan = InstrumentsProfiler.beginTokenization(inputLength: 0)
+            // Reasoning effort travels on FM's ContextOptions (not GenerationOptions); map it to a
+            // canonical string and inject it as a chat-template kwarg in makeTokens.
+            var reasoningEffort: String? = nil
+            if #available(FoundationModels 2.0, *) {
+                reasoningEffort = Self.reasoningEffortString(from: request.contextOptions.reasoningLevel)
+            }
             let promptTokens = Self.makeTokens(
                 from: Array(request.transcript),
                 using: model.tokenizer,
                 tools: request.enabledToolDefinitions,
                 toolCallDetection: model.toolCallDetection,
+                reasoningEffort: reasoningEffort,
                 component: "CoreAIExecutor"
             )
             guard !promptTokens.isEmpty else {
@@ -609,6 +616,7 @@ public struct CoreAILanguageModel: LanguageModel {
             using tokenizer: any Tokenizer,
             tools: [Transcript.ToolDefinition] = [],
             toolCallDetection: ToolCallDetection? = nil,
+            reasoningEffort: String? = nil,
             component: String = "CoreAIExecutor"
         ) -> [Int] {
             var messages: [Message] = []
@@ -669,7 +677,10 @@ public struct CoreAILanguageModel: LanguageModel {
 
             do {
                 CLILogger.log("Applying chat template via tokenizer", component: component)
-                return try tokenizer.applyChatTemplate(messages: messages, tools: toolSpecs)
+                let extra = reasoningTemplateContext(reasoningEffort)
+                return try tokenizer.applyChatTemplate(
+                    messages: messages, tools: toolSpecs,
+                    additionalContext: extra.isEmpty ? nil : extra)
             } catch {
                 CLILogger.log(
                     "Failed to apply chat template: \(error), falling back to simple encoding",
@@ -677,6 +688,31 @@ public struct CoreAILanguageModel: LanguageModel {
                 let text = messages.compactMap { $0["content"] as? String }.joined(separator: "\n")
                 return tokenizer.encode(text: text)
             }
+        }
+
+        /// Maps FM's `ContextOptions.ReasoningLevel` to our canonical effort string
+        /// (light→low, moderate→medium, deep→high, custom→verbatim).
+        @available(FoundationModels 2.0, *)
+        static func reasoningEffortString(from level: ContextOptions.ReasoningLevel?) -> String? {
+            switch level {
+            case .none: return nil
+            case .some(.light): return "low"
+            case .some(.moderate): return "medium"
+            case .some(.deep): return "high"
+            case .some(.custom(let s)): return s
+            @unknown default: return nil
+            }
+        }
+
+        /// Maps a canonical effort string to chat-template keyword arguments. Reasoning models read
+        /// their thinking budget from different template variables, so the value is bound to each
+        /// known variable; a chat template reads only the ones it references.
+        static func reasoningTemplateContext(_ effort: String?) -> [String: any Sendable] {
+            guard let e = effort?.trimmingCharacters(in: .whitespacesAndNewlines), !e.isEmpty else {
+                return [:]
+            }
+            if e.lowercased() == "none" { return ["enable_thinking": false] }
+            return ["reasoning_effort": e, "reasoning_strength": e, "enable_thinking": true]
         }
 
         /// Converts a `ToolDefinition` into the `ToolSpec` format expected by
