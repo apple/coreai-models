@@ -27,6 +27,10 @@ public actor CoreAIDiffusionModelFunction {
     public func loadResources() async throws {
         guard !isLoaded else { return }
 
+        // Fail fast on a missing asset.
+        guard FileManager.default.fileExists(atPath: modelURL.path) else {
+            throw CoreAIDiffusionError.modelFileNotFound(modelURL)
+        }
         let options = SpecializationOptions(preferredComputeUnitKind: .gpu)
         let loadedModel = try await AIModel(contentsOf: modelURL, options: options)
         guard let fn = try loadedModel.loadFunction(named: "main") else {
@@ -52,6 +56,9 @@ public actor CoreAIDiffusionModelFunction {
     /// The asset is released once this function returns.
     public func hasFunction(named name: String) async throws -> Bool {
         if let model { return model.functionNames.contains(name) }
+        guard FileManager.default.fileExists(atPath: modelURL.path) else {
+            throw CoreAIDiffusionError.modelFileNotFound(modelURL)
+        }
         let options = SpecializationOptions(preferredComputeUnitKind: .gpu)
         let probe = try await AIModel(contentsOf: modelURL, options: options)
         return probe.functionNames.contains(name)
@@ -397,6 +404,7 @@ public actor CoreAIDiffusionModelFunction {
 // MARK: - Errors
 
 public enum CoreAIDiffusionError: Error, LocalizedError {
+    case modelFileNotFound(URL)
     case functionNotFound(String, URL)
     case notLoaded
     case unsupportedInputScalarType(NDArray.ScalarType)
@@ -407,6 +415,8 @@ public enum CoreAIDiffusionError: Error, LocalizedError {
 
     public var errorDescription: String? {
         switch self {
+        case .modelFileNotFound(let url):
+            return "Model asset not found at \(url.path)"
         case .functionNotFound(let name, let url):
             return "Function '\(name)' not found in \(url.lastPathComponent)"
         case .notLoaded:
