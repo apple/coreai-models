@@ -30,6 +30,7 @@ import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
+from types import MethodType
 
 import torch
 import torch.nn as nn
@@ -534,7 +535,7 @@ async def export_text_bundle(
 def _f16_attention_forward(
     self, hidden_states, cu_seqlens=None, position_embeddings=None, **kwargs
 ):
-    """Dtype-preserving eager attention for Qwen3VLVisionAttention.
+    """Dtype-preserving eager attention for the Qwen VL-family vision towers.
 
     HF's eager path upcasts to fp32 inline twice per layer (RoPE's
     q/k.float() and softmax(dtype=fp32)); the ANE runs f16 only, so each
@@ -609,11 +610,12 @@ class StaticVisionEncoder(nn.Module):
         self.patchified_input = patchified_input
 
         if f16_attention:
-            # Class-level patch (same idiom as _patch_fast_pos_embed_interpolate):
-            # torch.export is only guaranteed to trace the class forward, so an
-            # instance-level override could silently fall back to HF's fp32 path.
-            # Resolved from the instance so every qwen-vl-family tower works.
-            type(visual_model.blocks[0].attn).forward = _f16_attention_forward
+            # Bound per attention instance: `nn.Module.__call__` reads `forward`
+            # off the instance, so tracing follows it, while every other module of
+            # the same class in this process keeps HF's implementation, the only
+            # one that accepts the plain [seq, head_dim] rotary layout.
+            for block in self.blocks:
+                block.attn.forward = MethodType(_f16_attention_forward, block.attn)
 
         self.image_size = image_size
         self.patch_size = patch_size

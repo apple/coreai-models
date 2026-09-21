@@ -225,3 +225,96 @@ _VISION_TOWERS = [
     pytest.param(Qwen3VLVisionConfig, Qwen3VLVisionModel, id="qwen3-vl"),
     pytest.param(Qwen3_5VisionConfig, Qwen3_5VisionModel, id="qwen3.5"),
 ]
+
+
+def _tiny_vision_tower(config_cls, model_cls, seed: int = 0):
+    """A randomly initialized vision tower small enough to run in a unit test."""
+    torch.manual_seed(seed)
+    config = config_cls(
+        depth=2,
+        hidden_size=32,
+        intermediate_size=64,
+        num_heads=2,
+        in_channels=3,
+        patch_size=16,
+        spatial_merge_size=1,
+        temporal_patch_size=2,
+        out_hidden_size=32,
+        num_position_embeddings=4,
+        deepstack_visual_indexes=[0],
+    )
+    return model_cls(config).eval()
+
+
+def _ane_encoder(tower) -> StaticVisionEncoder:
+    return StaticVisionEncoder(
+        tower,
+        **_TOWER_GEOMETRY,
+        patchified_input=True,
+        linear_patch_embed=True,
+        f16_attention=True,
+    ).eval()
+
+
+def _count_f16_attention_calls(monkeypatch) -> list:
+    """Record the attention modules that run the dtype-preserving implementation."""
+    calls: list = []
+    implementation = vlm_export._f16_attention_forward
+
+    def counting(self, *args, **kwargs):
+        calls.append(self)
+        return implementation(self, *args, **kwargs)
+
+    monkeypatch.setattr(vlm_export, "_f16_attention_forward", counting)
+    return calls
+
+
+@pytest.mark.parametrize(("config_cls", "model_cls"), _VISION_TOWERS)
+class TestF16AttentionScope:
+    def test_plain_encoder_is_unaffected_by_an_ane_encoder(self, config_cls, model_cls):
+        plain = StaticVisionEncoder(
+            _tiny_vision_tower(config_cls, model_cls), **_TOWER_GEOMETRY
+        ).eval()
+        pixels = torch.randn(1, 3, 32, 32)
+        with torch.no_grad():
+            before = plain(pixels)
+        assert torch.isfinite(before).all()
+
+        _ane_encoder(_tiny_vision_tower(config_cls, model_cls, seed=1))
+
+        with torch.no_grad():
+            after = plain(pixels)
+        assert after.shape == before.shape
+        assert torch.equal(before, after)
+
+    def test_attention_class_is_left_untouched(self, config_cls, model_cls):
+        tower = _tiny_vision_tower(config_cls, model_cls)
+        attention_cls = type(tower.blocks[0].attn)
+
+        _ane_encoder(tower)
+
+        assert attention_cls.forward is not vlm_export._f16_attention_forward
+        for block in tower.blocks:
+            assert block.attn.forward.__func__ is vlm_export._f16_attention_forward
+
+    def test_ane_encoder_runs_the_replacement(self, monkeypatch, config_cls, model_cls):
+        calls = _count_f16_attention_calls(monkeypatch)
+        tower = _tiny_vision_tower(config_cls, model_cls)
+        encoder = _ane_encoder(tower)
+
+        patches = torch.randn(1, encoder.num_patches, encoder.patch_dim)
+        with torch.no_grad():
+            features = encoder(patches)
+
+        assert calls == [block.attn for block in tower.blocks]
+        assert torch.isfinite(features).all()
+
+    def test_export_traces_the_replacement(self, monkeypatch, config_cls, model_cls):
+        calls = _count_f16_attention_calls(monkeypatch)
+        tower = _tiny_vision_tower(config_cls, model_cls)
+        encoder = _ane_encoder(tower)
+
+        patches = torch.randn(1, encoder.num_patches, encoder.patch_dim)
+        torch.export.export(encoder, (patches,))
+
+        assert {id(attention) for attention in calls} == {id(block.attn) for block in tower.blocks}
