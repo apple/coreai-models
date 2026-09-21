@@ -12,6 +12,11 @@
 /// bug reproduction. For ordinary generation, leave `seed` nil so the engine uses
 /// the system generator.
 ///
+/// A custom conformance is necessary because the standard library's
+/// `SystemRandomNumberGenerator` reads OS entropy and has no seed input, so it cannot
+/// produce reproducible output on any platform. The `UInt64` width is the
+/// `RandomNumberGenerator` protocol's `next()` output type, not something specific here.
+///
 /// The algorithm is SplitMix64 (Steele, Lea & Flood 2014): a fixed odd increment
 /// advances the state, then two xor-shift/multiply rounds mix it. It is fast, has a
 /// full 2^64 period, and passes standard statistical tests — enough for a sampling
