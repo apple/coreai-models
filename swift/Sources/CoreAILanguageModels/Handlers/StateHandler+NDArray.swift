@@ -198,7 +198,7 @@ func zeroFillNDArray(_ array: inout NDArray) {
         // Both 16-bit types zero to an all-zero bit pattern, so a raw view avoids the
         // scalar-type trap a typed `mutableView(as: Float16.self)` hits on a BFloat16 array.
         array.mutableRawView().withUnsafeMutableBytes { ptr, _, _ in
-            memset(ptr, 0, count * MemoryLayout<UInt16>.size)
+            memset(ptr, 0, count * MemoryLayout<UInt16>.stride)
         }
     case .float32:
         var view = array.mutableView(as: Float.self)
