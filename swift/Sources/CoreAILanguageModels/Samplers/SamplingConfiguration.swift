@@ -132,6 +132,9 @@ public struct SamplingConfiguration: Sendable, Equatable, Hashable {
     /// does not depend on a running generator's stream position. It therefore survives prefix
     /// reuse, reset, and cancellation. Greedy sampling (temperature 0) is already deterministic
     /// and ignores this field.
+    ///
+    /// The GPU pipelined engine (`CoreAIPipelinedEngine`) does not support seeded sampling and
+    /// throws if a request sets `seed`.
     public let seed: UInt64?
 
     /// Creates a new sampling configuration with validation.
@@ -330,9 +333,10 @@ extension SamplingConfiguration {
     ///
     /// - Parameters:
     ///   - logits: Mutable array of Float16 logits. May be modified during sampling.
-    ///   - step: Generation step index, used to derive this step's generator when `seed` is set.
+    ///   - step: Generation step index. Required when `seed` is set (each step derives its own
+    ///     generator from `(seed, step)`); ignored otherwise.
     /// - Returns: The sampled token ID.
-    public func fallbackSampler(from logits: inout [LogitsScalarType], step: Int = 0) -> Int32 {
+    public func fallbackSampler(from logits: inout [LogitsScalarType], step: Int? = nil) -> Int32 {
         precondition(
             !needsRepetitionPenalty,
             "Use fallbackSampler(from:tokenHistory:) when repetition penalty is configured"
@@ -348,12 +352,13 @@ extension SamplingConfiguration {
     /// - Parameters:
     ///   - logits: Mutable array of Float16 logits. May be modified during sampling.
     ///   - tokenHistory: Recent token IDs for repetition penalty.
-    ///   - step: Generation step index, used to derive this step's generator when `seed` is set.
+    ///   - step: Generation step index. Required when `seed` is set (each step derives its own
+    ///     generator from `(seed, step)`); ignored otherwise.
     /// - Returns: The sampled token ID.
     public func fallbackSampler(
         from logits: inout [LogitsScalarType],
         tokenHistory: some Collection<Int32>,
-        step: Int = 0
+        step: Int? = nil
     ) -> Int32 {
         if needsRepetitionPenalty {
             let window = repetitionPenaltyWindow.map { min($0, tokenHistory.count) } ?? tokenHistory.count
@@ -375,9 +380,18 @@ extension SamplingConfiguration {
     /// generator's stream position. With `seed` nil, the system generator is used. Greedy
     /// (temperature 0) is argmax and ignores the generator. Used by both `fallbackSampler` and
     /// the constrained-decoding path so seeded sampling is reproducible everywhere.
-    public func sampleToken(from logits: inout [LogitsScalarType], step: Int) -> Int32 {
+    ///
+    /// - Parameters:
+    ///   - logits: Mutable array of Float16 logits. May be modified during sampling.
+    ///   - step: Generation step index. Required when `seed` is set (each step derives its own
+    ///     generator from `(seed, step)`); ignored otherwise.
+    /// - Returns: The sampled token ID.
+    public func sampleToken(from logits: inout [LogitsScalarType], step: Int?) -> Int32 {
         guard let seed else {
             return CompositeSampler.sample(from: &logits, config: self)
+        }
+        guard let step else {
+            preconditionFailure("A generation step index is required when a sampling seed is set.")
         }
         var rng = SeededRandomNumberGenerator(seed: seed &+ UInt64(bitPattern: Int64(step)))
         return CompositeSampler.sample(from: &logits, config: self, using: &rng)
