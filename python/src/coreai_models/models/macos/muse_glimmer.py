@@ -43,6 +43,7 @@ from coreai_models.models.base import (
     TraceSpec,
     _load_tensors_for_keys,
     _resolve_safetensors_files,
+    _save_and_mmap_safetensors,
 )
 from coreai_models.primitives.macos.cache import KVCache, RingKVCache, ring_window_causal_mask
 from coreai_models.primitives.macos.mlp import MLP
@@ -375,7 +376,17 @@ class MuseGlimmerForCausalLM(BaseForCausalLM):
             for k, v in layer_sd.items():
                 remapped["model." + k[len(prefix) :]] = v
             del layer_sd
-            model.load_state_dict(remapped, assign=True, strict=False)
+            if mmap_path is not None:
+                # Offload this layer to disk and reload it mmap-backed so the OS
+                # can evict its pages, keeping peak RAM to ~one layer + shared.
+                layer_prefix = f"model.layers.{layer_idx}."
+                relative_sd = {k.removeprefix(layer_prefix): v for k, v in remapped.items()}
+                layer_module = model.model.layers[layer_idx]
+                layer_path = os.path.join(mmap_path, f"layer_{layer_idx}.safetensors")
+                _save_and_mmap_safetensors(layer_module, relative_sd, layer_path)
+                del relative_sd
+            else:
+                model.load_state_dict(remapped, assign=True, strict=False)
             del remapped
             gc.collect()
 
@@ -637,6 +648,7 @@ class MuseGlimmerForCausalLMWithDrafter(MuseGlimmerForCausalLM):
         self.encoder_fc = nn.Linear(encoder_in, encoder_out, bias=False)
         self.encoder_norm = RMSNorm(encoder_out, eps=config.rms_norm_eps)
 
+    @BaseForCausalLM.cast_logits_bfloat16_to_float16
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -645,10 +657,16 @@ class MuseGlimmerForCausalLMWithDrafter(MuseGlimmerForCausalLM):
         global_v_cache: torch.Tensor,
         sliding_k_cache: torch.Tensor,
         sliding_v_cache: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple:
         global_cache = KVCache(global_k_cache, global_v_cache)
         sliding_cache = RingKVCache(sliding_k_cache, sliding_v_cache)
+        # Run the backbone first so the KV caches are written even in prefill.
         hidden, extracted = self.model(input_ids, position_ids, global_cache, sliding_cache)
+
+        # Prefill only fills the KV cache; the LM head, softcap and drafter
+        # encoder are dead code there, exactly as in the parent forward.
+        if self.prefill_mode:
+            return ()
 
         logits = self.lm_head(hidden)
         if self._softcap:

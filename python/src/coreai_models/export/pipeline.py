@@ -38,7 +38,7 @@ from coreai_models.export.compression import (
 )
 from coreai_models.export.externalize import patch_model_for_externalization
 from coreai_models.export.ios import export_ios_model
-from coreai_models.export.macos import export_macos_model
+from coreai_models.export.macos import export_dflash_drafter, export_macos_model
 from coreai_models.export.metadata import build_aimodel_metadata
 from coreai_models.export.presets import (
     DEFAULT_MACOS_COMPRESSION_PRESET,
@@ -77,6 +77,14 @@ class ExportConfig:
     model_type_override: str | None = None
     # Speculative decoding: export the drafter model alongside the target.
     with_drafter: bool = False
+    # Speculative decoding: export the fused target that emits (logits,
+    # drafter_features) in one graph, instead of the plain single-output target.
+    # macOS only.
+    fused_target: bool = False
+    # Speculative decoding: export the DFlash two-entrypoint drafter (inject_kv +
+    # draft) alongside the target instead of the single-graph ring drafter.
+    # macOS only.
+    dflash_drafter: bool = False
 
     def __post_init__(self) -> None:
         if self.quantization_mode == "graph" and self.variant != "macOS":
@@ -173,7 +181,36 @@ async def _async_export_model(config: ExportConfig) -> str:
                 "--with-drafter is not supported for this model."
             )
 
+    if config.dflash_drafter:
+        if config.with_drafter:
+            raise ValueError(
+                "--with-drafter (ring drafter) and --dflash-drafter are mutually "
+                "exclusive; pick one drafter to export alongside the target."
+            )
+        if config.variant != "macOS":
+            raise ValueError("--dflash-drafter is only supported for macOS variant.")
+        if not config.fused_target:
+            raise ValueError(
+                "DFlash drafter requires --fused-target because it consumes the "
+                "fused target's drafter_features."
+            )
+        if entry.dflash_drafter_class is None or entry.drafter_model_id is None:
+            raise ValueError(
+                f"Model '{model_type}' does not have a registered DFlash drafter. "
+                "--dflash-drafter is not supported for this model."
+            )
+
     model_class = entry.macos_class if config.variant == "macOS" else entry.ios_class
+
+    if config.fused_target:
+        if config.variant != "macOS":
+            raise ValueError("--fused-target is only supported for macOS variant.")
+        if entry.fused_target_class is None:
+            raise ValueError(
+                f"Model '{model_type}' has no registered fused_target_class; "
+                "--fused-target is not supported for it."
+            )
+        model_class = entry.fused_target_class
 
     # ---- 2. Load model ----
     target_dtype = _resolve_precision(config.compute_precision)
@@ -384,6 +421,12 @@ async def _async_export_model(config: ExportConfig) -> str:
 
         # ---- 6. Export drafter if requested ----
         drafter_name: str | None = None
+        speculative_config: dict | None = None
+        # The drafter's OWN config, captured before the model is freed. Passed to
+        # the bundler so speculative structural metadata is sourced explicitly from
+        # the drafter (and validated against the target), not implicitly from the
+        # target's text_config.
+        drafter_structural_config: Any | None = None
         if config.with_drafter:
             if entry.drafter_class is None or entry.drafter_model_id is None:
                 raise ValueError(
@@ -424,6 +467,61 @@ async def _async_export_model(config: ExportConfig) -> str:
                 drafter_program.save_asset, drafter_aimodel_path, drafter_metadata
             )
             del drafter_program
+            speculative_config = entry.drafter_config
+
+        if config.dflash_drafter:
+            if entry.dflash_drafter_class is None or entry.drafter_model_id is None:
+                raise ValueError(
+                    f"Model '{model_type}' does not have a registered DFlash drafter. "
+                    "--dflash-drafter is not supported for this model."
+                )
+            drafter_name = f"{output_name}_dflash_drafter"
+            logger.info(
+                f"Exporting DFlash drafter from {entry.drafter_model_id} "
+                f"(target: {config.hf_model_id})..."
+            )
+
+            drafter_model = entry.dflash_drafter_class.from_hf(
+                entry.drafter_model_id,
+                max_context_length=max_context_length,
+                target_dtype=target_dtype,
+                target_model_id=config.hf_model_id,
+            )
+            drafter_model = drafter_model.eval()
+
+            # Capture the drafter's own structural config BEFORE the model is
+            # freed; the bundler validates it against the target and sources the
+            # speculative structural metadata from it explicitly.
+            drafter_structural_config = drafter_model.config
+            drafter_program = export_dflash_drafter(drafter_model, drafter_model.config, config)
+            del drafter_model
+
+            drafter_aimodel_path = bundle_path / f"{drafter_name}.aimodel"
+            if drafter_aimodel_path.exists():
+                if config.overwrite:
+                    import shutil
+
+                    shutil.rmtree(drafter_aimodel_path)
+                else:
+                    raise FileExistsError(
+                        f"{drafter_aimodel_path} already exists. Use --overwrite to replace it."
+                    )
+
+            logger.info(f"Saving DFlash drafter to {drafter_aimodel_path}...")
+            drafter_metadata = build_aimodel_metadata(entry.drafter_model_id)
+            await asyncio.to_thread(
+                drafter_program.save_asset, drafter_aimodel_path, drafter_metadata
+            )
+            del drafter_program
+            # Signal the DFlash two-phase runtime path via the drafter_kind knob
+            # (bundle._speculative_metadata anticipates it). DFlash drafts
+            # block_size tokens per cycle (a structural constant _speculative_metadata
+            # reads from the config), NOT the ring drafter's num_draft_tokens=5, so
+            # drop that misleading knob and keep only what still applies here.
+            speculative_config = {
+                k: v for k, v in (entry.drafter_config or {}).items() if k != "num_draft_tokens"
+            }
+            speculative_config["drafter_kind"] = "dflash"
 
         bundle_llm_asset(
             bundle_path=bundle_path,
@@ -433,7 +531,8 @@ async def _async_export_model(config: ExportConfig) -> str:
             name=output_name,
             tokenizer_model_id=entry.tokenizer_model_id,
             drafter_name=drafter_name,
-            speculative_config=entry.drafter_config if drafter_name else None,
+            speculative_config=speculative_config if drafter_name else None,
+            drafter_config=drafter_structural_config,
         )
 
     logger.info(f"Export complete: {bundle_path}")

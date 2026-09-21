@@ -6,7 +6,10 @@
 """Tests for DFlash speculative decoding: drafter shapes, hidden state extraction, fused target."""
 
 import torch
+import torch.nn as nn
 
+from coreai_models._constants import TRACE_KV_CACHE_SEQ_LEN
+from coreai_models.models.base import TraceSpec
 from coreai_models.models.macos.muse_glimmer import (
     MuseGlimmerForCausalLMWithDrafter,
     MuseGlimmerModelWithDrafter,
@@ -157,6 +160,153 @@ class TestDFlashDrafter:
         assert "rsqrt" not in src, (
             "DFlash drafter draft() must NOT apply embed norm (rsqrt). "
             "HF explicitly says: 'The assistant needs embedding without norm'."
+        )
+
+
+class _InjectKVGraphModule(nn.Module):
+    """nn.Module wrapper around ``inject_kv_graph`` for torch.export.
+
+    ``torch.export.export`` requires an ``nn.Module``, not a bound method (the
+    same reason the exporter wraps these entrypoints in ``export.macos``). The
+    forward param names match the graph's input/state names so ``dynamic_shapes``
+    keys stay valid.
+    """
+
+    def __init__(self, model: MuseGlimmerDFlashDrafterForCausalLM) -> None:
+        super().__init__()
+        self.model = model
+
+    def forward(self, features, position_ids, sliding_k_cache, sliding_v_cache):
+        return self.model.inject_kv_graph(features, position_ids, sliding_k_cache, sliding_v_cache)
+
+
+class _DraftGraphModule(nn.Module):
+    """nn.Module wrapper around ``draft_graph`` for torch.export (see
+    :class:`_InjectKVGraphModule`)."""
+
+    def __init__(self, model: MuseGlimmerDFlashDrafterForCausalLM) -> None:
+        super().__init__()
+        self.model = model
+
+    def forward(self, input_ids, position_ids, sliding_k_cache, sliding_v_cache):
+        return self.model.draft_graph(input_ids, position_ids, sliding_k_cache, sliding_v_cache)
+
+
+def _export_graph(module, kwargs, dyn):
+    """torch.export one entrypoint via its nn.Module wrapper (the supported route).
+
+    ``torch.export.export`` demands an ``nn.Module``, so each entrypoint is traced
+    through its wrapper -- the same approach the exporter uses in ``export.macos``.
+    """
+    return torch.export.export(module, args=(), kwargs=kwargs, dynamic_shapes=dyn)
+
+
+class TestDFlashDrafterExportContract:
+    """Two-entrypoint (inject_kv + draft) export contract, trace-level only.
+
+    Runs without the 55GB model: tiny config, hand-built tensors, no coreai
+    conversion.
+    """
+
+    def _model_and_spec(self):
+        cfg = _make_small_config()
+        m = MuseGlimmerDFlashDrafterForCausalLM(cfg)
+        m.eval()
+        # cache_seq_len must not exceed max_context_length (small config uses 512).
+        spec = TraceSpec(
+            max_context_length=cfg.max_position_embeddings,
+            cache_seq_len=min(TRACE_KV_CACHE_SEQ_LEN, cfg.max_position_embeddings),
+        )
+        return cfg, m, spec
+
+    def test_contract_hooks_agree(self):
+        cfg, m, spec = self._model_and_spec()
+        ref = m.build_reference_inputs(cfg, torch.float32, spec)
+        dyn = m.build_dynamic_shapes(cfg, spec)
+        m.validate_export_contract(ref, dyn)  # must not raise
+
+        graphs = {"inject_kv", "draft"}
+        assert set(m.export_input_names()) == graphs
+        assert set(m.export_state_names()) == graphs
+        assert set(m.export_output_names()) == graphs
+        assert set(ref) == graphs
+        assert set(dyn) == graphs
+
+        assert m.export_output_names()["inject_kv"] == ()
+        assert m.export_output_names()["draft"] == ("logits",)
+        # Identical state tuple for both graphs => one shared physical ring buffer.
+        assert (
+            m.export_state_names()["inject_kv"]
+            == m.export_state_names()["draft"]
+            == ("slidingKeyCache", "slidingValueCache")
+        )
+        assert m.export_state_classification() == {
+            "slidingKeyCache": "sliding_kv_cache",
+            "slidingValueCache": "sliding_kv_cache",
+        }
+
+    def test_graph_wrapper_shapes(self):
+        cfg = _make_small_config()
+        m = MuseGlimmerDFlashDrafterForCausalLM(cfg)
+        m.eval()
+
+        q, K = 5, cfg.block_size
+
+        sk = torch.zeros(
+            cfg.num_hidden_layers,
+            1,
+            cfg.num_key_value_heads,
+            cfg.sliding_window,
+            cfg.head_dim,
+        )
+        sv = torch.zeros_like(sk)
+
+        # inject_kv_graph: offset 0 (position_ids length == features length).
+        features = torch.randn(1, q, cfg.hidden_size)
+        inject_pos = torch.arange(q).unsqueeze(0)
+        with torch.no_grad():
+            out = m.inject_kv_graph(features, inject_pos, sk, sv)
+        assert out == ()
+        assert sk[0, 0, 0, 0, :].norm().item() > 0, "inject_kv_graph must populate the ring cache"
+
+        # draft_graph reads the SAME (shared) buffer and appends at offset == q.
+        draft_ids = torch.tensor([[42] + [cfg.mask_token_id] * (K - 1)])
+        full_pos = torch.arange(q + K).unsqueeze(0)
+        with torch.no_grad():
+            logits = m.draft_graph(draft_ids, full_pos, sk, sv)
+        assert logits.shape == (1, K, cfg.vocab_size)
+
+    def test_torch_export_traces_both_graphs(self):
+        """Guard the shape-derived inject offset (no ``.item()``) actually traces.
+
+        The inject offset is ``seq_len - n_features`` (a shape arithmetic), not
+        ``int(position_ids[0, 0])``. If it regressed to reading a value out of the
+        tensor, the trace would emit a data-dependent ``aten._local_scalar_dense``
+        (``.item()``) node, so we assert the inject_kv graph carries none.
+        """
+        cfg, m, spec = self._model_and_spec()
+        ref = m.build_reference_inputs(cfg, torch.float32, spec)
+        dyn = m.build_dynamic_shapes(cfg, spec)
+
+        inject_ep = _export_graph(_InjectKVGraphModule(m), ref["inject_kv"], dyn["inject_kv"])
+        draft_ep = _export_graph(_DraftGraphModule(m), ref["draft"], dyn["draft"])
+
+        assert isinstance(inject_ep, torch.export.ExportedProgram)
+        assert isinstance(draft_ep, torch.export.ExportedProgram)
+
+        # A shape-derived offset must NOT lower to a data-dependent .item() read.
+        data_dependent = {
+            torch.ops.aten._local_scalar_dense.default,
+            torch.ops.aten.item.default,
+        }
+        offending = [
+            node
+            for node in inject_ep.graph_module.graph.nodes
+            if node.op == "call_function" and node.target in data_dependent
+        ]
+        assert not offending, (
+            f"inject_kv graph must derive the offset from shapes, not .item(); "
+            f"found data-dependent nodes: {[n.target for n in offending]}"
         )
 
 

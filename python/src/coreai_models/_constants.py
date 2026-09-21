@@ -18,6 +18,12 @@ MAIN_GRAPH_NAME = "main"
 # in via `BaseForCausalLM.exports_prefill_graph`; the Swift runner uses it when present.
 PREFILL_GRAPH_NAME = "prefill"
 
+# The two macOS CoreML entrypoints of the DFlash drafter. They share one ring-KV
+# state (slidingKeyCache / slidingValueCache): `inject_kv` writes the target
+# features into the ring cache, `draft` reads them back and produces draft logits.
+INJECT_KV_GRAPH_NAME = "inject_kv"
+DRAFT_GRAPH_NAME = "draft"
+
 # KV cache names used by the Swift runner
 KEY_CACHE_NAME = "keyCache"
 VALUE_CACHE_NAME = "valueCache"

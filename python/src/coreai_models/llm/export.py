@@ -182,6 +182,24 @@ def build_parser() -> argparse.ArgumentParser:
             "The drafter is looked up from the model registry; not all models have one."
         ),
     )
+    parser.add_argument(
+        "--dflash-drafter",
+        action="store_true",
+        help=(
+            "macOS only. Export the DFlash two-phase drafter (inject_kv + draft) "
+            "alongside the target for speculative decoding. Mutually exclusive with "
+            "the plain --with-drafter ring drafter; not all models have a DFlash drafter."
+        ),
+    )
+    parser.add_argument(
+        "--fused-target",
+        action="store_true",
+        help=(
+            "macOS only. Export the 2-output fused target that emits both logits and "
+            "drafter_features in a single model, for speculative decoding. Complementary "
+            "to --with-drafter/--dflash-drafter; not all models have a fused target."
+        ),
+    )
     return parser
 
 
@@ -401,6 +419,8 @@ def _resolve_export_config(args: argparse.Namespace) -> ExportConfig:
         include_debug_info=args.include_debug_info,
         model_type_override=getattr(preset, "_model_type_override", None) if preset else None,
         with_drafter=args.with_drafter,
+        dflash_drafter=args.dflash_drafter,
+        fused_target=args.fused_target,
     )
 
 
@@ -475,6 +495,10 @@ def main() -> None:
         print(f"  include_debug_info: {config.include_debug_info}")
         if config.with_drafter:
             print("  with_drafter:       True")
+        if config.dflash_drafter:
+            print("  dflash_drafter:     True")
+        if config.fused_target:
+            print("  fused_target:       True")
         if config.variant == "iOS":
             print(f"  disable_embedding_quantization: {config.disable_embedding_quantization}")
         return

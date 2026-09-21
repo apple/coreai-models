@@ -328,7 +328,10 @@ class BaseForCausalLM(torch.nn.Module):
         """Decorator to cast torch.bfloat16 logits outputs to float16.
 
         This decorator checks if the output of a forward function is torch.bfloat16
-        and casts it to float16 if needed.
+        and casts it to float16 if needed. It also recurses into tuple/list returns,
+        casting each bfloat16 tensor element independently (e.g. a fused target's
+        ``(logits, drafter_features)``); an empty ``()`` prefill return and any
+        non-tensor leaf pass through untouched.
 
         The casting behavior can be disabled by setting the environment variable
         DISABLE_BFLOAT16_CAST_FOR_LOGITS to "1" or "true" (case-insensitive).
@@ -337,8 +340,23 @@ class BaseForCausalLM(torch.nn.Module):
             forward_fn: The forward function to wrap
 
         Returns:
-            Wrapped function that casts bfloat16 outputs to float16
+            Wrapped function that casts bfloat16 outputs (bare or in a tuple/list) to
+            float16
         """
+
+        def _cast_bf16_to_fp16(value: Any) -> Any:
+            """Cast bf16 tensors to fp16, recursing through tuple/list containers.
+
+            A bare-Tensor return (the common case) is cast directly. A fused
+            target returns ``(logits, drafter_features)``; each tensor element is
+            cast independently. The empty ``()`` a prefill forward returns, and
+            any non-tensor leaf, passes through untouched.
+            """
+            if isinstance(value, torch.Tensor):
+                return value.to(torch.float16) if value.dtype == torch.bfloat16 else value
+            if isinstance(value, (tuple, list)):
+                return type(value)(_cast_bf16_to_fp16(v) for v in value)
+            return value
 
         @wraps(forward_fn)
         def wrapper(*args, **kwargs):
@@ -347,14 +365,9 @@ class BaseForCausalLM(torch.nn.Module):
                 "1",
                 "true",
             )
-
-            if (
-                not disable_cast
-                and isinstance(output, torch.Tensor)
-                and output.dtype == torch.bfloat16
-            ):
-                return output.to(torch.float16)
-            return output
+            if disable_cast:
+                return output
+            return _cast_bf16_to_fp16(output)
 
         return wrapper
 
