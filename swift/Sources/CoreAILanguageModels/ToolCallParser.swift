@@ -26,6 +26,8 @@ public struct ToolCallParser: Sendable {
     public enum Format: Sendable {
         case json
         case atem
+        /// Qwen3-Coder style: `<function=NAME><parameter=K>V</parameter>…</function>` inside the markers.
+        case xmlFunction
     }
 
     private let openMarker: String
@@ -103,6 +105,8 @@ public struct ToolCallParser: Sendable {
             return parseJSONToolCalls(from: content)
         case .atem:
             return parseATEMToolCalls(from: content)
+        case .xmlFunction:
+            return parseXMLFunctionToolCalls(from: content)
         }
     }
 
@@ -121,6 +125,12 @@ public struct ToolCallParser: Sendable {
 
         if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             return makeJSONToolCallEvent(from: obj).map { [$0] } ?? []
+        }
+
+        // Qwen3-Coder shares Qwen3's `<tool_call>` markers (so it is detected as `.json`) but emits
+        // an XML `<function=…>` body. Fall back to XML parsing rather than dropping the call.
+        if trimmed.contains("<function=") {
+            return parseXMLFunctionToolCalls(from: trimmed)
         }
 
         return []
@@ -202,6 +212,54 @@ public struct ToolCallParser: Sendable {
         if let doubleVal = Double(trimmed), trimmed.contains(".") { return doubleVal }
         return trimmed
     }
+
+    // MARK: - XML Function Format (Qwen3-Coder)
+
+    /// Parse `<function=NAME><parameter=K>V</parameter>…</function>` blocks (Qwen3-Coder).
+    /// Parameter values are kept as strings, matching the model's on-the-wire form.
+    private func parseXMLFunctionToolCalls(from xml: String) -> [Event] {
+        let fnPattern = "<function=([^>]+)>(.*?)</function>"
+        guard let fnRegex = try? NSRegularExpression(pattern: fnPattern, options: .dotMatchesLineSeparators)
+        else { return [] }
+
+        let nsString = xml as NSString
+        let matches = fnRegex.matches(in: xml, range: NSRange(location: 0, length: nsString.length))
+
+        return matches.compactMap { match -> Event? in
+            guard match.numberOfRanges >= 3 else { return nil }
+            let name = nsString.substring(with: match.range(at: 1)).trimmingCharacters(in: .whitespacesAndNewlines)
+            let body = nsString.substring(with: match.range(at: 2))
+            let argsJSON = jsonString(from: parseXMLFunctionParameters(from: body))
+            let callId = "call_\(UUID().uuidString.prefix(8).lowercased())"
+            return .toolCall(id: callId, name: name, argsJSON: argsJSON)
+        }
+    }
+
+    private func parseXMLFunctionParameters(from body: String) -> [String: String] {
+        let paramPattern = "<parameter=([^>]+)>(.*?)</parameter>"
+        guard let paramRegex = try? NSRegularExpression(pattern: paramPattern, options: .dotMatchesLineSeparators)
+        else { return [:] }
+
+        let nsBody = body as NSString
+        let matches = paramRegex.matches(in: body, range: NSRange(location: 0, length: nsBody.length))
+
+        var result: [String: String] = [:]
+        for match in matches where match.numberOfRanges >= 3 {
+            let key = nsBody.substring(with: match.range(at: 1)).trimmingCharacters(in: .whitespacesAndNewlines)
+            let value = nsBody.substring(with: match.range(at: 2)).trimmingCharacters(in: .whitespacesAndNewlines)
+            result[key] = value
+        }
+        return result
+    }
+
+    /// Deterministic JSON object string (sorted keys) from string-valued args.
+    private func jsonString(from dict: [String: String]) -> String {
+        guard !dict.isEmpty,
+            let data = try? JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys]),
+            let str = String(data: data, encoding: .utf8)
+        else { return "{}" }
+        return str
+    }
 }
 
 // MARK: - Tool Call Marker Detection
@@ -241,6 +299,7 @@ public func detectToolCallFormat(using tokenizer: any Tokenizer) -> ToolCallDete
 
     let tagPairs: [(open: String, close: String)] = [
         ("<tool_call>", "</tool_call>"),
+        ("<|tool_call|>", "<|/tool_call|>"),
         ("<function_calls>", "</function_calls>"),
     ]
     for pair in tagPairs
