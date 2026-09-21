@@ -65,13 +65,9 @@ public struct CoreAIVisionLanguageModel: LanguageModel {
 
         let tokenizer = try await tokenizerResult
 
-        // Turn-end tokens the model stops on beyond the main EOS (e.g. Gemma's
-        // <end_of_turn>, Phi's <|end|>), resolved once at load like the text server does.
-        var additionalStopTokenIds: [Int32] = []
-        if let tokenizerDir = bundle.tokenizerPath {
-            additionalStopTokenIds = LanguageConfig.additionalStopTokenIds(
-                from: tokenizerDir, tokenizer: tokenizer)
-        }
+        // Turn-end tokens the model stops on beyond the main EOS (e.g. <|im_end|>,
+        // Gemma's <end_of_turn>, Phi's <|end|>), resolved once at load like the text path.
+        let additionalStopTokenIds = StopTokens.additionalIds(bundle: bundle, tokenizer: tokenizer)
 
         self.executorConfiguration = CoreAIVLMExecutor.Configuration(
             bundleURL: url,
@@ -158,8 +154,8 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
         )
 
         let maxTokens = request.generationOptions.maximumResponseTokens ?? 512
-        let stopTokens = Self.stopTokenSet(
-            tokenizer: tokenizer, additionalStopTokenIds: additionalStopTokenIds)
+        let stopTokens = StopTokens.set(
+            tokenizer: tokenizer, additional: additionalStopTokenIds)
 
         let stream = try await engine.generate(
             with: embeddedInput,
@@ -198,26 +194,6 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
                     input: .init(totalTokenCount: promptTokens.count, cachedTokenCount: 0),
                     output: .init(totalTokenCount: generatedCount, reasoningTokenCount: 0)
                 )))
-    }
-
-    // MARK: - Stop Tokens
-
-    /// Builds the set of token IDs that terminate generation: the tokenizer's main EOS,
-    /// `<|im_end|>` when present in the vocab, and any additional turn-end tokens resolved
-    /// at load time (e.g. Gemma's `<end_of_turn>`, Phi's `<|end|>`).
-    ///
-    /// Internal (not private) so tests can exercise the union without a real engine.
-    static func stopTokenSet(
-        tokenizer: any Tokenizer,
-        additionalStopTokenIds: [Int32]
-    ) -> Set<Int32> {
-        var stopTokens = Set<Int32>()
-        if let eos = tokenizer.eosTokenId { stopTokens.insert(Int32(eos)) }
-        if let imEnd = tokenizer.vocabContains("<|im_end|>") ? tokenizer.convertTokenToId("<|im_end|>") : nil {
-            stopTokens.insert(Int32(imEnd))
-        }
-        stopTokens.formUnion(additionalStopTokenIds)
-        return stopTokens
     }
 
     // MARK: - Prompt Construction

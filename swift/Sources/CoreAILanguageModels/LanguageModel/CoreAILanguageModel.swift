@@ -163,23 +163,13 @@ public struct CoreAILanguageModel: LanguageModel {
             }
         }()
         self.resources = resources
-        // Read additional stop token IDs from tokenizer_config.json (e.g. Gemma's
-        // <end_of_turn>). Empty when the bundle has no tokenizer directory.
-        var extraEos: [Int32] = []
-        if let tokenizerDir = bundle.tokenizerPath {
-            extraEos = LanguageConfig.additionalStopTokenIds(
-                from: tokenizerDir, tokenizer: tokenizer)
-        }
-        // Agentic models: stop on <|eot|> (end of user-facing turn) so the
-        // runner doesn't loop through repeated self→user cycles.
-        if case .agentic(_, _, _, let eot) = thinkingFormat,
-            let eotId = tokenizer.vocabContains(eot) ? tokenizer.convertTokenToId(eot) : nil
-        {
-            if !extraEos.contains(Int32(eotId)) {
-                extraEos.append(Int32(eotId))
-            }
-        }
-        self.additionalEosTokenIds = extraEos
+        // EOS-like token IDs beyond the main EOS (e.g. Gemma's <end_of_turn>,
+        // <|im_end|>, and the agentic <|eot|>), resolved once at load.
+        let agenticEOT: String? = {
+            if case .agentic(_, _, _, let eot) = thinkingFormat { eot } else { nil }
+        }()
+        self.additionalEosTokenIds = StopTokens.additionalIds(
+            bundle: bundle, tokenizer: tokenizer, agenticEOT: agenticEOT)
     }
 
     // MARK: - Resource control
@@ -328,10 +318,9 @@ public struct CoreAILanguageModel: LanguageModel {
             )
 
             // All EOS-like tokens: the tokenizer's main EOS plus any additional
-            // stop tokens from tokenizer_config.json (e.g. Gemma's <end_of_turn>).
-            var eosTokens = Set<Int32>()
-            if let id = tokenizer.eosTokenId { eosTokens.insert(Int32(id)) }
-            eosTokens.formUnion(model.additionalEosTokenIds)
+            // stop tokens resolved at load (e.g. Gemma's <end_of_turn>, <|im_end|>).
+            let eosTokens = StopTokens.set(
+                tokenizer: tokenizer, additional: model.additionalEosTokenIds)
             // Incremental-decode buffer. After a clean emit, one token is
             // retained as context for the next step (see below). During a
             // multi-byte sequence that hasn't decoded cleanly yet, multiple
