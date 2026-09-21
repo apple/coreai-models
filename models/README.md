@@ -243,7 +243,7 @@ uv run coreai.vlm.export qwen3-vl        # text decoder + token embedding + visi
 This produces a single `<name>/` bundle (`kind=vlm`) holding the text
 decoder (`main`), token-embedding lookup (`embedding`), vision encoder
 (`vision`), tokenizer, and `metadata.json`. Pass `--skip-vision` to export the
-text portion only.
+text portion only, or `--vision-only` for the vision encoder alone.
 
 ### Embedding Models
 

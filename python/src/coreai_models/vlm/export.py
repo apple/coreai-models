@@ -17,6 +17,7 @@ Exports a vision-language model to Core AI format as a multi-asset bundle
 Usage:
     uv run coreai.vlm.export qwen3-vl [--max-context-length 4096] [--num-layers N]
     uv run coreai.vlm.export muse-glimmer-vl [--max-context-length 4096]
+    uv run coreai.vlm.export qwen3.5-0.8b --vision-only
     uv run coreai.vlm.export --list-models
 """
 
@@ -52,14 +53,19 @@ class VLMSpec:
     """Per-model export recipe, keyed by registry short-name.
 
     Carries the bits that vary between VL checkpoints: the HF id, the output
-    bundle name, and the vision geometry (resolution, patch/merge sizes, the
-    image placeholder token, and CLIP normalization stats) that drive both the
-    vision-encoder export and the ``vision`` block of ``metadata.json``.
+    bundle name, the reauthored text-decoder class, and the vision geometry
+    (resolution, patch/merge sizes, the image placeholder token, and CLIP
+    normalization stats) that drive both the vision-encoder export and the
+    ``vision`` block of ``metadata.json``.
     """
 
     short_name: str
     hf_model_id: str
     output_name: str
+    #: Reauthored decoder the text bundle is built from, or ``None`` for a
+    #: checkpoint whose decoder has no recipe here — then only the vision
+    #: encoder can be exported.
+    text_decoder_class: type | None
     image_token_id: int
     image_size: int
     patch_size: int
@@ -82,6 +88,7 @@ SUPPORTED_MODELS: dict[str, VLMSpec] = {
         short_name="qwen3-vl",
         hf_model_id="Qwen/Qwen3-VL-2B-Instruct",
         output_name="qwen3_vl_2b",
+        text_decoder_class=Qwen3VLForCausalLMEmbeddings,
         image_token_id=151655,  # <|image_pad|>
         image_size=448,
         patch_size=16,
@@ -97,6 +104,7 @@ SUPPORTED_MODELS: dict[str, VLMSpec] = {
         short_name="muse-glimmer-vl",
         hf_model_id="meta-models/Muse-Glimmer-30B",
         output_name="muse_glimmer_30b_vlm",
+        text_decoder_class=MuseGlimmerForCausalLMEmbeddings,
         image_token_id=200092,
         image_size=448,
         patch_size=14,
@@ -110,6 +118,7 @@ SUPPORTED_MODELS: dict[str, VLMSpec] = {
         short_name="qwen3.5-0.8b",
         hf_model_id="Qwen/Qwen3.5-0.8B",
         output_name="qwen3_5_0p8b",
+        text_decoder_class=None,
         image_token_id=248056,  # <|image_pad|>
         image_size=448,
         patch_size=16,
@@ -327,6 +336,24 @@ async def export_embed_model(
 # ---------------------------------------------------------------------------
 
 
+def _vision_metadata(spec: VLMSpec) -> dict:
+    """The top-level ``vision`` block of metadata.json.
+
+    Consumed by Swift ``VisionConfig``, hence the snake_case keys.
+    """
+    return {
+        "image_size": spec.image_size,
+        "patch_size": spec.patch_size,
+        "image_token_count": spec.num_visual_tokens,
+        "image_token_id": spec.image_token_id,
+        "image_mean": list(spec.image_mean),
+        "image_std": list(spec.image_std),
+        "rescale_factor": spec.rescale_factor,
+        "image_strategy": spec.image_strategy,
+        "include_image_info": spec.include_image_info,
+    }
+
+
 async def export_text_bundle(
     spec: VLMSpec,
     *,
@@ -342,7 +369,17 @@ async def export_text_bundle(
     Produces ``<name>.aimodel`` (decoder), ``embed.aimodel``, ``tokenizer/``, and
     a ``metadata.json`` whose ``assets`` cover ``main``/``embedding``. The
     ``vision`` asset is added later by :func:`export_vision_encoder`.
+
+    Raises ``ValueError`` for a spec without a text decoder, before anything is
+    downloaded or loaded.
     """
+    decoder_class = spec.text_decoder_class
+    if decoder_class is None:
+        raise ValueError(
+            f"'{spec.short_name}' has no text decoder recipe; it supports vision-encoder "
+            f"export only. Run with --vision-only."
+        )
+
     output_name = spec.output_name
 
     # ---- 1. Download weights + load config ----
@@ -367,12 +404,8 @@ async def export_text_bundle(
 
     # ---- 2. Load model directly from safetensors ----
     logging.info("Loading model from safetensors (direct, skips vision encoder)...")
-    if spec.short_name == "muse-glimmer-vl":
-        model_class = MuseGlimmerForCausalLMEmbeddings
-    else:
-        model_class = Qwen3VLForCausalLMEmbeddings
     model = load_model_from_safetensors(
-        model_class=model_class,
+        model_class=decoder_class,
         hf_config=raw_cfg,
         model_dir=model_dir,
         max_ctx=max_ctx,
@@ -480,18 +513,7 @@ async def export_text_bundle(
             "embedded_tokenizer": True,
             "function_map": {"main": ["main"]},
         },
-        # Top-level `vision` block consumed by Swift VisionConfig (snake_case keys).
-        "vision": {
-            "image_size": spec.image_size,
-            "patch_size": spec.patch_size,
-            "image_token_count": spec.num_visual_tokens,
-            "image_token_id": spec.image_token_id,
-            "image_mean": list(spec.image_mean),
-            "image_std": list(spec.image_std),
-            "rescale_factor": spec.rescale_factor,
-            "image_strategy": spec.image_strategy,
-            "include_image_info": spec.include_image_info,
-        },
+        "vision": _vision_metadata(spec),
         "source": {
             "hf_model_id": spec.hf_model_id,
             "model_definition": "torch",
@@ -1062,10 +1084,20 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Output directory for the bundle (default: <repo-root>/exports/)",
     )
-    parser.add_argument(
+    stages = parser.add_mutually_exclusive_group()
+    stages.add_argument(
         "--skip-vision",
         action="store_true",
         help="Export only the text decoder + embedding (skip the vision encoder)",
+    )
+    stages.add_argument(
+        "--vision-only",
+        action="store_true",
+        help="Export only the vision encoder into <output-dir>/<bundle>/, creating "
+        "that bundle and its manifest when they do not exist yet (the route for a "
+        "checkpoint whose text decoder has no export recipe). A bundle created this "
+        "way holds the vision asset alone: no text decoder, embedding or tokenizer, "
+        "so the Swift runner cannot load it by itself",
     )
     parser.add_argument(
         "--num-frames",
@@ -1132,17 +1164,47 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _prepare_vision_only_bundle(spec: VLMSpec, output_dir: Path) -> Path:
+    """Bundle directory for a vision-only export, with a manifest to patch.
+
+    :func:`export_vision_encoder` writes into an existing bundle and updates its
+    ``metadata.json``; a checkpoint exported without its text decoder never gets
+    one from :func:`export_text_bundle`, so seed it from the spec.
+    """
+    bundle_path = output_dir / spec.output_name
+    bundle_path.mkdir(parents=True, exist_ok=True)
+    metadata_path = bundle_path / "metadata.json"
+    if not metadata_path.exists():
+        metadata = {
+            "metadata_version": "0.2",
+            "kind": "vlm",
+            "name": spec.output_name,
+            "assets": {},
+            "vision": _vision_metadata(spec),
+            "source": {
+                "hf_model_id": spec.hf_model_id,
+                "model_definition": "torch",
+            },
+        }
+        with open(metadata_path, "w") as f:
+            json.dump(metadata, f, indent=2)
+    return bundle_path
+
+
 async def _run(spec: VLMSpec, args: argparse.Namespace) -> Path:
     output_dir = Path(args.output_dir) if args.output_dir else _default_output_dir()
-    bundle_path = await export_text_bundle(
-        spec,
-        max_ctx=args.max_context_length,
-        num_layers=args.num_layers,
-        output_dir=output_dir,
-        overwrite=args.overwrite,
-        compression=args.compression,
-        include_debug_info=args.include_debug_info,
-    )
+    if args.vision_only:
+        bundle_path = _prepare_vision_only_bundle(spec, output_dir)
+    else:
+        bundle_path = await export_text_bundle(
+            spec,
+            max_ctx=args.max_context_length,
+            num_layers=args.num_layers,
+            output_dir=output_dir,
+            overwrite=args.overwrite,
+            compression=args.compression,
+            include_debug_info=args.include_debug_info,
+        )
     if not args.skip_vision:
         logging.info("Exporting vision encoder...")
         await export_vision_encoder(
@@ -1182,6 +1244,12 @@ def main() -> None:
         raise SystemExit(
             f"Error: '{args.model}' is not a supported VLM short-name. "
             f"Available: {', '.join(SUPPORTED_MODELS)}. Run --list-models."
+        )
+
+    if spec.text_decoder_class is None and not args.vision_only:
+        raise SystemExit(
+            f"Error: '{args.model}' has no text decoder recipe; it supports vision-encoder "
+            f"export only. Run with --vision-only."
         )
 
     bundle_path = asyncio.run(_run(spec, args))
