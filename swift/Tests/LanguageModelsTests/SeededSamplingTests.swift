@@ -139,4 +139,53 @@ struct SeededSamplingTests {
         let token = config.sampleToken(from: &logits, step: 0)
         #expect(token >= 0 && token < 8)
     }
+
+    // MARK: - fallbackSampler(from:tokenHistory:step:) — the static-shape engine path
+
+    /// The static-shape/ANE engine samples through `fallbackSampler(from:tokenHistory:step:)`.
+    /// Before the fix it always passed `step: 0`, so `seed &+ step` never advanced and every
+    /// token drew the same quantile. With the step threaded through, consecutive steps derive
+    /// distinct generators and do not collapse to a single token on a flat distribution.
+    @Test("Threading step advances the RNG on the tokenHistory sampler")
+    func tokenHistorySamplerAdvancesWithStep() {
+        let config = SamplingConfiguration(temperature: 1.0, seed: 88)
+        let history: [Int32] = []
+        var tokens: Set<Int32> = []
+        for step in 0..<64 {
+            var logits = flatLogits(4)
+            tokens.insert(config.fallbackSampler(from: &logits, tokenHistory: history, step: step))
+        }
+        #expect(tokens.count > 1)
+    }
+
+    /// A frozen step (the pre-fix behavior) collapses to one token — the bug this fix removes.
+    @Test("A frozen step collapses to a single quantile")
+    func frozenStepCollapses() {
+        let config = SamplingConfiguration(temperature: 1.0, seed: 88)
+        let history: [Int32] = []
+        var tokens: Set<Int32> = []
+        for _ in 0..<64 {
+            var logits = flatLogits(4)
+            tokens.insert(config.fallbackSampler(from: &logits, tokenHistory: history, step: 0))
+        }
+        #expect(tokens.count == 1)
+    }
+
+    // MARK: - GPU pipelined engine rejects seeded requests
+
+    /// The GPU pipelined engine samples on-GPU and cannot honor the seed, so it must reject
+    /// seeded requests loudly rather than silently ignoring reproducibility.
+    @Test("Pipelined engine guard throws when a seed is set")
+    func pipelinedGuardThrowsOnSeed() {
+        let seeded = SamplingConfiguration(temperature: 1.0, seed: 7)
+        #expect(throws: InferenceRuntimeError.self) {
+            try CoreAIPipelinedEngine.rejectSeedIfUnsupported(seeded)
+        }
+    }
+
+    @Test("Pipelined engine guard is a no-op without a seed")
+    func pipelinedGuardAllowsUnseeded() throws {
+        let unseeded = SamplingConfiguration(temperature: 1.0)
+        try CoreAIPipelinedEngine.rejectSeedIfUnsupported(unseeded)
+    }
 }
