@@ -174,7 +174,8 @@ def build_parser() -> argparse.ArgumentParser:
             "--platform is macOS."
         ),
     )
-    parser.add_argument(
+    drafter_group = parser.add_mutually_exclusive_group()
+    drafter_group.add_argument(
         "--with-drafter",
         action="store_true",
         help=(
@@ -182,7 +183,7 @@ def build_parser() -> argparse.ArgumentParser:
             "The drafter is looked up from the model registry; not all models have one."
         ),
     )
-    parser.add_argument(
+    drafter_group.add_argument(
         "--dflash-drafter",
         action="store_true",
         help=(
@@ -377,6 +378,12 @@ def _resolve_export_config(args: argparse.Namespace) -> ExportConfig:
 
     if args.quantization_mode == "graph" and variant != "macOS":
         raise SystemExit(f"--quantization-mode graph requires --platform macOS (got '{variant}').")
+
+    if args.dflash_drafter and variant != "macOS":
+        raise SystemExit(f"--dflash-drafter requires --platform macOS (got '{variant}').")
+
+    if args.fused_target and variant != "macOS":
+        raise SystemExit(f"--fused-target requires --platform macOS (got '{variant}').")
 
     if args.compression_config is not None:
         if not args.compression_config.is_file():

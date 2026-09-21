@@ -355,7 +355,10 @@ class BaseForCausalLM(torch.nn.Module):
             if isinstance(value, torch.Tensor):
                 return value.to(torch.float16) if value.dtype == torch.bfloat16 else value
             if isinstance(value, (tuple, list)):
-                return type(value)(_cast_bf16_to_fp16(v) for v in value)
+                # Build via tuple()/list() so namedtuple subclasses, whose
+                # __init__ takes positional fields, don't raise TypeError.
+                elements = (_cast_bf16_to_fp16(v) for v in value)
+                return tuple(elements) if isinstance(value, tuple) else list(elements)
             return value
 
         @wraps(forward_fn)

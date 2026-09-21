@@ -470,11 +470,6 @@ async def _async_export_model(config: ExportConfig) -> str:
             speculative_config = entry.drafter_config
 
         if config.dflash_drafter:
-            if entry.dflash_drafter_class is None or entry.drafter_model_id is None:
-                raise ValueError(
-                    f"Model '{model_type}' does not have a registered DFlash drafter. "
-                    "--dflash-drafter is not supported for this model."
-                )
             drafter_name = f"{output_name}_dflash_drafter"
             logger.info(
                 f"Exporting DFlash drafter from {entry.drafter_model_id} "

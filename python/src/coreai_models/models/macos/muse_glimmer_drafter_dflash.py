@@ -627,4 +627,5 @@ class MuseGlimmerDFlashDrafterForCausalLM(BaseForCausalLM):
             target_dtype=target_dtype,
             mmap_path=mmap_path,
             num_layers=num_layers,
+            **kwargs,
         )
