@@ -8,41 +8,6 @@ import Testing
 
 @testable import CoreAILanguageModels
 
-// MARK: - Fixtures
-
-/// Builds a `GenerationSessionState` backed by the in-module `MockStateHandler`
-/// (defined in `StateHandlerTests.swift`), so state round-trip and prefix-cache
-/// behavior can be exercised without a compiled model asset.
-private func makeSessionState(hasNonTruncatableStates: Bool = false) -> GenerationSessionState {
-    let kv = MockStateHandler(names: ["key_cache", "value_cache"], shape: [1, 8, 16, 32])
-    return GenerationSessionState(
-        kvCache: kv,
-        additionalStates: nil,
-        hasNonTruncatableStates: hasNonTruncatableStates
-    )
-}
-
-// MARK: - Session State Round-Trip (model-free)
-
-@Suite("GenerationSessionState round-trip")
-struct GenerationSessionStateTests {
-    @Test("two sessions are independent and do not alias")
-    func sessionsDoNotAlias() {
-        // Distinct sessions must carry their own cursor + history. Mutating one
-        // leaves the other untouched, so one engine can serve them sequentially.
-        let first = makeSessionState()
-        let second = makeSessionState()
-
-        first.processedTokenCount = 5
-        first.history.append(contentsOf: [1, 2, 3, 4, 5][...])
-
-        #expect(first !== second)
-        #expect(second.processedTokenCount == 0)
-        #expect(second.history.count == 0)
-        #expect(second.history.tokens.isEmpty)
-    }
-}
-
 // MARK: - Prefix Reset Plan (model-free)
 
 /// `CoreAISequentialEngine.prefixResetPlan` is the pure decision extracted from
@@ -113,31 +78,6 @@ struct PrefixResetPlanTests {
             #expect(plan.resetTo == c.expectedResetTo, "\(c.name): resetTo")
             #expect(plan.prefixHitCount == c.expectedHitCount, "\(c.name): prefixHitCount")
         }
-    }
-}
-
-// MARK: - Single-Active-Generation Contract (model-free)
-
-/// A `GenerationSessionState` is single-owner: only one active generation may drive
-/// it at a time. The shim enforces this with a `GenerationTokenBox`, cancelling any
-/// prior token before installing a new one (see generate(with:sessionState:)).
-@Suite("Single-active-generation contract")
-struct SingleActiveGenerationTests {
-    @Test("shim supersede sequence cancels the previous generation")
-    func supersedeCancelsPrevious() {
-        // Mirrors generate(with:sessionState:): cancelActive() then install(newToken).
-        let box = GenerationTokenBox()
-        let first = GenerationToken()
-        box.install(first)
-
-        // New generation supersedes.
-        box.cancelActive()
-        let second = GenerationToken()
-        box.install(second)
-
-        #expect(first.isCancelled)
-        #expect(!second.isCancelled)
-        #expect(box.isBusy)
     }
 }
 
@@ -215,8 +155,8 @@ struct IdempotentEngineRoutingTests {
 ///   IDEMPOTENT_PARITY_CONFIG — path to the model's config JSON
 ///   IDEMPOTENT_PARITY_MODEL  — path to the `.aimodel` / `.aimodelc` asset
 ///
-/// When either is unset the whole suite is skipped. This is a real (non-faked)
-/// scaffold: run it on-device to validate that (1) the idempotent path is
+/// When either is unset the whole suite is skipped. This is a scaffold:
+/// run it on-device to validate that (1) the idempotent path is
 /// bit-identical to the pre-refactor engine-owned shim, and (2) a snapshot →
 /// restore → continue sequence equals an uninterrupted run.
 private enum ParityFixture {

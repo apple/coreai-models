@@ -469,6 +469,9 @@ extension CoreAISequentialEngine {
         // For hybrid models with recurrent states, we must full-reset on any
         // rewind because recurrent state summarizes the whole prefix and cannot
         // be truncated by moving a KV cursor. Future: checkpoint/restore.
+        // Default to 0 so a fresh session (no history) always reports a clean
+        // value instead of leaking the previous session's hit count.
+        lastPrefixHitCount = 0
         if sessionState.history.count > 0 {
             let (commonPrefix, _) = sessionState.history.resolve(input: input)
             let plan = Self.prefixResetPlan(
