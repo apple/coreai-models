@@ -65,8 +65,6 @@ public struct CoreAIVisionLanguageModel: LanguageModel {
 
         let tokenizer = try await tokenizerResult
 
-        // Turn-end tokens the model stops on beyond the main EOS (e.g. <|im_end|>,
-        // Gemma's <end_of_turn>, Phi's <|end|>), resolved once at load like the text path.
         let additionalStopTokenIds = StopTokens.additionalIds(bundle: bundle, tokenizer: tokenizer)
 
         self.executorConfiguration = CoreAIVLMExecutor.Configuration(

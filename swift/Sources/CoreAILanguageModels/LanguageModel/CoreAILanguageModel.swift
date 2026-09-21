@@ -163,8 +163,6 @@ public struct CoreAILanguageModel: LanguageModel {
             }
         }()
         self.resources = resources
-        // EOS-like token IDs beyond the main EOS (e.g. Gemma's <end_of_turn>,
-        // <|im_end|>, and the agentic <|eot|>), resolved once at load.
         let agenticEOT: String? = {
             if case .agentic(_, _, _, let eot) = thinkingFormat { eot } else { nil }
         }()
@@ -317,8 +315,6 @@ public struct CoreAILanguageModel: LanguageModel {
                 inferenceOptions: InferenceOptions(maxTokens: maxTokens)
             )
 
-            // All EOS-like tokens: the tokenizer's main EOS plus any additional
-            // stop tokens resolved at load (e.g. Gemma's <end_of_turn>, <|im_end|>).
             let eosTokens = StopTokens.set(
                 tokenizer: tokenizer, additional: model.additionalEosTokenIds)
             // Incremental-decode buffer. After a clean emit, one token is

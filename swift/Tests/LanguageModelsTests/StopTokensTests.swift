@@ -85,18 +85,18 @@ struct StopTokensAdditionalIdsTests {
         let tokenizerDir = dir.appending(path: "tokenizer")
         try FileManager.default.createDirectory(at: tokenizerDir, withIntermediateDirectories: true)
         try """
-            {
-              "metadata_version": "0.2",
-              "kind": "llm",
-              "name": "stop-tokens-fixture",
-              "assets": { "main": "model.aimodel" },
-              "language": {
-                "tokenizer": "x/y",
-                "vocab_size": 100,
-                "max_context_length": 512
-              }
-            }
-            """.write(to: dir.appending(path: "metadata.json"), atomically: true, encoding: .utf8)
+        {
+          "metadata_version": "0.2",
+          "kind": "llm",
+          "name": "stop-tokens-fixture",
+          "assets": { "main": "model.aimodel" },
+          "language": {
+            "tokenizer": "x/y",
+            "vocab_size": 100,
+            "max_context_length": 512
+          }
+        }
+        """.write(to: dir.appending(path: "metadata.json"), atomically: true, encoding: .utf8)
         try config.write(
             to: tokenizerDir.appending(path: "tokenizer_config.json"),
             atomically: true, encoding: .utf8)
