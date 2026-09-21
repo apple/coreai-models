@@ -45,11 +45,9 @@ def bundle_llm_asset(
         speculative_config: Runtime config for speculative decoding (e.g.
             ``{"num_draft_tokens": 5, "shared_embeddings": True}``).
             Written as the ``"speculative"`` key in metadata.json.
-        drafter_config: The drafter model's own config. When supplied (the
-            DFlash path), the speculative structural metadata is sourced
-            EXPLICITLY from it and validated against *hf_config* (the target)
-            so a drafter/target divergence fails loudly at export time rather
-            than silently shipping wrong metadata.
+        drafter_config: The drafter model's own config. On the DFlash path,
+            speculative structural metadata is read from it and validated
+            against *hf_config* (the target); a divergence raises at export.
     """
     tok_id = tokenizer_model_id or hf_model_id
     _write_tokenizer(bundle_path / "tokenizer", tok_id)
@@ -118,12 +116,9 @@ def _write_metadata(
     logger.info(f"Wrote metadata to {metadata_path}")
 
 
-# Structural params that MUST agree between the drafter and its target because the
-# drafter borrows the target's shared embed_tokens / lm_head and is driven by the
-# target's hidden-state features. A divergence here is a build error, not a runtime
-# surprise: e.g. the drafter checkpoint declaring vocab_size 262144 against a target
-# of 202048 previously crashed the standalone drafter. Layer count is deliberately
-# NOT here — the drafter is intentionally shallower than the target.
+# Params that must match the target: the drafter shares its embed_tokens/lm_head
+# and consumes its hidden states. A vocab_size mismatch (262144 vs 202048) crashed
+# the standalone drafter. Layer count is excluded — the drafter is intentionally shallower.
 _DRAFTER_TARGET_SHARED_PARAMS = (
     "vocab_size",
     "hidden_size",
@@ -134,13 +129,10 @@ _DRAFTER_TARGET_SHARED_PARAMS = (
 
 
 def _validate_drafter_target_geometry(target_config: Any, drafter_config: Any) -> None:
-    """Fail loudly if the drafter and target diverge on shared structural params.
+    """Raise ValueError if the drafter and target diverge on a shared structural param.
 
-    The DFlash drafter shares the target's embeddings/lm_head and consumes the
-    target's ``drafter_features``; the params in ``_DRAFTER_TARGET_SHARED_PARAMS``
-    must therefore match exactly. Raises ``ValueError`` naming every divergent
-    field and both values, rather than silently emitting metadata sourced from the
-    wrong model.
+    Params in ``_DRAFTER_TARGET_SHARED_PARAMS`` must match; the error names each
+    divergent field with both values.
     """
     mismatches: list[str] = []
     for param in _DRAFTER_TARGET_SHARED_PARAMS:
@@ -155,12 +147,8 @@ def _validate_drafter_target_geometry(target_config: Any, drafter_config: Any) -
 
     if mismatches:
         raise ValueError(
-            "DFlash drafter/target structural divergence detected while writing "
-            "speculative metadata — the drafter shares the target's embeddings and "
-            "feature space, so these MUST match:\n  "
-            + "\n  ".join(mismatches)
-            + "\nRefusing to emit metadata that would silently mispair the drafter "
-            "with the target (recall the 262144-vs-202048 vocab_size crash)."
+            "DFlash drafter/target structural mismatch (shared embeddings and "
+            "feature space require these to match):\n  " + "\n  ".join(mismatches)
         )
 
 
@@ -172,21 +160,13 @@ def _speculative_metadata(
     """Merge runtime knobs with DFlash structural constants.
 
     Structural keys (``block_size``, ``mask_token_id``, ``target_layer_ids``,
-    ``drafter_hidden_size``) describe the drafter, so they are sourced from
-    *drafter_config* when it is supplied (the DFlash path) — an EXPLICIT source of
-    truth — and only fall back to *hf_config* (the target) when no drafter config is
-    given (the legacy ring-drafter path). ``runtime_knobs`` (``num_draft_tokens``,
-    ``shared_embeddings``, ``drafter_kind``) are export-time decisions and win on
-    conflict. The config attr is ``draft_mask_token_id`` (the HF-reserved
-    ``mask_token_id`` is avoided), but it is emitted under the metadata key
-    ``mask_token_id`` the runtime reads.
-
-    When *drafter_config* is supplied it is first validated against *hf_config* via
-    :func:`_validate_drafter_target_geometry`, so a drafter/target divergence fails
-    loudly here rather than shipping wrong metadata.
+    ``drafter_hidden_size``) come from *drafter_config* on the DFlash path, falling
+    back to *hf_config* for the legacy ring drafter. ``runtime_knobs`` override on
+    conflict. The config attr ``draft_mask_token_id`` is emitted under the metadata
+    key ``mask_token_id`` that the runtime reads. When *drafter_config* is given it
+    is validated against *hf_config* first (see :func:`_validate_drafter_target_geometry`).
     """
-    # The drafter's config is the explicit source of truth for its own structural
-    # constants; fall back to the target config for the legacy ring path.
+    # Structural constants come from the drafter; fall back to target for the ring path.
     if drafter_config is not None:
         _validate_drafter_target_geometry(hf_config, drafter_config)
         structural_source = drafter_config
