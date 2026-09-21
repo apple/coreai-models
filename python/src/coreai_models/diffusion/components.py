@@ -33,6 +33,7 @@ from coreai_models.diffusion.flux2 import (
     dummy_flux2_transformer_img2img_full,
     dummy_flux2_transformer_img2img_half,
     dummy_flux2_transformer_img2img_quarter,
+    dummy_flux2_transformer_quant_trace,
     dummy_flux2_vae_decoder,
     dummy_flux2_vae_decoder_half,
     dummy_flux2_vae_encoder,
@@ -208,6 +209,12 @@ class ComponentSpec:
     dummy_fn: Callable
     quantizable: bool = False
     dynamic_shapes_fn: Callable | None = None
+    quant_target_fn: Callable | None = None
+    quant_dummy_fn: Callable | None = None
+
+    def quant_trace_fn(self) -> Callable:
+        """The factory for the quantizer's trace inputs."""
+        return self.quant_dummy_fn or self.dummy_fn
 
 
 @dataclass(frozen=True)
@@ -233,6 +240,15 @@ class MultiFunctionComponentSpec:
     wrapper_fn: Callable
     functions: tuple[FunctionVariant, ...]
     quantizable: bool = True
+    quant_target_fn: Callable | None = None
+    quant_dummy_fn: Callable | None = None
+
+    def quant_trace_fn(self) -> Callable:
+        """The factory for the quantizer's trace inputs.
+
+        Weights are shared, so just grab the first one.
+        """
+        return self.quant_dummy_fn or self.functions[0].dummy_fn
 
 
 # ---------------------------------------------------------------------------
@@ -344,6 +360,8 @@ FLUX2_COMPONENTS: dict[str, ComponentSpec] = {
         ),
         output_names=("output",),
         wrapper_fn=lambda p: Flux2TransformerWrapper(p.transformer),
+        quant_target_fn=lambda p: p.transformer,
+        quant_dummy_fn=dummy_flux2_transformer_quant_trace,
         dummy_fn=dummy_flux2_transformer,
         quantizable=True,
     ),
@@ -359,6 +377,8 @@ FLUX2_COMPONENTS: dict[str, ComponentSpec] = {
         ),
         output_names=("output",),
         wrapper_fn=lambda p: Flux2TransformerWrapper(p.transformer),
+        quant_target_fn=lambda p: p.transformer,
+        quant_dummy_fn=dummy_flux2_transformer_quant_trace,
         dummy_fn=dummy_flux2_transformer_img2img_full,
         quantizable=True,
     ),
@@ -374,6 +394,8 @@ FLUX2_COMPONENTS: dict[str, ComponentSpec] = {
         ),
         output_names=("output",),
         wrapper_fn=lambda p: Flux2TransformerWrapper(p.transformer),
+        quant_target_fn=lambda p: p.transformer,
+        quant_dummy_fn=dummy_flux2_transformer_quant_trace,
         dummy_fn=dummy_flux2_transformer_img2img_half,
         quantizable=True,
     ),
@@ -389,6 +411,8 @@ FLUX2_COMPONENTS: dict[str, ComponentSpec] = {
         ),
         output_names=("output",),
         wrapper_fn=lambda p: Flux2TransformerWrapper(p.transformer),
+        quant_target_fn=lambda p: p.transformer,
+        quant_dummy_fn=dummy_flux2_transformer_quant_trace,
         dummy_fn=dummy_flux2_transformer_img2img_quarter,
         quantizable=True,
     ),
@@ -404,6 +428,8 @@ FLUX2_COMPONENTS: dict[str, ComponentSpec] = {
         ),
         output_names=("output",),
         wrapper_fn=lambda p: Flux2TransformerWrapper(p.transformer),
+        quant_target_fn=lambda p: p.transformer,
+        quant_dummy_fn=dummy_flux2_transformer_quant_trace,
         dummy_fn=dummy_flux2_transformer_512,
         quantizable=True,
     ),
@@ -419,6 +445,8 @@ FLUX2_COMPONENTS: dict[str, ComponentSpec] = {
         ),
         output_names=("output",),
         wrapper_fn=lambda p: Flux2TransformerWrapper(p.transformer),
+        quant_target_fn=lambda p: p.transformer,
+        quant_dummy_fn=dummy_flux2_transformer_quant_trace,
         dummy_fn=dummy_flux2_transformer_img2img_512_full,
         quantizable=True,
     ),
@@ -434,6 +462,8 @@ FLUX2_COMPONENTS: dict[str, ComponentSpec] = {
         ),
         output_names=("output",),
         wrapper_fn=lambda p: Flux2TransformerWrapper(p.transformer),
+        quant_target_fn=lambda p: p.transformer,
+        quant_dummy_fn=dummy_flux2_transformer_quant_trace,
         dummy_fn=dummy_flux2_transformer_img2img_512_half,
         quantizable=True,
     ),
@@ -449,6 +479,8 @@ FLUX2_COMPONENTS: dict[str, ComponentSpec] = {
         ),
         output_names=("output",),
         wrapper_fn=lambda p: Flux2TransformerWrapper(p.transformer),
+        quant_target_fn=lambda p: p.transformer,
+        quant_dummy_fn=dummy_flux2_transformer_quant_trace,
         dummy_fn=dummy_flux2_transformer_img2img_512_quarter,
         quantizable=True,
     ),
@@ -459,6 +491,7 @@ FLUX2_COMPONENTS: dict[str, ComponentSpec] = {
         wrapper_fn=lambda p: Flux2TextEncoderWrapper(p.text_encoder),
         dummy_fn=dummy_flux2_text_encoder,
         quantizable=True,
+        quant_target_fn=lambda p: p.text_encoder,
     ),
     "vae_decoder": ComponentSpec(
         asset_name="VAEDecoder",
@@ -508,6 +541,8 @@ FLUX2_MULTIFUNCTION_TRANSFORMER = MultiFunctionComponentSpec(
     input_names=_FLUX2_TRANSFORMER_INPUT_NAMES,
     output_names=("output",),
     wrapper_fn=lambda p: Flux2TransformerWrapper(p.transformer),
+    quant_target_fn=lambda p: p.transformer,
+    quant_dummy_fn=dummy_flux2_transformer_quant_trace,
     functions=(
         FunctionVariant("main", dummy_flux2_transformer),
         FunctionVariant("half", dummy_flux2_transformer_512),

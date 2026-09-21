@@ -7,8 +7,12 @@
 Compression presets for diffusion model export.
 
 Each preset is a named configuration consumed by the diffusion export pipeline.
-The only knob is post-export MLIR weight quantization (applied to quantizable
-components — text encoder and transformer). The VAE decoder is never quantized.
+Presets describe weight quantization applied to quantizable components (text
+encoder and transformer). The VAE decoder is never quantized.
+
+Configs are coreai-opt ``quantization_config`` dicts, applied to the PyTorch module
+before torch export. Pipelines still on the post-export MLIR path read the same dicts
+through a small adapter in ``coreai_models.export.compiler``.
 
 Usage::
 
@@ -22,6 +26,36 @@ from typing import Any
 
 DEFAULT_COMPRESSION_PRESET = "none"
 
+# `Qwen3RMSNorm.forward` is `self.weight * hidden_states`, and `torch.mul` is a
+# registered eager op, so the global `weight` spec matches its rank-1 parameter and
+# per_block(axis=1) raises a plain ValueError during prepare(). coreai-opt reserves its
+# automatic skip for block-size mismatches, so this exclusion covers the case instead.
+#
+# Only the text encoder needs an entry here. The FLUX.2 DiT uses `torch.nn.RMSNorm`,
+# which reaches `F.rms_norm` and stays outside the registered op set, and its LayerNorms
+# run without affine parameters.
+_MODULE_TYPE_EXCLUSIONS: dict[str, Any] = {
+    "transformers.models.qwen3.modeling_qwen3.Qwen3RMSNorm": None,
+}
+
+# Weight-only, so the input and output specs stay None.
+_WEIGHT_ONLY = {"op_input_spec": None, "op_output_spec": None}
+
+# `symmetric_with_clipping` gives int4 the range [-7, 7]
+_INT4_PER_BLOCK32 = {
+    "dtype": "int4",
+    "qscheme": "symmetric_with_clipping",
+    "granularity": {"type": "per_block", "block_size": 32, "axis": 1},
+}
+_INT4_PER_BLOCK32_ASYM = {**_INT4_PER_BLOCK32, "qscheme": "asymmetric"}
+
+# per_channel means per output channel, which is axis 0.
+_INT8_PER_CHANNEL = {
+    "dtype": "int8",
+    "qscheme": "symmetric_with_clipping",
+    "granularity": {"type": "per_channel", "axis": 0},
+}
+
 PRESETS: dict[str, dict[str, Any]] = {
     "none": {
         "description": "Full precision (no quantization)",
@@ -30,27 +64,25 @@ PRESETS: dict[str, dict[str, Any]] = {
     "4bit": {
         "description": "INT4 symmetric per-block (block_size=32)",
         "config": {
-            "type": "int4",
-            "symmetric": True,
-            "granularity": "per_block",
-            "block_size": 32,
+            "execution_mode": "eager",
+            "global_config": {"op_state_spec": {"weight": _INT4_PER_BLOCK32}, **_WEIGHT_ONLY},
+            "module_type_configs": _MODULE_TYPE_EXCLUSIONS,
         },
     },
     "4bit-asym": {
         "description": "INT4 asymmetric per-block (block_size=32)",
         "config": {
-            "type": "int4",
-            "symmetric": False,
-            "granularity": "per_block",
-            "block_size": 32,
+            "execution_mode": "eager",
+            "global_config": {"op_state_spec": {"weight": _INT4_PER_BLOCK32_ASYM}, **_WEIGHT_ONLY},
+            "module_type_configs": _MODULE_TYPE_EXCLUSIONS,
         },
     },
     "8bit": {
         "description": "INT8 per-channel, symmetric",
         "config": {
-            "type": "int8",
-            "symmetric": True,
-            "granularity": "per_channel",
+            "execution_mode": "eager",
+            "global_config": {"op_state_spec": {"weight": _INT8_PER_CHANNEL}, **_WEIGHT_ONLY},
+            "module_type_configs": _MODULE_TYPE_EXCLUSIONS,
         },
     },
 }
