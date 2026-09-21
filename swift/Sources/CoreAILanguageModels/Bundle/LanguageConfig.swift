@@ -151,9 +151,10 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
             }
         }
 
-        // 3. Check added_tokens_decoder for turn-ending special tokens
-        //    (e.g. Gemma's <end_of_turn> ID 106, Qwen's <|im_end|>, Phi's <|end|>)
-        //    Only include tokens whose content matches known turn-ending patterns.
+        // 3. Check added_tokens_decoder for turn-ending special tokens, matched
+        //    against the shared pattern list below (covers Gemma's <end_of_turn>,
+        //    Qwen's <|im_end|>, Phi's <|end|>, etc., when present here — not every
+        //    model exposes added_tokens_decoder; see step 5 for the fallback).
         let turnEndPatterns = ["end_of_turn", "im_end", "eot_id", "endoftext", "eot_token", "|eot|", "|end|"]
         if let addedTokens = json["added_tokens_decoder"] as? [String: Any] {
             for (idString, value) in addedTokens {
@@ -186,6 +187,9 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
         //    specials here and drop added_tokens_decoder from
         //    tokenizer_config.json, so this recovers Gemma's <end_of_turn>
         //    (ID 106) and Phi's <|end|> (ID 200020) in exported bundles.
+        //    Only reached if tokenizer_config.json exists and parses (see the
+        //    guard at the top of this function); save_pretrained always emits
+        //    it alongside tokenizer.json in practice.
         let tokenizerURL = tokenizerDir.appending(path: "tokenizer.json")
         if let tokenizerData = try? Data(contentsOf: tokenizerURL),
             let tokenizerJSON = try? JSONSerialization.jsonObject(with: tokenizerData) as? [String: Any],

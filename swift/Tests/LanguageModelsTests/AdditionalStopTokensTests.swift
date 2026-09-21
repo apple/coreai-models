@@ -195,4 +195,29 @@ struct AdditionalStopTokensTests {
                 """)
         #expect(ids.isEmpty)
     }
+
+    @Test("same turn-end ID from added_tokens_decoder and tokenizer.json is deduped")
+    func dedupAcrossBothSources() throws {
+        // <end_of_turn> (106) appears in both added_tokens_decoder and
+        // tokenizer.json's added_tokens; <|im_end|> (4) only in the former.
+        // Result must still be a set: 106 once, plus 4.
+        let ids = try Self.stopIds(
+            config: """
+                {
+                  "eos_token": "<eos>",
+                  "added_tokens_decoder": {
+                    "3": { "content": "<end_of_turn>", "special": true },
+                    "4": { "content": "<|im_end|>", "special": true }
+                  }
+                }
+                """,
+            tokenizerJSON: """
+                {
+                  "added_tokens": [
+                    { "id": 3, "content": "<end_of_turn>", "special": true }
+                  ]
+                }
+                """)
+        #expect(ids == [3, 4])
+    }
 }
