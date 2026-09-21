@@ -76,7 +76,8 @@ func runVLMCompletion(chatRequest: ChatCompletionRequest, state: ServerState) as
     guard let engine = state.multimodalEngine, let visionConfig = state.config.visionConfig else {
         throw ServerError.badRequest("this server is not serving a vision-language model")
     }
-    guard let image = VLMChatSupport.lastImage(in: chatRequest.messages) else {
+    guard let image = try VLMChatSupport.lastImage(in: chatRequest.messages, fileAccess: state.config.fileAccess)
+    else {
         throw ServerError.badRequest(
             "no decodable image found; provide an image_url content part with a base64 data URL or local path")
     }

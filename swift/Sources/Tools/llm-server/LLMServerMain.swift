@@ -90,6 +90,13 @@ struct LLMServer: AsyncParsableCommand {
     )
     var defaultReasoningEffort: String?
 
+    @Option(
+        name: .customLong("file-access"),
+        help:
+            "Local file access for image_url inputs: off (default; only data: and http(s) URLs) or subdirs (read files under the server working directory)"
+    )
+    var fileAccess: FileAccessPolicy = .off
+
     @Flag(
         name: .customLong("clear-coreai-cache"),
         help: "Clear Core AI cached specialization for this model before loading (forces re-specialization)"
@@ -264,7 +271,8 @@ struct LLMServer: AsyncParsableCommand {
             vocabSize: bundle.vocabSize,
             additionalEosTokenIds: additionalEosTokenIds,
             maxQueueDepth: maxQueueDepth,
-            visionConfig: visionConfig
+            visionConfig: visionConfig,
+            fileAccess: fileAccess
         )
 
         let state = ServerState(

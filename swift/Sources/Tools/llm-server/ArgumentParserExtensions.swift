@@ -34,3 +34,20 @@ extension KVCacheStrategy: ExpressibleByArgument {
         .list(allValueStrings)
     }
 }
+
+extension FileAccessPolicy: ExpressibleByArgument {
+    public init?(argument: String) {
+        guard let value = FileAccessPolicy(rawValue: argument.lowercased()) else {
+            return nil
+        }
+        self = value
+    }
+
+    public static var allValueStrings: [String] {
+        FileAccessPolicy.allCases.map(\.rawValue)
+    }
+
+    public static var defaultCompletionKind: CompletionKind {
+        .list(allValueStrings)
+    }
+}

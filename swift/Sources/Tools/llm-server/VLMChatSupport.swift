@@ -10,16 +10,31 @@ import Foundation
 import ImageIO
 import Tokenizers
 
+/// Policy governing local filesystem access for `image_url` content parts.
+///
+/// A client can put an arbitrary path in `image_url` (e.g. `/etc/hosts` or a
+/// `file://` URL). This policy decides whether the server is willing to read it.
+enum FileAccessPolicy: String, Sendable, CaseIterable {
+    /// Reject all local filesystem access (bare paths and `file://` URLs). Only
+    /// `data:` and `http(s)://` image URLs are accepted. This is the default.
+    case off
+    /// Allow local files only when the canonicalized real path resolves inside the
+    /// server's current working directory subtree. Absolute paths outside the CWD,
+    /// `..` traversal, and symlink escapes are rejected.
+    case subdirs
+}
+
 // Image handling and prompt construction for the vision-language chat path.
 enum VLMChatSupport {
     // MARK: - Image decode
 
     /// Decode the last image found in the messages (most recent user turn wins).
-    /// Returns nil if no decodable image is present.
-    static func lastImage(in messages: [ChatMessage]) -> CGImage? {
+    /// Returns nil if no decodable image is present. Throws when a local file
+    /// reference is present but forbidden by `fileAccess`.
+    static func lastImage(in messages: [ChatMessage], fileAccess: FileAccessPolicy) throws -> CGImage? {
         for message in messages.reversed() {
             for urlString in message.content.imageDataURLs.reversed() {
-                if let image = decodeImage(from: urlString) {
+                if let image = try decodeImage(from: urlString, fileAccess: fileAccess) {
                     return image
                 }
             }
@@ -34,18 +49,20 @@ enum VLMChatSupport {
 
     /// Decode an OpenAI `image_url` string into a CGImage.
     ///
-    /// Supported: `data:` URLs (base64 or percent-encoded) and local file paths
-    /// (`file://` or a bare path). Remote `http(s)` URLs are not fetched.
-    static func decodeImage(from urlString: String) -> CGImage? {
+    /// Supported: `data:` URLs (base64 or percent-encoded). Local file references
+    /// (`file://` or a bare path) are gated by `fileAccess`; remote `http(s)` URLs
+    /// are not fetched. Throws `ServerError.badRequest` when a local reference is
+    /// forbidden by the policy.
+    static func decodeImage(from urlString: String, fileAccess: FileAccessPolicy) throws -> CGImage? {
         let data: Data?
         if urlString.hasPrefix("data:") {
             data = decodeDataURL(urlString)
         } else if urlString.hasPrefix("http://") || urlString.hasPrefix("https://") {
             data = nil
-        } else if urlString.hasPrefix("file://"), let url = URL(string: urlString) {
-            data = try? Data(contentsOf: url)
         } else {
-            data = try? Data(contentsOf: URL(fileURLWithPath: urlString))
+            // Local file reference (`file://` URL or bare path): enforce the policy.
+            let fileURL = try resolveLocalFile(urlString, policy: fileAccess)
+            data = try? Data(contentsOf: fileURL)
         }
         guard let data,
             let source = CGImageSourceCreateWithData(data as CFData, nil),
@@ -54,6 +71,48 @@ enum VLMChatSupport {
             return nil
         }
         return image
+    }
+
+    /// Resolve a local filesystem reference (a bare path or a `file://` URL) to a
+    /// URL that the policy permits reading, or throw `ServerError.badRequest`.
+    ///
+    /// Under `.subdirs` the reference is canonicalized (symlinks resolved) and must
+    /// land strictly inside `baseDirectory`'s real path; absolute paths outside the
+    /// tree, `..` traversal, and symlink escapes are rejected.
+    static func resolveLocalFile(
+        _ urlString: String,
+        policy: FileAccessPolicy,
+        baseDirectory: URL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+    ) throws -> URL {
+        let rawPath: String
+        if urlString.hasPrefix("file://") {
+            guard let url = URL(string: urlString), url.isFileURL else {
+                throw ServerError.badRequest("invalid file URL: \(urlString)")
+            }
+            rawPath = url.path
+        } else {
+            rawPath = urlString
+        }
+
+        switch policy {
+        case .off:
+            throw ServerError.badRequest(
+                "local file access is disabled; start the server with --file-access subdirs to read files "
+                    + "under the working directory, or pass the image as a data: URL")
+        case .subdirs:
+            let base = baseDirectory.standardizedFileURL.resolvingSymlinksInPath()
+            let candidate = URL(fileURLWithPath: rawPath, relativeTo: base)
+                .standardizedFileURL.resolvingSymlinksInPath()
+            // Require a real-path prefix on a path boundary (so `/cwdX` cannot pass as
+            // a child of `/cwd`) and forbid the base directory itself.
+            let basePath = base.path
+            let boundary = basePath.hasSuffix("/") ? basePath : basePath + "/"
+            guard candidate.path != basePath, candidate.path.hasPrefix(boundary) else {
+                throw ServerError.badRequest(
+                    "file access denied: \(urlString) resolves outside the server working directory")
+            }
+            return candidate
+        }
     }
 
     /// Parse the payload of a `data:[<mediatype>][;base64],<data>` URL into bytes.

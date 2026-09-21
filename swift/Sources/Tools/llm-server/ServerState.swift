@@ -30,6 +30,8 @@ struct ServerConfig: Sendable {
     let maxQueueDepth: Int
     /// Vision configuration when serving a VLM bundle; nil for text-only models.
     let visionConfig: VisionConfig?
+    /// Policy for reading local files referenced by `image_url` (default: `.off`).
+    let fileAccess: FileAccessPolicy
 }
 
 // MARK: - Server Stats

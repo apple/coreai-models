@@ -405,6 +405,11 @@ struct StreamingOutcome {
 func prepareStreaming(chatRequest: ChatCompletionRequest, state: ServerState, sessionID: String? = nil) async throws
     -> PreparedStream
 {
+    // The streaming path decodes plain text tokens; the multimodal core is non-streaming
+    // only. Reject a stream+image request instead of silently answering without the image.
+    if state.isVLM && VLMChatSupport.hasImage(in: chatRequest.messages) {
+        throw ServerError.badRequest("Streaming is not supported for image (VLM) requests")
+    }
     let requestMaxTokens = chatRequest.maxCompletionTokens ?? chatRequest.maxTokens ?? state.config.defaultMaxTokens
     guard requestMaxTokens > 0 else {
         throw ServerError.badRequest("max_tokens must be positive")
