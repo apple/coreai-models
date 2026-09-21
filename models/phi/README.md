@@ -72,9 +72,13 @@ Perplexity score on the [`WikiText-2`](https://huggingface.co/datasets/EleutherA
 | Phi-3.5-mini     | none (`float16`)                         | 16.00                 | macOS    | 9.98             |
 | Phi-3.5-mini     | [INT4 with FP16 embedding][phi-4bit-yaml]| 4.56\*                | macOS    | 12.04            |
 | Phi-4-mini       | none (`float16`)                         | 16.00                 | macOS    | 11.12            |
-| Phi-4-mini       | [INT4 with FP16 embedding][phi-4bit-yaml]| 4.56\*                | macOS    | 12.80            |
+| Phi-4-mini       | [INT4 with FP16 embedding, INT8 down_proj][phi-4-down-yaml]| ~5.5\*\*   | macOS    | 12.80            |
 
 \* BPW: INT4 body (4.50) + FP16 embedding. Embedding is excluded from quantization
 because Phi-4 ties embedding and lm_head weights — INT4 on lm_head degrades generation quality.
 
+\*\* Phi-4-mini keeps `mlp.down_proj` at INT8 (rest INT4): its INT4 matmul is numerically
+fragile on some Apple GPU families. FP16 embedding as above.
+
 [phi-4bit-yaml]: phi_4bit_embedding_excluded.yaml
+[phi-4-down-yaml]: phi_4bit_down_int8.yaml
