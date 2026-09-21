@@ -48,40 +48,24 @@ public struct CoreAIVisionLanguageModel: LanguageModel {
                 "VLM bundle missing 'vision' config in metadata.json")
         }
 
-        let visionURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.vision)
-        let embedURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.embedding)
-        let mainURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.main)
-
-        let baseConfig = ModelConfig(
-            name: bundle.name,
-            tokenizer: bundle.tokenizer,
-            vocabSize: bundle.vocabSize,
-            maxContextLength: bundle.maxContextLength,
-            serializedModel: [mainURL.path],
-            function: bundle.language.functionMap?.name(for: "main") ?? "main"
-        )
-        let vlmConfig = VLMModelConfig(base: baseConfig, visionConfig: visionConfig)
-
-        // Load the tokenizer and the three model components concurrently.
+        // Load the tokenizer while the factory prepares the engine's components.
         async let tokenizerResult = bundle.loadTokenizer()
-        async let visionModelResult = PreparedModel.prepare(at: visionURL)
-        async let embedModelResult = PreparedModel.prepare(at: embedURL)
-        async let llmModelResult = PreparedModel.prepare(at: mainURL)
 
-        let engine = try await CoreAISequentialVLMEngine(
-            config: vlmConfig,
-            visionModel: try await visionModelResult,
-            embedModel: try await embedModelResult,
-            llmModel: try await llmModelResult,
+        let engine = try await EngineFactory.createEngine(
+            bundle: bundle,
             options: EngineOptions(
                 prefillChunkSize: bundle.language.prefillChunkSize,
                 prefillChunkThreshold: bundle.language.prefillChunkThreshold
             )
         )
+        guard let vlmEngine = engine as? CoreAISequentialVLMEngine else {
+            throw InferenceRuntimeError.invalidArgument(
+                "Expected a vision-language engine for a VLM bundle, got \(type(of: engine))")
+        }
 
         self.executorConfiguration = CoreAIVLMExecutor.Configuration(
             bundleURL: url,
-            engine: engine,
+            engine: vlmEngine,
             tokenizer: try await tokenizerResult,
             visionConfig: visionConfig
         )
