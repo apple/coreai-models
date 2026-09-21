@@ -104,14 +104,34 @@ struct ModelBundleTests {
         #expect(String(describing: error).contains("model.aimodelc"))
     }
 
-    @Test("Pointing at a .aimodel asset throws pointedAtModelAsset")
-    func pointedAtUncompiledAssetThrows() throws {
-        let error = #expect(throws: ModelBundle.BundleError.self) {
-            _ = try ModelBundle(from: "/some/where/model.aimodel")
-        }
-        guard case .pointedAtModelAsset = error else {
-            Issue.record("expected pointedAtModelAsset, got \(String(describing: error))")
-            return
-        }
+    @Test("resolveAssetURL falls back from .aimodel to a compiled .aimodelc")
+    func resolveAssetFallsBackToCompiled() throws {
+        // Mirrors a bundle produced by `coreai-build compile`: metadata.json still
+        // names the .aimodel, but only the compiled .aimodelc exists on disk.
+        let dir = FileManager.default.temporaryDirectory.appending(
+            path: "ModelBundleTests-\(UUID().uuidString)"
+        )
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let compiled = dir.appending(path: "TextEncoder.aimodelc")
+        try FileManager.default.createDirectory(at: compiled, withIntermediateDirectories: true)
+
+        let resolved = ModelBundle.resolveAssetURL("TextEncoder.aimodel", in: dir)
+        #expect(resolved == compiled)
+        #expect(FileManager.default.fileExists(atPath: resolved.path))
+    }
+
+    @Test("resolveAssetURL prefers an existing .aimodel over the compiled variant")
+    func resolveAssetPrefersUncompiled() throws {
+        let dir = FileManager.default.temporaryDirectory.appending(
+            path: "ModelBundleTests-\(UUID().uuidString)"
+        )
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let asset = dir.appending(path: "TextEncoder.aimodel")
+        try FileManager.default.createDirectory(at: asset, withIntermediateDirectories: true)
+
+        let resolved = ModelBundle.resolveAssetURL("TextEncoder.aimodel", in: dir)
+        #expect(resolved == asset)
     }
 }

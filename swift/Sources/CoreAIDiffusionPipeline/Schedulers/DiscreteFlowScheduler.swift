@@ -15,6 +15,11 @@ public final class DiscreteFlowScheduler {
     /// The first scheduled sigma after all shifts are applied — use this for img2img noise addition.
     public var startSigma: Float { sigmas.first ?? 1.0 }
 
+    /// Sigma for the step the NEXT `step(...)` call will consume — i.e. the current
+    /// point on the noise schedule, before advancing. Used to form the denoised x0
+    /// estimate for live previews: `x0 = sample − σ·v`.
+    public var currentSigma: Float { counter < sigmas.count ? sigmas[counter] : 0 }
+
     let trainSteps: Float
     let shift: Float
     let mu: Float?

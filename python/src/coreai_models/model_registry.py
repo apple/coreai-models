@@ -177,7 +177,7 @@ LLM_PRESETS: list[ModelPreset] = [
         "4bit",
         "float16",
         131072,
-        compression_config="models/phi/phi_4bit_embedding_excluded.yaml",
+        compression_config="models/phi/phi_4bit_down_int8.yaml",
     ),
     ModelPreset(
         "phi-3-mini-instruct",

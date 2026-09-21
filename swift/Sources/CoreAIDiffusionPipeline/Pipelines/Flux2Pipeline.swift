@@ -420,14 +420,32 @@ public struct Flux2Pipeline: DiffusionPipeline {
                 }
             }
 
+            // Capture the denoising state BEFORE the scheduler advances so the
+            // preview below can form the x0 estimate.
+            let previewSigma = scheduler.currentSigma
+            let sampleBeforeStep = packedLatents
             packedLatents = scheduler.step(output: output, timeStep: t, sample: packedLatents)
             try checkLatentsAreFinite(packedLatents, step: step)
 
             if let progressHandler {
+                // Preview the DENOISED estimate, not the raw post-step sample. The
+                // sample after the Euler step is still mostly noise until the last
+                // step or two, so on a few-step model (e.g. FLUX.2 Klein at 4 steps)
+                // the early previews look like static. Flow-matching gives the
+                // estimate for one multiply-add: with x_t = (1-σ)·x0 + σ·ε and the
+                // model predicting v = ε - x0, x0 = x_t - σ·v. Blurry on step one,
+                // but it shows the composition and converges to the final image.
+                var previewPacked = sampleBeforeStep
+                if previewSigma > 0 {
+                    var negSigma = -previewSigma
+                    vDSP_vsma(
+                        output, 1, &negSigma, sampleBeforeStep, 1, &previewPacked, 1,
+                        vDSP_Length(output.count))
+                }
                 // Unpack → denorm → unpatchify: [1, 128, 64, 64] → [1, 32, 128, 128]
                 // These are array copies, no model call.
                 let spatial = unpackLatentsSpatialFlatten(
-                    packedLatents, channels: inChannels, height: spatialSide, width: spatialSide)
+                    previewPacked, channels: inChannels, height: spatialSide, width: spatialSide)
                 let denormed = applyBatchNormDenorm(
                     spatial, channels: inChannels, height: spatialSide, width: spatialSide)
                 let unpatchified = Self.unpatchifyLatents(

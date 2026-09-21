@@ -256,6 +256,27 @@ struct SchedulerTests {
         #expect(result.count == 64)
     }
 
+    @Test("DiscreteFlow currentSigma tracks each step and reaches zero after the last")
+    func flowCurrentSigmaProgression() {
+        let stepCount = 5
+        let scheduler = DiscreteFlowScheduler(
+            stepCount: stepCount, trainStepCount: 1000, timeStepShift: 3.0)
+        let sample = [Float](repeating: 1.0, count: 8)
+        let output = [Float](repeating: 0.5, count: 8)
+
+        // Before any step, currentSigma is the schedule start.
+        #expect(scheduler.currentSigma == scheduler.startSigma)
+
+        // Each step consumes sigmas[i]; currentSigma exposes it before advancing.
+        for i in 0..<stepCount {
+            #expect(scheduler.currentSigma == scheduler.sigmas[i])
+            _ = scheduler.step(output: output, timeStep: scheduler.timeSteps[i], sample: sample)
+        }
+
+        // After the final step the schedule is exhausted; currentSigma floors to 0.
+        #expect(scheduler.currentSigma == 0)
+    }
+
     @Test("DiscreteFlow shift=1 produces linear sigma schedule")
     func flowLinearSigma() {
         let scheduler = DiscreteFlowScheduler(stepCount: 10, trainStepCount: 1000, timeStepShift: 1.0)

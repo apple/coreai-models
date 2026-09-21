@@ -109,13 +109,13 @@ public struct WanPipeline: VideoPipeline {
 
         self.init(
             transformer: CoreAIDiffusionModelFunction(
-                modelURL: url.appendingPathComponent("Transformer.aimodel")
+                modelURL: ModelBundle.resolveAssetURL("Transformer.aimodel", in: url)
             ),
             textEncoder: CoreAIDiffusionModelFunction(
-                modelURL: url.appendingPathComponent("TextEncoder.aimodel")
+                modelURL: ModelBundle.resolveAssetURL("TextEncoder.aimodel", in: url)
             ),
             decoder: CoreAIDiffusionModelFunction(
-                modelURL: url.appendingPathComponent("VAEDecoder.aimodel")
+                modelURL: ModelBundle.resolveAssetURL("VAEDecoder.aimodel", in: url)
             ),
             tokenizer: tokenizer,
             textDim: textDim,
