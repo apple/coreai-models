@@ -132,6 +132,27 @@ class TestmacOSRMSNorm:
         torch.testing.assert_close(out, ref_out, rtol=1e-3, atol=1e-3)
 
 
+@pytest.mark.skipif(not HAS_COREAI, reason="coreai-torch not available")
+class TestRMSNormGatedPresetExclusion:
+    """RMSNormGated must be excluded from 4bit weight quantization (#277)."""
+
+    def test_4bit_preset_excludes_gated_rms_norm(self):
+        from coreai_models.export.presets import get_preset
+
+        quant_config = get_preset("4bit")["torch_quantization_config"]
+        gated_path = f"{CoreaiTorchRMSNormGated.__module__}.{CoreaiTorchRMSNormGated.__qualname__}"
+
+        assert quant_config["module_type_configs"].get(gated_path, "missing") is None
+
+        # The exclusion is load-bearing: the global weight spec blocks along axis 1,
+        # which is out of bounds for RMSNormGated's rank-1 weight.
+        weight_spec = quant_config["global_config"]["op_state_spec"]["weight"]
+        global_axis = weight_spec["granularity"]["axis"]
+        weight = CoreaiTorchRMSNormGated(dim=8).weight
+        assert weight.ndim == 1
+        assert global_axis >= weight.ndim
+
+
 # =============================================================================
 # Functional-parity tests
 # =============================================================================

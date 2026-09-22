@@ -33,6 +33,7 @@ _TORCH_MODULE_EXCLUSIONS = {
     "coreai_models.primitives.macos.rope.RoPE": None,
     "coreai_models.primitives.macos.rms_norm.RMSNorm": None,
     "coreai_models.primitives.macos.rms_norm.RMSNormPlusOne": None,
+    "coreai_models.primitives.macos.rms_norm.RMSNormGated": None,
 }
 
 # Embedding modules excluded from iOS palettization.
