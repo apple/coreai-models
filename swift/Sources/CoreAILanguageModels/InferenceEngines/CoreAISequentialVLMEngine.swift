@@ -136,6 +136,17 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
 
     // MARK: - Init
 
+    /// Validates the LLM decoder's state-name contract. Accepts 2–4 states (KV cache + optional
+    /// persistent conv/recurrent states), matching `CoreAISequentialEngine`; hybrid decoders carry
+    /// extra conv/recurrent states beyond the two KV-cache states.
+    static func validateLLMStateNames(_ stateNames: [String]) throws {
+        guard stateNames.count >= 2 && stateNames.count <= 4 else {
+            throw InferenceRuntimeError.invalidOutputType(
+                "VLM LLM function expected 2–4 states (KV cache + optional persistent states), "
+                    + "got \(stateNames.count): \(stateNames)")
+        }
+    }
+
     /// Initialize the VLM engine with separate model assets for vision, embed, and LLM.
     ///
     /// - Parameters:
@@ -232,11 +243,7 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
                 "VLM LLM function expected 2 inputs (in_embeddings, position_ids), "
                     + "got \(llmDesc.inputNames.count): \(llmDesc.inputNames)")
         }
-        guard llmDesc.stateNames.count == 2 else {
-            throw InferenceRuntimeError.invalidOutputType(
-                "VLM LLM function expected 2 states (KV cache), "
-                    + "got \(llmDesc.stateNames.count): \(llmDesc.stateNames)")
-        }
+        try Self.validateLLMStateNames(llmDesc.stateNames)
         guard llmDesc.outputNames.count >= 1 else {
             throw InferenceRuntimeError.invalidOutputType(
                 "VLM LLM function expected at least 1 output (logits), "
