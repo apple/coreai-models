@@ -15,7 +15,6 @@ Supports:
 - FLUX.2 Klein (DiT-based)
 """
 
-import asyncio
 import json
 import logging
 import shutil
@@ -28,13 +27,14 @@ import torch
 from huggingface_hub import snapshot_download
 
 from coreai_models._constants import DEFAULT_INCLUDE_DEBUG_INFO
-from coreai_models.diffusion.components import MultiFunctionComponentSpec, get_component_registry
+from coreai_models.diffusion.components import (
+    MultiFunctionComponentSpec,
+    get_component_registry,
+    quant_weight_owner,
+)
 from coreai_models.diffusion.gpu import export_multifunction, export_stateless
 from coreai_models.diffusion.models import get_pipeline_type
 from coreai_models.diffusion.presets import PRESETS, list_presets
-from coreai_models.export.compiler import (
-    apply_mlir_quantization,
-)
 from coreai_models.export.compression import is_compression_mode_graph, quantize_pytorch_model
 from coreai_models.export.metadata import build_aimodel_metadata
 
@@ -65,10 +65,6 @@ def export_diffusion(config: DiffusionExportConfig) -> dict[str, str]:
     Returns:
         Dict mapping component name to its .aimodel path.
     """
-    return asyncio.run(_async_export_diffusion(config))
-
-
-async def _async_export_diffusion(config: DiffusionExportConfig) -> dict[str, str]:
     precision_map = {
         "float16": torch.float16,
         "bfloat16": torch.bfloat16,
@@ -116,15 +112,12 @@ async def _async_export_diffusion(config: DiffusionExportConfig) -> dict[str, st
 
         wrapper = spec.wrapper_fn(hf_pipe)
 
-        # Quantize weights here prior to export.
-        quantize_pre_export = (
-            quant_config is not None and spec.quantizable and spec.quant_target_fn is not None
-        )
-        if quantize_pre_export:
-            logger.info(f"Quantizing {name} (pre-export, torch)...")
+        # Quantize weights here, before export.
+        if quant_config is not None and spec.quantizable:
+            logger.info(f"Quantizing {name}...")
             _quantize_component_weights(
                 wrapper,
-                spec.quant_target_fn(hf_pipe),
+                quant_weight_owner(wrapper),
                 spec.quant_trace_fn()(hf_pipe),
                 quant_config,
                 quantized_modules,
@@ -159,13 +152,6 @@ async def _async_export_diffusion(config: DiffusionExportConfig) -> dict[str, st
                 dynamic_shapes=dynamic_shapes,
                 include_debug_info=config.include_debug_info,
             )
-
-        # Legacy post-export MLIR quantization, for pipelines still on that path.
-        # NOTE: this will be deprecated as soon as all diffusion models are tested
-        # on the pre-export quantization path.
-        if quant_config is not None and spec.quantizable and not quantize_pre_export:
-            logger.info(f"Quantizing {name} (post-export, MLIR)...")
-            program = await apply_mlir_quantization(program, quant_config)
 
         if asset_path.exists():
             shutil.rmtree(asset_path)

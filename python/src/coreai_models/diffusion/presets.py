@@ -11,8 +11,7 @@ Presets describe weight quantization applied to quantizable components (text
 encoder and transformer). The VAE decoder is never quantized.
 
 Configs are coreai-opt ``quantization_config`` dicts, applied to the PyTorch module
-before torch export. Pipelines still on the post-export MLIR path read the same dicts
-through a small adapter in ``coreai_models.export.compiler``.
+before torch export.
 
 Usage::
 

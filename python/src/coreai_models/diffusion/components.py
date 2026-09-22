@@ -196,6 +196,21 @@ class VAEEncoderWrapper(torch.nn.Module):
         return cast(torch.Tensor, self.vae.encode(x).latent_dist.parameters)
 
 
+def quant_weight_owner(wrapper: torch.nn.Module) -> torch.nn.Module:
+    """Returns the module holding quantizable weights
+
+    Quantizable wrappers store their model as ``self.model``. Two specs over the same
+    model return the same owner, which is how the export loop quantizes it once.
+    """
+    owner = getattr(wrapper, "model", None)
+    if owner is None:
+        raise AttributeError(
+            f"{type(wrapper).__name__} is quantizable but exposes no `.model`. "
+            "Quantization identifies a shared weight set by that attribute."
+        )
+    return cast(torch.nn.Module, owner)
+
+
 # ---------------------------------------------------------------------------
 # ComponentSpec
 # ---------------------------------------------------------------------------
@@ -210,7 +225,6 @@ class ComponentSpec:
     dummy_fn: Callable
     quantizable: bool = False
     dynamic_shapes_fn: Callable | None = None
-    quant_target_fn: Callable | None = None
     quant_dummy_fn: Callable | None = None
 
     def quant_trace_fn(self) -> Callable:
@@ -241,7 +255,6 @@ class MultiFunctionComponentSpec:
     wrapper_fn: Callable
     functions: tuple[FunctionVariant, ...]
     quantizable: bool = True
-    quant_target_fn: Callable | None = None
     quant_dummy_fn: Callable | None = None
 
     def quant_trace_fn(self) -> Callable:
@@ -335,7 +348,6 @@ SD_COMPONENTS: dict[str, ComponentSpec] = {
         wrapper_fn=lambda p: TextEncoderWrapper(p.text_encoder),
         dummy_fn=_dummy_text_encoder,
         quantizable=True,
-        quant_target_fn=lambda p: p.text_encoder,
     ),
     "unet": ComponentSpec(
         asset_name="Unet",
@@ -344,7 +356,6 @@ SD_COMPONENTS: dict[str, ComponentSpec] = {
         wrapper_fn=lambda p: UNetWrapper(p.unet),
         dummy_fn=_dummy_unet,
         quantizable=True,
-        quant_target_fn=lambda p: p.unet,
     ),
     "vae_decoder": ComponentSpec(
         asset_name="VAEDecoder",
@@ -377,7 +388,6 @@ FLUX2_COMPONENTS: dict[str, ComponentSpec] = {
         ),
         output_names=("output",),
         wrapper_fn=lambda p: Flux2TransformerWrapper(p.transformer),
-        quant_target_fn=lambda p: p.transformer,
         quant_dummy_fn=dummy_flux2_transformer_quant_trace,
         dummy_fn=dummy_flux2_transformer,
         quantizable=True,
@@ -394,7 +404,6 @@ FLUX2_COMPONENTS: dict[str, ComponentSpec] = {
         ),
         output_names=("output",),
         wrapper_fn=lambda p: Flux2TransformerWrapper(p.transformer),
-        quant_target_fn=lambda p: p.transformer,
         quant_dummy_fn=dummy_flux2_transformer_quant_trace,
         dummy_fn=dummy_flux2_transformer_img2img_full,
         quantizable=True,
@@ -411,7 +420,6 @@ FLUX2_COMPONENTS: dict[str, ComponentSpec] = {
         ),
         output_names=("output",),
         wrapper_fn=lambda p: Flux2TransformerWrapper(p.transformer),
-        quant_target_fn=lambda p: p.transformer,
         quant_dummy_fn=dummy_flux2_transformer_quant_trace,
         dummy_fn=dummy_flux2_transformer_img2img_half,
         quantizable=True,
@@ -428,7 +436,6 @@ FLUX2_COMPONENTS: dict[str, ComponentSpec] = {
         ),
         output_names=("output",),
         wrapper_fn=lambda p: Flux2TransformerWrapper(p.transformer),
-        quant_target_fn=lambda p: p.transformer,
         quant_dummy_fn=dummy_flux2_transformer_quant_trace,
         dummy_fn=dummy_flux2_transformer_img2img_quarter,
         quantizable=True,
@@ -445,7 +452,6 @@ FLUX2_COMPONENTS: dict[str, ComponentSpec] = {
         ),
         output_names=("output",),
         wrapper_fn=lambda p: Flux2TransformerWrapper(p.transformer),
-        quant_target_fn=lambda p: p.transformer,
         quant_dummy_fn=dummy_flux2_transformer_quant_trace,
         dummy_fn=dummy_flux2_transformer_512,
         quantizable=True,
@@ -462,7 +468,6 @@ FLUX2_COMPONENTS: dict[str, ComponentSpec] = {
         ),
         output_names=("output",),
         wrapper_fn=lambda p: Flux2TransformerWrapper(p.transformer),
-        quant_target_fn=lambda p: p.transformer,
         quant_dummy_fn=dummy_flux2_transformer_quant_trace,
         dummy_fn=dummy_flux2_transformer_img2img_512_full,
         quantizable=True,
@@ -479,7 +484,6 @@ FLUX2_COMPONENTS: dict[str, ComponentSpec] = {
         ),
         output_names=("output",),
         wrapper_fn=lambda p: Flux2TransformerWrapper(p.transformer),
-        quant_target_fn=lambda p: p.transformer,
         quant_dummy_fn=dummy_flux2_transformer_quant_trace,
         dummy_fn=dummy_flux2_transformer_img2img_512_half,
         quantizable=True,
@@ -496,7 +500,6 @@ FLUX2_COMPONENTS: dict[str, ComponentSpec] = {
         ),
         output_names=("output",),
         wrapper_fn=lambda p: Flux2TransformerWrapper(p.transformer),
-        quant_target_fn=lambda p: p.transformer,
         quant_dummy_fn=dummy_flux2_transformer_quant_trace,
         dummy_fn=dummy_flux2_transformer_img2img_512_quarter,
         quantizable=True,
@@ -508,7 +511,6 @@ FLUX2_COMPONENTS: dict[str, ComponentSpec] = {
         wrapper_fn=lambda p: Flux2TextEncoderWrapper(p.text_encoder),
         dummy_fn=dummy_flux2_text_encoder,
         quantizable=True,
-        quant_target_fn=lambda p: p.text_encoder,
     ),
     "vae_decoder": ComponentSpec(
         asset_name="VAEDecoder",
@@ -558,7 +560,6 @@ FLUX2_MULTIFUNCTION_TRANSFORMER = MultiFunctionComponentSpec(
     input_names=_FLUX2_TRANSFORMER_INPUT_NAMES,
     output_names=("output",),
     wrapper_fn=lambda p: Flux2TransformerWrapper(p.transformer),
-    quant_target_fn=lambda p: p.transformer,
     quant_dummy_fn=dummy_flux2_transformer_quant_trace,
     functions=(
         FunctionVariant("main", dummy_flux2_transformer),
@@ -595,7 +596,6 @@ SD3_COMPONENTS: dict[str, ComponentSpec] = {
         wrapper_fn=lambda p: TextEncoderWithPooledWrapper(p.text_encoder),
         dummy_fn=_dummy_text_encoder,
         quantizable=True,
-        quant_target_fn=lambda p: p.text_encoder,
     ),
     "text_encoder_2": ComponentSpec(
         asset_name="TextEncoder2",
@@ -604,7 +604,6 @@ SD3_COMPONENTS: dict[str, ComponentSpec] = {
         wrapper_fn=lambda p: TextEncoderWithPooledWrapper(p.text_encoder_2),
         dummy_fn=_dummy_text_encoder,
         quantizable=True,
-        quant_target_fn=lambda p: p.text_encoder_2,
     ),
     "transformer": ComponentSpec(
         asset_name="MMDiT",
@@ -613,7 +612,6 @@ SD3_COMPONENTS: dict[str, ComponentSpec] = {
         wrapper_fn=lambda p: SD3TransformerWrapper(p.transformer),
         dummy_fn=_dummy_sd3_transformer,
         quantizable=True,
-        quant_target_fn=lambda p: p.transformer,
         quant_dummy_fn=_dummy_sd3_transformer_quant_trace,
     ),
     "vae_decoder": ComponentSpec(
@@ -640,7 +638,6 @@ WAN_COMPONENTS: dict[str, ComponentSpec] = {
         dummy_fn=dummy_wan_transformer,
         quantizable=True,
         dynamic_shapes_fn=wan_transformer_dynamic_shapes,
-        quant_target_fn=lambda p: p.transformer,
         quant_dummy_fn=dummy_wan_transformer_quant_trace,
     ),
     "text_encoder": ComponentSpec(
@@ -650,7 +647,6 @@ WAN_COMPONENTS: dict[str, ComponentSpec] = {
         wrapper_fn=lambda p: WanTextEncoderWrapper(p.text_encoder),
         dummy_fn=dummy_wan_text_encoder,
         quantizable=True,
-        quant_target_fn=lambda p: p.text_encoder,
     ),
     "vae_decoder": ComponentSpec(
         asset_name="VAEDecoder",
