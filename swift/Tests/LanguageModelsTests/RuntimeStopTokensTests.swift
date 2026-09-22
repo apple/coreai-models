@@ -13,12 +13,11 @@ import Tokenizers
 // MARK: - Tokenizer.runtimeStopTokens (runtime terminating set)
 
 /// `Tokenizer.runtimeStopTokens(additional:)` is the runtime union both adapters
-/// check each generated token against: the tokenizer's main EOS plus the IDs
-/// resolved at load. These tests prove the additional IDs are actually unioned in
-/// (not stored and unused) and that the main EOS is always present.
+/// check each generated token against: the tokenizer's main EOS, a base-vocab
+/// `<|im_end|>`, and the IDs resolved at load.
 ///
-/// The load-time resolution itself (turn-end scan plus the universal `<|im_end|>`
-/// fold) lives in `LanguageConfig.additionalStopTokenIds` and is covered by
+/// The config-derived turn-end scan lives in
+/// `LanguageConfig.additionalStopTokenIds` and is covered by
 /// `AdditionalStopTokensTests`. The text adapter's agentic `<|eot|>` fold happens
 /// inline in `CoreAILanguageModel.init`, so it has no standalone unit test.
 @Suite("Tokenizer.runtimeStopTokens")
@@ -48,15 +47,29 @@ struct RuntimeStopTokensTests {
 
     @Test("Additional stop tokens combine with the main EOS without duplication")
     func unionsWithMainEos() {
-        // 4 is <|im_end|> (folded into the additional IDs at load); 2 is the main
-        // EOS and must not be duplicated.
+        // 2 is the main EOS and 4 is base-vocab <|im_end|>; passing them as
+        // additional IDs must not duplicate them.
         let stopTokens = Self.tokenizer().runtimeStopTokens(additional: [2, 4, 106])
         #expect(stopTokens == [2, 4, 106])
     }
 
+    @Test("Base-vocab <|im_end|> is folded in even with no additional IDs")
+    func foldsBaseVocabImEnd() {
+        // <|im_end|> (4) is in the base vocab but not passed as an additional ID.
+        // runtimeStopTokens folds it in regardless of the tokenizer directory.
+        let stopTokens = Self.tokenizer().runtimeStopTokens(additional: [])
+        #expect(stopTokens == [2, 4])
+    }
+
+    @Test("Base-vocab <|im_end|> is not added when absent from the vocab")
+    func skipsImEndWhenAbsent() {
+        let stopTokens = Self.tokenizer(vocab: ["<eos>": 2]).runtimeStopTokens(additional: [])
+        #expect(stopTokens == [2])
+    }
+
     @Test("Empty additional stop tokens leave only the main EOS")
     func emptyAdditionalStopTokensNoOp() {
-        let stopTokens = Self.tokenizer().runtimeStopTokens(additional: [])
+        let stopTokens = Self.tokenizer(vocab: ["<eos>": 2]).runtimeStopTokens(additional: [])
         #expect(stopTokens == [2])
     }
 }

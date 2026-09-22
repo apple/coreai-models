@@ -14,8 +14,6 @@ import Tokenizers
 struct AdditionalStopTokensTests {
     /// Vocabulary shared by the parsing tests. `<eos>` must be ID 2 to match
     /// `MockTokenizer.eosTokenId`, so it is expected to be filtered out.
-    /// `<|im_end|>` is deliberately absent here so the parsing cases stay focused;
-    /// the universal base-vocab `<|im_end|>` fold is covered by `foldsBaseVocabImEnd`.
     private static let vocab: [String: Int] = [
         "<eot>": 1,
         "<eos>": 2,
@@ -219,17 +217,17 @@ struct AdditionalStopTokensTests {
         #expect(ids == [3, 4])
     }
 
-    // MARK: - Universal <|im_end|> fold
+    // MARK: - Base-vocab <|im_end|> is not folded by the resolver
 
-    @Test("base-vocab <|im_end|> is folded in even when the config lists nothing")
-    func foldsBaseVocabImEnd() throws {
-        // The config resolves nothing on its own; <|im_end|> (4) reaches the set
-        // only via the universal base-vocab fold that keeps the text adapter, VLM
-        // adapter, server, and CLI from diverging.
+    @Test("base-vocab <|im_end|> is not folded by the resolver")
+    func doesNotFoldBaseVocabImEnd() throws {
+        // A base-vocab-only <|im_end|> (not declared as an added/special token) is
+        // the runtime baseline handled by Tokenizer.runtimeStopTokens, not this
+        // resolver, so the config resolving nothing yields an empty set.
         let dir = try Self.tokenizerDir(config: #"{ "eos_token": "<eos>" }"#)
         defer { try? FileManager.default.removeItem(at: dir) }
         let ids = LanguageConfig.additionalStopTokenIds(
             from: dir, tokenizer: MockTokenizer(vocab: ["<eos>": 2, "<|im_end|>": 4]))
-        #expect(ids == [4])
+        #expect(ids.isEmpty)
     }
 }

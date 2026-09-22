@@ -98,14 +98,8 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
     /// tokenizer_config.json, so this is where the exported bundle's
     /// `<end_of_turn>` (ID 106) is found.
     ///
-    /// Finally folds in `<|im_end|>` whenever it lives in the base vocabulary,
-    /// so every caller (text adapter, VLM adapter, server, CLI) stops on it even
-    /// when it isn't listed as an added/special token — this is the single point
-    /// that keeps those sites from diverging.
-    ///
     /// Best-effort on the config: if tokenizer_config.json is missing or can't be
-    /// parsed the config-derived IDs are skipped, but the base-vocab `<|im_end|>`
-    /// fold still runs.
+    /// parsed the config-derived IDs are skipped.
     ///
     /// TODO: Upstream the config parsing to swift-transformers as
     /// `Tokenizer.additionalEosTokenIds` so we don't parse tokenizer_config.json
@@ -212,12 +206,6 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
                     }
                 }
             }
-        }
-
-        // 6. Fold in a base-vocab <|im_end|> so the text path stops on it too,
-        //    even when it isn't carried as an added/special token above.
-        if tokenizer.vocabContains("<|im_end|>"), let id = tokenizer.convertTokenToId("<|im_end|>") {
-            result.insert(Int32(id))
         }
 
         return result

@@ -164,7 +164,8 @@ public struct CoreAILanguageModel: LanguageModel {
             }
         }()
         self.resources = resources
-        // Config-derived turn-end IDs plus the universal <|im_end|> fold.
+        // Config-derived turn-end IDs. The base-vocab <|im_end|> baseline is
+        // folded in at runtime by runtimeStopTokens.
         var additional: Set<Int32> =
             bundle.tokenizerPath.map {
                 LanguageConfig.additionalStopTokenIds(from: $0, tokenizer: tokenizer)
