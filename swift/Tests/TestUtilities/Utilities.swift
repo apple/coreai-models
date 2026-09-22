@@ -137,6 +137,94 @@ public struct MockTokenizer: Tokenizer, Sendable {
     }
 }
 
+// MARK: - Capturing Tokenizer
+
+/// Wraps a `MockTokenizer` and records the `messages`/`tools` passed to
+/// `applyChatTemplate(messages:tools:)`, so tests can inspect what a caller built.
+/// A class so the nonmutating protocol method can store into it.
+public final class CapturingTokenizer: Tokenizer, @unchecked Sendable {
+    public var capturedMessages: [Message] = []
+    public var capturedTools: [ToolSpec]?
+
+    private let inner: MockTokenizer
+
+    public init(vocab: [String: Int] = [:]) {
+        inner = MockTokenizer(vocab: vocab)
+    }
+
+    public var bosToken: String? { inner.bosToken }
+    public var bosTokenId: Int? { inner.bosTokenId }
+    public var eosToken: String? { inner.eosToken }
+    public var eosTokenId: Int? { inner.eosTokenId }
+    public var unknownToken: String? { inner.unknownToken }
+    public var unknownTokenId: Int? { inner.unknownTokenId }
+
+    public func convertTokenToId(_ token: String) -> Int? { inner.convertTokenToId(token) }
+    public func convertIdToToken(_ id: Int) -> String? { inner.convertIdToToken(id) }
+    public func convertTokensToIds(_ tokens: [String]) -> [Int?] { inner.convertTokensToIds(tokens) }
+    public func convertIdsToTokens(_ ids: [Int]) -> [String?] { inner.convertIdsToTokens(ids) }
+
+    public func encode(text: String) -> [Int] { inner.encode(text: text) }
+    public func encode(text: String, addSpecialTokens: Bool) -> [Int] {
+        inner.encode(text: text, addSpecialTokens: addSpecialTokens)
+    }
+    public func callAsFunction(_ text: String, addSpecialTokens: Bool) -> [Int] {
+        inner.callAsFunction(text, addSpecialTokens: addSpecialTokens)
+    }
+    public func decode(tokens: [Int]) -> String { inner.decode(tokens: tokens) }
+    public func decode(tokens: [Int], skipSpecialTokens: Bool) -> String {
+        inner.decode(tokens: tokens, skipSpecialTokens: skipSpecialTokens)
+    }
+    public func tokenize(text: String) -> [String] { inner.tokenize(text: text) }
+
+    public func applyChatTemplate(messages: [Message]) throws -> [Int] {
+        try inner.applyChatTemplate(messages: messages)
+    }
+
+    /// The captured overload: records `messages`/`tools` and returns a fixed token.
+    public func applyChatTemplate(messages: [Message], tools: [ToolSpec]?) throws -> [Int] {
+        capturedMessages = messages
+        capturedTools = tools
+        return [1]
+    }
+
+    public func applyChatTemplate(
+        messages: [Message], tools: [ToolSpec]?, additionalContext: [String: any Sendable]?
+    ) throws -> [Int] {
+        try inner.applyChatTemplate(messages: messages, tools: tools, additionalContext: additionalContext)
+    }
+
+    public func applyChatTemplate(messages: [Message], chatTemplate: ChatTemplateArgument) throws -> [Int] {
+        try inner.applyChatTemplate(messages: messages, chatTemplate: chatTemplate)
+    }
+
+    public func applyChatTemplate(messages: [Message], chatTemplate: String) throws -> [Int] {
+        try inner.applyChatTemplate(messages: messages, chatTemplate: chatTemplate)
+    }
+
+    public func applyChatTemplate(
+        messages: [Message], chatTemplate: ChatTemplateArgument?, addGenerationPrompt: Bool,
+        truncation: Bool, maxLength: Int?, tools: [ToolSpec]?
+    ) throws -> [Int] {
+        try inner.applyChatTemplate(
+            messages: messages, chatTemplate: chatTemplate, addGenerationPrompt: addGenerationPrompt,
+            truncation: truncation, maxLength: maxLength, tools: tools)
+    }
+
+    public func applyChatTemplate(
+        messages: [Message], chatTemplate: ChatTemplateArgument?, addGenerationPrompt: Bool,
+        truncation: Bool, maxLength: Int?, tools: [ToolSpec]?, additionalContext: [String: any Sendable]?
+    ) throws -> [Int] {
+        try inner.applyChatTemplate(
+            messages: messages, chatTemplate: chatTemplate, addGenerationPrompt: addGenerationPrompt,
+            truncation: truncation, maxLength: maxLength, tools: tools, additionalContext: additionalContext)
+    }
+
+    public func applyChatTemplate(messages: [[String: String]]) throws -> [Int] {
+        try inner.applyChatTemplate(messages: messages)
+    }
+}
+
 // MARK: - Image Test Helpers
 
 /// Create a solid-color CGImage for use in tests.

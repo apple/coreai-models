@@ -5,95 +5,11 @@
 
 import Foundation
 import FoundationModels
+import TestUtilities
 import Testing
 import Tokenizers
 
 @testable import CoreAILanguageModels
-
-/// Records the messages/tools passed to `applyChatTemplate` so the FM-path tool
-/// injection can be inspected. A class so the nonmutating protocol method can store.
-private final class CapturingTokenizer: Tokenizer, @unchecked Sendable {
-    var capturedMessages: [Message] = []
-    var capturedTools: [ToolSpec]?
-    var bosToken: String? { nil }
-    var bosTokenId: Int? { nil }
-    var eosToken: String? { nil }
-    var eosTokenId: Int? { nil }
-    var unknownToken: String? { nil }
-    var unknownTokenId: Int? { nil }
-    func convertTokenToId(_ token: String) -> Int? { nil }
-    func convertIdToToken(_ id: Int) -> String? { nil }
-    func encode(text: String) -> [Int] { [] }
-    func encode(text: String, addSpecialTokens: Bool) -> [Int] { [] }
-    func callAsFunction(_ text: String, addSpecialTokens: Bool) -> [Int] { [] }
-    func decode(tokens: [Int]) -> String { "" }
-    func decode(tokens: [Int], skipSpecialTokens: Bool) -> String { "" }
-    func tokenize(text: String) -> [String] { [] }
-    func convertTokensToIds(_ tokens: [String]) -> [Int?] { [] }
-    func convertIdsToTokens(_ ids: [Int]) -> [String?] { [] }
-    func applyChatTemplate(messages: [Message]) throws -> [Int] { [] }
-    func applyChatTemplate(messages: [Message], tools: [ToolSpec]?) throws -> [Int] {
-        capturedMessages = messages
-        capturedTools = tools
-        return [1]
-    }
-    func applyChatTemplate(messages: [Message], tools: [ToolSpec]?, additionalContext: [String: any Sendable]?) throws
-        -> [Int]
-    { [] }
-    func applyChatTemplate(messages: [Message], chatTemplate: ChatTemplateArgument) throws -> [Int] { [] }
-    func applyChatTemplate(messages: [Message], chatTemplate: String) throws -> [Int] { [] }
-    func applyChatTemplate(
-        messages: [Message], chatTemplate: ChatTemplateArgument?, addGenerationPrompt: Bool, truncation: Bool,
-        maxLength: Int?, tools: [ToolSpec]?
-    ) throws -> [Int] { [] }
-    func applyChatTemplate(
-        messages: [Message], chatTemplate: ChatTemplateArgument?, addGenerationPrompt: Bool, truncation: Bool,
-        maxLength: Int?, tools: [ToolSpec]?, additionalContext: [String: any Sendable]?
-    ) throws -> [Int] { [] }
-    func applyChatTemplate(messages: [[String: String]]) throws -> [Int] { [] }
-}
-
-/// Minimal tokenizer whose `vocabContains` is exact (round-trips only the known tokens).
-private struct DialectTokenizer: Tokenizer {
-    let known: [String: Int]
-    let reverse: [Int: String]
-    init(_ tokens: [String: Int]) {
-        known = tokens
-        reverse = Dictionary(uniqueKeysWithValues: tokens.map { ($0.value, $0.key) })
-    }
-    var bosToken: String? { nil }
-    var bosTokenId: Int? { nil }
-    var eosToken: String? { nil }
-    var eosTokenId: Int? { nil }
-    var unknownToken: String? { nil }
-    var unknownTokenId: Int? { nil }
-    func convertTokenToId(_ token: String) -> Int? { known[token] }
-    func convertIdToToken(_ id: Int) -> String? { reverse[id] }
-    func encode(text: String) -> [Int] { [] }
-    func encode(text: String, addSpecialTokens: Bool) -> [Int] { [] }
-    func callAsFunction(_ text: String, addSpecialTokens: Bool) -> [Int] { [] }
-    func decode(tokens: [Int]) -> String { "" }
-    func decode(tokens: [Int], skipSpecialTokens: Bool) -> String { "" }
-    func tokenize(text: String) -> [String] { [] }
-    func convertTokensToIds(_ tokens: [String]) -> [Int?] { tokens.map { convertTokenToId($0) } }
-    func convertIdsToTokens(_ ids: [Int]) -> [String?] { ids.map { convertIdToToken($0) } }
-    func applyChatTemplate(messages: [Message]) throws -> [Int] { [] }
-    func applyChatTemplate(messages: [Message], tools: [ToolSpec]?) throws -> [Int] { [] }
-    func applyChatTemplate(messages: [Message], tools: [ToolSpec]?, additionalContext: [String: any Sendable]?) throws
-        -> [Int]
-    { [] }
-    func applyChatTemplate(messages: [Message], chatTemplate: ChatTemplateArgument) throws -> [Int] { [] }
-    func applyChatTemplate(messages: [Message], chatTemplate: String) throws -> [Int] { [] }
-    func applyChatTemplate(
-        messages: [Message], chatTemplate: ChatTemplateArgument?, addGenerationPrompt: Bool, truncation: Bool,
-        maxLength: Int?, tools: [ToolSpec]?
-    ) throws -> [Int] { [] }
-    func applyChatTemplate(
-        messages: [Message], chatTemplate: ChatTemplateArgument?, addGenerationPrompt: Bool, truncation: Bool,
-        maxLength: Int?, tools: [ToolSpec]?, additionalContext: [String: any Sendable]?
-    ) throws -> [Int] { [] }
-    func applyChatTemplate(messages: [[String: String]]) throws -> [Int] { [] }
-}
 
 private func firstToolCall(_ events: [ToolCallParser.Event]) -> (name: String, args: String)? {
     for case .toolCall(_, let name, let args) in events { return (name, args) }
@@ -112,7 +28,7 @@ struct ToolCallDialectTests {
     // Phi emits JSON inside <|tool_call|> markers, which the detector must now recognize.
     @Test("detects the <|tool_call|> marker family (Phi)")
     func detectsPhiMarkers() {
-        let tok = DialectTokenizer(["<|tool_call|>": 1, "<|/tool_call|>": 2])
+        let tok = MockTokenizer(vocab: ["<|tool_call|>": 1, "<|/tool_call|>": 2])
         let d = detectToolCallFormat(using: tok)
         #expect(d?.openMarker == "<|tool_call|>")
         #expect(d?.closeMarker == "<|/tool_call|>")
@@ -124,7 +40,7 @@ struct ToolCallDialectTests {
     // Existing JSON <tool_call> detection must be unchanged (Qwen3).
     @Test("still detects <tool_call> as JSON (Qwen3 unaffected)")
     func detectsJSONMarkers() {
-        let tok = DialectTokenizer(["<tool_call>": 1, "</tool_call>": 2])
+        let tok = MockTokenizer(vocab: ["<tool_call>": 1, "</tool_call>": 2])
         let d = detectToolCallFormat(using: tok)
         #expect(d?.openMarker == "<tool_call>")
         // Qwen3 uses top-level tools, not a system-message key.
@@ -232,7 +148,7 @@ struct ToolCallDialectTests {
             toolCallDetection: detection)
         let system = tok.capturedMessages.first { ($0["role"] as? String) == "system" }
         #expect(system != nil)
-        #expect((system?["tools"] as? String)?.contains("lookup") == true)
+        #expect((system?["tools"] as? String) == toolsJSONForSystemMessage(tok.capturedTools ?? []))
         #expect(tok.capturedTools?.isEmpty == false)
     }
 
