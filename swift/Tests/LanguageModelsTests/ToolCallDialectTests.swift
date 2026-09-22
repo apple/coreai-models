@@ -72,13 +72,42 @@ struct ToolCallDialectTests {
         #expect(d?.openMarker == "<|tool_call|>")
         #expect(d?.closeMarker == "<|/tool_call|>")
         if case .json = d?.format {} else { Issue.record("expected .json format for Phi markers") }
+        // Phi renders tools from the system message.
+        #expect(d?.toolsInSystemMessage == true)
     }
 
     // Existing JSON <tool_call> detection must be unchanged (Qwen3).
     @Test("still detects <tool_call> as JSON (Qwen3 unaffected)")
     func detectsJSONMarkers() {
         let tok = DialectTokenizer(["<tool_call>": 1, "</tool_call>": 2])
-        #expect(detectToolCallFormat(using: tok)?.openMarker == "<tool_call>")
+        let d = detectToolCallFormat(using: tok)
+        #expect(d?.openMarker == "<tool_call>")
+        // Qwen3 uses top-level tools, not a system-message key.
+        #expect(d?.toolsInSystemMessage == false)
+    }
+
+    // Tool injection is scoped to the Phi dialect via applyToolsToSystemMessage.
+    @Test("applyToolsToSystemMessage attaches to an existing system message")
+    func toolsAttachToExistingSystem() {
+        let messages: [[String: any Sendable]] = [
+            ["role": "system", "content": "hi"],
+            ["role": "user", "content": "q"],
+        ]
+        let out = applyToolsToSystemMessage(messages, toolsJSON: "[TOOLS]")
+        #expect(out.count == 2)
+        #expect((out[0]["role"] as? String) == "system")
+        #expect((out[0]["tools"] as? String) == "[TOOLS]")
+        #expect((out[0]["content"] as? String) == "hi")
+    }
+
+    @Test("applyToolsToSystemMessage synthesizes a system message when none exists")
+    func toolsSynthesizeSystem() {
+        let messages: [[String: any Sendable]] = [["role": "user", "content": "q"]]
+        let out = applyToolsToSystemMessage(messages, toolsJSON: "[TOOLS]")
+        #expect(out.count == 2)
+        #expect((out[0]["role"] as? String) == "system")
+        #expect((out[0]["tools"] as? String) == "[TOOLS]")
+        #expect((out[1]["role"] as? String) == "user")
     }
 
     // Qwen3-Coder XML function body via the explicit .xmlFunction format.
@@ -90,7 +119,29 @@ struct ToolCallDialectTests {
             + "</function></tool_call>"
         let call = firstToolCall(runParser(input, open: "<tool_call>", close: "</tool_call>", format: .xmlFunction))
         #expect(call?.name == "add")
-        #expect(call?.args == #"{"a":"1","b":"2"}"#)
+        #expect(call?.args == #"{"a":1,"b":2}"#)
+    }
+
+    // XML params must coerce to their JSON-schema types, not stringify.
+    @Test("XML function params coerce numeric/bool/array (not stringified)")
+    func xmlFunctionParamCoercion() {
+        let input =
+            "<tool_call><function=configure>"
+            + "<parameter=count>5</parameter>"
+            + "<parameter=ratio>1.5</parameter>"
+            + "<parameter=enabled>true</parameter>"
+            + "<parameter=tags>[\"a\",\"b\"]</parameter>"
+            + "</function></tool_call>"
+        let call = firstToolCall(runParser(input, open: "<tool_call>", close: "</tool_call>", format: .xmlFunction))
+        #expect(call?.args == #"{"count":5,"enabled":true,"ratio":1.5,"tags":["a","b"]}"#)
+    }
+
+    // Content-based routing: a .json-declared parser (Qwen3-Coder) maps <function=…> to .xmlFunction.
+    @Test("effectiveToolCallFormat routes <function=…> bodies to .xmlFunction")
+    func effectiveFormatRoutesXML() {
+        #expect(effectiveToolCallFormat(declared: .json, body: "<function=add></function>") == .xmlFunction)
+        #expect(effectiveToolCallFormat(declared: .json, body: #"{"name":"add"}"#) == .json)
+        #expect(effectiveToolCallFormat(declared: .atem, body: "<function=add>") == .atem)
     }
 
     // Qwen3-Coder shares Qwen3's <tool_call> markers, so it is detected as .json; the JSON

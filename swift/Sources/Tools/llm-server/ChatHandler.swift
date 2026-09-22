@@ -607,19 +607,14 @@ private func tokenizeMessages(
         return spec
     }
 
-    // Some chat templates (e.g. Phi) read tools from a system message's `tools` key
-    // (string-concatenated), not the top-level `tools` variable. Attach a JSON string of the
-    // specs to the system message so those templates render them; templates that use top-level
-    // `tools` (e.g. Qwen3) ignore this key, so there is no double render.
-    if let toolSpecs,
+    // Phi-family templates read tools from a system message's `tools` key, not the top-level
+    // `tools` variable. Attach the specs there (and synthesize a system message if none exists)
+    // only for that dialect, so top-level-`tools` families (e.g. Qwen3) are not perturbed.
+    if let toolSpecs, state.toolCallDetection?.toolsInSystemMessage == true,
         let toolsData = try? JSONSerialization.data(withJSONObject: toolSpecs, options: [.sortedKeys]),
         let toolsJSON = String(data: toolsData, encoding: .utf8)
     {
-        if let sysIdx = templateMessages.firstIndex(where: { ($0["role"] as? String) == "system" }) {
-            templateMessages[sysIdx]["tools"] = toolsJSON
-        } else {
-            templateMessages.insert(["role": "system", "content": "", "tools": toolsJSON], at: 0)
-        }
+        templateMessages = applyToolsToSystemMessage(templateMessages, toolsJSON: toolsJSON)
     }
 
     do {

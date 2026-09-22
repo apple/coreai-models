@@ -23,7 +23,7 @@ public struct ToolCallParser: Sendable {
         case toolCall(id: String, name: String, argsJSON: String)
     }
 
-    public enum Format: Sendable {
+    public enum Format: Sendable, Equatable {
         case json
         case atem
         /// Qwen3-Coder style: `<function=NAME><parameter=K>V</parameter>…</function>` inside the markers.
@@ -100,7 +100,7 @@ public struct ToolCallParser: Sendable {
     }
 
     private func parseToolCalls(from content: String) -> [Event] {
-        switch format {
+        switch effectiveToolCallFormat(declared: format, body: content) {
         case .json:
             return parseJSONToolCalls(from: content)
         case .atem:
@@ -125,12 +125,6 @@ public struct ToolCallParser: Sendable {
 
         if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             return makeJSONToolCallEvent(from: obj).map { [$0] } ?? []
-        }
-
-        // Qwen3-Coder shares Qwen3's `<tool_call>` markers (so it is detected as `.json`) but emits
-        // an XML `<function=…>` body. Fall back to XML parsing rather than dropping the call.
-        if trimmed.contains("<function=") {
-            return parseXMLFunctionToolCalls(from: trimmed)
         }
 
         return []
@@ -216,7 +210,7 @@ public struct ToolCallParser: Sendable {
     // MARK: - XML Function Format (Qwen3-Coder)
 
     /// Parse `<function=NAME><parameter=K>V</parameter>…</function>` blocks (Qwen3-Coder).
-    /// Parameter values are kept as strings, matching the model's on-the-wire form.
+    /// Values are coerced to bool/Int/Double/array/object so JSON-schema types survive.
     private func parseXMLFunctionToolCalls(from xml: String) -> [Event] {
         let fnPattern = "<function=([^>]+)>(.*?)</function>"
         guard let fnRegex = try? NSRegularExpression(pattern: fnPattern, options: .dotMatchesLineSeparators)
@@ -235,7 +229,7 @@ public struct ToolCallParser: Sendable {
         }
     }
 
-    private func parseXMLFunctionParameters(from body: String) -> [String: String] {
+    private func parseXMLFunctionParameters(from body: String) -> [String: Any] {
         let paramPattern = "<parameter=([^>]+)>(.*?)</parameter>"
         guard let paramRegex = try? NSRegularExpression(pattern: paramPattern, options: .dotMatchesLineSeparators)
         else { return [:] }
@@ -243,17 +237,29 @@ public struct ToolCallParser: Sendable {
         let nsBody = body as NSString
         let matches = paramRegex.matches(in: body, range: NSRange(location: 0, length: nsBody.length))
 
-        var result: [String: String] = [:]
+        var result: [String: Any] = [:]
         for match in matches where match.numberOfRanges >= 3 {
             let key = nsBody.substring(with: match.range(at: 1)).trimmingCharacters(in: .whitespacesAndNewlines)
-            let value = nsBody.substring(with: match.range(at: 2)).trimmingCharacters(in: .whitespacesAndNewlines)
-            result[key] = value
+            let value = nsBody.substring(with: match.range(at: 2))
+            result[key] = coerceXMLFunctionValue(value)
         }
         return result
     }
 
-    /// Deterministic JSON object string (sorted keys) from string-valued args.
-    private func jsonString(from dict: [String: String]) -> String {
+    /// Scalar coercion (bool/Int/Double/String) plus JSON array/object bodies for list/dict args.
+    private func coerceXMLFunctionValue(_ raw: String) -> Any {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix("[") || trimmed.hasPrefix("{"),
+            let data = trimmed.data(using: .utf8),
+            let json = try? JSONSerialization.jsonObject(with: data)
+        {
+            return json
+        }
+        return coerceATEMValue(trimmed)
+    }
+
+    /// Deterministic JSON object string (sorted keys) from coerced args.
+    private func jsonString(from dict: [String: Any]) -> String {
         guard !dict.isEmpty,
             let data = try? JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys]),
             let str = String(data: data, encoding: .utf8)
@@ -268,6 +274,45 @@ public struct ToolCallDetection: Sendable {
     public let openMarker: String
     public let closeMarker: String
     public let format: ToolCallParser.Format
+    /// Whether the chat template renders tools from a system message's `tools` key (e.g. Phi)
+    /// rather than the top-level `tools` variable (e.g. Qwen3).
+    public let toolsInSystemMessage: Bool
+
+    public init(
+        openMarker: String,
+        closeMarker: String,
+        format: ToolCallParser.Format,
+        toolsInSystemMessage: Bool = false
+    ) {
+        self.openMarker = openMarker
+        self.closeMarker = closeMarker
+        self.format = format
+        self.toolsInSystemMessage = toolsInSystemMessage
+    }
+}
+
+/// Effective parse format for a tool-call body. Qwen3-Coder shares Qwen3's `<tool_call>` markers,
+/// so vocab detection yields `.json`; its XML `<function=…>` body only reveals the dialect here.
+func effectiveToolCallFormat(declared: ToolCallParser.Format, body: String) -> ToolCallParser.Format {
+    if declared == .json, body.contains("<function=") { return .xmlFunction }
+    return declared
+}
+
+/// Injects the tools JSON into a system message for dialects whose chat template reads
+/// `message['tools']` (e.g. Phi). Attaches to an existing system message, else synthesizes a
+/// leading one. Gate the call on `toolsInSystemMessage` so top-level-`tools` families (e.g. Qwen3)
+/// are not perturbed by a synthetic system message.
+public func applyToolsToSystemMessage(
+    _ messages: [[String: any Sendable]],
+    toolsJSON: String
+) -> [[String: any Sendable]] {
+    var out = messages
+    if let idx = out.firstIndex(where: { ($0["role"] as? String) == "system" }) {
+        out[idx]["tools"] = toolsJSON
+    } else {
+        out.insert(["role": "system", "content": "", "tools": toolsJSON], at: 0)
+    }
+    return out
 }
 
 /// Probes a tokenizer's vocabulary for known tool-call special tokens.
@@ -306,7 +351,11 @@ public func detectToolCallFormat(using tokenizer: any Tokenizer) -> ToolCallDete
     where tokenizer.vocabContains(pair.open)
         && tokenizer.vocabContains(pair.close)
     {
-        return ToolCallDetection(openMarker: pair.open, closeMarker: pair.close, format: .json)
+        // Phi's template reads tools from the system message; other JSON dialects use top-level tools.
+        let toolsInSystem = pair.open == "<|tool_call|>"
+        return ToolCallDetection(
+            openMarker: pair.open, closeMarker: pair.close, format: .json,
+            toolsInSystemMessage: toolsInSystem)
     }
     if tokenizer.vocabContains("[TOOL_CALLS]") {
         return ToolCallDetection(openMarker: "[TOOL_CALLS]", closeMarker: "\n", format: .json)
