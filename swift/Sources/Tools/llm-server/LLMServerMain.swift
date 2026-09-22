@@ -161,52 +161,10 @@ struct LLMServer: AsyncParsableCommand {
         let modelLoadSpan = InstrumentsProfiler.beginModelLoad(name: bundle.name)
 
         let visionConfig = bundle.visionConfig
-        let engine: any InferenceEngine
-        if bundle.bundle.kind == .vlm {
-            // VLM bundle: build the multimodal engine from the main / embedding / vision
-            // components directly (EngineFactory only produces text engines).
-            guard let visionConfig else {
-                print("Error: VLM bundle missing 'vision' config in metadata.json")
-                throw ExitCode.failure
-            }
-            let visionURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.vision)
-            let embeddingURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.embedding)
-            let baseConfig = ModelConfig(
-                name: bundle.name,
-                tokenizer: bundle.tokenizer,
-                vocabSize: bundle.vocabSize,
-                maxContextLength: bundle.maxContextLength,
-                serializedModel: [modelURL.path],
-                function: bundle.language.functionMap?.name(for: "main") ?? "main"
-            )
-            let vlmConfig = VLMModelConfig(base: baseConfig, visionConfig: visionConfig)
-            // Sequential prepare avoids concurrent model-preparation errors.
-            let visionModel = try await PreparedModel.prepare(at: visionURL)
-            let embedModel = try await PreparedModel.prepare(at: embeddingURL)
-            let llmModel = try await PreparedModel.prepare(at: modelURL)
-            engine = try await CoreAISequentialVLMEngine(
-                config: vlmConfig,
-                visionModel: visionModel,
-                embedModel: embedModel,
-                llmModel: llmModel,
-                options: engineOptions
-            )
-        } else {
-            let engineConfig = ModelConfig(
-                name: bundle.name,
-                tokenizer: bundle.tokenizer,
-                vocabSize: bundle.vocabSize,
-                maxContextLength: bundle.maxContextLength,
-                serializedModel: [bundle.modelAssetPath],
-                function: bundle.language.functionMap?.name(for: "main") ?? "main"
-            )
-            let configData = try JSONEncoder().encode(engineConfig)
-            engine = try await EngineFactory.createEngine(
-                config: configData,
-                modelURL: modelURL,
-                options: engineOptions
-            )
-        }
+        // Build the engine through the shared factory entry point: it routes kind == .vlm
+        // bundles to the sequential VLM engine and everything else to the text engines.
+        // Chunking overrides ride in through engineOptions.
+        let engine = try await EngineFactory.createEngine(bundle: bundle, options: engineOptions)
 
         let tokenizer = try await bundle.loadTokenizer()
 
