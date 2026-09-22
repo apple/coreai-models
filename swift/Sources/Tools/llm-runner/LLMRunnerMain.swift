@@ -238,6 +238,27 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         help: "Video frame sampling: uniform (default) or fps")
     var videoSampling: FrameSamplingStrategy = .uniform(count: defaultVideoFrameCount)
 
+    @Option(
+        name: .customLong("draft-model"),
+        help:
+            "Path to a draft model bundle to enable speculative decoding. The draft and target run on whichever engine EngineFactory builds; that engine must conform to SpeculativeEngine. Must share the tokenizer/vocabulary with --model."
+    )
+    var draftModel: String?
+
+    @Option(
+        name: .customLong("num-draft-tokens"),
+        help:
+            "Tokens the draft proposes per speculative step (default: 4). Only used with --draft-model or --prompt-lookup."
+    )
+    var numDraftTokens: Int = 4
+
+    @Flag(
+        name: .customLong("prompt-lookup"),
+        help:
+            "Speculative decoding with a free n-gram prompt-lookup drafter (no draft model). Drafts from the running context — faster than base when output repeats."
+    )
+    var promptLookup: Bool = false
+
     @Flag(
         name: .customLong("clear-coreai-cache"),
         help: "Clear Core AI cached specialization for this model before loading (forces re-specialization)"
@@ -345,7 +366,170 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         }
     }
 
+    /// Speculative decoding: a draft + target pair (or a free prompt-lookup drafter),
+    /// both built via `EngineFactory` and driven by ``SpeculativeDecoder``. The target
+    /// and draft engines must conform to `SpeculativeEngine`. Greedy output is
+    /// token-for-token identical to running the target alone.
+    private func runSpeculativeDecoding(
+        targetPath: String, draftPath rawDraftPath: String?, resolver: ModelPaths
+    ) async throws {
+        func loadSpeculativeEngine(from path: String, label: String) async throws
+            -> (engine: any SpeculativeEngine, bundle: LanguageBundle)
+        {
+            let bundle = try LanguageBundle(from: path)
+            try bundle.bundle.verify()
+            let options = EngineOptions(
+                variant: inferenceEngineVariant,
+                kvCacheStrategy: kvCacheStrategy,
+                kvCacheSize: kvCacheInitialCapacity,
+                prefillChunkSize: chunkSize ?? bundle.language.prefillChunkSize,
+                prefillChunkThreshold: chunkThreshold ?? bundle.language.prefillChunkThreshold
+            )
+            let engine = try await EngineFactory.createEngine(bundle: bundle, options: options)
+            guard let spec = engine as? any SpeculativeEngine else {
+                print(
+                    "Error: engine for \(bundle.name) (\(type(of: engine))) does not support "
+                        + "speculative decoding (the engine must conform to SpeculativeEngine).")
+                throw ExitCode.failure
+            }
+            print("Loaded \(label): \(bundle.name)  engine=\(type(of: engine))")
+            return (spec, bundle)
+        }
+
+        print("\n⏳ Loading target for speculative decoding...")
+        let (targetEngine, targetBundle) = try await loadSpeculativeEngine(
+            from: targetPath, label: "target")
+
+        // Draft: either a loaded draft model, or the free prompt-lookup drafter.
+        var draftEngine: (any SpeculativeEngine)?
+        if let rawDraftPath {
+            guard let draftURL = resolver.resolve(rawDraftPath) else {
+                print("Error: \(resolver.notFoundError(for: rawDraftPath))")
+                throw ExitCode.failure
+            }
+            let (draft, draftBundle) = try await loadSpeculativeEngine(
+                from: draftURL.path, label: "draft")
+            guard targetBundle.vocabSize == draftBundle.vocabSize else {
+                print(
+                    "Error: draft/target vocab mismatch "
+                        + "(\(draftBundle.vocabSize) vs \(targetBundle.vocabSize)).")
+                throw ExitCode.failure
+            }
+            draftEngine = draft
+        }
+
+        // Warm up the engine(s) so their graphs are specialized before the loop.
+        let warmupSampling = try parseSamplingStrategy()
+        var warmEngines: [(any SpeculativeEngine, String)] = [(targetEngine, "target")]
+        if let draftEngine { warmEngines.append((draftEngine, "draft")) }
+        for (engine, label) in warmEngines {
+            if let inferenceEngine = engine as? any InferenceEngine {
+                print("Warming up \(label)...")
+                try await performWarmup(
+                    mode: warmup, warmupLength: warmupLength, engine: inferenceEngine,
+                    samplingConfiguration: warmupSampling)
+                try await engine.reset(to: 0)
+            }
+        }
+
+        let tokenizer = try await targetBundle.loadTokenizer()
+        var stopTokenIds = Set<Int32>()
+        if let eos = tokenizer.eosTokenId { stopTokenIds.insert(Int32(eos)) }
+        if let tokenizerDir = targetBundle.tokenizerPath {
+            for id in LanguageConfig.additionalStopTokenIds(from: tokenizerDir, tokenizer: tokenizer) {
+                stopTokenIds.insert(id)
+            }
+        }
+
+        let promptInput = try resolvePromptInput()
+        let promptTokens: [Int32]
+        switch promptInput {
+        case .text(let text):
+            let input: Input = applyChatTemplate ? .prompt(text) : .rawText(text)
+            promptTokens = try PromptUtils.maybeApplyTokenizerChatTemplate(input, tokenizer: tokenizer)
+                .map { Int32($0) }
+        case .rawTokens(let container):
+            promptTokens = container.tokens.map { Int32($0) }
+        }
+
+        let useGreedy = samplingStrategy.lowercased() == "greedy" || temperature == 0
+        let decoder: SpeculativeDecoder
+        let drafterLabel: String
+        if let draftEngine {
+            decoder = SpeculativeDecoder(
+                draft: draftEngine, target: targetEngine, numDraftTokens: numDraftTokens)
+            drafterLabel = "draft-model"
+        } else {
+            let lookup = PromptLookupDrafter(maxContextLength: targetBundle.maxContextLength)
+            decoder = SpeculativeDecoder(
+                drafter: lookup, target: targetEngine, numDraftTokens: numDraftTokens)
+            drafterLabel = "prompt-lookup (free n-gram)"
+        }
+        print(
+            "\nGenerating (speculative, drafter=\(drafterLabel), k=\(numDraftTokens), "
+                + "\(useGreedy ? "greedy" : "sampling T=\(temperature)"))...\n")
+
+        var generatedIds: [Int] = []
+        var previousText = ""
+        let onToken: (Int32) -> Void = { token in
+            if !stopTokenIds.contains(token) {
+                generatedIds.append(Int(token))
+                let full = tokenizer.decode(tokens: generatedIds)
+                let delta = String(full.dropFirst(previousText.count))
+                previousText = full
+                print(delta, terminator: "")
+                fflush(stdout)
+            }
+        }
+
+        let clock = ContinuousClock()
+        let start = clock.now
+        let stats: SpeculativeDecoder.Stats
+        do {
+            if useGreedy {
+                stats = try await decoder.generateGreedy(
+                    promptTokens: promptTokens, maxNewTokens: maxTokens,
+                    stopTokenIds: stopTokenIds, onToken: onToken)
+            } else {
+                stats = try await decoder.generateSampling(
+                    promptTokens: promptTokens, maxNewTokens: maxTokens,
+                    stopTokenIds: stopTokenIds, temperature: temperature, onToken: onToken)
+            }
+        } catch {
+            print("\n[spec-decode] error: \(error)  |  reflected: \(String(reflecting: error))")
+            throw error
+        }
+        let elapsed = clock.now - start
+        let seconds =
+            Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) * 1e-18
+        let tokPerSec = seconds > 0 ? Double(stats.generatedTokens) / seconds : 0
+
+        print("\n\n── Speculative decoding summary ──")
+        print("  target=\(targetBundle.name)  drafter=\(drafterLabel)  k=\(numDraftTokens)")
+        print("  generated tokens:      \(stats.generatedTokens)")
+        print("  target forward passes: \(stats.iterations)")
+        print(
+            "  draft accepted:        \(stats.draftTokensAccepted)/\(stats.draftTokensProposed) "
+                + "(\(String(format: "%.1f", stats.acceptanceRate * 100))%)")
+        print("  tokens / target pass:  \(String(format: "%.2f", stats.meanTokensPerTargetPass))")
+        print(
+            "  throughput:            \(String(format: "%.1f", tokPerSec)) tok/s "
+                + "(\(String(format: "%.2f", seconds))s, incl. prompt/specialization)")
+        let genTokPerSec =
+            stats.generationSeconds > 0 ? Double(stats.generatedTokens) / stats.generationSeconds : 0
+        print(
+            "  generation-only:       \(String(format: "%.1f", genTokPerSec)) tok/s "
+                + "(\(String(format: "%.2f", stats.generationSeconds))s) — compare to base 'Generation:'")
+    }
+
     func runModel(path modelFile: String, resolver: ModelPaths) async throws {
+        // Speculative decoding: draft + target, or a free prompt-lookup drafter.
+        if draftModel != nil || promptLookup {
+            try await runSpeculativeDecoding(
+                targetPath: modelFile, draftPath: draftModel, resolver: resolver)
+            return
+        }
+
         // Validate continuation mode requirements
         if let continuation = continuation {
             guard !applyChatTemplate else {
