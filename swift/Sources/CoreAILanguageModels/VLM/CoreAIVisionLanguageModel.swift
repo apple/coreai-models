@@ -65,7 +65,10 @@ public struct CoreAIVisionLanguageModel: LanguageModel {
 
         let tokenizer = try await tokenizerResult
 
-        let additionalStopTokenIds = StopTokens.additionalIds(bundle: bundle, tokenizer: tokenizer)
+        let additionalStopTokenIds: Set<Int32> =
+            bundle.tokenizerPath.map {
+                LanguageConfig.additionalStopTokenIds(from: $0, tokenizer: tokenizer)
+            } ?? []
 
         self.executorConfiguration = CoreAIVLMExecutor.Configuration(
             bundleURL: url,
@@ -87,7 +90,7 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
         let engine: CoreAISequentialVLMEngine
         let tokenizer: any Tokenizer
         let visionConfig: VisionConfig
-        let additionalStopTokenIds: [Int32]
+        let additionalStopTokenIds: Set<Int32>
 
         public static func == (lhs: Configuration, rhs: Configuration) -> Bool {
             lhs.bundleURL == rhs.bundleURL
@@ -100,7 +103,7 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
     private let engine: CoreAISequentialVLMEngine
     private let tokenizer: any Tokenizer
     private let visionConfig: VisionConfig
-    private let additionalStopTokenIds: [Int32]
+    private let additionalStopTokenIds: Set<Int32>
 
     public init(configuration: Configuration) throws {
         self.engine = configuration.engine
@@ -152,8 +155,7 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
         )
 
         let maxTokens = request.generationOptions.maximumResponseTokens ?? 512
-        let stopTokens = StopTokens.set(
-            tokenizer: tokenizer, additional: additionalStopTokenIds)
+        let stopTokens = tokenizer.runtimeStopTokens(additional: additionalStopTokenIds)
 
         let stream = try await engine.generate(
             with: embeddedInput,

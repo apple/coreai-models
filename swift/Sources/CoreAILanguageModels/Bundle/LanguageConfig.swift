@@ -84,131 +84,143 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
 
     // MARK: - Additional Stop Tokens
 
-    /// Extract additional stop token IDs from the tokenizer config.
+    /// Resolve the EOS-like token IDs (beyond the tokenizer's main EOS) that
+    /// should terminate generation, as a `Set` for order-independent membership.
+    ///
     /// Reads `additional_special_tokens` from tokenizer_config.json and
     /// cross-references with the tokenizer to get their IDs.
     ///
     /// Also checks for array-valued `eos_token` (some models list multiple).
     ///
-    /// Finally scans `tokenizer.json`'s `added_tokens` for turn-ending
-    /// specials. Fast tokenizers saved via `save_pretrained` (e.g. Gemma)
-    /// keep their added specials there and omit `added_tokens_decoder` from
+    /// Scans `tokenizer.json`'s `added_tokens` for turn-ending specials. Fast
+    /// tokenizers saved via `save_pretrained` (e.g. Gemma) keep their added
+    /// specials there and omit `added_tokens_decoder` from
     /// tokenizer_config.json, so this is where the exported bundle's
     /// `<end_of_turn>` (ID 106) is found.
     ///
-    /// Best-effort: returns empty if the file doesn't exist or can't be parsed.
+    /// Finally folds in `<|im_end|>` whenever it lives in the base vocabulary,
+    /// so every caller (text adapter, VLM adapter, server, CLI) stops on it even
+    /// when it isn't listed as an added/special token — this is the single point
+    /// that keeps those sites from diverging.
     ///
-    /// TODO: Upstream this to swift-transformers as `Tokenizer.additionalEosTokenIds`
-    /// so we don't need to parse tokenizer_config.json ourselves.
+    /// Best-effort on the config: if tokenizer_config.json is missing or can't be
+    /// parsed the config-derived IDs are skipped, but the base-vocab `<|im_end|>`
+    /// fold still runs.
+    ///
+    /// TODO: Upstream the config parsing to swift-transformers as
+    /// `Tokenizer.additionalEosTokenIds` so we don't parse tokenizer_config.json
+    /// ourselves.
     public static func additionalStopTokenIds(
         from tokenizerDir: URL,
         tokenizer: any Tokenizer
-    ) -> [Int32] {
-        let configURL = tokenizerDir.appending(path: "tokenizer_config.json")
-        guard let data = try? Data(contentsOf: configURL),
-            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else {
-            return []
-        }
-
+    ) -> Set<Int32> {
         let mainEos = tokenizer.eosTokenId.map { Int32($0) }
         var result = Set<Int32>()
 
-        // 1. Check additional_special_tokens array
-        if let specials = json["additional_special_tokens"] as? [Any] {
-            for item in specials {
-                // Each item can be a string or a dict with a "content" key
-                let tokenString: String?
-                if let s = item as? String {
-                    tokenString = s
-                } else if let dict = item as? [String: Any],
-                    let content = dict["content"] as? String
-                {
-                    tokenString = content
-                } else {
-                    tokenString = nil
-                }
-                guard let token = tokenString else { continue }
-
-                if let id = tokenizer.vocabContains(token) ? tokenizer.convertTokenToId(token) : nil {
-                    let id32 = Int32(id)
-                    if id32 != mainEos {
-                        result.insert(id32)
-                    }
-                }
-            }
-        }
-
-        // 2. Check if eos_token is an array (some models list multiple)
-        if let eosArray = json["eos_token"] as? [String] {
-            for token in eosArray {
-                if let id = tokenizer.vocabContains(token) ? tokenizer.convertTokenToId(token) : nil {
-                    let id32 = Int32(id)
-                    if id32 != mainEos {
-                        result.insert(id32)
-                    }
-                }
-            }
-        }
-
-        // 3. Check added_tokens_decoder for turn-ending special tokens, matched
-        //    against the shared pattern list below (covers Gemma's <end_of_turn>,
-        //    Qwen's <|im_end|>, Phi's <|end|>, etc., when present here — not every
-        //    model exposes added_tokens_decoder; see step 5 for the fallback).
         let turnEndPatterns = ["end_of_turn", "im_end", "eot_id", "endoftext", "eot_token", "|eot|", "|end|"]
-        if let addedTokens = json["added_tokens_decoder"] as? [String: Any] {
-            for (idString, value) in addedTokens {
-                guard let dict = value as? [String: Any],
-                    let isSpecial = dict["special"] as? Bool, isSpecial,
-                    let content = dict["content"] as? String,
-                    let id = Int32(idString)
-                else { continue }
-                let lower = content.lowercased()
-                if id != mainEos && turnEndPatterns.contains(where: { lower.contains($0) }) {
-                    result.insert(id)
+
+        let configURL = tokenizerDir.appending(path: "tokenizer_config.json")
+        if let data = try? Data(contentsOf: configURL),
+            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        {
+            // 1. Check additional_special_tokens array
+            if let specials = json["additional_special_tokens"] as? [Any] {
+                for item in specials {
+                    // Each item can be a string or a dict with a "content" key
+                    let tokenString: String?
+                    if let s = item as? String {
+                        tokenString = s
+                    } else if let dict = item as? [String: Any],
+                        let content = dict["content"] as? String
+                    {
+                        tokenString = content
+                    } else {
+                        tokenString = nil
+                    }
+                    guard let token = tokenString else { continue }
+
+                    if let id = tokenizer.vocabContains(token) ? tokenizer.convertTokenToId(token) : nil {
+                        let id32 = Int32(id)
+                        if id32 != mainEos {
+                            result.insert(id32)
+                        }
+                    }
                 }
             }
-        }
 
-        // 4. Check for turn-ending tokens in in top level of config
-        for turnEndPattern in turnEndPatterns {
-            if let eotToken = json[turnEndPattern] as? String {
-                if let id = tokenizer.vocabContains(eotToken) ? tokenizer.convertTokenToId(eotToken) : nil {
+            // 2. Check if eos_token is an array (some models list multiple)
+            if let eosArray = json["eos_token"] as? [String] {
+                for token in eosArray {
+                    if let id = tokenizer.vocabContains(token) ? tokenizer.convertTokenToId(token) : nil {
+                        let id32 = Int32(id)
+                        if id32 != mainEos {
+                            result.insert(id32)
+                        }
+                    }
+                }
+            }
+
+            // 3. Check added_tokens_decoder for turn-ending special tokens, matched
+            //    against the shared pattern list above (covers Gemma's <end_of_turn>,
+            //    Qwen's <|im_end|>, Phi's <|end|>, etc., when present here — not every
+            //    model exposes added_tokens_decoder; see step 5 for the fallback).
+            if let addedTokens = json["added_tokens_decoder"] as? [String: Any] {
+                for (idString, value) in addedTokens {
+                    guard let dict = value as? [String: Any],
+                        let isSpecial = dict["special"] as? Bool, isSpecial,
+                        let content = dict["content"] as? String,
+                        let id = Int32(idString)
+                    else { continue }
+                    let lower = content.lowercased()
+                    if id != mainEos && turnEndPatterns.contains(where: { lower.contains($0) }) {
+                        result.insert(id)
+                    }
+                }
+            }
+
+            // 4. Check for turn-ending tokens in in top level of config
+            for turnEndPattern in turnEndPatterns {
+                if let eotToken = json[turnEndPattern] as? String {
+                    if let id = tokenizer.vocabContains(eotToken) ? tokenizer.convertTokenToId(eotToken) : nil {
+                        let id32 = Int32(id)
+                        if id32 != mainEos {
+                            result.insert(id32)
+                        }
+                    }
+                }
+            }
+
+            // 5. Check tokenizer.json's added_tokens for turn-ending specials.
+            //    Fast tokenizers saved via save_pretrained store their added
+            //    specials here and drop added_tokens_decoder from
+            //    tokenizer_config.json, so this recovers Gemma's <end_of_turn>
+            //    (ID 106) and Phi's <|end|> (ID 200020) in exported bundles.
+            let tokenizerURL = tokenizerDir.appending(path: "tokenizer.json")
+            if let tokenizerData = try? Data(contentsOf: tokenizerURL),
+                let tokenizerJSON = try? JSONSerialization.jsonObject(with: tokenizerData) as? [String: Any],
+                let addedTokens = tokenizerJSON["added_tokens"] as? [[String: Any]]
+            {
+                for entry in addedTokens {
+                    guard let isSpecial = entry["special"] as? Bool, isSpecial,
+                        let content = entry["content"] as? String,
+                        let id = entry["id"] as? Int
+                    else { continue }
                     let id32 = Int32(id)
-                    if id32 != mainEos {
+                    let lower = content.lowercased()
+                    if id32 != mainEos && turnEndPatterns.contains(where: { lower.contains($0) }) {
                         result.insert(id32)
                     }
                 }
             }
         }
 
-        // 5. Check tokenizer.json's added_tokens for turn-ending specials.
-        //    Fast tokenizers saved via save_pretrained store their added
-        //    specials here and drop added_tokens_decoder from
-        //    tokenizer_config.json, so this recovers Gemma's <end_of_turn>
-        //    (ID 106) and Phi's <|end|> (ID 200020) in exported bundles.
-        //    Only reached if tokenizer_config.json exists and parses (see the
-        //    guard at the top of this function); save_pretrained always emits
-        //    it alongside tokenizer.json in practice.
-        let tokenizerURL = tokenizerDir.appending(path: "tokenizer.json")
-        if let tokenizerData = try? Data(contentsOf: tokenizerURL),
-            let tokenizerJSON = try? JSONSerialization.jsonObject(with: tokenizerData) as? [String: Any],
-            let addedTokens = tokenizerJSON["added_tokens"] as? [[String: Any]]
-        {
-            for entry in addedTokens {
-                guard let isSpecial = entry["special"] as? Bool, isSpecial,
-                    let content = entry["content"] as? String,
-                    let id = entry["id"] as? Int
-                else { continue }
-                let id32 = Int32(id)
-                let lower = content.lowercased()
-                if id32 != mainEos && turnEndPatterns.contains(where: { lower.contains($0) }) {
-                    result.insert(id32)
-                }
-            }
+        // 6. Fold in a base-vocab <|im_end|> so the text path stops on it too,
+        //    even when it isn't carried as an added/special token above.
+        if tokenizer.vocabContains("<|im_end|>"), let id = tokenizer.convertTokenToId("<|im_end|>") {
+            result.insert(Int32(id))
         }
 
-        return Array(result)
+        return result
     }
 }
 

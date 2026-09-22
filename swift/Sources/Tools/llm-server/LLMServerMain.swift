@@ -145,7 +145,7 @@ struct LLMServer: AsyncParsableCommand {
 
         let tokenizer = try await bundle.loadTokenizer()
 
-        var additionalEosTokenIds: [Int32]
+        var additionalEosTokenIds: Set<Int32>
         if let tokenizerDir = bundle.tokenizerPath {
             additionalEosTokenIds = LanguageConfig.additionalStopTokenIds(
                 from: tokenizerDir, tokenizer: tokenizer)
@@ -160,8 +160,8 @@ struct LLMServer: AsyncParsableCommand {
             let mainEos = tokenizer.eosTokenId.map { Int32($0) }
             if let id = tokenizer.convertTokenToId(eot) {
                 let id32 = Int32(id)
-                if id32 != mainEos && !additionalEosTokenIds.contains(id32) {
-                    additionalEosTokenIds.append(id32)
+                if id32 != mainEos {
+                    additionalEosTokenIds.insert(id32)
                 }
             }
         }

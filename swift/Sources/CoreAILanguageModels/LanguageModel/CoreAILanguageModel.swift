@@ -51,8 +51,9 @@ public struct CoreAILanguageModel: LanguageModel {
     fileprivate let supportsReasoning: Bool
     fileprivate let resources: ModelResources
     /// All EOS-like token IDs beyond the tokenizer's main `eosTokenId` — e.g.
-    /// Gemma's `<end_of_turn>`, read from tokenizer_config.json at init.
-    fileprivate let additionalEosTokenIds: [Int32]
+    /// Gemma's `<end_of_turn>`, read from tokenizer_config.json at init, plus a
+    /// base-vocab `<|im_end|>` and this model's agentic `<|eot|>` when present.
+    fileprivate let additionalEosTokenIds: Set<Int32>
 
     // MARK: - Protocol Requirements
 
@@ -163,11 +164,20 @@ public struct CoreAILanguageModel: LanguageModel {
             }
         }()
         self.resources = resources
-        let agenticEOT: String? = {
-            if case .agentic(_, _, _, let eot) = thinkingFormat { eot } else { nil }
-        }()
-        self.additionalEosTokenIds = StopTokens.additionalIds(
-            bundle: bundle, tokenizer: tokenizer, agenticEOT: agenticEOT)
+        // Config-derived turn-end IDs plus the universal <|im_end|> fold.
+        var additional: Set<Int32> =
+            bundle.tokenizerPath.map {
+                LanguageConfig.additionalStopTokenIds(from: $0, tokenizer: tokenizer)
+            } ?? []
+        // Agentic models stop on <|eot|> so the runner doesn't loop self->user
+        // turns. This is text-adapter-specific, so it is folded in here rather
+        // than in the shared resolver.
+        if case .agentic(_, _, _, let eot) = thinkingFormat,
+            tokenizer.vocabContains(eot), let id = tokenizer.convertTokenToId(eot)
+        {
+            additional.insert(Int32(id))
+        }
+        self.additionalEosTokenIds = additional
     }
 
     // MARK: - Resource control
@@ -315,8 +325,7 @@ public struct CoreAILanguageModel: LanguageModel {
                 inferenceOptions: InferenceOptions(maxTokens: maxTokens)
             )
 
-            let eosTokens = StopTokens.set(
-                tokenizer: tokenizer, additional: model.additionalEosTokenIds)
+            let eosTokens = tokenizer.runtimeStopTokens(additional: model.additionalEosTokenIds)
             // Incremental-decode buffer. After a clean emit, one token is
             // retained as context for the next step (see below). During a
             // multi-byte sequence that hasn't decoded cleanly yet, multiple

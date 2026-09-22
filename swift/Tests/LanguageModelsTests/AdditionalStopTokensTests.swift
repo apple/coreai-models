@@ -12,13 +12,14 @@ import Tokenizers
 
 @Suite("LanguageConfig.additionalStopTokenIds")
 struct AdditionalStopTokensTests {
-    /// Vocabulary shared by the tests. `<eos>` must be ID 2 to match
+    /// Vocabulary shared by the parsing tests. `<eos>` must be ID 2 to match
     /// `MockTokenizer.eosTokenId`, so it is expected to be filtered out.
+    /// `<|im_end|>` is deliberately absent here so the parsing cases stay focused;
+    /// the universal base-vocab `<|im_end|>` fold is covered by `foldsBaseVocabImEnd`.
     private static let vocab: [String: Int] = [
         "<eot>": 1,
         "<eos>": 2,
         "<end_of_turn>": 3,
-        "<|im_end|>": 4,
         "<|endoftext|>": 5,
     ]
 
@@ -49,9 +50,7 @@ struct AdditionalStopTokensTests {
     private static func stopIds(config: String, tokenizerJSON: String? = nil) throws -> Set<Int32> {
         let dir = try tokenizerDir(config: config, tokenizerJSON: tokenizerJSON)
         defer { try? FileManager.default.removeItem(at: dir) }
-        return Set(
-            LanguageConfig.additionalStopTokenIds(from: dir, tokenizer: tokenizer())
-        )
+        return LanguageConfig.additionalStopTokenIds(from: dir, tokenizer: tokenizer())
     }
 
     // MARK: - Top-level turn-ending tokens
@@ -68,17 +67,16 @@ struct AdditionalStopTokensTests {
         #expect(ids == [1])
     }
 
-    @Test("top-level end_of_turn / im_end / endoftext keys are picked up")
+    @Test("top-level end_of_turn / endoftext keys are picked up")
     func topLevelOtherPatterns() throws {
         let ids = try Self.stopIds(
             config: """
                 {
                   "end_of_turn": "<end_of_turn>",
-                  "im_end": "<|im_end|>",
                   "endoftext": "<|endoftext|>"
                 }
                 """)
-        #expect(ids == [3, 4, 5])
+        #expect(ids == [3, 5])
     }
 
     @Test("top-level token equal to the main EOS is not duplicated")
@@ -198,9 +196,9 @@ struct AdditionalStopTokensTests {
 
     @Test("same turn-end ID from added_tokens_decoder and tokenizer.json is deduped")
     func dedupAcrossBothSources() throws {
-        // <end_of_turn> (106) appears in both added_tokens_decoder and
+        // <end_of_turn> (3) appears in both added_tokens_decoder and
         // tokenizer.json's added_tokens; <|im_end|> (4) only in the former.
-        // Result must still be a set: 106 once, plus 4.
+        // Result must still be a set: 3 once, plus 4.
         let ids = try Self.stopIds(
             config: """
                 {
@@ -219,5 +217,19 @@ struct AdditionalStopTokensTests {
                 }
                 """)
         #expect(ids == [3, 4])
+    }
+
+    // MARK: - Universal <|im_end|> fold
+
+    @Test("base-vocab <|im_end|> is folded in even when the config lists nothing")
+    func foldsBaseVocabImEnd() throws {
+        // The config resolves nothing on its own; <|im_end|> (4) reaches the set
+        // only via the universal base-vocab fold that keeps the text adapter, VLM
+        // adapter, server, and CLI from diverging.
+        let dir = try Self.tokenizerDir(config: #"{ "eos_token": "<eos>" }"#)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let ids = LanguageConfig.additionalStopTokenIds(
+            from: dir, tokenizer: MockTokenizer(vocab: ["<eos>": 2, "<|im_end|>": 4]))
+        #expect(ids == [4])
     }
 }
