@@ -316,7 +316,7 @@ func runChatCompletion(chatRequest: ChatCompletionRequest, state: ServerState, s
             logLine += ": \(calls.map(\.function.name).joined(separator: ", "))"
         }
     }
-    print(logLine)
+    logSummary(logLine)
     state.stats.record(
         promptTokens: promptTokens.count, genTokens: genTokenCount, promptSeconds: promptSeconds,
         genSeconds: genSeconds, totalSeconds: totalSeconds, toolCalls: responseToolCalls?.count ?? 0)
@@ -563,7 +563,7 @@ func runStreamingLoop(
             logLine += ": \(toolCallNames.joined(separator: ", "))"
         }
     }
-    print(logLine)
+    logSummary(logLine)
     state.stats.record(
         promptTokens: prepared.promptTokenCount, genTokens: tokenCount, promptSeconds: promptSeconds,
         genSeconds: genSeconds, totalSeconds: totalSeconds, toolCalls: toolCallNames.count)
@@ -735,6 +735,11 @@ private func buildStopSequences(from request: ChatCompletionRequest, state: Serv
         additionalSequences: additionalSequences,
         additionalEosTokenIds: state.config.additionalEosTokenIds
     )
+}
+
+// Per-request diagnostics go to stderr so a `--replay` stdout redirect captures clean JSONL.
+private func logSummary(_ line: String) {
+    FileHandle.standardError.write(Data((line + "\n").utf8))
 }
 
 private func ts() -> String {

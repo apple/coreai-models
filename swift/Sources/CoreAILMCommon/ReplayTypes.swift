@@ -133,7 +133,7 @@ public enum ReplayIO {
         let decoder = JSONDecoder()
         var indexed: [(Int, ReplayRequest)] = []
         for (i, rawLine) in text.split(separator: "\n", omittingEmptySubsequences: false).enumerated() {
-            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
             if line.isEmpty || line.hasPrefix("#") { continue }
             let req = try decoder.decode(ReplayRequest.self, from: Data(line.utf8))
             indexed.append((i, req))
