@@ -126,7 +126,18 @@ def test_standalone_recipe_defaults_to_release_and_offers_include_debug_info(rec
     assert "--include-debug-info" in source, (
         f"{recipe.parent.name}: missing the --include-debug-info flag"
     )
-    assert "Mode.RELEASE" in source, f"{recipe.parent.name}: does not default to RELEASE mode"
+    # A recipe defaults to RELEASE either by naming the mode explicitly
+    # (``Mode.RELEASE``) or by threading ``include_debug_info`` through the shared
+    # export helpers (``export_to_coreai`` / ``export_macos_model``), which default
+    # to RELEASE when it is False.
+    defaults_to_release = "Mode.RELEASE" in source or (
+        "include_debug_info" in source
+        and ("export_to_coreai" in source or "export_macos_model" in source)
+    )
+    assert defaults_to_release, (
+        f"{recipe.parent.name}: does not default to RELEASE mode (neither Mode.RELEASE "
+        "nor include_debug_info threaded through a shared export helper)"
+    )
     assert "TorchConverter()" not in source, (
         f"{recipe.parent.name}: constructs TorchConverter() with no mode, "
         "which silently inherits the library's DEBUG default"

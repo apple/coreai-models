@@ -71,6 +71,7 @@ def export_diffusion_gemma(
     encoder_only: bool = False,
     encoder_len: int = _TRACE_ENC_CTX,
     static_encoder: bool = False,
+    include_debug_info: bool = False,
 ) -> str:
     """Export DiffusionGemma to a Core AI bundle."""
     dtype = _resolve_dtype(compute_precision)
@@ -119,6 +120,7 @@ def export_diffusion_gemma(
             input_names=("input_ids", "position_ids"),
             output_names=("logits",),
             state_names=("keyCache", "valueCache"),
+            include_debug_info=include_debug_info,
         )
     else:
         export_cfg = ExportConfig(
@@ -126,6 +128,7 @@ def export_diffusion_gemma(
             max_context_length=max_context_length,
             compute_precision=compute_precision,
             compression=compression,
+            include_debug_info=include_debug_info,
         )
         # Pass the encoder as `config` too: _build_reference_inputs reads the unified
         # cache dims (num_key_value_heads=8, head_dim=512, num_hidden_layers) off it.
@@ -176,7 +179,10 @@ def export_diffusion_gemma(
         decoder = _quantize_decoder(decoder, compression, dec_inputs)
 
     dec_prog = export_to_coreai(
-        decoder, dec_inputs, output_names=("logits", "soft_embeds")
+        decoder,
+        dec_inputs,
+        output_names=("logits", "soft_embeds"),
+        include_debug_info=include_debug_info,
     )
     dec_path = bundle / "decoder.aimodel"
     _rm(dec_path, overwrite)
@@ -432,6 +438,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--verbose", "-v", action="store_true")
+    parser.add_argument(
+        "--include-debug-info",
+        action="store_true",
+        help="Export in the converter's DEBUG mode (embeds full debug info). Defaults to "
+        "RELEASE mode so shipped assets stay small.",
+    )
     return parser
 
 
@@ -454,6 +466,7 @@ def main() -> None:
         encoder_only=args.encoder_only,
         encoder_len=args.encoder_len,
         static_encoder=args.static_encoder,
+        include_debug_info=args.include_debug_info,
     )
     print(f"Export complete: {result}")
 
