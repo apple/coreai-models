@@ -3,10 +3,55 @@
 // Use of this source code is governed by a BSD-3-clause license that can
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
+import Foundation
+import FoundationModels
 import Testing
 import Tokenizers
 
 @testable import CoreAILanguageModels
+
+/// Records the messages/tools passed to `applyChatTemplate` so the FM-path tool
+/// injection can be inspected. A class so the nonmutating protocol method can store.
+private final class CapturingTokenizer: Tokenizer, @unchecked Sendable {
+    var capturedMessages: [Message] = []
+    var capturedTools: [ToolSpec]?
+    var bosToken: String? { nil }
+    var bosTokenId: Int? { nil }
+    var eosToken: String? { nil }
+    var eosTokenId: Int? { nil }
+    var unknownToken: String? { nil }
+    var unknownTokenId: Int? { nil }
+    func convertTokenToId(_ token: String) -> Int? { nil }
+    func convertIdToToken(_ id: Int) -> String? { nil }
+    func encode(text: String) -> [Int] { [] }
+    func encode(text: String, addSpecialTokens: Bool) -> [Int] { [] }
+    func callAsFunction(_ text: String, addSpecialTokens: Bool) -> [Int] { [] }
+    func decode(tokens: [Int]) -> String { "" }
+    func decode(tokens: [Int], skipSpecialTokens: Bool) -> String { "" }
+    func tokenize(text: String) -> [String] { [] }
+    func convertTokensToIds(_ tokens: [String]) -> [Int?] { [] }
+    func convertIdsToTokens(_ ids: [Int]) -> [String?] { [] }
+    func applyChatTemplate(messages: [Message]) throws -> [Int] { [] }
+    func applyChatTemplate(messages: [Message], tools: [ToolSpec]?) throws -> [Int] {
+        capturedMessages = messages
+        capturedTools = tools
+        return [1]
+    }
+    func applyChatTemplate(messages: [Message], tools: [ToolSpec]?, additionalContext: [String: any Sendable]?) throws
+        -> [Int]
+    { [] }
+    func applyChatTemplate(messages: [Message], chatTemplate: ChatTemplateArgument) throws -> [Int] { [] }
+    func applyChatTemplate(messages: [Message], chatTemplate: String) throws -> [Int] { [] }
+    func applyChatTemplate(
+        messages: [Message], chatTemplate: ChatTemplateArgument?, addGenerationPrompt: Bool, truncation: Bool,
+        maxLength: Int?, tools: [ToolSpec]?
+    ) throws -> [Int] { [] }
+    func applyChatTemplate(
+        messages: [Message], chatTemplate: ChatTemplateArgument?, addGenerationPrompt: Bool, truncation: Bool,
+        maxLength: Int?, tools: [ToolSpec]?, additionalContext: [String: any Sendable]?
+    ) throws -> [Int] { [] }
+    func applyChatTemplate(messages: [[String: String]]) throws -> [Int] { [] }
+}
 
 /// Minimal tokenizer whose `vocabContains` is exact (round-trips only the known tokens).
 private struct DialectTokenizer: Tokenizer {
@@ -161,5 +206,60 @@ struct ToolCallDialectTests {
         let call = firstToolCall(runParser(input, open: "<tool_call>", close: "</tool_call>", format: .json))
         #expect(call?.name == "add")
         #expect(call?.args == #"{"a":1}"#)
+    }
+
+    // toolsJSONForSystemMessage serializes with sorted keys so server and FM paths match.
+    @Test("toolsJSONForSystemMessage serializes tool specs with sorted keys")
+    func toolsJSONSortedKeys() {
+        let specs: [[String: any Sendable]] = [
+            ["type": "function", "function": ["name": "add", "description": "adds"]]
+        ]
+        let json = toolsJSONForSystemMessage(specs)
+        #expect(json == #"[{"function":{"description":"adds","name":"add"},"type":"function"}]"#)
+    }
+
+    // FM path: a Phi-style detection folds tools into a synthesized system message.
+    @Test("FM makeTokens injects tools into the system message for Phi")
+    func fmInjectsToolsForPhi() {
+        let tok = CapturingTokenizer()
+        let detection = ToolCallDetection(
+            openMarker: "<|tool_call|>", closeMarker: "<|/tool_call|>", format: .json,
+            toolsInSystemMessage: true)
+        _ = CoreAILanguageModel.CoreAIExecutor.makeTokens(
+            from: [.prompt(makePrompt("hi"))],
+            using: tok,
+            tools: [makeToolDef()],
+            toolCallDetection: detection)
+        let system = tok.capturedMessages.first { ($0["role"] as? String) == "system" }
+        #expect(system != nil)
+        #expect((system?["tools"] as? String)?.contains("lookup") == true)
+        #expect(tok.capturedTools?.isEmpty == false)
+    }
+
+    // FM path: a Qwen3-style detection leaves tools at the top level only.
+    @Test("FM makeTokens keeps tools top-level for Qwen3")
+    func fmTopLevelForQwen3() {
+        let tok = CapturingTokenizer()
+        let detection = ToolCallDetection(
+            openMarker: "<tool_call>", closeMarker: "</tool_call>", format: .json,
+            toolsInSystemMessage: false)
+        _ = CoreAILanguageModel.CoreAIExecutor.makeTokens(
+            from: [.prompt(makePrompt("hi"))],
+            using: tok,
+            tools: [makeToolDef()],
+            toolCallDetection: detection)
+        let system = tok.capturedMessages.first { ($0["role"] as? String) == "system" }
+        #expect(system == nil)
+        #expect(tok.capturedTools?.isEmpty == false)
+    }
+
+    private func makePrompt(_ text: String) -> Transcript.Prompt {
+        Transcript.Prompt(segments: [.text(Transcript.TextSegment(content: text))])
+    }
+
+    private func makeToolDef() -> Transcript.ToolDefinition {
+        let schema = try! GenerationSchema(
+            root: DynamicGenerationSchema(name: "args", properties: []), dependencies: [])
+        return Transcript.ToolDefinition(name: "lookup", description: "look things up", parameters: schema)
     }
 }

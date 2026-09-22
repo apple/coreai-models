@@ -611,8 +611,7 @@ private func tokenizeMessages(
     // `tools` variable. Attach the specs there (and synthesize a system message if none exists)
     // only for that dialect, so top-level-`tools` families (e.g. Qwen3) are not perturbed.
     if let toolSpecs, state.toolCallDetection?.toolsInSystemMessage == true,
-        let toolsData = try? JSONSerialization.data(withJSONObject: toolSpecs, options: [.sortedKeys]),
-        let toolsJSON = String(data: toolsData, encoding: .utf8)
+        let toolsJSON = toolsJSONForSystemMessage(toolSpecs)
     {
         templateMessages = applyToolsToSystemMessage(templateMessages, toolsJSON: toolsJSON)
     }

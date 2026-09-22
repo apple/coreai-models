@@ -251,6 +251,7 @@ public struct CoreAILanguageModel: LanguageModel {
                 from: Array(request.transcript),
                 using: model.tokenizer,
                 tools: request.enabledToolDefinitions,
+                toolCallDetection: model.toolCallDetection,
                 component: "CoreAIExecutor"
             )
             guard !promptTokens.isEmpty else {
@@ -607,6 +608,7 @@ public struct CoreAILanguageModel: LanguageModel {
             from entries: [Transcript.Entry],
             using tokenizer: any Tokenizer,
             tools: [Transcript.ToolDefinition] = [],
+            toolCallDetection: ToolCallDetection? = nil,
             component: String = "CoreAIExecutor"
         ) -> [Int] {
             var messages: [Message] = []
@@ -657,6 +659,16 @@ public struct CoreAILanguageModel: LanguageModel {
             if messages.isEmpty { return [] }
 
             let toolSpecs: [ToolSpec]? = tools.isEmpty ? nil : tools.compactMap { makeToolSpec(from: $0) }
+
+            // Phi-family templates read tools from a system message's `tools` key, not the
+            // top-level `tools` variable. Attach the specs there (synthesizing a system message
+            // if none exists) only for that dialect, mirroring the server's ChatHandler. Top-level
+            // `tools` is still passed for families such as Qwen3.
+            if let toolSpecs, toolCallDetection?.toolsInSystemMessage == true,
+                let toolsJSON = toolsJSONForSystemMessage(toolSpecs)
+            {
+                messages = applyToolsToSystemMessage(messages, toolsJSON: toolsJSON)
+            }
 
             do {
                 CLILogger.log("Applying chat template via tokenizer", component: component)

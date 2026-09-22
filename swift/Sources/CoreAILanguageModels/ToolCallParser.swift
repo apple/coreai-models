@@ -302,6 +302,16 @@ func effectiveToolCallFormat(declared: ToolCallParser.Format, body: String) -> T
 /// `message['tools']` (e.g. Phi). Attaches to an existing system message, else synthesizes a
 /// leading one. Gate the call on `toolsInSystemMessage` so top-level-`tools` families (e.g. Qwen3)
 /// are not perturbed by a synthetic system message.
+/// Serializes tool specs to a JSON string for the `applyToolsToSystemMessage` injection.
+/// Keys are sorted so the server and FM paths produce identical output.
+public func toolsJSONForSystemMessage(_ toolSpecs: [[String: any Sendable]]) -> String? {
+    guard
+        let data = try? JSONSerialization.data(withJSONObject: toolSpecs, options: [.sortedKeys]),
+        let json = String(data: data, encoding: .utf8)
+    else { return nil }
+    return json
+}
+
 public func applyToolsToSystemMessage(
     _ messages: [[String: any Sendable]],
     toolsJSON: String
