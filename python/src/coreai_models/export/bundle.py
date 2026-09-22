@@ -106,7 +106,7 @@ def _write_metadata(
         },
     }
     if speculative_config is not None:
-        metadata["speculative"] = _speculative_metadata(
+        metadata["speculative"] = _speculative_decoding_metadata(
             hf_config, speculative_config, drafter_config=drafter_config
         )
 
@@ -152,7 +152,7 @@ def _validate_drafter_target_geometry(target_config: Any, drafter_config: Any) -
         )
 
 
-def _speculative_metadata(
+def _speculative_decoding_metadata(
     hf_config: Any,
     runtime_knobs: dict[str, Any],
     drafter_config: Any | None = None,

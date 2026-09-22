@@ -114,7 +114,7 @@ class TestSpeculativeMetadata:
     def test_merge_and_key_rename(self):
         from types import SimpleNamespace
 
-        from coreai_models.export.bundle import _speculative_metadata
+        from coreai_models.export.bundle import _speculative_decoding_metadata
 
         cfg = SimpleNamespace(
             target_layer_ids=[1, 13, 25, 37, 49],
@@ -123,7 +123,7 @@ class TestSpeculativeMetadata:
             drafter_hidden_size=4096,
             hidden_size=5760,
         )
-        block = _speculative_metadata(cfg, {"num_draft_tokens": 5, "shared_embeddings": True})
+        block = _speculative_decoding_metadata(cfg, {"num_draft_tokens": 5, "shared_embeddings": True})
         assert block["mask_token_id"] == 201818  # draft_mask_token_id -> mask_token_id
         assert block["block_size"] == 16
         assert block["target_layer_ids"] == [1, 13, 25, 37, 49]
@@ -133,18 +133,18 @@ class TestSpeculativeMetadata:
     def test_drafter_hidden_size_falls_back_to_hidden_size(self):
         from types import SimpleNamespace
 
-        from coreai_models.export.bundle import _speculative_metadata
+        from coreai_models.export.bundle import _speculative_decoding_metadata
 
         cfg = SimpleNamespace(draft_mask_token_id=99, block_size=4, hidden_size=64)
-        assert _speculative_metadata(cfg, {})["drafter_hidden_size"] == 64
+        assert _speculative_decoding_metadata(cfg, {})["drafter_hidden_size"] == 64
 
     def test_runtime_knob_overrides_structural(self):
         from types import SimpleNamespace
 
-        from coreai_models.export.bundle import _speculative_metadata
+        from coreai_models.export.bundle import _speculative_decoding_metadata
 
         cfg = SimpleNamespace(block_size=16, hidden_size=64)
-        assert _speculative_metadata(cfg, {"block_size": 8})["block_size"] == 8
+        assert _speculative_decoding_metadata(cfg, {"block_size": 8})["block_size"] == 8
 
 
 class TestDrafterStructuralValidation:
@@ -185,7 +185,7 @@ class TestDrafterStructuralValidation:
     def test_structural_metadata_sourced_from_drafter_not_target(self):
         from types import SimpleNamespace
 
-        from coreai_models.export.bundle import _speculative_metadata
+        from coreai_models.export.bundle import _speculative_decoding_metadata
 
         # Target has NO DFlash structural attrs at all — proving the block is
         # sourced from the drafter, not implicitly from the target.
@@ -197,7 +197,7 @@ class TestDrafterStructuralValidation:
             num_key_value_heads=8,
         )
         drafter = self._drafter()
-        block = _speculative_metadata(target, {"drafter_kind": "dflash"}, drafter_config=drafter)
+        block = _speculative_decoding_metadata(target, {"drafter_kind": "dflash"}, drafter_config=drafter)
         assert block["block_size"] == 16
         assert block["mask_token_id"] == 201818
         assert block["target_layer_ids"] == [1, 13, 25, 37, 49]
@@ -205,45 +205,45 @@ class TestDrafterStructuralValidation:
         assert block["drafter_kind"] == "dflash"
 
     def test_matching_geometry_passes(self):
-        from coreai_models.export.bundle import _speculative_metadata
+        from coreai_models.export.bundle import _speculative_decoding_metadata
 
         # Should not raise.
-        _speculative_metadata(self._target(), {}, drafter_config=self._drafter())
+        _speculative_decoding_metadata(self._target(), {}, drafter_config=self._drafter())
 
     def test_vocab_divergence_fails_loud(self):
         import pytest
 
-        from coreai_models.export.bundle import _speculative_metadata
+        from coreai_models.export.bundle import _speculative_decoding_metadata
 
         # The historical crash: drafter 262144 vs target 202048.
         drafter = self._drafter(vocab_size=262144)
         with pytest.raises(ValueError, match=r"vocab_size.*262144.*202048"):
-            _speculative_metadata(self._target(), {}, drafter_config=drafter)
+            _speculative_decoding_metadata(self._target(), {}, drafter_config=drafter)
 
     def test_head_dim_divergence_fails_loud(self):
         import pytest
 
-        from coreai_models.export.bundle import _speculative_metadata
+        from coreai_models.export.bundle import _speculative_decoding_metadata
 
         drafter = self._drafter(head_dim=64)
         with pytest.raises(ValueError, match=r"head_dim"):
-            _speculative_metadata(self._target(), {}, drafter_config=drafter)
+            _speculative_decoding_metadata(self._target(), {}, drafter_config=drafter)
 
     def test_shallower_drafter_is_not_a_divergence(self):
-        from coreai_models.export.bundle import _speculative_metadata
+        from coreai_models.export.bundle import _speculative_decoding_metadata
 
         # num_hidden_layers differs by design (drafter is shallow) — must NOT raise.
         drafter = self._drafter(num_hidden_layers=2)
-        _speculative_metadata(self._target(), {}, drafter_config=drafter)
+        _speculative_decoding_metadata(self._target(), {}, drafter_config=drafter)
 
     def test_absent_param_on_one_side_is_not_a_divergence(self):
         from types import SimpleNamespace
 
-        from coreai_models.export.bundle import _speculative_metadata
+        from coreai_models.export.bundle import _speculative_decoding_metadata
 
         # Target omits head_dim; comparison skips it rather than false-positiving.
         target = SimpleNamespace(vocab_size=202048, hidden_size=5760)
-        _speculative_metadata(target, {}, drafter_config=self._drafter())
+        _speculative_decoding_metadata(target, {}, drafter_config=self._drafter())
 
 
 class TestRegistry:

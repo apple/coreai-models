@@ -509,8 +509,8 @@ async def _async_export_model(config: ExportConfig) -> str:
             )
             del drafter_program
             # Signal the DFlash two-phase runtime path via the drafter_kind knob
-            # (bundle._speculative_metadata anticipates it). DFlash drafts
-            # block_size tokens per cycle (a structural constant _speculative_metadata
+            # (bundle._speculative_decoding_metadata anticipates it). DFlash drafts
+            # block_size tokens per cycle (a structural constant _speculative_decoding_metadata
             # reads from the config), NOT the ring drafter's num_draft_tokens=5, so
             # drop that misleading knob and keep only what still applies here.
             speculative_config = {

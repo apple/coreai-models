@@ -608,11 +608,6 @@ def export_dflash_drafter(model: BaseForCausalLM, config, export_config) -> AIPr
         # _make_dflash_export_fn traces a small nn.Module wrapper that delegates to the
         # entrypoint; the wrapper holds the model add_pytorch_module patched, so
         # externalization still sees the patched composite-op submodules.
-        #
-        # Fallback if a future coreai_torch rejects the wrapper: build each program by
-        # hand (torch.export.export -> run_decompositions -> remove_functionalization on
-        # the wrapper) and stage it via converter.add_exported_program instead, mirroring
-        # iOS's _convert_to_coreai. That trades away composite-op externalization.
         converter.add_pytorch_module(
             model,
             export_fn=_make_dflash_export_fn(graph, reference_inputs[graph], dynamic_shapes[graph]),
