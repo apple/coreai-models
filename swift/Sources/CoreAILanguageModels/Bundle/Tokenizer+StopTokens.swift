@@ -7,6 +7,12 @@ import Foundation
 import Tokenizers
 
 extension Tokenizer {
+    /// Whether `token` is a genuine entry in the vocabulary, not an unk-token fallback.
+    func vocabContains(_ token: String) -> Bool {
+        guard let id = convertTokenToId(token) else { return false }
+        return convertIdToToken(id) == token
+    }
+
     /// Token IDs that terminate generation: the tokenizer's main EOS (when
     /// present), a base-vocab `<|im_end|>` (when present), and the load-time
     /// `additional` IDs resolved by `LanguageConfig.additionalStopTokenIds`.

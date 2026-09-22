@@ -495,17 +495,13 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             additionalEosTokenIds = []
         }
 
-        // Agentic models use <|eot|> / <|eom|> as turn boundaries.
-        // These may not appear in tokenizer_config.json, so add them explicitly.
+        // Agentic models use <|eot|> as a turn boundary. It may not appear in
+        // tokenizer_config.json, so add it explicitly (skipping the main EOS).
         let thinkingFormat = detectThinkingFormat(using: tokenizer)
-        if case .agentic(_, _, _, let eot) = thinkingFormat, tokenizer.vocabContains(eot) {
-            let mainEos = tokenizer.eosTokenId.map { Int32($0) }
-            if let id = tokenizer.convertTokenToId(eot) {
-                let id32 = Int32(id)
-                if id32 != mainEos {
-                    additionalEosTokenIds.insert(id32)
-                }
-            }
+        if let eotId = agenticEndOfTurnTokenId(thinkingFormat: thinkingFormat, tokenizer: tokenizer),
+            eotId != tokenizer.eosTokenId.map({ Int32($0) })
+        {
+            additionalEosTokenIds.insert(eotId)
         }
 
         CLILogger.log("Model loaded successfully:", component: "Main")

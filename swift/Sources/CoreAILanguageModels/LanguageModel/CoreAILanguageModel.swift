@@ -173,10 +173,8 @@ public struct CoreAILanguageModel: LanguageModel {
         // Agentic models stop on <|eot|> so the runner doesn't loop self->user
         // turns. This is text-adapter-specific, so it is folded in here rather
         // than in the shared resolver.
-        if case .agentic(_, _, _, let eot) = thinkingFormat,
-            tokenizer.vocabContains(eot), let id = tokenizer.convertTokenToId(eot)
-        {
-            additional.insert(Int32(id))
+        if let id = agenticEndOfTurnTokenId(thinkingFormat: thinkingFormat, tokenizer: tokenizer) {
+            additional.insert(id)
         }
         self.additionalEosTokenIds = additional
     }

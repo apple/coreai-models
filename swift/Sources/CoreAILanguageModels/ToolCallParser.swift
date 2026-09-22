@@ -6,16 +6,6 @@
 import Foundation
 import Tokenizers
 
-// MARK: - Tokenizer vocabulary probe
-
-extension Tokenizer {
-    /// Whether `token` is a genuine entry in the vocabulary, not an unk-token fallback.
-    public func vocabContains(_ token: String) -> Bool {
-        guard let id = convertTokenToId(token) else { return false }
-        return convertIdToToken(id) == token
-    }
-}
-
 /// Streaming parser that detects tool call blocks in the model's token stream.
 public struct ToolCallParser: Sendable {
     public enum Event {
@@ -283,4 +273,20 @@ public func detectThinkingFormat(using tokenizer: any Tokenizer) -> ThinkTagPars
         }
     }
     return .tagPair(open: "<think>", close: "</think>")
+}
+
+/// Turn-end token ID for an agentic thinking format, or nil.
+///
+/// Agentic models stop on `<|eot|>` so a runner doesn't loop self->user turns.
+/// Returns the id only when the format is `.agentic` and its `endOfTurn` token
+/// is a genuine vocabulary entry.
+public func agenticEndOfTurnTokenId(
+    thinkingFormat: ThinkTagParser.Format,
+    tokenizer: any Tokenizer
+) -> Int32? {
+    guard case .agentic(_, _, _, let eot) = thinkingFormat,
+        tokenizer.vocabContains(eot),
+        let id = tokenizer.convertTokenToId(eot)
+    else { return nil }
+    return Int32(id)
 }
