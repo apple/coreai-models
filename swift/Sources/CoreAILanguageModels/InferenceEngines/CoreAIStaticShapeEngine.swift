@@ -411,7 +411,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
 
     public func inference(
         inputTokens: [Int32], samplingConfig: SamplingConfiguration, returnsLogits: Bool,
-        generationStartOffset: Int = 0
+        generationStartOffset: Int = 0, step: Int = 0
     ) async throws -> (logits: [LogitsScalarType]?, token: Int32) {
         CLILogger.log("Inference: \(inputTokens.count) tokens, processed: \(processedTokenCount)")
 
@@ -497,7 +497,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         let actualLogits = returnsLogits ? logitBuffer : nil
         let sampleSpan = InstrumentsProfiler.beginSample(strategy: "cpu-fallback")
         let nextToken = samplingConfig.fallbackSampler(
-            from: &logitBuffer, tokenHistory: inputTokens[generationStartOffset...])
+            from: &logitBuffer, tokenHistory: inputTokens[generationStartOffset...], step: step)
         sampleSpan.end()
         CLILogger.log("Token: \(nextToken), processed: \(processedTokenCount)")
         return (logits: actualLogits, token: nextToken)
@@ -732,7 +732,8 @@ extension StaticShapeEngine.GenerationSequence {
                     inputTokens: inputTokens,
                     samplingConfig: samplingConfiguration,
                     returnsLogits: returnsLogits || forcedContinuation != nil,
-                    generationStartOffset: generationStartOffset
+                    generationStartOffset: generationStartOffset,
+                    step: step
                 )
 
                 // Update history with newly processed tokens

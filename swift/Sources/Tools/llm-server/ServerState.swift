@@ -124,6 +124,11 @@ final class ServerState: @unchecked Sendable {
     let queue: RequestQueue
     let toolCallDetection: ToolCallDetection?
     let thinkingFormat: ThinkTagParser.Format
+    /// Stable identifier for the backend configuration, echoed on responses as
+    /// `system_fingerprint`. Reproducible outputs (same `seed` + prompt) are only
+    /// guaranteed while this value is unchanged; it changes when output-affecting
+    /// configuration (model, engine, context length, sampling defaults) changes.
+    let systemFingerprint: String
     private let _state = Mutex<InternalState>(InternalState())
 
     private struct InternalState {
@@ -142,6 +147,28 @@ final class ServerState: @unchecked Sendable {
         self.queue = RequestQueue(maxDepth: config.maxQueueDepth)
         self.toolCallDetection = detectToolCallFormat(using: tokenizer)
         self.thinkingFormat = detectThinkingFormat(using: tokenizer)
+        self.systemFingerprint = Self.makeSystemFingerprint(config: config, engine: engine)
+    }
+
+    /// Deterministic FNV-1a hash of a canonical config descriptor. Deterministic (not
+    /// Swift's per-process-seeded `Hasher`) so two identical launches produce the same
+    /// fingerprint and a config change produces a different one.
+    private static func makeSystemFingerprint(config: ServerConfig, engine: any InferenceEngine) -> String {
+        let descriptor = [
+            config.modelName,
+            String(describing: type(of: engine)),
+            "ctx=\(config.maxContextLength)",
+            "t=\(config.defaultTemperature)",
+            "k=\(config.defaultTopK.map { "\($0)" } ?? "nil")",
+            "p=\(config.defaultTopP.map { "\($0)" } ?? "nil")",
+            "mp=\(config.defaultMinP.map { "\($0)" } ?? "nil")",
+        ].joined(separator: "|")
+        var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+        for byte in descriptor.utf8 {
+            hash ^= UInt64(byte)
+            hash = hash &* 0x0000_0100_0000_01b3
+        }
+        return "fp_" + String(hash, radix: 16)
     }
 
     var supportsToolCalling: Bool { toolCallDetection != nil }
@@ -258,7 +285,8 @@ final class ServerState: @unchecked Sendable {
         temperature: Double?,
         topP: Double?,
         topK: Int?,
-        minP: Double?
+        minP: Double?,
+        seed: UInt64? = nil
     ) -> SamplingConfiguration {
         let temp = temperature ?? config.defaultTemperature
         if temp == 0 {
@@ -268,7 +296,8 @@ final class ServerState: @unchecked Sendable {
             temperature: temp,
             topK: topK ?? config.defaultTopK,
             topP: topP ?? config.defaultTopP,
-            minP: minP ?? config.defaultMinP
+            minP: minP ?? config.defaultMinP,
+            seed: seed
         )
     }
 }

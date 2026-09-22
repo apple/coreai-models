@@ -183,7 +183,8 @@ private func handleNonStreamingRequest(chatRequest: ChatCompletionRequest, state
         temperature: chatRequest.temperature,
         topP: chatRequest.topP,
         topK: chatRequest.topK,
-        minP: nil
+        minP: nil,
+        seed: chatRequest.seed
     )
 
     let reasoningEffort = ReasoningEffort.resolve(
@@ -329,7 +330,8 @@ private func handleNonStreamingRequest(chatRequest: ChatCompletionRequest, state
             promptTokens: promptTokens.count,
             completionTokens: genTokenCount,
             totalTokens: promptTokens.count + genTokenCount
-        )
+        ),
+        systemFingerprint: state.systemFingerprint
     )
 
     let data = try JSONEncoder().encode(response)
@@ -358,7 +360,8 @@ private func handleStreamingRequest(
         temperature: chatRequest.temperature,
         topP: chatRequest.topP,
         topK: chatRequest.topK,
-        minP: nil
+        minP: nil,
+        seed: chatRequest.seed
     )
 
     let reasoningEffort = ReasoningEffort.resolve(
@@ -393,7 +396,8 @@ private func handleStreamingRequest(
 
             let roleChunk = ChatCompletionChunk(
                 id: requestID, object: "chat.completion.chunk", created: created, model: state.config.modelName,
-                choices: [.init(index: 0, delta: .init(role: "assistant", content: nil), finishReason: nil)]
+                choices: [.init(index: 0, delta: .init(role: "assistant", content: nil), finishReason: nil)],
+                systemFingerprint: state.systemFingerprint
             )
             if let data = try? encoder.encode(roleChunk), let json = String(data: data, encoding: .utf8) {
                 try await writer.write(ByteBuffer(string: "data: \(json)\n\n"))
@@ -429,7 +433,8 @@ private func handleStreamingRequest(
                 let chunk = ChatCompletionChunk(
                     id: requestID, object: "chat.completion.chunk", created: created,
                     model: state.config.modelName,
-                    choices: [.init(index: 0, delta: delta, finishReason: nil)])
+                    choices: [.init(index: 0, delta: delta, finishReason: nil)],
+                    systemFingerprint: state.systemFingerprint)
                 if let data = try? encoder.encode(chunk),
                     let json = String(data: data, encoding: .utf8)
                 {
@@ -511,7 +516,8 @@ private func handleStreamingRequest(
             let finishReason = tokenCount >= requestMaxTokens ? "length" : (hasToolCalls ? "tool_calls" : "stop")
             let doneChunk = ChatCompletionChunk(
                 id: requestID, object: "chat.completion.chunk", created: created, model: state.config.modelName,
-                choices: [.init(index: 0, delta: .init(role: nil, content: nil), finishReason: finishReason)]
+                choices: [.init(index: 0, delta: .init(role: nil, content: nil), finishReason: finishReason)],
+                systemFingerprint: state.systemFingerprint
             )
             if let data = try? encoder.encode(doneChunk), let json = String(data: data, encoding: .utf8) {
                 try await writer.write(ByteBuffer(string: "data: \(json)\n\n"))
