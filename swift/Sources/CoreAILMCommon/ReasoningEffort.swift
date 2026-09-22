@@ -7,13 +7,13 @@ import Foundation
 
 /// Thrown when server flags request contradictory reasoning defaults.
 public enum ReasoningEffortError: Error, CustomStringConvertible {
-    /// `--no-thinking` was combined with a non-`none` `--reasoning-default`.
+    /// `--no-thinking` was combined with a non-`none` `--default-reasoning-effort`.
     case contradiction(default: String)
 
     public var description: String {
         switch self {
         case .contradiction(let value):
-            return "--no-thinking conflicts with --reasoning-default \(value); --no-thinking means none"
+            return "--no-thinking conflicts with --default-reasoning-effort \(value); --no-thinking means none"
         }
     }
 }
@@ -60,11 +60,11 @@ public enum ReasoningEffort {
         effort?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == none
     }
 
-    /// Folds the `--no-thinking` alias into the server's `--reasoning-default`. `--no-thinking`
+    /// Folds the `--no-thinking` alias into the server's `--default-reasoning-effort`. `--no-thinking`
     /// means `none`; combining it with a non-`none` default is a contradiction.
-    public static func resolveDefault(reasoningDefault: String?, noThinking: Bool) throws -> String? {
-        guard noThinking else { return reasoningDefault }
-        if let value = reasoningDefault, !disablesThinking(value) {
+    public static func resolveDefault(defaultReasoningEffort: String?, noThinking: Bool) throws -> String? {
+        guard noThinking else { return defaultReasoningEffort }
+        if let value = defaultReasoningEffort, !disablesThinking(value) {
             throw ReasoningEffortError.contradiction(default: value)
         }
         return none

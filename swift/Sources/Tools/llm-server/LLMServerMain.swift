@@ -68,14 +68,17 @@ struct LLMServer: AsyncParsableCommand {
     @Option(name: .customLong("max-queue-depth"), help: "Max requests queued before returning 429 (default: 16)")
     var maxQueueDepth: Int = 16
 
-    @Flag(name: .customLong("no-thinking"), help: "Disable thinking/reasoning (alias for --reasoning-default none)")
+    @Flag(
+        name: .customLong("no-thinking"),
+        help: "Disable thinking/reasoning (alias for --default-reasoning-effort none)"
+    )
     var noThinking: Bool = false
 
     @Option(
-        name: .customLong("reasoning-default"),
+        name: .customLong("default-reasoning-effort"),
         help: "Default reasoning_effort when a request omits it (none, low, medium, high)."
     )
-    var reasoningDefault: String?
+    var defaultReasoningEffort: String?
 
     @Flag(
         name: .customLong("clear-coreai-cache"),
@@ -91,7 +94,8 @@ struct LLMServer: AsyncParsableCommand {
             throw ValidationError("--max-queue-depth must be >= 0 (got \(maxQueueDepth))")
         }
         do {
-            _ = try ReasoningEffort.resolveDefault(reasoningDefault: reasoningDefault, noThinking: noThinking)
+            _ = try ReasoningEffort.resolveDefault(
+                defaultReasoningEffort: defaultReasoningEffort, noThinking: noThinking)
         } catch {
             throw ValidationError("\(error)")
         }
@@ -198,7 +202,7 @@ struct LLMServer: AsyncParsableCommand {
         }
 
         let resolvedReasoningDefault = try ReasoningEffort.resolveDefault(
-            reasoningDefault: reasoningDefault, noThinking: noThinking)
+            defaultReasoningEffort: defaultReasoningEffort, noThinking: noThinking)
 
         let config = ServerConfig(
             modelName: modelName,
@@ -226,7 +230,7 @@ struct LLMServer: AsyncParsableCommand {
             print("  Engine: \(type(of: engine))")
             print("  Logprobs: \(supportsLogprobs ? "supported" : "not supported (use --variant coreai-sequential)")")
             print("  Context: \(bundle.maxContextLength) tokens")
-            print("  Reasoning default: \(config.defaultReasoningEffort ?? "template default")")
+            print("  Default reasoning effort: \(config.defaultReasoningEffort ?? "template default")")
             print("  Max queue depth: \(maxQueueDepth)")
             let topKStr = topK.map { "\($0)" } ?? "nil"
             let topPStr = topP.map { "\($0)" } ?? "nil"

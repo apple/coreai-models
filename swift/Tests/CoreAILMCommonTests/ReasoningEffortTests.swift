@@ -51,17 +51,17 @@ struct ReasoningEffortTests {
 
     @Test("--no-thinking folds into the reasoning default as none")
     func resolveDefaultNoThinking() throws {
-        #expect(try ReasoningEffort.resolveDefault(reasoningDefault: nil, noThinking: true) == "none")
-        #expect(try ReasoningEffort.resolveDefault(reasoningDefault: nil, noThinking: false) == nil)
-        #expect(try ReasoningEffort.resolveDefault(reasoningDefault: "low", noThinking: false) == "low")
+        #expect(try ReasoningEffort.resolveDefault(defaultReasoningEffort: nil, noThinking: true) == "none")
+        #expect(try ReasoningEffort.resolveDefault(defaultReasoningEffort: nil, noThinking: false) == nil)
+        #expect(try ReasoningEffort.resolveDefault(defaultReasoningEffort: "low", noThinking: false) == "low")
         // --no-thinking plus an explicit none default is consistent, not a conflict.
-        #expect(try ReasoningEffort.resolveDefault(reasoningDefault: "none", noThinking: true) == "none")
+        #expect(try ReasoningEffort.resolveDefault(defaultReasoningEffort: "none", noThinking: true) == "none")
     }
 
     @Test("--no-thinking with a non-none default is rejected")
     func resolveDefaultContradiction() {
         #expect(throws: ReasoningEffortError.self) {
-            try ReasoningEffort.resolveDefault(reasoningDefault: "low", noThinking: true)
+            try ReasoningEffort.resolveDefault(defaultReasoningEffort: "low", noThinking: true)
         }
     }
 
