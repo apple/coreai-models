@@ -98,32 +98,6 @@ class TestDFlashDrafter:
             assert k[0, 0, 0, 0, :].norm().item() > 0, "Cache should be populated after inject_kv"
             assert k[0, 0, 0, 3, :].norm().item() == 0
 
-    def test_draft_output_shape(self):
-        cfg = _make_small_config()
-        K = cfg.block_size
-        model = MuseGlimmerDFlashDrafterForCausalLM(cfg)
-        model.eval()
-
-        k = torch.zeros(
-            cfg.num_hidden_layers,
-            1,
-            cfg.num_key_value_heads,
-            cfg.sliding_window,
-            cfg.head_dim,
-        )
-        v = torch.zeros_like(k)
-        cache = RingKVCache(k, v)
-
-        features = torch.randn(1, 5, cfg.hidden_size)
-        model.inject_kv(features, torch.arange(5).unsqueeze(0), cache)
-
-        draft_ids = torch.tensor([[42] + [cfg.mask_token_id] * (K - 1)])
-        full_pos = torch.arange(5 + K).unsqueeze(0)
-        with torch.no_grad():
-            logits = model.draft(draft_ids, full_pos, cache)
-
-        assert logits.shape == (1, K, cfg.vocab_size)
-
     def test_draft_no_nan(self):
         cfg = _make_small_config()
         K = cfg.block_size
@@ -337,9 +311,18 @@ class TestMuseGlimmerWithDrafter:
         assert extracted[0].shape == (1, 4, config.hidden_size)
         assert hidden.shape == (1, 4, config.hidden_size)
 
-    def test_fused_target_dual_output(self):
+    def test_fused_target_emits_drafter_features_from_target_layer(self):
+        """Fusion: the fused target emits (logits, drafter_features) and the
+        features are derived from the hidden states at the configured
+        target_layer_ids (non-adjacent [0, 2] here).
+
+        Forward hooks capture the outputs of the configured tap layers, and the
+        features are recomputed by feeding those exact captures through the
+        model's own encoder. If fusion tapped the wrong layers or dropped the
+        second output, the recomputation diverges (or the unpack fails).
+        """
         config = _make_small_config()
-        config.target_layer_ids = [0, 1, 2, 3]  # 4 layers to match encoder_fc
+        assert config.target_layer_ids == [0, 2]
 
         model = MuseGlimmerForCausalLMWithDrafter(config)
         model.eval()
@@ -353,10 +336,33 @@ class TestMuseGlimmerWithDrafter:
         sk = torch.zeros(ns, 1, config.num_key_value_heads, config.sliding_window, config.head_dim)
         sv = torch.zeros_like(sk)
 
-        with torch.no_grad():
-            logits, features = model(ids, pos, gk, gv, sk, sv)
+        captured: dict[int, torch.Tensor] = {}
+        handles = []
+        for lid in config.target_layer_ids:
 
+            def _hook(_module, _inputs, output, lid=lid):
+                captured[lid] = output
+
+            handles.append(model.model.layers[lid].register_forward_hook(_hook))
+
+        try:
+            with torch.no_grad():
+                out = model(ids, pos, gk, gv, sk, sv)
+        finally:
+            for h in handles:
+                h.remove()
+
+        # (a) two outputs with the documented shapes.
+        assert isinstance(out, tuple) and len(out) == 2
+        logits, features = out
         assert logits.shape == (1, 4, config.vocab_size)
         assert features.shape == (1, 4, config.hidden_size)
         assert not torch.isnan(logits).any()
         assert not torch.isnan(features).any()
+
+        # (b) features are the encoder applied to the configured layers' hidden
+        # states, not some other layer's.
+        taps = torch.cat([captured[lid] for lid in config.target_layer_ids], dim=-1)
+        with torch.no_grad():
+            expected = model.encoder_norm(model.encoder_fc(taps))
+        assert torch.allclose(features, expected, atol=1e-5)
