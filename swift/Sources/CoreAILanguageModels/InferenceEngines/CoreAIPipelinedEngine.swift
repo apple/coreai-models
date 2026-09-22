@@ -129,6 +129,7 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
                     + "Use a sequential engine for evaluation."
             )
         }
+        try Self.rejectSeedIfUnsupported(samplingConfiguration)
 
         // Serialize: if a prior generation is still winding down (GPU drain),
         // cancel it and wait for the engine slot to be released.
@@ -271,6 +272,7 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
         maxTokens: Int,
         session: ConstrainedSessionHandle
     ) throws -> InferenceTokenSequence {
+        try Self.rejectSeedIfUnsupported(samplingConfiguration)
         if _generationTask.withLock({ $0 }) != nil || engineInUse.load(ordering: .acquiring) {
             throw InferenceRuntimeError.invalidState(
                 "generateConstrained called while a prior generation is still in flight — caller must drain first"
@@ -399,6 +401,21 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
     func validateSamplingStrategy(_ config: SamplingConfiguration) throws {
         // All sampling configurations are now supported by the GPU sampler:
         // greedy, temperature, topK, topP, and minP.
+    }
+
+    /// Reject a seeded request that reaches the GPU pipelined engine.
+    ///
+    /// Sampling runs on-GPU with `Float.random`, so the engine cannot honor
+    /// `SamplingConfiguration.seed`. Fail loudly rather than silently ignoring the seed
+    /// and returning non-reproducible tokens.
+    static func rejectSeedIfUnsupported(_ config: SamplingConfiguration) throws {
+        if config.seed != nil {
+            throw InferenceRuntimeError.invalidArgument(
+                "Seeded/reproducible generation is not supported on the GPU pipelined engine "
+                    + "(sampling runs on-GPU and cannot honor the seed). "
+                    + "Use a sequential or static-shape engine for reproducible generation."
+            )
+        }
     }
 
     func warmup(queryLength: Int, sampling: SamplingConfiguration?) async throws {

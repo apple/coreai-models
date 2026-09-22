@@ -26,8 +26,9 @@ struct AdditionalStopTokensTests {
         MockTokenizer(vocab: vocab)
     }
 
-    /// Write `tokenizer_config.json` into a fresh temp directory and return it.
-    private static func tokenizerDir(config: String) throws -> URL {
+    /// Write `tokenizer_config.json` (and optionally `tokenizer.json`) into a
+    /// fresh temp directory and return it.
+    private static func tokenizerDir(config: String, tokenizerJSON: String? = nil) throws -> URL {
         let dir = FileManager.default.temporaryDirectory.appending(
             path: "AdditionalStopTokensTests-\(UUID().uuidString)"
         )
@@ -36,11 +37,17 @@ struct AdditionalStopTokensTests {
             to: dir.appending(path: "tokenizer_config.json"),
             atomically: true, encoding: .utf8
         )
+        if let tokenizerJSON {
+            try tokenizerJSON.write(
+                to: dir.appending(path: "tokenizer.json"),
+                atomically: true, encoding: .utf8
+            )
+        }
         return dir
     }
 
-    private static func stopIds(config: String) throws -> Set<Int32> {
-        let dir = try tokenizerDir(config: config)
+    private static func stopIds(config: String, tokenizerJSON: String? = nil) throws -> Set<Int32> {
+        let dir = try tokenizerDir(config: config, tokenizerJSON: tokenizerJSON)
         defer { try? FileManager.default.removeItem(at: dir) }
         return Set(
             LanguageConfig.additionalStopTokenIds(from: dir, tokenizer: tokenizer())
@@ -106,5 +113,111 @@ struct AdditionalStopTokensTests {
                 }
                 """)
         #expect(ids.isEmpty)
+    }
+
+    // MARK: - tokenizer.json added_tokens (exported bundles)
+
+    @Test("Gemma exported bundle stops on <end_of_turn> via tokenizer.json")
+    func gemmaExportedBundleEndOfTurn() throws {
+        // save_pretrained drops added_tokens_decoder from tokenizer_config.json
+        // and keeps the specials in tokenizer.json, so 106 must be recovered
+        // from there.
+        let ids = try Self.stopIds(
+            config: """
+                {
+                  "eos_token": "<eos>"
+                }
+                """,
+            tokenizerJSON: """
+                {
+                  "added_tokens": [
+                    { "id": 106, "content": "<end_of_turn>", "special": true },
+                    { "id": 2, "content": "<eos>", "special": true },
+                    { "id": 255999, "content": "<start_of_image>", "special": true }
+                  ]
+                }
+                """)
+        #expect(ids == [106])
+    }
+
+    @Test("Phi exported bundle stops on <|end|> via tokenizer.json")
+    func phiExportedBundleEnd() throws {
+        // Phi-4-mini ends assistant turns with <|end|> (ID 200020) while its main
+        // EOS is <|endoftext|>, and save_pretrained keeps <|end|> in tokenizer.json.
+        let ids = try Self.stopIds(
+            config: """
+                {
+                  "eos_token": "<eos>"
+                }
+                """,
+            tokenizerJSON: """
+                {
+                  "added_tokens": [
+                    { "id": 200020, "content": "<|end|>", "special": true }
+                  ]
+                }
+                """)
+        #expect(ids == [200020])
+    }
+
+    @Test("tokenizer.json non-special turn token is ignored")
+    func tokenizerJSONNonSpecialIgnored() throws {
+        let ids = try Self.stopIds(
+            config: """
+                {
+                  "eos_token": "<eos>"
+                }
+                """,
+            tokenizerJSON: """
+                {
+                  "added_tokens": [
+                    { "id": 106, "content": "<end_of_turn>", "special": false }
+                  ]
+                }
+                """)
+        #expect(ids.isEmpty)
+    }
+
+    @Test("tokenizer.json entry equal to the main EOS is not duplicated")
+    func tokenizerJSONSkipsMainEos() throws {
+        let ids = try Self.stopIds(
+            config: """
+                {
+                  "eos_token": "<eos>"
+                }
+                """,
+            tokenizerJSON: """
+                {
+                  "added_tokens": [
+                    { "id": 2, "content": "<endoftext>", "special": true }
+                  ]
+                }
+                """)
+        #expect(ids.isEmpty)
+    }
+
+    @Test("same turn-end ID from added_tokens_decoder and tokenizer.json is deduped")
+    func dedupAcrossBothSources() throws {
+        // <end_of_turn> (106) appears in both added_tokens_decoder and
+        // tokenizer.json's added_tokens; <|im_end|> (4) only in the former.
+        // Result must still be a set: 106 once, plus 4.
+        let ids = try Self.stopIds(
+            config: """
+                {
+                  "eos_token": "<eos>",
+                  "added_tokens_decoder": {
+                    "3": { "content": "<end_of_turn>", "special": true },
+                    "4": { "content": "<|im_end|>", "special": true }
+                  }
+                }
+                """,
+            tokenizerJSON: """
+                {
+                  "added_tokens": [
+                    { "id": 3, "content": "<end_of_turn>", "special": true }
+                  ]
+                }
+                """)
+        #expect(ids == [3, 4])
     }
 }
