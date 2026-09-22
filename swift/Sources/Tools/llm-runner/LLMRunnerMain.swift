@@ -482,7 +482,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             component: "Main")
 
         // Read additional stop token IDs from tokenizer_config.json (e.g. <end_of_turn> for Gemma)
-        let additionalEosTokenIds: Set<Int32>
+        var additionalEosTokenIds: Set<Int32>
         if let tokenizerDir = bundle.tokenizerPath {
             additionalEosTokenIds = LanguageConfig.additionalStopTokenIds(
                 from: tokenizerDir, tokenizer: tokenizer)
@@ -493,6 +493,19 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             }
         } else {
             additionalEosTokenIds = []
+        }
+
+        // Agentic models use <|eot|> / <|eom|> as turn boundaries.
+        // These may not appear in tokenizer_config.json, so add them explicitly.
+        let thinkingFormat = detectThinkingFormat(using: tokenizer)
+        if case .agentic(_, _, _, let eot) = thinkingFormat, tokenizer.vocabContains(eot) {
+            let mainEos = tokenizer.eosTokenId.map { Int32($0) }
+            if let id = tokenizer.convertTokenToId(eot) {
+                let id32 = Int32(id)
+                if id32 != mainEos {
+                    additionalEosTokenIds.insert(id32)
+                }
+            }
         }
 
         CLILogger.log("Model loaded successfully:", component: "Main")

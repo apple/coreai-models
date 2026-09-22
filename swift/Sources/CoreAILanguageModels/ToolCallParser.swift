@@ -10,7 +10,7 @@ import Tokenizers
 
 extension Tokenizer {
     /// Whether `token` is a genuine entry in the vocabulary, not an unk-token fallback.
-    func vocabContains(_ token: String) -> Bool {
+    public func vocabContains(_ token: String) -> Bool {
         guard let id = convertTokenToId(token) else { return false }
         return convertIdToToken(id) == token
     }

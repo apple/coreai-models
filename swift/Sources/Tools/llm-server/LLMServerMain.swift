@@ -156,7 +156,7 @@ struct LLMServer: AsyncParsableCommand {
         // Agentic models use <|eot|> / <|eom|> as turn boundaries.
         // These may not appear in tokenizer_config.json, so add them explicitly.
         let thinkingFormat = detectThinkingFormat(using: tokenizer)
-        if case .agentic(_, _, _, let eot) = thinkingFormat {
+        if case .agentic(_, _, _, let eot) = thinkingFormat, tokenizer.vocabContains(eot) {
             let mainEos = tokenizer.eosTokenId.map { Int32($0) }
             if let id = tokenizer.convertTokenToId(eot) {
                 let id32 = Int32(id)
