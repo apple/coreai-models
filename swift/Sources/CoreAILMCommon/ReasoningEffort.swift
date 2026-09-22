@@ -5,13 +5,26 @@
 
 import Foundation
 
+/// Thrown when server flags request contradictory reasoning defaults.
+public enum ReasoningEffortError: Error, CustomStringConvertible {
+    /// `--no-thinking` was combined with a non-`none` `--reasoning-default`.
+    case contradiction(default: String)
+
+    public var description: String {
+        switch self {
+        case .contradiction(let value):
+            return "--no-thinking conflicts with --reasoning-default \(value); --no-thinking means none"
+        }
+    }
+}
+
 /// Resolves a reasoning-effort value into chat-template keyword arguments, which are then passed to
 /// `applyChatTemplate(additionalContext:)`.
 ///
 /// Reasoning models expose their thinking budget through different chat-template variables (for
-/// example `reasoning_effort`, `reasoning_strength`, or a boolean `enable_thinking`). Binding the
-/// canonical value to each known variable lets one request field drive them all: a chat template
-/// reads only the variables it references, so setting the others alongside is safe.
+/// example `reasoning_effort` or a boolean `enable_thinking`). Binding the canonical value to each
+/// known variable lets one request field drive them all: a chat template reads only the variables
+/// it references, so setting the others alongside is safe.
 public enum ReasoningEffort {
     /// Canonical value that requests no reasoning.
     public static let none = "none"
@@ -21,7 +34,7 @@ public enum ReasoningEffort {
     /// - `nil` or empty returns an empty dictionary, so the template keeps its own default.
     /// - `"none"` sets `enable_thinking` to `false` for templates that support disabling reasoning.
     /// - any level (for example `low`, `medium`, `high`) binds the level to `reasoning_effort` and
-    ///   `reasoning_strength`, and sets `enable_thinking` to `true`.
+    ///   sets `enable_thinking` to `true`.
     public static func templateContext(_ effort: String?) -> [String: any Sendable] {
         guard let value = effort?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
             return [:]
@@ -31,7 +44,6 @@ public enum ReasoningEffort {
         }
         return [
             "reasoning_effort": value,
-            "reasoning_strength": value,
             "enable_thinking": true,
         ]
     }
@@ -40,5 +52,21 @@ public enum ReasoningEffort {
     /// default, then `nil` (leaving the template default in place).
     public static func resolve(request: String?, default defaultEffort: String?) -> String? {
         request ?? defaultEffort
+    }
+
+    /// Whether a resolved effort disables model thinking (canonical `none`). Drives both the
+    /// `enable_thinking:false` template var and the legacy `/no_think` literal injection.
+    public static func disablesThinking(_ effort: String?) -> Bool {
+        effort?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == none
+    }
+
+    /// Folds the `--no-thinking` alias into the server's `--reasoning-default`. `--no-thinking`
+    /// means `none`; combining it with a non-`none` default is a contradiction.
+    public static func resolveDefault(reasoningDefault: String?, noThinking: Bool) throws -> String? {
+        guard noThinking else { return reasoningDefault }
+        if let value = reasoningDefault, !disablesThinking(value) {
+            throw ReasoningEffortError.contradiction(default: value)
+        }
+        return none
     }
 }

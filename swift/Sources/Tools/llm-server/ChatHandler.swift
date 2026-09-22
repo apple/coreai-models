@@ -566,6 +566,9 @@ private func tokenizeMessages(
     reasoningEffort: String? = nil, state: ServerState
 ) -> [Int] {
     var templateMessages: [[String: any Sendable]] = []
+    // Resolved effort is the single source of truth: `none` also injects the legacy `/no_think`
+    // literal for models (e.g. Qwen3) that honor it in the system prompt.
+    let noThink = ReasoningEffort.disablesThinking(reasoningEffort)
     for msg in messages {
         var dict: [String: any Sendable] = ["role": msg.role]
 
@@ -587,7 +590,7 @@ private func tokenizeMessages(
             dict["content"] = msg.content.textContent
         } else {
             var content = msg.content.textContent
-            if msg.role == "system" && state.config.noThinking {
+            if msg.role == "system" && noThink {
                 content += "\n/no_think"
             }
             dict["content"] = content
@@ -595,7 +598,7 @@ private func tokenizeMessages(
         templateMessages.append(dict)
     }
 
-    if state.config.noThinking && !messages.contains(where: { $0.role == "system" }) {
+    if noThink && !messages.contains(where: { $0.role == "system" }) {
         templateMessages.insert(["role": "system", "content": "/no_think"], at: 0)
     }
 

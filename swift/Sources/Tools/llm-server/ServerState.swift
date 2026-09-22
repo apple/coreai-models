@@ -19,8 +19,9 @@ struct ServerConfig: Sendable {
     let defaultTopP: Double?
     let defaultTopK: Int?
     let defaultMinP: Double?
-    let noThinking: Bool
     /// Default `reasoning_effort` applied when a request omits it. `nil` leaves the template default.
+    /// `--no-thinking` folds into this as `none`, which drives both `enable_thinking:false` and the
+    /// legacy `/no_think` literal injection.
     let defaultReasoningEffort: String?
     let supportsLogprobs: Bool
     let maxContextLength: Int

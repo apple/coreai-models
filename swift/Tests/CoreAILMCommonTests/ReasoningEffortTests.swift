@@ -27,8 +27,8 @@ struct ReasoningEffortTests {
         for level in ["low", "medium", "high"] {
             let context = ReasoningEffort.templateContext(level)
             #expect((context["reasoning_effort"] as? String) == level)
-            #expect((context["reasoning_strength"] as? String) == level)
             #expect((context["enable_thinking"] as? Bool) == true)
+            #expect(context["reasoning_strength"] == nil)
         }
     }
 
@@ -37,6 +37,32 @@ struct ReasoningEffortTests {
         #expect(ReasoningEffort.resolve(request: "high", default: "low") == "high")
         #expect(ReasoningEffort.resolve(request: nil, default: "low") == "low")
         #expect(ReasoningEffort.resolve(request: nil, default: nil) == nil)
+    }
+
+    @Test("disablesThinking is true only for the canonical none")
+    func disablesThinking() {
+        #expect(ReasoningEffort.disablesThinking("none"))
+        #expect(ReasoningEffort.disablesThinking("None"))
+        #expect(ReasoningEffort.disablesThinking(" none "))
+        #expect(!ReasoningEffort.disablesThinking("low"))
+        #expect(!ReasoningEffort.disablesThinking(nil))
+        #expect(!ReasoningEffort.disablesThinking(""))
+    }
+
+    @Test("--no-thinking folds into the reasoning default as none")
+    func resolveDefaultNoThinking() throws {
+        #expect(try ReasoningEffort.resolveDefault(reasoningDefault: nil, noThinking: true) == "none")
+        #expect(try ReasoningEffort.resolveDefault(reasoningDefault: nil, noThinking: false) == nil)
+        #expect(try ReasoningEffort.resolveDefault(reasoningDefault: "low", noThinking: false) == "low")
+        // --no-thinking plus an explicit none default is consistent, not a conflict.
+        #expect(try ReasoningEffort.resolveDefault(reasoningDefault: "none", noThinking: true) == "none")
+    }
+
+    @Test("--no-thinking with a non-none default is rejected")
+    func resolveDefaultContradiction() {
+        #expect(throws: ReasoningEffortError.self) {
+            try ReasoningEffort.resolveDefault(reasoningDefault: "low", noThinking: true)
+        }
     }
 
     @Test("reasoning_effort decodes from a chat completion request")
