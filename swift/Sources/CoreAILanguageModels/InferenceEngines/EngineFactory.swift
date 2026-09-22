@@ -68,6 +68,103 @@ public struct EngineFactory: Sendable {
         )
     }
 
+    // MARK: - Bundle-Aware Construction
+
+    /// Creates an inference engine from a parsed language bundle.
+    ///
+    /// Handles bundles that ship more than one asset. A vision-language bundle (`kind == .vlm`)
+    /// carries three components — vision, embedding, and a `main` decoder that consumes those
+    /// embeddings — and builds the sequential VLM engine. The `.vlm` kind in the metadata names
+    /// the modality, so the factory keys on it directly. Every other kind resolves its `main`
+    /// asset and hands off to ``createEngine(config:modelURL:options:)``.
+    ///
+    /// - Parameters:
+    ///   - bundle: The parsed language bundle (LLM or VLM).
+    ///   - options: Engine options; chunking overrides are applied here so the engine receives an
+    ///     already-resolved config.
+    /// - Returns: A configured inference engine.
+    public static func createEngine(
+        bundle: LanguageBundle,
+        options: EngineOptions = EngineOptions()
+    ) async throws -> any InferenceEngine {
+        let languageModelURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.main)
+
+        if bundle.bundle.kind == .vlm {
+            return try await makeVLMEngine(
+                bundle: bundle, languageModelURL: languageModelURL, options: options)
+        }
+
+        // Standard single-asset LLM: build the config and delegate to the asset/URL path.
+        let engineConfig = ModelConfig(
+            name: bundle.name,
+            tokenizer: bundle.tokenizer,
+            vocabSize: bundle.vocabSize,
+            maxContextLength: bundle.maxContextLength,
+            serializedModel: [bundle.modelAssetPath],
+            function: bundle.language.functionMap?.name(for: "main") ?? "main"
+        )
+        let configData = try JSONEncoder().encode(engineConfig)
+        return try await createEngine(config: configData, modelURL: languageModelURL, options: options)
+    }
+
+    /// Assemble the VLM config from a bundle, applying chunking overrides to the base config.
+    ///
+    /// Applies chunking overrides for the VLM path the same way `selectEngine` does for the text
+    /// path. Split out from `makeVLMEngine` so the config assembly can be unit-tested on its own.
+    static func makeVLMConfig(
+        bundle: LanguageBundle,
+        languageModelURL: URL,
+        options: EngineOptions
+    ) throws -> VLMModelConfig {
+        guard let visionConfig = bundle.visionConfig else {
+            throw InferenceRuntimeError.invalidArgument(
+                "VLM bundle missing 'vision' config in metadata.json")
+        }
+        var baseConfig = ModelConfig(
+            name: bundle.name,
+            tokenizer: bundle.tokenizer,
+            vocabSize: bundle.vocabSize,
+            maxContextLength: bundle.maxContextLength,
+            serializedModel: [languageModelURL.path],
+            function: bundle.language.functionMap?.name(for: "main") ?? "main"
+        )
+        baseConfig.applyChunkingOverrides(
+            prefillChunkSize: options.prefillChunkSize,
+            prefillChunkThreshold: options.prefillChunkThreshold
+        )
+        return VLMModelConfig(base: baseConfig, visionConfig: visionConfig)
+    }
+
+    /// Build the sequential VLM engine: assemble the config, prepare the three components, and
+    /// construct the engine. Components are prepared one at a time to keep Core AI specialization
+    /// stable.
+    private static func makeVLMEngine(
+        bundle: LanguageBundle,
+        languageModelURL: URL,
+        options: EngineOptions
+    ) async throws -> any InferenceEngine {
+        let vlmConfig = try makeVLMConfig(
+            bundle: bundle, languageModelURL: languageModelURL, options: options)
+
+        let visionModelURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.vision)
+        let embeddingModelURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.embedding)
+
+        CLILogger.log("EngineFactory: Creating vision-language engine for \(bundle.name)")
+
+        // Prepare one at a time to keep Core AI specialization stable.
+        let visionModel = try await PreparedModel.prepare(at: visionModelURL)
+        let embedModel = try await PreparedModel.prepare(at: embeddingModelURL)
+        let llmModel = try await PreparedModel.prepare(at: languageModelURL)
+
+        return try await CoreAISequentialVLMEngine(
+            config: vlmConfig,
+            visionModel: visionModel,
+            embedModel: embedModel,
+            llmModel: llmModel,
+            options: options
+        )
+    }
+
     // MARK: - Config Parsing
 
     /// Parsed config container for engine selection.
