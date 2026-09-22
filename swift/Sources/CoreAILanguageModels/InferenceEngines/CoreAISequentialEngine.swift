@@ -353,6 +353,55 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         return allLogits
     }
 
+    // MARK: - Speculative decoding support
+
+    /// Prefill `tokens` into the KV cache, discarding logits. Advances
+    /// `processedTokenCount`; roll back with `reset(to:)`.
+    public func advance(_ tokens: [Int32]) async throws {
+        guard !tokens.isEmpty else { return }
+        _ = try await processTokenBatch(tokens[...])
+    }
+
+    /// Forward `tokens` in one pass; per-position `[vocabSize]` logits predicting
+    /// the following token. The primitive the speculative decoder verifies with.
+    public func forwardWithPerPositionLogits(_ tokens: [Int32]) async throws -> [[LogitsScalarType]] {
+        guard !tokens.isEmpty else {
+            throw InferenceRuntimeError.invalidState("Cannot process empty token batch")
+        }
+        let flat = try await processTokenBatch(tokens[...])
+        let vocab = config.vocabSize
+        var perPosition: [[LogitsScalarType]] = []
+        perPosition.reserveCapacity(tokens.count)
+        for i in 0..<tokens.count {
+            perPosition.append(Array(flat[i * vocab..<(i + 1) * vocab]))
+        }
+        return perPosition
+    }
+
+    /// Forward `tokens` in one pass; per-position argmax (greedy) token. Fast path
+    /// for greedy verification (avoids a `[vocabSize]` copy per position).
+    public func forwardPerPositionArgmax(_ tokens: [Int32]) async throws -> [Int32] {
+        guard !tokens.isEmpty else {
+            throw InferenceRuntimeError.invalidState("Cannot process empty token batch")
+        }
+        let flat = try await processTokenBatch(tokens[...])
+        let vocab = config.vocabSize
+        var argmaxes = [Int32](repeating: 0, count: tokens.count)
+        flat.withUnsafeBufferPointer { buffer in
+            for pos in 0..<tokens.count {
+                let base = pos * vocab
+                var bestIndex = 0
+                var bestValue = buffer[base]
+                for v in 1..<vocab where buffer[base + v] > bestValue {
+                    bestValue = buffer[base + v]
+                    bestIndex = v
+                }
+                argmaxes[pos] = Int32(bestIndex)
+            }
+        }
+        return argmaxes
+    }
+
     // MARK: - Generate (primary API)
 
     public func generate(
