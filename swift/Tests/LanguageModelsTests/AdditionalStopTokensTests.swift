@@ -18,6 +18,7 @@ struct AdditionalStopTokensTests {
         "<eot>": 1,
         "<eos>": 2,
         "<end_of_turn>": 3,
+        "<|im_end|>": 4,
         "<|endoftext|>": 5,
     ]
 
@@ -65,16 +66,17 @@ struct AdditionalStopTokensTests {
         #expect(ids == [1])
     }
 
-    @Test("top-level end_of_turn / endoftext keys are picked up")
+    @Test("top-level end_of_turn / im_end / endoftext keys are picked up")
     func topLevelOtherPatterns() throws {
         let ids = try Self.stopIds(
             config: """
                 {
                   "end_of_turn": "<end_of_turn>",
+                  "im_end": "<|im_end|>",
                   "endoftext": "<|endoftext|>"
                 }
                 """)
-        #expect(ids == [3, 5])
+        #expect(ids == [3, 4, 5])
     }
 
     @Test("top-level token equal to the main EOS is not duplicated")
