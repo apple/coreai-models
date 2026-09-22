@@ -26,16 +26,18 @@ from typing import Any
 
 DEFAULT_COMPRESSION_PRESET = "none"
 
-# `Qwen3RMSNorm.forward` is `self.weight * hidden_states`, and `torch.mul` is a
-# registered eager op, so the global `weight` spec matches its rank-1 parameter and
+# These norms end their forward with `self.weight * hidden_states`, and `torch.mul` is a
+# registered eager op, so the global `weight` spec matches their rank-1 parameter and
 # per_block(axis=1) raises a plain ValueError during prepare(). coreai-opt reserves its
-# automatic skip for block-size mismatches, so this exclusion covers the case instead.
+# automatic skip for block-size mismatches, so these exclusions cover the case instead.
 #
-# Only the text encoder needs an entry here. The FLUX.2 DiT uses `torch.nn.RMSNorm`,
-# which reaches `F.rms_norm` and stays outside the registered op set, and its LayerNorms
-# run without affine parameters.
+# Entries are keyed by class, so one that a given pipeline never instantiates is a no-op.
+# Norms reached through `F.layer_norm`, `F.group_norm` or `F.rms_norm` need no entry, since
+# those ops stay outside the registered set.
 _MODULE_TYPE_EXCLUSIONS: dict[str, Any] = {
+    "diffusers.models.normalization.RMSNorm": None,
     "transformers.models.qwen3.modeling_qwen3.Qwen3RMSNorm": None,
+    "transformers.models.umt5.modeling_umt5.UMT5LayerNorm": None,
 }
 
 # Weight-only, so the input and output specs stay None.

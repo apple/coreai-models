@@ -45,6 +45,7 @@ from coreai_models.diffusion.wan import (
     WanVAEDecoderWrapper,
     dummy_wan_text_encoder,
     dummy_wan_transformer,
+    dummy_wan_transformer_quant_trace,
     dummy_wan_vae_decoder,
     wan_transformer_dynamic_shapes,
 )
@@ -297,15 +298,29 @@ def _dummy_vae_encoder(pipe: Any, batch_size: int = 2) -> tuple[torch.Tensor, ..
     return (torch.randn(1, 3, size * 8, size * 8, dtype=dtype),)
 
 
-def _dummy_sd3_transformer(pipe: Any, batch_size: int = 2) -> tuple[torch.Tensor, ...]:
+def _dummy_sd3_transformer(
+    pipe: Any, batch_size: int = 2, sample_size: int | None = None
+) -> tuple[torch.Tensor, ...]:
     cfg = pipe.transformer.config
     dtype = _model_dtype(pipe)
+    size = cfg.sample_size if sample_size is None else sample_size
     return (
-        torch.randn(batch_size, cfg.in_channels, cfg.sample_size, cfg.sample_size, dtype=dtype),
+        torch.randn(batch_size, cfg.in_channels, size, size, dtype=dtype),
         torch.tensor([999.0] * batch_size, dtype=dtype),
         torch.randn(batch_size, 154, cfg.joint_attention_dim, dtype=dtype),
         torch.randn(batch_size, cfg.pooled_projection_dim, dtype=dtype),
     )
+
+
+def _dummy_sd3_transformer_quant_trace(pipe: Any) -> tuple[torch.Tensor, ...]:
+    """Small trace for the weight quantizer's shape-discovery forward.
+
+    Weight-only quantization reads the weights alone, so this forward just has to reach
+    every quantizable op once. The MMDiT crops its position embedding out of
+    ``pos_embed_max_size``, which is how it generates below its native resolution, so a
+    smaller latent traces the same set of Linears.
+    """
+    return _dummy_sd3_transformer(pipe, batch_size=1, sample_size=32)
 
 
 # ---------------------------------------------------------------------------
@@ -320,6 +335,7 @@ SD_COMPONENTS: dict[str, ComponentSpec] = {
         wrapper_fn=lambda p: TextEncoderWrapper(p.text_encoder),
         dummy_fn=_dummy_text_encoder,
         quantizable=True,
+        quant_target_fn=lambda p: p.text_encoder,
     ),
     "unet": ComponentSpec(
         asset_name="Unet",
@@ -328,6 +344,7 @@ SD_COMPONENTS: dict[str, ComponentSpec] = {
         wrapper_fn=lambda p: UNetWrapper(p.unet),
         dummy_fn=_dummy_unet,
         quantizable=True,
+        quant_target_fn=lambda p: p.unet,
     ),
     "vae_decoder": ComponentSpec(
         asset_name="VAEDecoder",
@@ -578,6 +595,7 @@ SD3_COMPONENTS: dict[str, ComponentSpec] = {
         wrapper_fn=lambda p: TextEncoderWithPooledWrapper(p.text_encoder),
         dummy_fn=_dummy_text_encoder,
         quantizable=True,
+        quant_target_fn=lambda p: p.text_encoder,
     ),
     "text_encoder_2": ComponentSpec(
         asset_name="TextEncoder2",
@@ -586,6 +604,7 @@ SD3_COMPONENTS: dict[str, ComponentSpec] = {
         wrapper_fn=lambda p: TextEncoderWithPooledWrapper(p.text_encoder_2),
         dummy_fn=_dummy_text_encoder,
         quantizable=True,
+        quant_target_fn=lambda p: p.text_encoder_2,
     ),
     "transformer": ComponentSpec(
         asset_name="MMDiT",
@@ -594,6 +613,8 @@ SD3_COMPONENTS: dict[str, ComponentSpec] = {
         wrapper_fn=lambda p: SD3TransformerWrapper(p.transformer),
         dummy_fn=_dummy_sd3_transformer,
         quantizable=True,
+        quant_target_fn=lambda p: p.transformer,
+        quant_dummy_fn=_dummy_sd3_transformer_quant_trace,
     ),
     "vae_decoder": ComponentSpec(
         asset_name="VAEDecoder",
@@ -619,6 +640,8 @@ WAN_COMPONENTS: dict[str, ComponentSpec] = {
         dummy_fn=dummy_wan_transformer,
         quantizable=True,
         dynamic_shapes_fn=wan_transformer_dynamic_shapes,
+        quant_target_fn=lambda p: p.transformer,
+        quant_dummy_fn=dummy_wan_transformer_quant_trace,
     ),
     "text_encoder": ComponentSpec(
         asset_name="TextEncoder",
@@ -627,6 +650,7 @@ WAN_COMPONENTS: dict[str, ComponentSpec] = {
         wrapper_fn=lambda p: WanTextEncoderWrapper(p.text_encoder),
         dummy_fn=dummy_wan_text_encoder,
         quantizable=True,
+        quant_target_fn=lambda p: p.text_encoder,
     ),
     "vae_decoder": ComponentSpec(
         asset_name="VAEDecoder",
