@@ -145,6 +145,7 @@ public struct MockTokenizer: Tokenizer, Sendable {
 public final class CapturingTokenizer: Tokenizer, @unchecked Sendable {
     public var capturedMessages: [Message] = []
     public var capturedTools: [ToolSpec]?
+    public var capturedAdditionalContext: [String: any Sendable]?
 
     private let inner: MockTokenizer
 
@@ -188,10 +189,15 @@ public final class CapturingTokenizer: Tokenizer, @unchecked Sendable {
         return [1]
     }
 
+    /// Captured overload for callers that thread reasoning kwargs through
+    /// `additionalContext` (the FM executor's makeTokens path).
     public func applyChatTemplate(
         messages: [Message], tools: [ToolSpec]?, additionalContext: [String: any Sendable]?
     ) throws -> [Int] {
-        try inner.applyChatTemplate(messages: messages, tools: tools, additionalContext: additionalContext)
+        capturedMessages = messages
+        capturedTools = tools
+        capturedAdditionalContext = additionalContext
+        return [1]
     }
 
     public func applyChatTemplate(messages: [Message], chatTemplate: ChatTemplateArgument) throws -> [Int] {

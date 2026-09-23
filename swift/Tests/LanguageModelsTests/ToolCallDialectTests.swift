@@ -210,6 +210,40 @@ struct ToolCallDialectTests {
         #expect(tok.capturedTools?.isEmpty == false)
     }
 
+    // FM path: a reasoning effort reaches the template as `additionalContext`.
+    @Test("FM makeTokens threads a reasoning effort into additionalContext")
+    func fmThreadsReasoningEffort() {
+        let tok = CapturingTokenizer()
+        _ = CoreAILanguageModel.CoreAIExecutor.makeTokens(
+            from: [.prompt(makePrompt("hi"))],
+            using: tok,
+            reasoningEffort: "high")
+        #expect((tok.capturedAdditionalContext?["reasoning_effort"] as? String) == "high")
+        #expect((tok.capturedAdditionalContext?["enable_thinking"] as? Bool) == true)
+    }
+
+    // FM path: "none" disables thinking and omits reasoning_effort.
+    @Test("FM makeTokens maps none to enable_thinking false")
+    func fmThreadsNoneReasoning() {
+        let tok = CapturingTokenizer()
+        _ = CoreAILanguageModel.CoreAIExecutor.makeTokens(
+            from: [.prompt(makePrompt("hi"))],
+            using: tok,
+            reasoningEffort: "none")
+        #expect((tok.capturedAdditionalContext?["enable_thinking"] as? Bool) == false)
+        #expect(tok.capturedAdditionalContext?["reasoning_effort"] == nil)
+    }
+
+    // FM path: no reasoning effort passes no additionalContext.
+    @Test("FM makeTokens passes nil additionalContext without a reasoning effort")
+    func fmNoReasoningNoContext() {
+        let tok = CapturingTokenizer()
+        _ = CoreAILanguageModel.CoreAIExecutor.makeTokens(
+            from: [.prompt(makePrompt("hi"))],
+            using: tok)
+        #expect(tok.capturedAdditionalContext == nil)
+    }
+
     private func makePrompt(_ text: String) -> Transcript.Prompt {
         Transcript.Prompt(segments: [.text(Transcript.TextSegment(content: text))])
     }

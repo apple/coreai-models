@@ -247,8 +247,7 @@ public struct CoreAILanguageModel: LanguageModel {
         ) async throws {
             // Tokenization span
             let tokenizationSpan = InstrumentsProfiler.beginTokenization(inputLength: 0)
-            // Reasoning effort travels on FM's ContextOptions (not GenerationOptions); map it to a
-            // canonical string and inject it as a chat-template kwarg in makeTokens.
+            // Map FM's reasoning level to a canonical effort string and pass it to makeTokens.
             var reasoningEffort: String? = nil
             if #available(FoundationModels 2.0, *) {
                 reasoningEffort = Self.reasoningEffortString(from: request.contextOptions.reasoningLevel)
@@ -677,6 +676,9 @@ public struct CoreAILanguageModel: LanguageModel {
 
             do {
                 CLILogger.log("Applying chat template via tokenizer", component: component)
+                // Reasoning effort is applied as template context. The server also emits the
+                // legacy `/no_think` literal for models that read it from the system prompt;
+                // this path relies on `enable_thinking`.
                 let extra = reasoningTemplateContext(reasoningEffort)
                 return try tokenizer.applyChatTemplate(
                     messages: messages, tools: toolSpecs,
@@ -704,15 +706,15 @@ public struct CoreAILanguageModel: LanguageModel {
             }
         }
 
-        /// Maps a canonical effort string to chat-template keyword arguments. Reasoning models read
-        /// their thinking budget from different template variables, so the value is bound to each
-        /// known variable; a chat template reads only the ones it references.
+        /// Maps a canonical effort string to chat-template keyword arguments. Mirrors
+        /// `CoreAILMCommon.ReasoningEffort.templateContext`; unifying would require that type in a
+        /// module below both CoreAILanguageModels and CoreAILMCommon (for example CoreAIShared).
         static func reasoningTemplateContext(_ effort: String?) -> [String: any Sendable] {
             guard let e = effort?.trimmingCharacters(in: .whitespacesAndNewlines), !e.isEmpty else {
                 return [:]
             }
             if e.lowercased() == "none" { return ["enable_thinking": false] }
-            return ["reasoning_effort": e, "reasoning_strength": e, "enable_thinking": true]
+            return ["reasoning_effort": e, "enable_thinking": true]
         }
 
         /// Converts a `ToolDefinition` into the `ToolSpec` format expected by
