@@ -6,8 +6,8 @@ Unlike autoregressive models, DiffusionGemma generates a fixed-length token *can
 
 ## Supported Models
 
-| Model                        | Parameters        | macOS | iOS |
-| ---------------------------- | ----------------- | ----- | --- |
+| Model                           | Parameters          | macOS | iOS |
+| ------------------------------- | ------------------- | ----- | --- |
 | DiffusionGemma 26B-A4B Instruct | 25.2B (3.8B active) | Yes   | No  |
 
 ## Gated Access
@@ -34,3 +34,7 @@ uv run models/diffusion_gemma/export.py \
     --canvas-length 256 --compression 4bit \
     --output-dir ./exports/
 ```
+
+## License
+
+The export recipe in this repository is licensed under the [BSD-3-Clause license](../../LICENSE). The DiffusionGemma model weights are subject to Google's original model license — review and accept it on the [model's Hugging Face page](https://huggingface.co/google/diffusiongemma-26b-a4b-it) before exporting.
