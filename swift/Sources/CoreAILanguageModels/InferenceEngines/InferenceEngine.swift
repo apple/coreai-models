@@ -171,19 +171,15 @@ public protocol InferenceConfiguration: Sendable {
 
 /// Memory-based default prefill chunk size.
 ///
-/// Larger machines can afford bigger chunks (less overhead per prefill),
-/// while smaller machines need smaller chunks to keep peak memory in check.
-///
-/// ## Memory Calculation
-/// Logits buffer = batch × seqLen × vocabSize × sizeof(Float16)
-///
-/// Example with Qwen3 (vocab_size = 151,936):
-/// - 32K prompt without chunking: 1 × 32,768 × 151,936 × 2 = **9.6 GB**
-/// - 2048-token chunk:            1 × 2,048 × 151,936 × 2 = **620 MB** (94% reduction)
+/// Prefill throughput rises with chunk size and flattens past 4096, while peak
+/// wired memory keeps climbing (e.g. gpt-oss-120b: ~87 GB at chunk 4096 vs
+/// ~109 GB at 8192 for ~no gain). 4096 is the sweet spot, and only ≥64 GB
+/// machines can hold the large models that benefit from it; smaller Macs and
+/// all iOS devices fall to 2048.
 func defaultPrefillChunkSize() -> Int {
     let bytes = ProcessInfo.processInfo.physicalMemory
     let gb = bytes / (1024 * 1024 * 1024)
-    if gb <= 24 { return 2048 }
+    if gb < 64 { return 2048 }
     return 4096
 }
 
