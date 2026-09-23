@@ -104,7 +104,9 @@ def dummy_wan_text_encoder(pipe: Any, batch_size: int = 2) -> tuple[torch.Tensor
     )
 
 
-def dummy_wan_transformer(pipe: Any, batch_size: int = 2) -> tuple[torch.Tensor, ...]:
+def dummy_wan_transformer(
+    pipe: Any, batch_size: int = 2, latent_frames: int = DEFAULT_LATENT_FRAMES
+) -> tuple[torch.Tensor, ...]:
     """Transformer at default resolution (480x832) and frame count (81 frames = 21 latent)."""
     cfg = pipe.transformer.config
     # Some diffusers models keep a few submodules (e.g. norms, patch_embedding) in fp32
@@ -113,7 +115,6 @@ def dummy_wan_transformer(pipe: Any, batch_size: int = 2) -> tuple[torch.Tensor,
     # that's the first layer the dummy hidden_states input actually feeds into.
     dtype = pipe.transformer.patch_embedding.weight.dtype
 
-    latent_frames = DEFAULT_LATENT_FRAMES
     latent_h = DEFAULT_LATENT_HEIGHT
     latent_w = DEFAULT_LATENT_WIDTH
 
@@ -122,6 +123,18 @@ def dummy_wan_transformer(pipe: Any, batch_size: int = 2) -> tuple[torch.Tensor,
         torch.randn(1, TEXT_SEQ_LEN, cfg.text_dim, dtype=dtype),
         torch.tensor([999.0], dtype=dtype),
     )
+
+
+def dummy_wan_transformer_quant_trace(pipe: Any) -> tuple[torch.Tensor, ...]:
+    """Small trace for the weight quantizer's shape-discovery forward.
+
+    Weight-only quantization reads the weights alone, so this forward just has to reach
+    every quantizable op once. At the export shape the patchified sequence is
+    21x30x52 = 32760 tokens, and attention is quadratic in that. Two latent frames is the
+    minimum the exported graph declares as dynamic, and cuts the sequence by about 10x
+    while covering the same set of Linears.
+    """
+    return dummy_wan_transformer(pipe, latent_frames=2)
 
 
 def wan_transformer_dynamic_shapes() -> tuple[dict[int, "torch.export.Dim"] | None, ...]:

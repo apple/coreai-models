@@ -54,7 +54,7 @@ struct LLMServer: AsyncParsableCommand {
     @Option(
         name: .customLong("chunk-size"),
         help: ArgumentHelp(
-            "Prefill chunk size in tokens (default: memory-based; 128 is suggested for MoE models)", visibility: .hidden
+            "Prefill chunk size in tokens (default: 2048; 4096 on macOS with >=64GB memory)", visibility: .hidden
         )
     )
     var chunkSize: Int?
@@ -68,8 +68,17 @@ struct LLMServer: AsyncParsableCommand {
     @Option(name: .customLong("max-queue-depth"), help: "Max requests queued before returning 429 (default: 16)")
     var maxQueueDepth: Int = 16
 
-    @Flag(name: .customLong("no-thinking"), help: "Disable thinking/reasoning (appends /no_think or sets template)")
+    @Flag(
+        name: .customLong("no-thinking"),
+        help: "Disable thinking/reasoning (alias for --default-reasoning-effort none)"
+    )
     var noThinking: Bool = false
+
+    @Option(
+        name: .customLong("default-reasoning-effort"),
+        help: "Default reasoning_effort when a request omits it (none, low, medium, high)."
+    )
+    var defaultReasoningEffort: String?
 
     @Flag(
         name: .customLong("clear-coreai-cache"),
@@ -83,6 +92,12 @@ struct LLMServer: AsyncParsableCommand {
     func validate() throws {
         guard maxQueueDepth >= 0 else {
             throw ValidationError("--max-queue-depth must be >= 0 (got \(maxQueueDepth))")
+        }
+        do {
+            _ = try ReasoningEffort.resolveDefault(
+                defaultReasoningEffort: defaultReasoningEffort, noThinking: noThinking)
+        } catch {
+            throw ValidationError("\(error)")
         }
     }
 
@@ -182,6 +197,9 @@ struct LLMServer: AsyncParsableCommand {
             print(" done in \(String(format: "%.3f", prepareElapsed))s\(cacheSuffix)\n")
         }
 
+        let resolvedReasoningDefault = try ReasoningEffort.resolveDefault(
+            defaultReasoningEffort: defaultReasoningEffort, noThinking: noThinking)
+
         let config = ServerConfig(
             modelName: modelName,
             defaultMaxTokens: maxTokens,
@@ -189,7 +207,7 @@ struct LLMServer: AsyncParsableCommand {
             defaultTopP: topP,
             defaultTopK: topK,
             defaultMinP: minP,
-            noThinking: noThinking,
+            defaultReasoningEffort: resolvedReasoningDefault,
             supportsLogprobs: supportsLogprobs,
             maxContextLength: bundle.maxContextLength,
             vocabSize: bundle.vocabSize,
@@ -208,7 +226,7 @@ struct LLMServer: AsyncParsableCommand {
             print("  Engine: \(type(of: engine))")
             print("  Logprobs: \(supportsLogprobs ? "supported" : "not supported (use --variant coreai-sequential)")")
             print("  Context: \(bundle.maxContextLength) tokens")
-            print("  No-thinking: \(noThinking)")
+            print("  Default reasoning effort: \(config.defaultReasoningEffort ?? "template default")")
             print("  Max queue depth: \(maxQueueDepth)")
             let topKStr = topK.map { "\($0)" } ?? "nil"
             let topPStr = topP.map { "\($0)" } ?? "nil"
