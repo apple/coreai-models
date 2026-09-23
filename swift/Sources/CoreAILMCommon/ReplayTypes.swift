@@ -33,17 +33,18 @@ public struct ReplayRequest: Decodable, Sendable {
     public var isStreaming: Bool { request.stream == true }
 }
 
-/// Per-request result with instrumentation, emitted as one JSON object per line.
+/// Per-request result with instrumentation, emitted as one JSON object per line. The generated
+/// output reuses the response's `choices` shape (`ChatCompletionResponse.Choice`), so content,
+/// reasoning, tool calls, and finish reason round-trip per message; the surrounding fields are
+/// per-request instrumentation. `choices` is nil on the error path. One JSON object per line:
+///
+///     {"id":"r1","session":"A","t":0.0,"choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"prompt_tokens":3,"completion_tokens":1,"ttft_ms":12.5}
 public struct ReplayResult: Encodable, Sendable {
     public let id: String?
     public let session: String?
     public let t: Double?
-    public let content: String?
-    /// Reasoning trace, when the model emits one (mirrors `reasoning_content` in the response).
-    public let reasoningContent: String?
-    /// Tool calls, when the request triggers tool-calling.
-    public let toolCalls: [ToolCall]?
-    public let finishReason: String?
+    /// Response choices, mirroring `ChatCompletionResponse.choices`. Nil on error.
+    public let choices: [ChatCompletionResponse.Choice]?
     public let systemFingerprint: String?
     public let promptTokens: Int
     public let completionTokens: Int
@@ -57,19 +58,15 @@ public struct ReplayResult: Encodable, Sendable {
 
     public init(
         id: String?, session: String?, t: Double?,
-        content: String?, finishReason: String?, systemFingerprint: String?,
+        choices: [ChatCompletionResponse.Choice]?, systemFingerprint: String?,
         promptTokens: Int, completionTokens: Int, prefixReuseTokens: Int,
         ttftMs: Double, totalMs: Double, decodeTps: Double,
-        reasoningContent: String? = nil, toolCalls: [ToolCall]? = nil,
         streamed: Bool = false, error: String? = nil
     ) {
         self.id = id
         self.session = session
         self.t = t
-        self.content = content
-        self.reasoningContent = reasoningContent
-        self.toolCalls = toolCalls
-        self.finishReason = finishReason
+        self.choices = choices
         self.systemFingerprint = systemFingerprint
         self.promptTokens = promptTokens
         self.completionTokens = completionTokens
@@ -82,10 +79,7 @@ public struct ReplayResult: Encodable, Sendable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case id, session, t, content, streamed, error
-        case reasoningContent = "reasoning_content"
-        case toolCalls = "tool_calls"
-        case finishReason = "finish_reason"
+        case id, session, t, choices, streamed, error
         case systemFingerprint = "system_fingerprint"
         case promptTokens = "prompt_tokens"
         case completionTokens = "completion_tokens"
@@ -96,10 +90,10 @@ public struct ReplayResult: Encodable, Sendable {
     }
 }
 
-/// Folds streaming SSE deltas back into a final content/reasoning/tool-call triple, the way a
-/// client reassembles a stream. Lets `--replay` drive the real streaming path and record its
-/// aggregate output. The server emits each tool call as one whole delta (name + full args), so
-/// deltas are appended as-is.
+/// Folds streaming SSE deltas back into a single response `Choice`, the way a client reassembles
+/// a stream. Lets `--replay` drive the real streaming path and record its aggregate output using
+/// the same `choices` shape as the non-streaming path. The server emits each tool call as one
+/// whole delta (name + full args), so deltas are appended as-is.
 public struct ReplayStreamAggregator {
     private var content = ""
     private var reasoning = ""
@@ -120,9 +114,16 @@ public struct ReplayStreamAggregator {
         }
     }
 
-    public var aggregatedContent: String? { content.isEmpty ? nil : content }
-    public var aggregatedReasoning: String? { reasoning.isEmpty ? nil : reasoning }
-    public var aggregatedToolCalls: [ToolCall]? { calls.isEmpty ? nil : calls }
+    /// Fold the deltas into a single assistant `Choice` (index 0) carrying the final finish
+    /// reason, matching the shape the non-streaming path records.
+    public func choice(finishReason: String?) -> ChatCompletionResponse.Choice {
+        let message = ChatCompletionResponse.ResponseMessage(
+            role: "assistant",
+            content: content.isEmpty ? nil : content,
+            reasoningContent: reasoning.isEmpty ? nil : reasoning,
+            toolCalls: calls.isEmpty ? nil : calls)
+        return ChatCompletionResponse.Choice(index: 0, message: message, finishReason: finishReason)
+    }
 }
 
 /// JSONL parsing/serialization for the replay format. Blank lines and `#`-prefixed comment

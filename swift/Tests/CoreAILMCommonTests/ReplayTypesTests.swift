@@ -48,14 +48,20 @@ struct ReplayTypesTests {
         #expect(reqs.map(\.id) == ["x", "y"])
     }
 
-    @Test("A result encodes with snake_case instrumentation keys")
+    @Test("A result encodes a choices array with snake_case instrumentation keys")
     func resultEncodes() throws {
+        let choice = ChatCompletionResponse.Choice(
+            index: 0,
+            message: ChatCompletionResponse.ResponseMessage(role: "assistant", content: "hello"),
+            finishReason: "stop")
         let result = ReplayResult(
             id: "r1", session: "A", t: 0,
-            content: "hello", finishReason: "stop", systemFingerprint: "fp_z",
+            choices: [choice], systemFingerprint: "fp_z",
             promptTokens: 3, completionTokens: 2, prefixReuseTokens: 1,
             ttftMs: 12.5, totalMs: 30.0, decodeTps: 66.6)
         let json = try ReplayIO.encodeResult(result)
+        #expect(json.contains(#""choices":["#))
+        #expect(json.contains(#""content":"hello""#))
         #expect(json.contains(#""finish_reason":"stop""#))
         #expect(json.contains(#""system_fingerprint":"fp_z""#))
         #expect(json.contains(#""prefix_reuse_tokens":1"#))
@@ -63,26 +69,32 @@ struct ReplayTypesTests {
         #expect(!json.contains("\n"))  // single JSONL line
     }
 
-    @Test("An error result omits content but records the error")
+    @Test("An error result omits choices but records the error")
     func errorResultEncodes() throws {
         let result = ReplayResult(
             id: nil, session: "A", t: nil,
-            content: nil, finishReason: nil, systemFingerprint: nil,
+            choices: nil, systemFingerprint: nil,
             promptTokens: 0, completionTokens: 0, prefixReuseTokens: 0,
             ttftMs: 0, totalMs: 0, decodeTps: 0, error: "boom")
         let json = try ReplayIO.encodeResult(result)
         #expect(json.contains(#""error":"boom""#))
+        #expect(!json.contains(#""choices""#))
     }
 
-    @Test("A result carries reasoning_content, tool_calls, and streamed when present")
+    @Test("A choice carries reasoning_content and tool_calls, alongside streamed")
     func resultEncodesToolCallsAndReasoning() throws {
+        let choice = ChatCompletionResponse.Choice(
+            index: 0,
+            message: ChatCompletionResponse.ResponseMessage(
+                role: "assistant", content: nil,
+                reasoningContent: "let me think",
+                toolCalls: [ToolCall(id: "c1", function: .init(name: "get_weather", arguments: #"{"city":"SF"}"#))]),
+            finishReason: "tool_calls")
         let result = ReplayResult(
             id: "r1", session: "A", t: 0,
-            content: nil, finishReason: "tool_calls", systemFingerprint: nil,
+            choices: [choice], systemFingerprint: nil,
             promptTokens: 5, completionTokens: 4, prefixReuseTokens: 0,
             ttftMs: 1, totalMs: 2, decodeTps: 3,
-            reasoningContent: "let me think",
-            toolCalls: [ToolCall(id: "c1", function: .init(name: "get_weather", arguments: #"{"city":"SF"}"#))],
             streamed: true)
         let json = try ReplayIO.encodeResult(result)
         #expect(json.contains(#""reasoning_content":"let me think""#))
@@ -102,7 +114,7 @@ struct ReplayTypesTests {
         #expect(!(try JSONDecoder().decode(ReplayRequest.self, from: Data(absent.utf8)).isStreaming))
     }
 
-    @Test("ReplayStreamAggregator folds content, reasoning, and tool-call deltas")
+    @Test("ReplayStreamAggregator folds deltas into an assistant Choice")
     func aggregatorFoldsDeltas() {
         var agg = ReplayStreamAggregator()
         agg.consume(.init(role: nil, content: nil, reasoningContent: "think"))
@@ -114,18 +126,23 @@ struct ReplayTypesTests {
                 toolCalls: [
                     ToolCallDelta(index: 0, id: "c1", type: "function", function: .init(name: "f", arguments: "{}"))
                 ]))
-        #expect(agg.aggregatedContent == "Hello, world")
-        #expect(agg.aggregatedReasoning == "think")
-        #expect(agg.aggregatedToolCalls?.count == 1)
-        #expect(agg.aggregatedToolCalls?.first?.id == "c1")
-        #expect(agg.aggregatedToolCalls?.first?.function.name == "f")
+        let choice = agg.choice(finishReason: "tool_calls")
+        #expect(choice.index == 0)
+        #expect(choice.finishReason == "tool_calls")
+        #expect(choice.message.role == "assistant")
+        #expect(choice.message.content == "Hello, world")
+        #expect(choice.message.reasoningContent == "think")
+        #expect(choice.message.toolCalls?.count == 1)
+        #expect(choice.message.toolCalls?.first?.id == "c1")
+        #expect(choice.message.toolCalls?.first?.function.name == "f")
     }
 
-    @Test("An empty aggregator yields nil aggregates")
+    @Test("An empty aggregator yields a Choice with nil message fields")
     func aggregatorEmpty() {
-        let agg = ReplayStreamAggregator()
-        #expect(agg.aggregatedContent == nil)
-        #expect(agg.aggregatedReasoning == nil)
-        #expect(agg.aggregatedToolCalls == nil)
+        let choice = ReplayStreamAggregator().choice(finishReason: "stop")
+        #expect(choice.finishReason == "stop")
+        #expect(choice.message.content == nil)
+        #expect(choice.message.reasoningContent == nil)
+        #expect(choice.message.toolCalls == nil)
     }
 }

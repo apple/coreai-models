@@ -32,7 +32,7 @@ enum ReplayRunner {
             } catch {
                 result = ReplayResult(
                     id: req.id, session: req.session, t: req.t,
-                    content: nil, finishReason: nil, systemFingerprint: nil,
+                    choices: nil, systemFingerprint: nil,
                     promptTokens: 0, completionTokens: 0, prefixReuseTokens: 0,
                     ttftMs: 0, totalMs: 0, decodeTps: 0,
                     streamed: req.isStreaming, error: "\(error)")
@@ -54,14 +54,11 @@ enum ReplayRunner {
     {
         let outcome = try await runChatCompletion(
             chatRequest: req.request, state: state, sessionID: sessionID)
-        let choice = outcome.response.choices.first
-        let message = choice?.message
         let genSeconds = max(0, outcome.totalSeconds - outcome.ttftSeconds)
         let decodeTps = genSeconds > 0 ? Double(outcome.genTokenCount) / genSeconds : 0
         return ReplayResult(
             id: req.id, session: req.session, t: req.t,
-            content: message?.content,
-            finishReason: choice?.finishReason,
+            choices: outcome.response.choices,
             systemFingerprint: outcome.response.systemFingerprint,
             promptTokens: outcome.promptTokenCount,
             completionTokens: outcome.genTokenCount,
@@ -69,8 +66,6 @@ enum ReplayRunner {
             ttftMs: outcome.ttftSeconds * 1000,
             totalMs: outcome.totalSeconds * 1000,
             decodeTps: decodeTps,
-            reasoningContent: message?.reasoningContent,
-            toolCalls: message?.toolCalls,
             streamed: false)
     }
 
@@ -88,8 +83,7 @@ enum ReplayRunner {
         let decodeTps = genSeconds > 0 ? Double(outcome.genTokenCount) / genSeconds : 0
         return ReplayResult(
             id: req.id, session: req.session, t: req.t,
-            content: aggregator.aggregatedContent,
-            finishReason: outcome.finishReason,
+            choices: [aggregator.choice(finishReason: outcome.finishReason)],
             systemFingerprint: outcome.systemFingerprint,
             promptTokens: outcome.promptTokenCount,
             completionTokens: outcome.genTokenCount,
@@ -97,8 +91,6 @@ enum ReplayRunner {
             ttftMs: outcome.ttftSeconds * 1000,
             totalMs: outcome.totalSeconds * 1000,
             decodeTps: decodeTps,
-            reasoningContent: aggregator.aggregatedReasoning,
-            toolCalls: aggregator.aggregatedToolCalls,
             streamed: true)
     }
 }
