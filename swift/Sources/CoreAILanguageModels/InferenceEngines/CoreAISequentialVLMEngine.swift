@@ -151,15 +151,9 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
         llmModel: PreparedModel,
         options: EngineOptions = EngineOptions()
     ) async throws {
-        // Apply runtime chunking overrides (CLI / metadata) onto the base config,
-        // mirroring EngineFactory.selectEngine for the standard LLM path. `base` is
-        // immutable, so resolve on a local copy and reconstruct the VLM config.
-        var resolvedBase = config.base
-        resolvedBase.applyChunkingOverrides(
-            prefillChunkSize: options.prefillChunkSize,
-            prefillChunkThreshold: options.prefillChunkThreshold
-        )
-        self.config = VLMModelConfig(base: resolvedBase, visionConfig: config.visionConfig)
+        // Chunking overrides are applied by EngineFactory before construction (see
+        // EngineFactory.makeVLMConfig), so the config arrives already resolved.
+        self.config = config
 
         let modelLoadSignpost = InstrumentsProfiler.beginCustomInterval(
             name: "CoreAIVLMModelLoading",

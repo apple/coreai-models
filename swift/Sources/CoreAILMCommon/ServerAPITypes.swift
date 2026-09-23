@@ -15,6 +15,7 @@ public struct ChatCompletionRequest: Decodable, Sendable {
     public let maxCompletionTokens: Int?
     public let topP: Double?
     public let topK: Int?
+    public let seed: UInt64?
     public let stream: Bool?
     public let stop: [String]?
     public let responseFormat: ResponseFormat?
@@ -22,9 +23,12 @@ public struct ChatCompletionRequest: Decodable, Sendable {
     public let toolChoice: ToolChoice?
     public let parallelToolCalls: Bool?
     public let raw: Bool?
+    /// Reasoning-effort control, OpenAI-compatible. Canonical values are none, low, medium, high;
+    /// other values pass through to the model's chat template.
+    public let reasoningEffort: String?
 
     enum CodingKeys: String, CodingKey {
-        case model, messages, temperature, stream, stop, tools, raw
+        case model, messages, temperature, stream, stop, tools, raw, seed
         case maxTokens = "max_tokens"
         case maxCompletionTokens = "max_completion_tokens"
         case topP = "top_p"
@@ -32,6 +36,7 @@ public struct ChatCompletionRequest: Decodable, Sendable {
         case responseFormat = "response_format"
         case toolChoice = "tool_choice"
         case parallelToolCalls = "parallel_tool_calls"
+        case reasoningEffort = "reasoning_effort"
     }
 
     public init(from decoder: Decoder) throws {
@@ -43,12 +48,14 @@ public struct ChatCompletionRequest: Decodable, Sendable {
         maxCompletionTokens = try container.decodeIfPresent(Int.self, forKey: .maxCompletionTokens)
         topP = try container.decodeIfPresent(Double.self, forKey: .topP)
         topK = try container.decodeIfPresent(Int.self, forKey: .topK)
+        seed = try container.decodeIfPresent(UInt64.self, forKey: .seed)
         stream = try container.decodeIfPresent(Bool.self, forKey: .stream)
         responseFormat = try container.decodeIfPresent(ResponseFormat.self, forKey: .responseFormat)
         tools = try container.decodeIfPresent([ToolDefinition].self, forKey: .tools)
         toolChoice = try container.decodeIfPresent(ToolChoice.self, forKey: .toolChoice)
         parallelToolCalls = try container.decodeIfPresent(Bool.self, forKey: .parallelToolCalls)
         raw = try container.decodeIfPresent(Bool.self, forKey: .raw)
+        reasoningEffort = try container.decodeIfPresent(String.self, forKey: .reasoningEffort)
 
         if let arr = try? container.decode([String].self, forKey: .stop) {
             stop = arr
@@ -245,11 +252,13 @@ public struct ChatCompletionResponse: Encodable, Sendable {
     public let model: String
     public let choices: [Choice]
     public let usage: Usage?
+    public let systemFingerprint: String?
 
     public init(
         id: String, object: String = "chat.completion",
         created: Int = Int(Date().timeIntervalSince1970),
-        model: String, choices: [Choice], usage: Usage? = nil
+        model: String, choices: [Choice], usage: Usage? = nil,
+        systemFingerprint: String? = nil
     ) {
         self.id = id
         self.object = object
@@ -257,6 +266,12 @@ public struct ChatCompletionResponse: Encodable, Sendable {
         self.model = model
         self.choices = choices
         self.usage = usage
+        self.systemFingerprint = systemFingerprint
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, object, created, model, choices, usage
+        case systemFingerprint = "system_fingerprint"
     }
 
     public struct Choice: Encodable, Sendable {
@@ -324,17 +339,25 @@ public struct ChatCompletionChunk: Encodable, Sendable {
     public let created: Int
     public let model: String
     public let choices: [ChunkChoice]
+    public let systemFingerprint: String?
 
     public init(
         id: String, object: String = "chat.completion.chunk",
         created: Int = Int(Date().timeIntervalSince1970),
-        model: String, choices: [ChunkChoice]
+        model: String, choices: [ChunkChoice],
+        systemFingerprint: String? = nil
     ) {
         self.id = id
         self.object = object
         self.created = created
         self.model = model
         self.choices = choices
+        self.systemFingerprint = systemFingerprint
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, object, created, model, choices
+        case systemFingerprint = "system_fingerprint"
     }
 
     public struct ChunkChoice: Encodable, Sendable {

@@ -199,7 +199,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     @Option(
         name: .customLong("chunk-size"),
         help: ArgumentHelp(
-            "Prefill chunk size in tokens (default: memory-based; 128 is suggested for MoE models)",
+            "Prefill chunk size in tokens (default: 2048; 4096 on macOS with >=64GB memory)",
             visibility: .hidden)
     )
     var chunkSize: Int?
@@ -469,53 +469,10 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         let tokenizerLoadSpan = InstrumentsProfiler.beginTokenizerLoad(id: modelFile)
         async let tokenizerResult = bundle.loadTokenizer()
 
-        let inferenceEngine: any InferenceEngine
-        if let visionModelURL, let embeddingModelURL {
-            // VLM: load 3 models and create VLM engine directly
-            guard let visionConfig = bundle.visionConfig else {
-                throw InferenceRuntimeError.invalidArgument(
-                    "VLM bundle missing 'vision' config in metadata.json")
-            }
-
-            let baseConfig = ModelConfig(
-                name: bundle.name,
-                tokenizer: bundle.tokenizer,
-                vocabSize: bundle.vocabSize,
-                maxContextLength: bundle.maxContextLength,
-                serializedModel: [languageModelURL.path],
-                function: bundle.language.functionMap?.name(for: "main") ?? "main"
-            )
-            let vlmConfig = VLMModelConfig(base: baseConfig, visionConfig: visionConfig)
-
-            // Sequential to avoid runtime errors with concurrent model preparation.
-            let visionModel = try await PreparedModel.prepare(at: visionModelURL)
-            let embedModel = try await PreparedModel.prepare(at: embeddingModelURL)
-            let llmModel = try await PreparedModel.prepare(at: languageModelURL)
-
-            inferenceEngine = try await CoreAISequentialVLMEngine(
-                config: vlmConfig,
-                visionModel: visionModel,
-                embedModel: embedModel,
-                llmModel: llmModel,
-                options: engineOptions
-            )
-        } else {
-            // Standard LLM: use EngineFactory
-            let engineConfig = ModelConfig(
-                name: bundle.name,
-                tokenizer: bundle.tokenizer,
-                vocabSize: bundle.vocabSize,
-                maxContextLength: bundle.maxContextLength,
-                serializedModel: [bundle.modelAssetPath],
-                function: bundle.language.functionMap?.name(for: "main") ?? "main"
-            )
-            let configData = try JSONEncoder().encode(engineConfig)
-            inferenceEngine = try await EngineFactory.createEngine(
-                config: configData,
-                modelURL: languageModelURL,
-                options: engineOptions
-            )
-        }
+        // The factory routes by bundle kind: VLM bundles build the sequential VLM engine from
+        // their vision/embedding/main components; everything else takes the single-asset path.
+        let inferenceEngine = try await EngineFactory.createEngine(
+            bundle: bundle, options: engineOptions)
 
         modelLoadSpan.end()
         let tokenizer = try await tokenizerResult

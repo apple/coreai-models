@@ -183,10 +183,14 @@ private func handleNonStreamingRequest(chatRequest: ChatCompletionRequest, state
         temperature: chatRequest.temperature,
         topP: chatRequest.topP,
         topK: chatRequest.topK,
-        minP: nil
+        minP: nil,
+        seed: chatRequest.seed
     )
 
-    let promptTokens = tokenizeMessages(chatRequest.messages, tools: chatRequest.tools, state: state)
+    let reasoningEffort = ReasoningEffort.resolve(
+        request: chatRequest.reasoningEffort, default: state.config.defaultReasoningEffort)
+    let promptTokens = tokenizeMessages(
+        chatRequest.messages, tools: chatRequest.tools, reasoningEffort: reasoningEffort, state: state)
     let stopSequences = buildStopSequences(from: chatRequest, state: state)
     let input: Input = .tokens(promptTokens)
 
@@ -326,7 +330,8 @@ private func handleNonStreamingRequest(chatRequest: ChatCompletionRequest, state
             promptTokens: promptTokens.count,
             completionTokens: genTokenCount,
             totalTokens: promptTokens.count + genTokenCount
-        )
+        ),
+        systemFingerprint: state.systemFingerprint
     )
 
     let data = try JSONEncoder().encode(response)
@@ -355,10 +360,14 @@ private func handleStreamingRequest(
         temperature: chatRequest.temperature,
         topP: chatRequest.topP,
         topK: chatRequest.topK,
-        minP: nil
+        minP: nil,
+        seed: chatRequest.seed
     )
 
-    let promptTokens = tokenizeMessages(chatRequest.messages, tools: chatRequest.tools, state: state)
+    let reasoningEffort = ReasoningEffort.resolve(
+        request: chatRequest.reasoningEffort, default: state.config.defaultReasoningEffort)
+    let promptTokens = tokenizeMessages(
+        chatRequest.messages, tools: chatRequest.tools, reasoningEffort: reasoningEffort, state: state)
     let stopSequences = buildStopSequences(from: chatRequest, state: state)
     let input: Input = .tokens(promptTokens)
 
@@ -387,7 +396,8 @@ private func handleStreamingRequest(
 
             let roleChunk = ChatCompletionChunk(
                 id: requestID, object: "chat.completion.chunk", created: created, model: state.config.modelName,
-                choices: [.init(index: 0, delta: .init(role: "assistant", content: nil), finishReason: nil)]
+                choices: [.init(index: 0, delta: .init(role: "assistant", content: nil), finishReason: nil)],
+                systemFingerprint: state.systemFingerprint
             )
             if let data = try? encoder.encode(roleChunk), let json = String(data: data, encoding: .utf8) {
                 try await writer.write(ByteBuffer(string: "data: \(json)\n\n"))
@@ -423,7 +433,8 @@ private func handleStreamingRequest(
                 let chunk = ChatCompletionChunk(
                     id: requestID, object: "chat.completion.chunk", created: created,
                     model: state.config.modelName,
-                    choices: [.init(index: 0, delta: delta, finishReason: nil)])
+                    choices: [.init(index: 0, delta: delta, finishReason: nil)],
+                    systemFingerprint: state.systemFingerprint)
                 if let data = try? encoder.encode(chunk),
                     let json = String(data: data, encoding: .utf8)
                 {
@@ -505,7 +516,8 @@ private func handleStreamingRequest(
             let finishReason = tokenCount >= requestMaxTokens ? "length" : (hasToolCalls ? "tool_calls" : "stop")
             let doneChunk = ChatCompletionChunk(
                 id: requestID, object: "chat.completion.chunk", created: created, model: state.config.modelName,
-                choices: [.init(index: 0, delta: .init(role: nil, content: nil), finishReason: finishReason)]
+                choices: [.init(index: 0, delta: .init(role: nil, content: nil), finishReason: finishReason)],
+                systemFingerprint: state.systemFingerprint
             )
             if let data = try? encoder.encode(doneChunk), let json = String(data: data, encoding: .utf8) {
                 try await writer.write(ByteBuffer(string: "data: \(json)\n\n"))
@@ -556,9 +568,13 @@ private func handleStreamingRequest(
 // MARK: - Helpers
 
 private func tokenizeMessages(
-    _ messages: [ChatMessage], tools: [ToolDefinition]? = nil, state: ServerState
+    _ messages: [ChatMessage], tools: [ToolDefinition]? = nil,
+    reasoningEffort: String? = nil, state: ServerState
 ) -> [Int] {
     var templateMessages: [[String: any Sendable]] = []
+    // Resolved effort is the single source of truth: `none` also injects the legacy `/no_think`
+    // literal for models (e.g. Qwen3) that honor it in the system prompt.
+    let noThink = ReasoningEffort.disablesThinking(reasoningEffort)
     for msg in messages {
         var dict: [String: any Sendable] = ["role": msg.role]
 
@@ -580,7 +596,7 @@ private func tokenizeMessages(
             dict["content"] = msg.content.textContent
         } else {
             var content = msg.content.textContent
-            if msg.role == "system" && state.config.noThinking {
+            if msg.role == "system" && noThink {
                 content += "\n/no_think"
             }
             dict["content"] = content
@@ -588,7 +604,7 @@ private func tokenizeMessages(
         templateMessages.append(dict)
     }
 
-    if state.config.noThinking && !messages.contains(where: { $0.role == "system" }) {
+    if noThink && !messages.contains(where: { $0.role == "system" }) {
         templateMessages.insert(["role": "system", "content": "/no_think"], at: 0)
     }
 
@@ -608,8 +624,10 @@ private func tokenizeMessages(
     }
 
     do {
+        let additionalContext = ReasoningEffort.templateContext(reasoningEffort)
         let tokens = try state.tokenizer.applyChatTemplate(
-            messages: templateMessages, tools: toolSpecs)
+            messages: templateMessages, tools: toolSpecs,
+            additionalContext: additionalContext.isEmpty ? nil : additionalContext)
         return tokens
     } catch {
         CLILogger.log("applyChatTemplate failed: \(error)", component: "Server")

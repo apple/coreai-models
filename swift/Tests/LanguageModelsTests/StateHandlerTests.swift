@@ -35,6 +35,24 @@ struct ZeroFillNDArrayTests {
         }
     }
 
+    @Test("Zero-fills a BFloat16 NDArray")
+    func zeroFillBFloat16() {
+        // BFloat16 states (e.g. gpt-oss-20b) reach zeroFillNDArray through reset(). A typed
+        // Float16 view traps on them, so this exercises the raw-view path.
+        var array = NDArray(shape: [2, 4], scalarType: .bfloat16)
+        array.mutableRawView().withUnsafeMutableBytes { ptr, _, _ in
+            let dst = ptr.assumingMemoryBound(to: UInt16.self)
+            for i in 0..<8 { dst[i] = 0x3F80 }  // 1.0 in bf16
+        }
+        zeroFillNDArray(&array)
+        array.rawView().withUnsafeBytes { ptr, _, _ in
+            let src = ptr.assumingMemoryBound(to: UInt16.self)
+            for i in 0..<8 {
+                #expect(src[i] == 0, "Expected 0, got \(src[i])")
+            }
+        }
+    }
+
     @Test("Zero-fills a high-rank NDArray")
     func zeroFillHighRank() {
         var array = NDArray(shape: [2, 4, 8, 16], scalarType: .float16)
