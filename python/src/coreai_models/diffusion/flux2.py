@@ -176,6 +176,15 @@ def dummy_flux2_transformer(pipe: Any) -> tuple[torch.Tensor, ...]:
     return _dummy_flux2_transformer_impl(pipe, grid_size=64)
 
 
+def dummy_flux2_transformer_quant_trace(pipe: Any) -> tuple[torch.Tensor, ...]:
+    """Small trace for the weight quantizer's shape-discovery forward.
+
+    Identical to dummy_flux2_transformer but with smaller grid size for faster
+    export. We don't need the full grid size for quantization trace.
+    """
+    return _dummy_flux2_transformer_impl(pipe, grid_size=8)
+
+
 def dummy_flux2_text_encoder(pipe: Any) -> tuple[torch.Tensor, ...]:
     text_seq_len = 512
     return (

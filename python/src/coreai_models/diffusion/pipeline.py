@@ -15,7 +15,7 @@ Supports:
 - FLUX.2 Klein (DiT-based)
 """
 
-import asyncio
+import copy
 import json
 import logging
 import shutil
@@ -28,13 +28,15 @@ import torch
 from huggingface_hub import snapshot_download
 
 from coreai_models._constants import DEFAULT_INCLUDE_DEBUG_INFO
-from coreai_models.diffusion.components import MultiFunctionComponentSpec, get_component_registry
+from coreai_models.diffusion.components import (
+    MultiFunctionComponentSpec,
+    get_component_registry,
+    quant_weight_owner,
+)
 from coreai_models.diffusion.gpu import export_multifunction, export_stateless
 from coreai_models.diffusion.models import get_pipeline_type
 from coreai_models.diffusion.presets import PRESETS, list_presets
-from coreai_models.export.compiler import (
-    apply_mlir_quantization,
-)
+from coreai_models.export.compression import is_compression_mode_graph, quantize_pytorch_model
 from coreai_models.export.metadata import build_aimodel_metadata
 
 logger = logging.getLogger(__name__)
@@ -64,10 +66,6 @@ def export_diffusion(config: DiffusionExportConfig) -> dict[str, str]:
     Returns:
         Dict mapping component name to its .aimodel path.
     """
-    return asyncio.run(_async_export_diffusion(config))
-
-
-async def _async_export_diffusion(config: DiffusionExportConfig) -> dict[str, str]:
     precision_map = {
         "float16": torch.float16,
         "bfloat16": torch.bfloat16,
@@ -95,6 +93,11 @@ async def _async_export_diffusion(config: DiffusionExportConfig) -> dict[str, st
 
     # 2. Export each component
     results: dict[str, str] = {}
+
+    # Modules already quantized. Several specs can share one, and only the first pass
+    # sees dense weights, since eager finalize frees them in place.
+    quantized_modules: set[int] = set()
+
     for name in component_names:
         if name not in registry:
             logger.warning(f"Unknown component '{name}', skipping. Valid: {list(registry.keys())}")
@@ -108,12 +111,24 @@ async def _async_export_diffusion(config: DiffusionExportConfig) -> dict[str, st
             results[name] = str(asset_path)
             continue
 
+        wrapper = spec.wrapper_fn(hf_pipe)
+
+        # Quantize weights here, before export.
+        if quant_config is not None and spec.quantizable:
+            logger.info(f"Quantizing {name}...")
+            _quantize_component_weights(
+                wrapper,
+                quant_weight_owner(wrapper),
+                spec.quant_trace_fn()(hf_pipe),
+                quant_config,
+                quantized_modules,
+            )
+
         if isinstance(spec, MultiFunctionComponentSpec):
             logger.info(
                 f"Exporting {name} -> {spec.asset_name}.aimodel "
                 f"(multi-function: {[f.name for f in spec.functions]})"
             )
-            wrapper = spec.wrapper_fn(hf_pipe)
             functions = [(fv.name, wrapper, fv.dummy_fn(hf_pipe)) for fv in spec.functions]
             program = export_multifunction(
                 functions,
@@ -124,7 +139,6 @@ async def _async_export_diffusion(config: DiffusionExportConfig) -> dict[str, st
         else:
             logger.info(f"Exporting {name} -> {spec.asset_name}.aimodel")
 
-            wrapper = spec.wrapper_fn(hf_pipe)
             dummy_kwargs: dict[str, Any] = {}
             if "vae" in name and config.vae_tile_size is not None:
                 dummy_kwargs["tile_size"] = config.vae_tile_size
@@ -139,12 +153,6 @@ async def _async_export_diffusion(config: DiffusionExportConfig) -> dict[str, st
                 dynamic_shapes=dynamic_shapes,
                 include_debug_info=config.include_debug_info,
             )
-
-        # Optional MLIR quantization
-        component_quant = quant_config if spec.quantizable else None
-        if component_quant is not None:
-            logger.info(f"Quantizing {name}...")
-            program = await apply_mlir_quantization(program, component_quant)
 
         if asset_path.exists():
             shutil.rmtree(asset_path)
@@ -523,10 +531,55 @@ def _resolve_compression(compression: str) -> dict | None:
         return cast(dict | None, config)
     try:
         parsed: dict = json.loads(compression)
-        return parsed
     except (json.JSONDecodeError, TypeError) as e:
         available = ", ".join(list_presets())
         raise ValueError(
             f"Unknown compression value '{compression}'. "
             f"Expected a preset name ({available}) or a JSON config dict."
         ) from e
+
+    return parsed
+
+
+def _quantize_component_weights(
+    wrapper: torch.nn.Module,
+    weight_owner: torch.nn.Module,
+    trace_inputs: tuple,
+    quantization_config: dict,
+    quantized_modules: set[int],
+) -> None:
+    """Quantize a component's weights in place before torch.export.
+
+    Args:
+        wrapper: The export wrapper, quantized in place.
+        weight_owner: The shared module holding the weights, used as the identity key.
+        trace_inputs: Positional inputs for the shape-discovery forward.
+        quantization_config: A coreai-opt ``quantization_config`` dict.
+        quantized_modules: Identity keys of weight owners already quantized, updated here.
+    """
+    if id(weight_owner) in quantized_modules:
+        logger.info("  weights already quantized by an earlier component; reusing")
+        return
+
+    # Graph mode finalizes to an fx.GraphModule, which would replace the wrapper and its
+    # forward signature. Multi-function export also re-traces one live module at eight
+    # shapes, and a GraphModule is frozen at one.
+    if is_compression_mode_graph(quantization_config):
+        raise ValueError(
+            "Diffusion pre-export quantization requires execution_mode='eager'. Graph "
+            "mode returns an fx.GraphModule, which breaks the component wrappers and "
+            "multi-function export."
+        )
+
+    # `quantize_pytorch_model` is shaped for the LLM path, where the trace carries KV
+    # caches and activation calibration needs to know their length. Diffusion has neither,
+    # and the arguments below are only read when the config sets `calibrate_activations`.
+    quantize_pytorch_model(
+        wrapper,
+        trace_inputs,
+        None,  # dynamic_shapes: eager mode ignores it
+        copy.deepcopy(quantization_config),  # rewritten in place; presets are shared
+        0,  # cache_seq_len: no KV cache
+        (),  # state_indices: no states to reset between samples
+    )
+    quantized_modules.add(id(weight_owner))
