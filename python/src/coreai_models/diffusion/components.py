@@ -33,6 +33,7 @@ from coreai_models.diffusion.flux2 import (
     dummy_flux2_transformer_img2img_full,
     dummy_flux2_transformer_img2img_half,
     dummy_flux2_transformer_img2img_quarter,
+    dummy_flux2_transformer_quant_trace,
     dummy_flux2_vae_decoder,
     dummy_flux2_vae_decoder_half,
     dummy_flux2_vae_encoder,
@@ -44,6 +45,7 @@ from coreai_models.diffusion.wan import (
     WanVAEDecoderWrapper,
     dummy_wan_text_encoder,
     dummy_wan_transformer,
+    dummy_wan_transformer_quant_trace,
     dummy_wan_vae_decoder,
     wan_transformer_dynamic_shapes,
 )
@@ -194,6 +196,21 @@ class VAEEncoderWrapper(torch.nn.Module):
         return cast(torch.Tensor, self.vae.encode(x).latent_dist.parameters)
 
 
+def quant_weight_owner(wrapper: torch.nn.Module) -> torch.nn.Module:
+    """Returns the module holding quantizable weights
+
+    Quantizable wrappers store their model as ``self.model``. Two specs over the same
+    model return the same owner, which is how the export loop quantizes it once.
+    """
+    owner = getattr(wrapper, "model", None)
+    if owner is None:
+        raise AttributeError(
+            f"{type(wrapper).__name__} is quantizable but exposes no `.model`. "
+            "Quantization identifies a shared weight set by that attribute."
+        )
+    return cast(torch.nn.Module, owner)
+
+
 # ---------------------------------------------------------------------------
 # ComponentSpec
 # ---------------------------------------------------------------------------
@@ -208,6 +225,11 @@ class ComponentSpec:
     dummy_fn: Callable
     quantizable: bool = False
     dynamic_shapes_fn: Callable | None = None
+    quant_dummy_fn: Callable | None = None
+
+    def quant_trace_fn(self) -> Callable:
+        """The factory for the quantizer's trace inputs."""
+        return self.quant_dummy_fn or self.dummy_fn
 
 
 @dataclass(frozen=True)
@@ -233,6 +255,14 @@ class MultiFunctionComponentSpec:
     wrapper_fn: Callable
     functions: tuple[FunctionVariant, ...]
     quantizable: bool = True
+    quant_dummy_fn: Callable | None = None
+
+    def quant_trace_fn(self) -> Callable:
+        """The factory for the quantizer's trace inputs.
+
+        Weights are shared, so just grab the first one.
+        """
+        return self.quant_dummy_fn or self.functions[0].dummy_fn
 
 
 # ---------------------------------------------------------------------------
@@ -281,15 +311,29 @@ def _dummy_vae_encoder(pipe: Any, batch_size: int = 2) -> tuple[torch.Tensor, ..
     return (torch.randn(1, 3, size * 8, size * 8, dtype=dtype),)
 
 
-def _dummy_sd3_transformer(pipe: Any, batch_size: int = 2) -> tuple[torch.Tensor, ...]:
+def _dummy_sd3_transformer(
+    pipe: Any, batch_size: int = 2, sample_size: int | None = None
+) -> tuple[torch.Tensor, ...]:
     cfg = pipe.transformer.config
     dtype = _model_dtype(pipe)
+    size = cfg.sample_size if sample_size is None else sample_size
     return (
-        torch.randn(batch_size, cfg.in_channels, cfg.sample_size, cfg.sample_size, dtype=dtype),
+        torch.randn(batch_size, cfg.in_channels, size, size, dtype=dtype),
         torch.tensor([999.0] * batch_size, dtype=dtype),
         torch.randn(batch_size, 154, cfg.joint_attention_dim, dtype=dtype),
         torch.randn(batch_size, cfg.pooled_projection_dim, dtype=dtype),
     )
+
+
+def _dummy_sd3_transformer_quant_trace(pipe: Any) -> tuple[torch.Tensor, ...]:
+    """Small trace for the weight quantizer's shape-discovery forward.
+
+    Weight-only quantization reads the weights alone, so this forward just has to reach
+    every quantizable op once. The MMDiT crops its position embedding out of
+    ``pos_embed_max_size``, which is how it generates below its native resolution, so a
+    smaller latent traces the same set of Linears.
+    """
+    return _dummy_sd3_transformer(pipe, batch_size=1, sample_size=32)
 
 
 # ---------------------------------------------------------------------------
@@ -344,6 +388,7 @@ FLUX2_COMPONENTS: dict[str, ComponentSpec] = {
         ),
         output_names=("output",),
         wrapper_fn=lambda p: Flux2TransformerWrapper(p.transformer),
+        quant_dummy_fn=dummy_flux2_transformer_quant_trace,
         dummy_fn=dummy_flux2_transformer,
         quantizable=True,
     ),
@@ -359,6 +404,7 @@ FLUX2_COMPONENTS: dict[str, ComponentSpec] = {
         ),
         output_names=("output",),
         wrapper_fn=lambda p: Flux2TransformerWrapper(p.transformer),
+        quant_dummy_fn=dummy_flux2_transformer_quant_trace,
         dummy_fn=dummy_flux2_transformer_img2img_full,
         quantizable=True,
     ),
@@ -374,6 +420,7 @@ FLUX2_COMPONENTS: dict[str, ComponentSpec] = {
         ),
         output_names=("output",),
         wrapper_fn=lambda p: Flux2TransformerWrapper(p.transformer),
+        quant_dummy_fn=dummy_flux2_transformer_quant_trace,
         dummy_fn=dummy_flux2_transformer_img2img_half,
         quantizable=True,
     ),
@@ -389,6 +436,7 @@ FLUX2_COMPONENTS: dict[str, ComponentSpec] = {
         ),
         output_names=("output",),
         wrapper_fn=lambda p: Flux2TransformerWrapper(p.transformer),
+        quant_dummy_fn=dummy_flux2_transformer_quant_trace,
         dummy_fn=dummy_flux2_transformer_img2img_quarter,
         quantizable=True,
     ),
@@ -404,6 +452,7 @@ FLUX2_COMPONENTS: dict[str, ComponentSpec] = {
         ),
         output_names=("output",),
         wrapper_fn=lambda p: Flux2TransformerWrapper(p.transformer),
+        quant_dummy_fn=dummy_flux2_transformer_quant_trace,
         dummy_fn=dummy_flux2_transformer_512,
         quantizable=True,
     ),
@@ -419,6 +468,7 @@ FLUX2_COMPONENTS: dict[str, ComponentSpec] = {
         ),
         output_names=("output",),
         wrapper_fn=lambda p: Flux2TransformerWrapper(p.transformer),
+        quant_dummy_fn=dummy_flux2_transformer_quant_trace,
         dummy_fn=dummy_flux2_transformer_img2img_512_full,
         quantizable=True,
     ),
@@ -434,6 +484,7 @@ FLUX2_COMPONENTS: dict[str, ComponentSpec] = {
         ),
         output_names=("output",),
         wrapper_fn=lambda p: Flux2TransformerWrapper(p.transformer),
+        quant_dummy_fn=dummy_flux2_transformer_quant_trace,
         dummy_fn=dummy_flux2_transformer_img2img_512_half,
         quantizable=True,
     ),
@@ -449,6 +500,7 @@ FLUX2_COMPONENTS: dict[str, ComponentSpec] = {
         ),
         output_names=("output",),
         wrapper_fn=lambda p: Flux2TransformerWrapper(p.transformer),
+        quant_dummy_fn=dummy_flux2_transformer_quant_trace,
         dummy_fn=dummy_flux2_transformer_img2img_512_quarter,
         quantizable=True,
     ),
@@ -508,6 +560,7 @@ FLUX2_MULTIFUNCTION_TRANSFORMER = MultiFunctionComponentSpec(
     input_names=_FLUX2_TRANSFORMER_INPUT_NAMES,
     output_names=("output",),
     wrapper_fn=lambda p: Flux2TransformerWrapper(p.transformer),
+    quant_dummy_fn=dummy_flux2_transformer_quant_trace,
     functions=(
         FunctionVariant("main", dummy_flux2_transformer),
         FunctionVariant("half", dummy_flux2_transformer_512),
@@ -559,6 +612,7 @@ SD3_COMPONENTS: dict[str, ComponentSpec] = {
         wrapper_fn=lambda p: SD3TransformerWrapper(p.transformer),
         dummy_fn=_dummy_sd3_transformer,
         quantizable=True,
+        quant_dummy_fn=_dummy_sd3_transformer_quant_trace,
     ),
     "vae_decoder": ComponentSpec(
         asset_name="VAEDecoder",
@@ -584,6 +638,7 @@ WAN_COMPONENTS: dict[str, ComponentSpec] = {
         dummy_fn=dummy_wan_transformer,
         quantizable=True,
         dynamic_shapes_fn=wan_transformer_dynamic_shapes,
+        quant_dummy_fn=dummy_wan_transformer_quant_trace,
     ),
     "text_encoder": ComponentSpec(
         asset_name="TextEncoder",
