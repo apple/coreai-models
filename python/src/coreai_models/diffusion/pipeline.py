@@ -15,6 +15,7 @@ Supports:
 - FLUX.2 Klein (DiT-based)
 """
 
+import copy
 import json
 import logging
 import shutil
@@ -577,7 +578,7 @@ def _quantize_component_weights(
         wrapper,
         trace_inputs,
         None,  # dynamic_shapes: eager mode ignores it
-        quantization_config,
+        copy.deepcopy(quantization_config),  # rewritten in place; presets are shared
         0,  # cache_seq_len: no KV cache
         (),  # state_indices: no states to reset between samples
     )

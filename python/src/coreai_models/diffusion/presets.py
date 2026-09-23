@@ -26,9 +26,9 @@ from typing import Any
 DEFAULT_COMPRESSION_PRESET = "none"
 
 # These norms end their forward with `self.weight * hidden_states`, and `torch.mul` is a
-# registered eager op, so the global `weight` spec matches their rank-1 parameter and
-# per_block(axis=1) raises a plain ValueError during prepare(). coreai-opt reserves its
-# automatic skip for block-size mismatches, so these exclusions cover the case instead.
+# registered eager op, so the global `weight` spec matches their rank-1 parameter. coreai-opt
+# has no default axis for `torch.mul` and raises during prepare(), so these exclusions skip
+# the norms instead.
 #
 # Entries are keyed by class, so one that a given pipeline never instantiates is a no-op.
 # Norms reached through `F.layer_norm`, `F.group_norm` or `F.rms_norm` need no entry, since
@@ -46,7 +46,7 @@ _WEIGHT_ONLY = {"op_input_spec": None, "op_output_spec": None}
 _INT4_PER_BLOCK32 = {
     "dtype": "int4",
     "qscheme": "symmetric_with_clipping",
-    "granularity": {"type": "per_block", "block_size": 32, "axis": 1},
+    "granularity": {"type": "per_block", "block_size": 32},
 }
 _INT4_PER_BLOCK32_ASYM = {**_INT4_PER_BLOCK32, "qscheme": "asymmetric"}
 
@@ -54,7 +54,7 @@ _INT4_PER_BLOCK32_ASYM = {**_INT4_PER_BLOCK32, "qscheme": "asymmetric"}
 _INT8_PER_CHANNEL = {
     "dtype": "int8",
     "qscheme": "symmetric_with_clipping",
-    "granularity": {"type": "per_channel", "axis": 0},
+    "granularity": {"type": "per_channel"},
 }
 
 PRESETS: dict[str, dict[str, Any]] = {

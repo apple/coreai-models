@@ -21,6 +21,7 @@ import json
 import pytest
 import torch
 import torch.nn as nn
+from coreai_opt.quantization import QuantizerConfig
 
 from coreai_models.diffusion.components import (
     FLUX2_COMPONENTS,
@@ -118,19 +119,21 @@ def test_symmetric_presets_use_clipping_not_plain_symmetric() -> None:
     assert qscheme(asymmetric) == "asymmetric"
 
 
+def _weight_scale_shape(preset: str) -> tuple[int, ...]:
+    model = _TwoLinears().eval()
+    _quantize(model, copy.deepcopy(PRESETS[preset]["config"]))
+    return tuple(model.a.parametrizations["weight"][0].scale.shape)
+
+
 def test_per_block_blocks_on_the_input_channel_axis() -> None:
-    """Blocking runs along input channels, which is axis 1 of an [out, in] weight."""
-    granularity = PRESETS["4bit"]["config"]["global_config"]["op_state_spec"]["weight"][
-        "granularity"
-    ]
-    assert granularity == {"type": "per_block", "block_size": 32, "axis": 1}
+    """The presets leave ``axis`` to coreai-opt, which blocks a Linear along axis 1."""
+    # [out=512, in=256] weight, one scale per 32 input channels.
+    assert _weight_scale_shape("4bit") == (512, 256 // 32)
 
 
-def test_per_channel_blocks_on_the_output_channel_axis() -> None:
-    granularity = PRESETS["8bit"]["config"]["global_config"]["op_state_spec"]["weight"][
-        "granularity"
-    ]
-    assert granularity == {"type": "per_channel", "axis": 0}
+def test_per_channel_scales_along_the_output_channel_axis() -> None:
+    """The presets leave ``axis`` to coreai-opt, which scales a Linear along axis 0."""
+    assert _weight_scale_shape("8bit") == (512, 1)
 
 
 def test_int8_preset_is_no_longer_a_silent_no_op() -> None:
@@ -142,11 +145,8 @@ def test_int8_preset_is_no_longer_a_silent_no_op() -> None:
 @pytest.mark.parametrize("name", [n for n, p in PRESETS.items() if p["config"] is not None])
 def test_presets_satisfy_the_coreai_opt_schema(name: str) -> None:
     """Catches a schema typo without downloading any weights."""
-    coreai_opt_quantization = pytest.importorskip("coreai_opt.quantization")
-    # from_dict rewrites its input in place, turning "int4" into torch.int4, so give it a
-    # copy and leave the shared preset as the other tests expect to find it.
     config = copy.deepcopy(PRESETS[name]["config"])
-    coreai_opt_quantization.QuantizerConfig.from_dict({"quantization_config": config})
+    QuantizerConfig.from_dict({"quantization_config": config})
 
 
 @pytest.mark.parametrize(
@@ -160,7 +160,7 @@ def test_presets_satisfy_the_coreai_opt_schema(name: str) -> None:
 def test_required_module_exclusions_are_present(fq_name: str, why: str) -> None:
     """Each entry was added because an export failed without it.
 
-    Dropping any one raises ``axis 1 is out of bounds for tensor of rank 1`` minutes into
+    Dropping any one raises an ``unresolved axis=None`` error minutes into
     loading the real model, so pin them by name rather than trusting the dict's length.
     """
     assert _int4_config()["module_type_configs"][fq_name] is None, why
@@ -302,11 +302,11 @@ def test_rank_one_weight_raises_without_the_module_exclusion() -> None:
     """``_MODULE_TYPE_EXCLUSIONS`` covers this case.
 
     ``torch.mul`` is a registered op and the parameter is named ``weight``, so the global
-    per-block spec matches a rank-1 tensor. coreai-opt raises a plain ``ValueError`` here
-    and reserves its automatic skip for block-size mismatches.
+    per-block spec matches a rank-1 tensor. coreai-opt has no default axis for ``torch.mul``,
+    so it raises instead of skipping the weight.
     """
     config = {**_int4_config(), "module_type_configs": {}}
-    with pytest.raises(ValueError, match="rank 1"):
+    with pytest.raises(ValueError, match="unresolved axis"):
         _quantize(_NormThenLinear().eval(), config)
 
 
