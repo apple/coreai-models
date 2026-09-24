@@ -262,7 +262,7 @@ _METADATA: dict[str, AIModelMetadataFields] = {
         ),
     ),
     "Efficient-Large-Model/Sana_Sprint_0.6B_1024px_diffusers": AIModelMetadataFields(
-        author="NVIDIA",
+        author="NVIDIA, Sana",
         license="Apache-2.0",
         model_description=(
             "Sana Sprint 0.6B is a few-step (1-4) text-to-image linear-attention "
