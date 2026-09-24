@@ -136,7 +136,9 @@ def _bundle_name(config: VideoExportConfig) -> str:
     if config.output_name is not None:
         return config.output_name
     safe = Path(config.hf_model_id).name.lower()
-    return f"{safe}_video_{config.dtype}"
+    # Default resolution does not require renaming the bundle.
+    size = "" if config.image_size == VideoExportConfig.image_size else f"_{config.image_size}"
+    return f"{safe}_video{size}_{config.dtype}"
 
 
 # ---------------------------------------------------------------------------
@@ -270,15 +272,11 @@ def _memory_attention(
 
 
 def resize_mask(mask: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
-    """Bilinear mask resize, requesting antialiasing only when it does something.
+    """Upsample ``mask`` to ``size`` with bilinear interpolation.
 
-    HF passes ``antialias=True`` unconditionally, which lowers to
-    ``aten._upsample_bilinear2d_aa`` — an op the Core AI converter has no
-    lowering for. The flag is only meaningful when downsampling; measured on
-    the shapes this export uses (1008->1152, 63->288, 288->1008) the two agree
-    to 6e-5, well under fp16 resolution. A genuine downsample such as
-    1008->288 differs by ~2.4, so those are kept on the host instead of being
-    quietly approximated here.
+    Upsampling only. A correct downsample needs ``antialias=True``. This lowers to
+    ``aten._upsample_bilinear2d_aa``, which Core AI converter cannot lower.
+    Downsampling is thus done host-side.
     """
     if size[0] <= mask.shape[-2] or size[1] <= mask.shape[-1]:
         raise ValueError(
@@ -295,8 +293,7 @@ class ImageEncodeModule(nn.Module):
 
     The FPN neck is deliberately left to ``detect`` (mirroring the lite split,
     where ``image_encode`` returns ``backbone_features`` and ``DetectorModule``
-    owns the FPN): emitting the 288x288 and 144x144 neck levels across the
-    function boundary would cost ~113 MB of fp16 IO per frame.
+    owns the FPN).
     """
 
     def __init__(self, video_model: nn.Module) -> None:
@@ -511,10 +508,8 @@ class MemoryEncodeModule(nn.Module):
     The mask arrives **already at the memory-encoder input size**. Upstream,
     `_encode_new_memory` resizes whatever it is handed, and it is handed two
     different resolutions: `_tracker_update_memories:1202` passes the tracker's
-    low-res masks (288) while `_batch_encode_memories` passes image-resolution
-    ones (1008). A static graph can only accept one, so the host resizes — and
-    that also keeps it a single interpolation, matching HF, instead of
-    round-tripping through an intermediate size.
+    low-res masks while `_batch_encode_memories` passes
+    image-resolution ones.
     """
 
     def __init__(self, video_model: nn.Module) -> None:
@@ -570,7 +565,7 @@ class TrackerMaskInitModule(nn.Module):
 
     Takes the mask at detector resolution rather than image resolution: it
     arrives that way from ``det_out["mask"]``, and upsampling inside the graph
-    keeps a 1008x1008 tensor off the function boundary.
+    keeps a full image-resolution tensor off the function boundary.
     """
 
     def __init__(self, video_model: nn.Module, image_size: int) -> None:
@@ -629,6 +624,45 @@ def export_video(config: VideoExportConfig) -> str:
     return asyncio.run(_async_export_video(config))
 
 
+def _apply_image_size(model_config, image_size: int) -> None:
+    """
+    Modify in-place a ``Sam3VideoConfig`` to ``image_size``.
+    """
+    vision_config = model_config.detector_config.vision_config
+    patch_size = vision_config.backbone_config.patch_size
+    _validate_image_size(image_size, patch_size, vision_config.backbone_config.window_size)
+
+    model_config.image_size = image_size
+
+    stock_mask_size = model_config.low_res_mask_size
+    model_config.low_res_mask_size = (image_size // patch_size) * 4
+    vision_config.backbone_feature_sizes = [
+        [scale * image_size // patch_size] * 2 for scale in (4, 2, 1)
+    ]
+
+    # Rescale fill_hole_area
+    fill_hole_area = getattr(model_config, "fill_hole_area", None)
+    if fill_hole_area:
+        ratio = (model_config.low_res_mask_size / stock_mask_size) ** 2
+        model_config.fill_hole_area = max(1, round(fill_hole_area * ratio))
+
+
+def _validate_image_size(image_size: int, patch_size: int, window_size: int) -> None:
+    """The grid must be a whole number of attention windows.
+
+    With 14px patches and a 24px window, the image size must be a multiple of 336.
+    """
+    grid, remainder = divmod(image_size, patch_size)
+    if remainder or grid % window_size:
+        stride = patch_size * window_size
+        raise ValueError(
+            f"image_size={image_size} does not tile the {window_size}-patch attention window "
+            f"({patch_size}px patches give a grid of {image_size / patch_size}). Window "
+            f"partition would pad it. Use a multiple of {stride}, e.g. "
+            f"{stride}, {stride * 2}, {stride * 3}."
+        )
+
+
 def _validate_slots(config: VideoExportConfig, tracker_config) -> None:
     """The spatial slot count is dictated by the checkpoint, not chosen.
 
@@ -669,13 +703,11 @@ async def _async_export_video(config: VideoExportConfig) -> str:
     _prepare_bundle_dir(bundle_dir, config.overwrite)
 
     logger.info("Loading %s (image_size=%d)...", config.hf_model_id, config.image_size)
-    model = transformers.Sam3VideoModel.from_pretrained(config.hf_model_id)
-    if config.image_size != model.config.image_size:
-        raise ValueError(
-            f"--image-size {config.image_size} does not match the checkpoint's "
-            f"{model.config.image_size}. Resizing needs position-embedding "
-            f"interpolation that this export does not yet do."
-        )
+    model_config = transformers.Sam3VideoConfig.from_pretrained(config.hf_model_id)
+
+    # Modify the config with the given image size before constructing the model
+    _apply_image_size(model_config, config.image_size)
+    model = transformers.Sam3VideoModel.from_pretrained(config.hf_model_id, config=model_config)
     model.eval()
     model.to(torch_dtype)
 
