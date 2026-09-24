@@ -234,7 +234,7 @@ public struct StableDiffusionPipeline: DiffusionPipeline {
             return Schedule(timeSteps: s.timeSteps, step: s.step)
         case .discreteFlow:
             throw CoreAIComponentError.invalidShape(
-                "discreteFlow is not supported by StableDiffusionPipeline — use SD3Pipeline or Flux2Pipeline")
+                "discreteFlow is not supported by StableDiffusionPipeline — use SD3Pipeline or FlowTransformerPipeline")
         }
     }
 }

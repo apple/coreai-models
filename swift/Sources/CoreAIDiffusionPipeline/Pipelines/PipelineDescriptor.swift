@@ -35,6 +35,17 @@ public struct PipelineDescriptor: Codable, Sendable {
     public var defaultGuidanceScale: Float?
     public var defaultSteps: Int?
 
+    // Sana Sprint-specific fields
+    /// TrigFlow angles for the SCM schedule; the pipeline maps them to flow sigmas.
+    public var maxTimesteps: Float?
+    public var intermediateTimesteps: Float?
+    /// Instruction prepended to every prompt before tokenizing.
+    public var promptPrefix: String?
+    /// Token count the text encoder was traced at (prefix + prompt, padded).
+    public var textInputLength: Int?
+    /// Token count of the text encoder output fed to the transformer.
+    public var textSequenceLength: Int?
+
     public init(
         type: PipelineType? = nil,
         version: String? = nil,
@@ -50,7 +61,12 @@ public struct PipelineDescriptor: Codable, Sendable {
         ropeAxesDims: [Int]? = nil,
         ropeTheta: Float? = nil,
         defaultGuidanceScale: Float? = nil,
-        defaultSteps: Int? = nil
+        defaultSteps: Int? = nil,
+        maxTimesteps: Float? = nil,
+        intermediateTimesteps: Float? = nil,
+        promptPrefix: String? = nil,
+        textInputLength: Int? = nil,
+        textSequenceLength: Int? = nil
     ) {
         self.type = type
         self.version = version
@@ -67,6 +83,11 @@ public struct PipelineDescriptor: Codable, Sendable {
         self.ropeTheta = ropeTheta
         self.defaultGuidanceScale = defaultGuidanceScale
         self.defaultSteps = defaultSteps
+        self.maxTimesteps = maxTimesteps
+        self.intermediateTimesteps = intermediateTimesteps
+        self.promptPrefix = promptPrefix
+        self.textInputLength = textInputLength
+        self.textSequenceLength = textSequenceLength
     }
 
     public init(from decoder: Decoder) throws {
@@ -86,6 +107,11 @@ public struct PipelineDescriptor: Codable, Sendable {
         self.ropeTheta = try container.decodeIfPresent(Float.self, forKey: .ropeTheta)
         self.defaultGuidanceScale = try container.decodeIfPresent(Float.self, forKey: .defaultGuidanceScale)
         self.defaultSteps = try container.decodeIfPresent(Int.self, forKey: .defaultSteps)
+        self.maxTimesteps = try container.decodeIfPresent(Float.self, forKey: .maxTimesteps)
+        self.intermediateTimesteps = try container.decodeIfPresent(Float.self, forKey: .intermediateTimesteps)
+        self.promptPrefix = try container.decodeIfPresent(String.self, forKey: .promptPrefix)
+        self.textInputLength = try container.decodeIfPresent(Int.self, forKey: .textInputLength)
+        self.textSequenceLength = try container.decodeIfPresent(Int.self, forKey: .textSequenceLength)
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -93,6 +119,7 @@ public struct PipelineDescriptor: Codable, Sendable {
         case encoderScaleFactor, decoderScaleFactor, decoderShiftFactor
         case batchNormEps, guidanceEmbeds, ropeAxesDims, ropeTheta
         case defaultGuidanceScale, defaultSteps
+        case maxTimesteps, intermediateTimesteps, promptPrefix, textInputLength, textSequenceLength
     }
 
     // MARK: - Loading
@@ -218,6 +245,7 @@ public struct PipelineDescriptor: Codable, Sendable {
         case stableDiffusionXL = "stable-diffusion-xl"
         case stableDiffusion3 = "stable-diffusion-3"
         case flux2 = "flux2"
+        case sanaSprint = "sana-sprint"
     }
 
     public struct ComponentPaths: Codable, Sendable {

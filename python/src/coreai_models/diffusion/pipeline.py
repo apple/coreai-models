@@ -13,9 +13,12 @@ Supports:
 - Stable Diffusion 1.x / 2.x (UNet-based)
 - Stable Diffusion 3.x (MMDiT, T5-less)
 - FLUX.2 Klein (DiT-based)
+- Wan 2.1 (text-to-video)
+- Sana Sprint (few-step linear-attention DiT)
 """
 
 import copy
+import inspect
 import json
 import logging
 import shutil
@@ -172,6 +175,8 @@ def export_diffusion(config: DiffusionExportConfig) -> dict[str, str]:
     # 3. Save sidecar assets (tokenizer, BN stats, etc.)
     if pipeline_type == "flux2":
         _save_flux2_sidecar_assets(hf_pipe, output_path, overwrite=config.overwrite)
+    elif pipeline_type == "sana_sprint":
+        _save_pipeline_tokenizer(hf_pipe, output_path, overwrite=config.overwrite)
     else:
         _save_tokenizer(config.hf_model_id, output_path, hf_pipe, overwrite=config.overwrite)
 
@@ -208,6 +213,11 @@ def _load_hf_pipeline(model_id: str, pipeline_type: str, model_dtype: torch.dtyp
 
         hf_pipe = Flux2KleinPipeline.from_pretrained(model_id, torch_dtype=model_dtype)
         return hf_pipe
+
+    if pipeline_type == "sana_sprint":
+        from diffusers import SanaSprintPipeline
+
+        return SanaSprintPipeline.from_pretrained(model_id, torch_dtype=model_dtype)
 
     if pipeline_type == "wan":
         from diffusers import WanPipeline
@@ -303,6 +313,18 @@ def _save_flux2_sidecar_assets(hf_pipe: Any, output_path: Path, overwrite: bool)
         logger.warning(f"Could not save VAE BN stats: {e}")
 
 
+def _save_pipeline_tokenizer(hf_pipe: Any, output_path: Path, overwrite: bool) -> None:
+    """Save the loaded tokenizer as `tokenizer/`, loaded by swift-transformers `AutoTokenizer`."""
+    tok_dir = output_path / "tokenizer"
+    if tok_dir.exists() and not overwrite:
+        logger.info(f"Skipping tokenizer: {tok_dir} exists (use --overwrite)")
+        return
+    if tok_dir.exists():
+        shutil.rmtree(tok_dir)
+    hf_pipe.tokenizer.save_pretrained(str(tok_dir))
+    logger.info(f"Saved tokenizer to {tok_dir}")
+
+
 def _save_tokenizer(model_id: str, output_path: Path, hf_pipe: Any, overwrite: bool) -> None:
     """Save the tokenizer subdirs the model needs.
 
@@ -396,6 +418,8 @@ def _write_metadata_json(
 
     if pipeline_type == "flux2":
         diffusion_config = _build_flux2_config(hf_pipe, model_id)
+    elif pipeline_type == "sana_sprint":
+        diffusion_config = _build_sana_sprint_config(hf_pipe)
     elif pipeline_type == "wan":
         diffusion_config = _build_wan_config(hf_pipe, model_id, vae_tile_size=vae_tile_size)
     else:
@@ -455,6 +479,33 @@ def _build_flux2_config(hf_pipe: Any, model_id: str) -> dict:
         "default_steps": 4,
         "rope_axes_dims": axes_dims_rope,
         "rope_theta": rope_theta,
+    }
+
+
+def _build_sana_sprint_config(hf_pipe: Any) -> dict:
+    from coreai_models.diffusion.sana import (
+        TEXT_SEQUENCE_LENGTH,
+        sana_prompt_prefix,
+        sana_text_input_length,
+    )
+
+    vae_config = hf_pipe.vae.config
+    vae_spatial_scale = 2 ** (len(vae_config.encoder_block_out_channels) - 1)
+    # SanaSprintPipeline.__call__ defaults; the runtime converts these TrigFlow angles to σ.
+    call_defaults = inspect.signature(type(hf_pipe).__call__).parameters
+
+    return {
+        "type": "sana-sprint",
+        "prediction_type": "flow_matching",
+        "decoder_scale_factor": vae_config.scaling_factor,
+        "image_size": hf_pipe.transformer.config.sample_size * vae_spatial_scale,
+        "default_guidance_scale": call_defaults["guidance_scale"].default,
+        "default_steps": call_defaults["num_inference_steps"].default,
+        "max_timesteps": call_defaults["max_timesteps"].default,
+        "intermediate_timesteps": call_defaults["intermediate_timesteps"].default,
+        "prompt_prefix": sana_prompt_prefix(),
+        "text_input_length": sana_text_input_length(hf_pipe),
+        "text_sequence_length": TEXT_SEQUENCE_LENGTH,
     }
 
 

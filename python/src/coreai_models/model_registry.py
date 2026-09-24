@@ -467,6 +467,16 @@ DIFFUSION_PRESETS: list[ModelPreset] = [
         "float16",
         None,
     ),
+    ModelPreset(
+        "sana-sprint-0.6b",
+        "Efficient-Large-Model/Sana_Sprint_0.6B_1024px_diffusers",
+        "sana-sprint",
+        "diffusion",
+        None,
+        "none",
+        "bfloat16",
+        None,
+    ),
 ]
 
 # ---------------------------------------------------------------------------

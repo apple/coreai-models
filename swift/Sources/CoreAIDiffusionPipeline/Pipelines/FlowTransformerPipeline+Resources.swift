@@ -8,10 +8,12 @@ import CoreAIShared
 import Foundation
 import Tokenizers
 
-extension Flux2Pipeline {
-    /// Load a FLUX.2 pipeline from a directory containing .aimodel files, tokenizer/, and pipeline.json.
+extension FlowTransformerPipeline {
+    /// Load a FLUX.2 or Sana Sprint pipeline from a directory containing .aimodel files,
+    /// tokenizer/, and metadata.json.
     ///
-    /// The `mode` parameter selects which components are loaded:
+    /// For FLUX.2,
+    /// the `mode` parameter selects which components are loaded:
     /// - `.full`: Transformer + VAEDecoder (1024×1024)
     /// - `.half`: Transformer_512 + VAEDecoder_half (512×512, 4× faster)
     /// - `.tiled`: Transformer + VAEDecoder_half (1024×1024 via tiled decode)
@@ -21,6 +23,10 @@ extension Flux2Pipeline {
         mode: DecodeResolution = .auto
     ) async throws {
         let descriptor = try PipelineDescriptor.resolve(at: url, config: config)
+        if descriptor.type == .sanaSprint {
+            self = try await Self.loadSanaSprint(from: url, descriptor: descriptor, mode: mode)
+            return
+        }
 
         // Resolve .auto → best available mode
         let resolvedMode: DecodeResolution
@@ -150,8 +156,8 @@ extension Flux2Pipeline {
         let tokenizer = try await AutoTokenizer.from(modelFolder: tokenizerDir)
 
         // Load VAE batch norm statistics
-        let bnMean = Flux2Pipeline.loadNpyFloat32(url.appendingPathComponent("vae_bn_mean.npy"))
-        let bnVar = Flux2Pipeline.loadNpyFloat32(url.appendingPathComponent("vae_bn_var.npy"))
+        let bnMean = Self.loadNpyFloat32(url.appendingPathComponent("vae_bn_mean.npy"))
+        let bnVar = Self.loadNpyFloat32(url.appendingPathComponent("vae_bn_var.npy"))
         let bnEps = descriptor.batchNormEps ?? 1e-5
 
         self.descriptor = descriptor
@@ -166,6 +172,36 @@ extension Flux2Pipeline {
         self.batchNormMean = bnMean
         self.batchNormVar = bnVar
         self.batchNormEps = bnEps
+    }
+
+    /// Sana Sprint bundles carry one transformer and one VAE decoder, both at full resolution.
+    private static func loadSanaSprint(
+        from url: URL, descriptor: PipelineDescriptor, mode: DecodeResolution
+    ) async throws -> Self {
+        guard mode == .auto || mode == .full else {
+            throw PipelineLoadError.unsupportedConfiguration(
+                "Sana Sprint bundles decode at full resolution only; got \(mode).")
+        }
+        func component(_ name: String, _ path: String?) throws -> CoreAIDiffusionModelFunction {
+            guard let path else { throw PipelineLoadError.missingComponent(name) }
+            let assetURL = ModelBundle.resolveAssetURL(path, in: url)
+            guard FileManager.default.fileExists(atPath: assetURL.path) else {
+                throw PipelineLoadError.missingComponent(name)
+            }
+            return CoreAIDiffusionModelFunction(modelURL: assetURL)
+        }
+
+        return Self(
+            descriptor: descriptor,
+            mode: .full,
+            transformer: try component("transformer", descriptor.components.unet),
+            textEncoder: try component("text_encoder", descriptor.components.textEncoder),
+            decoder: try component("vae_decoder", descriptor.components.vaeDecoder),
+            encoder: nil,
+            tokenizer: try await AutoTokenizer.from(modelFolder: url.appendingPathComponent("tokenizer")),
+            batchNormMean: nil,
+            batchNormVar: nil,
+            batchNormEps: 0)
     }
 
     /// Resolve an asset name to a filename, checking for .aimodel or .aimodelc.

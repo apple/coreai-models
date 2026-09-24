@@ -23,7 +23,7 @@ struct Flux2TokenMathTests {
     @Test("subsampleTokens at stride 1 is an identity copy")
     func subsampleStrideOneIsIdentity() {
         let tokens = ramp(8 * 8 * 4)
-        let actual = Flux2Pipeline.subsampleTokens(
+        let actual = FlowTransformerPipeline.subsampleTokens(
             tokens, fromSide: 8, toSide: 8, channels: 4)
         #expect(actual == tokens)
     }
@@ -38,7 +38,7 @@ struct Flux2TokenMathTests {
         for token in 0..<(fromSide * fromSide) {
             for c in 0..<channels { tokens[token * channels + c] = Float(c) * 10 }
         }
-        let actual = Flux2Pipeline.subsampleTokens(
+        let actual = FlowTransformerPipeline.subsampleTokens(
             tokens, fromSide: fromSide, toSide: 2, channels: channels)
         for token in 0..<4 {
             for c in 0..<channels {
@@ -54,7 +54,7 @@ struct Flux2TokenMathTests {
         // 4×4 grid, 1 channel, value = token index. Each 2×2 block of a 4-wide row-major
         // grid holds {r, r+1, r+4, r+5}, so its mean is r + 2.5.
         let tokens = (0..<16).map { Float($0) }
-        let actual = Flux2Pipeline.subsampleTokens(
+        let actual = FlowTransformerPipeline.subsampleTokens(
             tokens, fromSide: 4, toSide: 2, channels: 1)
         #expect(actual.count == 4)
         for (i, origin) in [0, 2, 8, 10].enumerated() {
@@ -71,7 +71,7 @@ struct Flux2TokenMathTests {
         let uncond = ramp(count).map { $0 * -0.5 + 0.25 }
         var destination = [Float](repeating: 0, count: count)
 
-        Flux2Pipeline.applyClassifierFreeGuidance(
+        FlowTransformerPipeline.applyClassifierFreeGuidance(
             cond: cond[0..<count], uncond: uncond[0..<count],
             guidanceScale: guidanceScale, into: &destination)
 
@@ -86,7 +86,7 @@ struct Flux2TokenMathTests {
         let cond = ramp(64)
         let uncond = ramp(64).map { -$0 }
         var destination = [Float](repeating: 0, count: 64)
-        Flux2Pipeline.applyClassifierFreeGuidance(
+        FlowTransformerPipeline.applyClassifierFreeGuidance(
             cond: cond[0..<64], uncond: uncond[0..<64], guidanceScale: 1.0,
             into: &destination)
         #expect(destination == cond)
@@ -99,10 +99,10 @@ struct Flux2TokenMathTests {
         let uncond = ramp(64).map { -$0 }
         var destination = [Float](repeating: 0, count: 64)
 
-        Flux2Pipeline.applyClassifierFreeGuidance(
+        FlowTransformerPipeline.applyClassifierFreeGuidance(
             cond: cond[0..<64], uncond: uncond[0..<64], guidanceScale: 25.0,
             into: &destination)
-        Flux2Pipeline.applyClassifierFreeGuidance(
+        FlowTransformerPipeline.applyClassifierFreeGuidance(
             cond: cond[0..<64], uncond: uncond[0..<64], guidanceScale: 2.0,
             into: &destination)
 
@@ -118,7 +118,7 @@ struct Flux2TokenMathTests {
         let full = ramp(256)
         let half = 128
         var destination = [Float](repeating: 0, count: half)
-        Flux2Pipeline.applyClassifierFreeGuidance(
+        FlowTransformerPipeline.applyClassifierFreeGuidance(
             cond: full[0..<half], uncond: full[0..<half], guidanceScale: 4.0,
             into: &destination)
         // cond == uncond collapses to uncond regardless of g, so any leakage past the
