@@ -123,7 +123,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--image-size",
         type=int,
         default=None,
-        help=("Input resolution. Defaults to 336 (lite) or 1008 (--full / --video). "),
+        help=(
+            "Input resolution. Defaults to 336 (lite) or 1008 (--full / --video). "
+            "With --video, must tile the attention window: 336, 672 or 1008. "
+            "Smaller is much faster but with a real accuracy cost on small objects."
+        ),
     )
     # ---- Lite-only flags -------------------------------------------
     # Mode-specific flags default to None rather than their real default so
