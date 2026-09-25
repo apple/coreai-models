@@ -194,11 +194,6 @@ extension ModelConfig {
     }
 }
 
-/// Accepted serialized-model file extensions.
-private let acceptedFileExtensions: [String] = [
-    ".aimodel"
-]
-
 extension ModelConfig {
     /// Creates a model configuration from raw data.
     public init(parsing data: Data) throws {
@@ -220,59 +215,6 @@ extension ModelConfig {
         } catch {
             throw ConfigurationError.decodingError(
                 "model config", "Failed to parse model configuration: \(error.localizedDescription)")
-        }
-    }
-
-    /// Validates the model configuration.
-    public func validate() throws {
-        // Validate model name is not empty
-        guard !name.isEmpty else {
-            throw ConfigurationError.validationError("model config", "Model name cannot be empty")
-        }
-
-        // Validate vocab size
-        guard vocabSize > 0 else {
-            throw ConfigurationError.validationError(
-                "model config", "vocab_size must be positive, got \(vocabSize)")
-        }
-
-        // Validate max context length
-        guard maxContextLength > 0 else {
-            throw ConfigurationError.validationError(
-                "model config", "max_context_length must be positive, got \(maxContextLength)")
-        }
-
-        // Validate source has HF model ID (if source is present)
-        if let source = source {
-            guard let hfModelId = source.hfModelId, !hfModelId.isEmpty else {
-                throw ConfigurationError.validationError(
-                    "model config", "source.hf_model_id is required and cannot be empty")
-            }
-        }
-
-        // Validate serialized model files
-        guard !serializedModel.isEmpty else {
-            throw ConfigurationError.validationError("model config", "serialized_model array cannot be empty")
-        }
-
-        for (index, filename) in serializedModel.enumerated() {
-            guard !filename.isEmpty else {
-                throw ConfigurationError.validationError("model config", "serialized_model[\(index)] cannot be empty")
-            }
-        }
-
-        // Validate file extensions
-        for (index, filename) in serializedModel.enumerated() {
-            guard acceptedFileExtensions.contains(where: { filename.hasSuffix($0) }) else {
-                throw ConfigurationError.validationError(
-                    "model config",
-                    "serialized_model[\(index)] '\(filename)' must have .aimodel extension"
-                )
-            }
-        }
-
-        guard !function.isEmpty else {
-            throw ConfigurationError.validationError("model config", "function cannot be empty")
         }
     }
 }

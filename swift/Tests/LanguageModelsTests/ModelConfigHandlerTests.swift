@@ -29,7 +29,6 @@ struct UnifiedConfigHandlerTests {
             }
             """
         let config = try ModelConfig(parsing: Data(json.utf8))
-        try config.validate()
 
         #expect(config.source?.modelDefinition == .pyTorch)
         #expect(config.inputMode == nil)
@@ -51,7 +50,6 @@ struct UnifiedConfigHandlerTests {
             }
             """
         let config = try ModelConfig(parsing: Data(json.utf8))
-        try config.validate()
 
         #expect(config.source?.modelDefinition == nil)
         #expect(config.inputMode == .allZeros)
@@ -69,78 +67,6 @@ struct UnifiedConfigHandlerTests {
             function: "main"
         )
         #expect(config.resolvedModelDefinition == .pyTorch)
-    }
-
-    // MARK: - Field validation (empty name, empty hf_model_id)
-
-    @Test("Rejects empty model name")
-    func rejectsEmptyName() {
-        let config = ModelConfig(
-            name: "", tokenizer: "t",
-            vocabSize: 100, maxContextLength: 512,
-            source: ModelSource(hfModelId: "t"),
-            serializedModel: ["t.aimodel"],
-            function: "main"
-        )
-        #expect(throws: ConfigurationError.self) {
-            try config.validate()
-        }
-    }
-
-    @Test("Rejects nil hf_model_id")
-    func rejectsNilHfModelId() {
-        let config = ModelConfig(
-            name: "t", tokenizer: "t",
-            vocabSize: 100, maxContextLength: 512,
-            source: ModelSource(hfModelId: nil),
-            serializedModel: ["t.aimodel"],
-            function: "main"
-        )
-        #expect(throws: ConfigurationError.self) {
-            try config.validate()
-        }
-    }
-
-    @Test("Rejects empty hf_model_id")
-    func rejectsEmptyHfModelId() {
-        let config = ModelConfig(
-            name: "t", tokenizer: "t",
-            vocabSize: 100, maxContextLength: 512,
-            source: ModelSource(hfModelId: ""),
-            serializedModel: ["t.aimodel"],
-            function: "main"
-        )
-        #expect(throws: ConfigurationError.self) {
-            try config.validate()
-        }
-    }
-
-    // MARK: - File extension validation
-
-    @Test("Accepts .aimodel extension")
-    func acceptsAimodelExtension() throws {
-        let config = ModelConfig(
-            name: "t", tokenizer: "t",
-            vocabSize: 100, maxContextLength: 512,
-            source: ModelSource(hfModelId: "t"),
-            serializedModel: ["model.aimodel"],
-            function: "main"
-        )
-        try config.validate()
-    }
-
-    @Test("Rejects unknown file extension")
-    func rejectsUnknownExtension() {
-        let config = ModelConfig(
-            name: "t", tokenizer: "t",
-            vocabSize: 100, maxContextLength: 512,
-            source: ModelSource(hfModelId: "t"),
-            serializedModel: ["model.bin"],
-            function: "main"
-        )
-        #expect(throws: ConfigurationError.self) {
-            try config.validate()
-        }
     }
 
     // MARK: - Codable round-trip
