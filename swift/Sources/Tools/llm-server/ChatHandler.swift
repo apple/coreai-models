@@ -187,7 +187,10 @@ private func handleNonStreamingRequest(chatRequest: ChatCompletionRequest, state
         seed: chatRequest.seed
     )
 
-    let promptTokens = tokenizeMessages(chatRequest.messages, tools: chatRequest.tools, state: state)
+    let reasoningEffort = ReasoningEffort.resolve(
+        request: chatRequest.reasoningEffort, default: state.config.defaultReasoningEffort)
+    let promptTokens = tokenizeMessages(
+        chatRequest.messages, tools: chatRequest.tools, reasoningEffort: reasoningEffort, state: state)
     let stopSequences = buildStopSequences(from: chatRequest, state: state)
     let input: Input = .tokens(promptTokens)
 
@@ -361,7 +364,10 @@ private func handleStreamingRequest(
         seed: chatRequest.seed
     )
 
-    let promptTokens = tokenizeMessages(chatRequest.messages, tools: chatRequest.tools, state: state)
+    let reasoningEffort = ReasoningEffort.resolve(
+        request: chatRequest.reasoningEffort, default: state.config.defaultReasoningEffort)
+    let promptTokens = tokenizeMessages(
+        chatRequest.messages, tools: chatRequest.tools, reasoningEffort: reasoningEffort, state: state)
     let stopSequences = buildStopSequences(from: chatRequest, state: state)
     let input: Input = .tokens(promptTokens)
 
@@ -562,9 +568,13 @@ private func handleStreamingRequest(
 // MARK: - Helpers
 
 private func tokenizeMessages(
-    _ messages: [ChatMessage], tools: [ToolDefinition]? = nil, state: ServerState
+    _ messages: [ChatMessage], tools: [ToolDefinition]? = nil,
+    reasoningEffort: String? = nil, state: ServerState
 ) -> [Int] {
     var templateMessages: [[String: any Sendable]] = []
+    // Resolved effort is the single source of truth: `none` also injects the legacy `/no_think`
+    // literal for models (e.g. Qwen3) that honor it in the system prompt.
+    let noThink = ReasoningEffort.disablesThinking(reasoningEffort)
     for msg in messages {
         var dict: [String: any Sendable] = ["role": msg.role]
 
@@ -586,7 +596,7 @@ private func tokenizeMessages(
             dict["content"] = msg.content.textContent
         } else {
             var content = msg.content.textContent
-            if msg.role == "system" && state.config.noThinking {
+            if msg.role == "system" && noThink {
                 content += "\n/no_think"
             }
             dict["content"] = content
@@ -594,7 +604,7 @@ private func tokenizeMessages(
         templateMessages.append(dict)
     }
 
-    if state.config.noThinking && !messages.contains(where: { $0.role == "system" }) {
+    if noThink && !messages.contains(where: { $0.role == "system" }) {
         templateMessages.insert(["role": "system", "content": "/no_think"], at: 0)
     }
 
@@ -620,8 +630,10 @@ private func tokenizeMessages(
         templateMessages, toolSpecs: toolSpecs, detection: state.toolCallDetection)
 
     do {
+        let additionalContext = ReasoningEffort.templateContext(reasoningEffort)
         let tokens = try state.tokenizer.applyChatTemplate(
-            messages: templateMessages, tools: toolSpecs)
+            messages: templateMessages, tools: toolSpecs,
+            additionalContext: additionalContext.isEmpty ? nil : additionalContext)
         return tokens
     } catch {
         CLILogger.log("applyChatTemplate failed: \(error)", component: "Server")

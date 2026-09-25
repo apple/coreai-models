@@ -13,9 +13,12 @@ Supports:
 - Stable Diffusion 1.x / 2.x (UNet-based)
 - Stable Diffusion 3.x (MMDiT, T5-less)
 - FLUX.2 Klein (DiT-based)
+- Wan 2.1 (text-to-video)
+- Sana Sprint (few-step linear-attention DiT)
 """
 
-import asyncio
+import copy
+import inspect
 import json
 import logging
 import shutil
@@ -28,13 +31,15 @@ import torch
 from huggingface_hub import snapshot_download
 
 from coreai_models._constants import DEFAULT_INCLUDE_DEBUG_INFO
-from coreai_models.diffusion.components import MultiFunctionComponentSpec, get_component_registry
+from coreai_models.diffusion.components import (
+    MultiFunctionComponentSpec,
+    get_component_registry,
+    quant_weight_owner,
+)
 from coreai_models.diffusion.gpu import export_multifunction, export_stateless
 from coreai_models.diffusion.models import get_pipeline_type
 from coreai_models.diffusion.presets import PRESETS, list_presets
-from coreai_models.export.compiler import (
-    apply_mlir_quantization,
-)
+from coreai_models.export.compression import is_compression_mode_graph, quantize_pytorch_model
 from coreai_models.export.metadata import build_aimodel_metadata
 
 logger = logging.getLogger(__name__)
@@ -64,10 +69,6 @@ def export_diffusion(config: DiffusionExportConfig) -> dict[str, str]:
     Returns:
         Dict mapping component name to its .aimodel path.
     """
-    return asyncio.run(_async_export_diffusion(config))
-
-
-async def _async_export_diffusion(config: DiffusionExportConfig) -> dict[str, str]:
     precision_map = {
         "float16": torch.float16,
         "bfloat16": torch.bfloat16,
@@ -95,6 +96,11 @@ async def _async_export_diffusion(config: DiffusionExportConfig) -> dict[str, st
 
     # 2. Export each component
     results: dict[str, str] = {}
+
+    # Modules already quantized. Several specs can share one, and only the first pass
+    # sees dense weights, since eager finalize frees them in place.
+    quantized_modules: set[int] = set()
+
     for name in component_names:
         if name not in registry:
             logger.warning(f"Unknown component '{name}', skipping. Valid: {list(registry.keys())}")
@@ -108,12 +114,24 @@ async def _async_export_diffusion(config: DiffusionExportConfig) -> dict[str, st
             results[name] = str(asset_path)
             continue
 
+        wrapper = spec.wrapper_fn(hf_pipe)
+
+        # Quantize weights here, before export.
+        if quant_config is not None and spec.quantizable:
+            logger.info(f"Quantizing {name}...")
+            _quantize_component_weights(
+                wrapper,
+                quant_weight_owner(wrapper),
+                spec.quant_trace_fn()(hf_pipe),
+                quant_config,
+                quantized_modules,
+            )
+
         if isinstance(spec, MultiFunctionComponentSpec):
             logger.info(
                 f"Exporting {name} -> {spec.asset_name}.aimodel "
                 f"(multi-function: {[f.name for f in spec.functions]})"
             )
-            wrapper = spec.wrapper_fn(hf_pipe)
             functions = [(fv.name, wrapper, fv.dummy_fn(hf_pipe)) for fv in spec.functions]
             program = export_multifunction(
                 functions,
@@ -124,7 +142,6 @@ async def _async_export_diffusion(config: DiffusionExportConfig) -> dict[str, st
         else:
             logger.info(f"Exporting {name} -> {spec.asset_name}.aimodel")
 
-            wrapper = spec.wrapper_fn(hf_pipe)
             dummy_kwargs: dict[str, Any] = {}
             if "vae" in name and config.vae_tile_size is not None:
                 dummy_kwargs["tile_size"] = config.vae_tile_size
@@ -139,12 +156,6 @@ async def _async_export_diffusion(config: DiffusionExportConfig) -> dict[str, st
                 dynamic_shapes=dynamic_shapes,
                 include_debug_info=config.include_debug_info,
             )
-
-        # Optional MLIR quantization
-        component_quant = quant_config if spec.quantizable else None
-        if component_quant is not None:
-            logger.info(f"Quantizing {name}...")
-            program = await apply_mlir_quantization(program, component_quant)
 
         if asset_path.exists():
             shutil.rmtree(asset_path)
@@ -164,6 +175,8 @@ async def _async_export_diffusion(config: DiffusionExportConfig) -> dict[str, st
     # 3. Save sidecar assets (tokenizer, BN stats, etc.)
     if pipeline_type == "flux2":
         _save_flux2_sidecar_assets(hf_pipe, output_path, overwrite=config.overwrite)
+    elif pipeline_type == "sana_sprint":
+        _save_pipeline_tokenizer(hf_pipe, output_path, overwrite=config.overwrite)
     else:
         _save_tokenizer(config.hf_model_id, output_path, hf_pipe, overwrite=config.overwrite)
 
@@ -200,6 +213,11 @@ def _load_hf_pipeline(model_id: str, pipeline_type: str, model_dtype: torch.dtyp
 
         hf_pipe = Flux2KleinPipeline.from_pretrained(model_id, torch_dtype=model_dtype)
         return hf_pipe
+
+    if pipeline_type == "sana_sprint":
+        from diffusers import SanaSprintPipeline
+
+        return SanaSprintPipeline.from_pretrained(model_id, torch_dtype=model_dtype)
 
     if pipeline_type == "wan":
         from diffusers import WanPipeline
@@ -295,6 +313,18 @@ def _save_flux2_sidecar_assets(hf_pipe: Any, output_path: Path, overwrite: bool)
         logger.warning(f"Could not save VAE BN stats: {e}")
 
 
+def _save_pipeline_tokenizer(hf_pipe: Any, output_path: Path, overwrite: bool) -> None:
+    """Save the loaded tokenizer as `tokenizer/`, loaded by swift-transformers `AutoTokenizer`."""
+    tok_dir = output_path / "tokenizer"
+    if tok_dir.exists() and not overwrite:
+        logger.info(f"Skipping tokenizer: {tok_dir} exists (use --overwrite)")
+        return
+    if tok_dir.exists():
+        shutil.rmtree(tok_dir)
+    hf_pipe.tokenizer.save_pretrained(str(tok_dir))
+    logger.info(f"Saved tokenizer to {tok_dir}")
+
+
 def _save_tokenizer(model_id: str, output_path: Path, hf_pipe: Any, overwrite: bool) -> None:
     """Save the tokenizer subdirs the model needs.
 
@@ -388,6 +418,8 @@ def _write_metadata_json(
 
     if pipeline_type == "flux2":
         diffusion_config = _build_flux2_config(hf_pipe, model_id)
+    elif pipeline_type == "sana_sprint":
+        diffusion_config = _build_sana_sprint_config(hf_pipe)
     elif pipeline_type == "wan":
         diffusion_config = _build_wan_config(hf_pipe, model_id, vae_tile_size=vae_tile_size)
     else:
@@ -447,6 +479,33 @@ def _build_flux2_config(hf_pipe: Any, model_id: str) -> dict:
         "default_steps": 4,
         "rope_axes_dims": axes_dims_rope,
         "rope_theta": rope_theta,
+    }
+
+
+def _build_sana_sprint_config(hf_pipe: Any) -> dict:
+    from coreai_models.diffusion.sana import (
+        TEXT_SEQUENCE_LENGTH,
+        sana_prompt_prefix,
+        sana_text_input_length,
+    )
+
+    vae_config = hf_pipe.vae.config
+    vae_spatial_scale = 2 ** (len(vae_config.encoder_block_out_channels) - 1)
+    # SanaSprintPipeline.__call__ defaults; the runtime converts these TrigFlow angles to σ.
+    call_defaults = inspect.signature(type(hf_pipe).__call__).parameters
+
+    return {
+        "type": "sana-sprint",
+        "prediction_type": "flow_matching",
+        "decoder_scale_factor": vae_config.scaling_factor,
+        "image_size": hf_pipe.transformer.config.sample_size * vae_spatial_scale,
+        "default_guidance_scale": call_defaults["guidance_scale"].default,
+        "default_steps": call_defaults["num_inference_steps"].default,
+        "max_timesteps": call_defaults["max_timesteps"].default,
+        "intermediate_timesteps": call_defaults["intermediate_timesteps"].default,
+        "prompt_prefix": sana_prompt_prefix(),
+        "text_input_length": sana_text_input_length(hf_pipe),
+        "text_sequence_length": TEXT_SEQUENCE_LENGTH,
     }
 
 
@@ -523,10 +582,55 @@ def _resolve_compression(compression: str) -> dict | None:
         return cast(dict | None, config)
     try:
         parsed: dict = json.loads(compression)
-        return parsed
     except (json.JSONDecodeError, TypeError) as e:
         available = ", ".join(list_presets())
         raise ValueError(
             f"Unknown compression value '{compression}'. "
             f"Expected a preset name ({available}) or a JSON config dict."
         ) from e
+
+    return parsed
+
+
+def _quantize_component_weights(
+    wrapper: torch.nn.Module,
+    weight_owner: torch.nn.Module,
+    trace_inputs: tuple,
+    quantization_config: dict,
+    quantized_modules: set[int],
+) -> None:
+    """Quantize a component's weights in place before torch.export.
+
+    Args:
+        wrapper: The export wrapper, quantized in place.
+        weight_owner: The shared module holding the weights, used as the identity key.
+        trace_inputs: Positional inputs for the shape-discovery forward.
+        quantization_config: A coreai-opt ``quantization_config`` dict.
+        quantized_modules: Identity keys of weight owners already quantized, updated here.
+    """
+    if id(weight_owner) in quantized_modules:
+        logger.info("  weights already quantized by an earlier component; reusing")
+        return
+
+    # Graph mode finalizes to an fx.GraphModule, which would replace the wrapper and its
+    # forward signature. Multi-function export also re-traces one live module at eight
+    # shapes, and a GraphModule is frozen at one.
+    if is_compression_mode_graph(quantization_config):
+        raise ValueError(
+            "Diffusion pre-export quantization requires execution_mode='eager'. Graph "
+            "mode returns an fx.GraphModule, which breaks the component wrappers and "
+            "multi-function export."
+        )
+
+    # `quantize_pytorch_model` is shaped for the LLM path, where the trace carries KV
+    # caches and activation calibration needs to know their length. Diffusion has neither,
+    # and the arguments below are only read when the config sets `calibrate_activations`.
+    quantize_pytorch_model(
+        wrapper,
+        trace_inputs,
+        None,  # dynamic_shapes: eager mode ignores it
+        copy.deepcopy(quantization_config),  # rewritten in place; presets are shared
+        0,  # cache_seq_len: no KV cache
+        (),  # state_indices: no states to reset between samples
+    )
+    quantized_modules.add(id(weight_owner))

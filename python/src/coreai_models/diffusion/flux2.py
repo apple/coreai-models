@@ -126,7 +126,7 @@ class Flux2VAEEncoderWrapper(torch.nn.Module):
 
 # Reference tokens carry T=10 on RoPE axis 0 so the in-graph RoPE keeps them
 # positionally distinct from the noise grid even where H/W coincide. Mirrors
-# Flux2Pipeline.referenceTokenTimeOffset on the Swift side.
+# FlowTransformerPipeline.referenceTokenTimeOffset (FlowTransformerPipeline+Flux2.swift).
 REFERENCE_TOKEN_TIME_OFFSET = 10.0
 
 
@@ -174,6 +174,15 @@ def _dummy_flux2_transformer_impl(pipe: Any, grid_size: int) -> tuple[torch.Tens
 def dummy_flux2_transformer(pipe: Any) -> tuple[torch.Tensor, ...]:
     """1024×1024 (grid=64, seqLen=4096)."""
     return _dummy_flux2_transformer_impl(pipe, grid_size=64)
+
+
+def dummy_flux2_transformer_quant_trace(pipe: Any) -> tuple[torch.Tensor, ...]:
+    """Small trace for the weight quantizer's shape-discovery forward.
+
+    Identical to dummy_flux2_transformer but with smaller grid size for faster
+    export. We don't need the full grid size for quantization trace.
+    """
+    return _dummy_flux2_transformer_impl(pipe, grid_size=8)
 
 
 def dummy_flux2_text_encoder(pipe: Any) -> tuple[torch.Tensor, ...]:

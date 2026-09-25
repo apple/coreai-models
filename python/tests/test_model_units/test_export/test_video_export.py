@@ -26,8 +26,11 @@ from coreai_models.segmentation.video_pipeline import (  # noqa: E402
     ENTRYPOINT_IO,
     MASK_NEG,
     VideoExportConfig,
+    _apply_image_size,
+    _bundle_name,
     _memory_attention,
     _tracking_metadata,
+    _validate_image_size,
     _validate_slots,
     build_example_inputs,
     build_modules,
@@ -291,3 +294,126 @@ def test_tracking_metadata_emits_every_declared_field(tiny_model):
     ``>=5.5.0,<6.0``, so a routine dependency bump can trigger that with no code change."""
     tracking = _tracking_metadata(tiny_model.config)
     assert set(tracking) == set(_TRACKING_FIELDS) | set(_TRACKER_MEMORY_FIELDS)
+
+
+# --- input resolution ------------------------------------------------------
+
+
+@pytest.mark.parametrize("size", [336, 672, 1008])
+def test_validate_image_size_accepts_window_aligned_sizes(size):
+    _validate_image_size(size, patch_size=14, window_size=24)
+
+
+@pytest.mark.parametrize("size", [504, 448, 350])
+def test_validate_image_size_rejects_window_misaligned_sizes(size):
+    """These divide by the patch size but not the window, so `window_partition` would pad
+    and silently change the token count the graph was traced for."""
+    with pytest.raises(ValueError, match="attention window"):
+        _validate_image_size(size, patch_size=14, window_size=24)
+
+
+@pytest.mark.parametrize(
+    ("size", "mask_size", "feats"),
+    [
+        (1008, 288, [[288, 288], [144, 144], [72, 72]]),
+        (672, 192, [[192, 192], [96, 96], [48, 48]]),
+        (336, 96, [[96, 96], [48, 48], [24, 24]]),
+    ],
+)
+def test_apply_image_size_retargets_every_derived_geometry(size, mask_size, feats):
+    """`low_res_mask_size` is the one field `image_size`'s setter does not touch; left at
+    288 the detector would emit masks larger than the frame."""
+    config = transformers.Sam3VideoConfig()
+    _apply_image_size(config, size)
+
+    assert config.image_size == size
+    assert config.low_res_mask_size == mask_size
+    assert config.tracker_config.vision_config.backbone_feature_sizes == feats
+    assert config.detector_config.vision_config.backbone_feature_sizes == feats
+
+
+def _backbone_at(image_size: int, *, layers: int):
+    """The ViT backbone alone, retargeted to ``image_size``.
+
+    `_apply_image_size` works on the full video config, but these tests only read the
+    backbone, and building the whole `Sam3VideoModel` to reach it is ~30x slower.
+    """
+    from transformers.models.sam3.modeling_sam3 import Sam3ViTModel
+
+    config = transformers.Sam3VideoConfig()
+    _apply_image_size(config, image_size)
+    backbone_config = config.detector_config.vision_config.backbone_config
+    backbone_config.num_hidden_layers = layers
+    return Sam3ViTModel(backbone_config)
+
+
+def test_apply_image_size_leaves_position_embeddings_alone():
+    """The property that makes this whole change cheap.
+
+    Position embeddings are stored at `pretrain_image_size` (336, a 24x24 grid) and tiled up
+    at runtime, so the checkpoint tensor is the same shape at every resolution and 336 lands
+    on the tiling identity. If this ever stops holding, resizing needs real interpolation.
+    """
+    shapes = {
+        tuple(_backbone_at(size, layers=1).embeddings.position_embeddings.shape)
+        for size in (1008, 672, 336)
+    }
+    assert shapes == {(1, 576, 1024)}
+
+
+def test_apply_image_size_rebuilds_global_attention_rope():
+    """RoPE tables are non-persistent buffers, so they rebuild at the new grid rather than
+    loading from the checkpoint -- which is why no checkpoint tensor changes shape."""
+    backbone = _backbone_at(336, layers=8)
+
+    # Layer 7 is global (`global_attn_indexes`), the rest windowed. At 336 the grid equals
+    # the window, so both collapse to the same 576-position table.
+    assert tuple(backbone.layers[7].rotary_emb.rope_embeddings_cos.shape) == (576, 64)
+    assert tuple(backbone.layers[0].rotary_emb.rope_embeddings_cos.shape) == (576, 64)
+
+
+def test_fill_hole_area_scales_with_mask_area():
+    """It is an absolute pixel area the host applies at `low_res_mask_size`, so a threshold
+    tuned at 288^2 would cover 9x more of the mask at 96^2."""
+    stock = _tracking_metadata(transformers.Sam3VideoConfig())["fill_hole_area"]
+    assert stock == 16
+
+    scaled = {}
+    for size in (672, 336):
+        config = transformers.Sam3VideoConfig()
+        _apply_image_size(config, size)
+        scaled[size] = _tracking_metadata(config)["fill_hole_area"]
+
+    assert scaled[672] == round(stock * (192 / 288) ** 2)
+    assert scaled[336] == round(stock * (96 / 288) ** 2)
+
+
+def test_bundle_name_distinguishes_resolution():
+    """The default keeps the name it has always had, so existing bundles don't collide."""
+    assert _bundle_name(VideoExportConfig()) == "sam3_video_float16"
+    assert _bundle_name(VideoExportConfig(image_size=336)) == "sam3_video_336_float16"
+    assert _bundle_name(VideoExportConfig(image_size=672)) == "sam3_video_672_float16"
+
+
+@pytest.mark.parametrize("entrypoint", sorted(ENTRYPOINT_IO))
+def test_every_entrypoint_is_traceable_at_a_second_resolution(entrypoint):
+    """The 7-function contract has to hold at more than the one size it was written for."""
+    torch.manual_seed(4)
+    size = IMAGE_SIZE * 2  # grid 16, still a whole number of the tiny config's 4-patch window
+    config = _tiny_config()
+    _apply_image_size(config, size)
+    model = transformers.Sam3VideoModel(config).eval()
+
+    export_config = VideoExportConfig(
+        image_size=size, spatial_slots=SPATIAL_SLOTS, ptr_slots=PTR_SLOTS, dtype="float32"
+    )
+    modules = build_modules(model, export_config)
+    examples = build_example_inputs(
+        export_config, torch.float32, **model_geometry(model, export_config)
+    )
+
+    program = torch.export.export(modules[entrypoint].eval(), args=examples[entrypoint])
+    outputs = program.module()(*examples[entrypoint])
+    if isinstance(outputs, torch.Tensor):
+        outputs = (outputs,)
+    assert len(outputs) == len(ENTRYPOINT_IO[entrypoint][1]), entrypoint
