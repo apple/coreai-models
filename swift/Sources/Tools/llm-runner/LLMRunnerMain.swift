@@ -482,17 +482,26 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             component: "Main")
 
         // Read additional stop token IDs from tokenizer_config.json (e.g. <end_of_turn> for Gemma)
-        let additionalEosTokenIds: [Int32]
+        var additionalEosTokenIds: Set<Int32>
         if let tokenizerDir = bundle.tokenizerPath {
             additionalEosTokenIds = LanguageConfig.additionalStopTokenIds(
                 from: tokenizerDir, tokenizer: tokenizer)
             if !additionalEosTokenIds.isEmpty {
                 CLILogger.log(
-                    "Found \(additionalEosTokenIds.count) additional stop token(s) from tokenizer config: \(additionalEosTokenIds)",
+                    "Found \(additionalEosTokenIds.count) additional stop token(s) from tokenizer config: \(additionalEosTokenIds.sorted())",
                     component: "Main")
             }
         } else {
             additionalEosTokenIds = []
+        }
+
+        // Agentic models use <|eot|> as a turn boundary. It may not appear in
+        // tokenizer_config.json, so add it explicitly (skipping the main EOS).
+        let thinkingFormat = detectThinkingFormat(using: tokenizer)
+        if let eotId = agenticEndOfTurnTokenId(thinkingFormat: thinkingFormat, tokenizer: tokenizer),
+            eotId != tokenizer.eosTokenId.map({ Int32($0) })
+        {
+            additionalEosTokenIds.insert(eotId)
         }
 
         CLILogger.log("Model loaded successfully:", component: "Main")
@@ -780,7 +789,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         maxTokens: Int,
         actualInputTokens: Int,
         modelVocabSize: Int?,
-        additionalEosTokenIds: [Int32] = []
+        additionalEosTokenIds: Set<Int32> = []
     ) async throws {
         let schema: String
         if FileManager.default.fileExists(atPath: schemaInput) {
@@ -904,7 +913,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     func validateAndEncodeStopTokens(
         stopTokens: [String],
         tokenizer: any Tokenizer,
-        additionalEosTokenIds: [Int32] = []
+        additionalEosTokenIds: Set<Int32> = []
     ) throws -> StopSequences {
         var sequences: [[Int32]] = []
 
@@ -953,7 +962,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         tokenizer: any Tokenizer,
         samplingConfiguration: SamplingConfiguration,
         maxTokens: Int,
-        additionalEosTokenIds: [Int32],
+        additionalEosTokenIds: Set<Int32>,
         displayPrompt: String
     ) async throws {
         guard let vlmEngine = inferenceEngine as? any MultimodalInferenceEngine else {
@@ -1019,7 +1028,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         tokenizer: any Tokenizer,
         samplingConfiguration: SamplingConfiguration,
         maxTokens: Int,
-        additionalEosTokenIds: [Int32],
+        additionalEosTokenIds: Set<Int32>,
         displayPrompt: String
     ) async throws {
         guard let vlmEngine = inferenceEngine as? any MultimodalInferenceEngine else {
@@ -1073,7 +1082,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         tokenizer: any Tokenizer,
         samplingConfiguration: SamplingConfiguration,
         maxTokens: Int,
-        additionalEosTokenIds: [Int32],
+        additionalEosTokenIds: Set<Int32>,
         displayPrompt: String
     ) async throws {
         let imageTokenCount = embeddedInput.tokenCount
