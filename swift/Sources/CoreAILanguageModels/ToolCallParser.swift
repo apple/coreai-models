@@ -100,9 +100,14 @@ public struct ToolCallParser: Sendable {
     }
 
     private func parseToolCalls(from content: String) -> [Event] {
-        switch effectiveToolCallFormat(declared: format, body: content) {
+        switch format {
         case .json:
-            return parseJSONToolCalls(from: content)
+            // Qwen3-Coder shares Qwen3's `<tool_call>` markers, so it detects as `.json`.
+            // Try JSON first; only fall back to XML `<function=…>` if JSON yields no call.
+            // Attempting JSON first avoids misrouting a JSON call whose arg text contains
+            // `<function=`.
+            let jsonEvents = parseJSONToolCalls(from: content)
+            return jsonEvents.isEmpty ? parseXMLFunctionToolCalls(from: content) : jsonEvents
         case .atem:
             return parseATEMToolCalls(from: content)
         case .xmlFunction:
@@ -291,13 +296,6 @@ public struct ToolCallDetection: Sendable {
     }
 }
 
-/// Effective parse format for a tool-call body. Qwen3-Coder shares Qwen3's `<tool_call>` markers,
-/// so vocab detection yields `.json`; its XML `<function=…>` body only reveals the dialect here.
-func effectiveToolCallFormat(declared: ToolCallParser.Format, body: String) -> ToolCallParser.Format {
-    if declared == .json, body.contains("<function=") { return .xmlFunction }
-    return declared
-}
-
 /// Injects the tools JSON into a system message for dialects whose chat template reads
 /// `message['tools']` (e.g. Phi). Attaches to an existing system message, else synthesizes a
 /// leading one. Gate the call on `toolsInSystemMessage` so top-level-`tools` families (e.g. Qwen3)
@@ -320,9 +318,25 @@ public func applyToolsToSystemMessage(
     if let idx = out.firstIndex(where: { ($0["role"] as? String) == "system" }) {
         out[idx]["tools"] = toolsJSON
     } else {
+        // Empty content: standard Jinja templates render "" fine. Not verified against Phi's
+        // actual chat template (not checked into the repo) — needs on-device Phi confirmation.
         out.insert(["role": "system", "content": "", "tools": toolsJSON], at: 0)
     }
     return out
+}
+
+/// Attaches tool specs to a system message when the detected dialect reads `message['tools']`
+/// (e.g. Phi). No-op when no specs, no detection, or the dialect uses top-level `tools` (e.g.
+/// Qwen3). Shared by the server (ChatHandler) and FM (CoreAILanguageModel) prompt-building paths.
+public func injectToolsIntoSystemMessageIfNeeded(
+    _ messages: [[String: any Sendable]],
+    toolSpecs: [[String: any Sendable]]?,
+    detection: ToolCallDetection?
+) -> [[String: any Sendable]] {
+    guard let toolSpecs, detection?.toolsInSystemMessage == true,
+        let toolsJSON = toolsJSONForSystemMessage(toolSpecs)
+    else { return messages }
+    return applyToolsToSystemMessage(messages, toolsJSON: toolsJSON)
 }
 
 /// Probes a tokenizer's vocabulary for known tool-call special tokens.
@@ -352,20 +366,20 @@ public func detectToolCallFormat(using tokenizer: any Tokenizer) -> ToolCallDete
         )
     }
 
-    let tagPairs: [(open: String, close: String)] = [
-        ("<tool_call>", "</tool_call>"),
-        ("<|tool_call|>", "<|/tool_call|>"),
-        ("<function_calls>", "</function_calls>"),
+    // `toolsInSystem`: Phi's template reads tools from the system message; other JSON dialects
+    // use the top-level `tools` variable.
+    let tagPairs: [(open: String, close: String, toolsInSystem: Bool)] = [
+        ("<tool_call>", "</tool_call>", false),
+        ("<|tool_call|>", "<|/tool_call|>", true),
+        ("<function_calls>", "</function_calls>", false),
     ]
     for pair in tagPairs
     where tokenizer.vocabContains(pair.open)
         && tokenizer.vocabContains(pair.close)
     {
-        // Phi's template reads tools from the system message; other JSON dialects use top-level tools.
-        let toolsInSystem = pair.open == "<|tool_call|>"
         return ToolCallDetection(
             openMarker: pair.open, closeMarker: pair.close, format: .json,
-            toolsInSystemMessage: toolsInSystem)
+            toolsInSystemMessage: pair.toolsInSystem)
     }
     if tokenizer.vocabContains("[TOOL_CALLS]") {
         return ToolCallDetection(openMarker: "[TOOL_CALLS]", closeMarker: "\n", format: .json)

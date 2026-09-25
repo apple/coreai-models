@@ -71,6 +71,45 @@ struct ToolCallDialectTests {
         #expect((out[1]["role"] as? String) == "user")
     }
 
+    // Shared guard: injects only when specs present and the dialect reads system-message tools.
+    @Test("injectToolsIntoSystemMessageIfNeeded injects when flag + specs present")
+    func injectHelperInjects() {
+        let messages: [[String: any Sendable]] = [["role": "user", "content": "q"]]
+        let specs: [[String: any Sendable]] = [
+            ["type": "function", "function": ["name": "add", "description": "adds"]]
+        ]
+        let detection = ToolCallDetection(
+            openMarker: "<|tool_call|>", closeMarker: "<|/tool_call|>", format: .json,
+            toolsInSystemMessage: true)
+        let out = injectToolsIntoSystemMessageIfNeeded(messages, toolSpecs: specs, detection: detection)
+        #expect(out.count == 2)
+        #expect((out[0]["role"] as? String) == "system")
+        #expect((out[0]["tools"] as? String) == toolsJSONForSystemMessage(specs))
+    }
+
+    @Test("injectToolsIntoSystemMessageIfNeeded is a no-op when flag false or specs nil")
+    func injectHelperNoOp() {
+        let messages: [[String: any Sendable]] = [["role": "user", "content": "q"]]
+        let specs: [[String: any Sendable]] = [["type": "function", "function": ["name": "add"]]]
+        // Flag false (Qwen3-style): untouched.
+        let qwen = ToolCallDetection(
+            openMarker: "<tool_call>", closeMarker: "</tool_call>", format: .json,
+            toolsInSystemMessage: false)
+        let outFlagFalse = injectToolsIntoSystemMessageIfNeeded(messages, toolSpecs: specs, detection: qwen)
+        #expect(outFlagFalse.count == 1)
+        #expect(outFlagFalse.first?["tools"] == nil)
+        // No specs: untouched even when the flag is set.
+        let phi = ToolCallDetection(
+            openMarker: "<|tool_call|>", closeMarker: "<|/tool_call|>", format: .json,
+            toolsInSystemMessage: true)
+        let outNoSpecs = injectToolsIntoSystemMessageIfNeeded(messages, toolSpecs: nil, detection: phi)
+        #expect(outNoSpecs.count == 1)
+        #expect(outNoSpecs.first?["tools"] == nil)
+        // No detection: untouched.
+        let outNoDetection = injectToolsIntoSystemMessageIfNeeded(messages, toolSpecs: specs, detection: nil)
+        #expect(outNoDetection.count == 1)
+    }
+
     // Qwen3-Coder XML function body via the explicit .xmlFunction format.
     @Test("parses Qwen3-Coder <function=…> XML (explicit format)")
     func parsesXMLFunctionExplicit() {
@@ -97,12 +136,14 @@ struct ToolCallDialectTests {
         #expect(call?.args == #"{"count":5,"enabled":true,"ratio":1.5,"tags":["a","b"]}"#)
     }
 
-    // Content-based routing: a .json-declared parser (Qwen3-Coder) maps <function=…> to .xmlFunction.
-    @Test("effectiveToolCallFormat routes <function=…> bodies to .xmlFunction")
-    func effectiveFormatRoutesXML() {
-        #expect(effectiveToolCallFormat(declared: .json, body: "<function=add></function>") == .xmlFunction)
-        #expect(effectiveToolCallFormat(declared: .json, body: #"{"name":"add"}"#) == .json)
-        #expect(effectiveToolCallFormat(declared: .atem, body: "<function=add>") == .atem)
+    // JSON-first routing: a JSON call whose argument text contains `<function=` must parse as
+    // JSON, not be misrouted to the XML fallback.
+    @Test("JSON call with <function= in arg text parses as JSON (not misrouted)")
+    func jsonArgContainingFunctionTagNotMisrouted() {
+        let input = #"<tool_call>{"name":"write","arguments":{"code":"<function=foo>"}}</tool_call>"#
+        let call = firstToolCall(runParser(input, open: "<tool_call>", close: "</tool_call>", format: .json))
+        #expect(call?.name == "write")
+        #expect(call?.args == #"{"code":"<function=foo>"}"#)
     }
 
     // Qwen3-Coder shares Qwen3's <tool_call> markers, so it is detected as .json; the JSON

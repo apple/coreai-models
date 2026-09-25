@@ -664,11 +664,8 @@ public struct CoreAILanguageModel: LanguageModel {
             // top-level `tools` variable. Attach the specs there (synthesizing a system message
             // if none exists) only for that dialect, mirroring the server's ChatHandler. Top-level
             // `tools` is still passed for families such as Qwen3.
-            if let toolSpecs, toolCallDetection?.toolsInSystemMessage == true,
-                let toolsJSON = toolsJSONForSystemMessage(toolSpecs)
-            {
-                messages = applyToolsToSystemMessage(messages, toolsJSON: toolsJSON)
-            }
+            messages = injectToolsIntoSystemMessageIfNeeded(
+                messages, toolSpecs: toolSpecs, detection: toolCallDetection)
 
             do {
                 CLILogger.log("Applying chat template via tokenizer", component: component)
