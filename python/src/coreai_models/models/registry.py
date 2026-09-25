@@ -45,6 +45,12 @@ def _register_novel_configs() -> None:
                     kwargs.setdefault(
                         "layer_rope_theta", (theta_pattern * ((n_layers // 4) + 1))[:n_layers]
                     )
+                    # DFlash speculative-decoding constants (validated: K=16 block,
+                    # mask id 201818). Metadata-only; not read by forward. A real
+                    # checkpoint config that carries them wins via setdefault.
+                    # ``draft_`` prefix avoids the HF-reserved ``mask_token_id`` field.
+                    kwargs.setdefault("draft_mask_token_id", 201818)
+                    kwargs.setdefault("block_size", 16)
                     super().__init__(**kwargs)
 
             class _MuseGlimmerConfig(PretrainedConfig):
@@ -73,6 +79,13 @@ def _register_novel_configs() -> None:
                     kwargs.setdefault("sliding_window", 2048)
                     kwargs.setdefault("num_hidden_layers", 5)
                     kwargs.setdefault("rope_parameters", {"rope_theta": 500000.0})
+                    # DFlash constants (validated). drafter_hidden_size == this
+                    # config's hidden_size (4096) — the width of the tap features
+                    # the fused target must emit to match this drafter's inject_kv.
+                    # ``draft_`` prefix avoids the HF-reserved ``mask_token_id`` field.
+                    kwargs.setdefault("draft_mask_token_id", 201818)
+                    kwargs.setdefault("block_size", 16)
+                    kwargs.setdefault("target_layer_ids", [1, 13, 25, 37, 49])
                     super().__init__(**kwargs)
 
             AutoConfig.register("muse_glimmer", _MuseGlimmerConfig)
@@ -109,6 +122,12 @@ class ModelEntry:
     drafter_class: type[nn.Module] | None = None
     drafter_model_id: str | None = None
     drafter_config: dict | None = None
+    # Fused speculative target: one graph emitting (logits, drafter_features).
+    # Selected instead of ``macos_class`` when ``ExportConfig.fused_target`` is set.
+    fused_target_class: type[nn.Module] | None = None
+    # DFlash two-entrypoint drafter (inject_kv + draft). Exported instead of the
+    # single-graph ring drafter when ``ExportConfig.dflash_drafter`` is set.
+    dflash_drafter_class: type[nn.Module] | None = None
 
 
 @lru_cache(maxsize=1)
@@ -124,7 +143,13 @@ def _get_registry() -> dict[str, ModelEntry]:
     from coreai_models.models.macos.gpt_oss import GptOssForCausalLM
     from coreai_models.models.macos.mistral import MistralForCausalLM
     from coreai_models.models.macos.mixtral import MixtralForCausalLM
-    from coreai_models.models.macos.muse_glimmer import MuseGlimmerForCausalLM
+    from coreai_models.models.macos.muse_glimmer import (
+        MuseGlimmerForCausalLM,
+        MuseGlimmerForCausalLMWithDrafter,
+    )
+    from coreai_models.models.macos.muse_glimmer_drafter_dflash import (
+        MuseGlimmerDFlashDrafterForCausalLM,
+    )
     from coreai_models.models.macos.muse_glimmer_drafter_ring import MuseGlimmerDrafterForCausalLM
     from coreai_models.models.macos.olmo2 import Olmo2ForCausalLM
     from coreai_models.models.macos.phi3 import Phi3ForCausalLM
@@ -174,6 +199,8 @@ def _get_registry() -> dict[str, ModelEntry]:
                 "num_draft_tokens": 5,
                 "shared_embeddings": True,
             },
+            fused_target_class=MuseGlimmerForCausalLMWithDrafter,
+            dflash_drafter_class=MuseGlimmerDFlashDrafterForCausalLM,
         ),
         "muse_glimmer_assistant": ModelEntry(
             macos_class=MuseGlimmerDrafterForCausalLM,

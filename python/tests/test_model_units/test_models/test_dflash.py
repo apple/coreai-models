@@ -6,7 +6,10 @@
 """Tests for DFlash speculative decoding: drafter shapes, hidden state extraction, fused target."""
 
 import torch
+import torch.nn as nn
 
+from coreai_models._constants import TRACE_KV_CACHE_SEQ_LEN
+from coreai_models.models.base import TraceSpec
 from coreai_models.models.macos.muse_glimmer import (
     MuseGlimmerForCausalLMWithDrafter,
     MuseGlimmerModelWithDrafter,
@@ -95,32 +98,6 @@ class TestDFlashDrafter:
             assert k[0, 0, 0, 0, :].norm().item() > 0, "Cache should be populated after inject_kv"
             assert k[0, 0, 0, 3, :].norm().item() == 0
 
-    def test_draft_output_shape(self):
-        cfg = _make_small_config()
-        K = cfg.block_size
-        model = MuseGlimmerDFlashDrafterForCausalLM(cfg)
-        model.eval()
-
-        k = torch.zeros(
-            cfg.num_hidden_layers,
-            1,
-            cfg.num_key_value_heads,
-            cfg.sliding_window,
-            cfg.head_dim,
-        )
-        v = torch.zeros_like(k)
-        cache = RingKVCache(k, v)
-
-        features = torch.randn(1, 5, cfg.hidden_size)
-        model.inject_kv(features, torch.arange(5).unsqueeze(0), cache)
-
-        draft_ids = torch.tensor([[42] + [cfg.mask_token_id] * (K - 1)])
-        full_pos = torch.arange(5 + K).unsqueeze(0)
-        with torch.no_grad():
-            logits = model.draft(draft_ids, full_pos, cache)
-
-        assert logits.shape == (1, K, cfg.vocab_size)
-
     def test_draft_no_nan(self):
         cfg = _make_small_config()
         K = cfg.block_size
@@ -160,6 +137,153 @@ class TestDFlashDrafter:
         )
 
 
+class _InjectKVGraphModule(nn.Module):
+    """nn.Module wrapper around ``inject_kv_graph`` for torch.export.
+
+    ``torch.export.export`` requires an ``nn.Module``, not a bound method (the
+    same reason the exporter wraps these entrypoints in ``export.macos``). The
+    forward param names match the graph's input/state names so ``dynamic_shapes``
+    keys stay valid.
+    """
+
+    def __init__(self, model: MuseGlimmerDFlashDrafterForCausalLM) -> None:
+        super().__init__()
+        self.model = model
+
+    def forward(self, features, position_ids, sliding_k_cache, sliding_v_cache):
+        return self.model.inject_kv_graph(features, position_ids, sliding_k_cache, sliding_v_cache)
+
+
+class _DraftGraphModule(nn.Module):
+    """nn.Module wrapper around ``draft_graph`` for torch.export (see
+    :class:`_InjectKVGraphModule`)."""
+
+    def __init__(self, model: MuseGlimmerDFlashDrafterForCausalLM) -> None:
+        super().__init__()
+        self.model = model
+
+    def forward(self, input_ids, position_ids, sliding_k_cache, sliding_v_cache):
+        return self.model.draft_graph(input_ids, position_ids, sliding_k_cache, sliding_v_cache)
+
+
+def _export_graph(module, kwargs, dyn):
+    """torch.export one entrypoint via its nn.Module wrapper (the supported route).
+
+    ``torch.export.export`` demands an ``nn.Module``, so each entrypoint is traced
+    through its wrapper -- the same approach the exporter uses in ``export.macos``.
+    """
+    return torch.export.export(module, args=(), kwargs=kwargs, dynamic_shapes=dyn)
+
+
+class TestDFlashDrafterExportContract:
+    """Two-entrypoint (inject_kv + draft) export contract, trace-level only.
+
+    Runs without the 55GB model: tiny config, hand-built tensors, no coreai
+    conversion.
+    """
+
+    def _model_and_spec(self):
+        cfg = _make_small_config()
+        m = MuseGlimmerDFlashDrafterForCausalLM(cfg)
+        m.eval()
+        # cache_seq_len must not exceed max_context_length (small config uses 512).
+        spec = TraceSpec(
+            max_context_length=cfg.max_position_embeddings,
+            cache_seq_len=min(TRACE_KV_CACHE_SEQ_LEN, cfg.max_position_embeddings),
+        )
+        return cfg, m, spec
+
+    def test_contract_hooks_agree(self):
+        cfg, m, spec = self._model_and_spec()
+        ref = m.build_reference_inputs(cfg, torch.float32, spec)
+        dyn = m.build_dynamic_shapes(cfg, spec)
+        m.validate_export_contract(ref, dyn)  # must not raise
+
+        graphs = {"inject_kv", "draft"}
+        assert set(m.export_input_names()) == graphs
+        assert set(m.export_state_names()) == graphs
+        assert set(m.export_output_names()) == graphs
+        assert set(ref) == graphs
+        assert set(dyn) == graphs
+
+        assert m.export_output_names()["inject_kv"] == ()
+        assert m.export_output_names()["draft"] == ("logits",)
+        # Identical state tuple for both graphs => one shared physical ring buffer.
+        assert (
+            m.export_state_names()["inject_kv"]
+            == m.export_state_names()["draft"]
+            == ("slidingKeyCache", "slidingValueCache")
+        )
+        assert m.export_state_classification() == {
+            "slidingKeyCache": "sliding_kv_cache",
+            "slidingValueCache": "sliding_kv_cache",
+        }
+
+    def test_graph_wrapper_shapes(self):
+        cfg = _make_small_config()
+        m = MuseGlimmerDFlashDrafterForCausalLM(cfg)
+        m.eval()
+
+        q, K = 5, cfg.block_size
+
+        sk = torch.zeros(
+            cfg.num_hidden_layers,
+            1,
+            cfg.num_key_value_heads,
+            cfg.sliding_window,
+            cfg.head_dim,
+        )
+        sv = torch.zeros_like(sk)
+
+        # inject_kv_graph: offset 0 (position_ids length == features length).
+        features = torch.randn(1, q, cfg.hidden_size)
+        inject_pos = torch.arange(q).unsqueeze(0)
+        with torch.no_grad():
+            out = m.inject_kv_graph(features, inject_pos, sk, sv)
+        assert out == ()
+        assert sk[0, 0, 0, 0, :].norm().item() > 0, "inject_kv_graph must populate the ring cache"
+
+        # draft_graph reads the SAME (shared) buffer and appends at offset == q.
+        draft_ids = torch.tensor([[42] + [cfg.mask_token_id] * (K - 1)])
+        full_pos = torch.arange(q + K).unsqueeze(0)
+        with torch.no_grad():
+            logits = m.draft_graph(draft_ids, full_pos, sk, sv)
+        assert logits.shape == (1, K, cfg.vocab_size)
+
+    def test_torch_export_traces_both_graphs(self):
+        """Guard the shape-derived inject offset (no ``.item()``) actually traces.
+
+        The inject offset is ``seq_len - n_features`` (a shape arithmetic), not
+        ``int(position_ids[0, 0])``. If it regressed to reading a value out of the
+        tensor, the trace would emit a data-dependent ``aten._local_scalar_dense``
+        (``.item()``) node, so we assert the inject_kv graph carries none.
+        """
+        cfg, m, spec = self._model_and_spec()
+        ref = m.build_reference_inputs(cfg, torch.float32, spec)
+        dyn = m.build_dynamic_shapes(cfg, spec)
+
+        inject_ep = _export_graph(_InjectKVGraphModule(m), ref["inject_kv"], dyn["inject_kv"])
+        draft_ep = _export_graph(_DraftGraphModule(m), ref["draft"], dyn["draft"])
+
+        assert isinstance(inject_ep, torch.export.ExportedProgram)
+        assert isinstance(draft_ep, torch.export.ExportedProgram)
+
+        # A shape-derived offset must NOT lower to a data-dependent .item() read.
+        data_dependent = {
+            torch.ops.aten._local_scalar_dense.default,
+            torch.ops.aten.item.default,
+        }
+        offending = [
+            node
+            for node in inject_ep.graph_module.graph.nodes
+            if node.op == "call_function" and node.target in data_dependent
+        ]
+        assert not offending, (
+            f"inject_kv graph must derive the offset from shapes, not .item(); "
+            f"found data-dependent nodes: {[n.target for n in offending]}"
+        )
+
+
 class TestMuseGlimmerWithDrafter:
     """Tests for the fused target model that extracts hidden states."""
 
@@ -187,9 +311,18 @@ class TestMuseGlimmerWithDrafter:
         assert extracted[0].shape == (1, 4, config.hidden_size)
         assert hidden.shape == (1, 4, config.hidden_size)
 
-    def test_fused_target_dual_output(self):
+    def test_fused_target_emits_drafter_features_from_target_layer(self):
+        """Fusion: the fused target emits (logits, drafter_features) and the
+        features are derived from the hidden states at the configured
+        target_layer_ids (non-adjacent [0, 2] here).
+
+        Forward hooks capture the outputs of the configured tap layers, and the
+        features are recomputed by feeding those exact captures through the
+        model's own encoder. If fusion tapped the wrong layers or dropped the
+        second output, the recomputation diverges (or the unpack fails).
+        """
         config = _make_small_config()
-        config.target_layer_ids = [0, 1, 2, 3]  # 4 layers to match encoder_fc
+        assert config.target_layer_ids == [0, 2]
 
         model = MuseGlimmerForCausalLMWithDrafter(config)
         model.eval()
@@ -203,10 +336,33 @@ class TestMuseGlimmerWithDrafter:
         sk = torch.zeros(ns, 1, config.num_key_value_heads, config.sliding_window, config.head_dim)
         sv = torch.zeros_like(sk)
 
-        with torch.no_grad():
-            logits, features = model(ids, pos, gk, gv, sk, sv)
+        captured: dict[int, torch.Tensor] = {}
+        handles = []
+        for lid in config.target_layer_ids:
 
+            def _hook(_module, _inputs, output, lid=lid):
+                captured[lid] = output
+
+            handles.append(model.model.layers[lid].register_forward_hook(_hook))
+
+        try:
+            with torch.no_grad():
+                out = model(ids, pos, gk, gv, sk, sv)
+        finally:
+            for h in handles:
+                h.remove()
+
+        # (a) two outputs with the documented shapes.
+        assert isinstance(out, tuple) and len(out) == 2
+        logits, features = out
         assert logits.shape == (1, 4, config.vocab_size)
         assert features.shape == (1, 4, config.hidden_size)
         assert not torch.isnan(logits).any()
         assert not torch.isnan(features).any()
+
+        # (b) features are the encoder applied to the configured layers' hidden
+        # states, not some other layer's.
+        taps = torch.cat([captured[lid] for lid in config.target_layer_ids], dim=-1)
+        with torch.no_grad():
+            expected = model.encoder_norm(model.encoder_fc(taps))
+        assert torch.allclose(features, expected, atol=1e-5)

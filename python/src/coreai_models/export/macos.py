@@ -29,6 +29,8 @@ from torch.export.graph_signature import ExportGraphSignature, OutputKind
 
 from coreai_models._constants import (
     DEFAULT_INCLUDE_DEBUG_INFO,
+    DRAFT_GRAPH_NAME,
+    INJECT_KV_GRAPH_NAME,
     MAIN_GRAPH_NAME,
     PREFILL_GRAPH_NAME,
     TRACE_KV_CACHE_SEQ_LEN,
@@ -442,3 +444,183 @@ def export_macos_model(
     coreai_program.optimize()
 
     return coreai_program
+
+
+class _InjectKVEntrypointModule(torch.nn.Module):
+    """``nn.Module`` wrapper around the drafter's ``inject_kv_graph`` entrypoint.
+
+    ``torch.export.export`` requires an ``nn.Module``, not a bound method. Registering the
+    drafter as a submodule lifts its parameters and buffers into the exported program, and
+    ``forward`` delegates to the (state-only, empty-output) ``inject_kv_graph`` entrypoint.
+    The forward param names match the graph's input/state names so a per-name
+    ``dynamic_shapes`` dict stays valid.
+    """
+
+    def __init__(self, drafter: torch.nn.Module) -> None:
+        super().__init__()
+        self.drafter = drafter
+
+    def forward(self, features, position_ids, sliding_k_cache, sliding_v_cache):
+        return self.drafter.inject_kv_graph(
+            features, position_ids, sliding_k_cache, sliding_v_cache
+        )
+
+
+class _DraftEntrypointModule(torch.nn.Module):
+    """``nn.Module`` wrapper around the drafter's ``draft_graph`` entrypoint (see
+    :class:`_InjectKVEntrypointModule`); ``forward`` returns the draft ``logits``."""
+
+    def __init__(self, drafter: torch.nn.Module) -> None:
+        super().__init__()
+        self.drafter = drafter
+
+    def forward(self, input_ids, position_ids, sliding_k_cache, sliding_v_cache):
+        return self.drafter.draft_graph(input_ids, position_ids, sliding_k_cache, sliding_v_cache)
+
+
+_DFLASH_ENTRYPOINT_WRAPPERS = {
+    INJECT_KV_GRAPH_NAME: _InjectKVEntrypointModule,
+    DRAFT_GRAPH_NAME: _DraftEntrypointModule,
+}
+
+
+def _make_dflash_export_fn(graph: str, ref_inputs: dict[str, Any], dyn_shapes: dict | None):
+    """Build an ``export_fn`` that traces a DFlash drafter entrypoint via an nn.Module.
+
+    ``add_pytorch_module`` hands the patched (externalization-marked) model to the
+    returned ``export_fn`` as ``module``. We wrap that same model in the entrypoint's
+    ``nn.Module`` wrapper -- ``torch.export.export`` rejects the bound entrypoint method
+    directly (it demands an ``nn.Module``), and the wrapper's ``forward`` delegates to it.
+    Because the wrapper holds the very model ``add_pytorch_module`` patched, the
+    composite-op submodules the entrypoint invokes are the patched ones, mirroring
+    ``export_to_coreai``'s ``make_export_fn`` (minus the prefill toggle).
+
+    ``ref_inputs`` is insertion-ordered to match the entrypoint signature and is passed as
+    kwargs so ``dyn_shapes`` keys line up by parameter name; a falsy ``dyn_shapes`` passes
+    ``None`` (e.g. an all-static entrypoint).
+    """
+    wrapper_cls = _DFLASH_ENTRYPOINT_WRAPPERS[graph]
+
+    def export_fn(module: torch.nn.Module) -> torch.export.ExportedProgram:
+        wrapper = wrapper_cls(module).eval()
+        with torch.no_grad():
+            aten_exported_program = torch.export.export(
+                wrapper,
+                args=(),
+                kwargs=ref_inputs,
+                dynamic_shapes=dyn_shapes or None,
+            )
+        coreaten_exported_program = aten_exported_program.run_decompositions(
+            coreai_torch.get_decomp_table()
+        )
+        remove_functionalization(coreaten_exported_program)
+        return coreaten_exported_program
+
+    return export_fn
+
+
+def export_dflash_drafter(model: BaseForCausalLM, config, export_config) -> AIProgram:
+    """Export the DFlash drafter's two macOS entrypoints to a single AIProgram.
+
+    Unlike ``export_macos_model`` (one traced signature, plus an optional ``prefill``
+    twin of it), the DFlash drafter has two *distinct* bound methods sharing one ring-KV
+    state: ``inject_kv`` writes the target features into ``slidingKeyCache`` /
+    ``slidingValueCache`` (no outputs), and ``draft`` reads them back and emits draft
+    ``logits``. Because both entrypoints declare the *same* state names, the converter
+    binds one physical ring buffer across them -- the macOS ``main``/``prefill`` and iOS
+    ``extend``/``prompt_opt`` shared-KV mechanism.
+
+    This mirrors the eager block of ``export_to_coreai`` (one ``add_pytorch_module`` per
+    entrypoint on the same eager model) and iOS's ``_convert_to_coreai`` contract loop
+    (one entrypoint per named bound method). ``export_to_coreai`` and
+    ``export_macos_model`` are left untouched.
+
+    Args:
+        model: The eager ``MuseGlimmerDFlashDrafterForCausalLM`` (already in the target
+            dtype). Never graph-mode-quantized in the pipeline.
+        config: HuggingFace model config (cache dimensions, vocab size, etc.).
+        export_config: An ExportConfig instance (max_context_length, compute_precision,
+            include_debug_info).
+
+    Returns:
+        An optimized AIProgram carrying the ``inject_kv`` and ``draft`` entrypoints.
+    """
+    max_context_length = getattr(export_config, "max_context_length", None) or getattr(
+        config, "max_position_embeddings", 2048
+    )
+
+    from coreai_models.export.pipeline import _resolve_precision
+
+    target_dtype = _resolve_precision(export_config.compute_precision)
+
+    logger.info(
+        f"Exporting DFlash drafter (dtype={target_dtype}, max_context_length={max_context_length})"
+    )
+
+    # The trace cache length only bounds peak memory, so cap it at the context it serves.
+    spec = TraceSpec(
+        max_context_length=max_context_length,
+        cache_seq_len=min(TRACE_KV_CACHE_SEQ_LEN, max_context_length),
+    )
+    reference_inputs = model.build_reference_inputs(config, target_dtype, spec)
+    dynamic_shapes = model.build_dynamic_shapes(config, spec)
+    # Keep all graphs -- unlike the single-graph macOS path, we do not unwrap [MAIN].
+    model.validate_export_contract(reference_inputs, dynamic_shapes)
+
+    inputs = model.export_input_names()
+    states = model.export_state_names()
+    outputs = model.export_output_names()
+
+    # The two entrypoints are traced through nn.Module wrappers
+    # (_DFLASH_ENTRYPOINT_WRAPPERS), so only the graph names are needed here.
+    entry_graphs = (INJECT_KV_GRAPH_NAME, DRAFT_GRAPH_NAME)
+    if set(entry_graphs) != set(inputs):
+        raise ValueError(
+            "DFlash drafter entrypoints "
+            f"{sorted(entry_graphs)} disagree with the export contract graphs "
+            f"{sorted(inputs)}; expected exactly {{{INJECT_KV_GRAPH_NAME!r}, "
+            f"{DRAFT_GRAPH_NAME!r}}}."
+        )
+
+    # The drafter is exported eagerly; graph-mode quantization is never applied to it in
+    # the pipeline (and the per-method externalization re-patching below relies on it).
+    if isinstance(model, torch.fx.GraphModule):
+        raise TypeError(
+            "export_dflash_drafter only supports the eager drafter module, got a "
+            "flattened torch.fx.GraphModule."
+        )
+
+    mode = (
+        coreai_torch.TorchConverter.Mode.DEBUG
+        if getattr(export_config, "include_debug_info", DEFAULT_INCLUDE_DEBUG_INFO)
+        else coreai_torch.TorchConverter.Mode.RELEASE
+    )
+    converter = coreai_torch.TorchConverter(mode=mode)
+    model.eval()
+
+    for graph in entry_graphs:
+        # Calling add_pytorch_module twice on the SAME eager model is already proven by
+        # the prefill path (main/prefill above). The eager path re-patches externalization
+        # per entrypoint, so there is no symbol-name collision (that only afflicts the
+        # flattened path via _rename_for_second_entrypoint).
+        #
+        # torch.export.export rejects a bound method (it demands an nn.Module), so
+        # _make_dflash_export_fn traces a small nn.Module wrapper that delegates to the
+        # entrypoint; the wrapper holds the model add_pytorch_module patched, so
+        # externalization still sees the patched composite-op submodules.
+        converter.add_pytorch_module(
+            model,
+            export_fn=_make_dflash_export_fn(graph, reference_inputs[graph], dynamic_shapes[graph]),
+            externalize_modules=EXTERNALIZE_SPECS,
+            input_names=inputs[graph],
+            output_names=outputs[graph],
+            state_names=states[graph],
+            entrypoint_name=graph,
+        )
+
+    register_custom_torch_lowering(converter)
+    program = converter.to_coreai()
+    logger.info("Optimizing AIProgram...")
+    program.optimize()
+
+    return program

@@ -174,12 +174,31 @@ def build_parser() -> argparse.ArgumentParser:
             "--platform is macOS."
         ),
     )
-    parser.add_argument(
+    drafter_group = parser.add_mutually_exclusive_group()
+    drafter_group.add_argument(
         "--with-drafter",
         action="store_true",
         help=(
             "Export the drafter model alongside the target for speculative decoding. "
             "The drafter is looked up from the model registry; not all models have one."
+        ),
+    )
+    drafter_group.add_argument(
+        "--dflash-drafter",
+        action="store_true",
+        help=(
+            "macOS only. Export the DFlash two-phase drafter (inject_kv + draft) "
+            "alongside the target for speculative decoding. Mutually exclusive with "
+            "the plain --with-drafter ring drafter; not all models have a DFlash drafter."
+        ),
+    )
+    parser.add_argument(
+        "--fused-target",
+        action="store_true",
+        help=(
+            "macOS only. Export the 2-output fused target that emits both logits and "
+            "drafter_features in a single model, for speculative decoding. Complementary "
+            "to --with-drafter/--dflash-drafter; not all models have a fused target."
         ),
     )
     return parser
@@ -360,6 +379,12 @@ def _resolve_export_config(args: argparse.Namespace) -> ExportConfig:
     if args.quantization_mode == "graph" and variant != "macOS":
         raise SystemExit(f"--quantization-mode graph requires --platform macOS (got '{variant}').")
 
+    if args.dflash_drafter and variant != "macOS":
+        raise SystemExit(f"--dflash-drafter requires --platform macOS (got '{variant}').")
+
+    if args.fused_target and variant != "macOS":
+        raise SystemExit(f"--fused-target requires --platform macOS (got '{variant}').")
+
     if args.compression_config is not None:
         if not args.compression_config.is_file():
             raise SystemExit(f"--compression-config: file not found: {args.compression_config}")
@@ -401,6 +426,8 @@ def _resolve_export_config(args: argparse.Namespace) -> ExportConfig:
         include_debug_info=args.include_debug_info,
         model_type_override=getattr(preset, "_model_type_override", None) if preset else None,
         with_drafter=args.with_drafter,
+        dflash_drafter=args.dflash_drafter,
+        fused_target=args.fused_target,
     )
 
 
@@ -475,6 +502,10 @@ def main() -> None:
         print(f"  include_debug_info: {config.include_debug_info}")
         if config.with_drafter:
             print("  with_drafter:       True")
+        if config.dflash_drafter:
+            print("  dflash_drafter:     True")
+        if config.fused_target:
+            print("  fused_target:       True")
         if config.variant == "iOS":
             print(f"  disable_embedding_quantization: {config.disable_embedding_quantization}")
         return
