@@ -295,7 +295,6 @@ async def export_embed_model(
         state_names=None,
         include_debug_info=include_debug_info,
     )
-    program.optimize()
 
     embed_path = bundle_path / "embed.aimodel"
     if embed_path.exists():
@@ -421,8 +420,6 @@ async def export_text_bundle(
         state_names=KV_STATE_NAMES,
         include_debug_info=include_debug_info,
     )
-    logging.info("Optimizing AIProgram...")
-    program.optimize()
 
     # ---- 6. Save bundle ----
     bundle_path = output_dir / output_name
@@ -834,8 +831,6 @@ async def export_vision_encoder(
         output_names=("image_features",),
         include_debug_info=include_debug_info,
     )
-    logging.info("Optimizing AIProgram...")
-    program.optimize()
 
     # ---- 6. Save vision.aimodel ----
     vision_path = bundle_path / "vision.aimodel"
