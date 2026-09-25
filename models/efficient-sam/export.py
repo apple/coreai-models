@@ -6,8 +6,8 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "coreai-core==1.0.0b2",
-#     "coreai-torch==0.4.1",
+#     "coreai-core==1.0.0b3",
+#     "coreai-torch==0.4.3",
 #     "efficient-sam @ git+https://github.com/yformer/EfficientSAM.git",
 #     "torch<=2.11.0"
 # ]
@@ -181,8 +181,6 @@ def create_efficient_sam(
     )
     coreai_program = converter.to_coreai()
     print("[INFO] Model converted.")
-    coreai_program.optimize()
-    print("[INFO] Model optimized.")
 
     bundle_dir, model_path = _bundle_paths(
         output_dir, model_name, dtype, dynamic, num_queries, num_pts

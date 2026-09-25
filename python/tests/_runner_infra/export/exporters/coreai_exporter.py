@@ -57,9 +57,6 @@ class CoreaiExporter:
         )
         return converter.to_coreai()
 
-    async def _async_optimize(self: Self, coreai_program: AIProgram) -> None:
-        coreai_program.optimize()
-
     @final
     async def _async_export_and_optimize(
         self: Self,
@@ -72,7 +69,6 @@ class CoreaiExporter:
             reference_inputs,
             dynamic_shapes=dynamic_shapes,
         )
-        await self._async_optimize(coreai_program)
         return coreai_program
 
     @final
@@ -151,7 +147,3 @@ class CoreaiStatefulExporter(CoreaiExporter):
         )
         register_custom_torch_lowering(converter)
         return converter.to_coreai()
-
-    @override
-    async def _async_optimize(self: Self, coreai_program: AIProgram) -> None:
-        coreai_program.optimize()

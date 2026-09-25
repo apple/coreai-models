@@ -96,7 +96,6 @@ def export_stateless(
         output_names=output_names,
     )
     program = converter.to_coreai()
-    program.optimize()
     return program
 
 
@@ -148,5 +147,4 @@ def export_multifunction(
         )
 
     program = converter.to_coreai()
-    program.optimize()
     return program

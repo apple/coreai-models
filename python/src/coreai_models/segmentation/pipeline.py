@@ -292,7 +292,6 @@ async def _async_export_segmentation(config: SegmentationExportConfig) -> str:
         output_names=["pred_masks", "pred_boxes", "pred_logits", "presence_logits", "semantic_seg"],
     )
     coreai_program = converter.to_coreai()
-    coreai_program.optimize()
 
     metadata = build_aimodel_metadata(
         config.hf_model_id, component="lite image segmentation for iOS"
@@ -472,7 +471,6 @@ async def _async_export_full(config: FullExportConfig) -> str:
         ],
     )
     coreai_program = converter.to_coreai()
-    coreai_program.optimize()
 
     metadata = build_aimodel_metadata(config.hf_model_id, component="image segmentation")
     coreai_program.save_asset(asset_path, metadata)
