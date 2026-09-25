@@ -318,8 +318,9 @@ public func applyToolsToSystemMessage(
     if let idx = out.firstIndex(where: { ($0["role"] as? String) == "system" }) {
         out[idx]["tools"] = toolsJSON
     } else {
-        // Empty content: standard Jinja templates render "" fine. Not verified against Phi's
-        // actual chat template (not checked into the repo) — needs on-device Phi confirmation.
+        // Content is empty by design: Phi's template renders a system message's tools as
+        // "<|system|>{content}<|tool|>{tools}<|/tool|>", so the tools carry the payload and the
+        // content adds nothing. Empty string (not nil) concatenates cleanly in the template.
         out.insert(["role": "system", "content": "", "tools": toolsJSON], at: 0)
     }
     return out
