@@ -6,8 +6,9 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "coreai-core==1.0.0b2",
-#     "coreai-torch==0.4.1",
+#     "addict",
+#     "coreai-core==1.0.0b3",
+#     "coreai-torch==0.4.3",
 #     "depth-anything-3 @ git+https://github.com/ByteDance-Seed/Depth-Anything-3.git",
 #     "scipy<1.15",
 # ]
@@ -21,7 +22,14 @@
 # # a pure-torch SwiGLU. xformers has no macOS-arm64 wheel and its sdist build
 # # fails on Apple Silicon. The override marks xformers as only needed on an
 # # impossible Python version, which makes uv's resolver drop it entirely.
-# override-dependencies = ["xformers ; python_version >= '99'"]
+# #
+# # depth-anything-3 pins `numpy<2`, which collides with coreai-core's
+# # `numpy>=2.3`. This constraint is not relevant for this export script,
+# # so we override it in favor of coreai-core's requirement.
+# override-dependencies = [
+#     "xformers ; python_version >= '99'",
+#     "numpy>=2.3.0",
+# ]
 # ///
 import argparse
 import shutil
@@ -156,8 +164,6 @@ def create_depth_anything(
     )
     coreai_program = converter.to_coreai()
     print("[INFO] Model converted.")
-    coreai_program.optimize()
-    print("[INFO] Model optimized.")
 
     model_path = _asset_path(output_dir, model_name, dtype)
     _save_asset(coreai_program, model_path, overwrite)

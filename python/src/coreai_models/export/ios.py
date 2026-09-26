@@ -135,13 +135,10 @@ async def _convert_to_coreai(
     static_shapes = model.export_static_shape_configs(config, max_context_length)
     constraints = model.export_hardware_constraints(max_context_length)
     for entrypoint, graph in contract_for.items():
-        if static_shapes[graph]:
-            coreai_program.set_static_shape_config(entrypoint, static_shapes[graph])
         if constraints[graph]:
             coreai_program.set_hardware_constraints(entrypoint, constraints[graph])
-
-    logger.info("Applying optimization passes...")
-    coreai_program.optimize()
+        if static_shapes[graph]:
+            coreai_program.set_static_shape_config(entrypoint, static_shapes[graph])
 
     return coreai_program
 

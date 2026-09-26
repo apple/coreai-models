@@ -438,7 +438,4 @@ def export_macos_model(
         export_prefill_graph=contract_model.exports_prefill_graph,
     )
 
-    logger.info("Optimizing AIProgram...")
-    coreai_program.optimize()
-
     return coreai_program

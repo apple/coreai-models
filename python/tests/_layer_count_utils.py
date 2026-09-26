@@ -125,7 +125,7 @@ def get_layer_counts(
 
     coreai_program = asyncio.run(_run())
 
-    mlir_str = coreai_program._mlir_module.operation.get_asm(
+    mlir_str = coreai_program._module._mlir_module.operation.get_asm(
         large_elements_limit=0,
         large_resource_limit=0,
         enable_debug_info=False,

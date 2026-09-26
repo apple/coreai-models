@@ -636,8 +636,6 @@ async def _async_get_coreai_program(
     register_custom_torch_lowering(importer)
     coreai_program = importer.to_coreai()
 
-    coreai_program.optimize()
-
     return coreai_program
 
 
@@ -1220,7 +1218,6 @@ class ForCausalLMTestBase:
             assert coreai_program is not None, "export_macos_model returned None, conversion failed"
 
             # KV-specific check: the exported key/value cache states must be INT8.
-            coreai_program.optimize()
             aimodel_path = Path(tmpdir) / "kv_int8.aimodel"
             coreai_program.save_asset(aimodel_path, AIModelAssetMetadata())
             summary = AIModelAsset.load(aimodel_path).summary(include_statistics=False)
