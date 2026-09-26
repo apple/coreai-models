@@ -148,7 +148,7 @@ func runVLMCompletion(chatRequest: ChatCompletionRequest, state: ServerState) as
 
     let prefillTps = promptSeconds > 0 ? Double(promptTokens.count) / promptSeconds : 0
     let genTps = genSeconds > 0 ? Double(genTokenCount) / genSeconds : 0
-    print(
+    logSummary(
         "\(ts()) [\(requestID)] vlm: \(promptTokens.count)t prefill \(String(format: "%.1f", prefillTps)) t/s, \(genTokenCount)t gen \(String(format: "%.1f", genTps)) t/s (\(String(format: "%.2f", totalSeconds))s) [\(parsed.finishReason)]"
     )
     state.stats.record(

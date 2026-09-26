@@ -754,7 +754,7 @@ private func buildStopSequences(from request: ChatCompletionRequest, state: Serv
 }
 
 // Per-request diagnostics go to stderr so a `--replay` stdout redirect captures clean JSONL.
-private func logSummary(_ line: String) {
+func logSummary(_ line: String) {
     FileHandle.standardError.write(Data((line + "\n").utf8))
 }
 
