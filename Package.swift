@@ -324,6 +324,16 @@ let package = Package(
             path: "swift/Tests/ImageSegmenterTests"
         ),
         .testTarget(
+            name: "LLMServerTests",
+            dependencies: [
+                "llm-server",
+                "CoreAILMCommon",
+                "TestUtilities",
+                .product(name: "Transformers", package: "swift-transformers"),
+            ],
+            path: "swift/Tests/LLMServerTests"
+        ),
+        .testTarget(
             name: "VideoSegmenterTests",
             dependencies: [
                 "CoreAIVideoSegmenter",

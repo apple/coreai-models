@@ -421,17 +421,21 @@ public struct ModelsResponse: Encodable, Sendable {
         public let object: String
         public let created: Int
         public let ownedBy: String
+        /// True when the model accepts image input (VLM bundle). Omitted when false.
+        public let supportsVision: Bool?
 
-        public init(id: String, created: Int, ownedBy: String) {
+        public init(id: String, created: Int, ownedBy: String, supportsVision: Bool? = nil) {
             self.id = id
             self.object = "model"
             self.created = created
             self.ownedBy = ownedBy
+            self.supportsVision = supportsVision
         }
 
         enum CodingKeys: String, CodingKey {
             case id, object, created
             case ownedBy = "owned_by"
+            case supportsVision = "supports_vision"
         }
     }
 }

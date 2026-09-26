@@ -90,6 +90,13 @@ struct LLMServer: AsyncParsableCommand {
     )
     var defaultReasoningEffort: String?
 
+    @Option(
+        name: .customLong("file-access"),
+        help:
+            "Local file access for image_url inputs: off (default; only data: and http(s) URLs) or subdirs (read files under the server working directory)"
+    )
+    var fileAccess: FileAccessPolicy = .off
+
     @Flag(
         name: .customLong("clear-coreai-cache"),
         help: "Clear Core AI cached specialization for this model before loading (forces re-specialization)"
@@ -153,20 +160,11 @@ struct LLMServer: AsyncParsableCommand {
 
         let modelLoadSpan = InstrumentsProfiler.beginModelLoad(name: bundle.name)
 
-        let engineConfig = ModelConfig(
-            name: bundle.name,
-            tokenizer: bundle.tokenizer,
-            vocabSize: bundle.vocabSize,
-            maxContextLength: bundle.maxContextLength,
-            serializedModel: [bundle.modelAssetPath],
-            function: bundle.language.functionMap?.name(for: "main") ?? "main"
-        )
-        let configData = try JSONEncoder().encode(engineConfig)
-        let engine = try await EngineFactory.createEngine(
-            config: configData,
-            modelURL: modelURL,
-            options: engineOptions
-        )
+        let visionConfig = bundle.visionConfig
+        // Build the engine through the shared factory entry point: it routes kind == .vlm
+        // bundles to the sequential VLM engine and everything else to the text engines.
+        // Chunking overrides ride in through engineOptions.
+        let engine = try await EngineFactory.createEngine(bundle: bundle, options: engineOptions)
 
         let tokenizer = try await bundle.loadTokenizer()
 
@@ -197,7 +195,11 @@ struct LLMServer: AsyncParsableCommand {
             topP: topP,
             minP: minP
         )
-        try await engine.warmup(queryLength: 1, sampling: samplingConfig)
+        // Warmup runs a text-shaped query; skip it for VLM engines, which prefill
+        // through the image-embedding path instead.
+        if bundle.bundle.kind != .vlm {
+            try await engine.warmup(queryLength: 1, sampling: samplingConfig)
+        }
 
         modelLoadSpan.end()
         await Task.yield()
@@ -226,7 +228,9 @@ struct LLMServer: AsyncParsableCommand {
             maxContextLength: bundle.maxContextLength,
             vocabSize: bundle.vocabSize,
             additionalEosTokenIds: additionalEosTokenIds,
-            maxQueueDepth: maxQueueDepth
+            maxQueueDepth: maxQueueDepth,
+            visionConfig: visionConfig,
+            fileAccess: fileAccess
         )
 
         let state = ServerState(

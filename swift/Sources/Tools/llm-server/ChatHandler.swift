@@ -30,7 +30,8 @@ func startServer(state: ServerState, port: Int) async throws {
                 ModelsResponse.ModelInfo(
                     id: state.config.modelName,
                     created: Int(Date().timeIntervalSince1970),
-                    ownedBy: "coreai"
+                    ownedBy: "coreai",
+                    supportsVision: state.isVLM ? true : nil
                 )
             ]
         )
@@ -184,6 +185,10 @@ struct ChatCompletionOutcome {
 func runChatCompletion(chatRequest: ChatCompletionRequest, state: ServerState, sessionID: String? = nil)
     async throws -> ChatCompletionOutcome
 {
+    // Vision-language request with an image: run the multimodal core instead.
+    if state.isVLM && VLMChatSupport.hasImage(in: chatRequest.messages) {
+        return try await runVLMCompletion(chatRequest: chatRequest, state: state)
+    }
     let requestMaxTokens = chatRequest.maxCompletionTokens ?? chatRequest.maxTokens ?? state.config.defaultMaxTokens
     guard requestMaxTokens > 0 else {
         throw ServerError.badRequest("max_tokens must be positive")
@@ -400,6 +405,11 @@ struct StreamingOutcome {
 func prepareStreaming(chatRequest: ChatCompletionRequest, state: ServerState, sessionID: String? = nil) async throws
     -> PreparedStream
 {
+    // The streaming path decodes plain text tokens; the multimodal core is non-streaming
+    // only. Reject a stream+image request instead of silently answering without the image.
+    if state.isVLM && VLMChatSupport.hasImage(in: chatRequest.messages) {
+        throw ServerError.badRequest("Streaming is not supported for image (VLM) requests")
+    }
     let requestMaxTokens = chatRequest.maxCompletionTokens ?? chatRequest.maxTokens ?? state.config.defaultMaxTokens
     guard requestMaxTokens > 0 else {
         throw ServerError.badRequest("max_tokens must be positive")
@@ -744,7 +754,7 @@ private func buildStopSequences(from request: ChatCompletionRequest, state: Serv
 }
 
 // Per-request diagnostics go to stderr so a `--replay` stdout redirect captures clean JSONL.
-private func logSummary(_ line: String) {
+func logSummary(_ line: String) {
     FileHandle.standardError.write(Data((line + "\n").utf8))
 }
 
