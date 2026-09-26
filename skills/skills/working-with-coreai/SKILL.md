@@ -78,7 +78,6 @@ program = (
     .add_exported_program(ep, input_names=["image"], output_names=["logits"])
     .to_coreai()
 )
-program.optimize()
 program.save_asset("model.aimodel")
 ```
 
