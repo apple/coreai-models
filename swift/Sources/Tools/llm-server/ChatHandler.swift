@@ -444,8 +444,8 @@ func prepareStreaming(chatRequest: ChatCompletionRequest, state: ServerState, se
 
 /// The streaming generation core, shared by the HTTP SSE handler and `--replay`. Drives the
 /// incremental token loop with per-chunk think/tool parsing, delivering each `Delta` to `emit`,
-/// and returns per-request instrumentation. Emits neither the leading role chunk nor the trailing
-/// done/`[DONE]` frames — those are SSE framing owned by the HTTP handler.
+/// and returns per-request instrumentation. The caller owns SSE framing: the leading role chunk
+/// and the trailing done/`[DONE]` frames are added by the HTTP handler.
 func runStreamingLoop(
     prepared: PreparedStream, chatRequest: ChatCompletionRequest, state: ServerState,
     emit: (ChatCompletionChunk.Delta) async throws -> Void

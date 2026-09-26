@@ -10,9 +10,9 @@ import Foundation
 ///
 /// Requests run in arrival-timestamp order through the same cores the HTTP handler uses:
 /// `runChatCompletion` for `stream:false`, `runStreamingLoop` for `stream:true` (deltas folded
-/// back into the result). The engine is single-active, so requests run sequentially — the real
-/// server's behavior; interleaving sessions in the input reproduces the single-session cache
-/// thrash. Each result is one JSONL line with per-request instrumentation.
+/// back into the result). The engine is single-active, so requests run sequentially, matching the
+/// server. Interleaving sessions in the input reproduces the same per-session cache behavior. Each
+/// result is one JSONL line with per-request instrumentation.
 enum ReplayRunner {
     static func run(inputPath: String, outputPath: String?, state: ServerState) async throws {
         let text = try String(contentsOfFile: inputPath, encoding: .utf8)

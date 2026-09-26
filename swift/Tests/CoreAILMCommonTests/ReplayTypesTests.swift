@@ -48,6 +48,29 @@ struct ReplayTypesTests {
         #expect(reqs.map(\.id) == ["x", "y"])
     }
 
+    @Test("parseRequests tolerates CRLF line endings")
+    func parseToleratesCRLF() throws {
+        let jsonl =
+            "{\"id\":\"x\",\"request\":{\"messages\":[{\"role\":\"user\",\"content\":\"a\"}]}}\r\n"
+            + "{\"id\":\"y\",\"request\":{\"messages\":[{\"role\":\"user\",\"content\":\"b\"}]}}\r\n"
+        let reqs = try ReplayIO.parseRequests(jsonl)
+        #expect(reqs.map(\.id) == ["x", "y"])
+    }
+
+    @Test("A malformed line reports its 1-based line number")
+    func malformedLineReportsIndex() {
+        let jsonl = """
+            {"id":"ok","request":{"messages":[{"role":"user","content":"a"}]}}
+            {"id":"bad", not json}
+            """
+        #expect {
+            try ReplayIO.parseRequests(jsonl)
+        } throws: { error in
+            guard case ReplayError.malformedLine(let line, _) = error else { return false }
+            return line == 2
+        }
+    }
+
     @Test("A result encodes a choices array with snake_case instrumentation keys")
     func resultEncodes() throws {
         let choice = ChatCompletionResponse.Choice(

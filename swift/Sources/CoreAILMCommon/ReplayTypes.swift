@@ -126,6 +126,18 @@ public struct ReplayStreamAggregator {
     }
 }
 
+/// Errors surfaced while reading a replay JSONL file.
+public enum ReplayError: Error, CustomStringConvertible {
+    case malformedLine(line: Int, underlying: Error)
+
+    public var description: String {
+        switch self {
+        case .malformedLine(let line, let underlying):
+            return "malformed JSON on line \(line): \(underlying)"
+        }
+    }
+}
+
 /// JSONL parsing/serialization for the replay format. Blank lines and `#`-prefixed comment
 /// lines are ignored on input; requests are returned in arrival-timestamp order (stable for
 /// equal or absent `t`).
@@ -133,11 +145,18 @@ public enum ReplayIO {
     public static func parseRequests(_ text: String) throws -> [ReplayRequest] {
         let decoder = JSONDecoder()
         var indexed: [(Int, ReplayRequest)] = []
-        for (i, rawLine) in text.split(separator: "\n", omittingEmptySubsequences: false).enumerated() {
+        let text = text.hasPrefix("\u{FEFF}") ? String(text.dropFirst()) : text
+        // `\r\n` is a single Swift Character, so split on any Unicode newline rather than "\n".
+        for (i, rawLine) in text.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
+            .enumerated()
+        {
             let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
             if line.isEmpty || line.hasPrefix("#") { continue }
-            let req = try decoder.decode(ReplayRequest.self, from: Data(line.utf8))
-            indexed.append((i, req))
+            do {
+                indexed.append((i, try decoder.decode(ReplayRequest.self, from: Data(line.utf8))))
+            } catch {
+                throw ReplayError.malformedLine(line: i + 1, underlying: error)
+            }
         }
         // Stable sort by t (absent t sorts as 0), preserving input order within ties.
         return

@@ -45,7 +45,7 @@ struct LLMServer: AsyncParsableCommand {
     @Option(
         name: .customLong("replay"),
         help:
-            "Process a JSONL request file and exit, without binding a port (functional testing without the serving surface; see CoreAILMCommon/ReplayTypes)"
+            "Process a JSONL request file and exit instead of serving over HTTP; runs the generation core directly. See CoreAILMCommon/ReplayTypes."
     )
     var replayPath: String?
 
@@ -146,7 +146,7 @@ struct LLMServer: AsyncParsableCommand {
         let cacheHit = PreparedModel.isCached(at: modelURL)
         let assetLabel: String = modelURL.pathExtension == "aimodelc" ? "compiled" : "source"
 
-        if !verbose {
+        if !verbose && replayPath == nil {
             print("\n⏳ Preparing AI asset from \(assetLabel)...", terminator: "")
             fflush(stdout)
         }
@@ -205,7 +205,7 @@ struct LLMServer: AsyncParsableCommand {
         let modelName = serverModelName ?? bundle.name
         let supportsLogprobs = engine.supportsLogits
 
-        if !verbose {
+        if !verbose && replayPath == nil {
             let prepareElapsed = await PerformanceMetrics.shared.modelLoadTime
             let cacheSuffix = cacheHit ? " (cache hit)" : ""
             print(" done in \(String(format: "%.3f", prepareElapsed))s\(cacheSuffix)\n")
