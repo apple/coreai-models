@@ -42,6 +42,16 @@ struct LLMServer: AsyncParsableCommand {
     @Option(name: .customLong("min-p"), help: "Default Min-P sampling")
     var minP: Double?
 
+    @Option(
+        name: .customLong("replay"),
+        help:
+            "Process a JSONL request file and exit instead of serving over HTTP; runs the generation core directly. See CoreAILMCommon/ReplayTypes."
+    )
+    var replayPath: String?
+
+    @Option(name: .customLong("replay-output"), help: "Write replay results JSONL here (default: stdout)")
+    var replayOutput: String?
+
     @Option(name: .customLong("variant"), help: "Engine variant: auto, coreai-pipelined, coreai-sequential")
     var inferenceEngineVariant: String = "default"
 
@@ -136,7 +146,7 @@ struct LLMServer: AsyncParsableCommand {
         let cacheHit = PreparedModel.isCached(at: modelURL)
         let assetLabel: String = modelURL.pathExtension == "aimodelc" ? "compiled" : "source"
 
-        if !verbose {
+        if !verbose && replayPath == nil {
             print("\n⏳ Preparing AI asset from \(assetLabel)...", terminator: "")
             fflush(stdout)
         }
@@ -195,7 +205,7 @@ struct LLMServer: AsyncParsableCommand {
         let modelName = serverModelName ?? bundle.name
         let supportsLogprobs = engine.supportsLogits
 
-        if !verbose {
+        if !verbose && replayPath == nil {
             let prepareElapsed = await PerformanceMetrics.shared.modelLoadTime
             let cacheSuffix = cacheHit ? " (cache hit)" : ""
             print(" done in \(String(format: "%.3f", prepareElapsed))s\(cacheSuffix)\n")
@@ -224,6 +234,11 @@ struct LLMServer: AsyncParsableCommand {
             tokenizer: tokenizer,
             config: config
         )
+
+        if let replayPath {
+            try await ReplayRunner.run(inputPath: replayPath, outputPath: replayOutput, state: state)
+            return
+        }
 
         if verbose {
             print("Model: \(modelName)")
