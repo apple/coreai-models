@@ -47,7 +47,7 @@ enum VLMChatSupport {
         messages.contains { !$0.content.imageDataURLs.isEmpty }
     }
 
-    /// Decode an OpenAI `image_url` string into a CGImage.
+    /// Decode an `image_url` string into a CGImage.
     ///
     /// Supported: `data:` URLs (base64 or percent-encoded). Local file references
     /// (`file://` or a bare path) are gated by `fileAccess`; remote `http(s)` URLs
