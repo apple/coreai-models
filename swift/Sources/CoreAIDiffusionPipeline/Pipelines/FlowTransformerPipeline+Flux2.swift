@@ -9,51 +9,12 @@ import CoreAIShared
 import CoreGraphics
 import Tokenizers
 
-/// A traced img2img graph: which asset holds it, and under which entrypoint.
-public struct Img2ImgRoute: Sendable {
-    public let function: CoreAIDiffusionModelFunction
-    public let entrypoint: String
-
-    public init(function: CoreAIDiffusionModelFunction, entrypoint: String) {
-        self.function = function
-        self.entrypoint = entrypoint
-    }
-}
-
-/// FLUX.2 Klein pipeline using Core AI backend.
-///
-/// Orchestrates: tokenize → text encode → noise → pack → denoise loop
+/// FLUX.2 Klein: tokenize → text encode → noise → pack → denoise loop
 /// (flow-match Euler) → unpack → BN denorm → unpatchify → VAE decode.
 ///
 /// RoPE is computed inside the transformer graph; this pipeline only supplies
 /// position IDs, which depend on grid geometry alone.
-public struct Flux2Pipeline: DiffusionPipeline {
-    public let descriptor: PipelineDescriptor
-    public let mode: DecodeResolution
-
-    public let transformer: CoreAIDiffusionModelFunction
-    /// How each reference grid reaches a traced graph, resolved at load time.
-    ///
-    /// img2img arrives two ways and a bundle can contain both, because export directories
-    /// accumulate assets across runs. Resolving to (asset, entrypoint) pairs up front
-    /// keeps the choice in one place:
-    ///
-    /// - multi-function: an `img2img_*` entrypoint on `transformer` — preferred, since it
-    ///   reuses the already-loaded asset instead of a second ~2 GB weight set
-    /// - single-function: a `Transformer[_512]_img2img_<grid>` asset, entrypoint `main`
-    ///
-    /// A grid absent from both is simply not supported by the bundle.
-    public let img2imgRoutes: [ReferenceGrid: Img2ImgRoute]
-    public let textEncoder: CoreAIDiffusionModelFunction
-    public let decoder: CoreAIDiffusionModelFunction
-    public let encoder: CoreAIDiffusionModelFunction?
-    public let transformerFunctionName: String
-    public let tokenizer: any Tokenizer
-
-    public let batchNormMean: [Float]?
-    public let batchNormVar: [Float]?
-    public let batchNormEps: Float
-
+extension FlowTransformerPipeline {
     // MARK: - Architecture Constants
 
     private static let patchSize = 16
@@ -103,85 +64,9 @@ public struct Flux2Pipeline: DiffusionPipeline {
         return a * Float(numSteps) + b
     }
 
-    /// Image size is determined by the mode selected at init.
-    public var defaultImageSize: (width: Int, height: Int) {
-        let full = descriptor.imageSize ?? 1024
-        let size = (mode == .half) ? full / 2 : full
-        return (size, size)
-    }
+    // MARK: - Denoising Plan
 
-    public var supportedSchedulers: [SchedulerType] {
-        [.discreteFlow]
-    }
-
-    public var supportsImageToImage: Bool {
-        encoder != nil
-    }
-
-    public init(
-        descriptor: PipelineDescriptor,
-        mode: DecodeResolution = .full,
-        transformer: CoreAIDiffusionModelFunction,
-        img2imgRoutes: [ReferenceGrid: Img2ImgRoute] = [:],
-        textEncoder: CoreAIDiffusionModelFunction,
-        decoder: CoreAIDiffusionModelFunction,
-        encoder: CoreAIDiffusionModelFunction?,
-        transformerFunctionName: String = "main",
-        tokenizer: any Tokenizer,
-        batchNormMean: [Float]?,
-        batchNormVar: [Float]?,
-        batchNormEps: Float
-    ) {
-        self.descriptor = descriptor
-        self.mode = mode
-        self.transformer = transformer
-        self.img2imgRoutes = img2imgRoutes
-        self.textEncoder = textEncoder
-        self.decoder = decoder
-        self.encoder = encoder
-        self.transformerFunctionName = transformerFunctionName
-        self.tokenizer = tokenizer
-        self.batchNormMean = batchNormMean
-        self.batchNormVar = batchNormVar
-        self.batchNormEps = batchNormEps
-
-        if tokenizer.convertTokenToId("<|endoftext|>") == nil {
-            CLILogger.log(
-                "⚠️ Flux2Pipeline: tokenizer has no <|endoftext|> token, using Qwen3 fallback pad ID",
-                component: "Diffusion")
-        }
-    }
-
-    // MARK: - ResourceManaging
-
-    public func loadResources() async throws {
-        try await transformer.loadResources()
-        try await textEncoder.loadResources()
-        try await decoder.loadResources()
-        if let encoder { try await encoder.loadResources() }
-        // The img2img transformers are deliberately *not* loaded here. Each is a full
-        // weight set (~2 GB resident on GPU) that a txt2img run never touches, and
-        // `CoreAIDiffusionModelFunction` loads itself on first use anyway. They are still
-        // unloaded below, so a run that did use one releases it.
-    }
-
-    public func unloadResources() async {
-        await transformer.unloadResources()
-        // Distinct assets only: multi-function routes point back at `transformer`.
-        for route in img2imgRoutes.values where route.function !== transformer {
-            await route.function.unloadResources()
-        }
-        await textEncoder.unloadResources()
-        await decoder.unloadResources()
-        if let encoder { await encoder.unloadResources() }
-    }
-
-    // MARK: - Generation
-
-    public func generateImages(
-        configuration: PipelineConfiguration,
-        progressHandler: ((PipelineProgress) -> Bool)?
-    ) async throws -> GenerationResult {
+    func makeFlux2Plan(_ configuration: PipelineConfiguration) async throws -> DenoisingPlan {
         let steps = configuration.stepCount
         let guidanceScale = configuration.guidanceScale
 
@@ -228,8 +113,7 @@ public struct Flux2Pipeline: DiffusionPipeline {
         let noisePacked = packLatentsSpatialFlatten(
             noise, channels: inChannels, height: spatialSide, width: spatialSide)
 
-        // 5. Initialize packed latents and reference tokens
-        var packedLatents: [Float]
+        // 5. Initialize reference tokens. Latents start from pure noise either way.
         var referenceTokens: [Float]?
         var refSide: Int = 0
 
@@ -263,9 +147,6 @@ public struct Flux2Pipeline: DiffusionPipeline {
             // The reference tokens concatenated at each step provide structural
             // guidance via cross-attention. The text prompt steers content.
             // (This differs from SD-style img2img which blends noise with the encoded image.)
-            packedLatents = noisePacked
-        } else {
-            packedLatents = noisePacked
         }
 
         // 6. Build RoPE position IDs — the transformer computes the frequencies in-graph
@@ -288,8 +169,7 @@ public struct Flux2Pipeline: DiffusionPipeline {
         }
         let textIds = buildTextIds(textSeqLen: textSeqLen, axisCount: axisCount)
 
-        // 7. Denoising loop
-        // Pick the asset + entrypoint that serves this pass. img2img arrives one of two
+        // 7. Pick the asset + entrypoint that serves this pass. img2img arrives one of two
         // ways: as a named entrypoint on the multi-function transformer, or as its own
         // single-function asset. Which one is decided at load time by whether that asset
         // exists on disk.
@@ -332,7 +212,7 @@ public struct Flux2Pipeline: DiffusionPipeline {
         } else {
             if configuration.guidanceMode == .manual {
                 CLILogger.log(
-                    "⚠️ Flux2Pipeline: --guidance-mode manual needs a guidance scale above 1.0 "
+                    "⚠️ FlowTransformerPipeline: --guidance-mode manual needs a guidance scale above 1.0 "
                         + "(got \(guidanceScale)); falling back to distilled, which applies no "
                         + "guidance at all. Raise the scale to get the two-pass path.",
                     component: "Diffusion")
@@ -344,8 +224,9 @@ public struct Flux2Pipeline: DiffusionPipeline {
         // seqLen*inChannels array on every one.
         var cfgBuffer = [Float](repeating: 0, count: seqLen * inChannels)
 
-        for (step, t) in scheduler.timeSteps.enumerated() {
-            let timestepValue = Float(t) / 1000.0
+        let predict: (_ latents: [Float], _ step: Int, _ sigma: Float) async throws -> [Float] = {
+            packedLatents, step, _ in
+            let timestepValue = Float(scheduler.timeSteps[step]) / 1000.0
 
             // For img2img: concatenate noise + reference tokens at each step
             let inputTokens: [Float]
@@ -357,8 +238,6 @@ public struct Flux2Pipeline: DiffusionPipeline {
                 inputTokens = packedLatents
                 inputSeqLen = seqLen
             }
-
-            let output: [Float]
 
             if let emptyEmb = emptyEmbeddings {
                 // Manual CFG: two forward passes. The guidance input is 0 only because the
@@ -399,129 +278,47 @@ public struct Flux2Pipeline: DiffusionPipeline {
                 Self.applyClassifierFreeGuidance(
                     cond: condSlice, uncond: uncondSlice,
                     guidanceScale: guidanceScale, into: &cfgBuffer)
-                output = cfgBuffer
-            } else {
-                // Distilled: one pass, no CFG. `guidanceScale` is passed to satisfy the
-                // traced signature but this checkpoint discards it (see above).
-                let fullOutput = try await denoiser.run(
-                    floatInputs: [
-                        (inputTokens, [1, inputSeqLen, inChannels]),
-                        (textEmbeddings, [1, textSeqLen, hiddenDim(textEmbeddings)]),
-                        ([timestepValue], [1]),
-                        ([guidanceScale], [1]),
-                        (imageIds, [1, inputSeqLen, axisCount]),
-                        (textIds, [1, textSeqLen, axisCount]),
-                    ], functionName: fnName)
-
-                if referenceTokens != nil {
-                    output = Array(fullOutput[0..<(seqLen * inChannels)])
-                } else {
-                    output = fullOutput
-                }
+                return cfgBuffer
             }
 
-            // Capture the denoising state BEFORE the scheduler advances so the
-            // preview below can form the x0 estimate.
-            let previewSigma = scheduler.currentSigma
-            let sampleBeforeStep = packedLatents
-            packedLatents = scheduler.step(output: output, timeStep: t, sample: packedLatents)
-            try checkLatentsAreFinite(packedLatents, step: step)
+            // Distilled: one pass, no CFG. `guidanceScale` is passed to satisfy the
+            // traced signature but this checkpoint discards it (see above).
+            let fullOutput = try await denoiser.run(
+                floatInputs: [
+                    (inputTokens, [1, inputSeqLen, inChannels]),
+                    (textEmbeddings, [1, textSeqLen, hiddenDim(textEmbeddings)]),
+                    ([timestepValue], [1]),
+                    ([guidanceScale], [1]),
+                    (imageIds, [1, inputSeqLen, axisCount]),
+                    (textIds, [1, textSeqLen, axisCount]),
+                ], functionName: fnName)
 
-            if let progressHandler {
-                // Preview the DENOISED estimate, not the raw post-step sample. The
-                // sample after the Euler step is still mostly noise until the last
-                // step or two, so on a few-step model (e.g. FLUX.2 Klein at 4 steps)
-                // the early previews look like static. Flow-matching gives the
-                // estimate for one multiply-add: with x_t = (1-σ)·x0 + σ·ε and the
-                // model predicting v = ε - x0, x0 = x_t - σ·v. Blurry on step one,
-                // but it shows the composition and converges to the final image.
-                var previewPacked = sampleBeforeStep
-                if previewSigma > 0 {
-                    var negSigma = -previewSigma
-                    vDSP_vsma(
-                        output, 1, &negSigma, sampleBeforeStep, 1, &previewPacked, 1,
-                        vDSP_Length(output.count))
-                }
-                // Unpack → denorm → unpatchify: [1, 128, 64, 64] → [1, 32, 128, 128]
-                // These are array copies, no model call.
-                let spatial = unpackLatentsSpatialFlatten(
-                    previewPacked, channels: inChannels, height: spatialSide, width: spatialSide)
-                let denormed = applyBatchNormDenorm(
-                    spatial, channels: inChannels, height: spatialSide, width: spatialSide)
-                let unpatchified = Self.unpatchifyLatents(
-                    denormed, channels: inChannels, height: spatialSide, width: spatialSide)
-
-                let vaeChannels = inChannels / 4  // 128 → 32 after patchify
-                let vaeHeight = spatialSide * 2
-                let vaeWidth = spatialSide * 2
-                var previewLatents = NDArray(
-                    shape: [1, vaeChannels, vaeHeight, vaeWidth], scalarType: .float32)
-                previewLatents.mutableView(as: Float.self).withUnsafeMutablePointer { ptr, _, _ in
-                    for i in 0..<unpatchified.count { ptr[i] = unpatchified[i] }
-                }
-                let progress = PipelineProgress(step: step + 1, totalSteps: steps, currentLatent: previewLatents)
-                if !progressHandler(progress) { break }
+            if referenceTokens != nil {
+                return Array(fullOutput[0..<(seqLen * inChannels)])
             }
+            return fullOutput
         }
 
-        if configuration.lazyModelLoading {
-            // Release whichever asset ran
-            await denoiser.unloadResources()
+        // Unpack → BN denorm → unpatchify: (1, 64*64, 128) → (1, 32, 128, 128)
+        let vaeLatents: (_ latents: [Float]) -> [Float] = { packed in
+            let spatial = unpackLatentsSpatialFlatten(
+                packed, channels: inChannels, height: spatialSide, width: spatialSide)
+            let denormed = applyBatchNormDenorm(
+                spatial, channels: inChannels, height: spatialSide, width: spatialSide)
+            return Self.unpatchifyLatents(
+                denormed, channels: inChannels, height: spatialSide, width: spatialSide)
         }
 
-        // 8. Unpack: (B, H*W, C) → (B, C, H, W)
-        var spatialLatents = unpackLatentsSpatialFlatten(
-            packedLatents, channels: inChannels, height: spatialSide, width: spatialSide
-        )
-
-        // 9. Batch norm denormalization
-        spatialLatents = applyBatchNormDenorm(
-            spatialLatents, channels: inChannels, height: spatialSide, width: spatialSide)
-
-        // 10. Unpatchify: (B, 128, 64, 64) → (B, 32, 128, 128)
-        let vaeChannels = inChannels / 4
-        let vaeHeight = spatialSide * 2
-        let vaeWidth = spatialSide * 2
-        let unpatchified = Self.unpatchifyLatents(
-            spatialLatents, channels: inChannels, height: spatialSide, width: spatialSide)
-
-        // 11. VAE decode
-        // Note: self.decoder is mode-appropriate (loaded at init):
-        //   .full → VAEDecoder (128×128 input), .half/.tiled → VAEDecoder_half (64×64 input)
-        let vaeShape = [1, vaeChannels, vaeHeight, vaeWidth]
-        let pixels: [Float]
-        let outputHeight: Int
-        let outputWidth: Int
-
-        switch mode {
-        case .full, .half:
-            pixels = try await decoder.run(floatInputs: [(unpatchified, vaeShape)])
-            outputHeight = imageSize
-            outputWidth = imageSize
-
-        case .tiled:
-            pixels = try await decodeTiled(
-                latents: unpatchified, channels: vaeChannels, height: vaeHeight, width: vaeWidth,
-                decoder: decoder, outputScale: 8)
-            outputHeight = imageSize
-            outputWidth = imageSize
-
-        case .auto:
-            preconditionFailure("auto resolved at init")
-        }
-
-        if configuration.lazyModelLoading { await decoder.unloadResources() }
-
-        // 12. Convert to image
-        let image = try DiffusionUtilities.pixelsToCGImage(pixels, height: outputHeight, width: outputWidth)
-
-        var latentsND = NDArray(shape: latentShape, scalarType: .float32)
-        let latentsView = latentsND.mutableView(as: Float.self)
-        latentsView.withUnsafeMutablePointer { ptr, _, _ in
-            for i in 0..<noise.count { ptr[i] = noise[i] }
-        }
-
-        return GenerationResult(images: [image], latents: [latentsND])
+        return DenoisingPlan(
+            latents: noisePacked,
+            scheduler: scheduler,
+            renoise: nil,
+            predict: predict,
+            vaeLatents: vaeLatents,
+            vaeShape: [1, inChannels / 4, spatialSide * 2, spatialSide * 2],
+            denoiser: denoiser,
+            initialNoise: noise,
+            noiseShape: latentShape)
     }
 
     // MARK: - Img2Img
@@ -705,27 +502,6 @@ public struct Flux2Pipeline: DiffusionPipeline {
         return result
     }
 
-    // MARK: - Classifier-Free Guidance
-
-    /// `uncond + g*(cond - uncond)`, written into `destination` rather than returned.
-    ///
-    /// The caller reuses one buffer across denoising steps; at 1024×1024 each result is
-    /// ~2 MB, so returning a fresh array would allocate one per step.
-    static func applyClassifierFreeGuidance(
-        cond: ArraySlice<Float>, uncond: ArraySlice<Float>,
-        guidanceScale: Float, into destination: inout [Float]
-    ) {
-        // Reusing the buffer means a short input would leave the previous step's values
-        // in the tail rather than merely producing a short array, so require an exact fit.
-        precondition(
-            cond.count == destination.count && uncond.count == destination.count,
-            "CFG expected \(destination.count) noise values, got "
-                + "cond=\(cond.count) uncond=\(uncond.count)")
-        for (offset, (u, c)) in zip(uncond, cond).enumerated() {
-            destination[offset] = u + guidanceScale * (c - u)
-        }
-    }
-
     // MARK: - Latent Packing/Unpacking
 
     /// (B, C, H, W) → (B, H*W, C) — spatial flatten for patch_size=1
@@ -855,208 +631,5 @@ public struct Flux2Pipeline: DiffusionPipeline {
             }
         }
         return result
-    }
-
-    // MARK: - Image Conversion
-
-    // MARK: - Half/Tiled Decode Helpers
-
-    /// Area-average downsample BCHW latents by an integer factor using vDSP.
-    static func downsampleLatents(
-        _ input: [Float], channels: Int, height: Int, width: Int, factor: Int
-    ) -> [Float] {
-        let outH = height / factor
-        let outW = width / factor
-        let scale = 1.0 / Float(factor * factor)
-        var output = [Float](repeating: 0, count: channels * outH * outW)
-        for c in 0..<channels {
-            let chIn = c * height * width
-            let chOut = c * outH * outW
-            for oh in 0..<outH {
-                for ow in 0..<outW {
-                    var sum: Float = 0
-                    for dy in 0..<factor {
-                        let rowStart = chIn + (oh * factor + dy) * width + ow * factor
-                        for dx in 0..<factor {
-                            sum += input[rowStart + dx]
-                        }
-                    }
-                    output[chOut + oh * outW + ow] = sum * scale
-                }
-            }
-        }
-        return output
-    }
-
-    /// Bicubic 2× upsample planar [C, H, W] image.
-    static func bicubicUpsample2x(
-        _ input: [Float], channels: Int, height: Int, width: Int
-    ) -> [Float] {
-        let outH = height * 2
-        let outW = width * 2
-        var output = [Float](repeating: 0, count: channels * outH * outW)
-
-        for c in 0..<channels {
-            let chOffset = c * height * width
-            let outChOffset = c * outH * outW
-            for oy in 0..<outH {
-                let srcY = Float(oy) / 2.0 - 0.25
-                for ox in 0..<outW {
-                    let srcX = Float(ox) / 2.0 - 0.25
-                    output[outChOffset + oy * outW + ox] = bicubicSample(
-                        input, offset: chOffset, height: height, width: width, y: srcY, x: srcX)
-                }
-            }
-        }
-        return output
-    }
-
-    private static func bicubicSample(
-        _ data: [Float], offset: Int, height: Int, width: Int, y: Float, x: Float
-    ) -> Float {
-        let iy = Int(floor(y))
-        let ix = Int(floor(x))
-        let fy = y - Float(iy)
-        let fx = x - Float(ix)
-
-        var result: Float = 0
-        for j in -1...2 {
-            let wy = cubicWeight(Float(j) - fy)
-            for i in -1...2 {
-                let wx = cubicWeight(Float(i) - fx)
-                let sy = min(max(iy + j, 0), height - 1)
-                let sx = min(max(ix + i, 0), width - 1)
-                result += wy * wx * data[offset + sy * width + sx]
-            }
-        }
-        return result
-    }
-
-    private static func cubicWeight(_ t: Float) -> Float {
-        let a: Float = -0.5
-        let at = abs(t)
-        if at <= 1 {
-            return (a + 2) * at * at * at - (a + 3) * at * at + 1
-        } else if at < 2 {
-            return a * at * at * at - 5 * a * at * at + 8 * a * at - 4 * a
-        }
-        return 0
-    }
-
-    /// Tiled VAE decode: split latents into a grid of tiles, decode each with the half-res VAE, blend overlaps.
-    private func decodeTiled(
-        latents: [Float], channels: Int, height: Int, width: Int,
-        decoder: CoreAIDiffusionModelFunction, outputScale: Int
-    ) async throws -> [Float] {
-        let tileSize = height / 2
-        let overlap = 4
-        let stride = tileSize - overlap
-
-        let outTileSize = tileSize * outputScale
-        let outOverlap = overlap * outputScale
-        let outH = height * outputScale
-        let outW = width * outputScale
-        let outChannels = 3
-
-        var output = [Float](repeating: 0, count: outChannels * outH * outW)
-        var weights = [Float](repeating: 0, count: outH * outW)
-
-        let startsY = tileStarts(length: height, tileSize: tileSize, stride: stride)
-        let startsX = tileStarts(length: width, tileSize: tileSize, stride: stride)
-
-        for startY in startsY {
-            for startX in startsX {
-                let tile = extractTile(
-                    from: latents, channels: channels, height: height, width: width,
-                    startY: startY, startX: startX, tileSize: tileSize)
-
-                let tileShape = [1, channels, tileSize, tileSize]
-                let decodedTile = try await decoder.run(floatInputs: [(tile, tileShape)])
-
-                blendTile(
-                    decodedTile, into: &output, weights: &weights,
-                    outChannels: outChannels, outH: outH, outW: outW,
-                    outTileSize: outTileSize, outOverlap: outOverlap,
-                    outStartY: startY * outputScale, outStartX: startX * outputScale)
-            }
-        }
-
-        normalizeByWeights(&output, weights: weights, channels: outChannels, size: outH * outW)
-        return output
-    }
-
-    private func extractTile(
-        from latents: [Float], channels: Int, height: Int, width: Int,
-        startY: Int, startX: Int, tileSize: Int
-    ) -> [Float] {
-        var tile = [Float](repeating: 0, count: channels * tileSize * tileSize)
-        for c in 0..<channels {
-            for y in 0..<tileSize {
-                for x in 0..<tileSize {
-                    let srcY = min(startY + y, height - 1)
-                    let srcX = min(startX + x, width - 1)
-                    tile[c * tileSize * tileSize + y * tileSize + x] =
-                        latents[c * height * width + srcY * width + srcX]
-                }
-            }
-        }
-        return tile
-    }
-
-    private func blendTile(
-        _ decodedTile: [Float], into output: inout [Float], weights: inout [Float],
-        outChannels: Int, outH: Int, outW: Int,
-        outTileSize: Int, outOverlap: Int,
-        outStartY: Int, outStartX: Int
-    ) {
-        for c in 0..<outChannels {
-            for y in 0..<outTileSize {
-                let outY = outStartY + y
-                guard outY < outH else { continue }
-                let wy = blendWeight(y, outTileSize, outOverlap)
-                for x in 0..<outTileSize {
-                    let outX = outStartX + x
-                    guard outX < outW else { continue }
-                    let w = wy * blendWeight(x, outTileSize, outOverlap)
-                    output[c * outH * outW + outY * outW + outX] +=
-                        w * decodedTile[c * outTileSize * outTileSize + y * outTileSize + x]
-                    if c == 0 { weights[outY * outW + outX] += w }
-                }
-            }
-        }
-    }
-
-    private func normalizeByWeights(
-        _ output: inout [Float], weights: [Float], channels: Int, size: Int
-    ) {
-        for c in 0..<channels {
-            let offset = c * size
-            for i in 0..<size where weights[i] > 0 {
-                output[offset + i] /= weights[i]
-            }
-        }
-    }
-
-    /// Generate tile start positions that cover [0, length) with given tile size and stride.
-    private func tileStarts(length: Int, tileSize: Int, stride: Int) -> [Int] {
-        var starts: [Int] = []
-        var pos = 0
-        while pos + tileSize <= length {
-            starts.append(pos)
-            pos += stride
-        }
-        if starts.isEmpty || starts.last! + tileSize < length {
-            starts.append(length - tileSize)
-        }
-        return starts
-    }
-
-    private func blendWeight(_ pos: Int, _ size: Int, _ overlap: Int) -> Float {
-        if pos < overlap {
-            return Float(pos) / Float(overlap)
-        } else if pos >= size - overlap {
-            return Float(size - 1 - pos) / Float(overlap)
-        }
-        return 1.0
     }
 }

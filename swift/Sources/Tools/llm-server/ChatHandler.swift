@@ -694,6 +694,12 @@ private func tokenizeMessages(
         return spec
     }
 
+    // Phi-family templates read tools from a system message's `tools` key, not the top-level
+    // `tools` variable. Attach the specs there (and synthesize a system message if none exists)
+    // only for that dialect, so top-level-`tools` families (e.g. Qwen3) are not perturbed.
+    templateMessages = injectToolsIntoSystemMessageIfNeeded(
+        templateMessages, toolSpecs: toolSpecs, detection: state.toolCallDetection)
+
     do {
         let additionalContext = ReasoningEffort.templateContext(reasoningEffort)
         let tokens = try state.tokenizer.applyChatTemplate(

@@ -150,9 +150,9 @@ struct ComponentTests {
 
 // MARK: - Flux2 Pipeline Utilities
 
-private func makeFlux2Pipeline(bnMean: [Float]? = nil, bnVar: [Float]? = nil) -> Flux2Pipeline {
+private func makeFlux2Pipeline(bnMean: [Float]? = nil, bnVar: [Float]? = nil) -> FlowTransformerPipeline {
     let stub = CoreAIDiffusionModelFunction(modelURL: URL(filePath: "/nonexistent.aimodel"))
-    return Flux2Pipeline(
+    return FlowTransformerPipeline(
         descriptor: PipelineDescriptor(),
         mode: .full,
         transformer: stub,
@@ -179,8 +179,8 @@ struct Flux2UtilityTests {
         let inChannels = inCh * 4  // 128
         let original = (0..<(inCh * (h * 2) * (w * 2))).map { Float($0) }
 
-        let patchified = Flux2Pipeline.patchifyLatents(original, inChannels: inChannels, height: h, width: w)
-        let recovered = Flux2Pipeline.unpatchifyLatents(patchified, channels: inChannels, height: h, width: w)
+        let patchified = FlowTransformerPipeline.patchifyLatents(original, inChannels: inChannels, height: h, width: w)
+        let recovered = FlowTransformerPipeline.unpatchifyLatents(patchified, channels: inChannels, height: h, width: w)
 
         #expect(original.count == recovered.count)
         for (a, b) in zip(original, recovered) {

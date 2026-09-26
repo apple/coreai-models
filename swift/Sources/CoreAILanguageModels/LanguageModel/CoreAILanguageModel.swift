@@ -247,10 +247,17 @@ public struct CoreAILanguageModel: LanguageModel {
         ) async throws {
             // Tokenization span
             let tokenizationSpan = InstrumentsProfiler.beginTokenization(inputLength: 0)
+            // Map FM's reasoning level to a canonical effort string and pass it to makeTokens.
+            var reasoningEffort: String? = nil
+            if #available(FoundationModels 2.0, *) {
+                reasoningEffort = Self.reasoningEffortString(from: request.contextOptions.reasoningLevel)
+            }
             let promptTokens = Self.makeTokens(
                 from: Array(request.transcript),
                 using: model.tokenizer,
                 tools: request.enabledToolDefinitions,
+                toolCallDetection: model.toolCallDetection,
+                reasoningEffort: reasoningEffort,
                 component: "CoreAIExecutor"
             )
             guard !promptTokens.isEmpty else {
@@ -607,6 +614,8 @@ public struct CoreAILanguageModel: LanguageModel {
             from entries: [Transcript.Entry],
             using tokenizer: any Tokenizer,
             tools: [Transcript.ToolDefinition] = [],
+            toolCallDetection: ToolCallDetection? = nil,
+            reasoningEffort: String? = nil,
             component: String = "CoreAIExecutor"
         ) -> [Int] {
             var messages: [Message] = []
@@ -658,9 +667,22 @@ public struct CoreAILanguageModel: LanguageModel {
 
             let toolSpecs: [ToolSpec]? = tools.isEmpty ? nil : tools.compactMap { makeToolSpec(from: $0) }
 
+            // Phi-family templates read tools from a system message's `tools` key, not the
+            // top-level `tools` variable. Attach the specs there (synthesizing a system message
+            // if none exists) only for that dialect, mirroring the server's ChatHandler. Top-level
+            // `tools` is still passed for families such as Qwen3.
+            messages = injectToolsIntoSystemMessageIfNeeded(
+                messages, toolSpecs: toolSpecs, detection: toolCallDetection)
+
             do {
                 CLILogger.log("Applying chat template via tokenizer", component: component)
-                return try tokenizer.applyChatTemplate(messages: messages, tools: toolSpecs)
+                // Reasoning effort is applied as template context. The server also emits the
+                // legacy `/no_think` literal for models that read it from the system prompt;
+                // this path relies on `enable_thinking`.
+                let extra = reasoningTemplateContext(reasoningEffort)
+                return try tokenizer.applyChatTemplate(
+                    messages: messages, tools: toolSpecs,
+                    additionalContext: extra.isEmpty ? nil : extra)
             } catch {
                 CLILogger.log(
                     "Failed to apply chat template: \(error), falling back to simple encoding",
@@ -668,6 +690,31 @@ public struct CoreAILanguageModel: LanguageModel {
                 let text = messages.compactMap { $0["content"] as? String }.joined(separator: "\n")
                 return tokenizer.encode(text: text)
             }
+        }
+
+        /// Maps FM's `ContextOptions.ReasoningLevel` to our canonical effort string
+        /// (light→low, moderate→medium, deep→high, custom→verbatim).
+        @available(FoundationModels 2.0, *)
+        static func reasoningEffortString(from level: ContextOptions.ReasoningLevel?) -> String? {
+            switch level {
+            case .none: return nil
+            case .some(.light): return "low"
+            case .some(.moderate): return "medium"
+            case .some(.deep): return "high"
+            case .some(.custom(let s)): return s
+            @unknown default: return nil
+            }
+        }
+
+        /// Maps a canonical effort string to chat-template keyword arguments. Mirrors
+        /// `CoreAILMCommon.ReasoningEffort.templateContext`; unifying would require that type in a
+        /// module below both CoreAILanguageModels and CoreAILMCommon (for example CoreAIShared).
+        static func reasoningTemplateContext(_ effort: String?) -> [String: any Sendable] {
+            guard let e = effort?.trimmingCharacters(in: .whitespacesAndNewlines), !e.isEmpty else {
+                return [:]
+            }
+            if e.lowercased() == "none" { return ["enable_thinking": false] }
+            return ["reasoning_effort": e, "enable_thinking": true]
         }
 
         /// Converts a `ToolDefinition` into the `ToolSpec` format expected by

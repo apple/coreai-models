@@ -123,7 +123,7 @@ entrypoints inside `Transformer.aimodel`.
 import CoreAIDiffusionPipeline
 
 // Pipeline auto-detects the best mode from available components
-let pipeline = try await Flux2Pipeline(from: modelURL)
+let pipeline = try await FlowTransformerPipeline(from: modelURL)
 
 let config = PipelineConfiguration(
     prompt: "a photo of a cat",
