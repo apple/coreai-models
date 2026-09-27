@@ -91,6 +91,8 @@ public struct SamplingConfiguration: Sendable, Equatable, Hashable {
     /// Unlike TopP, it does not require sorting — it operates as a simple threshold in logit space.
     public let minP: Double?
 
+    // MARK: Penalties and logit bias
+
     /// Repetition penalty factor applied to tokens that appear in the generation history.
     ///
     /// - **nil** or **1.0**: No penalty (disabled)
@@ -110,6 +112,36 @@ public struct SamplingConfiguration: Sendable, Equatable, Hashable {
     /// - **64**: Only penalize tokens from the last 64 steps
     /// - **256**: Moderate window
     public let repetitionPenaltyWindow: Int?
+
+    /// Additive penalty scaled by how many times a token has appeared in the recent history.
+    ///
+    /// - **nil** or **0**: No penalty (disabled)
+    /// - **positive**: Discourages repetition; applied as `logit -= frequencyPenalty * count`
+    /// - **negative**: Encourages repetition
+    ///
+    /// Valid range is [-2, 2]. Unlike `repetitionPenalty` (multiplicative, count-agnostic),
+    /// this is additive and scales with occurrence count.
+    public let frequencyPenalty: Double?
+
+    /// Additive penalty applied once to any token that has appeared in the recent history.
+    ///
+    /// - **nil** or **0**: No penalty (disabled)
+    /// - **positive**: Discourages reusing tokens already seen; applied as `logit -= presencePenalty`
+    /// - **negative**: Encourages reuse
+    ///
+    /// Valid range is [-2, 2]. Independent of how many times the token appeared.
+    public let presencePenalty: Double?
+
+    /// Fixed additive bias per token id, applied to the logits before sampling.
+    ///
+    /// - **nil**: No bias
+    /// - Keyed by token id; each entry adds `bias` to that token's logit (`logit += bias`)
+    ///
+    /// Typical values are in [-100, 100]; large magnitudes effectively force or ban a token.
+    /// This is a static, request-level vector — it does not depend on generation history.
+    public let logitBias: [Int32: Float]?
+
+    // MARK: Execution options
 
     /// A boolean flag that requests the sampling operation be combined
     /// with logit inference.
@@ -148,6 +180,9 @@ public struct SamplingConfiguration: Sendable, Equatable, Hashable {
     ///   - repetitionPenaltyWindow: Optional window size. Must be > 0 if set.
     ///   - combined: Whether to combine sampling with logit inference. Defaults to true.
     ///   - seed: Optional seed for reproducible sampling. Defaults to nil (system generator).
+    ///   - frequencyPenalty: Optional additive count-scaled penalty. Must be in [-2, 2] if set.
+    ///   - presencePenalty: Optional additive presence penalty. Must be in [-2, 2] if set.
+    ///   - logitBias: Optional per-token-id additive bias applied before sampling.
     public init(
         temperature: Double,
         topK: Int? = nil,
@@ -156,7 +191,10 @@ public struct SamplingConfiguration: Sendable, Equatable, Hashable {
         repetitionPenalty: Double? = nil,
         repetitionPenaltyWindow: Int? = nil,
         combined: Bool = true,
-        seed: UInt64? = nil
+        seed: UInt64? = nil,
+        frequencyPenalty: Double? = nil,
+        presencePenalty: Double? = nil,
+        logitBias: [Int32: Float]? = nil
     ) {
         precondition(temperature >= 0, "Temperature must be non-negative.")
         precondition(topK == nil || topK! > 0, "TopK must be positive if set.")
@@ -168,6 +206,12 @@ public struct SamplingConfiguration: Sendable, Equatable, Hashable {
         precondition(
             repetitionPenaltyWindow == nil || repetitionPenaltyWindow! > 0,
             "Repetition penalty window must be > 0 if set.")
+        precondition(
+            frequencyPenalty == nil || (frequencyPenalty! >= -2 && frequencyPenalty! <= 2),
+            "Frequency penalty must be in [-2, 2] if set.")
+        precondition(
+            presencePenalty == nil || (presencePenalty! >= -2 && presencePenalty! <= 2),
+            "Presence penalty must be in [-2, 2] if set.")
 
         self.temperature = temperature
         self.topK = topK
@@ -177,6 +221,9 @@ public struct SamplingConfiguration: Sendable, Equatable, Hashable {
         self.repetitionPenaltyWindow = repetitionPenaltyWindow
         self.combined = combined
         self.seed = seed
+        self.frequencyPenalty = frequencyPenalty
+        self.presencePenalty = presencePenalty
+        self.logitBias = logitBias
     }
 
     /// A predefined configuration for deterministic, greedy token generation.
@@ -213,6 +260,22 @@ public struct SamplingConfiguration: Sendable, Equatable, Hashable {
     public var needsRepetitionPenalty: Bool {
         guard let penalty = repetitionPenalty else { return false }
         return penalty > 1.0
+    }
+
+    /// Whether an additive frequency or presence penalty is active.
+    public var needsAdditivePenalty: Bool {
+        (frequencyPenalty ?? 0) != 0 || (presencePenalty ?? 0) != 0
+    }
+
+    /// Whether a per-token logit bias is active.
+    public var needsLogitBias: Bool {
+        guard let bias = logitBias else { return false }
+        return !bias.isEmpty
+    }
+
+    /// Whether any logit modification beyond the multiplicative repetition penalty is active.
+    public var needsAdditiveLogitProcessing: Bool {
+        needsAdditivePenalty || needsLogitBias
     }
 
     /// Validates the configuration and returns warnings for potentially suboptimal settings.
@@ -287,8 +350,10 @@ public struct SamplingConfiguration: Sendable, Equatable, Hashable {
     ///
     /// - Returns: A new configuration with redundant settings removed.
     public func normalized() -> SamplingConfiguration {
-        // topK=1 with temperature>0 is equivalent to greedy — promote it
-        if let k = topK, k == 1, temperature > 0 {
+        // topK=1 with temperature>0 is equivalent to greedy — promote it, unless additive
+        // logit processing (frequency/presence penalty or logit bias) is configured, since the
+        // bare .greedy configuration would drop those fields.
+        if let k = topK, k == 1, temperature > 0, !needsAdditiveLogitProcessing {
             CLILogger.log(
                 "⚠️ SamplingConfiguration: topK=1 normalized to greedy (temperature=0)",
                 component: "Sampling")
@@ -319,7 +384,10 @@ public struct SamplingConfiguration: Sendable, Equatable, Hashable {
             repetitionPenalty: repetitionPenalty,
             repetitionPenaltyWindow: repetitionPenaltyWindow,
             combined: combined,
-            seed: seed
+            seed: seed,
+            frequencyPenalty: frequencyPenalty,
+            presencePenalty: presencePenalty,
+            logitBias: logitBias
         )
     }
 }
@@ -341,6 +409,11 @@ extension SamplingConfiguration {
             !needsRepetitionPenalty,
             "Use fallbackSampler(from:tokenHistory:) when repetition penalty is configured"
         )
+        // Frequency/presence penalties require token history; the logit bias does not, so it is
+        // still honored on this history-free path.
+        if needsLogitBias {
+            AdditivePenaltyProcessor.applyLogitBias(to: &logits, logitBias: logitBias!)
+        }
         return sampleToken(from: &logits, step: step)
     }
 
@@ -367,6 +440,17 @@ extension SamplingConfiguration {
                 to: &logits,
                 recentTokenIds: recentTokens,
                 penalty: Float(repetitionPenalty!)
+            )
+        }
+        if needsAdditiveLogitProcessing {
+            let window = repetitionPenaltyWindow.map { min($0, tokenHistory.count) } ?? tokenHistory.count
+            let recentTokens = tokenHistory.suffix(window)
+            AdditivePenaltyProcessor.apply(
+                to: &logits,
+                recentTokenIds: recentTokens,
+                frequencyPenalty: Float(frequencyPenalty ?? 0),
+                presencePenalty: Float(presencePenalty ?? 0),
+                logitBias: logitBias
             )
         }
         return sampleToken(from: &logits, step: step)
