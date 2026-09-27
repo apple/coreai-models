@@ -201,15 +201,9 @@ func runChatCompletion(chatRequest: ChatCompletionRequest, state: ServerState, s
 
     let reasoningEffort = ReasoningEffort.resolve(
         request: chatRequest.reasoningEffort, default: state.config.defaultReasoningEffort)
-    let promptTokens = tokenizeMessages(
-        chatRequest.messages, tools: chatRequest.tools, reasoningEffort: reasoningEffort, state: state)
+    let promptTokens = try resolvePromptTokens(chatRequest, reasoningEffort: reasoningEffort, state: state)
     let stopSequences = buildStopSequences(from: chatRequest, state: state)
     let input: Input = .tokens(promptTokens)
-
-    guard promptTokens.count < state.config.maxContextLength else {
-        throw ServerError.badRequest(
-            "Prompt (\(promptTokens.count) tokens) exceeds context length (\(state.config.maxContextLength))")
-    }
 
     CLILogger.log(
         "[\(requestID)] messages: \(chatRequest.messages.count), tokens: \(promptTokens.count), max_tokens: \(requestMaxTokens)",
@@ -416,15 +410,9 @@ func prepareStreaming(chatRequest: ChatCompletionRequest, state: ServerState, se
 
     let reasoningEffort = ReasoningEffort.resolve(
         request: chatRequest.reasoningEffort, default: state.config.defaultReasoningEffort)
-    let promptTokens = tokenizeMessages(
-        chatRequest.messages, tools: chatRequest.tools, reasoningEffort: reasoningEffort, state: state)
+    let promptTokens = try resolvePromptTokens(chatRequest, reasoningEffort: reasoningEffort, state: state)
     let stopSequences = buildStopSequences(from: chatRequest, state: state)
     let input: Input = .tokens(promptTokens)
-
-    guard promptTokens.count < state.config.maxContextLength else {
-        throw ServerError.badRequest(
-            "Prompt (\(promptTokens.count) tokens) exceeds context length (\(state.config.maxContextLength))")
-    }
 
     CLILogger.log(
         "[\(requestID)] stream, messages: \(chatRequest.messages.count), tokens: \(promptTokens.count), max_tokens: \(requestMaxTokens)",
@@ -637,6 +625,26 @@ private func handleStreamingRequest(
 }
 
 // MARK: - Helpers
+
+/// Renders the prompt and applies the request's context-overflow policy (`truncation`).
+/// Throws `.badRequest` when the prompt exceeds the context window and truncation is off.
+private func resolvePromptTokens(
+    _ chatRequest: ChatCompletionRequest, reasoningEffort: String?, state: ServerState
+) throws -> [Int] {
+    let render: ([ChatMessage]) -> [Int] = {
+        tokenizeMessages($0, tools: chatRequest.tools, reasoningEffort: reasoningEffort, state: state)
+    }
+    switch ContextTruncation.apply(
+        messages: chatRequest.messages, truncation: chatRequest.truncation,
+        maxContextLength: state.config.maxContextLength, render: render)
+    {
+    case .ok(let tokens):
+        return tokens
+    case .overflow(let promptTokens, let budget):
+        throw ServerError.badRequest(
+            "Prompt (\(promptTokens) tokens) exceeds context length (\(budget))")
+    }
+}
 
 private func tokenizeMessages(
     _ messages: [ChatMessage], tools: [ToolDefinition]? = nil,

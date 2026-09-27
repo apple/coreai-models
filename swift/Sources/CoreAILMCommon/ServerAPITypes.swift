@@ -5,6 +5,18 @@
 
 import Foundation
 
+// MARK: - Truncation Policy
+
+/// How to handle a prompt that exceeds the model's context window.
+/// - off: reject with an error (default; preserves eval safety).
+/// - auto: drop oldest whole messages (keeping the system message and the newest turn) to fit.
+/// - tokensAt(N): as auto, but target a budget of min(N, maxContextLength) tokens.
+public enum Truncation: Sendable, Equatable {
+    case off
+    case auto
+    case tokensAt(Int)
+}
+
 // MARK: - Chat Completion Request
 
 public struct ChatCompletionRequest: Decodable, Sendable {
@@ -26,9 +38,11 @@ public struct ChatCompletionRequest: Decodable, Sendable {
     /// Reasoning-effort control, OpenAI-compatible. Canonical values are none, low, medium, high;
     /// other values pass through to the model's chat template.
     public let reasoningEffort: String?
+    /// Context-overflow policy. Decodes from `"off"`/`"auto"` or a positive integer token budget.
+    public let truncation: Truncation
 
     enum CodingKeys: String, CodingKey {
-        case model, messages, temperature, stream, stop, tools, raw, seed
+        case model, messages, temperature, stream, stop, tools, raw, seed, truncation
         case maxTokens = "max_tokens"
         case maxCompletionTokens = "max_completion_tokens"
         case topP = "top_p"
@@ -56,6 +70,26 @@ public struct ChatCompletionRequest: Decodable, Sendable {
         parallelToolCalls = try container.decodeIfPresent(Bool.self, forKey: .parallelToolCalls)
         raw = try container.decodeIfPresent(Bool.self, forKey: .raw)
         reasoningEffort = try container.decodeIfPresent(String.self, forKey: .reasoningEffort)
+
+        if let n = try? container.decode(Int.self, forKey: .truncation) {
+            guard n > 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .truncation, in: container,
+                    debugDescription: "truncation token budget must be a positive integer")
+            }
+            truncation = .tokensAt(n)
+        } else if let s = try? container.decode(String.self, forKey: .truncation) {
+            switch s {
+            case "auto": truncation = .auto
+            case "off", "disabled", "none": truncation = .off
+            default:
+                throw DecodingError.dataCorruptedError(
+                    forKey: .truncation, in: container,
+                    debugDescription: #"truncation must be "auto", "off", or a positive integer"#)
+            }
+        } else {
+            truncation = .off
+        }
 
         if let arr = try? container.decode([String].self, forKey: .stop) {
             stop = arr
