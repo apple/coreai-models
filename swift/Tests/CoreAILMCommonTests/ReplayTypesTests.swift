@@ -19,9 +19,38 @@ struct ReplayTypesTests {
         #expect(req.id == "r1")
         #expect(req.session == "A")
         #expect(req.t == 1.5)
-        #expect(req.request.seed == 7)
-        #expect(req.request.maxTokens == 32)
-        #expect(req.request.messages.count == 1)
+        #expect(req.loglikelihood == nil)
+        #expect(req.request?.seed == 7)
+        #expect(req.request?.maxTokens == 32)
+        #expect(req.request?.messages.count == 1)
+    }
+
+    @Test("A loglikelihood line decodes into a CompletionRequest body")
+    func loglikelihoodRequestDecodes() throws {
+        let line = #"{"id":"w1","loglikelihood":{"prompt":[1,2,3],"echo":true,"logprobs":0}}"#
+        let req = try JSONDecoder().decode(ReplayRequest.self, from: Data(line.utf8))
+        #expect(req.id == "w1")
+        #expect(req.request == nil)
+        #expect(req.loglikelihood?.echo == true)
+        #expect(req.loglikelihood?.logprobs == 0)
+        #expect(req.loglikelihood?.prompts.count == 1)
+    }
+
+    @Test("A line with neither body is rejected")
+    func rejectsEmptyBody() {
+        let line = #"{"id":"bad","session":"A"}"#
+        #expect(throws: DecodingError.self) {
+            try JSONDecoder().decode(ReplayRequest.self, from: Data(line.utf8))
+        }
+    }
+
+    @Test("A line with both bodies is rejected")
+    func rejectsBothBodies() {
+        let line =
+            #"{"id":"bad","request":{"messages":[{"role":"user","content":"hi"}]},"loglikelihood":{"prompt":[1,2]}}"#
+        #expect(throws: DecodingError.self) {
+            try JSONDecoder().decode(ReplayRequest.self, from: Data(line.utf8))
+        }
     }
 
     @Test("parseRequests skips blanks and comments and orders by timestamp")
@@ -167,5 +196,37 @@ struct ReplayTypesTests {
         #expect(choice.message.content == nil)
         #expect(choice.message.reasoningContent == nil)
         #expect(choice.message.toolCalls == nil)
+    }
+
+    @Test("A loglikelihood result encodes token logprobs with a null first entry")
+    func loglikelihoodResultEncodes() throws {
+        let result = ReplayResult(
+            id: "w1", session: nil, t: nil,
+            choices: nil, systemFingerprint: nil,
+            promptTokens: 3, completionTokens: 0, prefixReuseTokens: 0,
+            ttftMs: 0, totalMs: 5.0, decodeTps: 0,
+            tokens: ["a", "b", "c"],
+            tokenLogprobs: [nil, -1.5, -2.25],
+            textOffset: [0, 1, 2])
+        let json = try ReplayIO.encodeResult(result)
+        #expect(json.contains(#""token_logprobs":[null,-1.5,-2.25]"#))
+        #expect(json.contains(#""text_offset":[0,1,2]"#))
+        #expect(json.contains(#""tokens":["a","b","c"]"#))
+    }
+
+    @Test("A chat result omits the loglikelihood-only fields")
+    func chatResultOmitsLogprobFields() throws {
+        let choice = ChatCompletionResponse.Choice(
+            index: 0,
+            message: ChatCompletionResponse.ResponseMessage(role: "assistant", content: "hi"),
+            finishReason: "stop")
+        let result = ReplayResult(
+            id: "r1", session: "A", t: 0,
+            choices: [choice], systemFingerprint: nil,
+            promptTokens: 1, completionTokens: 1, prefixReuseTokens: 0,
+            ttftMs: 1, totalMs: 2, decodeTps: 3)
+        let json = try ReplayIO.encodeResult(result)
+        #expect(!json.contains("token_logprobs"))
+        #expect(!json.contains("text_offset"))
     }
 }
