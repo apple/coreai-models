@@ -21,7 +21,7 @@ public typealias LogitsScalarType = Float
 public struct InferenceOutput: Sendable {
     public let tokenId: Int32
 
-    /// Populated when `InferenceOptions.includeLogits` is true. Shape: [vocabSize].
+    /// Populated when `InferenceOptions.logits` is not `.none`. Shape: [vocabSize].
     public let logits: [LogitsScalarType]?
 
     public init(tokenId: Int32, logits: [LogitsScalarType]? = nil) {
@@ -32,25 +32,67 @@ public struct InferenceOutput: Sendable {
 
 // MARK: - Inference Options
 
+/// Whether to sample a token this step.
+public enum TokenRequest: Sendable, Equatable {
+    case none
+    case sample
+}
+
+/// Which positions' logits to return.
+public enum LogitsRequest: Sendable, Equatable {
+    case none
+    case lastPosition
+    case allPositions
+}
+
 /// Controls what the engine produces and how much.
-/// Struct-based for additive extensibility (future: embeddings, attention maps).
 public struct InferenceOptions: Sendable {
     /// Max tokens to generate. Nil = until EOS or context limit.
     public var maxTokens: Int?
-    /// Include raw logits in each `InferenceOutput`. May incur GPU→CPU copy cost.
-    public var includeLogits: Bool
-    /// When set, engines use these token IDs instead of sampling.
-    /// Used by MMLU-style evaluation to compute P(continuation|context).
+    public var tokens: TokenRequest
+    public var logits: LogitsRequest
+    /// Force these token IDs instead of sampling (MMLU-style scoring).
     public var forcedContinuation: [Int32]?
 
     public init(
         maxTokens: Int? = nil,
-        includeLogits: Bool = false,
+        tokens: TokenRequest = .sample,
+        logits: LogitsRequest = .none,
         forcedContinuation: [Int32]? = nil
     ) {
         self.maxTokens = maxTokens
-        self.includeLogits = includeLogits
+        self.tokens = tokens
+        self.logits = logits
         self.forcedContinuation = forcedContinuation
+    }
+}
+
+/// Presets for the common (tokens, logits) pairs.
+extension InferenceOptions {
+    /// Warm the KV cache; no token or logits generation.
+    public static func prefill(maxTokens: Int? = nil) -> InferenceOptions {
+        InferenceOptions(maxTokens: maxTokens, tokens: .none, logits: .none)
+    }
+    /// Decode one token.
+    public static func extend(maxTokens: Int? = nil) -> InferenceOptions {
+        InferenceOptions(maxTokens: maxTokens, tokens: .sample, logits: .none)
+    }
+    /// Same as `extend`.
+    public static func `default`(maxTokens: Int? = nil) -> InferenceOptions {
+        .extend(maxTokens: maxTokens)
+    }
+    /// Logits at every position, for eval / PPL.
+    public static func eval(maxTokens: Int? = nil, forcedContinuation: [Int32]? = nil) -> InferenceOptions {
+        InferenceOptions(
+            maxTokens: maxTokens, tokens: .none, logits: .allPositions, forcedContinuation: forcedContinuation)
+    }
+    /// Last-row logits for constrained decoding.
+    public static func guided(maxTokens: Int? = nil) -> InferenceOptions {
+        InferenceOptions(maxTokens: maxTokens, tokens: .none, logits: .lastPosition)
+    }
+    /// Decode, and also return the last-row logits.
+    public static func sampleWithLogits(maxTokens: Int? = nil) -> InferenceOptions {
+        InferenceOptions(maxTokens: maxTokens, tokens: .sample, logits: .lastPosition)
     }
 }
 
@@ -96,7 +138,7 @@ public protocol InferenceEngine: Sendable {
     /// - Parameters:
     ///   - input: Token IDs (prompt, context, or continuation).
     ///   - sampling: Sampling configuration (temperature, topK, etc.).
-    ///   - generation: Inference options (maxTokens, includeLogits).
+    ///   - generation: Inference options (maxTokens, tokens, logits).
     /// - Returns: An `InferenceOutputSequence` — iterate for tokens, read
     ///   `stopReason` after the loop to learn why generation ended.
     func generate(

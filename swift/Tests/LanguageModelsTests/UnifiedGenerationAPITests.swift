@@ -37,14 +37,32 @@ struct InferenceOptionsTests {
     func defaultOptions() {
         let opts = InferenceOptions()
         #expect(opts.maxTokens == nil)
-        #expect(opts.includeLogits == false)
+        #expect(opts.logits == .none)
+        #expect(opts.tokens == .sample)
     }
 
     @Test("Custom options")
     func customOptions() {
-        let opts = InferenceOptions(maxTokens: 50, includeLogits: true)
+        let opts = InferenceOptions(maxTokens: 50, logits: .lastPosition)
         #expect(opts.maxTokens == 50)
-        #expect(opts.includeLogits == true)
+        #expect(opts.logits == .lastPosition)
+    }
+
+    @Test("Presets map to the right (tokens, logits) pairs")
+    func presets() {
+        #expect(InferenceOptions.prefill().tokens == .none)
+        #expect(InferenceOptions.prefill().logits == .none)
+        #expect(InferenceOptions.extend().tokens == .sample)
+        #expect(InferenceOptions.extend().logits == .none)
+        #expect(InferenceOptions.eval().tokens == .none)
+        #expect(InferenceOptions.eval().logits == .allPositions)
+        #expect(InferenceOptions.guided().tokens == .none)
+        #expect(InferenceOptions.guided().logits == .lastPosition)
+        #expect(InferenceOptions.sampleWithLogits().tokens == .sample)
+        #expect(InferenceOptions.sampleWithLogits().logits == .lastPosition)
+        // no-arg default == .extend (sample, no logits) — byte-identical to old includeLogits:false
+        #expect(InferenceOptions().tokens == .sample)
+        #expect(InferenceOptions().logits == .none)
     }
 }
 
@@ -75,11 +93,11 @@ struct GenerateDefaultExtensionTests {
         #expect(outputs[4].tokenId == 20)
     }
 
-    @Test("generate() returns nil logits when includeLogits is false")
+    @Test("generate() returns nil logits when logits is .none")
     func noLogitsWhenNotRequested() async throws {
         let engine = MockEngine(tokens: [42])
 
-        let generation = InferenceOptions(maxTokens: 1, includeLogits: false)
+        let generation = InferenceOptions(maxTokens: 1, logits: .none)
         for try await output in try await engine.generate(
             with: [1],
             samplingConfiguration: SamplingConfiguration.greedy,
@@ -89,11 +107,11 @@ struct GenerateDefaultExtensionTests {
         }
     }
 
-    @Test("generate() returns logits when includeLogits is true")
+    @Test("generate() returns logits when logits is requested")
     func logitsWhenRequested() async throws {
         let engine = MockEngine(tokens: [42], vocabSize: 50)
 
-        let generation = InferenceOptions(maxTokens: 1, includeLogits: true)
+        let generation = InferenceOptions(maxTokens: 1, logits: .lastPosition)
         for try await output in try await engine.generate(
             with: [1],
             samplingConfiguration: SamplingConfiguration.greedy,
@@ -108,7 +126,7 @@ struct GenerateDefaultExtensionTests {
     func logitsHighProbOnTarget() async throws {
         let engine = MockEngine(tokens: [5], vocabSize: 10)
 
-        let generation = InferenceOptions(maxTokens: 1, includeLogits: true)
+        let generation = InferenceOptions(maxTokens: 1, logits: .lastPosition)
         for try await output in try await engine.generate(
             with: [1],
             samplingConfiguration: SamplingConfiguration.greedy,
@@ -128,7 +146,7 @@ struct GenerateDefaultExtensionTests {
     func noLogitsWhenVocabSizeNil() async throws {
         let engine = MockEngine(tokens: [42], vocabSize: nil)
 
-        let generation = InferenceOptions(maxTokens: 1, includeLogits: true)
+        let generation = InferenceOptions(maxTokens: 1, logits: .lastPosition)
         for try await output in try await engine.generate(
             with: [1],
             samplingConfiguration: SamplingConfiguration.greedy,
@@ -208,7 +226,7 @@ struct GenerateMultiCallTests {
             for try await output in try await engine.generate(
                 with: tokens,
                 samplingConfiguration: .greedy,
-                inferenceOptions: InferenceOptions(maxTokens: 1, includeLogits: true)
+                inferenceOptions: .guided(maxTokens: 1)
             ) {
                 got = output
                 break  // Only consume 1 token (GG pattern)
@@ -260,10 +278,7 @@ struct GenerateMultiCallTests {
         for try await output in try await engine.generate(
             with: [1, 2, 3],
             samplingConfiguration: .greedy,
-            inferenceOptions: InferenceOptions(
-                includeLogits: true,
-                forcedContinuation: forced
-            )
+            inferenceOptions: .eval(forcedContinuation: forced)
         ) {
             outputs.append(output)
         }
