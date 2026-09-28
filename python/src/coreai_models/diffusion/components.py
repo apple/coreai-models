@@ -39,6 +39,16 @@ from coreai_models.diffusion.flux2 import (
     dummy_flux2_vae_encoder,
     dummy_flux2_vae_encoder_half,
 )
+from coreai_models.diffusion.sana import (
+    SanaTextEncoderWrapper,
+    SanaTransformerWrapper,
+    SanaVAEDecoderWrapper,
+    dummy_sana_text_encoder,
+    dummy_sana_text_encoder_quant_trace,
+    dummy_sana_transformer,
+    dummy_sana_transformer_quant_trace,
+    dummy_sana_vae_decoder,
+)
 from coreai_models.diffusion.wan import (
     WanTextEncoderWrapper,
     WanTransformerWrapper,
@@ -659,6 +669,42 @@ WAN_COMPONENTS: dict[str, ComponentSpec] = {
 
 ALL_WAN_COMPONENTS: list[str] = list(WAN_COMPONENTS.keys())
 
+SANA_SPRINT_COMPONENTS: dict[str, ComponentSpec] = {
+    "transformer": ComponentSpec(
+        asset_name="Transformer",
+        input_names=(
+            "hidden_states",
+            "encoder_hidden_states",
+            "encoder_attention_mask",
+            "timestep",
+            "guidance",
+        ),
+        output_names=("output",),
+        wrapper_fn=lambda p: SanaTransformerWrapper(p.transformer),
+        dummy_fn=dummy_sana_transformer,
+        quantizable=True,
+        quant_dummy_fn=dummy_sana_transformer_quant_trace,
+    ),
+    "text_encoder": ComponentSpec(
+        asset_name="TextEncoder",
+        input_names=("input_ids", "attention_mask"),
+        output_names=("hidden_states",),
+        wrapper_fn=lambda p: SanaTextEncoderWrapper(p.text_encoder),
+        dummy_fn=dummy_sana_text_encoder,
+        quantizable=True,
+        quant_dummy_fn=dummy_sana_text_encoder_quant_trace,
+    ),
+    "vae_decoder": ComponentSpec(
+        asset_name="VAEDecoder",
+        input_names=("z",),
+        output_names=("image",),
+        wrapper_fn=lambda p: SanaVAEDecoderWrapper(p.vae),
+        dummy_fn=dummy_sana_vae_decoder,
+    ),
+}
+
+ALL_SANA_SPRINT_COMPONENTS: list[str] = list(SANA_SPRINT_COMPONENTS.keys())
+
 
 def get_component_registry(
     hf_pipe: Any,
@@ -670,7 +716,7 @@ def get_component_registry(
     Args:
         hf_pipe: The loaded HuggingFace pipeline (unused for routing, but
             available for future introspection).
-        pipeline_type: One of "sd", "sd3", or "flux2".
+        pipeline_type: One of "sd", "sd3", "flux2", "wan", or "sana_sprint".
         multifunction: If True, use multi-function export for FLUX.2 transformer
             (5 functions in one .aimodel: main, half, img2img_quarter/half/full).
     """
@@ -682,6 +728,8 @@ def get_component_registry(
         return SD3_COMPONENTS
     if pipeline_type == "wan":
         return WAN_COMPONENTS
+    if pipeline_type == "sana_sprint":
+        return SANA_SPRINT_COMPONENTS
     return SD_COMPONENTS
 
 
@@ -695,4 +743,6 @@ def get_valid_components(pipeline_type: str, multifunction: bool = False) -> lis
         return ALL_SD3_COMPONENTS
     if pipeline_type == "wan":
         return ALL_WAN_COMPONENTS
+    if pipeline_type == "sana_sprint":
+        return ALL_SANA_SPRINT_COMPONENTS
     return ALL_SD_COMPONENTS

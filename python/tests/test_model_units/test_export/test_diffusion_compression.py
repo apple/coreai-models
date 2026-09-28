@@ -154,6 +154,7 @@ def test_presets_satisfy_the_coreai_opt_schema(name: str) -> None:
     [
         ("diffusers.models.normalization.RMSNorm", "SD3 qk-norm"),
         ("transformers.models.qwen3.modeling_qwen3.Qwen3RMSNorm", "FLUX.2 text encoder"),
+        ("transformers.models.gemma2.modeling_gemma2.Gemma2RMSNorm", "Sana Sprint text encoder"),
         ("transformers.models.umt5.modeling_umt5.UMT5LayerNorm", "WAN text encoder"),
     ],
 )

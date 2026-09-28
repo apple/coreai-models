@@ -154,11 +154,11 @@ struct DiffusionRunner: AsyncParsableCommand {
 
         // Determine pipeline type and dispatch
         let resolvedDescriptor = try PipelineDescriptor.resolve(at: bundleURL, config: configSource)
-        let isFlux2 = resolvedDescriptor.type == .flux2
+        let isFlowTransformer = resolvedDescriptor.type == .flux2 || resolvedDescriptor.type == .sanaSprint
         let isSd3 = resolvedDescriptor.type == .stableDiffusion3
 
         let schedulerType: SchedulerType =
-            (isFlux2 || isSd3) ? .discreteFlow : (scheduler == "pndm" ? .pndm : .dpmSolverMultistep)
+            (isFlowTransformer || isSd3) ? .discreteFlow : (scheduler == "pndm" ? .pndm : .dpmSolverMultistep)
         let effectiveSteps = steps ?? resolvedDescriptor.defaultSteps ?? 20
         let effectiveGuidance = guidanceScale ?? resolvedDescriptor.defaultGuidanceScale ?? 7.5
 
@@ -196,10 +196,12 @@ struct DiffusionRunner: AsyncParsableCommand {
             lazyModelLoading: lazyModelLoading
         )
 
-        if isFlux2 {
-            let pipeline = try await Flux2Pipeline(from: bundleURL, config: configSource, mode: decodeResolution)
+        if isFlowTransformer {
+            let pipeline = try await FlowTransformerPipeline(
+                from: bundleURL, config: configSource, mode: decodeResolution)
 
-            print("Generating (FLUX.2): \"\(prompt)\"")
+            let family = resolvedDescriptor.type == .sanaSprint ? "Sana Sprint" : "FLUX.2"
+            print("Generating (\(family)): \"\(prompt)\"")
             print("Steps: \(effectiveSteps), Guidance: \(effectiveGuidance), Seed: \(seed)")
             print("Image size: \(pipeline.defaultImageSize.width)x\(pipeline.defaultImageSize.height)")
 

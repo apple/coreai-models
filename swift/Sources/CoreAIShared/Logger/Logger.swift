@@ -21,7 +21,8 @@ public struct CLILogger {
         }
     }
 
-    /// Performs logging if enabled for the requested level.
+    /// Performs logging if enabled for the requested level. Diagnostics go to stderr so stdout
+    /// stays reserved for program output (for example, `--replay` JSONL results).
     /// - Parameters:
     ///   - message: The message to log.
     ///   - component: The name of the component logging.
@@ -31,11 +32,8 @@ public struct CLILogger {
             return
         }
 
-        if let component {
-            print("[\(component)] \(message)")
-        } else {
-            print(message)
-        }
+        let line = (component.map { "[\($0)] " } ?? "") + message + "\n"
+        FileHandle.standardError.write(Data(line.utf8))
     }
 
     public static func isEnabled(at level: Int) -> Bool {
