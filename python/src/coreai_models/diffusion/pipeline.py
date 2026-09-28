@@ -35,7 +35,7 @@ from coreai_models.diffusion.components import (
     quant_weight_owner,
 )
 from coreai_models.diffusion.gpu import export_multifunction, export_stateless
-from coreai_models.diffusion.models import get_pipeline_type
+from coreai_models.diffusion.models import get_pipeline_type, unknown_pipeline_type_error
 from coreai_models.diffusion.presets import PRESETS, list_presets
 from coreai_models.export.compression import is_compression_mode_graph, quantize_pytorch_model
 from coreai_models.export.metadata import build_aimodel_metadata
@@ -223,9 +223,7 @@ def _load_hf_pipeline(model_id: str, pipeline_type: str, model_dtype: torch.dtyp
         hf_pipe = WanPipeline.from_pretrained(model_id, torch_dtype=model_dtype)
         return hf_pipe
 
-    raise ValueError(
-        f"Unknown pipeline type: '{pipeline_type}'. Supported: 'flux2', 'wan', 'sana_sprint'."
-    )
+    raise unknown_pipeline_type_error(pipeline_type)
 
 
 # ---------------------------------------------------------------------------
@@ -290,14 +288,10 @@ def _save_pipeline_tokenizer(hf_pipe: Any, output_path: Path, overwrite: bool) -
 def _save_tokenizer(model_id: str, output_path: Path, hf_pipe: Any, overwrite: bool) -> None:
     """Save the tokenizer subdirs the model needs.
 
-    Downloads `tokenizer/` (and `tokenizer_2/` when the pipeline exposes one) from the
+    Downloads `tokenizer/` from the
     HF snapshot and copies it alongside the exported assets.
     """
-    subdirs = ["tokenizer"]
-    if hasattr(hf_pipe, "tokenizer_2") and getattr(hf_pipe, "tokenizer_2", None) is not None:
-        subdirs.append("tokenizer_2")
-
-    for subdir in subdirs:
+    for subdir in ["tokenizer"]:
         dst_dir = output_path / subdir
         if dst_dir.exists() and not overwrite:
             logger.info(f"Skipping {subdir}: {dst_dir} exists (use --overwrite)")
@@ -384,9 +378,7 @@ def _write_metadata_json(
     elif pipeline_type == "wan":
         diffusion_config = _build_wan_config(hf_pipe, model_id, vae_tile_size=vae_tile_size)
     else:
-        raise ValueError(
-            f"Unknown pipeline type: '{pipeline_type}'. Supported: 'flux2', 'wan', 'sana_sprint'."
-        )
+        raise unknown_pipeline_type_error(pipeline_type)
 
     json_path = output_path / "metadata.json"
     assets = _prepare_assets(json_path, exported_assets)

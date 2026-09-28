@@ -39,6 +39,7 @@ from coreai_models.diffusion.flux2 import (
     dummy_flux2_vae_encoder,
     dummy_flux2_vae_encoder_half,
 )
+from coreai_models.diffusion.models import unknown_pipeline_type_error
 from coreai_models.diffusion.sana import (
     SanaTextEncoderWrapper,
     SanaTransformerWrapper,
@@ -504,9 +505,7 @@ def get_component_registry(
         return WAN_COMPONENTS
     if pipeline_type == "sana_sprint":
         return SANA_SPRINT_COMPONENTS
-    raise ValueError(
-        f"Unknown pipeline type: '{pipeline_type}'. Supported: 'flux2', 'wan', 'sana_sprint'."
-    )
+    raise unknown_pipeline_type_error(pipeline_type)
 
 
 def get_valid_components(pipeline_type: str, multifunction: bool = False) -> list[str]:
@@ -519,6 +518,4 @@ def get_valid_components(pipeline_type: str, multifunction: bool = False) -> lis
         return ALL_WAN_COMPONENTS
     if pipeline_type == "sana_sprint":
         return ALL_SANA_SPRINT_COMPONENTS
-    raise ValueError(
-        f"Unknown pipeline type: '{pipeline_type}'. Supported: 'flux2', 'wan', 'sana_sprint'."
-    )
+    raise unknown_pipeline_type_error(pipeline_type)

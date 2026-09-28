@@ -36,3 +36,13 @@ def get_pipeline_type(model_id: str) -> str:
         f"Unknown diffusion model: '{model_id}'. "
         f"Supported models: {[mid for _, mid, _ in SUPPORTED_MODELS]}"
     )
+
+
+# Pipeline types, derived from the single source of truth above (order-preserving, deduped).
+SUPPORTED_PIPELINE_TYPES: list[str] = list(dict.fromkeys(ptype for _, _, ptype in SUPPORTED_MODELS))
+
+
+def unknown_pipeline_type_error(pipeline_type: str) -> ValueError:
+    """Uniform error for an unrecognized diffusion pipeline type."""
+    supported = ", ".join(f"'{t}'" for t in SUPPORTED_PIPELINE_TYPES)
+    return ValueError(f"Unknown pipeline type: '{pipeline_type}'. Supported: {supported}.")

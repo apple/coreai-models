@@ -26,6 +26,7 @@ from coreai_opt.quantization import QuantizerConfig
 from coreai_models.diffusion.components import (
     FLUX2_COMPONENTS,
     FLUX2_MULTIFUNCTION_TRANSFORMER,
+    SANA_SPRINT_COMPONENTS,
     WAN_COMPONENTS,
     quant_weight_owner,
 )
@@ -246,7 +247,7 @@ def test_denoisers_override_the_quant_trace(registry) -> None:
 
 
 def test_vae_components_stay_unquantized() -> None:
-    for registry in (FLUX2_COMPONENTS, WAN_COMPONENTS):
+    for registry in (FLUX2_COMPONENTS, SANA_SPRINT_COMPONENTS, WAN_COMPONENTS):
         vaes = [name for name in registry if "vae" in name]
         assert vaes
         assert all(not registry[name].quantizable for name in vaes)
