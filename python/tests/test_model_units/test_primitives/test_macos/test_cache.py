@@ -8,6 +8,7 @@
 import pytest
 import torch
 
+import coreai_models.primitives.macos.cache as cache_module
 from coreai_models.primitives.macos.cache import KVCache, SSMState
 from tests._runner_infra.testing_utils import (
     assert_close,
@@ -350,3 +351,37 @@ class TestSSMState:
             # Verify all previously updated states are correct
             for j in range(i + 1):
                 assert_close(ssm_state.states[j], res[j])
+
+    @staticmethod
+    @pytest.mark.parametrize("state_dims", [(4, 6), (3, 4, 5)])
+    def test_update_states_slice_bounds_cover_all_dims(monkeypatch, state_dims) -> None:
+        """update_states must build begin/end that span every cache dimension.
+
+        AIProgram.optimize rejects a slice_update whose begin and end ranks
+        differ; eager right-pads via zip(strict=False) and never surfaces the
+        mismatch, so capture the indices update_states passes down and assert
+        the equal-rank invariant directly (plus the written values).
+        """
+        n_layers, batch_size = 2, 1
+        states = torch.zeros(n_layers, batch_size, *state_dims)
+        ssm_state = SSMState(states)
+
+        captured: dict[str, torch.Tensor] = {}
+        real_slice_update = cache_module.mutable_slice_update
+
+        def spy(*args, **kwargs):
+            captured["begin"] = kwargs["begin"]
+            captured["end"] = kwargs["end"]
+            return real_slice_update(*args, **kwargs)
+
+        monkeypatch.setattr(cache_module, "mutable_slice_update", spy)
+
+        layer_idx = 1
+        new_state = torch.randn(batch_size, *state_dims)
+        ssm_state.update_states(layer_idx, new_state)
+
+        assert captured["begin"].numel() == states.dim()
+        assert captured["end"].numel() == states.dim()
+
+        assert_close(ssm_state.states[layer_idx], new_state)
+        assert_close(ssm_state.states[0], torch.zeros(batch_size, *state_dims))

@@ -320,7 +320,17 @@ class TestRegisteredModelsSatisfyTheContract:
 
         from transformers import AutoConfig
 
+        # DiffusionGemma is a two-graph (encoder + canvas decoder) block-diffusion
+        # export whose MoE/cache config is not fully specified by transformers'
+        # *default* diffusion_gemma_text config (moe_intermediate_size, num_experts,
+        # and num_global_key_value_heads default to None); it needs a
+        # checkpoint-derived config, so this stock-default contract check does not
+        # apply. Its export contract is covered by the DiffusionGemma model tests.
+        contract_skip = {"diffusion_gemma_text"}
+
         for model_type, entry in self._macos_entries():
+            if model_type in contract_skip:
+                continue
             raw = AutoConfig.for_model(model_type)
             cfg = (
                 getattr(raw, entry.hf_config_attr)

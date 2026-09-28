@@ -6,8 +6,9 @@
 import Accelerate
 import Foundation
 
-/// Discrete flow matching scheduler for SD3 and Flux models.
-/// Uses Euler method on a flow-matching ODE (sigma interpolation between noise and data).
+/// Discrete flow matching scheduler for SD3, Flux and Sana Sprint models.
+/// Uses Euler method on a flow-matching ODE (sigma interpolation between noise and data),
+/// or stochastic sampling (`stepStochastic`) for consistency-distilled models.
 public final class DiscreteFlowScheduler {
     public let trainStepCount: Int
     public let inferenceStepCount: Int
@@ -77,6 +78,20 @@ public final class DiscreteFlowScheduler {
         self.timeSteps = inferSigmas.map { Int($0 * ts) }
     }
 
+    /// An explicit sigma schedule, e.g. Sana Sprint's TrigFlow angles mapped to flow sigmas.
+    /// A terminal sigma of 0 is appended.
+    public init(sigmas: [Float], trainStepCount: Int = 1000) {
+        precondition(!sigmas.isEmpty && trainStepCount > 0)
+        self.trainStepCount = trainStepCount
+        self.inferenceStepCount = sigmas.count
+        self.trainSteps = Float(trainStepCount)
+        self.shift = 1.0
+        self.mu = nil
+        self.counter = 0
+        self.sigmas = sigmas + [0.0]
+        self.timeSteps = sigmas.map { Int($0 * Float(trainStepCount)) }
+    }
+
     static func sigmaFromTimestep(_ timestep: Float, trainSteps: Float, shift: Float) -> Float {
         if shift == 1.0 {
             return timestep / trainSteps
@@ -108,6 +123,24 @@ public final class DiscreteFlowScheduler {
         var dtVal = dt
         vDSP_vsma(output, 1, &dtVal, sample, 1, &prevSample, 1, count)
 
+        counter += 1
+        return prevSample
+    }
+
+    /// Stochastic step: predict x0 = x − σ·v, then renoise it to the next sigma with fresh
+    /// `noise`. Matches diffusers' `SCMScheduler.step` and flow-match `stochastic_sampling`.
+    public func stepStochastic(output: [Float], sample: [Float], noise: [Float]) -> [Float] {
+        let stepIndex = counter
+        precondition(stepIndex < sigmas.count - 1, "stepStochastic() called beyond inferenceStepCount")
+        precondition(output.count == sample.count && noise.count == sample.count)
+        let sigma = sigmas[stepIndex]
+        let nextSigma = sigmas[stepIndex + 1]
+
+        var prevSample = [Float](repeating: 0, count: sample.count)
+        for i in 0..<sample.count {
+            let x0 = sample[i] - sigma * output[i]
+            prevSample[i] = (1 - nextSigma) * x0 + nextSigma * noise[i]
+        }
         counter += 1
         return prevSample
     }

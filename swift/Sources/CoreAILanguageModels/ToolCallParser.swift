@@ -23,9 +23,11 @@ public struct ToolCallParser: Sendable {
         case toolCall(id: String, name: String, argsJSON: String)
     }
 
-    public enum Format: Sendable {
+    public enum Format: Sendable, Equatable {
         case json
         case atem
+        /// Qwen3-Coder style: `<function=NAME><parameter=K>V</parameter>…</function>` inside the markers.
+        case xmlFunction
     }
 
     private let openMarker: String
@@ -100,9 +102,16 @@ public struct ToolCallParser: Sendable {
     private func parseToolCalls(from content: String) -> [Event] {
         switch format {
         case .json:
-            return parseJSONToolCalls(from: content)
+            // Qwen3-Coder shares Qwen3's `<tool_call>` markers, so it detects as `.json`.
+            // Try JSON first; only fall back to XML `<function=…>` if JSON yields no call.
+            // Attempting JSON first avoids misrouting a JSON call whose arg text contains
+            // `<function=`.
+            let jsonEvents = parseJSONToolCalls(from: content)
+            return jsonEvents.isEmpty ? parseXMLFunctionToolCalls(from: content) : jsonEvents
         case .atem:
             return parseATEMToolCalls(from: content)
+        case .xmlFunction:
+            return parseXMLFunctionToolCalls(from: content)
         }
     }
 
@@ -202,6 +211,66 @@ public struct ToolCallParser: Sendable {
         if let doubleVal = Double(trimmed), trimmed.contains(".") { return doubleVal }
         return trimmed
     }
+
+    // MARK: - XML Function Format (Qwen3-Coder)
+
+    /// Parse `<function=NAME><parameter=K>V</parameter>…</function>` blocks (Qwen3-Coder).
+    /// Values are coerced to bool/Int/Double/array/object so JSON-schema types survive.
+    private func parseXMLFunctionToolCalls(from xml: String) -> [Event] {
+        let fnPattern = "<function=([^>]+)>(.*?)</function>"
+        guard let fnRegex = try? NSRegularExpression(pattern: fnPattern, options: .dotMatchesLineSeparators)
+        else { return [] }
+
+        let nsString = xml as NSString
+        let matches = fnRegex.matches(in: xml, range: NSRange(location: 0, length: nsString.length))
+
+        return matches.compactMap { match -> Event? in
+            guard match.numberOfRanges >= 3 else { return nil }
+            let name = nsString.substring(with: match.range(at: 1)).trimmingCharacters(in: .whitespacesAndNewlines)
+            let body = nsString.substring(with: match.range(at: 2))
+            let argsJSON = jsonString(from: parseXMLFunctionParameters(from: body))
+            let callId = "call_\(UUID().uuidString.prefix(8).lowercased())"
+            return .toolCall(id: callId, name: name, argsJSON: argsJSON)
+        }
+    }
+
+    private func parseXMLFunctionParameters(from body: String) -> [String: Any] {
+        let paramPattern = "<parameter=([^>]+)>(.*?)</parameter>"
+        guard let paramRegex = try? NSRegularExpression(pattern: paramPattern, options: .dotMatchesLineSeparators)
+        else { return [:] }
+
+        let nsBody = body as NSString
+        let matches = paramRegex.matches(in: body, range: NSRange(location: 0, length: nsBody.length))
+
+        var result: [String: Any] = [:]
+        for match in matches where match.numberOfRanges >= 3 {
+            let key = nsBody.substring(with: match.range(at: 1)).trimmingCharacters(in: .whitespacesAndNewlines)
+            let value = nsBody.substring(with: match.range(at: 2))
+            result[key] = coerceXMLFunctionValue(value)
+        }
+        return result
+    }
+
+    /// Scalar coercion (bool/Int/Double/String) plus JSON array/object bodies for list/dict args.
+    private func coerceXMLFunctionValue(_ raw: String) -> Any {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix("[") || trimmed.hasPrefix("{"),
+            let data = trimmed.data(using: .utf8),
+            let json = try? JSONSerialization.jsonObject(with: data)
+        {
+            return json
+        }
+        return coerceATEMValue(trimmed)
+    }
+
+    /// Deterministic JSON object string (sorted keys) from coerced args.
+    private func jsonString(from dict: [String: Any]) -> String {
+        guard !dict.isEmpty,
+            let data = try? JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys]),
+            let str = String(data: data, encoding: .utf8)
+        else { return "{}" }
+        return str
+    }
 }
 
 // MARK: - Tool Call Marker Detection
@@ -210,6 +279,65 @@ public struct ToolCallDetection: Sendable {
     public let openMarker: String
     public let closeMarker: String
     public let format: ToolCallParser.Format
+    /// Whether the chat template renders tools from a system message's `tools` key (e.g. Phi)
+    /// rather than the top-level `tools` variable (e.g. Qwen3).
+    public let toolsInSystemMessage: Bool
+
+    public init(
+        openMarker: String,
+        closeMarker: String,
+        format: ToolCallParser.Format,
+        toolsInSystemMessage: Bool = false
+    ) {
+        self.openMarker = openMarker
+        self.closeMarker = closeMarker
+        self.format = format
+        self.toolsInSystemMessage = toolsInSystemMessage
+    }
+}
+
+/// Injects the tools JSON into a system message for dialects whose chat template reads
+/// `message['tools']` (e.g. Phi). Attaches to an existing system message, else synthesizes a
+/// leading one. Gate the call on `toolsInSystemMessage` so top-level-`tools` families (e.g. Qwen3)
+/// are not perturbed by a synthetic system message.
+/// Serializes tool specs to a JSON string for the `applyToolsToSystemMessage` injection.
+/// Keys are sorted so the server and FM paths produce identical output.
+public func toolsJSONForSystemMessage(_ toolSpecs: [[String: any Sendable]]) -> String? {
+    guard
+        let data = try? JSONSerialization.data(withJSONObject: toolSpecs, options: [.sortedKeys]),
+        let json = String(data: data, encoding: .utf8)
+    else { return nil }
+    return json
+}
+
+public func applyToolsToSystemMessage(
+    _ messages: [[String: any Sendable]],
+    toolsJSON: String
+) -> [[String: any Sendable]] {
+    var out = messages
+    if let idx = out.firstIndex(where: { ($0["role"] as? String) == "system" }) {
+        out[idx]["tools"] = toolsJSON
+    } else {
+        // Content is empty by design: Phi's template renders a system message's tools as
+        // "<|system|>{content}<|tool|>{tools}<|/tool|>", so the tools carry the payload and the
+        // content adds nothing. Empty string (not nil) concatenates cleanly in the template.
+        out.insert(["role": "system", "content": "", "tools": toolsJSON], at: 0)
+    }
+    return out
+}
+
+/// Attaches tool specs to a system message when the detected dialect reads `message['tools']`
+/// (e.g. Phi). No-op when no specs, no detection, or the dialect uses top-level `tools` (e.g.
+/// Qwen3). Shared by the server (ChatHandler) and FM (CoreAILanguageModel) prompt-building paths.
+public func injectToolsIntoSystemMessageIfNeeded(
+    _ messages: [[String: any Sendable]],
+    toolSpecs: [[String: any Sendable]]?,
+    detection: ToolCallDetection?
+) -> [[String: any Sendable]] {
+    guard let toolSpecs, detection?.toolsInSystemMessage == true,
+        let toolsJSON = toolsJSONForSystemMessage(toolSpecs)
+    else { return messages }
+    return applyToolsToSystemMessage(messages, toolsJSON: toolsJSON)
 }
 
 /// Probes a tokenizer's vocabulary for known tool-call special tokens.
@@ -239,15 +367,20 @@ public func detectToolCallFormat(using tokenizer: any Tokenizer) -> ToolCallDete
         )
     }
 
-    let tagPairs: [(open: String, close: String)] = [
-        ("<tool_call>", "</tool_call>"),
-        ("<function_calls>", "</function_calls>"),
+    // `toolsInSystem`: Phi's template reads tools from the system message; other JSON dialects
+    // use the top-level `tools` variable.
+    let tagPairs: [(open: String, close: String, toolsInSystem: Bool)] = [
+        ("<tool_call>", "</tool_call>", false),
+        ("<|tool_call|>", "<|/tool_call|>", true),
+        ("<function_calls>", "</function_calls>", false),
     ]
     for pair in tagPairs
     where tokenizer.vocabContains(pair.open)
         && tokenizer.vocabContains(pair.close)
     {
-        return ToolCallDetection(openMarker: pair.open, closeMarker: pair.close, format: .json)
+        return ToolCallDetection(
+            openMarker: pair.open, closeMarker: pair.close, format: .json,
+            toolsInSystemMessage: pair.toolsInSystem)
     }
     if tokenizer.vocabContains("[TOOL_CALLS]") {
         return ToolCallDetection(openMarker: "[TOOL_CALLS]", closeMarker: "\n", format: .json)

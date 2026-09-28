@@ -36,6 +36,7 @@ DEFAULT_COMPRESSION_PRESET = "none"
 _MODULE_TYPE_EXCLUSIONS: dict[str, Any] = {
     "diffusers.models.normalization.RMSNorm": None,
     "transformers.models.qwen3.modeling_qwen3.Qwen3RMSNorm": None,
+    "transformers.models.gemma2.modeling_gemma2.Gemma2RMSNorm": None,
     "transformers.models.umt5.modeling_umt5.UMT5LayerNorm": None,
 }
 

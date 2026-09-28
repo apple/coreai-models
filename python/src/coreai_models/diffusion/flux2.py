@@ -126,7 +126,7 @@ class Flux2VAEEncoderWrapper(torch.nn.Module):
 
 # Reference tokens carry T=10 on RoPE axis 0 so the in-graph RoPE keeps them
 # positionally distinct from the noise grid even where H/W coincide. Mirrors
-# Flux2Pipeline.referenceTokenTimeOffset on the Swift side.
+# FlowTransformerPipeline.referenceTokenTimeOffset (FlowTransformerPipeline+Flux2.swift).
 REFERENCE_TOKEN_TIME_OFFSET = 10.0
 
 

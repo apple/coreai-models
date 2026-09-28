@@ -55,7 +55,7 @@ the `tracking` block records the checkpoint's heuristic thresholds.
 | Flag                   | Description                                  | Default                |
 |------------------------|----------------------------------------------|------------------------|
 | `--dtype`              | `float16` or `float32`                       | `float16`              |
-| `--image-size`         | Input resolution. Must match the checkpoint. | `1008`                 |
+| `--image-size`         | Input resolution: `336`, `672` or `1008`     | `1008`                 |
 | `--spatial-slots`      | Spatial memory slots per object              | `10`                   |
 | `--ptr-slots`          | Object-pointer slots per object              | `96`                   |
 | `--output-dir`         | Bundle destination                           | `<repo-root>/exports/` |
@@ -63,6 +63,18 @@ the `tracking` block records the checkpoint's heuristic thresholds.
 | `--overwrite`          | Replace an existing bundle                   | off                    |
 | `--include-debug-info` | Embed conversion debug info                  | off                    |
 | `--dry-run`            | Print the resolved config and exit           | off                    |
+
+### Resolution
+
+Modifying the input resolution can drastically reduce latency, but with an accuracy cost on
+smaller objects.
+
+```sh
+uv run models/sam3_video/export.py --image-size 336
+```
+
+Only **336, 672 and 1008** are accepted. The ViT grid must be a whole number of 24-patch
+attention windows, and with 14px patches, that means only multiples of 336 are valid.
 
 ### Multiple prompts
 
