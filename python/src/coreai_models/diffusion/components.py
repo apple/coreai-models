@@ -505,8 +505,7 @@ def get_component_registry(
     if pipeline_type == "sana_sprint":
         return SANA_SPRINT_COMPONENTS
     raise ValueError(
-        f"Unknown pipeline type: '{pipeline_type}'. "
-        "Supported: 'flux2', 'wan', 'sana_sprint'."
+        f"Unknown pipeline type: '{pipeline_type}'. Supported: 'flux2', 'wan', 'sana_sprint'."
     )
 
 
@@ -521,6 +520,5 @@ def get_valid_components(pipeline_type: str, multifunction: bool = False) -> lis
     if pipeline_type == "sana_sprint":
         return ALL_SANA_SPRINT_COMPONENTS
     raise ValueError(
-        f"Unknown pipeline type: '{pipeline_type}'. "
-        "Supported: 'flux2', 'wan', 'sana_sprint'."
+        f"Unknown pipeline type: '{pipeline_type}'. Supported: 'flux2', 'wan', 'sana_sprint'."
     )

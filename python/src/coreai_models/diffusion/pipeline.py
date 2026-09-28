@@ -224,8 +224,7 @@ def _load_hf_pipeline(model_id: str, pipeline_type: str, model_dtype: torch.dtyp
         return hf_pipe
 
     raise ValueError(
-        f"Unknown pipeline type: '{pipeline_type}'. "
-        "Supported: 'flux2', 'wan', 'sana_sprint'."
+        f"Unknown pipeline type: '{pipeline_type}'. Supported: 'flux2', 'wan', 'sana_sprint'."
     )
 
 
@@ -386,8 +385,7 @@ def _write_metadata_json(
         diffusion_config = _build_wan_config(hf_pipe, model_id, vae_tile_size=vae_tile_size)
     else:
         raise ValueError(
-            f"Unknown pipeline type: '{pipeline_type}'. "
-            "Supported: 'flux2', 'wan', 'sana_sprint'."
+            f"Unknown pipeline type: '{pipeline_type}'. Supported: 'flux2', 'wan', 'sana_sprint'."
         )
 
     json_path = output_path / "metadata.json"

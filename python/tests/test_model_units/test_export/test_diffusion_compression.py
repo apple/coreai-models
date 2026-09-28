@@ -200,9 +200,7 @@ def test_quant_weight_owner_returns_the_wrapped_model() -> None:
 def test_quant_weight_owner_is_shared_across_wrappers_of_one_module() -> None:
     """Two specs over one module resolve to the same owner, which is what dedup keys on."""
     inner = _TwoLinears()
-    assert quant_weight_owner(_ModelWrapper(inner)) is quant_weight_owner(
-        _ModelWrapper(inner)
-    )
+    assert quant_weight_owner(_ModelWrapper(inner)) is quant_weight_owner(_ModelWrapper(inner))
 
 
 def test_quant_weight_owner_names_the_offender_when_the_convention_is_broken() -> None:
