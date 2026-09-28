@@ -740,7 +740,6 @@ async def _async_export_video(config: VideoExportConfig) -> str:
 
     logger.info("Converting to Core AI...")
     coreai_program = converter.to_coreai()
-    coreai_program.optimize()
 
     metadata = build_aimodel_metadata(config.hf_model_id, component="video segmentation")
     coreai_program.save_asset(asset_path, metadata)
