@@ -599,3 +599,99 @@ class TestRingConcatOracleParity:
         # offset = 16 (two wraps), write_start = 0 so chunk_len <= window never wraps.
         diff = self._run(prefill_schedule=[8, 8], chunk_len=chunk_len, seed=4 + chunk_len)
         assert diff < 1e-5, f"chunk_len={chunk_len} diverges from oracle: {diff}"
+
+
+def _write_index_ancestry_targets(exported_program, write_dim_arg_name):
+    """Collect the call_function targets feeding a write node's begin index.
+
+    Walks the exported graph backwards from the node whose output name is
+    ``write_dim_arg_name`` (the ``begin`` bounds of the ring write) and returns
+    the set of op targets (as strings) that produce it, plus the set of
+    placeholder names it depends on.
+    """
+    name_to_node = {n.name: n for n in exported_program.graph.nodes}
+
+    def ancestors(name, seen):
+        if name in seen or name not in name_to_node:
+            return seen
+        seen.add(name)
+        for inp in name_to_node[name].all_input_nodes:
+            ancestors(inp.name, seen)
+        return seen
+
+    anc = ancestors(write_dim_arg_name, set())
+    targets = {str(name_to_node[a].target) for a in anc if name_to_node[a].op == "call_function"}
+    placeholders = {a for a in anc if name_to_node[a].op == "placeholder"}
+    return targets, placeholders
+
+
+class TestConcatWriteIndexIsShapeSymint:
+    """The ring write index must stay a shape symint, never a runtime data tensor.
+
+    The concat path derives its ring write column from ``offset % capacity`` where
+    ``offset = seq_len - query_len`` is a shape-derived symint. This must never
+    collapse into an index read out of tensor *data*: the underlying
+    slice_update kernel crashes on the GPU backend when its write column comes
+    from a runtime data tensor rather than from a shape symint. This test pins
+    that property on the exported graph so a future refactor cannot silently
+    reintroduce a data-dependent write index.
+    """
+
+    def _export_concat_update(self):
+        capacity, n_kv, head_dim, query_len = 8, 1, 4, 4
+
+        class _ConcatUpdate(torch.nn.Module):
+            def forward(self, k, v, k_cache, v_cache, position_ids):
+                seq_len = position_ids.shape[-1]
+                q_len = k.shape[-2]
+                torch._check_is_size(seq_len)
+                torch._check_is_size(q_len)
+                offset = seq_len - q_len  # shape symint, not a data value
+                torch._check_is_size(offset)
+                cache = RingKVCache(k_cache, v_cache)
+                full_k, full_v = cache.fetch_and_concat(0, k, v)
+                cache.update(0, offset, k, v, query_len=q_len)
+                return full_k + 0.0, full_v + 0.0
+
+        k = torch.zeros(1, n_kv, query_len, head_dim)
+        v = torch.zeros(1, n_kv, query_len, head_dim)
+        k_cache = torch.zeros(1, 1, n_kv, capacity, head_dim)
+        v_cache = torch.zeros(1, 1, n_kv, capacity, head_dim)
+        position_ids = torch.arange(6, dtype=torch.int32)[None]  # seq_len dynamic
+
+        seq = torch.export.Dim("seq", min=query_len, max=capacity * 4)
+        dynamic_shapes = {
+            "k": None,
+            "v": None,
+            "k_cache": None,
+            "v_cache": None,
+            "position_ids": {1: seq},
+        }
+        return torch.export.export(
+            _ConcatUpdate(),
+            (k, v, k_cache, v_cache, position_ids),
+            dynamic_shapes=dynamic_shapes,
+        )
+
+    def test_write_index_derives_from_shape_not_data(self):
+        exported = self._export_concat_update()
+
+        write_nodes = [n for n in exported.graph.nodes if "mutable_slice_update" in str(n.target)]
+        assert write_nodes, "concat path produced no ring write (mutable_slice_update)"
+
+        for node in write_nodes:
+            begin_arg = node.args[2]  # (x, update, begin, end)
+            targets, _ = _write_index_ancestry_targets(exported, begin_arg.name)
+
+            # Shape-derived: the write column traces back to a tensor shape query.
+            assert any("sym_size" in t for t in targets), (
+                "ring write index must be derived from a shape symint "
+                f"(no sym_size op in its ancestry: {sorted(targets)})"
+            )
+            # Not data-derived: nothing pulls a value out of a tensor to index with.
+            # A data-tensor write index makes the slice_update kernel crash.
+            data_ops = [t for t in targets if "_local_scalar_dense" in t or ".item" in t]
+            assert not data_ops, (
+                "ring write index must be a shape symint, not a runtime data "
+                f"tensor, or the slice_update kernel crashes; found {data_ops}"
+            )
