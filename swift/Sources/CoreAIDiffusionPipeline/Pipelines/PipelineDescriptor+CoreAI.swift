@@ -39,6 +39,18 @@ public enum PipelineLoadError: Error, LocalizedError {
     }
 }
 
+/// Resolves `path` against `directory` and verifies the asset exists on disk, throwing
+/// `PipelineLoadError.missingComponent` with the attempted filename if not — e.g. when a
+/// pipeline descriptor still names a source `.aimodel` that's since been compiled to
+/// `.aimodelc` without updating the descriptor.
+func resolveExistingPipelineAsset(_ path: String, in directory: URL, component: String) throws -> URL {
+    let url = directory.appendingPathComponent(path)
+    guard FileManager.default.fileExists(atPath: url.path) else {
+        throw PipelineLoadError.missingComponent("\(component) (expected \(url.lastPathComponent))")
+    }
+    return url
+}
+
 extension PipelineDescriptor {
     /// Load Core AI components from a model directory based on this descriptor.
     ///
@@ -52,20 +64,23 @@ extension PipelineDescriptor {
         guard let decoderPath = components.vaeDecoder else {
             throw PipelineLoadError.missingComponent("vae_decoder")
         }
+        guard let textEncoderPath = components.textEncoder else {
+            throw PipelineLoadError.missingComponent("text_encoder")
+        }
+
+        let unetURL = try resolveExistingPipelineAsset(unetPath, in: baseURL, component: "unet")
+        let decoderURL = try resolveExistingPipelineAsset(decoderPath, in: baseURL, component: "vae_decoder")
+        let textEncoderURL = try resolveExistingPipelineAsset(
+            textEncoderPath, in: baseURL, component: "text_encoder")
+        let encoderURL = try components.vaeEncoder.map {
+            try resolveExistingPipelineAsset($0, in: baseURL, component: "vae_encoder")
+        }
 
         // Create model functions
-        let unetFunction = CoreAIDiffusionModelFunction(
-            modelURL: ModelBundle.resolveAssetURL(unetPath, in: baseURL))
-        let decoderFunction = CoreAIDiffusionModelFunction(
-            modelURL: ModelBundle.resolveAssetURL(decoderPath, in: baseURL))
-
-        let encoderFunction: CoreAIDiffusionModelFunction?
-        if let encoderPath = components.vaeEncoder {
-            encoderFunction = CoreAIDiffusionModelFunction(
-                modelURL: ModelBundle.resolveAssetURL(encoderPath, in: baseURL))
-        } else {
-            encoderFunction = nil
-        }
+        let unetFunction = CoreAIDiffusionModelFunction(modelURL: unetURL)
+        let decoderFunction = CoreAIDiffusionModelFunction(modelURL: decoderURL)
+        let textEncoderFunction = CoreAIDiffusionModelFunction(modelURL: textEncoderURL)
+        let encoderFunction = encoderURL.map { CoreAIDiffusionModelFunction(modelURL: $0) }
 
         // Load UNet to inspect its descriptors
         try await unetFunction.loadResources()
@@ -106,15 +121,6 @@ extension PipelineDescriptor {
             tokenizer = try BPETokenizer(
                 mergesAt: tokenizerDir.appendingPathComponent("merges.txt"),
                 vocabularyAt: tokenizerDir.appendingPathComponent("vocab.json"))
-        }
-
-        // Build components
-        let textEncoderFunction: CoreAIDiffusionModelFunction
-        if let tePath = components.textEncoder {
-            textEncoderFunction = CoreAIDiffusionModelFunction(
-                modelURL: ModelBundle.resolveAssetURL(tePath, in: baseURL))
-        } else {
-            throw PipelineLoadError.missingComponent("text_encoder")
         }
 
         let textEncoderSeqLength = try await textEncoderFunction.inferSequenceLength() ?? 77

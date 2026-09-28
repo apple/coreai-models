@@ -87,9 +87,11 @@ public struct EngineFactory: Sendable {
         bundle: LanguageBundle,
         options: EngineOptions = EngineOptions()
     ) async throws -> any InferenceEngine {
+        try bundle.modelBundle.verifyAssetsExisting()
+
         let languageModelURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.main)
 
-        if bundle.bundle.kind == .vlm {
+        if bundle.modelBundle.kind == .vlm {
             return try await makeVLMEngine(
                 bundle: bundle, languageModelURL: languageModelURL, options: options)
         }

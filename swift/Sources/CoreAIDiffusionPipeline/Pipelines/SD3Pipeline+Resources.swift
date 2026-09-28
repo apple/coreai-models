@@ -29,14 +29,16 @@ extension SD3Pipeline {
             throw PipelineLoadError.missingComponent("vae_decoder")
         }
 
-        let transformer = CoreAIDiffusionModelFunction(
-            modelURL: ModelBundle.resolveAssetURL(transformerPath, in: url))
-        let textEncoder = CoreAIDiffusionModelFunction(
-            modelURL: ModelBundle.resolveAssetURL(textEncoderPath, in: url))
-        let textEncoder2 = CoreAIDiffusionModelFunction(
-            modelURL: ModelBundle.resolveAssetURL(textEncoder2Path, in: url))
-        let decoder = CoreAIDiffusionModelFunction(
-            modelURL: ModelBundle.resolveAssetURL(decoderPath, in: url))
+        let transformerURL = try resolveExistingPipelineAsset(transformerPath, in: url, component: "transformer")
+        let textEncoderURL = try resolveExistingPipelineAsset(textEncoderPath, in: url, component: "text_encoder")
+        let textEncoder2URL = try resolveExistingPipelineAsset(
+            textEncoder2Path, in: url, component: "text_encoder_2")
+        let decoderURL = try resolveExistingPipelineAsset(decoderPath, in: url, component: "vae_decoder")
+
+        let transformer = CoreAIDiffusionModelFunction(modelURL: transformerURL)
+        let textEncoder = CoreAIDiffusionModelFunction(modelURL: textEncoderURL)
+        let textEncoder2 = CoreAIDiffusionModelFunction(modelURL: textEncoder2URL)
+        let decoder = CoreAIDiffusionModelFunction(modelURL: decoderURL)
 
         let tokenizer = try Self.loadBPETokenizer(
             at: url.appendingPathComponent("tokenizer"))

@@ -144,8 +144,8 @@ struct LanguageBundleTests {
             }
             """)
         let bundle = try LanguageBundle(at: url)
-        #expect(bundle.bundle.userData?["exported_by"] == "ci")
-        #expect(bundle.bundle.userData?["git_sha"] == "abc1234")
-        #expect(bundle.bundle.userData?["tags"] == "gold,recommended")
+        #expect(bundle.modelBundle.userData?["exported_by"] == "ci")
+        #expect(bundle.modelBundle.userData?["git_sha"] == "abc1234")
+        #expect(bundle.modelBundle.userData?["tags"] == "gold,recommended")
     }
 }

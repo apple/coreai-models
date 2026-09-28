@@ -48,13 +48,15 @@ public struct ModelBundle: Sendable {
     }
 
     /// Resolve a component's URL within the bundle by role key.
-    /// Falls back to `.aimodelc` if the declared `.aimodel` path doesn't exist on disk.
     public func modelURL(for key: String) -> URL? {
         guard let path = assets[key] else { return nil }
-        return Self.resolveAssetURL(path, in: bundlePath)
+        return bundlePath.appending(path: path)
     }
 
-    /// Required-component variant — throws `BundleError.missingField` if absent.
+    /// Required-component variant — throws `BundleError.missingField` if absent from
+    /// `assets`. Does not check whether the resolved file exists on disk; callers that
+    /// need that guarantee should call `verifyAssetsExisting()` first (as `llm-runner`/
+    /// `llm-server` do).
     public func requireModelURL(for key: String) throws -> URL {
         guard let url = modelURL(for: key) else {
             throw BundleError.missingField("assets.\(key)")
@@ -62,28 +64,13 @@ public struct ModelBundle: Sendable {
         return url
     }
 
-    /// Resolve an asset path against a directory, falling back from `.aimodel` to `.aimodelc`.
-    ///
-    /// When `coreai-build compile` produces a compiled `.aimodelc` from a source `.aimodel`,
-    /// metadata.json still references the original name. This finds the compiled variant
-    /// so users don't need to hand-edit metadata.json after compilation.
-    public static func resolveAssetURL(_ path: String, in directory: URL) -> URL {
-        let url = directory.appending(path: path)
-        if FileManager.default.fileExists(atPath: url.path) { return url }
-        if path.hasSuffix(".aimodel") {
-            let compiled = directory.appending(path: path + "c")
-            if FileManager.default.fileExists(atPath: compiled.path) { return compiled }
-        }
-        return url
-    }
-
     /// Verify all declared assets exist on disk. Throws `BundleError.missingAsset`
     /// with guidance if a component is missing (e.g. after manual compilation).
-    public func verify() throws {
+    public func verifyAssetsExisting() throws {
         for (key, filename) in assets {
-            let url = Self.resolveAssetURL(filename, in: bundlePath)
+            let url = bundlePath.appending(path: filename)
             if !FileManager.default.fileExists(atPath: url.path) {
-                throw BundleError.missingAsset(key: key, path: url)
+                throw BundleError.missingAsset(key: key, url: url)
             }
         }
     }
@@ -96,7 +83,7 @@ public struct ModelBundle: Sendable {
         case unsupportedVersion(String)
         case kindMismatch(expected: BundleKind, got: BundleKind)
         case missingField(String)
-        case missingAsset(key: String, path: URL)
+        case missingAsset(key: String, url: URL)
         case pointedAtModelAsset(URL)
 
         public var description: String {
@@ -115,13 +102,8 @@ public struct ModelBundle: Sendable {
                 return "expected bundle kind \(expected), got \(got)"
             case .missingField(let name):
                 return "metadata is missing required field '\(name)'"
-            case .missingAsset(let key, let path):
-                return """
-                    Asset '\(key)' not found at \(path.path). \
-                    If you compiled this model with `xcrun coreai-build compile`, \
-                    update metadata.json "assets" to reference the compiled filename \
-                    (e.g. modelName.architectureName.aimodelc). See models/README.md#compiled-models
-                    """
+            case .missingAsset(let key, let url):
+                return "Asset '\(key)' of metadata.json in the bundle requires '\(url.lastPathComponent)', but not found"
             }
         }
 

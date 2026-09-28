@@ -121,7 +121,7 @@ extension FlowTransformerPipeline {
         }
 
         // Resolve compiled assets; report a missing text encoder up front.
-        let textEncoderURL = ModelBundle.resolveAssetURL(textEncoderPath, in: url)
+        let textEncoderURL = url.appendingPathComponent(textEncoderPath)
         guard FileManager.default.fileExists(atPath: textEncoderURL.path) else {
             throw PipelineLoadError.missingComponent("text_encoder")
         }
@@ -142,7 +142,7 @@ extension FlowTransformerPipeline {
         let encoder: CoreAIDiffusionModelFunction?
         if let name = encoderName {
             // Optional component: nil when absent so supportsImageToImage is accurate.
-            let encoderURL = ModelBundle.resolveAssetURL(name, in: url)
+            let encoderURL = url.appendingPathComponent(name)
             encoder =
                 FileManager.default.fileExists(atPath: encoderURL.path)
                 ? CoreAIDiffusionModelFunction(modelURL: encoderURL)
@@ -184,7 +184,7 @@ extension FlowTransformerPipeline {
         }
         func component(_ name: String, _ path: String?) throws -> CoreAIDiffusionModelFunction {
             guard let path else { throw PipelineLoadError.missingComponent(name) }
-            let assetURL = ModelBundle.resolveAssetURL(path, in: url)
+            let assetURL = url.appendingPathComponent(path)
             guard FileManager.default.fileExists(atPath: assetURL.path) else {
                 throw PipelineLoadError.missingComponent(name)
             }
@@ -204,11 +204,11 @@ extension FlowTransformerPipeline {
             batchNormEps: 0)
     }
 
-    /// Resolve an asset name to a filename, checking for .aimodel or .aimodelc.
+    /// Resolve an asset name to a filename, checking for .aimodel.
     private static func resolveAsset(at url: URL, name: String) -> String? {
-        let resolved = ModelBundle.resolveAssetURL("\(name).aimodel", in: url)
-        guard FileManager.default.fileExists(atPath: resolved.path) else { return nil }
-        return resolved.lastPathComponent
+        let candidate = url.appendingPathComponent("\(name).aimodel")
+        guard FileManager.default.fileExists(atPath: candidate.path) else { return nil }
+        return candidate.lastPathComponent
     }
 
     /// Probe available assets and pick the highest quality mode.

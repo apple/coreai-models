@@ -15,7 +15,7 @@ import Foundation
 /// The `tracking` block is optional and carries the `Sam3VideoConfig` thresholds. A bundle
 /// without it gets ``VideoSegmentationParameters``'s defaults.
 public struct VideoSegmenterBundle: Sendable {
-    public let bundle: ModelBundle
+    public let modelBundle: ModelBundle
     public let modelURL: URL
     public let tokenizerFolder: URL
     public let geometry: Geometry
@@ -47,7 +47,7 @@ public struct VideoSegmenterBundle: Sendable {
         guard bundle.kind == .videoSegmenter else {
             throw ModelBundle.BundleError.kindMismatch(expected: .videoSegmenter, got: bundle.kind)
         }
-        self.bundle = bundle
+        self.modelBundle = bundle
         self.modelURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.main)
         self.tokenizerFolder = bundle.bundlePath.appending(path: "tokenizer")
 
@@ -85,10 +85,10 @@ public struct VideoSegmenterBundle: Sendable {
     {
         let envelope: TrackingEnvelope
         do {
-            envelope = try JSONDecoder().decode(TrackingEnvelope.self, from: bundle.raw)
+            envelope = try JSONDecoder().decode(TrackingEnvelope.self, from: modelBundle.raw)
         } catch {
             throw VideoSegmentationError.invalidConfiguration(
-                "\(bundle.bundlePath.lastPathComponent)/metadata.json has a malformed 'tracking' "
+                "\(modelBundle.bundlePath.lastPathComponent)/metadata.json has a malformed 'tracking' "
                     + "block: \(error)")
         }
         guard let tracking = envelope.tracking else { return base }

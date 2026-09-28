@@ -121,7 +121,7 @@ struct LLMServer: AsyncParsableCommand {
         }
 
         let bundle = try LanguageBundle(from: url.path)
-        try bundle.bundle.verify()
+        try bundle.modelBundle.verifyAssetsExisting()
 
         if clearCoreAICache {
             let cleared = try PreparedModel.clearCache(at: bundle.bundlePath)

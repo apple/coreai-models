@@ -107,16 +107,14 @@ public struct WanPipeline: VideoPipeline {
         let tokenizerURL = url.appendingPathComponent("tokenizer")
         let tokenizer = try await AutoTokenizer.from(modelFolder: tokenizerURL)
 
+        let transformerURL = try Self.resolveExistingAsset("Transformer.aimodel", in: url, component: "transformer")
+        let textEncoderURL = try Self.resolveExistingAsset("TextEncoder.aimodel", in: url, component: "text_encoder")
+        let decoderURL = try Self.resolveExistingAsset("VAEDecoder.aimodel", in: url, component: "vae_decoder")
+
         self.init(
-            transformer: CoreAIDiffusionModelFunction(
-                modelURL: ModelBundle.resolveAssetURL("Transformer.aimodel", in: url)
-            ),
-            textEncoder: CoreAIDiffusionModelFunction(
-                modelURL: ModelBundle.resolveAssetURL("TextEncoder.aimodel", in: url)
-            ),
-            decoder: CoreAIDiffusionModelFunction(
-                modelURL: ModelBundle.resolveAssetURL("VAEDecoder.aimodel", in: url)
-            ),
+            transformer: CoreAIDiffusionModelFunction(modelURL: transformerURL),
+            textEncoder: CoreAIDiffusionModelFunction(modelURL: textEncoderURL),
+            decoder: CoreAIDiffusionModelFunction(modelURL: decoderURL),
             tokenizer: tokenizer,
             textDim: textDim,
             latentChannels: latentChannels,
@@ -126,6 +124,18 @@ public struct WanPipeline: VideoPipeline {
             defaultFrameCount: defaultFrameCount,
             lazyModelLoading: lazyModelLoading
         )
+    }
+
+    /// Resolves `name` against `url` and verifies the asset exists on disk, throwing
+    /// `WanError.invalidMetadata` with the attempted filename if not — e.g. when a
+    /// bundle still names a source `.aimodel` that's since been compiled to `.aimodelc`
+    /// without updating metadata.json.
+    private static func resolveExistingAsset(_ name: String, in url: URL, component: String) throws -> URL {
+        let resolved = url.appendingPathComponent(name)
+        guard FileManager.default.fileExists(atPath: resolved.path) else {
+            throw WanError.invalidMetadata("\(component) not found (expected \(resolved.lastPathComponent))")
+        }
+        return resolved
     }
 
     // MARK: - VideoPipeline
