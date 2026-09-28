@@ -19,7 +19,7 @@ extension GuidanceMode: ExpressibleByArgument {}
 struct DiffusionRunner: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "diffusion-runner",
-        abstract: "Generate images using CoreAI diffusion models"
+        abstract: "Generate images using Core AI diffusion models"
     )
 
     @Option(help: "Path to model directory containing .aimodel components (or pipeline.json)")
