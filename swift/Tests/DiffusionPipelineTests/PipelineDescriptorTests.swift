@@ -14,7 +14,6 @@ struct PipelineDescriptorTests {
     func loadFromJSON() throws {
         let json = """
             {
-                "type": "stable-diffusion",
                 "version": "1.5",
                 "prediction_type": "epsilon",
                 "image_size": 512,
@@ -39,7 +38,7 @@ struct PipelineDescriptorTests {
         defer { try? FileManager.default.removeItem(at: tmp) }
 
         let descriptor = try PipelineDescriptor.load(from: tmp)
-        #expect(descriptor.type == .stableDiffusion)
+        #expect(descriptor.type == nil)
         #expect(descriptor.version == "1.5")
         #expect(descriptor.predictionType == .epsilon)
         #expect(descriptor.imageSize == 512)
@@ -49,39 +48,6 @@ struct PipelineDescriptorTests {
         #expect(descriptor.components.vaeEncoder == "VAEEncoder.aimodel")
         #expect(descriptor.decoderScaleFactor == 0.18215)
         #expect(descriptor.scheduler?.trainingSteps == 1000)
-    }
-
-    @Test("Loads SD 2.1 v-prediction config")
-    func loadSD21() throws {
-        let json = """
-            {
-                "type": "stable-diffusion",
-                "version": "2.1",
-                "prediction_type": "v_prediction",
-                "image_size": 768,
-                "components": {
-                    "text_encoder": "TextEncoder.aimodel",
-                    "unet": "Unet.aimodel",
-                    "vae_decoder": "VAEDecoder.aimodel"
-                },
-                "scheduler": {
-                    "training_steps": 1000,
-                    "beta_start": 0.00085,
-                    "beta_end": 0.012,
-                    "beta_schedule": "scaled_linear"
-                },
-                "decoder_scale_factor": 0.18215
-            }
-            """
-
-        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("pipeline_21_\(UUID()).json")
-        try json.write(to: tmp, atomically: true, encoding: .utf8)
-        defer { try? FileManager.default.removeItem(at: tmp) }
-
-        let descriptor = try PipelineDescriptor.load(from: tmp)
-        #expect(descriptor.predictionType == .vPrediction)
-        #expect(descriptor.imageSize == 768)
-        #expect(descriptor.components.vaeEncoder == nil)
     }
 
     @Test("Minimal pipeline.json — only components required")
@@ -110,7 +76,7 @@ struct PipelineDescriptorTests {
 
     @Test("Auto-detects components from directory")
     func detectFromDirectory() throws {
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("sd_model_\(UUID())")
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("detect_model_\(UUID())")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
 
@@ -129,7 +95,7 @@ struct PipelineDescriptorTests {
 
     @Test("Auto-detects snake_case component names")
     func detectSnakeCase() throws {
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("sd_snake_\(UUID())")
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("detect_snake_\(UUID())")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
 
@@ -147,7 +113,7 @@ struct PipelineDescriptorTests {
 
     @Test("Detects transformer as unet component")
     func detectTransformer() throws {
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("sd3_\(UUID())")
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("transformer_\(UUID())")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
 
@@ -159,7 +125,7 @@ struct PipelineDescriptorTests {
 
     @Test("Resolve errors on legacy pipeline.json")
     func resolveRejectsLegacyPipelineJSON() throws {
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("sd_resolve_\(UUID())")
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("resolve_legacy_\(UUID())")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
 
@@ -209,7 +175,7 @@ struct PipelineDescriptorTests {
     @Test("Encodes to JSON with snake_case keys")
     func encodeToJSON() throws {
         let descriptor = PipelineDescriptor(
-            type: .stableDiffusion,
+            type: .flux2,
             predictionType: .epsilon,
             components: .init(textEncoder: "TE.aimodel", unet: "U.aimodel", vaeDecoder: "D.aimodel"),
             decoderScaleFactor: 0.18215

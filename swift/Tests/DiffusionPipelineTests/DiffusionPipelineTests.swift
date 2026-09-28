@@ -17,15 +17,13 @@ struct DiffusionPipelineTests {
         #expect(config.negativePrompt == "")
         #expect(config.stepCount == 50)
         #expect(config.guidanceScale == 7.5)
-        #expect(config.schedulerType == .dpmSolverMultistep)
+        #expect(config.schedulerType == .discreteFlow)
         #expect(!config.isImageToImage)
     }
 
     @Test("Scheduler type raw values match pipeline.json")
     func schedulerTypeRawValues() {
-        #expect(SchedulerType(rawValue: "dpmpp") == .dpmSolverMultistep)
         #expect(SchedulerType(rawValue: "flow_match_euler") == .discreteFlow)
-        #expect(SchedulerType(rawValue: "pndm") == .pndm)
     }
 
     @Test("Descriptors auto-load and throw on bad path")

@@ -7,7 +7,13 @@ import Foundation
 
 /// Supported scheduler algorithms.
 public enum SchedulerType: String, Sendable, CaseIterable {
-    case pndm
-    case dpmSolverMultistep = "dpmpp"
     case discreteFlow = "flow_match_euler"
+}
+
+/// What the model predicts at each denoising step.
+public enum PredictionType: String, Codable, Sendable {
+    case epsilon
+    case vPrediction = "v_prediction"
+    case flow
+    case flowMatching = "flow_matching"
 }

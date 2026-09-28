@@ -137,8 +137,8 @@ public struct PipelineDescriptor: Codable, Sendable {
     /// 2. `pipeline.json` (deprecated — prints migration warning)
     /// 3. Directory scan for known component filenames
     ///
-    /// Fields left nil by auto-detection are filled in later during `loadComponents(from:)`
-    /// by inspecting the actual model descriptors.
+    /// Fields left nil by auto-detection are filled in later during component
+    /// loading by inspecting the actual model descriptors.
     public static func resolve(at url: URL, config: ConfigSource = .auto) throws -> PipelineDescriptor {
         switch config {
         case .auto:
@@ -241,9 +241,6 @@ public struct PipelineDescriptor: Codable, Sendable {
     // MARK: - Nested Types
 
     public enum PipelineType: String, Codable, Sendable {
-        case stableDiffusion = "stable-diffusion"
-        case stableDiffusionXL = "stable-diffusion-xl"
-        case stableDiffusion3 = "stable-diffusion-3"
         case flux2 = "flux2"
         case sanaSprint = "sana-sprint"
     }
