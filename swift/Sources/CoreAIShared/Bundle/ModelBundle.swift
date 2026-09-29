@@ -103,7 +103,8 @@ public struct ModelBundle: Sendable {
             case .missingField(let name):
                 return "metadata is missing required field '\(name)'"
             case .missingAsset(let key, let url):
-                return "Asset '\(key)' of metadata.json in the bundle requires '\(url.lastPathComponent)', but not found"
+                return
+                    "Asset '\(key)' of metadata.json in the bundle requires '\(url.lastPathComponent)', but not found"
             }
         }
 

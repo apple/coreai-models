@@ -104,7 +104,9 @@ struct ModelBundleTests {
         #expect(String(describing: error).contains("model.aimodelc"))
     }
 
-    @Test("verifyAssetsExisting() throws missingAsset when the declared asset isn't on disk, even if a compiled variant is")
+    @Test(
+        "verifyAssetsExisting() throws missingAsset when the declared asset isn't on disk, even if a compiled variant is"
+    )
     func verifyThrowsOnMissingDeclaredAsset() throws {
         let url = try Self.tempBundle(
             """
