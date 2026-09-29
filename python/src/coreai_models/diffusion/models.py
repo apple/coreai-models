@@ -38,7 +38,7 @@ def get_pipeline_type(model_id: str) -> str:
     )
 
 
-# Pipeline types, derived from the single source of truth above (order-preserving, deduped).
+# Pipeline types derived from SUPPORTED_MODELS above (order-preserving, deduped).
 SUPPORTED_PIPELINE_TYPES: list[str] = list(dict.fromkeys(ptype for _, _, ptype in SUPPORTED_MODELS))
 
 

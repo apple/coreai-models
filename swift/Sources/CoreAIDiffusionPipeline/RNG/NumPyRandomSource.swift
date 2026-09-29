@@ -6,7 +6,6 @@
 import Foundation
 
 /// Matches NumPy's legacy RNG (`numpy.random.RandomState`).
-/// Used by Stable Diffusion 1.5 and 2.x models.
 public struct NumPyRandomSource: RandomNumberGenerator, RandomSource, Sendable {
     struct State {
         var key = [UInt32](repeating: 0, count: 624)
