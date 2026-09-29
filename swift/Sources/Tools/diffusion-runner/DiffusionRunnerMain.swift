@@ -141,7 +141,13 @@ struct DiffusionRunner: AsyncParsableCommand {
         let isFlowTransformer = resolvedDescriptor.type == .flux2 || resolvedDescriptor.type == .sanaSprint
 
         guard isFlowTransformer else {
-            print("Error: unsupported pipeline type \(resolvedDescriptor.type)")
+            if let type = resolvedDescriptor.type {
+                print("Error: unsupported pipeline type '\(type)'")
+            } else {
+                print(
+                    "Error: could not determine the pipeline type for this bundle. "
+                        + "Re-export with metadata.json (via `coreai.diffusion.export`) so the runner can detect it.")
+            }
             throw ExitCode.failure
         }
 
