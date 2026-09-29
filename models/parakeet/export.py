@@ -6,8 +6,8 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "coreai-core==1.0.0b2",
-#     "coreai-torch==0.4.1",
+#     "coreai-core==1.0.0b3",
+#     "coreai-torch==0.4.3",
 #     "transformers[audio]>=5.9.0,<5.10.1",
 # ]
 #
@@ -15,6 +15,9 @@
 # index-url       = "https://pypi.org/simple"
 # prerelease      = "allow"
 # index-strategy  = "unsafe-best-match"
+# override-dependencies = [
+#     "numpy>=2.3.0",
+# ]
 # ///
 import argparse
 import dataclasses
@@ -320,7 +323,6 @@ def _convert(
         output_names=output_names,
     )
     program = converter.to_coreai()
-    program.optimize()
     return program
 
 
