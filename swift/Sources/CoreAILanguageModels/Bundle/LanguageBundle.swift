@@ -18,7 +18,7 @@ import Tokenizers
 ///
 /// For lossy peeks see `extension ModelBundle { var language: LanguageBundle? }`.
 public struct LanguageBundle: Sendable {
-    public let bundle: ModelBundle
+    public let modelBundle: ModelBundle
     public let modelAssetPath: String
     public let language: LanguageConfig
     public let visionConfig: VisionConfig?
@@ -36,7 +36,7 @@ public struct LanguageBundle: Sendable {
         guard bundle.kind == .llm || bundle.kind == .vlm else {
             throw ModelBundle.BundleError.kindMismatch(expected: .llm, got: bundle.kind)
         }
-        self.bundle = bundle
+        self.modelBundle = bundle
         let payload = try JSONDecoder().decode(LanguagePayload.self, from: bundle.raw)
         guard let main = payload.assets.main else {
             throw ModelBundle.BundleError.missingField("assets.main")
@@ -55,25 +55,25 @@ public struct LanguageBundle: Sendable {
 
     // MARK: - Convenience accessors
 
-    public var name: String { bundle.name }
-    public var bundlePath: URL { bundle.bundlePath }
+    public var name: String { modelBundle.name }
+    public var bundlePath: URL { modelBundle.bundlePath }
     public var tokenizer: String { language.tokenizer }
     public var vocabSize: Int { language.vocabSize }
     public var maxContextLength: Int { language.maxContextLength }
 
     /// Raw metadata bytes for passing to engine config parsers.
-    public var rawMetadata: Data { bundle.raw }
+    public var rawMetadata: Data { modelBundle.raw }
 
     // MARK: - Component resolution (forwarded from ModelBundle)
 
-    public var componentKeys: [String] { bundle.componentKeys }
+    public var componentKeys: [String] { modelBundle.componentKeys }
 
     public func modelURL(for key: String) -> URL? {
-        bundle.modelURL(for: key)
+        modelBundle.modelURL(for: key)
     }
 
     public func requireModelURL(for key: String) throws -> URL {
-        try bundle.requireModelURL(for: key)
+        try modelBundle.requireModelURL(for: key)
     }
 
     // MARK: - Tokenizer

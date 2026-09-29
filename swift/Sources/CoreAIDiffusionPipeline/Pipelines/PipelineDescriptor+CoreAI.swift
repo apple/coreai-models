@@ -25,3 +25,15 @@ public enum PipelineLoadError: Error, LocalizedError {
         }
     }
 }
+
+/// Resolves `path` against `directory` and verifies the asset exists on disk, throwing
+/// `PipelineLoadError.missingComponent` with the attempted filename if not — e.g. when a
+/// pipeline descriptor still names a source `.aimodel` that's since been compiled to
+/// `.aimodelc` without updating the descriptor.
+func resolveExistingPipelineAsset(_ path: String, in directory: URL, component: String) throws -> URL {
+    let url = directory.appendingPathComponent(path)
+    guard FileManager.default.fileExists(atPath: url.path) else {
+        throw PipelineLoadError.missingComponent("\(component) (expected \(url.lastPathComponent))")
+    }
+    return url
+}

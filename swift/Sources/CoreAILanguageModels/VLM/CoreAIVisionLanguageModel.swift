@@ -39,7 +39,7 @@ public struct CoreAIVisionLanguageModel: LanguageModel {
     /// - Parameter url: URL to the bundle directory (`kind=vlm`).
     public init(resourcesAt url: URL) async throws {
         let bundle = try LanguageBundle(at: url)
-        guard bundle.bundle.kind == .vlm else {
+        guard bundle.modelBundle.kind == .vlm else {
             throw InferenceRuntimeError.invalidArgument(
                 "CoreAIVisionLanguageModel requires a VLM bundle (kind=vlm)")
         }

@@ -167,6 +167,7 @@ public struct ImageSegmenter {
         guard bundle.kind == .segmenter else {
             throw ModelBundle.BundleError.kindMismatch(expected: .segmenter, got: bundle.kind)
         }
+        try bundle.verifyAssetsExisting()
         let modelURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.main)
         let tokenizerFolder = bundle.bundlePath.appending(path: "tokenizer")
 

@@ -77,6 +77,7 @@ struct LLMBenchmark: AsyncParsableCommand {
         #endif
 
         let bundle = try LanguageBundle(from: model)
+        try bundle.modelBundle.verifyAssetsExisting()
         let vocabSize = bundle.vocabSize
 
         let modelURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.main)

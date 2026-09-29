@@ -63,6 +63,8 @@ public struct CoreAIRunner {
 
     /// Creates an inference engine using auto-detection.
     public func makeInferenceEngine() async throws -> any InferenceEngine {
+        try bundle.modelBundle.verifyAssetsExisting()
+
         let config = makeConfig()
         let configData = try JSONEncoder().encode(config)
 

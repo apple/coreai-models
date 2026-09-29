@@ -409,13 +409,13 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         }
 
         let bundle = try LanguageBundle(from: modelFile)
-        try bundle.bundle.verify()
+        try bundle.modelBundle.verifyAssetsExisting()
         let modelName = bundle.name
         let modelVocabSize = bundle.vocabSize
 
         // Resolve component model URLs once; reused for the cache check and model loading below.
         // An LLM bundle has only `main`; VLM bundles also have `vision` and `embedding`.
-        let isVLM = bundle.bundle.kind == .vlm
+        let isVLM = bundle.modelBundle.kind == .vlm
         let languageModelURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.main)
         let visionModelURL = isVLM ? try bundle.requireModelURL(for: ModelBundle.ComponentKey.vision) : nil
         let embeddingModelURL = isVLM ? try bundle.requireModelURL(for: ModelBundle.ComponentKey.embedding) : nil

@@ -168,6 +168,7 @@ struct ImageSegmenterCLI: AsyncParsableCommand {
         }
 
         let bundle = try ModelBundle(from: model)
+        try bundle.verifyAssetsExisting()
         let modelURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.main)
 
         if clearCoreAICache {
@@ -257,6 +258,7 @@ struct ImageSegmenterCLI: AsyncParsableCommand {
                 "Bundle at \(model) has kind \(bundle.kind.rawValue), expected segmenter"
             )
         }
+        try bundle.verifyAssetsExisting()
         let modelURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.main)
 
         let params = SegmentationParameters(maskThreshold: maskThreshold, maxSegments: maxSegments)
