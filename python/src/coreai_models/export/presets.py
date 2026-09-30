@@ -220,12 +220,8 @@ MACOS_PRESETS: dict[str, dict[str, Any]] = {
         "torch_quantization_config": {
             "execution_mode": "graph",
             "global_config": None,
-            "module_type_configs": _fp_module_type_configs(
-                _FP4_WEIGHT_SPEC, _FP8_ACTIVATION_SPEC
-            ),
-            "kv_cache_quant_configs": _create_per_tensor_symmetric_kv_cache_config(
-                "float8_e4m3fn"
-            ),
+            "module_type_configs": _fp_module_type_configs(_FP4_WEIGHT_SPEC, _FP8_ACTIVATION_SPEC),
+            "kv_cache_quant_configs": _create_per_tensor_symmetric_kv_cache_config("float8_e4m3fn"),
             "calibrate_activations": True,
         },
         "suffix": "fp4_weights_fp8_act_fp8_kv_cache",
@@ -241,12 +237,8 @@ MACOS_PRESETS: dict[str, dict[str, Any]] = {
         "torch_quantization_config": {
             "execution_mode": "graph",
             "global_config": None,
-            "module_type_configs": _fp_module_type_configs(
-                _FP8_WEIGHT_SPEC, _FP8_ACTIVATION_SPEC
-            ),
-            "kv_cache_quant_configs": _create_per_tensor_symmetric_kv_cache_config(
-                "float8_e4m3fn"
-            ),
+            "module_type_configs": _fp_module_type_configs(_FP8_WEIGHT_SPEC, _FP8_ACTIVATION_SPEC),
+            "kv_cache_quant_configs": _create_per_tensor_symmetric_kv_cache_config("float8_e4m3fn"),
             "calibrate_activations": True,
         },
         "suffix": "fp8_weights_fp8_act_fp8_kv_cache",
