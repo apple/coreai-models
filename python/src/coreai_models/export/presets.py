@@ -214,7 +214,8 @@ MACOS_PRESETS: dict[str, dict[str, Any]] = {
             "INT4 symmetric per-block weight quantization and INT8 per-tensor KV cache (graph mode)"
         ),
     },
-    # FP4 weights, FP8 activations/KV
+    # FP4 (e2m1) per-block weights + FP8 per-tensor
+    # activations into linear projections and FFN + FP8 per-tensor KV cache.
     "fp4_weights_fp8_activations_fp8_kv_cache": {
         "torch_quantization_config": {
             "execution_mode": "graph",
