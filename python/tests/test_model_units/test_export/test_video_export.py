@@ -41,7 +41,7 @@ IMAGE_SIZE = 112
 SPATIAL_SLOTS = 10
 PTR_SLOTS = 6
 
-#: Shared with the Swift runtime's `VideoSegmenterBundle metadata` suite, which drives the
+#: Shared with the Swift runtime's `VideoSegmentationBundle metadata` suite, which drives the
 #: same keys through `parameters()`. It is the one written-down list joining the field
 #: tuples below to Swift's `Tracking.CodingKeys`; the two are otherwise maintained
 #: independently and drift with no CI signal.

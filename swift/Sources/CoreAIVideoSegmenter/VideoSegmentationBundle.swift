@@ -14,7 +14,7 @@ import Foundation
 ///
 /// The `tracking` block is optional and carries the `Sam3VideoConfig` thresholds. A bundle
 /// without it gets ``VideoSegmentationParameters``'s defaults.
-public struct VideoSegmenterBundle: Sendable {
+public struct VideoSegmentationBundle: Sendable {
     public let modelBundle: ModelBundle
     public let modelURL: URL
     public let tokenizerFolder: URL
