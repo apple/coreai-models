@@ -214,6 +214,26 @@ MACOS_PRESETS: dict[str, dict[str, Any]] = {
             "INT4 symmetric per-block weight quantization and INT8 per-tensor KV cache (graph mode)"
         ),
     },
+    # FP4 weights, FP8 activations/KV
+    "fp4_weights_fp8_activations_fp8_kv_cache": {
+        "torch_quantization_config": {
+            "execution_mode": "graph",
+            "global_config": None,
+            "module_type_configs": _fp_module_type_configs(
+                _FP4_WEIGHT_SPEC, _FP8_ACTIVATION_SPEC
+            ),
+            "kv_cache_quant_configs": _create_per_tensor_symmetric_kv_cache_config(
+                "float8_e4m3fn"
+            ),
+            "calibrate_activations": True,
+        },
+        "suffix": "fp4_weights_fp8_act_fp8_kv_cache",
+        "description": (
+            "FP4 (e2m1) weights, FP8 per-tensor activations into "
+            "linear projections and FFN, and FP8 per-tensor KV cache. "
+            "SDPA, RoPE, and normalization stay in full precision."
+        ),
+    },
     # FP8 (e4m3) per-tensor weights + FP8 per-tensor
     # activations into linear projections and FFN + FP8 per-tensor KV cache.
     "fp8_weights_fp8_activations_fp8_kv_cache": {
@@ -233,26 +253,6 @@ MACOS_PRESETS: dict[str, dict[str, Any]] = {
             "FP8 (e4m3) per-tensor weights, FP8 per-tensor activations into linear "
             "projections and FFN, and FP8 per-tensor KV cache. SDPA, "
             "RoPE, and normalization stay in full precision."
-        ),
-    },
-    # FP4 weights, FP8 activations/KV
-    "fp4_weights_fp8_activations_fp8_kv_cache": {
-        "torch_quantization_config": {
-            "execution_mode": "graph",
-            "global_config": None,
-            "module_type_configs": _fp_module_type_configs(
-                _FP4_WEIGHT_SPEC, _FP8_ACTIVATION_SPEC
-            ),
-            "kv_cache_quant_configs": _create_per_tensor_symmetric_kv_cache_config(
-                "float8_e4m3fn"
-            ),
-            "calibrate_activations": True,
-        },
-        "suffix": "fp4_weights_fp8_act_fp8_kv_cache",
-        "description": (
-            "FP4 (e2m1) weights, FP8 per-tensor activations into "
-            "linear projections and FFN, and FP8 per-tensor KV cache. "
-            "SDPA, RoPE, and normalization stay in full precision."
         ),
     },
 }
