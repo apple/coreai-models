@@ -7,30 +7,7 @@ import CoreAIShared
 import CoreGraphics
 import Foundation
 
-/// High-level runner that combines tokenization, engine inference, and output decoding.
-///
-/// ```swift
-/// // Text-guided (SAM3):
-/// let runner = try ImageSegmenter(engine: sam3Engine, tokenizerFolder: url)
-/// let segments = try await runner.segment(image: cgImage, prompt: "cat")
-///
-/// // Single click (EfficientSAM):
-/// let runner = try ImageSegmenter(engine: efficientSamEngine)
-/// let pq = PointQuery(points: [.init(x: 320, y: 240)])
-/// let segments = try await runner.segment(image: cgImage, pointQuery: pq)
-///
-/// // Box prompt — one query with two points:
-/// let box = PointQuery(points: [
-///     .init(x: 100, y: 100, label: .boxTopLeft),
-///     .init(x: 400, y: 300, label: .boxBottomRight),
-/// ])
-///
-/// // Multiple independent prompts — Q queries, P points each:
-/// let multi = PointQuery(queries: [
-///     [.init(x: 100, y: 100)],
-///     [.init(x: 300, y: 300)],
-/// ])
-/// ```
+/// High-level runner that combines optional tokenization, engine inference, and output decoding.
 public struct ImageSegmenter {
     private let engine: CoreAISegmentationEngine
     private let tokenizer: CLIPTokenizer?
@@ -163,15 +140,9 @@ public struct ImageSegmenter {
     public init(resourcesAt path: String, parameters: SegmentationParameters = .default)
         async throws
     {
-        let bundle = try ModelBundle(from: path)
-        guard bundle.kind == .segmenter else {
-            throw ModelBundle.BundleError.kindMismatch(expected: .segmenter, got: bundle.kind)
-        }
-        try bundle.verifyAssetsExisting()
-        let modelURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.main)
-        let tokenizerFolder = bundle.bundlePath.appending(path: "tokenizer")
-
-        let engine = try await CoreAISegmentationEngine(parameters: parameters, modelURL: modelURL)
-        try self.init(engine: engine, tokenizerFolder: tokenizerFolder)
+        let bundle = try ImageSegmentationBundle(from: path)
+        let engine = try await CoreAISegmentationEngine(
+            parameters: parameters, modelURL: bundle.modelURL)
+        try self.init(engine: engine, tokenizerFolder: bundle.tokenizerFolder)
     }
 }

@@ -26,7 +26,7 @@ import Foundation
 /// ```
 @VideoSegmentationActor
 public final class VideoSegmenter: ResourceManaging {
-    private let bundle: VideoSegmenterBundle
+    private let bundle: VideoSegmentationBundle
     private let engine: VideoSegmentationEngine
     private let tokenizer: CLIPTokenizer
     public let parameters: VideoSegmentationParameters
@@ -55,7 +55,7 @@ public final class VideoSegmenter: ResourceManaging {
         parameters: VideoSegmentationParameters = .default,
         pinning: ((inout VideoSegmentationParameters) -> Void)? = nil
     ) async throws {
-        let bundle = try VideoSegmenterBundle(from: path)
+        let bundle = try VideoSegmentationBundle(from: path)
         try bundle.modelBundle.verifyAssetsExisting()
         self.bundle = bundle
         var resolved = try bundle.parameters(overriding: parameters)

@@ -167,13 +167,12 @@ struct ImageSegmenterCLI: AsyncParsableCommand {
             CLILogger.level = 1
         }
 
-        let bundle = try ModelBundle(from: model)
-        try bundle.verifyAssetsExisting()
-        let modelURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.main)
+        let bundle = try ImageSegmentationBundle(from: model)
+        let modelURL = bundle.modelURL
 
         if clearCoreAICache {
-            let cleared = try PreparedModel.clearCache(at: bundle.bundlePath)
-            print("🗑️  Cleared specialization cache for \(bundle.name) (\(cleared.count) component(s))")
+            let cleared = try PreparedModel.clearCache(at: bundle.modelBundle.bundlePath)
+            print("🗑️  Cleared specialization cache for \(bundle.modelBundle.name) (\(cleared.count) component(s))")
         }
 
         // Detect an existing cached specialization before loading so we can annotate the load time
@@ -248,18 +247,9 @@ struct ImageSegmenterCLI: AsyncParsableCommand {
             )
         }
 
-        // Load the bundle and resolve the main asset URL. Mirrors the
-        // ModelBundle path in ImageSegmenter+CoreAI.swift's convenience init —
-        // we construct the engine ourselves so we can capture raw model outputs
-        // before SegmentationPostprocessor collapses them into top-N segments.
-        let bundle = try ModelBundle(from: model)
-        guard bundle.kind == .segmenter else {
-            throw ValidationError(
-                "Bundle at \(model) has kind \(bundle.kind.rawValue), expected segmenter"
-            )
-        }
-        try bundle.verifyAssetsExisting()
-        let modelURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.main)
+        // Load the bundle and resolve the main asset URL.
+        let bundle = try ImageSegmentationBundle(from: model)
+        let modelURL = bundle.modelURL
 
         let params = SegmentationParameters(maskThreshold: maskThreshold, maxSegments: maxSegments)
         let engine = try await CoreAISegmentationEngine(parameters: params, modelURL: modelURL)
@@ -289,7 +279,7 @@ struct ImageSegmenterCLI: AsyncParsableCommand {
             std: params.normalizationStds,
             rescaleFactor: 1.0
         ).preprocessCHW(cgImage: cgImage)
-        let swiftTokens = try CLIPTokenizer(folder: bundle.bundlePath.appending(path: "tokenizer"))
+        let swiftTokens = try CLIPTokenizer(folder: bundle.tokenizerFolder)
             .encode(prompt, contextLength: params.tokenizerContextLength)
 
         // Feed the model Python's tokens (apples-to-apples model parity — Swift
