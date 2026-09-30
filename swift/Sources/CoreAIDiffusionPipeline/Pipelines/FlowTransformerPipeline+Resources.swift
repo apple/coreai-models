@@ -121,10 +121,8 @@ extension FlowTransformerPipeline {
         }
 
         // Resolve compiled assets; report a missing text encoder up front.
-        let textEncoderURL = url.appendingPathComponent(textEncoderPath)
-        guard FileManager.default.fileExists(atPath: textEncoderURL.path) else {
-            throw PipelineLoadError.missingComponent("text_encoder")
-        }
+        let textEncoderURL = try resolveExistingPipelineAsset(
+            textEncoderPath, in: url, component: "text_encoder")
         let textEncoder = CoreAIDiffusionModelFunction(modelURL: textEncoderURL)
         let decoder = CoreAIDiffusionModelFunction(
             modelURL: url.appendingPathComponent(decoderName))
@@ -184,10 +182,7 @@ extension FlowTransformerPipeline {
         }
         func component(_ name: String, _ path: String?) throws -> CoreAIDiffusionModelFunction {
             guard let path else { throw PipelineLoadError.missingComponent(name) }
-            let assetURL = url.appendingPathComponent(path)
-            guard FileManager.default.fileExists(atPath: assetURL.path) else {
-                throw PipelineLoadError.missingComponent(name)
-            }
+            let assetURL = try resolveExistingPipelineAsset(path, in: url, component: name)
             return CoreAIDiffusionModelFunction(modelURL: assetURL)
         }
 
