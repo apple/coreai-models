@@ -19,24 +19,24 @@ extension FlowTransformerPipeline {
     /// - `.tiled`: Transformer + VAEDecoder_half (1024×1024 via tiled decode)
     public init(
         from url: URL,
-        config: PipelineDescriptor.ConfigSource = .auto,
         mode: DecodeResolution = .auto
     ) async throws {
-        let descriptor = try PipelineDescriptor.resolve(at: url, config: config)
-        if descriptor.type == .sanaSprint {
-            self = try await Self.loadSanaSprint(from: url, descriptor: descriptor, mode: mode)
+        let bundle = try DiffusionBundle(at: url)
+        let config = bundle.config
+        if config.type == .sanaSprint {
+            self = try await Self.loadSanaSprint(from: url, bundle: bundle, mode: mode)
             return
         }
 
         // Resolve .auto → best available mode
         let resolvedMode: DecodeResolution
         if mode == .auto {
-            resolvedMode = try Self.bestAvailableMode(at: url, descriptor: descriptor)
+            resolvedMode = try Self.bestAvailableMode(at: url, bundle: bundle)
         } else {
             resolvedMode = mode
         }
 
-        guard let textEncoderPath = descriptor.components.textEncoder else {
+        guard let textEncoderPath = bundle.textEncoderFilename else {
             throw PipelineLoadError.missingComponent(DiffusionComponentKey.textEncoder)
         }
 
@@ -131,7 +131,7 @@ extension FlowTransformerPipeline {
         let encoderName: String?
         switch resolvedMode {
         case .full:
-            encoderName = descriptor.components.vaeEncoder
+            encoderName = bundle.vaeEncoderFilename
         case .half, .tiled:
             encoderName = Self.resolveAsset(at: url, name: AssetName.vaeEncoderHalf)
         case .auto:
@@ -156,9 +156,9 @@ extension FlowTransformerPipeline {
         // Load VAE batch norm statistics
         let bnMean = Self.loadNpyFloat32(url.appendingPathComponent("vae_bn_mean.npy"))
         let bnVar = Self.loadNpyFloat32(url.appendingPathComponent("vae_bn_var.npy"))
-        let bnEps = descriptor.batchNormEps ?? 1e-5
+        let bnEps = config.batchNormEps ?? DiffusionDefaults.Image.batchNormEps
 
-        self.descriptor = descriptor
+        self.config = config
         self.mode = resolvedMode
         self.transformer = transformer
         self.img2imgRoutes = img2imgRoutes
@@ -174,7 +174,7 @@ extension FlowTransformerPipeline {
 
     /// Sana Sprint bundles carry one transformer and one VAE decoder, both at full resolution.
     private static func loadSanaSprint(
-        from url: URL, descriptor: PipelineDescriptor, mode: DecodeResolution
+        from url: URL, bundle: DiffusionBundle, mode: DecodeResolution
     ) async throws -> Self {
         guard mode == .auto || mode == .full else {
             throw PipelineLoadError.unsupportedConfiguration(
@@ -187,11 +187,11 @@ extension FlowTransformerPipeline {
         }
 
         return Self(
-            descriptor: descriptor,
+            config: bundle.config,
             mode: .full,
-            transformer: try component(DiffusionComponentKey.transformer, descriptor.components.transformer),
-            textEncoder: try component(DiffusionComponentKey.textEncoder, descriptor.components.textEncoder),
-            decoder: try component(DiffusionComponentKey.vaeDecoder, descriptor.components.vaeDecoder),
+            transformer: try component(DiffusionComponentKey.transformer, bundle.transformerFilename),
+            textEncoder: try component(DiffusionComponentKey.textEncoder, bundle.textEncoderFilename),
+            decoder: try component(DiffusionComponentKey.vaeDecoder, bundle.vaeDecoderFilename),
             encoder: nil,
             tokenizer: try await AutoTokenizer.from(modelFolder: url.appendingPathComponent("tokenizer")),
             batchNormMean: nil,
@@ -218,10 +218,10 @@ extension FlowTransformerPipeline {
     /// Probe available assets and pick the highest quality mode.
     /// Priority: .full > .tiled > .half. Throws if no valid combination exists.
     private static func bestAvailableMode(
-        at url: URL, descriptor: PipelineDescriptor
+        at url: URL, bundle: DiffusionBundle
     ) throws -> DecodeResolution {
-        let hasFullTransformer = descriptor.components.transformer != nil
-        let hasFullDecoder = descriptor.components.vaeDecoder != nil
+        let hasFullTransformer = bundle.transformerFilename != nil
+        let hasFullDecoder = bundle.vaeDecoderFilename != nil
         let hasHalfDecoder = resolveAsset(at: url, name: AssetName.vaeDecoderHalf) != nil
         let hasHalfTransformer = resolveAsset(at: url, name: AssetName.transformer512) != nil
 

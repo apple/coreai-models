@@ -22,7 +22,7 @@ struct DiffusionRunner: AsyncParsableCommand {
         abstract: "Generate images using Core AI diffusion models"
     )
 
-    @Option(help: "Path to model directory containing .aimodel components (or pipeline.json)")
+    @Option(help: "Path to model directory containing .aimodel components")
     var model: String?
 
     @Option(help: "Text prompt for image generation")
@@ -42,9 +42,6 @@ struct DiffusionRunner: AsyncParsableCommand {
 
     @Option(help: "Output image path (default: output.png)")
     var output: String = "output.png"
-
-    @Option(name: .customLong("config"), help: "Path to pipeline.json (auto-detected if not specified)")
-    var configPath: String?
 
     @Option(help: "Path to input image for image-to-image generation")
     var inputImage: String?
@@ -129,20 +126,14 @@ struct DiffusionRunner: AsyncParsableCommand {
 
         print("Loading pipeline from: \(model)")
 
-        let configSource: PipelineDescriptor.ConfigSource
-        if let configPath {
-            configSource = .file(URL(fileURLWithPath: configPath))
-        } else {
-            configSource = .auto
-        }
-
         // Determine pipeline type and dispatch
-        let resolvedDescriptor = try PipelineDescriptor.resolve(at: bundleURL, config: configSource)
-        let isFlowTransformer = resolvedDescriptor.type == .flux2 || resolvedDescriptor.type == .sanaSprint
+        let bundle = try DiffusionBundle(at: bundleURL)
+        let diffusion = bundle.config
+        let isFlowTransformer = diffusion.type == .flux2 || diffusion.type == .sanaSprint
 
         guard isFlowTransformer else {
-            if let type = resolvedDescriptor.type {
-                print("Error: unsupported pipeline type '\(type)'")
+            if let type = diffusion.type {
+                print("Error: unsupported pipeline type '\(type.rawValue)'")
             } else {
                 print(
                     "Error: could not determine the pipeline type for this bundle. "
@@ -152,8 +143,9 @@ struct DiffusionRunner: AsyncParsableCommand {
         }
 
         let schedulerType: SchedulerType = .discreteFlow
-        let effectiveSteps = steps ?? resolvedDescriptor.defaultSteps ?? 20
-        let effectiveGuidance = guidanceScale ?? resolvedDescriptor.defaultGuidanceScale ?? 7.5
+        let effectiveSteps = steps ?? diffusion.defaultSteps ?? DiffusionDefaults.Runner.steps
+        let effectiveGuidance =
+            guidanceScale ?? diffusion.defaultGuidanceScale ?? DiffusionDefaults.Runner.guidanceScale
 
         var startingCGImage: CGImage? = nil
         if let imagePath = inputImage {
@@ -182,18 +174,18 @@ struct DiffusionRunner: AsyncParsableCommand {
             strength: strength,
             referenceGrid: referenceGrid ?? .full,
             guidanceMode: guidanceMode ?? .distilled,
-            encoderScaleFactor: resolvedDescriptor.encoderScaleFactor ?? 0.18215,
-            decoderScaleFactor: resolvedDescriptor.decoderScaleFactor ?? 0.18215,
-            decoderShiftFactor: resolvedDescriptor.decoderShiftFactor ?? 0.0,
+            encoderScaleFactor: diffusion.encoderScaleFactor ?? DiffusionDefaults.Image.scaleFactor,
+            decoderScaleFactor: diffusion.decoderScaleFactor ?? DiffusionDefaults.Image.scaleFactor,
+            decoderShiftFactor: diffusion.decoderShiftFactor ?? DiffusionDefaults.Image.decoderShiftFactor,
             decodeResolution: decodeResolution,
             lazyModelLoading: lazyModelLoading
         )
 
         if isFlowTransformer {
             let pipeline = try await FlowTransformerPipeline(
-                from: bundleURL, config: configSource, mode: decodeResolution)
+                from: bundleURL, mode: decodeResolution)
 
-            let family = resolvedDescriptor.type == .sanaSprint ? "Sana Sprint" : "FLUX.2"
+            let family = diffusion.type == .sanaSprint ? "Sana Sprint" : "FLUX.2"
             print("Generating (\(family)): \"\(prompt)\"")
             print("Steps: \(effectiveSteps), Guidance: \(effectiveGuidance), Seed: \(seed)")
             print("Image size: \(pipeline.defaultImageSize.width)x\(pipeline.defaultImageSize.height)")

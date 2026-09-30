@@ -30,13 +30,12 @@ extension DiffusionRunner {
     // MARK: - Flux2 Component Parity
 
     private func runFlux2ComponentParity(modelURL: URL, dataDir: URL) async throws {
-        let configSource: PipelineDescriptor.ConfigSource = configPath.map { .file(URL(fileURLWithPath: $0)) } ?? .auto
-        let descriptor = try PipelineDescriptor.resolve(at: modelURL, config: configSource)
+        let bundle = try DiffusionBundle(at: modelURL)
 
-        guard let teAsset = descriptor.components.textEncoder else {
+        guard let teAsset = bundle.textEncoderFilename else {
             throw PipelineLoadError.missingComponent("text_encoder")
         }
-        guard let vaeAsset = descriptor.components.vaeDecoder else {
+        guard let vaeAsset = bundle.vaeDecoderFilename else {
             throw PipelineLoadError.missingComponent("vae_decoder")
         }
 

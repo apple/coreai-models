@@ -70,7 +70,7 @@ public struct PipelineConfiguration: Hashable, Sendable {
     public var referenceGrid: ReferenceGrid
     public var guidanceMode: GuidanceMode
 
-    // VAE scale factors (from pipeline.json)
+    // VAE scale factors (from the metadata.json diffusion block)
     public var encoderScaleFactor: Float
     public var decoderScaleFactor: Float
     public var decoderShiftFactor: Float

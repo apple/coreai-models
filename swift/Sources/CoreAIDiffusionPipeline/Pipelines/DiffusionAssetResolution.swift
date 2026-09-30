@@ -9,7 +9,6 @@ import Foundation
 public enum PipelineLoadError: Error, LocalizedError {
     case missingComponent(String)
     case missingConfig(String)
-    case deprecatedFormat(String)
     case unsupportedConfiguration(String)
 
     public var errorDescription: String? {
@@ -18,8 +17,6 @@ public enum PipelineLoadError: Error, LocalizedError {
             return "Required component '\(name)' not found in model directory"
         case .missingConfig(let detail):
             return "Invalid bundle configuration: \(detail)"
-        case .deprecatedFormat(let message):
-            return message
         case .unsupportedConfiguration(let detail):
             return "Unsupported configuration: \(detail)"
         }

@@ -87,6 +87,7 @@ struct SanaSprintTests {
             {
                 "metadata_version": "0.2",
                 "kind": "diffusion",
+                "name": "sana-sprint-test",
                 "assets": {
                     "transformer": "Transformer.aimodel",
                     "text_encoder": "TextEncoder.aimodel",
@@ -109,7 +110,8 @@ struct SanaSprintTests {
             """
         try json.write(to: dir.appendingPathComponent("metadata.json"), atomically: true, encoding: .utf8)
 
-        let descriptor = try PipelineDescriptor.resolve(at: dir)
+        let bundle = try DiffusionBundle(at: dir)
+        let descriptor = bundle.config
         #expect(descriptor.type == .sanaSprint)
         #expect(descriptor.predictionType == .flowMatching)
         #expect(descriptor.decoderScaleFactor == 0.41407)
@@ -119,8 +121,8 @@ struct SanaSprintTests {
         #expect(descriptor.promptPrefix == "Prefix:\nUser Prompt: ")
         #expect(descriptor.textInputLength == 506)
         #expect(descriptor.textSequenceLength == 300)
-        #expect(descriptor.components.transformer == "Transformer.aimodel")
-        #expect(descriptor.components.textEncoder == "TextEncoder.aimodel")
-        #expect(descriptor.components.vaeDecoder == "VAEDecoder.aimodel")
+        #expect(bundle.transformerFilename == "Transformer.aimodel")
+        #expect(bundle.textEncoderFilename == "TextEncoder.aimodel")
+        #expect(bundle.vaeDecoderFilename == "VAEDecoder.aimodel")
     }
 }
