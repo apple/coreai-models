@@ -10,14 +10,14 @@ import Foundation
 /// `ModelBundle` parses only the common fields shared across every bundle kind.
 /// Kind-specific config blocks (`language`, `vlm`, `diffusion`, `segmenter`) are
 /// decoded by per-kind types in their respective runner modules
-/// (`LanguageBundle` in CoreAILanguageModels, etc.) using the preserved `raw`
+/// (`LanguageModelBundle` in CoreAILanguageModels, etc.) using the preserved `raw`
 /// JSON.
 ///
 /// Two access patterns:
 /// - **Inspection**: `let bundle = try ModelBundle(at: url)` then
 ///   `bundle.language?.tokenizer` (extension property in CoreAILanguageModels).
 ///   Lossy — returns `nil` for kind mismatch or malformed payload.
-/// - **Strict load**: `let lang = try LanguageBundle(at: url)`. Throws on
+/// - **Strict load**: `let lang = try LanguageModelBundle(at: url)`. Throws on
 ///   kind mismatch / missing required fields. Use when the caller has
 ///   committed to a specific kind.
 public struct ModelBundle: Sendable {

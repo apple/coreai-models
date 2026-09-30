@@ -120,7 +120,7 @@ struct LLMServer: AsyncParsableCommand {
             throw ExitCode.failure
         }
 
-        let bundle = try LanguageBundle(from: url.path)
+        let bundle = try LanguageModelBundle(from: url.path)
         try bundle.modelBundle.verifyAssetsExisting()
 
         if clearCoreAICache {

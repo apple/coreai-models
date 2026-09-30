@@ -52,7 +52,7 @@ struct EngineFactoryVLMTests {
     @Test("makeVLMConfig assembles base + vision from a VLM bundle")
     func assemblesConfig() throws {
         let url = try Self.tempBundle(Self.vlmMetadata)
-        let bundle = try LanguageBundle(at: url)
+        let bundle = try LanguageModelBundle(at: url)
         let mainURL = try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.main)
 
         let config = try EngineFactory.makeVLMConfig(
@@ -73,7 +73,7 @@ struct EngineFactoryVLMTests {
     @Test("makeVLMConfig applies chunking overrides to the base config")
     func appliesChunkingOverrides() throws {
         let url = try Self.tempBundle(Self.vlmMetadata)
-        let bundle = try LanguageBundle(at: url)
+        let bundle = try LanguageModelBundle(at: url)
         let mainURL = try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.main)
 
         let options = EngineOptions(prefillChunkSize: 128, prefillChunkThreshold: 256)

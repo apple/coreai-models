@@ -76,7 +76,7 @@ struct EngineSupportTests {
     func perLayerEmbeddingsResolvesFromAssets() throws {
         let url = try Self.bundle(
             metadata: Self.gemmaMetadata(), files: ["model_ple.safetensors"])
-        let resolved = try LanguageBundle(at: url).tensorData
+        let resolved = try LanguageModelBundle(at: url).tensorData
 
         let key = EngineOptions.TensorDataKey.perLayerEmbeddings
         #expect(resolved[key]?.lastPathComponent == "model_ple.safetensors")
@@ -85,7 +85,7 @@ struct EngineSupportTests {
     @Test("A bundle that ships no sidecar reports none")
     func noSidecarReportsEmpty() throws {
         let url = try Self.bundle(metadata: Self.gemmaMetadata(assets: #""main": "model.aimodel""#))
-        let resolved = try LanguageBundle(at: url).tensorData
+        let resolved = try LanguageModelBundle(at: url).tensorData
 
         // Absent rather than present-and-missing: the static engine distinguishes
         // the two, and reports "bundle ships no PLE table" rather than failing to
@@ -99,7 +99,7 @@ struct EngineSupportTests {
     func engineFacingConfigIsCarried() throws {
         let url = try Self.bundle(
             metadata: Self.gemmaMetadata(), files: ["model_ple.safetensors"])
-        let bundle = try LanguageBundle(at: url)
+        let bundle = try LanguageModelBundle(at: url)
 
         // Every field here drives a handler the static engine attaches.
         let overrides = try #require(bundle.overrides)
@@ -126,7 +126,7 @@ struct EngineSupportTests {
                   }
                 }
                 """)
-        let bundle = try LanguageBundle(at: url)
+        let bundle = try LanguageModelBundle(at: url)
 
         #expect(bundle.overrides == nil)
         #expect(bundle.tensorData.isEmpty)

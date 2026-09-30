@@ -43,7 +43,7 @@ public struct CoreAILanguageModel: LanguageModel {
     private let prefillChunkSizeConfig: Int?
     private let prefillChunkThresholdConfig: Int?
     fileprivate let samplingConfig: SamplingConfiguration
-    fileprivate let bundle: LanguageBundle
+    fileprivate let bundle: LanguageModelBundle
     fileprivate let tokenizer: any Tokenizer
     fileprivate let thinkingFormat: ThinkTagParser.Format
     fileprivate let toolCallDetection: ToolCallDetection?
@@ -110,7 +110,7 @@ public struct CoreAILanguageModel: LanguageModel {
         prefillChunkSize: Int? = nil,
         prefillChunkThreshold: Int? = nil
     ) async throws {
-        let bundle = try LanguageBundle(at: url)
+        let bundle = try LanguageModelBundle(at: url)
         let configuration = CoreAIExecutor.Configuration(
             url: url,
             variant: variant,
@@ -139,7 +139,7 @@ public struct CoreAILanguageModel: LanguageModel {
 
     private init(
         configuration: CoreAIExecutor.Configuration,
-        bundle: LanguageBundle,
+        bundle: LanguageModelBundle,
         tokenizer: any Tokenizer,
         resources: ModelResources
     ) {

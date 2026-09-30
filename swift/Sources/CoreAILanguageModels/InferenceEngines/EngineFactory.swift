@@ -84,7 +84,7 @@ public struct EngineFactory: Sendable {
     ///     already-resolved config.
     /// - Returns: A configured inference engine.
     public static func createEngine(
-        bundle: LanguageBundle,
+        bundle: LanguageModelBundle,
         options: EngineOptions = EngineOptions()
     ) async throws -> any InferenceEngine {
         try bundle.modelBundle.verifyAssetsExisting()
@@ -118,7 +118,7 @@ public struct EngineFactory: Sendable {
     /// Applies chunking overrides for the VLM path the same way `selectEngine` does for the text
     /// path. Split out from `makeVLMEngine` so the config assembly can be unit-tested on its own.
     static func makeVLMConfig(
-        bundle: LanguageBundle,
+        bundle: LanguageModelBundle,
         languageModelURL: URL,
         options: EngineOptions
     ) throws -> VLMModelConfig {
@@ -145,7 +145,7 @@ public struct EngineFactory: Sendable {
     /// construct the engine. Components are prepared one at a time to keep Core AI specialization
     /// stable.
     private static func makeVLMEngine(
-        bundle: LanguageBundle,
+        bundle: LanguageModelBundle,
         languageModelURL: URL,
         options: EngineOptions
     ) async throws -> any InferenceEngine {

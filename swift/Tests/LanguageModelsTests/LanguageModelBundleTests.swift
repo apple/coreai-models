@@ -9,11 +9,11 @@ import Testing
 @testable import CoreAILanguageModels
 @testable import CoreAIShared
 
-@Suite("LanguageBundle")
-struct LanguageBundleTests {
+@Suite("LanguageModelBundle")
+struct LanguageModelBundleTests {
     private static func tempBundle(_ metadata: String, named name: String = "test") throws -> URL {
         let dir = FileManager.default.temporaryDirectory.appending(
-            path: "LanguageBundleTests-\(UUID().uuidString)/\(name)"
+            path: "LanguageModelBundleTests-\(UUID().uuidString)/\(name)"
         )
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         try metadata.write(
@@ -40,7 +40,7 @@ struct LanguageBundleTests {
               }
             }
             """)
-        let bundle = try LanguageBundle(at: url)
+        let bundle = try LanguageModelBundle(at: url)
         #expect(bundle.tokenizer == "Qwen/Qwen3-0.6B")
         #expect(bundle.vocabSize == 151936)
         #expect(bundle.maxContextLength == 8192)
@@ -66,7 +66,7 @@ struct LanguageBundleTests {
             }
             """)
         #expect(throws: ModelBundle.BundleError.self) {
-            _ = try LanguageBundle(at: url)
+            _ = try LanguageModelBundle(at: url)
         }
     }
 
@@ -83,7 +83,7 @@ struct LanguageBundleTests {
             """)
         let bundle = try ModelBundle(at: url)
         #expect(throws: ModelBundle.BundleError.self) {
-            _ = try LanguageBundle(bundle: bundle)
+            _ = try LanguageModelBundle(bundle: bundle)
         }
     }
 
@@ -118,7 +118,7 @@ struct LanguageBundleTests {
               }
             }
             """)
-        let bundle = try LanguageBundle(at: url)
+        let bundle = try LanguageModelBundle(at: url)
         #expect(bundle.language.functionMap == nil)
     }
 
@@ -143,7 +143,7 @@ struct LanguageBundleTests {
               }
             }
             """)
-        let bundle = try LanguageBundle(at: url)
+        let bundle = try LanguageModelBundle(at: url)
         #expect(bundle.modelBundle.userData?["exported_by"] == "ci")
         #expect(bundle.modelBundle.userData?["git_sha"] == "abc1234")
         #expect(bundle.modelBundle.userData?["tags"] == "gold,recommended")

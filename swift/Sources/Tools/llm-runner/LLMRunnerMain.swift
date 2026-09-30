@@ -408,7 +408,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             }
         }
 
-        let bundle = try LanguageBundle(from: modelFile)
+        let bundle = try LanguageModelBundle(from: modelFile)
         try bundle.modelBundle.verifyAssetsExisting()
         let modelName = bundle.name
         let modelVocabSize = bundle.vocabSize
@@ -951,7 +951,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     private func runVLMInference(
         imagePath: String,
         inferenceEngine: any InferenceEngine,
-        bundle: LanguageBundle,
+        bundle: LanguageModelBundle,
         tokenizer: any Tokenizer,
         samplingConfiguration: SamplingConfiguration,
         maxTokens: Int,
@@ -1017,7 +1017,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     private func runVLMVideoInference(
         videoPath: String,
         inferenceEngine: any InferenceEngine,
-        bundle: LanguageBundle,
+        bundle: LanguageModelBundle,
         tokenizer: any Tokenizer,
         samplingConfiguration: SamplingConfiguration,
         maxTokens: Int,

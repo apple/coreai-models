@@ -6,7 +6,7 @@
 /// Top-level model categories the runner ecosystem knows about.
 ///
 /// The bundle's `kind` selects which kind-specific config block (and which
-/// kind-specific Swift type — `LanguageBundle`, `DiffusionBundle`, etc.) is
+/// kind-specific Swift type — `LanguageModelBundle`, `DiffusionBundle`, etc.) is
 /// expected on top of the common `ModelBundle`.
 public enum BundleKind: String, Codable, Sendable, CaseIterable {
     case llm

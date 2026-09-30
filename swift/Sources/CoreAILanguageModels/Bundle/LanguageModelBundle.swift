@@ -13,11 +13,11 @@ import Tokenizers
 /// vocab, context, optional `function_map`) and the model asset path.
 ///
 /// Two strict-load constructors:
-/// - `LanguageBundle(at: url)` — read metadata.json, throws if not LLM
-/// - `LanguageBundle(bundle: existing)` — upgrade an inspected `ModelBundle`
+/// - `LanguageModelBundle(at: url)` — read metadata.json, throws if not LLM
+/// - `LanguageModelBundle(bundle: existing)` — upgrade an inspected `ModelBundle`
 ///
-/// For lossy peeks see `extension ModelBundle { var language: LanguageBundle? }`.
-public struct LanguageBundle: Sendable {
+/// For lossy peeks see `extension ModelBundle { var language: LanguageModelBundle? }`.
+public struct LanguageModelBundle: Sendable {
     public let modelBundle: ModelBundle
     public let modelAssetPath: String
     public let language: LanguageConfig
@@ -102,7 +102,7 @@ public struct LanguageBundle: Sendable {
 
 // MARK: - 0.2 payload shape
 
-extension LanguageBundle {
+extension LanguageModelBundle {
     fileprivate struct LanguagePayload: Decodable {
         let assets: Assets
         let language: LanguageConfig?

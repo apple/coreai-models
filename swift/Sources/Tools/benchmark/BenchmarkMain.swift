@@ -76,7 +76,7 @@ struct LLMBenchmark: AsyncParsableCommand {
         print("Note: built in Debug mode. For more reliable results, build with -c release.")
         #endif
 
-        let bundle = try LanguageBundle(from: model)
+        let bundle = try LanguageModelBundle(from: model)
         try bundle.modelBundle.verifyAssetsExisting()
         let vocabSize = bundle.vocabSize
 

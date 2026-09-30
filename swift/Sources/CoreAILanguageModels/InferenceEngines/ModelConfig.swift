@@ -108,7 +108,7 @@ public struct ModelConfig: InferenceConfiguration, Codable, Sendable {
 
     /// The engine config for a bundle's language model: identity and sizes from the
     /// bundle's `language` metadata, its `main` asset and function, and its overrides.
-    public init(bundle: LanguageBundle, source: ModelSource? = nil) {
+    public init(bundle: LanguageModelBundle, source: ModelSource? = nil) {
         self.init(
             name: bundle.name,
             tokenizer: bundle.tokenizer,

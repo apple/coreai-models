@@ -19,7 +19,7 @@ import Tokenizers
 public struct CoreAIRunner {
     // MARK: - Properties
 
-    private let bundle: LanguageBundle
+    private let bundle: LanguageModelBundle
     private let engineVariant: String?
     private let kvCacheStrategy: KVCacheStrategy
     private let prefillChunkSizeOverride: Int?
@@ -36,7 +36,7 @@ public struct CoreAIRunner {
         prefillChunkThreshold: Int? = nil
     ) throws {
         self.init(
-            bundle: try LanguageBundle(at: url),
+            bundle: try LanguageModelBundle(at: url),
             variant: variant,
             kvCacheStrategy: kvCacheStrategy,
             prefillChunkSize: prefillChunkSize,
@@ -44,9 +44,9 @@ public struct CoreAIRunner {
         )
     }
 
-    /// Creates a runner from a LanguageBundle.
+    /// Creates a runner from a LanguageModelBundle.
     public init(
-        bundle: LanguageBundle,
+        bundle: LanguageModelBundle,
         variant: String? = nil,
         kvCacheStrategy: KVCacheStrategy = .auto,
         prefillChunkSize: Int? = nil,
