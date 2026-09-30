@@ -19,7 +19,7 @@ struct PipelineDescriptorTests {
                 "image_size": 512,
                 "components": {
                     "text_encoder": "TextEncoder.aimodel",
-                    "unet": "Unet.aimodel",
+                    "transformer": "Transformer.aimodel",
                     "vae_decoder": "VAEDecoder.aimodel",
                     "vae_encoder": "VAEEncoder.aimodel"
                 },
@@ -43,7 +43,7 @@ struct PipelineDescriptorTests {
         #expect(descriptor.predictionType == .epsilon)
         #expect(descriptor.imageSize == 512)
         #expect(descriptor.components.textEncoder == "TextEncoder.aimodel")
-        #expect(descriptor.components.unet == "Unet.aimodel")
+        #expect(descriptor.components.transformer == "Transformer.aimodel")
         #expect(descriptor.components.vaeDecoder == "VAEDecoder.aimodel")
         #expect(descriptor.components.vaeEncoder == "VAEEncoder.aimodel")
         #expect(descriptor.decoderScaleFactor == 0.18215)
@@ -55,7 +55,7 @@ struct PipelineDescriptorTests {
         let json = """
             {
                 "components": {
-                    "unet": "Unet.aimodel",
+                    "transformer": "Transformer.aimodel",
                     "vae_decoder": "VAEDecoder.aimodel"
                 }
             }
@@ -70,7 +70,7 @@ struct PipelineDescriptorTests {
         #expect(descriptor.version == nil)
         #expect(descriptor.predictionType == nil)
         #expect(descriptor.imageSize == nil)
-        #expect(descriptor.components.unet == "Unet.aimodel")
+        #expect(descriptor.components.transformer == "Transformer.aimodel")
         #expect(descriptor.components.vaeDecoder == "VAEDecoder.aimodel")
     }
 
@@ -81,12 +81,12 @@ struct PipelineDescriptorTests {
         defer { try? FileManager.default.removeItem(at: dir) }
 
         try "".write(to: dir.appendingPathComponent("TextEncoder.aimodel"), atomically: true, encoding: .utf8)
-        try "".write(to: dir.appendingPathComponent("Unet.aimodel"), atomically: true, encoding: .utf8)
+        try "".write(to: dir.appendingPathComponent("Transformer.aimodel"), atomically: true, encoding: .utf8)
         try "".write(to: dir.appendingPathComponent("VAEDecoder.aimodel"), atomically: true, encoding: .utf8)
 
         let descriptor = PipelineDescriptor.detect(at: dir)
         #expect(descriptor.components.textEncoder == "TextEncoder.aimodel")
-        #expect(descriptor.components.unet == "Unet.aimodel")
+        #expect(descriptor.components.transformer == "Transformer.aimodel")
         #expect(descriptor.components.vaeDecoder == "VAEDecoder.aimodel")
         #expect(descriptor.components.vaeEncoder == nil)
         #expect(descriptor.type == nil)
@@ -100,18 +100,18 @@ struct PipelineDescriptorTests {
         defer { try? FileManager.default.removeItem(at: dir) }
 
         try "".write(to: dir.appendingPathComponent("text_encoder.aimodel"), atomically: true, encoding: .utf8)
-        try "".write(to: dir.appendingPathComponent("unet.aimodel"), atomically: true, encoding: .utf8)
+        try "".write(to: dir.appendingPathComponent("transformer.aimodel"), atomically: true, encoding: .utf8)
         try "".write(to: dir.appendingPathComponent("vae_decoder.aimodel"), atomically: true, encoding: .utf8)
         try "".write(to: dir.appendingPathComponent("vae_encoder.aimodel"), atomically: true, encoding: .utf8)
 
         let descriptor = PipelineDescriptor.detect(at: dir)
         #expect(descriptor.components.textEncoder == "text_encoder.aimodel")
-        #expect(descriptor.components.unet == "unet.aimodel")
+        #expect(descriptor.components.transformer == "transformer.aimodel")
         #expect(descriptor.components.vaeDecoder == "vae_decoder.aimodel")
         #expect(descriptor.components.vaeEncoder == "vae_encoder.aimodel")
     }
 
-    @Test("Detects transformer as unet component")
+    @Test("Detects transformer component")
     func detectTransformer() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("transformer_\(UUID())")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -120,7 +120,7 @@ struct PipelineDescriptorTests {
         try "".write(to: dir.appendingPathComponent("Transformer.aimodel"), atomically: true, encoding: .utf8)
 
         let descriptor = PipelineDescriptor.detect(at: dir)
-        #expect(descriptor.components.unet == "Transformer.aimodel")
+        #expect(descriptor.components.transformer == "Transformer.aimodel")
     }
 
     @Test("Resolve errors on legacy pipeline.json")
@@ -169,7 +169,7 @@ struct PipelineDescriptorTests {
         #expect(descriptor.predictionType == nil)
         #expect(descriptor.imageSize == nil)
         #expect(descriptor.decoderScaleFactor == nil)
-        #expect(descriptor.components.unet == nil)
+        #expect(descriptor.components.transformer == nil)
     }
 
     @Test("Encodes to JSON with snake_case keys")
@@ -177,7 +177,7 @@ struct PipelineDescriptorTests {
         let descriptor = PipelineDescriptor(
             type: .flux2,
             predictionType: .epsilon,
-            components: .init(textEncoder: "TE.aimodel", unet: "U.aimodel", vaeDecoder: "D.aimodel"),
+            components: .init(textEncoder: "TE.aimodel", transformer: "U.aimodel", vaeDecoder: "D.aimodel"),
             decoderScaleFactor: 0.18215
         )
         let encoder = JSONEncoder()

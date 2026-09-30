@@ -180,11 +180,10 @@ public struct PipelineDescriptor: Codable, Sendable {
         var descriptor = try decoder.decode(PipelineDescriptor.self, from: diffusionData)
 
         // Map assets to component paths
-        descriptor.components.textEncoder = assets["text_encoder"]
-        descriptor.components.textEncoder2 = assets["text_encoder_2"]
-        descriptor.components.unet = assets["transformer"] ?? assets["unet"]
-        descriptor.components.vaeDecoder = assets["vae_decoder"]
-        descriptor.components.vaeEncoder = assets["vae_encoder"]
+        descriptor.components.textEncoder = assets[DiffusionComponentKey.textEncoder]
+        descriptor.components.transformer = assets[DiffusionComponentKey.transformer]
+        descriptor.components.vaeDecoder = assets[DiffusionComponentKey.vaeDecoder]
+        descriptor.components.vaeEncoder = assets[DiffusionComponentKey.vaeEncoder]
 
         return descriptor
     }
@@ -199,7 +198,7 @@ public struct PipelineDescriptor: Codable, Sendable {
         var descriptor = try decoder.decode(PipelineDescriptor.self, from: data)
 
         // If no components were specified, detect from the same directory
-        if descriptor.components.textEncoder == nil && descriptor.components.unet == nil {
+        if descriptor.components.textEncoder == nil && descriptor.components.transformer == nil {
             let dir = url.deletingLastPathComponent()
             let detected = detect(at: dir)
             descriptor.components = detected.components
@@ -218,12 +217,10 @@ public struct PipelineDescriptor: Codable, Sendable {
 
         for file in contents {
             let lower = file.lowercased()
-            if lower.contains("textencoder2") || lower.contains("text_encoder_2") {
-                descriptor.components.textEncoder2 = file
-            } else if lower.contains("textencoder") || lower.contains("text_encoder") {
+            if lower.contains("textencoder") || lower.contains("text_encoder") {
                 descriptor.components.textEncoder = file
-            } else if lower.contains("unet") || lower.contains("transformer") || lower.contains("mmdit") {
-                descriptor.components.unet = file
+            } else if lower.contains("transformer") {
+                descriptor.components.transformer = file
             } else if (lower.contains("vaedecoder") || lower.contains("vae_decoder"))
                 && !lower.contains("half")
             {
@@ -247,21 +244,18 @@ public struct PipelineDescriptor: Codable, Sendable {
 
     public struct ComponentPaths: Codable, Sendable {
         public var textEncoder: String?
-        public var textEncoder2: String?
-        public var unet: String?
+        public var transformer: String?
         public var vaeDecoder: String?
         public var vaeEncoder: String?
 
         public init(
             textEncoder: String? = nil,
-            textEncoder2: String? = nil,
-            unet: String? = nil,
+            transformer: String? = nil,
             vaeDecoder: String? = nil,
             vaeEncoder: String? = nil
         ) {
             self.textEncoder = textEncoder
-            self.textEncoder2 = textEncoder2
-            self.unet = unet
+            self.transformer = transformer
             self.vaeDecoder = vaeDecoder
             self.vaeEncoder = vaeEncoder
         }
@@ -269,8 +263,7 @@ public struct PipelineDescriptor: Codable, Sendable {
         public init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             self.textEncoder = try container.decodeIfPresent(String.self, forKey: .textEncoder)
-            self.textEncoder2 = try container.decodeIfPresent(String.self, forKey: .textEncoder2)
-            self.unet = try container.decodeIfPresent(String.self, forKey: .unet)
+            self.transformer = try container.decodeIfPresent(String.self, forKey: .transformer)
             self.vaeDecoder = try container.decodeIfPresent(String.self, forKey: .vaeDecoder)
             self.vaeEncoder = try container.decodeIfPresent(String.self, forKey: .vaeEncoder)
         }

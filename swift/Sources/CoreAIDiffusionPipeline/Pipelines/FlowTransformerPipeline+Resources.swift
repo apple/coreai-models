@@ -37,7 +37,7 @@ extension FlowTransformerPipeline {
         }
 
         guard let textEncoderPath = descriptor.components.textEncoder else {
-            throw PipelineLoadError.missingComponent("text_encoder")
+            throw PipelineLoadError.missingComponent(DiffusionComponentKey.textEncoder)
         }
 
         // Select transformer by mode.
@@ -48,13 +48,13 @@ extension FlowTransformerPipeline {
         let transformerFnName: String
         switch resolvedMode {
         case .full, .tiled:
-            guard let path = Self.resolveAsset(at: url, name: "Transformer") else {
-                throw PipelineLoadError.missingComponent("Transformer")
+            guard let path = Self.resolveAsset(at: url, name: AssetName.transformer) else {
+                throw PipelineLoadError.missingComponent(AssetName.transformer)
             }
             transformer = CoreAIDiffusionModelFunction(modelURL: url.appendingPathComponent(path))
             transformerFnName = "main"
         case .half:
-            if let path = Self.resolveAsset(at: url, name: "Transformer") {
+            if let path = Self.resolveAsset(at: url, name: AssetName.transformer) {
                 let candidate = CoreAIDiffusionModelFunction(
                     modelURL: url.appendingPathComponent(path))
                 if try await candidate.hasFunction(named: "half") {
@@ -62,7 +62,7 @@ extension FlowTransformerPipeline {
                     // img2img_512_* from the same asset).
                     transformer = candidate
                     transformerFnName = "half"
-                } else if let path512 = Self.resolveAsset(at: url, name: "Transformer_512") {
+                } else if let path512 = Self.resolveAsset(at: url, name: AssetName.transformer512) {
                     transformer = CoreAIDiffusionModelFunction(
                         modelURL: url.appendingPathComponent(path512))
                     transformerFnName = "main"
@@ -72,12 +72,12 @@ extension FlowTransformerPipeline {
                     transformer = candidate
                     transformerFnName = "main"
                 }
-            } else if let path512 = Self.resolveAsset(at: url, name: "Transformer_512") {
+            } else if let path512 = Self.resolveAsset(at: url, name: AssetName.transformer512) {
                 transformer = CoreAIDiffusionModelFunction(
                     modelURL: url.appendingPathComponent(path512))
                 transformerFnName = "main"
             } else {
-                throw PipelineLoadError.missingComponent("Transformer or Transformer_512")
+                throw PipelineLoadError.missingComponent("\(AssetName.transformer) or \(AssetName.transformer512)")
             }
         case .auto:
             preconditionFailure("auto resolved above")
@@ -107,13 +107,13 @@ extension FlowTransformerPipeline {
         let decoderName: String
         switch resolvedMode {
         case .full:
-            guard let path = Self.resolveAsset(at: url, name: "VAEDecoder") else {
-                throw PipelineLoadError.missingComponent("VAEDecoder")
+            guard let path = Self.resolveAsset(at: url, name: AssetName.vaeDecoder) else {
+                throw PipelineLoadError.missingComponent(AssetName.vaeDecoder)
             }
             decoderName = path
         case .half, .tiled:
-            guard let path = Self.resolveAsset(at: url, name: "VAEDecoder_half") else {
-                throw PipelineLoadError.missingComponent("VAEDecoder_half")
+            guard let path = Self.resolveAsset(at: url, name: AssetName.vaeDecoderHalf) else {
+                throw PipelineLoadError.missingComponent(AssetName.vaeDecoderHalf)
             }
             decoderName = path
         case .auto:
@@ -122,7 +122,7 @@ extension FlowTransformerPipeline {
 
         // Resolve compiled assets; report a missing text encoder up front.
         let textEncoderURL = try resolveExistingPipelineAsset(
-            textEncoderPath, in: url, component: "text_encoder")
+            textEncoderPath, in: url, component: DiffusionComponentKey.textEncoder)
         let textEncoder = CoreAIDiffusionModelFunction(modelURL: textEncoderURL)
         let decoder = CoreAIDiffusionModelFunction(
             modelURL: url.appendingPathComponent(decoderName))
@@ -133,7 +133,7 @@ extension FlowTransformerPipeline {
         case .full:
             encoderName = descriptor.components.vaeEncoder
         case .half, .tiled:
-            encoderName = Self.resolveAsset(at: url, name: "VAEEncoder_half")
+            encoderName = Self.resolveAsset(at: url, name: AssetName.vaeEncoderHalf)
         case .auto:
             preconditionFailure("auto resolved above")
         }
@@ -189,14 +189,23 @@ extension FlowTransformerPipeline {
         return Self(
             descriptor: descriptor,
             mode: .full,
-            transformer: try component("transformer", descriptor.components.unet),
-            textEncoder: try component("text_encoder", descriptor.components.textEncoder),
-            decoder: try component("vae_decoder", descriptor.components.vaeDecoder),
+            transformer: try component(DiffusionComponentKey.transformer, descriptor.components.transformer),
+            textEncoder: try component(DiffusionComponentKey.textEncoder, descriptor.components.textEncoder),
+            decoder: try component(DiffusionComponentKey.vaeDecoder, descriptor.components.vaeDecoder),
             encoder: nil,
             tokenizer: try await AutoTokenizer.from(modelFolder: url.appendingPathComponent("tokenizer")),
             batchNormMean: nil,
             batchNormVar: nil,
             batchNormEps: 0)
+    }
+
+    /// On-disk asset filename stems probed by `resolveAsset`.
+    private enum AssetName {
+        static let transformer = "Transformer"
+        static let transformer512 = "Transformer_512"
+        static let vaeDecoder = "VAEDecoder"
+        static let vaeDecoderHalf = "VAEDecoder_half"
+        static let vaeEncoderHalf = "VAEEncoder_half"
     }
 
     /// Resolve an asset name to a filename, checking for .aimodel.
@@ -211,10 +220,10 @@ extension FlowTransformerPipeline {
     private static func bestAvailableMode(
         at url: URL, descriptor: PipelineDescriptor
     ) throws -> DecodeResolution {
-        let hasFullTransformer = descriptor.components.unet != nil
+        let hasFullTransformer = descriptor.components.transformer != nil
         let hasFullDecoder = descriptor.components.vaeDecoder != nil
-        let hasHalfDecoder = resolveAsset(at: url, name: "VAEDecoder_half") != nil
-        let hasHalfTransformer = resolveAsset(at: url, name: "Transformer_512") != nil
+        let hasHalfDecoder = resolveAsset(at: url, name: AssetName.vaeDecoderHalf) != nil
+        let hasHalfTransformer = resolveAsset(at: url, name: AssetName.transformer512) != nil
 
         if hasFullTransformer && hasFullDecoder { return .full }
         if hasFullTransformer && hasHalfDecoder { return .tiled }

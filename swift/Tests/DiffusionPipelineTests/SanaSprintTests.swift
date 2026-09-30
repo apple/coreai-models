@@ -119,7 +119,7 @@ struct SanaSprintTests {
         #expect(descriptor.promptPrefix == "Prefix:\nUser Prompt: ")
         #expect(descriptor.textInputLength == 506)
         #expect(descriptor.textSequenceLength == 300)
-        #expect(descriptor.components.unet == "Transformer.aimodel")
+        #expect(descriptor.components.transformer == "Transformer.aimodel")
         #expect(descriptor.components.textEncoder == "TextEncoder.aimodel")
         #expect(descriptor.components.vaeDecoder == "VAEDecoder.aimodel")
     }
