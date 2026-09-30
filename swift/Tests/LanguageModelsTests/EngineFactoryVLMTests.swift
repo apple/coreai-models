@@ -53,7 +53,7 @@ struct EngineFactoryVLMTests {
     func assemblesConfig() throws {
         let url = try Self.tempBundle(Self.vlmMetadata)
         let bundle = try LanguageBundle(at: url)
-        let mainURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.main)
+        let mainURL = try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.main)
 
         let config = try EngineFactory.makeVLMConfig(
             bundle: bundle, languageModelURL: mainURL, options: EngineOptions())
@@ -74,7 +74,7 @@ struct EngineFactoryVLMTests {
     func appliesChunkingOverrides() throws {
         let url = try Self.tempBundle(Self.vlmMetadata)
         let bundle = try LanguageBundle(at: url)
-        let mainURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.main)
+        let mainURL = try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.main)
 
         let options = EngineOptions(prefillChunkSize: 128, prefillChunkThreshold: 256)
         let config = try EngineFactory.makeVLMConfig(

@@ -89,7 +89,7 @@ public struct EngineFactory: Sendable {
     ) async throws -> any InferenceEngine {
         try bundle.modelBundle.verifyAssetsExisting()
 
-        let languageModelURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.main)
+        let languageModelURL = try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.main)
 
         if bundle.modelBundle.kind == .vlm {
             return try await makeVLMEngine(
@@ -148,8 +148,8 @@ public struct EngineFactory: Sendable {
         let vlmConfig = try makeVLMConfig(
             bundle: bundle, languageModelURL: languageModelURL, options: options)
 
-        let visionModelURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.vision)
-        let embeddingModelURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.embedding)
+        let visionModelURL = try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.vision)
+        let embeddingModelURL = try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.embedding)
 
         CLILogger.log("EngineFactory: Creating vision-language engine for \(bundle.name)")
 

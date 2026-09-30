@@ -64,18 +64,6 @@ public struct LanguageBundle: Sendable {
     /// Raw metadata bytes for passing to engine config parsers.
     public var rawMetadata: Data { modelBundle.raw }
 
-    // MARK: - Component resolution (forwarded from ModelBundle)
-
-    public var componentKeys: [String] { modelBundle.componentKeys }
-
-    public func modelURL(for key: String) -> URL? {
-        modelBundle.modelURL(for: key)
-    }
-
-    public func requireModelURL(for key: String) throws -> URL {
-        try modelBundle.requireModelURL(for: key)
-    }
-
     // MARK: - Tokenizer
 
     /// Path to the embedded tokenizer directory, if present.

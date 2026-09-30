@@ -416,9 +416,10 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         // Resolve component model URLs once; reused for the cache check and model loading below.
         // An LLM bundle has only `main`; VLM bundles also have `vision` and `embedding`.
         let isVLM = bundle.modelBundle.kind == .vlm
-        let languageModelURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.main)
-        let visionModelURL = isVLM ? try bundle.requireModelURL(for: ModelBundle.ComponentKey.vision) : nil
-        let embeddingModelURL = isVLM ? try bundle.requireModelURL(for: ModelBundle.ComponentKey.embedding) : nil
+        let languageModelURL = try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.main)
+        let visionModelURL = isVLM ? try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.vision) : nil
+        let embeddingModelURL =
+            isVLM ? try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.embedding) : nil
 
         if clearCoreAICache {
             let cleared = try PreparedModel.clearCache(at: bundle.bundlePath)

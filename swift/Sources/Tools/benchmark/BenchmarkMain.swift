@@ -80,7 +80,7 @@ struct LLMBenchmark: AsyncParsableCommand {
         try bundle.modelBundle.verifyAssetsExisting()
         let vocabSize = bundle.vocabSize
 
-        let modelURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.main)
+        let modelURL = try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.main)
 
         if clearCoreAICache {
             let cleared = try PreparedModel.clearCache(at: bundle.bundlePath)

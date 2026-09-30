@@ -141,7 +141,7 @@ struct LLMServer: AsyncParsableCommand {
             prefillChunkThreshold: resolvedChunkThreshold
         )
 
-        let modelURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.main)
+        let modelURL = try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.main)
 
         let cacheHit = PreparedModel.isCached(at: modelURL)
         let assetLabel: String = modelURL.pathExtension == "aimodelc" ? "compiled" : "source"

@@ -80,7 +80,7 @@ public struct CoreAIRunner {
 
         return try await EngineFactory.createEngine(
             config: configData,
-            modelURL: try bundle.requireModelURL(for: ModelBundle.ComponentKey.main),
+            modelURL: try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.main),
             options: options
         )
     }

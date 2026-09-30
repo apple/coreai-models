@@ -187,7 +187,7 @@ public struct CoreAILanguageModel: LanguageModel {
     /// Estimated on-disk size of the model's main asset, in bytes.
 
     public var estimatedSizeOnDiskBytes: Int? {
-        guard let assetURL = bundle.modelURL(for: ModelBundle.ComponentKey.main) else { return nil }
+        guard let assetURL = bundle.modelBundle.modelURL(for: ModelBundle.ComponentKey.main) else { return nil }
         return assetURL.recursiveFileSizeInBytes()
     }
 
