@@ -6,9 +6,23 @@
 import Accelerate
 import CoreGraphics
 import Foundation
+import ImageIO
 
 /// Shared CGImage conversion utilities for diffusion and other vision pipelines.
 public enum CGImageUtils {
+    /// Load and decode the first image in a file into a `CGImage`. Expands a leading `~`.
+    ///
+    /// Throws `ImagePreprocessorError.loadFailed` when the file cannot be opened or decoded.
+    public static func load(from path: String) throws -> CGImage {
+        let url = URL(fileURLWithPath: NSString(string: path).expandingTildeInPath)
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+            let image = CGImageSourceCreateImageAtIndex(source, 0, nil)
+        else {
+            throw ImagePreprocessorError.loadFailed(url)
+        }
+        return image
+    }
+
     /// Resize a CGImage to `side × side` using CGContext with high-quality interpolation.
     public static func resize(_ image: CGImage, to side: Int) -> CGImage? {
         guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
