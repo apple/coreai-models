@@ -159,6 +159,8 @@ def _fp_module_type_configs(
 
     ``nn.Linear`` (attention/MLP projections and FFN): weight and input-activation quantizated.
     ``nn.Embedding``: weight-only quantization.
+    ``SDPA``: query (input 0) quantized to FP8 (e4m3) per-tensor. Key and value stay
+    in full precision.
 
     Args:
         weight_spec: ``op_state_spec`` weight config (e.g. ``_FP8_WEIGHT_SPEC``).
@@ -175,6 +177,16 @@ def _fp_module_type_configs(
             "op_state_spec": weight_spec,
             "op_input_spec": None,
             "op_output_spec": None,
+        },
+        "coreai_models.primitives.macos.sdpa.SDPA": {
+            "op_input_spec": None,
+            "op_output_spec": None,
+            "op_state_spec": None,
+            "module_input_spec": {
+                0: _FP8_ACTIVATION_SPEC["*"],
+                1: None,
+                2: None,
+            },
         },
     }
 
@@ -227,8 +239,9 @@ MACOS_PRESETS: dict[str, dict[str, Any]] = {
         "suffix": "fp4_weights_fp8_act_fp8_kv_cache",
         "description": (
             "FP4 (e2m1) weights, FP8 per-tensor activations into "
-            "linear projections and FFN, and FP8 per-tensor KV cache. "
-            "SDPA, RoPE, and normalization stay in full precision."
+            "linear projections and FFN, FP8 per-tensor KV cache, and the SDPA "
+            "query quantized to FP8 per-tensor. RoPE and normalization stay in "
+            "full precision."
         ),
     },
     # FP8 (e4m3) per-tensor weights + FP8 per-tensor
@@ -244,8 +257,9 @@ MACOS_PRESETS: dict[str, dict[str, Any]] = {
         "suffix": "fp8_weights_fp8_act_fp8_kv_cache",
         "description": (
             "FP8 (e4m3) per-tensor weights, FP8 per-tensor activations into linear "
-            "projections and FFN, and FP8 per-tensor KV cache. SDPA, "
-            "RoPE, and normalization stay in full precision."
+            "projections and FFN, FP8 per-tensor KV cache, and the SDPA query "
+            "quantized to FP8 per-tensor. RoPE and normalization stay in full "
+            "precision."
         ),
     },
 }
