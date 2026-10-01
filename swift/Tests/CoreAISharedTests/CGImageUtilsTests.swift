@@ -29,6 +29,10 @@ struct CGImageUtilsTests {
         let loaded = try CGImageUtils.load(from: url.path)
         #expect(loaded.width == 5)
         #expect(loaded.height == 5)
+
+        let viaURL = try CGImageUtils.load(from: url)
+        #expect(viaURL.width == 5)
+        #expect(viaURL.height == 5)
     }
 
     @Test("load: a missing file throws loadFailed")

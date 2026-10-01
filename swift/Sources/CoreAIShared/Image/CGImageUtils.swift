@@ -14,7 +14,13 @@ public enum CGImageUtils {
     ///
     /// Throws `ImagePreprocessorError.loadFailed` when the file cannot be opened or decoded.
     public static func load(from path: String) throws -> CGImage {
-        let url = URL(fileURLWithPath: NSString(string: path).expandingTildeInPath)
+        try load(from: URL(fileURLWithPath: NSString(string: path).expandingTildeInPath))
+    }
+
+    /// Load and decode the first image at `url` into a `CGImage`.
+    ///
+    /// Throws `ImagePreprocessorError.loadFailed` when the file cannot be opened or decoded.
+    public static func load(from url: URL) throws -> CGImage {
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
             let image = CGImageSourceCreateImageAtIndex(source, 0, nil)
         else {
