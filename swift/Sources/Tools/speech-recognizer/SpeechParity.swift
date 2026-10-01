@@ -491,16 +491,3 @@ private func psnr(_ a: [Float], _ b: [Float]) -> Double {
     if peak == 0 { peak = 1 }
     return 10 * log10(peak * peak / mse)
 }
-
-private func cosineSimilarity(_ a: [Float], _ b: [Float]) -> Double {
-    var dot = 0.0
-    var na = 0.0
-    var nb = 0.0
-    for i in a.indices {
-        dot += Double(a[i]) * Double(b[i])
-        na += Double(a[i]) * Double(a[i])
-        nb += Double(b[i]) * Double(b[i])
-    }
-    guard na > 0 && nb > 0 else { return na == nb ? 1 : 0 }
-    return dot / (na.squareRoot() * nb.squareRoot())
-}

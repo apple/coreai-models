@@ -61,10 +61,10 @@ extension DiffusionRunner {
         if let hiddenKey = teOutputs.keys.first(where: { $0.contains("hidden") }),
             let actual = teOutputs[hiddenKey]
         {
-            let cosine = cosineSimilarity(actual, expectedTE.data)
+            let cosine = Float(cosineSimilarity(actual, expectedTE.data))
             print("  Cosine similarity: \(cosine)")
         } else if let actual = teOutputs.values.first {
-            let cosine = cosineSimilarity(actual, expectedTE.data)
+            let cosine = Float(cosineSimilarity(actual, expectedTE.data))
             print("  Cosine similarity (first output): \(cosine)")
         }
 
@@ -79,7 +79,7 @@ extension DiffusionRunner {
         let vaeND = floatsToNDArray(vaeInput.data, asInt32: false, shape: vaeInput.shape, scalarType: vaeType)
         let vaeOutputs = try await vaeDecoder.predictAutoNamed(inputs: [vaeND])
         if let actual = vaeOutputs.values.first {
-            let cosine = cosineSimilarity(actual, expectedVAE.data)
+            let cosine = Float(cosineSimilarity(actual, expectedVAE.data))
             print("  Cosine similarity: \(cosine)")
         }
 
@@ -101,20 +101,6 @@ extension DiffusionRunner {
     }
 
     // MARK: - Helpers
-
-    private func cosineSimilarity(_ a: [Float], _ b: [Float]) -> Float {
-        guard a.count == b.count, !a.isEmpty else { return 0 }
-        var dot: Float = 0
-        var normA: Float = 0
-        var normB: Float = 0
-        for i in 0..<a.count {
-            dot += a[i] * b[i]
-            normA += a[i] * a[i]
-            normB += b[i] * b[i]
-        }
-        let denom = sqrt(normA) * sqrt(normB)
-        return denom > 0 ? dot / denom : 0
-    }
 
     /// Widen a `[Float]` buffer into an `NDArray` of the requested scalar type.
     ///

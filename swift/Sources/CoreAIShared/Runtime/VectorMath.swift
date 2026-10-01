@@ -21,3 +21,22 @@ public func sigmoid(_ x: Float) -> Float {
     let e = Foundation.exp(x)
     return e / (1 + e)
 }
+
+/// Cosine similarity of two equal-length vectors, accumulated in `Double`.
+///
+/// Returns `0` for empty, length-mismatched, or zero-norm inputs. The parity harnesses that
+/// use this report the value as a diagnostic, so the single documented convention keeps their
+/// numbers comparable.
+public func cosineSimilarity(_ a: [Float], _ b: [Float]) -> Double {
+    guard a.count == b.count, !a.isEmpty else { return 0 }
+    var dot = 0.0
+    var normA = 0.0
+    var normB = 0.0
+    for i in a.indices {
+        dot += Double(a[i]) * Double(b[i])
+        normA += Double(a[i]) * Double(a[i])
+        normB += Double(b[i]) * Double(b[i])
+    }
+    let denom = (normA * normB).squareRoot()
+    return denom > 0 ? dot / denom : 0
+}

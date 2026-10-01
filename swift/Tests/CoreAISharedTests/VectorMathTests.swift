@@ -34,4 +34,23 @@ struct VectorMathTests {
         #expect(sigmoid(-100) < 1e-40)
         #expect(sigmoid(-100).isNaN == false)
     }
+
+    // MARK: - cosineSimilarity
+
+    @Test("cosineSimilarity: identical, orthogonal, and opposite vectors")
+    func cosineKnownValues() {
+        #expect(abs(cosineSimilarity([1, 2, 3], [1, 2, 3]) - 1.0) < 1e-9)
+        #expect(abs(cosineSimilarity([1, 0], [0, 1])) < 1e-9)
+        #expect(abs(cosineSimilarity([1, 2, 3], [-1, -2, -3]) + 1.0) < 1e-9)
+    }
+
+    @Test("cosineSimilarity: degenerate inputs return 0")
+    func cosineDegenerate() {
+        // The single documented convention: empty, length-mismatched, and zero-norm inputs all
+        // score 0 (the old SpeechParity copy returned 1 when both norms were zero).
+        #expect(cosineSimilarity([], []) == 0)
+        #expect(cosineSimilarity([1, 2], [1, 2, 3]) == 0)
+        #expect(cosineSimilarity([0, 0], [0, 0]) == 0)
+        #expect(cosineSimilarity([0, 0], [1, 2]) == 0)
+    }
 }
