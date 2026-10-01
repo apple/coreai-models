@@ -21,7 +21,7 @@ struct DiffusionPipelineTests {
         #expect(!config.isImageToImage)
     }
 
-    @Test("Scheduler type raw values match pipeline.json")
+    @Test("Scheduler type raw values match the metadata.json diffusion block")
     func schedulerTypeRawValues() {
         #expect(SchedulerType(rawValue: "flow_match_euler") == .discreteFlow)
     }

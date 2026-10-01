@@ -153,7 +153,7 @@ struct ComponentTests {
 private func makeFlux2Pipeline(bnMean: [Float]? = nil, bnVar: [Float]? = nil) -> FlowTransformerPipeline {
     let stub = CoreAIDiffusionModelFunction(modelURL: URL(filePath: "/nonexistent.aimodel"))
     return FlowTransformerPipeline(
-        descriptor: PipelineDescriptor(),
+        config: DiffusionConfig(),
         mode: .full,
         transformer: stub,
         textEncoder: stub,

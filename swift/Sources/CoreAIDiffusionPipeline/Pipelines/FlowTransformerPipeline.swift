@@ -23,7 +23,7 @@ public struct Img2ImgRoute: Sendable {
 /// Flow-matching diffusion-transformer pipeline using Core AI backend.
 ///
 /// Orchestrates: tokenize → text encode → noise → denoise loop (flow-match Euler or
-/// stochastic) → VAE decode. The model family (`descriptor.type`) supplies the text
+/// stochastic) → VAE decode. The model family (`config.type`) supplies the text
 /// conditioning, transformer inputs, sigma schedule, and latent → VAE conversion:
 ///
 /// - `.flux2` (FLUX.2 Klein): Qwen3 encoder, packed tokens with RoPE ids, BN + unpatchify.
@@ -31,7 +31,7 @@ public struct Img2ImgRoute: Sendable {
 /// - `.sanaSprint`: Gemma2 encoder, NCHW latents, SCM schedule with stochastic steps.
 ///   See `FlowTransformerPipeline+SanaSprint.swift`.
 public struct FlowTransformerPipeline: DiffusionPipeline {
-    public let descriptor: PipelineDescriptor
+    public let config: DiffusionConfig
     public let mode: DecodeResolution
 
     public let transformer: CoreAIDiffusionModelFunction
@@ -59,7 +59,7 @@ public struct FlowTransformerPipeline: DiffusionPipeline {
 
     /// Image size is determined by the mode selected at init.
     public var defaultImageSize: (width: Int, height: Int) {
-        let full = descriptor.imageSize ?? 1024
+        let full = config.imageSize ?? DiffusionDefaults.Image.imageSize
         let size = (mode == .half) ? full / 2 : full
         return (size, size)
     }
@@ -73,7 +73,7 @@ public struct FlowTransformerPipeline: DiffusionPipeline {
     }
 
     public init(
-        descriptor: PipelineDescriptor,
+        config: DiffusionConfig,
         mode: DecodeResolution = .full,
         transformer: CoreAIDiffusionModelFunction,
         img2imgRoutes: [ReferenceGrid: Img2ImgRoute] = [:],
@@ -86,7 +86,7 @@ public struct FlowTransformerPipeline: DiffusionPipeline {
         batchNormVar: [Float]?,
         batchNormEps: Float
     ) {
-        self.descriptor = descriptor
+        self.config = config
         self.mode = mode
         self.transformer = transformer
         self.img2imgRoutes = img2imgRoutes
@@ -99,7 +99,7 @@ public struct FlowTransformerPipeline: DiffusionPipeline {
         self.batchNormVar = batchNormVar
         self.batchNormEps = batchNormEps
 
-        if descriptor.type != .sanaSprint && tokenizer.convertTokenToId("<|endoftext|>") == nil {
+        if config.type != .sanaSprint && tokenizer.convertTokenToId("<|endoftext|>") == nil {
             CLILogger.log(
                 "⚠️ FlowTransformerPipeline: tokenizer has no <|endoftext|> token, using Qwen3 fallback pad ID",
                 component: "Diffusion")
@@ -154,7 +154,7 @@ public struct FlowTransformerPipeline: DiffusionPipeline {
         progressHandler: ((PipelineProgress) -> Bool)?
     ) async throws -> GenerationResult {
         var plan =
-            descriptor.type == .sanaSprint
+            config.type == .sanaSprint
             ? try await makeSanaSprintPlan(configuration)
             : try await makeFlux2Plan(configuration)
         let scheduler = plan.scheduler

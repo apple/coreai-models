@@ -6,13 +6,13 @@
 import CoreAIShared
 
 extension ModelBundle {
-    /// Lossy peek for inspection: returns a `LanguageBundle` if and only if
+    /// Lossy peek for inspection: returns a `LanguageModelBundle` if and only if
     /// this bundle's `kind == .llm` and the LLM payload decodes cleanly.
     ///
     /// Returns `nil` for any other kind, missing fields, or malformed JSON.
-    /// Strict callers should use `LanguageBundle(at:)` or
-    /// `LanguageBundle(bundle:)` directly.
-    public var language: LanguageBundle? {
-        try? LanguageBundle(bundle: self)
+    /// Strict callers should use `LanguageModelBundle(at:)` or
+    /// `LanguageModelBundle(bundle:)` directly.
+    public var language: LanguageModelBundle? {
+        try? LanguageModelBundle(bundle: self)
     }
 }
