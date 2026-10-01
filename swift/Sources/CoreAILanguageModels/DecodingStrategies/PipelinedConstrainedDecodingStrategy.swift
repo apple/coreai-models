@@ -211,8 +211,10 @@ extension PipelinedConstrainedSequence {
                     // Decode text incrementally
                     generatedTokens.append(tokenId)
                     let fullDecode = tokenizer.decode(tokens: generatedTokens.map { Int($0) })
-                    let common = fullDecode.commonPrefix(with: previousDecodedText)
-                    let delta = String(fullDecode.dropFirst(common.count))
+                    // Compare Unicode scalars: a Character-wise prefix re-emits the grapheme a token extends.
+                    let fullScalars = fullDecode.unicodeScalars
+                    let common = zip(fullScalars, previousDecodedText.unicodeScalars).prefix(while: { $0 == $1 }).count
+                    let delta = String(String.UnicodeScalarView(fullScalars.dropFirst(common)))
 
                     if delta.unicodeScalars.contains(where: { $0 == "\u{FFFD}" }) {
                         consecutiveDecodeFailures += 1
