@@ -33,10 +33,21 @@ struct ArgmaxFloatTests {
 
     @Test("Ties go to the lowest index")
     func tiesGoLow() {
-        // Documented contract, and it differs from CoreAISpeech's WhisperDecoder, whose
-        // `indices.max(by:)` returns the *last* maximal element. Pinned so a future cleanup
-        // does not unify the two on the assumption that they already agree.
+        // Documented contract. Swift's `max(by: { a < b })` — which the Whisper decoders in
+        // CoreAISpeech / speech-recognizer previously used — also keeps the earlier element on a
+        // tie, so routing those sites through `argmaxFloat` preserves tie-breaking.
         #expect(argmaxFloat(row([2, 2, 1]), in: 0..<3) == 0)
+    }
+
+    @Test("A trailing-position range selects that position's argmax")
+    func trailingPositionRange() {
+        // The Whisper decoders argmax the last position of a `[1, seqLen, vocab]` logits buffer
+        // via `base = (seqLen - 1) * vocab`. A larger value in an earlier position must not win,
+        // and the result is relative to `base` (i.e. a vocab index).
+        let vocab = 3
+        var array = NDArray(shape: [1, 2, vocab], scalarType: .float32)
+        fillFloatNDArray(&array, with: [9, 1, 1, 2, 7, 3])  // pos0 argmax=0 (9); pos1 argmax=1 (7)
+        #expect(argmaxFloat(array, in: vocab..<(2 * vocab)) == 1)
     }
 
     @Test("An all-negative-infinity range returns zero")
