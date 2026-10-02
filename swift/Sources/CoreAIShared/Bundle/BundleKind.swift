@@ -6,12 +6,16 @@
 /// Top-level model categories the runner ecosystem knows about.
 ///
 /// The bundle's `kind` selects which kind-specific config block (and which
-/// kind-specific Swift type — `LanguageBundle`, `DiffusionBundle`, etc.) is
+/// kind-specific Swift type — `LanguageModelBundle`, `DiffusionBundle`, etc.) is
 /// expected on top of the common `ModelBundle`.
 public enum BundleKind: String, Codable, Sendable, CaseIterable {
     case llm
     case vlm
     case diffusion
+    /// Video diffusion (Wan). Its own kind tag, but decoded by the same
+    /// `DiffusionBundle` as image diffusion — mirroring how `.vlm` shares its
+    /// bundle with `.llm`.
+    case videoDiffusion = "video-diffusion"
     case segmenter
     /// Text-promptable video segmentation (SAM 3 video). Its own kind because the bundle
     /// carries a `runtime` block with the memory-bank geometry.

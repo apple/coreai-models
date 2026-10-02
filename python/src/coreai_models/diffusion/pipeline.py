@@ -10,8 +10,6 @@ Exports a HuggingFace diffusion model to a set of Core AI .aimodel files — one
 per component — plus tokenizer files and a pipeline.json descriptor.
 
 Supports:
-- Stable Diffusion 1.x / 2.x (UNet-based)
-- Stable Diffusion 3.x (MMDiT, T5-less)
 - FLUX.2 Klein (DiT-based)
 - Wan 2.1 (text-to-video)
 - Sana Sprint (few-step linear-attention DiT)
@@ -37,7 +35,7 @@ from coreai_models.diffusion.components import (
     quant_weight_owner,
 )
 from coreai_models.diffusion.gpu import export_multifunction, export_stateless
-from coreai_models.diffusion.models import get_pipeline_type
+from coreai_models.diffusion.models import get_pipeline_type, unknown_pipeline_type_error
 from coreai_models.diffusion.presets import PRESETS, list_presets
 from coreai_models.export.compression import is_compression_mode_graph, quantize_pytorch_model
 from coreai_models.export.metadata import build_aimodel_metadata
@@ -225,45 +223,7 @@ def _load_hf_pipeline(model_id: str, pipeline_type: str, model_dtype: torch.dtyp
         hf_pipe = WanPipeline.from_pretrained(model_id, torch_dtype=model_dtype)
         return hf_pipe
 
-    if pipeline_type == "sd3":
-        from diffusers import StableDiffusion3Pipeline
-
-        try:
-            # T5-less path: skip text_encoder_3 / tokenizer_3 entirely. Quality cost
-            # accepted; T5 can be added later by removing these kwargs.
-            hf_pipe = StableDiffusion3Pipeline.from_pretrained(
-                model_id,
-                torch_dtype=model_dtype,
-                text_encoder_3=None,
-                tokenizer_3=None,
-            )
-            hf_pipe.vae = hf_pipe.vae.float()
-            return hf_pipe
-        except OSError as e:
-            if "gated" in str(e).lower() or "access to model" in str(e).lower():
-                raise PermissionError(
-                    f"Access denied: {model_id} is a gated model. "
-                    f"Accept the license at https://huggingface.co/{model_id} "
-                    f"and run: hf auth login"
-                ) from e
-            raise
-
-    from diffusers import StableDiffusionPipeline
-
-    try:
-        return StableDiffusionPipeline.from_pretrained(
-            model_id,
-            torch_dtype=model_dtype,
-            safety_checker=None,
-        )
-    except OSError as e:
-        if "gated" in str(e).lower() or "access to model" in str(e).lower():
-            raise PermissionError(
-                f"Access denied: {model_id} is a gated model. "
-                f"Accept the license at https://huggingface.co/{model_id} "
-                f"and run: hf auth login"
-            ) from e
-        raise
+    raise unknown_pipeline_type_error(pipeline_type)
 
 
 # ---------------------------------------------------------------------------
@@ -328,15 +288,10 @@ def _save_pipeline_tokenizer(hf_pipe: Any, output_path: Path, overwrite: bool) -
 def _save_tokenizer(model_id: str, output_path: Path, hf_pipe: Any, overwrite: bool) -> None:
     """Save the tokenizer subdirs the model needs.
 
-    SD 1.x/2.x: just `tokenizer/`. SD3: also `tokenizer_2/` (CLIP-G). T5
-    (`tokenizer_3/`) is skipped — paired with the T5-less load in
-    `_load_hf_pipeline`.
+    Downloads `tokenizer/` from the
+    HF snapshot and copies it alongside the exported assets.
     """
-    subdirs = ["tokenizer"]
-    if hasattr(hf_pipe, "tokenizer_2") and getattr(hf_pipe, "tokenizer_2", None) is not None:
-        subdirs.append("tokenizer_2")
-
-    for subdir in subdirs:
+    for subdir in ["tokenizer"]:
         dst_dir = output_path / subdir
         if dst_dir.exists() and not overwrite:
             logger.info(f"Skipping {subdir}: {dst_dir} exists (use --overwrite)")
@@ -423,7 +378,7 @@ def _write_metadata_json(
     elif pipeline_type == "wan":
         diffusion_config = _build_wan_config(hf_pipe, model_id, vae_tile_size=vae_tile_size)
     else:
-        diffusion_config = _build_sd_config(hf_pipe, model_id, pipeline_type)
+        raise unknown_pipeline_type_error(pipeline_type)
 
     json_path = output_path / "metadata.json"
     assets = _prepare_assets(json_path, exported_assets)
@@ -530,43 +485,6 @@ def _build_wan_config(hf_pipe: Any, model_id: str, *, vae_tile_size: int | None 
     if vae_tile_size is not None:
         config["vae_tile_size"] = vae_tile_size
         config["vae_temporal_frames"] = 5
-    return config
-
-
-def _build_sd_config(hf_pipe: Any, model_id: str, pipeline_type: str = "sd") -> dict:
-    scheduler_config = hf_pipe.scheduler.config
-    vae_config = hf_pipe.vae.config
-
-    is_sd3 = pipeline_type == "sd3"
-    denoiser_config = hf_pipe.transformer.config if is_sd3 else hf_pipe.unet.config
-
-    prediction_type = getattr(scheduler_config, "prediction_type", None) or "epsilon"
-    scaling_factor = getattr(vae_config, "scaling_factor", None) or 0.18215
-    shift_factor = getattr(vae_config, "shift_factor", None) or 0.0
-
-    vae_scale_power = len(vae_config.block_out_channels) - 1
-    vae_spatial_scale = 2**vae_scale_power
-    image_size = denoiser_config.sample_size * vae_spatial_scale
-
-    config: dict[str, Any] = {
-        "type": "stable-diffusion-3" if is_sd3 else "stable-diffusion",
-        "prediction_type": "flow" if is_sd3 else prediction_type,
-        "encoder_scale_factor": scaling_factor,
-        "decoder_scale_factor": scaling_factor,
-        "decoder_shift_factor": shift_factor,
-        "image_size": image_size,
-        "default_guidance_scale": 5.0 if is_sd3 else 7.5,
-        "default_steps": 28 if is_sd3 else 50,
-    }
-
-    # Include scheduler defaults for reproducibility
-    config["scheduler"] = {
-        "training_steps": getattr(scheduler_config, "num_train_timesteps", 1000),
-        "beta_start": getattr(scheduler_config, "beta_start", 0.00085),
-        "beta_end": getattr(scheduler_config, "beta_end", 0.012),
-        "beta_schedule": getattr(scheduler_config, "beta_schedule", "scaled_linear"),
-    }
-
     return config
 
 

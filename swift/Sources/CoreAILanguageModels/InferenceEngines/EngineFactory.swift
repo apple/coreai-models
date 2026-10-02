@@ -84,25 +84,31 @@ public struct EngineFactory: Sendable {
     ///     already-resolved config.
     /// - Returns: A configured inference engine.
     public static func createEngine(
-        bundle: LanguageBundle,
+        bundle: LanguageModelBundle,
         options: EngineOptions = EngineOptions()
     ) async throws -> any InferenceEngine {
-        let languageModelURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.main)
+        try bundle.modelBundle.verifyAssetsExisting()
 
-        if bundle.bundle.kind == .vlm {
+        let languageModelURL = try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.main)
+
+        if bundle.modelBundle.kind == .vlm {
             return try await makeVLMEngine(
                 bundle: bundle, languageModelURL: languageModelURL, options: options)
         }
 
+        // The bundle knows its own sidecars; assets passed explicitly still win.
+        let options = EngineOptions(
+            variant: options.variant,
+            kvCacheStrategy: options.kvCacheStrategy,
+            kvCacheSize: options.kvCacheSize,
+            prefillChunkSize: options.prefillChunkSize,
+            prefillChunkThreshold: options.prefillChunkThreshold,
+            tensorData: bundle.tensorData.merging(options.tensorData) { _, explicit in
+                explicit
+            })
+
         // Standard single-asset LLM: build the config and delegate to the asset/URL path.
-        let engineConfig = ModelConfig(
-            name: bundle.name,
-            tokenizer: bundle.tokenizer,
-            vocabSize: bundle.vocabSize,
-            maxContextLength: bundle.maxContextLength,
-            serializedModel: [bundle.modelAssetPath],
-            function: bundle.language.functionMap?.name(for: "main") ?? "main"
-        )
+        let engineConfig = ModelConfig(bundle: bundle)
         let configData = try JSONEncoder().encode(engineConfig)
         return try await createEngine(config: configData, modelURL: languageModelURL, options: options)
     }
@@ -112,7 +118,7 @@ public struct EngineFactory: Sendable {
     /// Applies chunking overrides for the VLM path the same way `selectEngine` does for the text
     /// path. Split out from `makeVLMEngine` so the config assembly can be unit-tested on its own.
     static func makeVLMConfig(
-        bundle: LanguageBundle,
+        bundle: LanguageModelBundle,
         languageModelURL: URL,
         options: EngineOptions
     ) throws -> VLMModelConfig {
@@ -139,15 +145,15 @@ public struct EngineFactory: Sendable {
     /// construct the engine. Components are prepared one at a time to keep Core AI specialization
     /// stable.
     private static func makeVLMEngine(
-        bundle: LanguageBundle,
+        bundle: LanguageModelBundle,
         languageModelURL: URL,
         options: EngineOptions
     ) async throws -> any InferenceEngine {
         let vlmConfig = try makeVLMConfig(
             bundle: bundle, languageModelURL: languageModelURL, options: options)
 
-        let visionModelURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.vision)
-        let embeddingModelURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.embedding)
+        let visionModelURL = try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.vision)
+        let embeddingModelURL = try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.embedding)
 
         CLILogger.log("EngineFactory: Creating vision-language engine for \(bundle.name)")
 
@@ -175,6 +181,7 @@ public struct EngineFactory: Sendable {
         let tokenizer: String
         let function: String
         let modelDefinition: ModelSource.ModelDefinition
+        let overrides: LanguageOverrides?
     }
 
     /// Parses config data using the unified config handler.
@@ -186,14 +193,16 @@ public struct EngineFactory: Sendable {
             maxContextLength: config.maxContextLength,
             tokenizer: config.tokenizer,
             function: config.function,
-            modelDefinition: config.resolvedModelDefinition
+            modelDefinition: config.resolvedModelDefinition,
+            overrides: config.overrides
         )
     }
 
     // MARK: - Variant Resolution
 
     /// Resolves the engine variant based on override or auto-detection.
-    private static func resolveVariant(
+    // Internal for EngineSupportTests.
+    static func resolveVariant(
         override: String?,
         detectedStructure: ModelStructure
     ) throws -> Variant {
@@ -292,7 +301,8 @@ public struct EngineFactory: Sendable {
                 modelDefinition: config.modelDefinition
             ),
             serializedModel: [modelURL.lastPathComponent],
-            function: config.function
+            function: config.function,
+            overrides: config.overrides
         )
 
         modelConfig.applyChunkingOverrides(
@@ -302,10 +312,12 @@ public struct EngineFactory: Sendable {
 
         switch variant {
         case .staticShape:
+            // Model-specific inputs and states are handled inside the engine.
             CLILogger.log("Creating static-shape engine")
             return try await StaticShapeEngine(
                 configuration: modelConfig,
-                preparedModel: preparedModel
+                preparedModel: preparedModel,
+                tensorData: options.tensorData
             )
 
         case .sequential:
@@ -364,6 +376,17 @@ public struct EngineOptions: Sendable {
     /// When set, takes precedence over model metadata and engine defaults.
     public let prefillChunkThreshold: Int?
 
+    /// Tensor data the bundle ships alongside the model, for weights too large to bake
+    /// into the graph, keyed by the role name under `assets` in `metadata.json` (see
+    /// ``TensorDataKey``). A role absent here is data the bundle does not ship.
+    public let tensorData: [String: URL]
+
+    /// Well-known `assets` roles for tensor data.
+    public enum TensorDataKey {
+        /// INT8 per-layer embeddings table (`*_ple.safetensors`).
+        public static let perLayerEmbeddings = "per_layer_embeddings"
+    }
+
     /// Creates an options value with the variant and KV cache settings you specify.
     ///
     /// - Parameters:
@@ -374,18 +397,21 @@ public struct EngineOptions: Sendable {
     ///     Defaults to `nil`.
     ///   - prefillChunkSize: Tokens per prefill chunk, or `nil` to use model/engine default.
     ///   - prefillChunkThreshold: Minimum prompt tokens to trigger chunking, or `nil` for default.
+    ///   - tensorData: Tensor data URLs keyed by `assets` role. Defaults to empty.
     public init(
         variant: String? = nil,
         kvCacheStrategy: KVCacheStrategy = .auto,
         kvCacheSize: Int? = nil,
         prefillChunkSize: Int? = nil,
-        prefillChunkThreshold: Int? = nil
+        prefillChunkThreshold: Int? = nil,
+        tensorData: [String: URL] = [:]
     ) {
         self.variant = variant
         self.kvCacheStrategy = kvCacheStrategy
         self.kvCacheSize = kvCacheSize
         self.prefillChunkSize = prefillChunkSize
         self.prefillChunkThreshold = prefillChunkThreshold
+        self.tensorData = tensorData
     }
 
     /// Returns the KV cache size in tokens that the engine uses for a given context length.
@@ -407,7 +433,7 @@ public struct EngineOptions: Sendable {
 
 extension EngineFactory {
     /// Determines the appropriate engine variant based on model structure.
-    private enum Variant: String, Sendable, CaseIterable {
+    enum Variant: String, Sendable, CaseIterable {
         /// Core AI sequential engine (clean public API rewrite)
         case sequential = "coreai-sequential"
 

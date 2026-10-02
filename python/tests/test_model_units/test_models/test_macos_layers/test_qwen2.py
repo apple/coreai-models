@@ -975,5 +975,4 @@ class TestQwen2ForCausalLM(ForCausalLMTestBase):
     _test_weights_tying = True
     _test_weight_activation_quantization = True
     _test_kv_cache_quantization = True
-    # enable once the fix in https://github.com/apple/coreai-optimization/pull/78 is released
-    _test_eager_activation_quantization = False
+    _test_eager_activation_quantization = True

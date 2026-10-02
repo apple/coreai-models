@@ -150,7 +150,7 @@ extension FlowTransformerPipeline {
         }
 
         // 6. Build RoPE position IDs — the transformer computes the frequencies in-graph
-        let axesDims = descriptor.ropeAxesDims ?? [32, 32, 32, 32]
+        let axesDims = config.ropeAxesDims ?? DiffusionDefaults.Image.ropeAxesDims
         let axisCount = axesDims.count
         // Image ids put H/W on axes 1/2; text ids put the seq index on the last axis.
         guard axisCount >= 3 else {
@@ -332,7 +332,7 @@ extension FlowTransformerPipeline {
         inChannels: Int
     ) async throws -> [Float] {
         let resized = CGImageUtils.resize(srcImage, to: imageSize) ?? srcImage
-        let encoderScaleFactor = descriptor.encoderScaleFactor ?? 0.18215
+        let encoderScaleFactor = config.encoderScaleFactor ?? DiffusionDefaults.Image.scaleFactor
 
         let imagePixels = try CGImageUtils.toNormalizedPlanarRGB(resized)
         let encodedFloats = try await encoder.run(floatInputs: [(imagePixels, [1, 3, imageSize, imageSize])])

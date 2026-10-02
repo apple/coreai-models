@@ -114,7 +114,7 @@ struct MultiOutputModelFunctionTests {
             .deletingLastPathComponent()  // repo root
         let candidate =
             repoRoot
-            .appendingPathComponent("exports/stable-diffusion-3.5-medium/TextEncoder.aimodel")
+            .appendingPathComponent("exports/FLUX.2-klein-4B/TextEncoder.aimodel")
         return FileManager.default.fileExists(atPath: candidate.path) ? candidate : nil
     }
 }

@@ -408,17 +408,18 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             }
         }
 
-        let bundle = try LanguageBundle(from: modelFile)
-        try bundle.bundle.verify()
+        let bundle = try LanguageModelBundle(from: modelFile)
+        try bundle.modelBundle.verifyAssetsExisting()
         let modelName = bundle.name
         let modelVocabSize = bundle.vocabSize
 
         // Resolve component model URLs once; reused for the cache check and model loading below.
         // An LLM bundle has only `main`; VLM bundles also have `vision` and `embedding`.
-        let isVLM = bundle.bundle.kind == .vlm
-        let languageModelURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.main)
-        let visionModelURL = isVLM ? try bundle.requireModelURL(for: ModelBundle.ComponentKey.vision) : nil
-        let embeddingModelURL = isVLM ? try bundle.requireModelURL(for: ModelBundle.ComponentKey.embedding) : nil
+        let isVLM = bundle.modelBundle.kind == .vlm
+        let languageModelURL = try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.main)
+        let visionModelURL = isVLM ? try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.vision) : nil
+        let embeddingModelURL =
+            isVLM ? try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.embedding) : nil
 
         if clearCoreAICache {
             let cleared = try PreparedModel.clearCache(at: bundle.bundlePath)
@@ -461,7 +462,8 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             kvCacheStrategy: kvCacheStrategy,
             kvCacheSize: kvCacheInitialCapacity,
             prefillChunkSize: resolvedChunkSize,
-            prefillChunkThreshold: resolvedChunkThreshold
+            prefillChunkThreshold: resolvedChunkThreshold,
+            tensorData: bundle.tensorData
         )
 
         // Parallel loading: engine compilation + tokenizer are independent.
@@ -958,7 +960,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     private func runVLMInference(
         imagePath: String,
         inferenceEngine: any InferenceEngine,
-        bundle: LanguageBundle,
+        bundle: LanguageModelBundle,
         tokenizer: any Tokenizer,
         samplingConfiguration: SamplingConfiguration,
         maxTokens: Int,
@@ -1024,7 +1026,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     private func runVLMVideoInference(
         videoPath: String,
         inferenceEngine: any InferenceEngine,
-        bundle: LanguageBundle,
+        bundle: LanguageModelBundle,
         tokenizer: any Tokenizer,
         samplingConfiguration: SamplingConfiguration,
         maxTokens: Int,
