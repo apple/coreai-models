@@ -96,14 +96,14 @@ Perplexity score on the [`WikiText-2`](https://huggingface.co/datasets/EleutherA
 | Qwen3 4B   | none (`float16`)                                        | 16.00                 | macOS         | 16.41            |
 | Qwen3 4B   | [4-bit quantized][presets-info]                         | 4.50                  | macOS         | 18.33            |
 | Qwen3 4B   | [4-bit quantized with INT8 KV cache][presets-info]      | 4.50                  | macOS         | 18.65            |
-| Qwen3 4B   | [FP4 weights, FP8 activations & KV cache][presets-info] | 4.25                  | macOS (27.2+) | 18.96            |
-| Qwen3 4B   | [FP8 weights, FP8 activations & KV cache][presets-info] | 8.00                  | macOS (27.2+) | 16.38            |
+| Qwen3 4B   | [FP4 weights, FP8 activations & KV cache][presets-info] | 4.25                  | macOS (27.2+) | 20.07            |
+| Qwen3 4B   | [FP8 weights, FP8 activations & KV cache][presets-info] | 8.00                  | macOS (27.2+) | 17.35            |
 | Qwen3 4B   | none (`float16`)                                        | 16.00                 | iOS           | 16.41            |
 | Qwen3 4B   | [Mixed 4-bit/8-bit palettized][qwen3-4b-mixed-yaml]     | 4.89\*                | iOS           | 18.80            |
 | Qwen3 8B   | none (`float16`)                                        | 16.00                 | macOS         | 12.19            |
 | Qwen3 8B   | [4-bit quantized][presets-info]                         | 4.50                  | macOS         | 12.90            |
-| Qwen3 8B   | [FP4 weights, FP8 activations & KV cache][presets-info] | 4.25                  | macOS (27.2+) | 13.69            |
-| Qwen3 8B   | [FP8 weights, FP8 activations & KV cache][presets-info] | 8.00                  | macOS (27.2+) | 12.31            |
+| Qwen3 8B   | [FP4 weights, FP8 activations & KV cache][presets-info] | 4.25                  | macOS (27.2+) | 14.34            |
+| Qwen3 8B   | [FP8 weights, FP8 activations & KV cache][presets-info] | 8.00                  | macOS (27.2+) | 12.87            |
 | Qwen3 8B   | none (`float16`)                                        | 16.00                 | iOS           | 12.19            |
 | Qwen3 8B   | [Mixed 4-bit/8-bit palettized][qwen3-8b-mixed-yaml]     | 4.90\*                | iOS           | 14.83            |
 
