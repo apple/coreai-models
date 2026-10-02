@@ -185,13 +185,13 @@ struct TemporalIndexTests {
     }
 }
 
-@Suite("VideoSegmenterBundle metadata")
+@Suite("VideoSegmentationBundle metadata")
 struct BundleMetadataTests {
     /// A minimal `video_segmenter` metadata document, plus whatever extra top-level blocks
     /// the caller needs.
     private func bundle(
         imageSize: Int = 1008, extraBlocks: String = ""
-    ) throws -> VideoSegmenterBundle {
+    ) throws -> VideoSegmentationBundle {
         try bundle(
             """
             {
@@ -207,8 +207,8 @@ struct BundleMetadataTests {
             """)
     }
 
-    private func bundle(_ json: String) throws -> VideoSegmenterBundle {
-        try VideoSegmenterBundle(
+    private func bundle(_ json: String) throws -> VideoSegmentationBundle {
+        try VideoSegmentationBundle(
             bundle: ModelBundle(
                 raw: Data(json.utf8),
                 bundlePath: URL(fileURLWithPath: "/tmp/does-not-need-to-exist")))
@@ -248,7 +248,7 @@ struct BundleMetadataTests {
         #expect(parsed.geometry.imageSize == 336)
     }
 
-    /// Every key ``VideoSegmenterBundle/Tracking`` understands, and the value the fixture
+    /// Every key ``VideoSegmentationBundle/Tracking`` understands, and the value the fixture
     /// assigns it. Kept in the test rather than derived, so adding a field to the fixture
     /// forces someone to come here and wire up the assertion below.
     private static let expectedTrackingKeys: Set<String> = [

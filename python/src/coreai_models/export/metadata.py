@@ -214,35 +214,6 @@ _METADATA: dict[str, AIModelMetadataFields] = {
         ),
     ),
     # ---- Diffusion ----
-    "runwayml/stable-diffusion-v1-5": AIModelMetadataFields(
-        author="Robin Rombach, Patrick Esser, et al.",
-        license="CreativeML Open RAIL-M",
-        model_description=(
-            "Stable Diffusion v1.5 is a latent text-to-image diffusion model "
-            "trained on a subset of LAION-5B that generates images from natural "
-            "language prompts. "
-            "Source: https://huggingface.co/runwayml/stable-diffusion-v1-5"
-        ),
-    ),
-    "sd2-community/stable-diffusion-2-1": AIModelMetadataFields(
-        author="Stability AI",
-        license="CreativeML Open RAIL++-M",
-        model_description=(
-            "Stable Diffusion 2.1 is a latent text-to-image diffusion model from "
-            "Stability AI, fine-tuned from SD 2.0 with reduced restrictive "
-            "filtering. "
-            "Source: https://huggingface.co/sd2-community/stable-diffusion-2-1"
-        ),
-    ),
-    "stabilityai/stable-diffusion-3.5-medium": AIModelMetadataFields(
-        author="Stability AI",
-        license="Stability AI Community License",
-        model_description=(
-            "Stable Diffusion 3.5 Medium is a Multimodal Diffusion Transformer "
-            "(MMDiT-X) text-to-image model from Stability AI. "
-            "Source: https://huggingface.co/stabilityai/stable-diffusion-3.5-medium"
-        ),
-    ),
     "black-forest-labs/FLUX.2-klein-4B": AIModelMetadataFields(
         author="Black Forest Labs",
         license="Apache-2.0",

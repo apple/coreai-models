@@ -70,17 +70,13 @@ public struct PipelineConfiguration: Hashable, Sendable {
     public var referenceGrid: ReferenceGrid
     public var guidanceMode: GuidanceMode
 
-    // VAE scale factors (from pipeline.json)
+    // VAE scale factors (from the metadata.json diffusion block)
     public var encoderScaleFactor: Float
     public var decoderScaleFactor: Float
     public var decoderShiftFactor: Float
 
     // Decode resolution
     public var decodeResolution: DecodeResolution
-
-    // SDXL geometry conditioning
-    public var originalSize: Float
-    public var targetSize: Float
 
     /// Load model components on demand and unload after each pipeline stage to reduce peak memory.
     /// Disable to keep all models resident and exercise full memory pressure (e.g. profiling peak footprint).
@@ -92,7 +88,7 @@ public struct PipelineConfiguration: Hashable, Sendable {
         seed: UInt32 = 0,
         stepCount: Int = 50,
         guidanceScale: Float = 7.5,
-        schedulerType: SchedulerType = .dpmSolverMultistep,
+        schedulerType: SchedulerType = .discreteFlow,
         startingImage: CGImage? = nil,
         strength: Float = 1.0,
         referenceGrid: ReferenceGrid = .full,
@@ -101,8 +97,6 @@ public struct PipelineConfiguration: Hashable, Sendable {
         decoderScaleFactor: Float = 0.18215,
         decoderShiftFactor: Float = 0.0,
         decodeResolution: DecodeResolution = .full,
-        originalSize: Float = 1024,
-        targetSize: Float = 1024,
         lazyModelLoading: Bool = true
     ) {
         self.prompt = prompt
@@ -119,8 +113,6 @@ public struct PipelineConfiguration: Hashable, Sendable {
         self.decoderScaleFactor = decoderScaleFactor
         self.decoderShiftFactor = decoderShiftFactor
         self.decodeResolution = decodeResolution
-        self.originalSize = originalSize
-        self.targetSize = targetSize
         self.lazyModelLoading = lazyModelLoading
     }
 
@@ -143,8 +135,6 @@ extension PipelineConfiguration {
         hasher.combine(decoderScaleFactor)
         hasher.combine(decoderShiftFactor)
         hasher.combine(decodeResolution)
-        hasher.combine(originalSize)
-        hasher.combine(targetSize)
         hasher.combine(lazyModelLoading)
     }
 
@@ -162,8 +152,6 @@ extension PipelineConfiguration {
             && lhs.decoderScaleFactor == rhs.decoderScaleFactor
             && lhs.decoderShiftFactor == rhs.decoderShiftFactor
             && lhs.decodeResolution == rhs.decodeResolution
-            && lhs.originalSize == rhs.originalSize
-            && lhs.targetSize == rhs.targetSize
             && lhs.lazyModelLoading == rhs.lazyModelLoading
     }
 }

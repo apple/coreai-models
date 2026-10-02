@@ -71,6 +71,10 @@ public struct ModelConfig: InferenceConfiguration, Codable, Sendable {
     var prefillChunkSizeOverride: Int?
     var prefillChunkThresholdOverride: Int?
 
+    /// Model-specific runtime settings from the bundle's `language.overrides`,
+    /// honored by the static-shape engine. nil for most models.
+    public var overrides: LanguageOverrides?
+
     public enum InputMode: String, Codable, Sendable {
         case random
         case allZeros = "all-zeros"
@@ -86,7 +90,8 @@ public struct ModelConfig: InferenceConfiguration, Codable, Sendable {
         function: String,
         inputMode: InputMode? = nil,
         prefillChunkSize: Int? = nil,
-        prefillChunkThreshold: Int? = nil
+        prefillChunkThreshold: Int? = nil,
+        overrides: LanguageOverrides? = nil
     ) {
         self.name = name
         self.tokenizer = tokenizer
@@ -98,6 +103,21 @@ public struct ModelConfig: InferenceConfiguration, Codable, Sendable {
         self.inputMode = inputMode
         self.prefillChunkSizeOverride = prefillChunkSize
         self.prefillChunkThresholdOverride = prefillChunkThreshold
+        self.overrides = overrides
+    }
+
+    /// The engine config for a bundle's language model: identity and sizes from the
+    /// bundle's `language` metadata, its `main` asset and function, and its overrides.
+    public init(bundle: LanguageModelBundle, source: ModelSource? = nil) {
+        self.init(
+            name: bundle.name,
+            tokenizer: bundle.tokenizer,
+            vocabSize: bundle.vocabSize,
+            maxContextLength: bundle.maxContextLength,
+            source: source,
+            serializedModel: [bundle.modelAssetPath],
+            function: bundle.language.functionMap?.name(for: "main") ?? "main",
+            overrides: bundle.overrides)
     }
 
     enum CodingKeys: String, CodingKey {
@@ -109,6 +129,7 @@ public struct ModelConfig: InferenceConfiguration, Codable, Sendable {
         case serializedModel = "serialized_model"
         case function
         case inputMode = "input_mode"
+        case overrides
     }
 
     public init(from decoder: Decoder) throws {
@@ -123,6 +144,7 @@ public struct ModelConfig: InferenceConfiguration, Codable, Sendable {
         self.inputMode = try c.decodeIfPresent(InputMode.self, forKey: .inputMode)
         self.prefillChunkSizeOverride = nil
         self.prefillChunkThresholdOverride = nil
+        self.overrides = try c.decodeIfPresent(LanguageOverrides.self, forKey: .overrides)
     }
 }
 

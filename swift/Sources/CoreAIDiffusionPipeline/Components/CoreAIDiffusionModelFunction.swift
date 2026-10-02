@@ -9,7 +9,7 @@ import CoreAIShared
 import Foundation
 
 /// Core AI diffusion model function — manages a single InferenceFunction
-/// for stateless model evaluation (text encoder, UNet, VAE).
+/// for stateless model evaluation (text encoder, denoiser, VAE).
 public actor CoreAIDiffusionModelFunction {
     private let modelURL: URL
     private var model: AIModel?

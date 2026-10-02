@@ -7,7 +7,7 @@
 
 Every diffusion pipeline quantizes its weights before ``torch.export`` through coreai-opt,
 rather than rewriting the exported Core AI program afterwards. These tests cover the
-presets, the module exclusions the text encoders and SD3's denoiser rely on, and the
+presets, the module exclusions the text encoders rely on, and the
 guards around the quantizer's in-place behaviour.
 
 CPU-only, toy modules. Nothing here downloads weights or runs an export.
@@ -26,10 +26,8 @@ from coreai_opt.quantization import QuantizerConfig
 from coreai_models.diffusion.components import (
     FLUX2_COMPONENTS,
     FLUX2_MULTIFUNCTION_TRANSFORMER,
-    SD3_COMPONENTS,
-    SD_COMPONENTS,
+    SANA_SPRINT_COMPONENTS,
     WAN_COMPONENTS,
-    TextEncoderWrapper,
     quant_weight_owner,
 )
 from coreai_models.diffusion.pipeline import _quantize_component_weights, _resolve_compression
@@ -47,6 +45,17 @@ class _TwoLinears(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.b(self.a(x))
+
+
+class _ModelWrapper(nn.Module):
+    """Minimal export-wrapper stand-in: stores the wrapped module as ``.model``."""
+
+    def __init__(self, inner: nn.Module) -> None:
+        super().__init__()
+        self.model = inner
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.model(x)
 
 
 class _MulNorm(nn.Module):
@@ -152,7 +161,7 @@ def test_presets_satisfy_the_coreai_opt_schema(name: str) -> None:
 @pytest.mark.parametrize(
     ("fq_name", "why"),
     [
-        ("diffusers.models.normalization.RMSNorm", "SD3 qk-norm"),
+        ("diffusers.models.normalization.RMSNorm", "diffusers RMSNorm (qk-norm)"),
         ("transformers.models.qwen3.modeling_qwen3.Qwen3RMSNorm", "FLUX.2 text encoder"),
         ("transformers.models.gemma2.modeling_gemma2.Gemma2RMSNorm", "Sana Sprint text encoder"),
         ("transformers.models.umt5.modeling_umt5.UMT5LayerNorm", "WAN text encoder"),
@@ -186,15 +195,13 @@ def test_resolve_compression_accepts_a_coreai_opt_json_config() -> None:
 def test_quant_weight_owner_returns_the_wrapped_model() -> None:
     """The owner is the wrapped model, not the export wrapper built around it."""
     inner = _TwoLinears()
-    assert quant_weight_owner(TextEncoderWrapper(inner)) is inner
+    assert quant_weight_owner(_ModelWrapper(inner)) is inner
 
 
 def test_quant_weight_owner_is_shared_across_wrappers_of_one_module() -> None:
     """Two specs over one module resolve to the same owner, which is what dedup keys on."""
     inner = _TwoLinears()
-    assert quant_weight_owner(TextEncoderWrapper(inner)) is quant_weight_owner(
-        TextEncoderWrapper(inner)
-    )
+    assert quant_weight_owner(_ModelWrapper(inner)) is quant_weight_owner(_ModelWrapper(inner))
 
 
 def test_quant_weight_owner_names_the_offender_when_the_convention_is_broken() -> None:
@@ -216,8 +223,6 @@ def test_quant_weight_owner_names_the_offender_when_the_convention_is_broken() -
 @pytest.mark.parametrize(
     ("registry", "names"),
     [
-        (SD_COMPONENTS, ("text_encoder", "unet")),
-        (SD3_COMPONENTS, ("text_encoder", "text_encoder_2")),
         (WAN_COMPONENTS, ("text_encoder",)),
     ],
 )
@@ -233,16 +238,16 @@ def test_cheap_components_reuse_their_export_dummies(registry, names) -> None:
         assert spec.quant_trace_fn() is spec.dummy_fn
 
 
-@pytest.mark.parametrize("registry", [SD3_COMPONENTS, WAN_COMPONENTS])
+@pytest.mark.parametrize("registry", [WAN_COMPONENTS])
 def test_denoisers_override_the_quant_trace(registry) -> None:
-    """The SD3 and WAN denoisers trace thousands of tokens at their export shape."""
+    """The WAN denoiser traces thousands of tokens at its export shape."""
     spec = registry["transformer"]
     assert spec.quant_dummy_fn is not None
     assert spec.quant_trace_fn() is not spec.dummy_fn
 
 
 def test_vae_components_stay_unquantized() -> None:
-    for registry in (FLUX2_COMPONENTS, SD_COMPONENTS, SD3_COMPONENTS, WAN_COMPONENTS):
+    for registry in (FLUX2_COMPONENTS, SANA_SPRINT_COMPONENTS, WAN_COMPONENTS):
         vaes = [name for name in registry if "vae" in name]
         assert vaes
         assert all(not registry[name].quantizable for name in vaes)

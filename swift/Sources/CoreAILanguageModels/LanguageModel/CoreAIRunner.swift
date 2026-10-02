@@ -19,7 +19,7 @@ import Tokenizers
 public struct CoreAIRunner {
     // MARK: - Properties
 
-    private let bundle: LanguageBundle
+    private let bundle: LanguageModelBundle
     private let engineVariant: String?
     private let kvCacheStrategy: KVCacheStrategy
     private let prefillChunkSizeOverride: Int?
@@ -36,7 +36,7 @@ public struct CoreAIRunner {
         prefillChunkThreshold: Int? = nil
     ) throws {
         self.init(
-            bundle: try LanguageBundle(at: url),
+            bundle: try LanguageModelBundle(at: url),
             variant: variant,
             kvCacheStrategy: kvCacheStrategy,
             prefillChunkSize: prefillChunkSize,
@@ -44,9 +44,9 @@ public struct CoreAIRunner {
         )
     }
 
-    /// Creates a runner from a LanguageBundle.
+    /// Creates a runner from a LanguageModelBundle.
     public init(
-        bundle: LanguageBundle,
+        bundle: LanguageModelBundle,
         variant: String? = nil,
         kvCacheStrategy: KVCacheStrategy = .auto,
         prefillChunkSize: Int? = nil,
@@ -63,6 +63,8 @@ public struct CoreAIRunner {
 
     /// Creates an inference engine using auto-detection.
     public func makeInferenceEngine() async throws -> any InferenceEngine {
+        try bundle.modelBundle.verifyAssetsExisting()
+
         let config = makeConfig()
         let configData = try JSONEncoder().encode(config)
 
@@ -73,12 +75,13 @@ public struct CoreAIRunner {
             variant: engineVariant,
             kvCacheStrategy: kvCacheStrategy,
             prefillChunkSize: resolvedChunkSize,
-            prefillChunkThreshold: resolvedThreshold
+            prefillChunkThreshold: resolvedThreshold,
+            tensorData: bundle.tensorData
         )
 
         return try await EngineFactory.createEngine(
             config: configData,
-            modelURL: try bundle.requireModelURL(for: ModelBundle.ComponentKey.main),
+            modelURL: try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.main),
             options: options
         )
     }
@@ -86,19 +89,8 @@ public struct CoreAIRunner {
     // MARK: - Private Helpers
 
     private func makeConfig() -> ModelConfig {
-        let functionName = bundle.language.functionMap?.name(for: "main") ?? "main"
-        let modelAsset = bundle.modelAssetPath
-        return ModelConfig(
-            name: bundle.name,
-            tokenizer: bundle.tokenizer,
-            vocabSize: bundle.vocabSize,
-            maxContextLength: bundle.maxContextLength,
-            source: ModelSource(
-                hfModelId: bundle.tokenizer,
-                modelDefinition: .pyTorch
-            ),
-            serializedModel: [modelAsset],
-            function: functionName
-        )
+        ModelConfig(
+            bundle: bundle,
+            source: ModelSource(hfModelId: bundle.tokenizer, modelDefinition: .pyTorch))
     }
 }

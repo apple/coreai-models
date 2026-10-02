@@ -64,6 +64,7 @@ public struct SpeechRecognitionBundle: Sendable {
             let bundle = try ModelBundle(at: url)
             switch bundle.kind {
             case .speechRecognizer:
+                try bundle.verifyAssetsExisting()
                 switch Self.architecture(from: bundle.raw) {
                 case .parakeetTDT:
                     let assets = try await Self.loadParakeetTDT(bundle: bundle)

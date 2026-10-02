@@ -76,10 +76,11 @@ struct LLMBenchmark: AsyncParsableCommand {
         print("Note: built in Debug mode. For more reliable results, build with -c release.")
         #endif
 
-        let bundle = try LanguageBundle(from: model)
+        let bundle = try LanguageModelBundle(from: model)
+        try bundle.modelBundle.verifyAssetsExisting()
         let vocabSize = bundle.vocabSize
 
-        let modelURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.main)
+        let modelURL = try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.main)
 
         if clearCoreAICache {
             let cleared = try PreparedModel.clearCache(at: bundle.bundlePath)
@@ -90,14 +91,7 @@ struct LLMBenchmark: AsyncParsableCommand {
         // time below. This only inspects the cache; it never triggers specialization.
         let cacheHit = PreparedModel.isCached(at: modelURL)
 
-        let engineConfig = ModelConfig(
-            name: bundle.name,
-            tokenizer: bundle.tokenizer,
-            vocabSize: vocabSize,
-            maxContextLength: bundle.maxContextLength,
-            serializedModel: [bundle.modelAssetPath],
-            function: bundle.language.functionMap?.name(for: "main") ?? "main"
-        )
+        let engineConfig = ModelConfig(bundle: bundle)
         let configData = try JSONEncoder().encode(engineConfig)
         print("\n⏳ Preparing AI asset...", terminator: "")
         fflush(stdout)
@@ -107,7 +101,8 @@ struct LLMBenchmark: AsyncParsableCommand {
         let resolvedChunkThreshold = chunkThreshold ?? bundle.language.prefillChunkThreshold
         let engineOptions = EngineOptions(
             prefillChunkSize: resolvedChunkSize,
-            prefillChunkThreshold: resolvedChunkThreshold
+            prefillChunkThreshold: resolvedChunkThreshold,
+            tensorData: bundle.tensorData
         )
         let prepareStart = SuspendingClock.now
         let engine = try await EngineFactory.createEngine(

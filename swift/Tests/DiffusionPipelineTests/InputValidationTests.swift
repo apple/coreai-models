@@ -145,7 +145,6 @@ struct InputValidationTests {
         let candidates = [
             "exports/FLUX.2-klein-4B/VAEDecoder_half.aimodel",
             "exports/FLUX.2-klein-4B/VAEDecoder.aimodel",
-            "exports/stable-diffusion-3.5-medium/VAEDecoder.aimodel",
         ]
         for candidate in candidates {
             let url = repoRoot.appendingPathComponent(candidate)

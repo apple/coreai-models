@@ -344,22 +344,28 @@ extension SamplingConfiguration {
         return sampleToken(from: &logits, step: step)
     }
 
-    /// Samples the next token with repetition penalty applied first.
+    /// Samples the next token with the logits processors applied first.
     ///
-    /// Applies repetition penalty (if configured) to the logits based on token history,
-    /// then delegates to the standard sampler pipeline.
+    /// Applies the model's final-logit soft cap (if given), then repetition penalty (if
+    /// configured) based on token history, then delegates to the standard sampler pipeline.
     ///
     /// - Parameters:
     ///   - logits: Mutable array of Float16 logits. May be modified during sampling.
     ///   - tokenHistory: Recent token IDs for repetition penalty.
     ///   - step: Generation step index. Required when `seed` is set (each step derives its own
     ///     generator from `(seed, step)`); ignored otherwise.
+    ///   - logitSoftcap: The model's final-logit soft cap, for models whose graph leaves it
+    ///     out; see ``LogitSoftcapProcessor``.
     /// - Returns: The sampled token ID.
     public func fallbackSampler(
         from logits: inout [LogitsScalarType],
         tokenHistory: some Collection<Int32>,
-        step: Int? = nil
+        step: Int? = nil,
+        logitSoftcap: Double? = nil
     ) -> Int32 {
+        if let logitSoftcap {
+            LogitSoftcapProcessor.apply(to: &logits, cap: Float(logitSoftcap))
+        }
         if needsRepetitionPenalty {
             let window = repetitionPenaltyWindow.map { min($0, tokenHistory.count) } ?? tokenHistory.count
             let recentTokens = tokenHistory.suffix(window)

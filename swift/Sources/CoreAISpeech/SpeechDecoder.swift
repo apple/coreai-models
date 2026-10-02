@@ -168,8 +168,9 @@ public struct WhisperDecoder: SpeechDecoder {
             let t0 = ContinuousClock.now
             try await step(tokens.last!, pos: pos)
             stepTimesMs.append((ContinuousClock.now - t0).inMilliseconds)
-            let logits = flattenAsFloat(logitsArray)
-            let next = Int32(logits.indices.max(by: { logits[$0] < logits[$1] })!)
+            // Scan the logits in place; `argmaxFloat` ties to the lowest index (same as the
+            // previous `max(by:)`) without flattening a whole vocab row per step.
+            let next = Int32(argmaxFloat(logitsArray, in: 0..<vocabSize))
             tokens.append(next)
             pos += 1
             if next == config.eotToken { break }

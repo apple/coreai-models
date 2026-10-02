@@ -427,6 +427,12 @@ if _HAS_MLX:
 # ---------------------------------------------------------------------------
 
 
+def _randn_linear_weight(out_features: int, in_features: int) -> torch.Tensor:
+    """Variance-preserving init; raw randn blows activations up to ~100, where
+    bf16 rounding error exceeds the fixed atol and the test flakes by seed."""
+    return torch.randn(out_features, in_features) / in_features**0.5
+
+
 class Qwen3Attention(Model):
     _model_name = "Qwen3Attention"
 
@@ -455,8 +461,10 @@ class Qwen3Attention(Model):
 
         # Pre-generate shared weights (no bias for Qwen3)
         qkv_total_size = (num_attention_heads + 2 * num_key_value_heads) * head_dim
-        self._qkv_proj_weight = torch.randn(qkv_total_size, self._hidden_size)
-        self._o_proj_weight = torch.randn(self._hidden_size, num_attention_heads * head_dim)
+        self._qkv_proj_weight = _randn_linear_weight(qkv_total_size, self._hidden_size)
+        self._o_proj_weight = _randn_linear_weight(
+            self._hidden_size, num_attention_heads * head_dim
+        )
 
         # Pre-generate Q/K norm weights (head_dim sized)
         self._q_norm_weight = torch.randn(head_dim)
@@ -638,17 +646,19 @@ class Qwen3TransformerBlock(Model):
 
         # Pre-generate shared attention weights (no bias for Qwen3)
         qkv_total_size = (num_attention_heads + 2 * num_key_value_heads) * head_dim
-        self._qkv_proj_weight = torch.randn(qkv_total_size, self._hidden_size)
-        self._o_proj_weight = torch.randn(self._hidden_size, num_attention_heads * head_dim)
+        self._qkv_proj_weight = _randn_linear_weight(qkv_total_size, self._hidden_size)
+        self._o_proj_weight = _randn_linear_weight(
+            self._hidden_size, num_attention_heads * head_dim
+        )
 
         # Pre-generate Q/K norm weights (head_dim sized)
         self._q_norm_weight = torch.randn(head_dim)
         self._k_norm_weight = torch.randn(head_dim)
 
         # Pre-generate shared MLP weights
-        self._gate_weight = torch.randn(intermediate_size, self._hidden_size)
-        self._up_weight = torch.randn(intermediate_size, self._hidden_size)
-        self._down_weight = torch.randn(self._hidden_size, intermediate_size)
+        self._gate_weight = _randn_linear_weight(intermediate_size, self._hidden_size)
+        self._up_weight = _randn_linear_weight(intermediate_size, self._hidden_size)
+        self._down_weight = _randn_linear_weight(self._hidden_size, intermediate_size)
 
         # Pre-generate shared layernorm weights
         self._input_ln_weight = torch.randn(self._hidden_size)
@@ -859,6 +869,8 @@ class TestQwen3Layers:
         if num_key_value_heads > num_attention_heads:
             pytest.skip("num_key_value_heads > num_attention_heads is invalid")
 
+        # Weights and inputs are random; seed so results don't depend on test order.
+        torch.manual_seed(0)
         # Disable fused KV for the entire test so Core AI model uses
         # separate q_norm/k_norm (matching HF) during both construction
         # and forward.

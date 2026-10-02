@@ -368,10 +368,8 @@ func runLegacy(model: String, audioPath: String?, warmup: Bool) async throws {
             _ = try await fn.run(
                 inputs: ["input_features": melArray, "decoder_input_ids": ids],
                 states: InferenceFunction.MutableViews(), outputViews: consume out)
-            let logits = flattenAsFloat(la)
             let base = (seqLen - 1) * vocabSize
-            let next = Int32(
-                (0..<vocabSize).max(by: { logits[base + $0] < logits[base + $1] })!)
+            let next = Int32(argmaxFloat(la, in: base..<(base + vocabSize)))
             warmupTokens.append(next)
             if next == config.eotToken { break }
         }
@@ -393,10 +391,8 @@ func runLegacy(model: String, audioPath: String?, warmup: Bool) async throws {
             states: InferenceFunction.MutableViews(), outputViews: consume out)
         let thisStepTime = ContinuousClock.now - t0
         stepTimesMs.append(thisStepTime.inMilliseconds)
-        let logits = flattenAsFloat(la)
         let base = (seqLen - 1) * vocabSize
-        let next = Int32(
-            (0..<vocabSize).max(by: { logits[base + $0] < logits[base + $1] })!)
+        let next = Int32(argmaxFloat(la, in: base..<(base + vocabSize)))
         tokens.append(next)
         if next == config.eotToken { break }
     }
