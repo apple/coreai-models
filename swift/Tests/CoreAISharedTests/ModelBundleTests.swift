@@ -104,34 +104,37 @@ struct ModelBundleTests {
         #expect(String(describing: error).contains("model.aimodelc"))
     }
 
-    @Test("resolveAssetURL falls back from .aimodel to a compiled .aimodelc")
-    func resolveAssetFallsBackToCompiled() throws {
-        // Mirrors a bundle produced by `coreai-build compile`: metadata.json still
-        // names the .aimodel, but only the compiled .aimodelc exists on disk.
-        let dir = FileManager.default.temporaryDirectory.appending(
-            path: "ModelBundleTests-\(UUID().uuidString)"
-        )
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
-        let compiled = dir.appending(path: "TextEncoder.aimodelc")
+    @Test(
+        "verifyAssetsExisting() throws missingAsset when the declared asset isn't on disk, even if a compiled variant is"
+    )
+    func verifyThrowsOnMissingDeclaredAsset() throws {
+        let url = try Self.tempBundle(
+            """
+            {
+              "metadata_version": "0.2",
+              "kind": "llm",
+              "name": "qwen3-0.6b",
+              "assets": { "main": "model.aimodel" },
+              "language": {
+                "tokenizer": "Qwen/Qwen3-0.6B",
+                "vocab_size": 151936,
+                "max_context_length": 8192
+              }
+            }
+            """)
+        // Only the compiled variant exists — metadata.json still declares the source name.
+        let compiled = url.appending(path: "model.aimodelc")
         try FileManager.default.createDirectory(at: compiled, withIntermediateDirectories: true)
 
-        let resolved = ModelBundle.resolveAssetURL("TextEncoder.aimodel", in: dir)
-        #expect(resolved == compiled)
-        #expect(FileManager.default.fileExists(atPath: resolved.path))
-    }
-
-    @Test("resolveAssetURL prefers an existing .aimodel over the compiled variant")
-    func resolveAssetPrefersUncompiled() throws {
-        let dir = FileManager.default.temporaryDirectory.appending(
-            path: "ModelBundleTests-\(UUID().uuidString)"
-        )
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
-        let asset = dir.appending(path: "TextEncoder.aimodel")
-        try FileManager.default.createDirectory(at: asset, withIntermediateDirectories: true)
-
-        let resolved = ModelBundle.resolveAssetURL("TextEncoder.aimodel", in: dir)
-        #expect(resolved == asset)
+        let bundle = try ModelBundle(at: url)
+        let error = #expect(throws: ModelBundle.BundleError.self) {
+            try bundle.verifyAssetsExisting()
+        }
+        guard case .missingAsset(let key, let path) = error else {
+            Issue.record("expected missingAsset, got \(String(describing: error))")
+            return
+        }
+        #expect(key == "main")
+        #expect(path.lastPathComponent == "model.aimodel")
     }
 }

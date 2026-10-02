@@ -6,7 +6,7 @@
 import Accelerate
 import Foundation
 
-/// Discrete flow matching scheduler for SD3, Flux and Sana Sprint models.
+/// Discrete flow matching scheduler for Flux, Wan and Sana Sprint models.
 /// Uses Euler method on a flow-matching ODE (sigma interpolation between noise and data),
 /// or stochastic sampling (`stepStochastic`) for consistency-distilled models.
 public final class DiscreteFlowScheduler {
@@ -55,7 +55,7 @@ public final class DiscreteFlowScheduler {
                 expMu / (expMu + (1.0 / sigma - 1.0))
             }
         } else if timeStepShift != 1.0 {
-            // Static shift (Wan, SD3): match diffusers FlowMatchEulerDiscreteScheduler.
+            // Static shift (Wan): match diffusers FlowMatchEulerDiscreteScheduler.
             // Algorithm: linspace in timestep space from sigma_max*T to sigma_min*T
             // (where sigma_min = shift(1/T)), then divide by T, then apply shift.
             let ts = Float(trainStepCount)

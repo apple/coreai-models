@@ -6,7 +6,7 @@
 import CoreAI
 import Foundation
 
-/// Core AI denoiser — wraps a UNet or DiT/MMDiT model function.
+/// Core AI denoiser — wraps a DiT model function.
 public final class CoreAIDenoiser: Sendable {
     public let function: CoreAIDiffusionModelFunction
 

@@ -67,12 +67,12 @@ public struct WanPipeline: VideoPipeline {
         textEncoder: CoreAIDiffusionModelFunction,
         decoder: CoreAIDiffusionModelFunction,
         tokenizer: any Tokenizer,
-        textDim: Int = 4096,
-        latentChannels: Int = 16,
-        defaultSteps: Int = 50,
-        defaultGuidanceScale: Float = 5.0,
-        schedulerShift: Float = 3.0,
-        defaultFrameCount: Int = 81,
+        textDim: Int = DiffusionDefaults.Video.textDim,
+        latentChannels: Int = DiffusionDefaults.Video.latentChannels,
+        defaultSteps: Int = DiffusionDefaults.Video.steps,
+        defaultGuidanceScale: Float = DiffusionDefaults.Video.guidanceScale,
+        schedulerShift: Float = DiffusionDefaults.Video.schedulerShift,
+        defaultFrameCount: Int = DiffusionDefaults.Video.frameCount,
         lazyModelLoading: Bool = true
     ) {
         self.transformer = transformer
@@ -89,34 +89,33 @@ public struct WanPipeline: VideoPipeline {
     }
 
     public init(from url: URL, lazyModelLoading: Bool = true) async throws {
-        let metadataURL = url.appendingPathComponent("metadata.json")
-        let metadataData = try Data(contentsOf: metadataURL)
-        guard let json = try JSONSerialization.jsonObject(with: metadataData) as? [String: Any],
-            let diffusion = json["diffusion"] as? [String: Any]
-        else {
-            throw WanError.invalidMetadata("metadata.json missing 'diffusion' block")
-        }
+        // Video diffusion shares `DiffusionBundle` with image diffusion; the
+        // `.videoDiffusion` kind tag routes here. Asset filenames stay fixed
+        // (below) rather than coming from the bundle's `assets` map.
+        let bundle = try DiffusionBundle(at: url)
+        let config = bundle.config
 
-        let textDim = diffusion["text_dim"] as? Int ?? 4096
-        let latentChannels = diffusion["z_dim"] as? Int ?? 16
-        let defaultSteps = diffusion["default_steps"] as? Int ?? 50
-        let defaultGuidanceScale = (diffusion["default_guidance_scale"] as? NSNumber)?.floatValue ?? 5.0
-        let shift = (diffusion["default_shift"] as? NSNumber)?.floatValue ?? 3.0
-        let defaultFrameCount = diffusion["default_num_frames"] as? Int ?? 81
+        let textDim = config.textDim ?? DiffusionDefaults.Video.textDim
+        let latentChannels = config.latentChannels ?? DiffusionDefaults.Video.latentChannels
+        let defaultSteps = config.defaultSteps ?? DiffusionDefaults.Video.steps
+        let defaultGuidanceScale = config.defaultGuidanceScale ?? DiffusionDefaults.Video.guidanceScale
+        let shift = config.schedulerShift ?? DiffusionDefaults.Video.schedulerShift
+        let defaultFrameCount = config.defaultNumFrames ?? DiffusionDefaults.Video.frameCount
 
         let tokenizerURL = url.appendingPathComponent("tokenizer")
         let tokenizer = try await AutoTokenizer.from(modelFolder: tokenizerURL)
 
+        let transformerURL = try resolveExistingPipelineAsset(
+            Asset.transformer, in: url, component: DiffusionComponentKey.transformer)
+        let textEncoderURL = try resolveExistingPipelineAsset(
+            Asset.textEncoder, in: url, component: DiffusionComponentKey.textEncoder)
+        let decoderURL = try resolveExistingPipelineAsset(
+            Asset.vaeDecoder, in: url, component: DiffusionComponentKey.vaeDecoder)
+
         self.init(
-            transformer: CoreAIDiffusionModelFunction(
-                modelURL: ModelBundle.resolveAssetURL("Transformer.aimodel", in: url)
-            ),
-            textEncoder: CoreAIDiffusionModelFunction(
-                modelURL: ModelBundle.resolveAssetURL("TextEncoder.aimodel", in: url)
-            ),
-            decoder: CoreAIDiffusionModelFunction(
-                modelURL: ModelBundle.resolveAssetURL("VAEDecoder.aimodel", in: url)
-            ),
+            transformer: CoreAIDiffusionModelFunction(modelURL: transformerURL),
+            textEncoder: CoreAIDiffusionModelFunction(modelURL: textEncoderURL),
+            decoder: CoreAIDiffusionModelFunction(modelURL: decoderURL),
             tokenizer: tokenizer,
             textDim: textDim,
             latentChannels: latentChannels,
@@ -126,6 +125,13 @@ public struct WanPipeline: VideoPipeline {
             defaultFrameCount: defaultFrameCount,
             lazyModelLoading: lazyModelLoading
         )
+    }
+
+    /// Wan bundles use fixed component filenames; the metadata `assets` names are not consulted here.
+    private enum Asset {
+        static let transformer = "Transformer.aimodel"
+        static let textEncoder = "TextEncoder.aimodel"
+        static let vaeDecoder = "VAEDecoder.aimodel"
     }
 
     // MARK: - VideoPipeline

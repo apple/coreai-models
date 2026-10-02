@@ -194,51 +194,6 @@ struct RNGTests {
 
 @Suite("Schedulers")
 struct SchedulerTests {
-    @Test("PNDM timesteps are decreasing")
-    func pndmTimesteps() {
-        let scheduler = PNDMScheduler(stepCount: 20)
-        let ts = scheduler.timeSteps
-        #expect(ts.count == 21)  // stepCount - 1 + 2 extra
-        #expect(ts.first! > ts.last!)
-    }
-
-    @Test("PNDM step produces output of same size as input")
-    func pndmStepShape() {
-        let scheduler = PNDMScheduler(stepCount: 20)
-        let sample = [Float](repeating: 1.0, count: 64)
-        let noise = [Float](repeating: 0.5, count: 64)
-        let result = scheduler.step(output: noise, timeStep: scheduler.timeSteps[0], sample: sample)
-        #expect(result.count == 64)
-    }
-
-    @Test("PNDM multiple steps reduce noise")
-    func pndmConverges() {
-        let scheduler = PNDMScheduler(stepCount: 20)
-        var sample = [Float](repeating: 1.0, count: 16)
-        for t in scheduler.timeSteps {
-            let noise = [Float](repeating: 0.01, count: 16)
-            sample = scheduler.step(output: noise, timeStep: t, sample: sample)
-        }
-        let magnitude = sample.map { abs($0) }.reduce(0, +) / Float(sample.count)
-        #expect(magnitude < 100)
-    }
-
-    @Test("DPM-Solver++ timesteps are decreasing")
-    func dpmTimesteps() {
-        let scheduler = DPMSolverMultistepScheduler(stepCount: 20)
-        let ts = scheduler.timeSteps
-        #expect(ts.first! > ts.last!)
-    }
-
-    @Test("DPM-Solver++ step produces output of same size")
-    func dpmStepShape() {
-        let scheduler = DPMSolverMultistepScheduler(stepCount: 20)
-        let sample = [Float](repeating: 1.0, count: 64)
-        let noise = [Float](repeating: 0.5, count: 64)
-        let result = scheduler.step(output: noise, timeStep: scheduler.timeSteps[0], sample: sample)
-        #expect(result.count == 64)
-    }
-
     @Test("DiscreteFlow timesteps constructed correctly")
     func flowTimesteps() {
         let scheduler = DiscreteFlowScheduler(stepCount: 28, trainStepCount: 1000, timeStepShift: 3.0)
@@ -286,15 +241,6 @@ struct SchedulerTests {
         #expect(abs(lastSigma) < 0.2)
     }
 
-    @Test("PNDM calculateTimesteps with strength")
-    func pndmStrength() {
-        let scheduler = PNDMScheduler(stepCount: 20)
-        let full = scheduler.calculateTimesteps(strength: nil)
-        let half = scheduler.calculateTimesteps(strength: 0.5)
-        #expect(half.count < full.count)
-        #expect(half.count == full.count - 10)
-    }
-
     @Test("linspace produces correct endpoints")
     func linspaceEndpoints() {
         let result = linspace(0.0, 1.0, 11)
@@ -302,16 +248,6 @@ struct SchedulerTests {
         #expect(abs(result.first! - 0.0) < 1e-6)
         #expect(abs(result.last! - 1.0) < 1e-6)
         #expect(abs(result[5] - 0.5) < 1e-6)
-    }
-
-    @Test("weightedSum is correct")
-    func weightedSumCorrect() {
-        let a: [Float] = [1, 2, 3]
-        let b: [Float] = [4, 5, 6]
-        let result = weightedSum([0.5, 0.5], [a, b])
-        #expect(abs(result[0] - 2.5) < 1e-6)
-        #expect(abs(result[1] - 3.5) < 1e-6)
-        #expect(abs(result[2] - 4.5) < 1e-6)
     }
 
     @Test("addNoise blends sample and noise correctly at boundary and midpoint strengths")

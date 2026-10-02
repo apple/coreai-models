@@ -12,9 +12,6 @@ the families known to work end-to-end through the export pipeline.
 
 # Each entry: (family name, example HF model ID, pipeline_type)
 SUPPORTED_MODELS: list[tuple[str, str, str]] = [
-    ("stable-diffusion-1.x", "runwayml/stable-diffusion-v1-5", "sd"),
-    ("stable-diffusion-2.x", "sd2-community/stable-diffusion-2-1", "sd"),
-    ("stable-diffusion-3.x", "stabilityai/stable-diffusion-3.5-medium", "sd3"),
     ("flux2", "black-forest-labs/FLUX.2-klein-4B", "flux2"),
     ("wan-t2v-1.3b", "Wan-AI/Wan2.1-T2V-1.3B-Diffusers", "wan"),
     ("sana-sprint-0.6b", "Efficient-Large-Model/Sana_Sprint_0.6B_1024px_diffusers", "sana_sprint"),
@@ -29,7 +26,7 @@ def list_models() -> list[str]:
 def get_pipeline_type(model_id: str) -> str:
     """Determine the pipeline type for a given HF model ID.
 
-    Returns "sd", "sd3", "flux2", "wan", or "sana_sprint". Raises ValueError for unknown models.
+    Returns "flux2", "wan", or "sana_sprint". Raises ValueError for unknown models.
     """
     for _, known_id, ptype in SUPPORTED_MODELS:
         if model_id == known_id:
@@ -39,3 +36,13 @@ def get_pipeline_type(model_id: str) -> str:
         f"Unknown diffusion model: '{model_id}'. "
         f"Supported models: {[mid for _, mid, _ in SUPPORTED_MODELS]}"
     )
+
+
+# Pipeline types derived from SUPPORTED_MODELS above (order-preserving, deduped).
+SUPPORTED_PIPELINE_TYPES: list[str] = list(dict.fromkeys(ptype for _, _, ptype in SUPPORTED_MODELS))
+
+
+def unknown_pipeline_type_error(pipeline_type: str) -> ValueError:
+    """Uniform error for an unrecognized diffusion pipeline type."""
+    supported = ", ".join(f"'{t}'" for t in SUPPORTED_PIPELINE_TYPES)
+    return ValueError(f"Unknown pipeline type: '{pipeline_type}'. Supported: {supported}.")

@@ -61,8 +61,8 @@ extension FlowTransformerPipeline {
         let scheduler = DiscreteFlowScheduler(
             sigmas: Self.sanaSprintSigmas(
                 steps: configuration.stepCount,
-                maxTimestep: descriptor.maxTimesteps ?? 1.5708,
-                intermediateTimestep: descriptor.intermediateTimesteps))
+                maxTimestep: config.maxTimesteps ?? DiffusionDefaults.Sana.maxTimesteps,
+                intermediateTimestep: config.intermediateTimesteps))
 
         let guidanceScale = configuration.guidanceScale
         let transformer = transformer
@@ -77,7 +77,7 @@ extension FlowTransformerPipeline {
             ])
         }
 
-        let scaleFactor = descriptor.decoderScaleFactor ?? 1.0
+        let scaleFactor = config.decoderScaleFactor ?? DiffusionDefaults.Sana.decoderScaleFactor
         return DenoisingPlan(
             latents: noise,
             scheduler: scheduler,
@@ -95,14 +95,14 @@ extension FlowTransformerPipeline {
     /// Mirrors diffusers `SanaSprintPipeline._get_gemma_prompt_embeds`: lowercase and strip
     /// the prompt, prepend the instruction, add BOS, and right-pad to the traced length.
     func encodeSanaPrompt(_ prompt: String) async throws -> (embeddings: [Float], mask: [Float]) {
-        guard let inputLength = descriptor.textInputLength,
-            let outputLength = descriptor.textSequenceLength
+        guard let inputLength = config.textInputLength,
+            let outputLength = config.textSequenceLength
         else {
             throw PipelineLoadError.missingConfig("text_input_length / text_sequence_length")
         }
 
         let cleaned = prompt.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
-        var ids = tokenizer.encode(text: (descriptor.promptPrefix ?? "") + cleaned)
+        var ids = tokenizer.encode(text: (config.promptPrefix ?? "") + cleaned)
         if ids.count > inputLength { ids = Array(ids.prefix(inputLength)) }
         let realTokenCount = ids.count
         let padTokenId = tokenizer.convertTokenToId("<pad>") ?? 0

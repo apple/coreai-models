@@ -417,36 +417,6 @@ LLM_PRESETS: list[ModelPreset] = [
 
 DIFFUSION_PRESETS: list[ModelPreset] = [
     ModelPreset(
-        "sd-1.5",
-        "runwayml/stable-diffusion-v1-5",
-        "stable-diffusion",
-        "diffusion",
-        None,
-        "none",
-        "float16",
-        None,
-    ),
-    ModelPreset(
-        "sd-2.1",
-        "sd2-community/stable-diffusion-2-1",
-        "stable-diffusion",
-        "diffusion",
-        None,
-        "none",
-        "float32",
-        None,
-    ),
-    ModelPreset(
-        "sd-3.5-medium",
-        "stabilityai/stable-diffusion-3.5-medium",
-        "stable-diffusion-3",
-        "diffusion",
-        None,
-        "none",
-        "float32",
-        None,
-    ),
-    ModelPreset(
         "flux2-klein-4b",
         "black-forest-labs/FLUX.2-klein-4B",
         "flux2",
@@ -836,7 +806,7 @@ def _preset_to_output_name(preset: ModelPreset) -> str:
     preset points at a YAML config, the YAML stem (which encodes model identity)
     replaces the `<hf_tail>_<compression>` segment to avoid duplication.
 
-    Diffusion: the HF id's tail (e.g. `stable-diffusion-v1-5`); the export
+    Diffusion: the HF id's tail (e.g. `FLUX.2-klein-4B`); the export
     tool writes a directory of components there.
     """
     tail = preset.hf_id.split("/")[-1]
