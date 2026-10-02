@@ -169,7 +169,6 @@ AIModelAsset.load("outputModel.aimodel").update_metadata(
 ### Diffusion Models
 
 ```bash
-uv run coreai.diffusion.export stabilityai/stable-diffusion-3.5-medium
 uv run coreai.diffusion.export black-forest-labs/FLUX.2-klein-4B
 uv run coreai.diffusion.export sana-sprint-0.6b
 ```
@@ -211,7 +210,6 @@ uv run models/<name>/export.py --include-debug-info   # embed debug information 
 
 ### Diffusion Models
 
-- [Stable Diffusion 1.5, 2.1, 3.5 Medium](stable-diffusion/)
 - [FLUX.2](flux2)
 - [Sana Sprint](sana)
 

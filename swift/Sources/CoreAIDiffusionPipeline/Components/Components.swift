@@ -10,7 +10,7 @@ import CoreGraphics
 public struct TextEncoderOutput: Sendable {
     /// Token-level embeddings [1, seq_len, hidden_dim].
     public let hiddenStates: NDArray
-    /// Sentence-level embedding [1, hidden_dim]. Nil for single-output encoders (e.g. SD 1.5 CLIP-L).
+    /// Sentence-level embedding [1, hidden_dim]. Nil for single-output encoders (e.g. T5).
     public let pooledOutput: NDArray?
 
     public init(hiddenStates: NDArray, pooledOutput: NDArray? = nil) {

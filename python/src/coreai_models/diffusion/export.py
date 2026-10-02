@@ -48,8 +48,6 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="+",
         default=None,
         help="Components to export (default: all). "
-        "SD 1.x/2.x: text_encoder unet vae_decoder vae_encoder. "
-        "SD 3.x: text_encoder text_encoder_2 transformer vae_decoder. "
         "FLUX.2: transformer text_encoder vae_decoder vae_encoder. "
         "Sana Sprint: transformer text_encoder vae_decoder.",
     )

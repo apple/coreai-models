@@ -158,38 +158,40 @@ public final class GrowingNDArrayState: SyncStateHandler {
         let srcBlockStride = srcShape[sequenceDim...].reduce(1, *)
         let dstBlockStride = dstShape[sequenceDim...].reduce(1, *)
 
-        switch source.scalarType {
-        case .float16, .bfloat16:
-            // KV states are 16-bit and this is a raw block copy, so reinterpret the bytes as
-            // UInt16. A typed `view(as: Float16.self)` traps on a BFloat16 array (the scalar
-            // types must match), and the element values are copied verbatim either way.
-            source.rawView().withUnsafeBytes { srcRaw, _, _ in
-                let srcPtr = srcRaw.assumingMemoryBound(to: UInt16.self)
-                destination.mutableRawView().withUnsafeMutableBytes { dstRaw, _, _ in
-                    let dstPtr = dstRaw.assumingMemoryBound(to: UInt16.self)
-                    for block in 0..<numBlocks {
-                        dstPtr.advanced(by: block * dstBlockStride).update(
-                            from: srcPtr.advanced(by: block * srcBlockStride), count: copyElements)
-                    }
-                }
-            }
-        case .float32:
-            source.view(as: Float.self).withUnsafePointer { srcPtr, _, _ in
-                var dstView = destination.mutableView(as: Float.self)
-                dstView.withUnsafeMutablePointer { dstPtr, _, _ in
-                    for block in 0..<numBlocks {
-                        dstPtr.advanced(by: block * dstBlockStride).update(
-                            from: srcPtr.advanced(by: block * srcBlockStride), count: copyElements)
-                    }
-                }
-            }
-        default:
-            preconditionFailure("Unsupported scalar type for state copy: \(source.scalarType)")
-        }
+        copyBlockPrefixes(
+            from: source, to: &destination, blockCount: numBlocks, sourceBlockStride: srcBlockStride,
+            destinationBlockStride: dstBlockStride, runElements: copyElements)
     }
 }
 
 // MARK: - Shared Utilities
+
+/// Copies the leading `runElements` elements of each of `blockCount` blocks from
+/// `source` to `destination`, whose blocks start every `sourceBlockStride` and
+/// `destinationBlockStride` elements respectively.
+///
+/// A raw byte copy: a typed `view(as: Float16.self)` traps on a BFloat16 array (the
+/// scalar types must match), and the element values are copied verbatim either way.
+func copyBlockPrefixes(
+    from source: NDArray, to destination: inout NDArray,
+    blockCount: Int, sourceBlockStride: Int, destinationBlockStride: Int, runElements: Int
+) {
+    let width: Int
+    switch source.scalarType {
+    case .float16, .bfloat16: width = 2
+    case .float32: width = 4
+    default: preconditionFailure("Unsupported scalar type for state copy: \(source.scalarType)")
+    }
+    source.rawView().withUnsafeBytes { sourceBytes, _, _ in
+        destination.mutableRawView().withUnsafeMutableBytes { destinationBytes, _, _ in
+            for block in 0..<blockCount {
+                (destinationBytes + block * destinationBlockStride * width).copyMemory(
+                    from: sourceBytes + block * sourceBlockStride * width,
+                    byteCount: runElements * width)
+            }
+        }
+    }
+}
 
 func zeroFillNDArray(_ array: inout NDArray) {
     let count = array.shape.reduce(1, *)

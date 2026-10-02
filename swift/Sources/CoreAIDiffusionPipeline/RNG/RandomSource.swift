@@ -11,8 +11,8 @@ import Foundation
 /// different Python frameworks. Using the matching source guarantees the same seed
 /// produces the same image across platforms.
 ///
-/// - ``TorchRandomSource``: Default. Matches PyTorch (`torch.manual_seed`). Used by SDXL, SD3, Flux.
-/// - ``NumPyRandomSource``: Matches NumPy (`numpy.random.RandomState`). Used by SD 1.5/2.x.
+/// - ``TorchRandomSource``: Default. Matches PyTorch (`torch.manual_seed`). Used by Flux and most modern diffusion models.
+/// - ``NumPyRandomSource``: Matches NumPy's legacy `numpy.random.RandomState`.
 /// - ``NvRandomSource``: Matches NVIDIA cuRAND (Philox). Used by some ComfyUI/Automatic1111 workflows.
 ///
 /// The implementations are direct ports of MT19937 / Philox; do not refactor the

@@ -6,8 +6,8 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "coreai-core==1.0.0b2",
-#     "coreai-torch==0.4.1",
+#     "coreai-core==1.0.0b3",
+#     "coreai-torch==0.4.3",
 #     "torchaudio",
 # ]
 #
@@ -130,8 +130,6 @@ def create_wav2vec2(
     )
     coreai_program = converter.to_coreai()
     print("[INFO] Model converted.")
-    coreai_program.optimize()
-    print("[INFO] Model optimized.")
 
     model_path = _asset_path(output_dir, model_name, dtype, dynamic)
     _save_asset(coreai_program, model_path, overwrite)

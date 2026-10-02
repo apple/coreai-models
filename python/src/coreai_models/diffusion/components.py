@@ -6,8 +6,8 @@
 """
 Diffusion component specifications and torch wrappers.
 
-Each diffusion pipeline is made of independent components (text encoder, UNet,
-VAE decoder, VAE encoder) that are exported separately.  A ComponentSpec
+Each diffusion pipeline is made of independent components (text encoder,
+transformer, VAE decoder, VAE encoder) that are exported separately.  A ComponentSpec
 captures everything needed to export one component: its I/O names, a thin
 torch.nn.Module wrapper that normalises the HF output, and a factory for
 dummy inputs.
@@ -39,6 +39,7 @@ from coreai_models.diffusion.flux2 import (
     dummy_flux2_vae_encoder,
     dummy_flux2_vae_encoder_half,
 )
+from coreai_models.diffusion.models import unknown_pipeline_type_error
 from coreai_models.diffusion.sana import (
     SanaTextEncoderWrapper,
     SanaTransformerWrapper,
@@ -64,68 +65,6 @@ from coreai_models.diffusion.wan import (
 # Torch wrappers — thin adapters that extract the tensor we need from the
 # HuggingFace model's rich output objects.
 # ---------------------------------------------------------------------------
-
-
-class TextEncoderWrapper(torch.nn.Module):
-    def __init__(self, text_encoder: torch.nn.Module) -> None:
-        super().__init__()
-        self.model = text_encoder
-
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return cast(torch.Tensor, self.model(input_ids).last_hidden_state)
-
-
-class TextEncoderWithPooledWrapper(torch.nn.Module):
-    """Returns (last_hidden_state, pooled). Used by SD3 CLIP-L and CLIP-G."""
-
-    def __init__(self, text_encoder: torch.nn.Module) -> None:
-        super().__init__()
-        self.model = text_encoder
-        # CLIPTextModelWithProjection emits text_embeds; CLIPTextModel emits pooler_output.
-        self._use_text_embeds = "WithProjection" in type(text_encoder).__name__
-
-    def forward(self, input_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        out = self.model(input_ids)
-        pooled = out.text_embeds if self._use_text_embeds else out.pooler_output
-        return out.last_hidden_state, pooled
-
-
-class SD3TransformerWrapper(torch.nn.Module):
-    def __init__(self, transformer: torch.nn.Module) -> None:
-        super().__init__()
-        self.model: Any = transformer
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        timestep: torch.Tensor,
-        encoder_hidden_states: torch.Tensor,
-        pooled_projections: torch.Tensor,
-    ) -> torch.Tensor:
-        return cast(
-            torch.Tensor,
-            self.model(
-                hidden_states=hidden_states.contiguous(),
-                encoder_hidden_states=encoder_hidden_states.contiguous(),
-                pooled_projections=pooled_projections.contiguous(),
-                timestep=timestep,
-            ).sample,
-        )
-
-
-class UNetWrapper(torch.nn.Module):
-    def __init__(self, unet: torch.nn.Module) -> None:
-        super().__init__()
-        self.model = unet
-        _patch_nearest_upsample(self.model)
-
-    def forward(
-        self,
-        sample: torch.Tensor,
-        timestep: torch.Tensor,
-        encoder_hidden_states: torch.Tensor,
-    ) -> torch.Tensor:
-        return cast(torch.Tensor, self.model(sample, timestep, encoder_hidden_states).sample)
 
 
 def _patch_nearest_upsample(module: torch.nn.Module) -> None:
@@ -185,25 +124,6 @@ def _patch_nearest_upsample(module: torch.nn.Module) -> None:
                 return hidden_states
 
             mod.forward = _patched_forward
-
-
-class VAEDecoderWrapper(torch.nn.Module):
-    def __init__(self, vae: torch.nn.Module) -> None:
-        super().__init__()
-        self.vae: Any = vae
-        _patch_nearest_upsample(self.vae.decoder)
-
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        return cast(torch.Tensor, self.vae.decode(z).sample)
-
-
-class VAEEncoderWrapper(torch.nn.Module):
-    def __init__(self, vae: torch.nn.Module) -> None:
-        super().__init__()
-        self.vae: Any = vae
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return cast(torch.Tensor, self.vae.encode(x).latent_dist.parameters)
 
 
 def quant_weight_owner(wrapper: torch.nn.Module) -> torch.nn.Module:
@@ -276,114 +196,8 @@ class MultiFunctionComponentSpec:
 
 
 # ---------------------------------------------------------------------------
-# Dummy-input factories — build reference tensors for torch.export
-# ---------------------------------------------------------------------------
-
-
-def _model_dtype(pipe: Any) -> torch.dtype:
-    """Infer the dtype from the pipeline's denoiser weights (UNet or transformer)."""
-    denoiser = getattr(pipe, "unet", None) or pipe.transformer
-    return cast(torch.dtype, next(denoiser.parameters()).dtype)
-
-
-def _dummy_text_encoder(pipe: Any, batch_size: int = 2) -> tuple[torch.Tensor, ...]:
-    return (torch.zeros(1, 77, dtype=torch.long),)
-
-
-def _dummy_unet(pipe: Any, batch_size: int = 2) -> tuple[torch.Tensor, ...]:
-    cfg = pipe.unet.config
-    dtype = _model_dtype(pipe)
-    return (
-        torch.randn(batch_size, cfg.in_channels, cfg.sample_size, cfg.sample_size, dtype=dtype),
-        torch.tensor([999.0] * batch_size, dtype=dtype),
-        torch.randn(batch_size, 77, cfg.cross_attention_dim, dtype=dtype),
-    )
-
-
-def _dummy_vae_decoder(pipe: Any, batch_size: int = 2) -> tuple[torch.Tensor, ...]:
-    latent_ch = pipe.vae.config.latent_channels
-    size = (
-        pipe.unet.config.sample_size
-        if hasattr(pipe, "unet") and pipe.unet is not None
-        else pipe.transformer.config.sample_size
-    )
-    dtype = next(pipe.vae.parameters()).dtype
-    return (torch.randn(1, latent_ch, size, size, dtype=dtype),)
-
-
-def _dummy_vae_encoder(pipe: Any, batch_size: int = 2) -> tuple[torch.Tensor, ...]:
-    size = (
-        pipe.unet.config.sample_size
-        if hasattr(pipe, "unet") and pipe.unet is not None
-        else pipe.transformer.config.sample_size
-    )
-    dtype = _model_dtype(pipe)
-    return (torch.randn(1, 3, size * 8, size * 8, dtype=dtype),)
-
-
-def _dummy_sd3_transformer(
-    pipe: Any, batch_size: int = 2, sample_size: int | None = None
-) -> tuple[torch.Tensor, ...]:
-    cfg = pipe.transformer.config
-    dtype = _model_dtype(pipe)
-    size = cfg.sample_size if sample_size is None else sample_size
-    return (
-        torch.randn(batch_size, cfg.in_channels, size, size, dtype=dtype),
-        torch.tensor([999.0] * batch_size, dtype=dtype),
-        torch.randn(batch_size, 154, cfg.joint_attention_dim, dtype=dtype),
-        torch.randn(batch_size, cfg.pooled_projection_dim, dtype=dtype),
-    )
-
-
-def _dummy_sd3_transformer_quant_trace(pipe: Any) -> tuple[torch.Tensor, ...]:
-    """Small trace for the weight quantizer's shape-discovery forward.
-
-    Weight-only quantization reads the weights alone, so this forward just has to reach
-    every quantizable op once. The MMDiT crops its position embedding out of
-    ``pos_embed_max_size``, which is how it generates below its native resolution, so a
-    smaller latent traces the same set of Linears.
-    """
-    return _dummy_sd3_transformer(pipe, batch_size=1, sample_size=32)
-
-
-# ---------------------------------------------------------------------------
 # Component registries
 # ---------------------------------------------------------------------------
-
-SD_COMPONENTS: dict[str, ComponentSpec] = {
-    "text_encoder": ComponentSpec(
-        asset_name="TextEncoder",
-        input_names=("input_ids",),
-        output_names=("last_hidden_state",),
-        wrapper_fn=lambda p: TextEncoderWrapper(p.text_encoder),
-        dummy_fn=_dummy_text_encoder,
-        quantizable=True,
-    ),
-    "unet": ComponentSpec(
-        asset_name="Unet",
-        input_names=("sample", "timestep", "encoder_hidden_states"),
-        output_names=("noise_pred",),
-        wrapper_fn=lambda p: UNetWrapper(p.unet),
-        dummy_fn=_dummy_unet,
-        quantizable=True,
-    ),
-    "vae_decoder": ComponentSpec(
-        asset_name="VAEDecoder",
-        input_names=("z",),
-        output_names=("image",),
-        wrapper_fn=lambda p: VAEDecoderWrapper(p.vae),
-        dummy_fn=_dummy_vae_decoder,
-    ),
-    "vae_encoder": ComponentSpec(
-        asset_name="VAEEncoder",
-        input_names=("image",),
-        output_names=("latent_params",),
-        wrapper_fn=lambda p: VAEEncoderWrapper(p.vae),
-        dummy_fn=_dummy_vae_encoder,
-    ),
-}
-
-ALL_SD_COMPONENTS: list[str] = list(SD_COMPONENTS.keys())
 
 FLUX2_COMPONENTS: dict[str, ComponentSpec] = {
     "transformer": ComponentSpec(
@@ -598,43 +412,6 @@ FLUX2_MULTIFUNCTION_COMPONENTS: dict[str, ComponentSpec | MultiFunctionComponent
 ALL_FLUX2_MULTIFUNCTION_COMPONENTS: list[str] = list(FLUX2_MULTIFUNCTION_COMPONENTS.keys())
 
 
-SD3_COMPONENTS: dict[str, ComponentSpec] = {
-    "text_encoder": ComponentSpec(
-        asset_name="TextEncoder",
-        input_names=("input_ids",),
-        output_names=("hidden_embeds", "pooled_outputs"),
-        wrapper_fn=lambda p: TextEncoderWithPooledWrapper(p.text_encoder),
-        dummy_fn=_dummy_text_encoder,
-        quantizable=True,
-    ),
-    "text_encoder_2": ComponentSpec(
-        asset_name="TextEncoder2",
-        input_names=("input_ids",),
-        output_names=("hidden_embeds", "pooled_outputs"),
-        wrapper_fn=lambda p: TextEncoderWithPooledWrapper(p.text_encoder_2),
-        dummy_fn=_dummy_text_encoder,
-        quantizable=True,
-    ),
-    "transformer": ComponentSpec(
-        asset_name="MMDiT",
-        input_names=("sample", "timestep", "encoder_hidden_states", "pooled_projections"),
-        output_names=("noise_pred",),
-        wrapper_fn=lambda p: SD3TransformerWrapper(p.transformer),
-        dummy_fn=_dummy_sd3_transformer,
-        quantizable=True,
-        quant_dummy_fn=_dummy_sd3_transformer_quant_trace,
-    ),
-    "vae_decoder": ComponentSpec(
-        asset_name="VAEDecoder",
-        input_names=("z",),
-        output_names=("image",),
-        wrapper_fn=lambda p: VAEDecoderWrapper(p.vae),
-        dummy_fn=_dummy_vae_decoder,
-    ),
-}
-
-ALL_SD3_COMPONENTS: list[str] = list(SD3_COMPONENTS.keys())
-
 WAN_COMPONENTS: dict[str, ComponentSpec] = {
     "transformer": ComponentSpec(
         asset_name="Transformer",
@@ -708,7 +485,7 @@ ALL_SANA_SPRINT_COMPONENTS: list[str] = list(SANA_SPRINT_COMPONENTS.keys())
 
 def get_component_registry(
     hf_pipe: Any,
-    pipeline_type: str = "sd",
+    pipeline_type: str,
     multifunction: bool = False,
 ) -> dict[str, ComponentSpec | MultiFunctionComponentSpec]:
     """Return the component registry for the given pipeline type.
@@ -716,7 +493,7 @@ def get_component_registry(
     Args:
         hf_pipe: The loaded HuggingFace pipeline (unused for routing, but
             available for future introspection).
-        pipeline_type: One of "sd", "sd3", "flux2", "wan", or "sana_sprint".
+        pipeline_type: One of "flux2", "wan", or "sana_sprint".
         multifunction: If True, use multi-function export for FLUX.2 transformer
             (5 functions in one .aimodel: main, half, img2img_quarter/half/full).
     """
@@ -724,13 +501,11 @@ def get_component_registry(
         if multifunction:
             return FLUX2_MULTIFUNCTION_COMPONENTS
         return FLUX2_COMPONENTS
-    if pipeline_type == "sd3":
-        return SD3_COMPONENTS
     if pipeline_type == "wan":
         return WAN_COMPONENTS
     if pipeline_type == "sana_sprint":
         return SANA_SPRINT_COMPONENTS
-    return SD_COMPONENTS
+    raise unknown_pipeline_type_error(pipeline_type)
 
 
 def get_valid_components(pipeline_type: str, multifunction: bool = False) -> list[str]:
@@ -739,10 +514,8 @@ def get_valid_components(pipeline_type: str, multifunction: bool = False) -> lis
         if multifunction:
             return ALL_FLUX2_MULTIFUNCTION_COMPONENTS
         return ALL_FLUX2_COMPONENTS
-    if pipeline_type == "sd3":
-        return ALL_SD3_COMPONENTS
     if pipeline_type == "wan":
         return ALL_WAN_COMPONENTS
     if pipeline_type == "sana_sprint":
         return ALL_SANA_SPRINT_COMPONENTS
-    return ALL_SD_COMPONENTS
+    raise unknown_pipeline_type_error(pipeline_type)
