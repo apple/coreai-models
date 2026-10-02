@@ -588,9 +588,9 @@ struct BuildOutputsPairingTests {
             trackerLogits: maskLogits(for: tracked), trackerScoreLogits: scoreLogits(for: tracked),
             plan: plan, newScores: [:])
 
-        #expect(output.trackerScoreByObjectID[1] == DetectionDecoder.sigmoid(1))
+        #expect(output.trackerScoreByObjectID[1] == sigmoid(1))
         #expect(
-            output.trackerScoreByObjectID[3] == DetectionDecoder.sigmoid(3),
+            output.trackerScoreByObjectID[3] == sigmoid(3),
             "object 3 must not inherit object 2's score")
     }
 
