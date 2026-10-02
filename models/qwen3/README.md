@@ -47,6 +47,9 @@ uv run coreai.llm.export Qwen/Qwen3-4B --compression 4bit_weights_8bit_kv_cache
 
 # FP4 weights with FP8 activations and FP8 KV cache on macOS (27.2+)
 uv run coreai.llm.export Qwen/Qwen3-4B --compression fp4_weights_fp8_activations_fp8_kv_cache
+
+# FP8 weights with FP8 activations and FP8 KV cache on macOS (27.2+)
+uv run coreai.llm.export Qwen/Qwen3-4B --compression fp8_weights_fp8_activations_fp8_kv_cache
 ```
 
 ## Run a Core AI Language Model
