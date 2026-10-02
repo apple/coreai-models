@@ -39,9 +39,9 @@ struct VectorMathTests {
 
     @Test("cosineSimilarity: identical, orthogonal, and opposite vectors")
     func cosineKnownValues() {
-        #expect(abs(cosineSimilarity([1, 2, 3], [1, 2, 3]) - 1.0) < 1e-9)
-        #expect(abs(cosineSimilarity([1, 0], [0, 1])) < 1e-9)
-        #expect(abs(cosineSimilarity([1, 2, 3], [-1, -2, -3]) + 1.0) < 1e-9)
+        #expect(abs(cosineSimilarity([1, 2, 3], [1, 2, 3]) - 1.0) < 1e-6)
+        #expect(abs(cosineSimilarity([1, 0], [0, 1])) < 1e-6)
+        #expect(abs(cosineSimilarity([1, 2, 3], [-1, -2, -3]) + 1.0) < 1e-6)
     }
 
     @Test("cosineSimilarity: degenerate inputs return 0")

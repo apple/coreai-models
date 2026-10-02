@@ -467,7 +467,7 @@ private func metricRow(
             ok: false)
     }
     let p = psnr(actual, ref)
-    let c = cosineSimilarity(actual, ref)
+    let c = Double(cosineSimilarity(actual, ref))
     let maxAbs = zip(actual, ref).reduce(Float(0)) { max($0, abs($1.0 - $1.1)) }
     let ok = (p.isInfinite || p >= psnrFloor) && c >= cosineFloor
     let psnrStr = p.isInfinite ? "INF" : String(format: "%.2f", p)

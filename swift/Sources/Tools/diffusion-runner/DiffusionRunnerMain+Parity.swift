@@ -61,10 +61,10 @@ extension DiffusionRunner {
         if let hiddenKey = teOutputs.keys.first(where: { $0.contains("hidden") }),
             let actual = teOutputs[hiddenKey]
         {
-            let cosine = Float(cosineSimilarity(actual, expectedTE.data))
+            let cosine = cosineSimilarity(actual, expectedTE.data)
             print("  Cosine similarity: \(cosine)")
         } else if let actual = teOutputs.values.first {
-            let cosine = Float(cosineSimilarity(actual, expectedTE.data))
+            let cosine = cosineSimilarity(actual, expectedTE.data)
             print("  Cosine similarity (first output): \(cosine)")
         }
 
@@ -79,7 +79,7 @@ extension DiffusionRunner {
         let vaeND = floatsToNDArray(vaeInput.data, asInt32: false, shape: vaeInput.shape, scalarType: vaeType)
         let vaeOutputs = try await vaeDecoder.predictAutoNamed(inputs: [vaeND])
         if let actual = vaeOutputs.values.first {
-            let cosine = Float(cosineSimilarity(actual, expectedVAE.data))
+            let cosine = cosineSimilarity(actual, expectedVAE.data)
             print("  Cosine similarity: \(cosine)")
         }
 

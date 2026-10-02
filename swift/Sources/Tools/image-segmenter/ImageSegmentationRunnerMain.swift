@@ -627,7 +627,7 @@ struct ImageSegmenterCLI: AsyncParsableCommand {
             )
         }
         let p = psnr(actual, ref)
-        let c = Float(cosineSimilarity(actual, ref))
+        let c = cosineSimilarity(actual, ref)
         let ok = (p.isInfinite || p >= psnrFloor) && c >= cosineFloor
         let psnrStr = p.isInfinite ? "INF" : String(format: "%.2f", p)
         return ParityRow(
