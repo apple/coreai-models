@@ -174,6 +174,15 @@ async def _async_export_model(config: ExportConfig) -> str:
             )
 
     model_class = entry.macos_class if config.variant == "macOS" else entry.ios_class
+    if config.quantization_mode == "graph" and not model_class.supports_graph_quantization:
+        raise ValueError(
+            f"Graph-mode quantization is not currently supported for {model_type}; "
+            "use --quantization-mode eager."
+        )
+    if config.num_layers is not None and not model_class.supports_num_layers:
+        raise ValueError(
+            f"--num-layers is not currently supported for hybrid models ({model_type})."
+        )
 
     # ---- 2. Load model ----
     target_dtype = _resolve_precision(config.compute_precision)
@@ -287,6 +296,11 @@ async def _async_export_model(config: ExportConfig) -> str:
                 )
 
             graph_mode = is_compression_mode_graph(quant_cfg)
+            if graph_mode and not model_class.supports_graph_quantization:
+                raise ValueError(
+                    f"Compression config '{config.compression}' sets execution_mode: graph, "
+                    f"which is not currently supported for {model_type}; use eager."
+                )
 
             quantizer_mmap_dir: str | None = None
             # coreai-opt only supports mmap-backed finalization in eager mode.

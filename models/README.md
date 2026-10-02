@@ -208,6 +208,7 @@ uv run models/<name>/export.py --include-debug-info   # embed debug information 
 - [Qwen2.5](qwen2)
 - [Qwen3](qwen3)
 - [Qwen3 MoE](qwen3_moe)
+- [Qwen3.5](qwen3_5)
 
 ### Diffusion Models
 

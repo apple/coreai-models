@@ -26,6 +26,10 @@ VALUE_CACHE_NAME = "valueCache"
 SLIDING_KEY_CACHE_NAME = "slidingKeyCache"
 SLIDING_VALUE_CACHE_NAME = "slidingValueCache"
 
+# SSM state names for hybrid attention+SSM models (e.g. Qwen3.5)
+CONV_STATES_NAME = "convStates"
+RECURRENT_STATES_NAME = "recurrentStates"
+
 # Trace-time KV cache sequence length, to bound peak trace memory. At inference the
 # cache size is dynamic.
 TRACE_KV_CACHE_SEQ_LEN = 2048
