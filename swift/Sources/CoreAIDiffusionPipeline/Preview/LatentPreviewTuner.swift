@@ -377,9 +377,10 @@ public class LatentPreviewTuner {
                 continue
             }
 
-            guard let source = CGImageSourceCreateWithURL(decodedURL as CFURL, nil),
-                let image = CGImageSourceCreateImageAtIndex(source, 0, nil)
-            else {
+            let image: CGImage
+            do {
+                image = try CGImageUtils.load(from: decodedURL)
+            } catch {
                 print("[tune-fit] Could not read decoded.png in \(genDir.lastPathComponent), skipping")
                 continue
             }

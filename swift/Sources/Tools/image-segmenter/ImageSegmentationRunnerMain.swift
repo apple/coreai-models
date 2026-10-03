@@ -188,7 +188,12 @@ struct ImageSegmenterCLI: AsyncParsableCommand {
         let loadElapsed = ContinuousClock.now - loadStart
         print(" done in \(String(format: "%.3f", loadElapsed.inSeconds))s\(cacheHit ? " (cache hit)" : "")")
 
-        let cgImage = try loadCGImage(from: imagePath)
+        let cgImage: CGImage
+        do {
+            cgImage = try CGImageUtils.load(from: imagePath)
+        } catch {
+            throw ValidationError("Cannot load image at \(imagePath)")
+        }
         if verbose { print("Loaded image: \(cgImage.width)×\(cgImage.height)") }
 
         let params = SegmentationParameters(maskThreshold: maskThreshold, maxSegments: maxSegments)
@@ -669,20 +674,6 @@ struct ImageSegmenterCLI: AsyncParsableCommand {
             ok: false
         )
     }
-}
-
-// MARK: - Helpers
-
-private func loadCGImage(from path: String) throws -> CGImage {
-    let expanded = NSString(string: path).expandingTildeInPath
-    let url = URL(fileURLWithPath: expanded)
-    guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
-        throw ValidationError("Cannot open image at \(path)")
-    }
-    guard let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
-        throw ValidationError("Cannot decode image at \(path)")
-    }
-    return cgImage
 }
 
 // MARK: - JSON output types
