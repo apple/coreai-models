@@ -43,16 +43,20 @@ uv run coreai.llm.export org/NewModel \
 
 #### Quantization Options
 
-| Platform | Preset                                     | Description                                    |
-|----------|--------------------------------------------|------------------------------------------------|
-| macOS    | `4bit` (default)                           | INT4 weight-only, block size 32 (all layers)   |
-| macOS    | `4bit_weights_8bit_kv_cache`               | INT4 weight-only with INT8 per-tensor KV cache |
-| macOS    | `none`                                     | Full precision                                 |
-| iOS      | `4bit_weight_palettized_group32` (default) | 4-bit palettization with channel group size 32 |
-| iOS      | `4bit_weight_palettized_group8`            | 4-bit palettization with channel group size 8  |
-| iOS      | `none`                                     | Full precision                                 |
+| Platform      | Preset                                     | Description                                          |
+|---------------|--------------------------------------------|------------------------------------------------------|
+| macOS         | `4bit` (default)                           | INT4 weight-only, block size 32 (all layers)         |
+| macOS         | `4bit_weights_8bit_kv_cache`               | INT4 weight-only with INT8 per-tensor KV cache       |
+| macOS (27.2+) | `fp4_weights_fp8_activations_fp8_kv_cache` | FP4 (e2m1) weights, FP8 (e4m3) activations, KV cache |
+| macOS (27.2+) | `fp8_weights_fp8_activations_fp8_kv_cache` | FP8 (e4m3) weights, activations, and KV cache        |
+| macOS         | `none`                                     | Full precision                                       |
+| iOS           | `4bit_weight_palettized_group32` (default) | 4-bit palettization with channel group size 32       |
+| iOS           | `4bit_weight_palettized_group8`            | 4-bit palettization with channel group size 8        |
+| iOS           | `none`                                     | Full precision                                       |
 
 **Note:** All `iOS` palettization presets quantize the Embedding to 8-bit per tensor by default.
+
+**Note:** The `fp4_weights_fp8_activations_fp8_kv_cache` and `fp8_weights_fp8_activations_fp8_kv_cache` presets quantize weights to per-block FP4 (e2m1) and per-tensor FP8 (e4m3) respectively, with activations and KV Cache per-tensor quantized to FP8 (e4m3). Both presets require macOS 27.2+.
 
 Override the default with `--compression`:
 
