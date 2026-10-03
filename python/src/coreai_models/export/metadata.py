@@ -130,6 +130,24 @@ _METADATA: dict[str, AIModelMetadataFields] = {
             "Source: https://huggingface.co/google/gemma-3n-E4B-it"
         ),
     ),
+    "google/gemma-4-E2B-it": AIModelMetadataFields(
+        author="Google DeepMind",
+        license="Apache-2.0",
+        model_description=(
+            "Gemma 4 E2B IT is a ~5B-parameter instruction-tuned on-device model from "
+            "Google's Gemma 4 family using Per-Layer Embeddings; this export targets the "
+            "text decoder. Source: https://huggingface.co/google/gemma-4-E2B-it"
+        ),
+    ),
+    "google/gemma-4-E4B-it": AIModelMetadataFields(
+        author="Google DeepMind",
+        license="Apache-2.0",
+        model_description=(
+            "Gemma 4 E4B IT is a ~8B-parameter instruction-tuned on-device model from "
+            "Google's Gemma 4 family using Per-Layer Embeddings; this export targets the "
+            "text decoder. Source: https://huggingface.co/google/gemma-4-E4B-it"
+        ),
+    ),
     "mistralai/Mistral-7B-Instruct-v0.3": AIModelMetadataFields(
         author="Mistral AI",
         license="Apache-2.0",
