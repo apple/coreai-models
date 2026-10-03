@@ -157,7 +157,7 @@ class MockEngine: InferenceEngine, @unchecked Sendable {
                 generationToken: GenerationToken
             ) {
                 self.engine = engine
-                self.returnsLogits = inferenceOptions.includeLogits
+                self.returnsLogits = (inferenceOptions.logits != .none)
                 self.forcedContinuation = inferenceOptions.forcedContinuation
                 self.stopReasonStore = stopReasonStore
                 self.generationToken = generationToken

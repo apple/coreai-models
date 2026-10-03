@@ -143,9 +143,8 @@ private func processOnePrompt(
     let paddingToken = allTokens[0]
     let continuation = Array(allTokens.dropFirst()) + [paddingToken]
 
-    let options = InferenceOptions(
+    let options = InferenceOptions.eval(
         maxTokens: continuation.count,
-        includeLogits: true,
         forcedContinuation: continuation
     )
 
