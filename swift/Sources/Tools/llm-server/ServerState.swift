@@ -286,18 +286,35 @@ final class ServerState: @unchecked Sendable {
         topP: Double?,
         topK: Int?,
         minP: Double?,
-        seed: UInt64? = nil
+        seed: UInt64? = nil,
+        frequencyPenalty: Double? = nil,
+        presencePenalty: Double? = nil,
+        logitBias: [Int32: Float]? = nil
     ) -> SamplingConfiguration {
         let temp = temperature ?? config.defaultTemperature
+        let hasAdditiveProcessing =
+            (frequencyPenalty ?? 0) != 0 || (presencePenalty ?? 0) != 0 || !(logitBias?.isEmpty ?? true)
         if temp == 0 {
-            return .greedy
+            // Greedy: additive penalties and the logit bias still shift the argmax, so build a
+            // full temperature-0 config carrying them rather than dropping to bare `.greedy`.
+            guard hasAdditiveProcessing else { return .greedy }
+            return SamplingConfiguration(
+                temperature: 0,
+                seed: seed,
+                frequencyPenalty: frequencyPenalty,
+                presencePenalty: presencePenalty,
+                logitBias: logitBias
+            )
         }
         return SamplingConfiguration(
             temperature: temp,
             topK: topK ?? config.defaultTopK,
             topP: topP ?? config.defaultTopP,
             minP: minP ?? config.defaultMinP,
-            seed: seed
+            seed: seed,
+            frequencyPenalty: frequencyPenalty,
+            presencePenalty: presencePenalty,
+            logitBias: logitBias
         )
     }
 }

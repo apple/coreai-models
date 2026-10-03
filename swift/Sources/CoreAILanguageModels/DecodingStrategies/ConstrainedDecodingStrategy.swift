@@ -148,6 +148,19 @@ public struct ConstrainedDecodingStrategy: DecodingStrategy {
                 penalty: Float(penalty)
             )
         }
+        if samplingConfiguration.needsAdditiveLogitProcessing {
+            let window =
+                samplingConfiguration.repetitionPenaltyWindow.map { min($0, generatedTokens.count) }
+                ?? generatedTokens.count
+            AdditivePenaltyProcessor.apply(
+                to: &maskedLogits,
+                recentTokenIds: generatedTokens.suffix(window),
+                frequencyPenalty: Float(samplingConfiguration.frequencyPenalty ?? 0),
+                presencePenalty: Float(samplingConfiguration.presencePenalty ?? 0),
+                logitBias: samplingConfiguration.logitBias
+            )
+        }
+        // Apply the grammar mask last so its token bans stay authoritative over any bias.
         _ = session.applyMask(to: &maskedLogits)
 
         let bestToken = samplingConfiguration.sampleToken(from: &maskedLogits, step: generatedTokens.count)
