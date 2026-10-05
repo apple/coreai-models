@@ -56,7 +56,7 @@ public final class VideoSegmenter: ResourceManaging {
         pinning: ((inout VideoSegmentationParameters) -> Void)? = nil
     ) async throws {
         let bundle = try VideoSegmentationBundle(from: path)
-        try bundle.modelBundle.verifyAssetsExisting()
+        try bundle.modelBundle.validateModelAssets()
         self.bundle = bundle
         var resolved = try bundle.parameters(overriding: parameters)
         pinning?(&resolved)

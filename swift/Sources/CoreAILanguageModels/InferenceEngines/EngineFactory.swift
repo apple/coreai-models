@@ -25,7 +25,7 @@ public struct EngineFactory: Sendable {
     ///
     /// - Parameters:
     ///   - config: The JSON model configuration as raw data.
-    ///   - modelURL: The location of the CoreAI model asset (`.aimodel` or `.aimodelc`).
+    ///   - modelURL: The location of the Core AI model.
     ///   - options: The engine options, including an optional variant override and KV cache
     ///     settings. Defaults to a value with auto-detection enabled and the `.auto` KV cache
     ///     strategy.
@@ -87,7 +87,7 @@ public struct EngineFactory: Sendable {
         bundle: LanguageModelBundle,
         options: EngineOptions = EngineOptions()
     ) async throws -> any InferenceEngine {
-        try bundle.modelBundle.verifyAssetsExisting()
+        try bundle.modelBundle.validateModelAssets()
 
         let languageModelURL = try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.main)
 
