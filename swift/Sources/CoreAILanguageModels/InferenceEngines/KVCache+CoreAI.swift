@@ -585,10 +585,10 @@ extension NDArray.ScalarType {
         case .bfloat16: return .bFloat16
         case .float32: return .float32
         case .int8: return .int8
-        case .float8e5m2, .float8e4m3fn, .float8e8m0fn, .float4e2m1fn:
-            return .float16
+        case .float8e4m3fn: return .float8e4m3
+        case .float8e5m2: return .float8e5m2
         default:
-            fatalError("Unsupported KV cache scalar type for MPSNDArray: \(self)")
+            fatalError("Unsupported scalar type for KV Cache expansion: \(self).\n")
         }
     }
 }
