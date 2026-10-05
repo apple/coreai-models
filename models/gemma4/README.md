@@ -83,6 +83,10 @@ flat global KV cache is paired with a fixed-depth sliding-window ring, RoPE
 arrives precomputed as `rope_cos`/`rope_sin` inputs, and the INT8 Per-Layer
 Embeddings table is written as a sidecar next to the asset.
 
+## Note on AOT Compilation
+
+Due to a known issue with coreai-build in Xcode 27.2 beta, Ahead-of-time compilation is not supported for this model. Please use on-device specialization from .aimodel directly.
+
 ### Runner side
 
 There is no Gemma-specific engine. The generic static-shape engine drives these
