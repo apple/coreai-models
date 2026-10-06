@@ -129,6 +129,8 @@ class ResolvedModel:
     hf_config: Any
     target_dtype: torch.dtype
     max_context_length: int | None
+    quantization_config: dict | None
+    palettization_config: Any
 
 
 class BuiltModel(NamedTuple):
@@ -197,6 +199,20 @@ def resolve_model(config: ExportConfig) -> ResolvedModel:
     if config.num_layers is not None:
         hf_config.num_hidden_layers = config.num_layers
 
+    # ---- 3. Resolve compression preset ----
+    if config.compression_config_object is not None:
+        torch_quantization_config, torch_palettization_config = split_compression_config(
+            config.compression_config_object
+        )
+    else:
+        preset = get_preset(config.compression)
+        torch_quantization_config = preset.get("torch_quantization_config")
+        torch_palettization_config = preset.get("torch_palettization_config")
+
+    assert not (torch_quantization_config is not None and torch_palettization_config is not None), (
+        "Both a quantization and a palettization config were provided, this should never happen."
+    )
+
     return ResolvedModel(
         config=config,
         entry=entry,
@@ -205,6 +221,8 @@ def resolve_model(config: ExportConfig) -> ResolvedModel:
         hf_config=hf_config,
         target_dtype=target_dtype,
         max_context_length=max_context_length,
+        quantization_config=torch_quantization_config,
+        palettization_config=torch_palettization_config,
     )
 
 
@@ -242,19 +260,8 @@ def build_model(resolved: ResolvedModel, temp_dir: str | None) -> BuiltModel:
             disable_embedding_quantization=config.disable_embedding_quantization,
         )
     model = model.eval()
-    # ---- 3. Resolve compression preset ----
-    if config.compression_config_object is not None:
-        torch_quantization_config, torch_palettization_config = split_compression_config(
-            config.compression_config_object
-        )
-    else:
-        preset = get_preset(config.compression)
-        torch_quantization_config = preset.get("torch_quantization_config")
-        torch_palettization_config = preset.get("torch_palettization_config")
-
-    assert not (torch_quantization_config is not None and torch_palettization_config is not None), (
-        "Both a quantization and a palettization config were provided, this should never happen."
-    )
+    torch_quantization_config = resolved.quantization_config
+    torch_palettization_config = resolved.palettization_config
 
     # ---- 3a. Pre-export torch quantization (if configured) ----
     effective_max_ctx = max_context_length or getattr(
