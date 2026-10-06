@@ -1,0 +1,25 @@
+# Default Gemma 4 iOS compression: 4-bit per-grouped-channel k-means palettization,
+# except each block's per-layer-embedding gate and projection (8-bit per-tensor)
+# and the per-layer model projection and embedding tables (left uncompressed).
+kmeans_palettization_config:
+  global_config:
+    op_state_spec:
+      weight:
+        n_bits: 4
+        granularity:
+          type: per_grouped_channel
+          axis: 0
+          group_size: 32
+  module_type_configs:
+    torch.nn.modules.sparse.Embedding: null
+    coreai_models.primitives.ios.embedding.LoadEmbeddings: null
+
+  module_name_configs:
+    'extend\.model\.layers\.\d+\.(per_layer_input_gate|per_layer_projection)':
+      op_state_spec:
+        weight:
+          n_bits: 8
+          granularity:
+            type: per_tensor
+
+    'extend\.model\.per_layer_model_projection': null

@@ -444,6 +444,7 @@ class TestMistraliOSAttention(MistraliOSComponentTestBase):
         layer_idx: int,
     ) -> None:
         """Test Core AI compilation and execution."""
+        torch.manual_seed(0)
         model, inputs, _ = self.get_model_asset(base_mistral_config, heads, layer_idx)
         run_compare_coreai(
             model=model,

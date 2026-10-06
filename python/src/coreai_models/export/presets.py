@@ -120,6 +120,75 @@ _INT4_WEIGHT_ONLY_CONFIG_BASE: dict[str, Any] = {
     "module_type_configs": _TORCH_MODULE_CONFIGS_4BIT,
 }
 
+# Floating-point (FP8 / FP4) building blocks.
+_FP8_WEIGHT_SPEC = {
+    "weight": {
+        "dtype": "float8_e4m3fn",
+        "qscheme": "symmetric",
+        "granularity": {"type": "per_tensor"},
+    }
+}
+
+# FP4 (e2m1) per-block weight spec
+# Scale used is e8m0
+_FP4_WEIGHT_SPEC = {
+    "weight": {
+        "dtype": "float4_e2m1fn_x2",
+        "qscheme": "symmetric",
+        "granularity": {
+            "type": "per_block",
+            "block_size": 32,
+        },
+    }
+}
+
+_FP8_ACTIVATION_SPEC = {
+    "*": {
+        "dtype": "float8_e4m3fn",
+        "qscheme": "symmetric",
+        "granularity": {"type": "per_tensor"},
+    }
+}
+
+
+def _fp_module_type_configs(
+    weight_spec: dict[str, Any],
+    activation_spec: dict[str, Any],
+) -> dict[str, Any]:
+    """Per-module-type quantization config for the FP presets.
+
+    ``nn.Linear`` (attention/MLP projections and FFN): weight and input-activation quantizated.
+    ``nn.Embedding``: weight-only quantization.
+    ``SDPA``: query (input 0) quantized to FP8 (e4m3) per-tensor.
+
+    Args:
+        weight_spec: ``op_state_spec`` weight config (e.g. ``_FP8_WEIGHT_SPEC``).
+        activation_spec: ``op_input_spec`` activation config for ``nn.Linear``.
+    """
+    return {
+        **_TORCH_MODULE_EXCLUSIONS,
+        "torch.nn.modules.linear.Linear": {
+            "op_state_spec": weight_spec,
+            "op_input_spec": activation_spec,
+            "op_output_spec": None,
+        },
+        "torch.nn.modules.sparse.Embedding": {
+            "op_state_spec": weight_spec,
+            "op_input_spec": None,
+            "op_output_spec": None,
+        },
+        "coreai_models.primitives.macos.sdpa.SDPA": {
+            "op_input_spec": None,
+            "op_output_spec": None,
+            "op_state_spec": None,
+            "module_input_spec": {
+                0: _FP8_ACTIVATION_SPEC["*"],
+                1: None,
+                2: None,
+            },
+        },
+    }
+
 
 MACOS_PRESETS: dict[str, dict[str, Any]] = {
     # ---------------------------------------------------------------
@@ -154,6 +223,42 @@ MACOS_PRESETS: dict[str, dict[str, Any]] = {
         "suffix": "4bit_weights_8bit_kv_cache",
         "description": (
             "INT4 symmetric per-block weight quantization and INT8 per-tensor KV cache (graph mode)"
+        ),
+    },
+    # FP4 (e2m1) per-block weights + FP8 per-tensor
+    # activations into linear projections and FFN + FP8 per-tensor KV cache.
+    "fp4_weights_fp8_activations_fp8_kv_cache": {
+        "torch_quantization_config": {
+            "execution_mode": "graph",
+            "global_config": None,
+            "module_type_configs": _fp_module_type_configs(_FP4_WEIGHT_SPEC, _FP8_ACTIVATION_SPEC),
+            "kv_cache_quant_configs": _create_per_tensor_symmetric_kv_cache_config("float8_e4m3fn"),
+            "calibrate_activations": True,
+        },
+        "suffix": "fp4_weights_fp8_act_fp8_kv_cache",
+        "description": (
+            "FP4 (e2m1) weights, FP8 per-tensor activations into "
+            "linear projections and FFN, FP8 per-tensor KV cache, and the Q, K, "
+            "and V feeding into SDPA quantized to FP8 per-tensor. RoPE and "
+            "normalization stay in full precision."
+        ),
+    },
+    # FP8 (e4m3) per-tensor weights + FP8 per-tensor
+    # activations into linear projections and FFN + FP8 per-tensor KV cache.
+    "fp8_weights_fp8_activations_fp8_kv_cache": {
+        "torch_quantization_config": {
+            "execution_mode": "graph",
+            "global_config": None,
+            "module_type_configs": _fp_module_type_configs(_FP8_WEIGHT_SPEC, _FP8_ACTIVATION_SPEC),
+            "kv_cache_quant_configs": _create_per_tensor_symmetric_kv_cache_config("float8_e4m3fn"),
+            "calibrate_activations": True,
+        },
+        "suffix": "fp8_weights_fp8_act_fp8_kv_cache",
+        "description": (
+            "FP8 (e4m3) per-tensor weights, FP8 per-tensor activations into linear "
+            "projections and FFN, FP8 per-tensor KV cache, and the Q, K, and V "
+            "feeding into SDPA quantized to FP8 per-tensor. RoPE and normalization "
+            "stay in full precision."
         ),
     },
 }

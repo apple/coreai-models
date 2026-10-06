@@ -79,9 +79,9 @@ struct ModelBundleTests {
         }
     }
 
-    @Test("Pointing at a .aimodelc asset throws pointedAtModelAsset, not a parse error")
+    @Test("Pointing at a compiled Core AI model throws pointedAtModelAsset, not a parse error")
     func pointedAtCompiledAssetThrows() throws {
-        // A compiled `.aimodelc` is a directory with its own unrelated
+        // A compiled Core AI model is a directory with its own unrelated
         // metadata.json. Pointing the tool at it must fail fast with guidance,
         // not parse that inner metadata as a bogus 0.1 bundle.
         let bundleDir = FileManager.default.temporaryDirectory.appending(
@@ -93,6 +93,7 @@ struct ModelBundleTests {
         { "producer": "coreai-build", "assetVersion": "2.0" }
         """.write(
             to: asset.appending(path: "metadata.json"), atomically: true, encoding: .utf8)
+        FileManager.default.createFile(atPath: asset.appending(path: "main-h15c.mlirb").path, contents: nil)
 
         let error = #expect(throws: ModelBundle.BundleError.self) {
             _ = try ModelBundle(at: asset)
@@ -105,9 +106,9 @@ struct ModelBundleTests {
     }
 
     @Test(
-        "verifyAssetsExisting() throws missingAsset when the declared asset isn't on disk, even if a compiled variant is"
+        "validateModelAssets() throws missingAsset when the declared asset isn't on disk, even if a compiled variant is"
     )
-    func verifyThrowsOnMissingDeclaredAsset() throws {
+    func validateModelAssetsThrowsOnMissingDeclaredAsset() throws {
         let url = try Self.tempBundle(
             """
             {
@@ -128,10 +129,43 @@ struct ModelBundleTests {
 
         let bundle = try ModelBundle(at: url)
         let error = #expect(throws: ModelBundle.BundleError.self) {
-            try bundle.verifyAssetsExisting()
+            try bundle.validateModelAssets()
         }
         guard case .missingAsset(let key, let path) = error else {
             Issue.record("expected missingAsset, got \(String(describing: error))")
+            return
+        }
+        #expect(key == "main")
+        #expect(path.lastPathComponent == "model.aimodel")
+    }
+
+    @Test("validateModelAssets() throws invalidModelAsset when the declared asset exists but isn't a valid model")
+    func validateModelAssetsThrowsOnInvalidAsset() throws {
+        let url = try Self.tempBundle(
+            """
+            {
+              "metadata_version": "0.2",
+              "kind": "llm",
+              "name": "qwen3-0.6b",
+              "assets": { "main": "model.aimodel" },
+              "language": {
+                "tokenizer": "Qwen/Qwen3-0.6B",
+                "vocab_size": 151936,
+                "max_context_length": 8192
+              }
+            }
+            """)
+        // The declared path exists, but it's an empty directory — no source program inside,
+        // so AIModelAsset.isValid considers it invalid rather than missing.
+        try FileManager.default.createDirectory(
+            at: url.appending(path: "model.aimodel"), withIntermediateDirectories: true)
+
+        let bundle = try ModelBundle(at: url)
+        let error = #expect(throws: ModelBundle.BundleError.self) {
+            try bundle.validateModelAssets()
+        }
+        guard case .invalidModelAsset(let key, let path) = error else {
+            Issue.record("expected invalidModelAsset, got \(String(describing: error))")
             return
         }
         #expect(key == "main")
