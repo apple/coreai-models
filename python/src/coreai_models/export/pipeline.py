@@ -226,11 +226,15 @@ def resolve_model(config: ExportConfig) -> ResolvedModel:
     )
 
 
-def build_model(resolved: ResolvedModel, temp_dir: str | None) -> BuiltModel:
+def build_model(
+    resolved: ResolvedModel, temp_dir: str | None, export_backend: object | None = None
+) -> BuiltModel:
     """Load ``resolved``'s weights and apply its compression.
 
     Args:
         temp_dir: The macOS export's working directory, or None for iOS.
+        export_backend: The backend coreai-opt finalizes quantized weights for. None is
+            Core AI.
     """
     config, entry, model_class = resolved.config, resolved.entry, resolved.model_class
     hf_config, target_dtype = resolved.hf_config, resolved.target_dtype
@@ -305,7 +309,7 @@ def build_model(resolved: ResolvedModel, temp_dir: str | None) -> BuiltModel:
             quantizer_mmap_dir = os.path.join(temp_dir, "quantized")
             os.makedirs(quantizer_mmap_dir, exist_ok=True)
 
-        if graph_mode:
+        if graph_mode and export_backend is None:
             patch_model_for_externalization(model)
             # externalization patches live on the eager module's composite op
             # submodules but quantize_for_export in graph-mode below returns a
@@ -321,6 +325,7 @@ def build_model(resolved: ResolvedModel, temp_dir: str | None) -> BuiltModel:
             quant_cfg,
             calibration_data_fn=get_calibration_data,
             mmap_dir=quantizer_mmap_dir,
+            export_backend=export_backend,
         )
 
     if torch_palettization_config is not None:
