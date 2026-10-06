@@ -44,6 +44,7 @@ from coreai_models.export.presets import (
     DEFAULT_MACOS_COMPRESSION_PRESET,
     get_preset,
 )
+from coreai_models.model_registry import ModelPreset
 from coreai_models.models.registry import ModelEntry, get_model_entry
 
 logger = logging.getLogger(__name__)
@@ -83,6 +84,39 @@ class ExportConfig:
             raise ValueError(
                 f"quantization_mode='graph' is macOS only (got variant '{self.variant}')."
             )
+
+    @classmethod
+    def from_preset(
+        cls,
+        preset: ModelPreset,
+        *,
+        platform: str | None = None,
+        compression: str | None = None,
+        compression_config_object: Any = None,
+        compute_precision: str | None = None,
+        max_context_length: int | None = None,
+        **options: Any,
+    ) -> "ExportConfig":
+        """The config that exports ``preset``, with any value passed here winning over the preset's.
+
+        Raises:
+            ValueError: If neither ``compute_precision`` nor the preset names a precision.
+        """
+        precision = compute_precision or preset.compute_precision
+        if precision is None:
+            raise ValueError(
+                f"{preset.short_name!r} registers no compute precision; pass one explicitly."
+            )
+        return cls(
+            hf_model_id=preset.hf_id,
+            variant=platform or preset.variant or "macOS",
+            compression=compression if compression is not None else preset.compression,
+            compression_config_object=compression_config_object,
+            compute_precision=precision,
+            max_context_length=max_context_length or preset.max_context_length,
+            model_type_override=preset._model_type_override,
+            **options,
+        )
 
 
 def _generate_output_name(config: ExportConfig) -> str:
