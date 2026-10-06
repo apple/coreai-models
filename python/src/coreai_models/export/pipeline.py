@@ -227,12 +227,13 @@ def resolve_model(config: ExportConfig) -> ResolvedModel:
 
 
 def build_model(
-    resolved: ResolvedModel, temp_dir: str | None, export_backend: object | None = None
+    resolved: ResolvedModel, temp_dir: str | None = None, export_backend: object | None = None
 ) -> BuiltModel:
     """Load ``resolved``'s weights and apply its compression.
 
     Args:
-        temp_dir: The macOS export's working directory, or None for iOS.
+        temp_dir: Where macOS weights and quantizer checkpoints are disk-backed. None keeps
+            them in RAM.
         export_backend: The backend coreai-opt finalizes quantized weights for. None is
             Core AI.
     """
@@ -243,9 +244,10 @@ def build_model(
     logger.info(f"Loading {config.hf_model_id} ({config.variant}, dtype={target_dtype})...")
     use_memory_efficient = config.variant == "macOS"
     if use_memory_efficient:
-        assert temp_dir is not None  # nullcontext yields None only when not memory-efficient
-        layer_mmap_dir = os.path.join(temp_dir, "layers")
-        os.makedirs(layer_mmap_dir, exist_ok=True)
+        layer_mmap_dir = None
+        if temp_dir is not None:
+            layer_mmap_dir = os.path.join(temp_dir, "layers")
+            os.makedirs(layer_mmap_dir, exist_ok=True)
         model = model_class.from_hf_memory_efficient(
             config.hf_model_id,
             max_context_length=max_context_length,
@@ -304,8 +306,7 @@ def build_model(
 
         quantizer_mmap_dir: str | None = None
         # coreai-opt only supports mmap-backed finalization in eager mode.
-        if use_memory_efficient and not graph_mode:
-            assert temp_dir is not None
+        if use_memory_efficient and temp_dir is not None and not graph_mode:
             quantizer_mmap_dir = os.path.join(temp_dir, "quantized")
             os.makedirs(quantizer_mmap_dir, exist_ok=True)
 
