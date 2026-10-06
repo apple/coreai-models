@@ -26,8 +26,10 @@ struct ImageSegmentationBundleTests {
         }
         """.write(to: dir.appending(path: "metadata.json"), atomically: true, encoding: .utf8)
         if writeAsset {
-            try FileManager.default.createDirectory(
-                at: dir.appending(path: "sam3.aimodel"), withIntermediateDirectories: true)
+            let assetDir = dir.appending(path: "sam3.aimodel")
+            try FileManager.default.createDirectory(at: assetDir, withIntermediateDirectories: true)
+            // `AIModelAsset.isValid` requires a source program file to recognize a .aimodel as valid.
+            FileManager.default.createFile(atPath: assetDir.appending(path: "main.mlirb").path, contents: nil)
         }
         return dir
     }

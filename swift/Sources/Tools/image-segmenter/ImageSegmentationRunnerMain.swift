@@ -181,7 +181,7 @@ struct ImageSegmenterCLI: AsyncParsableCommand {
         let cacheHit = PreparedModel.isCached(at: modelURL)
 
         if verbose { print("Creating image segmenter...") }
-        print("⏳ Preparing AI asset...", terminator: "")
+        print("⏳ Preparing AI asset from \(modelURL.lastPathComponent)...", terminator: "")
         fflush(stdout)
         let loadStart = ContinuousClock.now
         let runner = try await ImageSegmenter(resourcesAt: model)

@@ -91,6 +91,9 @@ struct ObjectDetectorCLI: AsyncParsableCommand {
         if verbose { print("Loading model from \(model)...") }
 
         let modelURL = URL(fileURLWithPath: NSString(string: model).expandingTildeInPath)
+        guard AIModelAsset.isValid(at: modelURL) else {
+            throw DetectionRuntimeError.modelNotFound(modelURL.path)
+        }
 
         if clearCoreAICache {
             let cleared = try PreparedModel.clearCache(at: modelURL)
@@ -108,7 +111,7 @@ struct ObjectDetectorCLI: AsyncParsableCommand {
         )
         if let h = inputHeight { params.inputHeight = h }
         if let w = inputWidth { params.inputWidth = w }
-        print("⏳ Preparing AI asset...", terminator: "")
+        print("⏳ Preparing AI asset from \(modelURL.lastPathComponent)...", terminator: "")
         fflush(stdout)
         let loadStart = ContinuousClock.now
         let detector = try await ObjectDetector(resourcesAt: modelURL.path)
