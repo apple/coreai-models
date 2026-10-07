@@ -39,9 +39,18 @@ def _fake(
     return rope_cos, rope_sin
 
 
-def apply_rope(x: torch.Tensor, rope_cos: torch.Tensor, rope_sin: torch.Tensor) -> torch.Tensor:
-    rope_cos = rope_cos.unsqueeze(1)
-    rope_sin = rope_sin.unsqueeze(1)
+def apply_rope(
+    x: torch.Tensor,
+    rope_cos: torch.Tensor,
+    rope_sin: torch.Tensor,
+    head_axis: int = 1,
+) -> torch.Tensor:
+    # `head_axis` is where the (broadcast) head dimension lives in `x`. The
+    # default of 1 matches the `(B, n_heads, S, head_dim)` head-format layout.
+    # Callers that keep Q/K in `(B, S, n_heads, head_dim)` pass `head_axis=2` so
+    # cos/sin broadcast over heads without an extra transpose into head format.
+    rope_cos = rope_cos.unsqueeze(head_axis)
+    rope_sin = rope_sin.unsqueeze(head_axis)
 
     torch._check(len(rope_cos.shape) == 4)
     torch._check(len(rope_sin.shape) == 4)
