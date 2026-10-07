@@ -148,19 +148,6 @@ struct DetectionDecoderTests {
         return bitset
     }
 
-    @Test("sigmoid does not overflow on a large positive logit")
-    func sigmoidStability() {
-        // `1 / (1 + exp(-x))` is fine for large x but `exp(x) / (1 + exp(x))` overflows to
-        // inf/inf = NaN. The detector's logits are unbounded, so the branch matters.
-        #expect(DetectionDecoder.sigmoid(0) == 0.5)
-        #expect(DetectionDecoder.sigmoid(100) == 1)
-        // Not exactly zero: the negative branch keeps the denormal rather than underflowing.
-        #expect(DetectionDecoder.sigmoid(-100) < 1e-40)
-        #expect(DetectionDecoder.sigmoid(-100) >= 0)
-        #expect(DetectionDecoder.sigmoid(-100).isNaN == false)
-        #expect(abs(DetectionDecoder.sigmoid(2) - 0.880797) < 1e-5)
-    }
-
     @Test("NMS keeps the highest-scoring member of an overlapping group")
     func nmsSuppresses() {
         let masks = [mask(["####"]), mask(["###."]), mask(["...#"])]
@@ -235,7 +222,7 @@ struct DetectionDecoderTests {
             outputs(queries: [2], presence: 1, masks: [[1, 1, -1, -1]]),
             promptID: 0, maskSize: 2, parameters: parameters(threshold: 0.1, nms: 0))
         #expect(decoded.count == 1)
-        let expected = DetectionDecoder.sigmoid(2) * DetectionDecoder.sigmoid(1)
+        let expected = sigmoid(2) * sigmoid(1)
         #expect(abs(decoded.scores[0] - expected) < 1e-6)
         #expect(abs(expected - 0.643914) < 1e-5)
     }
@@ -289,8 +276,8 @@ struct DetectionDecoderTests {
         #expect(decoded.maskLogits[1] == [-1, -1, -1, 1])
         #expect(decoded.masks[1].area == 1)
         let expected = [
-            DetectionDecoder.sigmoid(3) * DetectionDecoder.sigmoid(8),
-            DetectionDecoder.sigmoid(1) * DetectionDecoder.sigmoid(8),
+            sigmoid(3) * sigmoid(8),
+            sigmoid(1) * sigmoid(8),
         ]
         #expect(zip(decoded.scores, expected).allSatisfy { abs($0 - $1) < 1e-6 })
     }

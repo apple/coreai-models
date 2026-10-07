@@ -25,7 +25,7 @@ public struct EngineFactory: Sendable {
     ///
     /// - Parameters:
     ///   - config: The JSON model configuration as raw data.
-    ///   - modelURL: The location of the CoreAI model asset (`.aimodel` or `.aimodelc`).
+    ///   - modelURL: The location of the Core AI model.
     ///   - options: The engine options, including an optional variant override and KV cache
     ///     settings. Defaults to a value with auto-detection enabled and the `.auto` KV cache
     ///     strategy.
@@ -87,7 +87,7 @@ public struct EngineFactory: Sendable {
         bundle: LanguageModelBundle,
         options: EngineOptions = EngineOptions()
     ) async throws -> any InferenceEngine {
-        try bundle.modelBundle.verifyAssetsExisting()
+        try bundle.modelBundle.validateModelAssets()
 
         let languageModelURL = try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.main)
 
@@ -377,7 +377,7 @@ public struct EngineOptions: Sendable {
     public let prefillChunkThreshold: Int?
 
     /// Tensor data the bundle ships alongside the model, for weights too large to bake
-    /// into the graph, keyed by the role name under `assets` in `metadata.json` (see
+    /// into the graph, keyed by the role name under `auxiliary_assets` in `metadata.json` (see
     /// ``TensorDataKey``). A role absent here is data the bundle does not ship.
     public let tensorData: [String: URL]
 
@@ -397,7 +397,7 @@ public struct EngineOptions: Sendable {
     ///     Defaults to `nil`.
     ///   - prefillChunkSize: Tokens per prefill chunk, or `nil` to use model/engine default.
     ///   - prefillChunkThreshold: Minimum prompt tokens to trigger chunking, or `nil` for default.
-    ///   - tensorData: Tensor data URLs keyed by `assets` role. Defaults to empty.
+    ///   - tensorData: Tensor data URLs keyed by `auxiliary_assets` role. Defaults to empty.
     public init(
         variant: String? = nil,
         kvCacheStrategy: KVCacheStrategy = .auto,

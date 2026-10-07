@@ -109,13 +109,15 @@ def _is_layer_key_beyond(key: str, num_layers: int) -> bool:
     Used to filter HuggingFace state dicts when loading a truncated model.
 
     Args:
-        key: State dict key, e.g. "model.layers.3.self_attn.q_proj.weight"
+        key: State dict key, e.g. "model.layers.3.self_attn.q_proj.weight". Keys that
+            have already had a `hf_state_dict_prefix` stripped may start at
+            "layers.3." with no leading component, so the prefix is optional.
         num_layers: Maximum number of layers to keep (0-indexed, exclusive upper bound)
 
     Returns:
         True if the key should be dropped (layer index >= num_layers)
     """
-    match = re.search(r"\.layers\.(\d+)\.", key)
+    match = re.search(r"(?:^|\.)layers\.(\d+)\.", key)
     if match is None:
         return False
     return int(match.group(1)) >= num_layers
