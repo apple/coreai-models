@@ -44,6 +44,12 @@ uv run coreai.llm.export Qwen/Qwen3-0.6B --dry-run
 
 # INT4 Per Block quantized weights and INT8 KV Cache on macOS
 uv run coreai.llm.export Qwen/Qwen3-4B --compression 4bit_weights_8bit_kv_cache
+
+# FP4 weights with FP8 activations and FP8 KV cache on macOS (27.2+)
+uv run coreai.llm.export Qwen/Qwen3-4B --compression fp4_weights_fp8_activations_fp8_kv_cache
+
+# FP8 weights with FP8 activations and FP8 KV cache on macOS (27.2+)
+uv run coreai.llm.export Qwen/Qwen3-4B --compression fp8_weights_fp8_activations_fp8_kv_cache
 ```
 
 ## Run a Core AI Language Model
@@ -83,22 +89,26 @@ Defaults: 512 prompt tokens, 1024 generation tokens, 5 trials. Override with `-p
 
 Perplexity score on the [`WikiText-2`](https://huggingface.co/datasets/EleutherAI/wikitext_document_level) dataset computed using the [lm-evaluation-harness](https://github.com/EleutherAI/lm-evaluation-harness/blob/main/lm_eval/tasks/wikitext/README.md) with the Core AI PyTorch models.
 
-| Model      | Compression                                          | Bits Per Weight (BPW) | Platform | Perplexity Score |
-| ---------- | ---------------------------------------------------- | --------------------- | -------- | ---------------- |
-| Qwen3 0.6B | none (`float16`)                                     | 16.00                 | iOS      | 26.16            |
-| Qwen3 0.6B | [Mixed 4-bit/8-bit palettized][mixed-4bit-8bit-yaml] | 5.71\*                | iOS      | 30.90            |
-| Qwen3 1.7B | none (`float16`)                                     | 16.00                 | macOS    | 20.96            |
-| Qwen3 1.7B | [4-bit quantized][presets-info]                      | 4.50                  | macOS    | 21.19            |
-| Qwen3 1.7B | [6-bit palettized][qwen3-1.7b-6bit-yaml]             | 6.00                  | iOS      | —                |
-| Qwen3 4B   | none (`float16`)                                     | 16.00                 | macOS    | 16.41            |
-| Qwen3 4B   | [4-bit quantized][presets-info]                      | 4.50                  | macOS    | 18.33            |
-| Qwen3 4B   | [4-bit quantized with INT8 KV cache][presets-info]   | 4.50                  | macOS    | 18.65            |
-| Qwen3 4B   | none (`float16`)                                     | 16.00                 | iOS      | 16.41            |
-| Qwen3 4B   | [Mixed 4-bit/8-bit palettized][qwen3-4b-mixed-yaml]  | 4.89\*                | iOS      | 18.80            |
-| Qwen3 8B   | none (`float16`)                                     | 16.00                 | macOS    | 12.19            |
-| Qwen3 8B   | [4-bit quantized][presets-info]                      | 4.50                  | macOS    | 12.90            |
-| Qwen3 8B   | none (`float16`)                                     | 16.00                 | iOS      | 12.19            |
-| Qwen3 8B   | [Mixed 4-bit/8-bit palettized][qwen3-8b-mixed-yaml]  | 4.90\*                | iOS      | 14.83            |
+| Model      | Compression                                             | Bits Per Weight (BPW) | Platform      | Perplexity Score |
+| ---------- | ------------------------------------------------------- | --------------------- | ------------- | ---------------- |
+| Qwen3 0.6B | none (`float16`)                                        | 16.00                 | iOS           | 26.16            |
+| Qwen3 0.6B | [Mixed 4-bit/8-bit palettized][mixed-4bit-8bit-yaml]    | 5.71\*                | iOS           | 30.90            |
+| Qwen3 1.7B | none (`float16`)                                        | 16.00                 | macOS         | 20.96            |
+| Qwen3 1.7B | [4-bit quantized][presets-info]                         | 4.50                  | macOS         | 21.19            |
+| Qwen3 1.7B | [6-bit palettized][qwen3-1.7b-6bit-yaml]                | 6.00                  | iOS           | —                |
+| Qwen3 4B   | none (`float16`)                                        | 16.00                 | macOS         | 16.41            |
+| Qwen3 4B   | [4-bit quantized][presets-info]                         | 4.50                  | macOS         | 18.33            |
+| Qwen3 4B   | [4-bit quantized with INT8 KV cache][presets-info]      | 4.50                  | macOS         | 18.65            |
+| Qwen3 4B   | [FP4 weights, FP8 activations & KV cache][presets-info] | 4.25                  | macOS (27.2+) | 20.07            |
+| Qwen3 4B   | [FP8 weights, FP8 activations & KV cache][presets-info] | 8.00                  | macOS (27.2+) | 17.35            |
+| Qwen3 4B   | none (`float16`)                                        | 16.00                 | iOS           | 16.41            |
+| Qwen3 4B   | [Mixed 4-bit/8-bit palettized][qwen3-4b-mixed-yaml]     | 4.89\*                | iOS           | 18.80            |
+| Qwen3 8B   | none (`float16`)                                        | 16.00                 | macOS         | 12.19            |
+| Qwen3 8B   | [4-bit quantized][presets-info]                         | 4.50                  | macOS         | 12.90            |
+| Qwen3 8B   | [FP4 weights, FP8 activations & KV cache][presets-info] | 4.25                  | macOS (27.2+) | 14.34            |
+| Qwen3 8B   | [FP8 weights, FP8 activations & KV cache][presets-info] | 8.00                  | macOS (27.2+) | 12.87            |
+| Qwen3 8B   | none (`float16`)                                        | 16.00                 | iOS           | 12.19            |
+| Qwen3 8B   | [Mixed 4-bit/8-bit palettized][qwen3-8b-mixed-yaml]     | 4.90\*                | iOS           | 14.83            |
 
 \* BPW includes the Embedding which is quantized to INT8 per-tensor.
 

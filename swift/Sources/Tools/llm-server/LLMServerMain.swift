@@ -121,7 +121,7 @@ struct LLMServer: AsyncParsableCommand {
         }
 
         let bundle = try LanguageModelBundle(from: url.path)
-        try bundle.modelBundle.verifyAssetsExisting()
+        try bundle.modelBundle.validateModelAssets()
 
         if clearCoreAICache {
             let cleared = try PreparedModel.clearCache(at: bundle.bundlePath)
@@ -145,10 +145,9 @@ struct LLMServer: AsyncParsableCommand {
         let modelURL = try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.main)
 
         let cacheHit = PreparedModel.isCached(at: modelURL)
-        let assetLabel: String = modelURL.pathExtension == "aimodelc" ? "compiled" : "source"
 
         if !verbose && replayPath == nil {
-            print("\n⏳ Preparing AI asset from \(assetLabel)...", terminator: "")
+            print("\n⏳ Preparing AI asset from \(modelURL.lastPathComponent)...", terminator: "")
             fflush(stdout)
         }
 

@@ -3,6 +3,7 @@
 // Use of this source code is governed by a BSD-3-clause license that can
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
+import CoreAIShared
 import CoreGraphics
 import Foundation
 
@@ -225,11 +226,6 @@ public enum SegmentationPostprocessor {
         )
         return SemanticSegmentationMap(
             probabilities: probabilities, width: outputWidth, height: outputHeight)
-    }
-
-    // MARK: - Helpers
-    public static func sigmoid(_ x: Float) -> Float {
-        1.0 / (1.0 + exp(-x))
     }
 
     /// Bilinear-upsample a Float grid and threshold at the destination resolution.
