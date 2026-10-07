@@ -4,6 +4,8 @@
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
 import CoreGraphics
+import Foundation
+import ImageIO
 import TestUtilities
 import Testing
 
@@ -11,6 +13,35 @@ import Testing
 
 @Suite("CGImageUtils")
 struct CGImageUtilsTests {
+    // MARK: - load
+
+    @Test("load: reads a written PNG back at its original size")
+    func loadRoundTrips() throws {
+        let image = try #require(makeSolidCGImage(r: 10, g: 20, b: 30, side: 5))
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cgimageutils-load-\(UUID().uuidString).png")
+        let dest = try #require(
+            CGImageDestinationCreateWithURL(url as CFURL, "public.png" as CFString, 1, nil))
+        CGImageDestinationAddImage(dest, image, nil)
+        #expect(CGImageDestinationFinalize(dest))
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let loaded = try CGImageUtils.load(from: url.path)
+        #expect(loaded.width == 5)
+        #expect(loaded.height == 5)
+
+        let viaURL = try CGImageUtils.load(from: url)
+        #expect(viaURL.width == 5)
+        #expect(viaURL.height == 5)
+    }
+
+    @Test("load: a missing file throws loadFailed")
+    func loadMissingThrows() {
+        #expect(throws: ImagePreprocessorError.self) {
+            _ = try CGImageUtils.load(from: "/nonexistent/\(UUID().uuidString).png")
+        }
+    }
+
     // MARK: - toNormalizedPlanarRGB
 
     @Test("White image normalizes to 1.0")

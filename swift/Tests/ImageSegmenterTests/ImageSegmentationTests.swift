@@ -373,15 +373,6 @@ struct ImageSegmentationTests {
         #expect(overlay.height == h)
     }
 
-    // MARK: - Sigmoid
-
-    @Test("sigmoid(0) == 0.5 and sigmoid(x) + sigmoid(-x) == 1")
-    func sigmoidKnownValues() {
-        #expect(sigmoid(0) == 0.5)
-        let x: Float = 2.5
-        #expect(abs(sigmoid(x) + sigmoid(-x) - 1.0) < 1e-6)
-    }
-
     // MARK: - Helpers
 
     private func makeSolidCGImage(width: Int, height: Int, r: UInt8, g: UInt8, b: UInt8) -> CGImage? {

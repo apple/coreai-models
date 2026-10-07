@@ -41,7 +41,8 @@ struct EngineSupportTests {
 
     /// A Gemma-4-shaped bundle: sliding window, dual RoPE, soft cap, PLE sidecar.
     private static func gemmaMetadata(
-        assets: String = #""main": "model.aimodel", "per_layer_embeddings": "model_ple.safetensors""#,
+        assets: String = #""main": "model.aimodel""#,
+        auxiliaryAssets: String = #""per_layer_embeddings": "model_ple.safetensors""#,
         extraLanguage: String = ""
     ) -> String {
         """
@@ -50,6 +51,7 @@ struct EngineSupportTests {
           "kind": "llm",
           "name": "gemma_4_e2b_it_static",
           "assets": { \(assets) },
+          "auxiliary_assets": { \(auxiliaryAssets) },
           "language": {
             "tokenizer": "google/gemma-4-E2B-it",
             "vocab_size": 262144,
@@ -72,7 +74,7 @@ struct EngineSupportTests {
 
     // MARK: - Sidecar resolution
 
-    @Test("A declared PLE sidecar resolves through the assets role map")
+    @Test("A declared PLE sidecar resolves through the auxiliary_assets role map")
     func perLayerEmbeddingsResolvesFromAssets() throws {
         let url = try Self.bundle(
             metadata: Self.gemmaMetadata(), files: ["model_ple.safetensors"])
@@ -84,7 +86,7 @@ struct EngineSupportTests {
 
     @Test("A bundle that ships no sidecar reports none")
     func noSidecarReportsEmpty() throws {
-        let url = try Self.bundle(metadata: Self.gemmaMetadata(assets: #""main": "model.aimodel""#))
+        let url = try Self.bundle(metadata: Self.gemmaMetadata(auxiliaryAssets: ""))
         let resolved = try LanguageModelBundle(at: url).tensorData
 
         // Absent rather than present-and-missing: the static engine distinguishes

@@ -409,7 +409,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         }
 
         let bundle = try LanguageModelBundle(from: modelFile)
-        try bundle.modelBundle.verifyAssetsExisting()
+        try bundle.modelBundle.validateModelAssets()
         let modelName = bundle.name
         let modelVocabSize = bundle.vocabSize
 
@@ -439,9 +439,8 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             cacheHit = PreparedModel.isCached(at: languageModelURL)
         }
 
-        let assetLabel = try modelAssetTypeLabel(for: languageModelURL.pathExtension)
         if !CLILogger.isVerbose {
-            print("\n⏳ Preparing AI asset from \(assetLabel)...", terminator: "")
+            print("\n⏳ Preparing AI asset from \(languageModelURL.lastPathComponent)...", terminator: "")
             fflush(stdout)
         }
 
@@ -1239,18 +1238,6 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         // If we never found the placeholder, the template didn't produce it — fall back
         guard foundPlaceholder else { return nil }
         return result
-    }
-
-    // MARK: - Asset Type Label
-
-    private func modelAssetTypeLabel(for ext: String) throws -> String {
-        switch ext.lowercased() {
-        case "aimodelc": return "compiled"
-        case "aimodel": return "source"
-        default:
-            print("Unsupported model file: only .aimodel or .aimodelc")
-            throw ExitCode.failure
-        }
     }
 
     // MARK: - Warmup
