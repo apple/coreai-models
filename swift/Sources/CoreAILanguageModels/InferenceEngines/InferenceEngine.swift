@@ -54,6 +54,16 @@ public struct InferenceOptions: Sendable {
     /// Force these token IDs instead of sampling (MMLU-style scoring).
     public var forcedContinuation: [Int32]?
 
+    /// Raw initializer over the full `(tokens, logits)` space.
+    ///
+    /// The two axes are intentionally orthogonal and this initializer is
+    /// deliberately permissive: every `(tokens, logits)` pair is representable
+    /// and there are no invalid combinations to reject. The `prefill`, `extend`,
+    /// `eval`, `guided`, and `sampleWithLogits` presets below cover all the
+    /// meaningful pairings; prefer them to constructing options by hand. The
+    /// only representable pair without a dedicated preset is
+    /// `(tokens: .sample, logits: .allPositions)` — sampling a token while also
+    /// returning logits at every position — which is odd but harmless.
     public init(
         maxTokens: Int? = nil,
         tokens: TokenRequest = .sample,
@@ -65,6 +75,12 @@ public struct InferenceOptions: Sendable {
         self.logits = logits
         self.forcedContinuation = forcedContinuation
     }
+
+    /// Whether this request asks the engine to return logits at any position.
+    ///
+    /// Equivalent to `logits != .none`; use this instead of open-coding the
+    /// comparison so the intent reads clearly at the call site.
+    public var returnsLogits: Bool { logits != .none }
 }
 
 /// Presets for the common (tokens, logits) pairs.

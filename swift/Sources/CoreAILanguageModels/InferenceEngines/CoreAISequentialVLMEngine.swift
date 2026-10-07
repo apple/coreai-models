@@ -983,7 +983,7 @@ extension CoreAISequentialVLMEngine.GenerationSequence {
         ) {
             self.engine = engine
             self.samplingConfiguration = samplingConfiguration.normalized()
-            self.returnsLogits = (inferenceOptions.logits != .none)
+            self.returnsLogits = inferenceOptions.returnsLogits
             self.forcedContinuation = inferenceOptions.forcedContinuation
             self.stopReasonStore = stopReasonStore
             self.generationToken = generationToken
