@@ -21,9 +21,10 @@ jobs:
         run: |
           command -v uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-      - run: uv tool install ruff
-      - run: ruff check python/src/ python/tests/
-      - run: ruff format --check python/src/ python/tests/
+      # Run the ruff pinned in pyproject.toml's lint group (also used by pre-commit),
+      # so CI doesn't change behaviour whenever a new ruff is released.
+      - run: uv run --frozen --only-group lint ruff check python/src/ python/tests/
+      - run: uv run --frozen --only-group lint ruff format --check python/src/ python/tests/
 
   swift-format:
     if: github.repository == 'apple/coreai-models'
