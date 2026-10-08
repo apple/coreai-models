@@ -67,3 +67,8 @@ OUTPUT_LOGITS_NAME = "out_logits"
 # the converter in RELEASE mode and embeds minimum debug information. The
 # --include-debug-info flag turns it on (DEBUG mode).
 DEFAULT_INCLUDE_DEBUG_INFO = False
+
+# metadata.json schema version (default for all bundle kinds).
+METADATA_VERSION = "0.2"
+# Batched LLM bundles use 0.3 (adds the max_batch_size field).
+METADATA_VERSION_BATCHED = "0.3"

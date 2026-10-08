@@ -20,7 +20,7 @@ from coreai_models.diffusion.presets import (
 from coreai_models.diffusion.presets import (
     PRESETS as DIFFUSION_PRESETS,
 )
-from coreai_models.export.pipeline import ExportConfig, export_model
+from coreai_models.export.pipeline import AttentionMaskMode, ExportConfig, export_model
 from coreai_models.export.presets import ALL_PRESET_NAMES, IOS_PRESETS, MACOS_PRESETS, list_presets
 from coreai_models.export.presets import (
     DEFAULT_IOS_COMPRESSION_PRESET as IOS_DEFAULT,
@@ -180,6 +180,28 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Export the drafter model alongside the target for speculative decoding. "
             "The drafter is looked up from the model registry; not all models have one."
+        ),
+    )
+    parser.add_argument(
+        "--attention-mask",
+        choices=["default", "batched", "paged"],
+        default="default",
+        help=(
+            "Experimental, macOS only. Attention-mask / KV-write mode of the exported graph. "
+            "'default' keeps the implicit causal mask (shipping contract); 'batched' emits an "
+            "explicit additive attn_mask input (is_causal off) for the dense batched/ragged "
+            "decoder; 'paged' is reserved for the hardware paged backend (not yet supported). "
+            "Default: default. Non-default is rejected when --platform is iOS."
+        ),
+    )
+    parser.add_argument(
+        "--dynamic-batch-size",
+        type=int,
+        default=None,
+        help=(
+            "Experimental, macOS only. Declare a DYNAMIC batch dim up to this max (traced at 2) "
+            "across input_ids/position_ids/attn_mask and the KV cache. Must be >= 2. Pairs with "
+            "--attention-mask batched."
         ),
     )
     return parser
@@ -385,6 +407,8 @@ def _resolve_export_config(args: argparse.Namespace) -> ExportConfig:
             f"preset. Available: {list_presets()}"
         )
 
+    attention_mask_mode = AttentionMaskMode(args.attention_mask)
+
     return ExportConfig(
         hf_model_id=hf_model_id,
         variant=variant,
@@ -401,6 +425,8 @@ def _resolve_export_config(args: argparse.Namespace) -> ExportConfig:
         include_debug_info=args.include_debug_info,
         model_type_override=getattr(preset, "_model_type_override", None) if preset else None,
         with_drafter=args.with_drafter,
+        attention_mask_mode=attention_mask_mode,
+        dynamic_max_batch_size=args.dynamic_batch_size,
     )
 
 

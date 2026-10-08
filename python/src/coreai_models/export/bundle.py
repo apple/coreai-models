@@ -13,9 +13,9 @@ from typing import Any
 
 from transformers import AutoTokenizer
 
-logger = logging.getLogger(__name__)
+from coreai_models._constants import METADATA_VERSION, METADATA_VERSION_BATCHED
 
-METADATA_VERSION = "0.2"
+logger = logging.getLogger(__name__)
 
 
 def bundle_llm_asset(
@@ -27,8 +27,9 @@ def bundle_llm_asset(
     tokenizer_model_id: str | None = None,
     drafter_name: str | None = None,
     speculative_config: dict[str, Any] | None = None,
+    max_batch_size: int = 1,
 ) -> None:
-    """Add tokenizer and metadata.json (0.2 schema) to an LLM bundle.
+    """Add tokenizer and metadata.json to an LLM bundle.
 
     Expects ``{name}.aimodel`` to already exist inside bundle_path.
     When *drafter_name* is set, ``{drafter_name}.aimodel`` must also exist;
@@ -44,6 +45,8 @@ def bundle_llm_asset(
         speculative_config: Runtime config for speculative decoding (e.g.
             ``{"num_draft_tokens": 5, "shared_embeddings": True}``).
             Written as the ``"speculative"`` key in metadata.json.
+        max_batch_size: Upper bound on the request batch the graph serves;
+            > 1 selects the 0.3 schema (adds the ``max_batch_size`` field).
     """
     tok_id = tokenizer_model_id or hf_model_id
     _write_tokenizer(bundle_path / "tokenizer", tok_id)
@@ -55,6 +58,7 @@ def bundle_llm_asset(
         name,
         drafter_name=drafter_name,
         speculative_config=speculative_config,
+        max_batch_size=max_batch_size,
     )
 
 
@@ -72,23 +76,29 @@ def _write_metadata(
     name: str,
     drafter_name: str | None = None,
     speculative_config: dict[str, Any] | None = None,
+    max_batch_size: int = 1,
 ) -> None:
     assets: dict[str, str] = {"main": f"{name}.aimodel"}
     if drafter_name is not None:
         assets["drafter"] = f"{drafter_name}.aimodel"
 
+    is_batched = max_batch_size > 1
+    language: dict[str, Any] = {
+        "tokenizer": hf_model_id,
+        "vocab_size": getattr(hf_config, "vocab_size", None),
+        "max_context_length": getattr(hf_config, "max_position_embeddings", None),
+        "embedded_tokenizer": True,
+        "function_map": {"main": ["main"]},
+    }
+    if is_batched:
+        language["max_batch_size"] = max_batch_size
+
     metadata: dict[str, Any] = {
-        "metadata_version": METADATA_VERSION,
+        "metadata_version": METADATA_VERSION_BATCHED if is_batched else METADATA_VERSION,
         "kind": "llm",
         "name": name,
         "assets": assets,
-        "language": {
-            "tokenizer": hf_model_id,
-            "vocab_size": getattr(hf_config, "vocab_size", None),
-            "max_context_length": getattr(hf_config, "max_position_embeddings", None),
-            "embedded_tokenizer": True,
-            "function_map": {"main": ["main"]},
-        },
+        "language": language,
         "source": {
             "model_definition": "torch",
             "hf_model_id": hf_model_id,
