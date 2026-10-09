@@ -76,11 +76,38 @@ public struct InferenceOptions: Sendable {
         self.forcedContinuation = forcedContinuation
     }
 
+    /// Legacy initializer bridging the old `includeLogits` boolean to the
+    /// `(tokens, logits)` axes: `true` maps to `logits: .lastPosition`, `false` to
+    /// `logits: .none`. Tokens are sampled, as they always were under this API.
+    @available(
+        *, deprecated,
+        message: "Use the tokens:/logits: initializer; includeLogits: true == logits: .lastPosition."
+    )
+    public init(
+        maxTokens: Int? = nil,
+        includeLogits: Bool,
+        forcedContinuation: [Int32]? = nil
+    ) {
+        self.init(
+            maxTokens: maxTokens,
+            tokens: .sample,
+            logits: includeLogits ? .lastPosition : .none,
+            forcedContinuation: forcedContinuation)
+    }
+
     /// Whether this request asks the engine to return logits at any position.
     ///
     /// Equivalent to `logits != .none`; use this instead of open-coding the
     /// comparison so the intent reads clearly at the call site.
     public var returnsLogits: Bool { logits != .none }
+
+    /// Legacy accessor for the old `includeLogits` boolean. Reads as `returnsLogits`;
+    /// setting `true` requests last-position logits, `false` requests none.
+    @available(*, deprecated, message: "Use `logits` / `returnsLogits` instead.")
+    public var includeLogits: Bool {
+        get { returnsLogits }
+        set { logits = newValue ? .lastPosition : .none }
+    }
 }
 
 /// Presets for the common (tokens, logits) pairs.
