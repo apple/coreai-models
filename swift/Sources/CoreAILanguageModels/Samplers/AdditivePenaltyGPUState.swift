@@ -46,10 +46,10 @@ final class AdditivePenaltyGPUState: @unchecked Sendable {
         device: MTLDevice,
         vocabSize: Int,
         pipelineDepth: Int,
-        frequencyPenalty: Double,
-        presencePenalty: Double,
-        logitBias: [Int32: Float]?,
-        windowSize: Int?
+        frequencyPenalty: Double = 0,
+        presencePenalty: Double = 0,
+        logitBias: [Int32: Float]? = nil,
+        windowSize: Int? = nil
     ) throws {
         self.vocabSize = vocabSize
         self.pipelineDepth = pipelineDepth

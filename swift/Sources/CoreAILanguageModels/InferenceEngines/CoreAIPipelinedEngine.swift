@@ -859,6 +859,8 @@ private struct EngineImpl: ~Copyable {
         self.cachedSampler = nil
         self.cachedSamplerTemperature = nil
         self.cachedSamplerPenaltySignature = nil
+        self.penaltyState = nil
+        self.additivePenaltyState = nil
 
         CLILogger.log("CoreAI pipelined engine initialized — Vocab: \(config.vocabSize)")
     }
@@ -908,7 +910,10 @@ private struct EngineImpl: ~Copyable {
                     vocabSize: self.config.vocabSize,
                     pipelineDepth: pipelineDepth,
                     penalty: config.repetitionPenalty!,
-                    windowSize: config.repetitionPenaltyWindow
+                    // nil window means "all history" (SamplingConfiguration contract); the GPU
+                    // ring is fixed-size, so size it to the max possible history (context length)
+                    // to match the CPU path instead of silently capping at the state's default.
+                    windowSize: config.repetitionPenaltyWindow ?? self.config.maxContextLength
                 )
             }
         }
@@ -925,7 +930,10 @@ private struct EngineImpl: ~Copyable {
                     frequencyPenalty: config.frequencyPenalty ?? 0,
                     presencePenalty: config.presencePenalty ?? 0,
                     logitBias: config.logitBias,
-                    windowSize: config.repetitionPenaltyWindow
+                    // nil window means "all history" (SamplingConfiguration contract); the GPU
+                    // ring is fixed-size, so size it to the max possible history (context length)
+                    // to match the CPU path instead of silently capping at the state's default.
+                    windowSize: config.repetitionPenaltyWindow ?? self.config.maxContextLength
                 )
             }
         }

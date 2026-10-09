@@ -369,10 +369,8 @@ final class MPSGraphArgmaxSampler: @unchecked Sendable {
             guard let neutralBuf = device.makeBuffer(length: neutralByteCount, options: .storageModeShared) else {
                 throw MPSGraphSamplerError.bufferAllocationFailed
             }
-            let ptr = neutralBuf.contents().assumingMemoryBound(to: Float16.self)
-            for i in 0..<vocabSize {
-                ptr[i] = Float16(0.0)
-            }
+            // Float16 0.0 is all-zero bits, so a single memset is the additive identity.
+            memset(neutralBuf.contents(), 0, neutralByteCount)
             self.neutralAdditiveData = MPSGraphTensorData(
                 neutralBuf, shape: [1, vocabSize as NSNumber], dataType: .float16)
         } else {
@@ -1194,10 +1192,8 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
             guard let neutralBuf = device.makeBuffer(length: neutralByteCount, options: .storageModeShared) else {
                 throw MPSGraphSamplerError.bufferAllocationFailed
             }
-            let ptr = neutralBuf.contents().assumingMemoryBound(to: Float16.self)
-            for i in 0..<vocabSize {
-                ptr[i] = Float16(0.0)
-            }
+            // Float16 0.0 is all-zero bits, so a single memset is the additive identity.
+            memset(neutralBuf.contents(), 0, neutralByteCount)
             self.neutralAdditiveData = MPSGraphTensorData(
                 neutralBuf, shape: [1, vocabSize as NSNumber], dataType: .float16)
         } else {
