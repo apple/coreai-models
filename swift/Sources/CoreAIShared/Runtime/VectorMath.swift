@@ -20,11 +20,11 @@ public func sigmoid(_ x: Float) -> Float {
 
 /// Cosine similarity of two equal-length vectors, accumulated in `Double` and returned as `Float`.
 ///
-/// Returns `0` for empty, length-mismatched, or zero-norm inputs. The parity harnesses that
-/// use this report the value as a diagnostic, so the single documented convention keeps their
-/// numbers comparable.
+/// Length-mismatched inputs score `0`. For zero-norm inputs the convention matches the parity
+/// harnesses: two zero-norm (or empty) vectors are identical and score `1`, while a single
+/// zero-norm vector has no direction to compare and scores `0`.
 public func cosineSimilarity(_ a: [Float], _ b: [Float]) -> Float {
-    guard a.count == b.count, !a.isEmpty else { return 0 }
+    guard a.count == b.count else { return 0 }
     var dot = 0.0
     var normA = 0.0
     var normB = 0.0
@@ -34,5 +34,6 @@ public func cosineSimilarity(_ a: [Float], _ b: [Float]) -> Float {
         normB += Double(b[i]) * Double(b[i])
     }
     let denom = (normA * normB).squareRoot()
-    return denom > 0 ? Float(dot / denom) : 0
+    guard denom > 0 else { return normA == normB ? 1 : 0 }
+    return Float(dot / denom)
 }
