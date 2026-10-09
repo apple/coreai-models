@@ -260,7 +260,7 @@ extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
         private let inferenceEngine: any InferenceEngine
         private let samplingConfiguration: SamplingConfiguration
         private let stopSequences: StopSequences
-        private let constrainedOptions = InferenceOptions(maxTokens: 1, includeLogits: true)
+        private let constrainedOptions = InferenceOptions.guided(maxTokens: 1)
 
         // Generation state, seeded eagerly from the prepared setup.
         private var session: ConstrainedGenerationSession?

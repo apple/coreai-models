@@ -1135,10 +1135,8 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             with: embeddedInput,
             tokens: vlmTokens,
             samplingConfiguration: samplingConfiguration,
-            inferenceOptions: InferenceOptions(
-                maxTokens: maxTokens,
-                includeLogits: printLogits || saveLogits != nil
-            )
+            inferenceOptions: (printLogits || saveLogits != nil)
+                ? .sampleWithLogits(maxTokens: maxTokens) : .extend(maxTokens: maxTokens)
         )
 
         CLILogger.log("VLM generate started, maxTokens=\(maxTokens)", component: "VLM")

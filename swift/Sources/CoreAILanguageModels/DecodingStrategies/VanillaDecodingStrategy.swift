@@ -24,7 +24,7 @@ public struct VanillaDecodingStrategy: DecodingStrategy {
     ///   - tokenizer: Tokenizer for encoding/decoding
     ///   - inferenceEngine: Engine for model inference
     ///   - samplingConfiguration: Sampling parameters (temperature, topK, etc.)
-    ///   - options: Inference options (maxTokens, includeLogits)
+    ///   - options: Inference options (maxTokens, tokens, logits)
     ///   - stopSequences: Token sequences that halt generation
     /// - Returns: Stream of `GenerationResult` (text + optional logits)
     public func decode(

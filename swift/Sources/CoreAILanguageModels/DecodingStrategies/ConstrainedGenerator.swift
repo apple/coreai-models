@@ -188,7 +188,7 @@ public struct ConstrainedGenerator: DecodingStrategy {
         for _ in 0..<maxTokens {
             if session.isTerminated { break }
 
-            let options = InferenceOptions(maxTokens: 1, includeLogits: true)
+            let options = InferenceOptions.guided(maxTokens: 1)
 
             var rawLogits: [LogitsScalarType]? = nil
             for try await output in try await inferenceEngine.generate(

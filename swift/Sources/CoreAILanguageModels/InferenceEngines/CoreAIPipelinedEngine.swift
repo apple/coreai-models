@@ -117,7 +117,7 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
         samplingConfiguration: SamplingConfiguration,
         inferenceOptions: InferenceOptions
     ) async throws -> GenerationSequence {
-        if inferenceOptions.includeLogits {
+        if inferenceOptions.returnsLogits {
             throw InferenceRuntimeError.invalidArgument(
                 "CoreAI pipelined engine does not support logits (GPU-side sampling). "
                     + "Use a sequential engine for constrained generation or evaluation."
