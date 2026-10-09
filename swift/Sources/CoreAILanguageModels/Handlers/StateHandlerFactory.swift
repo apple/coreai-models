@@ -102,6 +102,7 @@ enum StateHandlerFactory {
         maxContextLength: Int,
         stateKinds: [String: StateKind]? = nil,
         options: EngineOptions = EngineOptions(),
+        batchSize: Int = 1,
         verbose: Bool = false
     ) throws -> SyncStateHandlerSet {
         guard !descriptor.stateNames.isEmpty else {
@@ -139,8 +140,12 @@ enum StateHandlerFactory {
         if !growingPairs.isEmpty {
             if options.kvCacheStrategy == .fixedSize {
                 let resolved = growingPairs.map { (name, desc) -> (name: String, descriptor: NDArrayDescriptor) in
+                    // Grow the seq dim to the full context; pin a dynamic batch dim to batchSize.
+                    let seqDim = max(0, desc.shape.count - 2)
                     let resolvedDesc = desc.resolvingDynamicDimensions(
-                        desc.shape.map { $0 < 0 ? maxContextLength : $0 })
+                        GrowingNDArrayState.resolveKVShape(
+                            desc.shape, sequenceDimIndex: seqDim, sequenceLength: maxContextLength,
+                            batchSize: batchSize))
                     return (name, resolvedDesc)
                 }
                 kvCache = FixedNDArrayState(states: resolved)
@@ -149,7 +154,8 @@ enum StateHandlerFactory {
                 kvCache = GrowingNDArrayState(
                     states: growingPairs,
                     initialCapacity: initial,
-                    maxCapacity: maxContextLength
+                    maxCapacity: maxContextLength,
+                    batchSize: batchSize
                 )
             }
         } else {

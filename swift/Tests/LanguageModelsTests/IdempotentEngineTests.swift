@@ -145,6 +145,43 @@ struct IdempotentEngineRoutingTests {
     }
 }
 
+// MARK: - Per-session generation state (model-free)
+
+/// `GenerationTokenBox` and `lastPrefixHitCount` live on `GenerationSessionState`, not the
+/// engine, so independent sessions (a concurrent scheduler, or a batch=1 fallback lane running
+/// beside the batched lane) cannot cancel or clobber each other's in-flight generation or
+/// prefix metrics.
+@Suite("Per-session generation state")
+struct PerSessionStateTests {
+    private func makeSession() -> GenerationSessionState {
+        GenerationSessionState(
+            kvCache: MockStateHandler(names: ["k"], shape: [1, 1, 1, 1, 1]),
+            additionalStates: nil,
+            hasNonTruncatableStates: false)
+    }
+
+    @Test("each session owns an independent in-flight token box")
+    func independentTokenBoxes() {
+        let a = makeSession()
+        let b = makeSession()
+        let tokenA = GenerationToken()
+        a.tokenBox.install(tokenA)
+        #expect(a.tokenBox.isBusy)
+        #expect(!b.tokenBox.isBusy)  // installing on A must not make B busy
+        b.tokenBox.cancelActive()
+        #expect(a.tokenBox.isBusy)  // cancelling B must not clear A's token
+    }
+
+    @Test("each session tracks its own prefix hit count")
+    func independentPrefixHitCount() {
+        let a = makeSession()
+        let b = makeSession()
+        a.lastPrefixHitCount = 7
+        #expect(a.lastPrefixHitCount == 7)
+        #expect(b.lastPrefixHitCount == 0)  // per-session, not shared engine state
+    }
+}
+
 // MARK: - Parity Scaffold (Phase 2 — requires an on-device compiled model)
 
 /// Model-backed parity checks for the idempotent-engine refactor.

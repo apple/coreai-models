@@ -48,6 +48,28 @@ struct LanguageModelBundleTests {
         #expect(bundle.language.embeddedTokenizer == true)  // default
         #expect(bundle.language.functionMap?.names(for: "extend") == ["extend_512", "extend_1024"])
         #expect(bundle.language.functionMap?.name(for: "main") == "main")
+        #expect(bundle.maxBatchSize == 1)  // 0.2 bundle: no max_batch_size → defaults to 1
+    }
+
+    @Test("max_batch_size decodes from the language block (batched asset)")
+    func decodesMaxBatchSize() throws {
+        let url = try Self.tempBundle(
+            """
+            {
+              "metadata_version": "0.3",
+              "kind": "llm",
+              "name": "qwen3-1.7b-batched",
+              "assets": { "main": "model.aimodel" },
+              "language": {
+                "tokenizer": "Qwen/Qwen3-1.7B",
+                "vocab_size": 151936,
+                "max_context_length": 8192,
+                "max_batch_size": 8
+              }
+            }
+            """)
+        let bundle = try LanguageModelBundle(at: url)
+        #expect(bundle.maxBatchSize == 8)
     }
 
     @Test("0.1 legacy bundle throws unsupportedVersion")

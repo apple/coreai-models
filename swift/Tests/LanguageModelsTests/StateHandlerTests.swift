@@ -107,6 +107,35 @@ struct StateHandlerConformanceTests {
     }
 }
 
+// MARK: - KV Cache Shape Resolution (batch-aware)
+
+@Suite("KV cache dynamic-shape resolution")
+struct KVCacheShapeResolutionTests {
+    // Cache layout is [n_layers, batch, n_kv_heads, seq, head_dim]; seq is second-to-last (index 3).
+    let seqDim = 3
+
+    @Test("grows the seq dim and pins a dynamic batch dim to batchSize")
+    func dynamicBatchAndSeq() {
+        let resolved = GrowingNDArrayState.resolveKVShape(
+            [2, -1, 4, -1, 8], sequenceDimIndex: seqDim, sequenceLength: 256, batchSize: 3)
+        #expect(resolved == [2, 3, 4, 256, 8])
+    }
+
+    @Test("single dynamic seq dim leaves a static batch untouched")
+    func onlySeqDynamic() {
+        let resolved = GrowingNDArrayState.resolveKVShape(
+            [2, 1, 4, -1, 8], sequenceDimIndex: seqDim, sequenceLength: 256, batchSize: 1)
+        #expect(resolved == [2, 1, 4, 256, 8])
+    }
+
+    @Test("default batchSize=1 resolves a dynamic batch dim to 1")
+    func dynamicBatchDefaultsToOne() {
+        let resolved = GrowingNDArrayState.resolveKVShape(
+            [2, -1, 4, -1, 8], sequenceDimIndex: seqDim, sequenceLength: 512, batchSize: 1)
+        #expect(resolved == [2, 1, 4, 512, 8])
+    }
+}
+
 // MARK: - withBoundStates Tests
 
 /// Minimal state handler for testing the binding API.
@@ -176,5 +205,189 @@ struct BindTests {
         var views = InferenceFunction.MutableViews()
         primary.bind(into: &views)
         secondary.bind(into: &views)
+    }
+}
+
+// MARK: - Per-row blit (copyRegion)
+
+@Suite("GrowingNDArrayState.copyRegion (per-row blit)")
+struct CopyRegionTests {
+    /// Row-major flat index into a [B, H, S, D] cache.
+    private func idx(_ b: Int, _ h: Int, _ s: Int, _ d: Int, H: Int, S: Int, D: Int) -> Int {
+        ((b * H + h) * S + s) * D + d
+    }
+
+    @Test("blits one row's seq slice (float16), leaving every other row/position untouched")
+    func blitsFloat16() {
+        let (B, H, S, D) = (3, 2, 6, 4)
+        let count = B * H * S * D
+        var array = NDArray(shape: [B, H, S, D], scalarType: .float16)
+        fillNDArray(&array, as: Float16.self, count: count) { Float16($0) }
+
+        // Row 1's new token was shared-written at the longest slot (seq 5); blit it to its cursor (2).
+        GrowingNDArrayState.copyRegion(
+            in: &array, sequenceDimIndex: 2, batchDimIndex: 0, row: 1, fromSeq: 5, toSeq: 2)
+
+        let out = readNDArray(array, as: Float16.self, count: count)
+        for b in 0..<B {
+            for h in 0..<H {
+                for s in 0..<S {
+                    for d in 0..<D {
+                        let flat = idx(b, h, s, d, H: H, S: S, D: D)
+                        let expected =
+                            (b == 1 && s == 2)
+                            ? Float16(idx(1, h, 5, d, H: H, S: S, D: D)) : Float16(flat)
+                        #expect(out[flat] == expected, "mismatch at [\(b),\(h),\(s),\(d)]")
+                    }
+                }
+            }
+        }
+    }
+
+    @Test("blits one row's seq slice (float32)")
+    func blitsFloat32() {
+        let (B, H, S, D) = (2, 1, 5, 3)
+        let count = B * H * S * D
+        var array = NDArray(shape: [B, H, S, D], scalarType: .float32)
+        fillNDArray(&array, as: Float.self, count: count) { Float($0) }
+
+        GrowingNDArrayState.copyRegion(
+            in: &array, sequenceDimIndex: 2, batchDimIndex: 0, row: 0, fromSeq: 4, toSeq: 1)
+
+        let out = readNDArray(array, as: Float.self, count: count)
+        for b in 0..<B {
+            for h in 0..<H {
+                for s in 0..<S {
+                    for d in 0..<D {
+                        let flat = idx(b, h, s, d, H: H, S: S, D: D)
+                        let expected =
+                            (b == 0 && s == 1)
+                            ? Float(idx(0, h, 4, d, H: H, S: S, D: D)) : Float(flat)
+                        #expect(out[flat] == expected, "mismatch at [\(b),\(h),\(s),\(d)]")
+                    }
+                }
+            }
+        }
+    }
+
+    @Test("fromSeq == toSeq is a no-op (the longest row / equal-length cohort → zero blits)")
+    func equalSlotIsNoOp() {
+        let (B, H, S, D) = (2, 2, 4, 2)
+        let count = B * H * S * D
+        var array = NDArray(shape: [B, H, S, D], scalarType: .float16)
+        fillNDArray(&array, as: Float16.self, count: count) { Float16($0) }
+
+        GrowingNDArrayState.copyRegion(
+            in: &array, sequenceDimIndex: 2, batchDimIndex: 0, row: 1, fromSeq: 3, toSeq: 3)
+
+        let out = readNDArray(array, as: Float16.self, count: count)
+        #expect(out == (0..<count).map { Float16($0) })
+    }
+
+    @Test("copyRowPrefix moves a batch-1 prefill into a slab across differing seq capacities")
+    func copyRowPrefixIntoSlab() {
+        // Source: batch-1 scratch [1, H, srcSeq, D]; destination: batch-N [N, H, dstSeq, D] with a
+        // larger seq capacity. Prefill prefix of length P goes into destination slab `destRow`.
+        let (H, D) = (2, 2)
+        let (srcSeq, dstSeq, N, destRow, P) = (3, 5, 3, 1, 3)
+        func sidx(_ h: Int, _ s: Int, _ d: Int) -> Int { ((0 * H + h) * srcSeq + s) * D + d }
+        func didx(_ b: Int, _ h: Int, _ s: Int, _ d: Int) -> Int { ((b * H + h) * dstSeq + s) * D + d }
+
+        var src = NDArray(shape: [1, H, srcSeq, D], scalarType: .float16)
+        fillNDArray(&src, as: Float16.self, count: H * srcSeq * D) { Float16(100 + $0) }
+        var dst = NDArray(shape: [N, H, dstSeq, D], scalarType: .float16)
+        let dstCount = N * H * dstSeq * D
+        fillNDArray(&dst, as: Float16.self, count: dstCount) { Float16($0) }
+
+        GrowingNDArrayState.copyRowPrefix(
+            from: src, sourceRow: 0, to: &dst, destRow: destRow, sequenceDimIndex: 2,
+            batchDimIndex: 0, count: P)
+
+        let out = readNDArray(dst, as: Float16.self, count: dstCount)
+        for b in 0..<N {
+            for h in 0..<H {
+                for s in 0..<dstSeq {
+                    for d in 0..<D {
+                        let flat = didx(b, h, s, d)
+                        let expected =
+                            (b == destRow && s < P)
+                            ? Float16(100 + sidx(h, s, d)) : Float16(flat)
+                        #expect(out[flat] == expected, "mismatch at [\(b),\(h),\(s),\(d)]")
+                    }
+                }
+            }
+        }
+    }
+
+    // The real qwen3 KV layout is [G, B, H, seq, D] — batch at dim 1, NOT leading. These lock the
+    // generalized blit to a non-leading batch dim; a leading-batch assumption crashes on device.
+
+    @Test("copyRegion blits one row with a NON-leading batch dim ([G,B,H,S,D], batchDimIndex 1)")
+    func blitNonLeadingBatchDim() {
+        let (G, B, H, S, D) = (2, 3, 2, 5, 2)
+        let count = G * B * H * S * D
+        func idx(_ g: Int, _ b: Int, _ h: Int, _ s: Int, _ d: Int) -> Int {
+            (((g * B + b) * H + h) * S + s) * D + d
+        }
+        var array = NDArray(shape: [G, B, H, S, D], scalarType: .float16)
+        fillNDArray(&array, as: Float16.self, count: count) { Float16($0) }
+
+        // Blit batch row 1's new token from the shared write slot (seq 4) down to its cursor (seq 1).
+        GrowingNDArrayState.copyRegion(
+            in: &array, sequenceDimIndex: 3, batchDimIndex: 1, row: 1, fromSeq: 4, toSeq: 1)
+
+        let out = readNDArray(array, as: Float16.self, count: count)
+        for g in 0..<G {
+            for b in 0..<B {
+                for h in 0..<H {
+                    for s in 0..<S {
+                        for d in 0..<D {
+                            let flat = idx(g, b, h, s, d)
+                            let expected =
+                                (b == 1 && s == 1) ? Float16(idx(g, 1, h, 4, d)) : Float16(flat)
+                            #expect(out[flat] == expected, "mismatch at [\(g),\(b),\(h),\(s),\(d)]")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @Test("copyRowPrefix into a slab with a NON-leading batch dim ([G,B,H,S,D], batchDimIndex 1)")
+    func prefixNonLeadingBatchDim() {
+        let (G, H, D) = (2, 2, 2)
+        let (srcSeq, dstSeq, N, destRow, P) = (3, 5, 3, 1, 3)
+        func sidx(_ g: Int, _ h: Int, _ s: Int, _ d: Int) -> Int {
+            (((g * 1 + 0) * H + h) * srcSeq + s) * D + d
+        }
+        func didx(_ g: Int, _ b: Int, _ h: Int, _ s: Int, _ d: Int) -> Int {
+            (((g * N + b) * H + h) * dstSeq + s) * D + d
+        }
+        var src = NDArray(shape: [G, 1, H, srcSeq, D], scalarType: .float16)
+        fillNDArray(&src, as: Float16.self, count: G * H * srcSeq * D) { Float16(100 + $0) }
+        var dst = NDArray(shape: [G, N, H, dstSeq, D], scalarType: .float16)
+        let dstCount = G * N * H * dstSeq * D
+        fillNDArray(&dst, as: Float16.self, count: dstCount) { Float16($0) }
+
+        GrowingNDArrayState.copyRowPrefix(
+            from: src, sourceRow: 0, to: &dst, destRow: destRow, sequenceDimIndex: 3,
+            batchDimIndex: 1, count: P)
+
+        let out = readNDArray(dst, as: Float16.self, count: dstCount)
+        for g in 0..<G {
+            for b in 0..<N {
+                for h in 0..<H {
+                    for s in 0..<dstSeq {
+                        for d in 0..<D {
+                            let flat = didx(g, b, h, s, d)
+                            let expected =
+                                (b == destRow && s < P)
+                                ? Float16(100 + sidx(g, h, s, d)) : Float16(flat)
+                            #expect(out[flat] == expected, "mismatch at [\(g),\(b),\(h),\(s),\(d)]")
+                        }
+                    }
+                }
+            }
+        }
     }
 }
