@@ -35,7 +35,7 @@ public struct AdditivePenaltyProcessor {
     ) {
         let vocabSize = logits.count
 
-        if frequencyPenalty != 0 || presencePenalty != 0 {
+        if frequencyPenalty != 0.0 || presencePenalty != 0.0 {
             var counts = [Int32: Int](minimumCapacity: min(recentTokenIds.count, 512))
             for tokenId in recentTokenIds {
                 guard tokenId >= 0 && Int(tokenId) < vocabSize else { continue }
