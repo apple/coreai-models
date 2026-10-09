@@ -114,7 +114,9 @@ enum MPSGraphSamplerFactory {
         config: SamplingConfiguration
     ) throws -> any MPSGraphSampler {
         if config.temperature == 0 {
-            return try MPSGraphArgmaxSampler(device: device, vocabSize: vocabSize)
+            return try MPSGraphArgmaxSampler(
+                device: device, vocabSize: vocabSize,
+                additiveEnabled: config.needsAdditiveLogitProcessing)
         }
 
         // Determine effective K for the topK operation:
@@ -137,7 +139,8 @@ enum MPSGraphSamplerFactory {
             temperature: Float(config.temperature),
             topP: config.topP.map { Float($0) } ?? 1.0,
             minP: config.minP.map { Float($0) } ?? 0.0,
-            penaltyEnabled: config.needsRepetitionPenalty
+            penaltyEnabled: config.needsRepetitionPenalty,
+            additiveEnabled: config.needsAdditiveLogitProcessing
         )
     }
 
@@ -203,6 +206,21 @@ private func buildBitmaskExpansionGraph(
     return graph.select(predicate: predicate, trueTensor: logits, falseTensor: negInf, name: "masked_logits")
 }
 
+/// Builds the additive-delta stage: `logits + delta`, where `delta` carries the frequency/presence
+/// penalty and the logit bias. The delta placeholder is f16 with a neutral value of 0.0.
+///
+/// - Parameters:
+///   - graph: The graph to add the operation to.
+///   - logits: The current logits tensor (float32).
+///   - additiveTensor: The f16 additive-delta placeholder `[1, vocabSize]`.
+/// - Returns: `logits + cast(additiveTensor, float32)`.
+private func applyAdditiveStage(
+    graph: MPSGraph, logits: MPSGraphTensor, additiveTensor: MPSGraphTensor, name: String
+) -> MPSGraphTensor {
+    let additiveF32 = graph.cast(additiveTensor, to: .float32, name: "\(name)_f32")
+    return graph.addition(logits, additiveF32, name: name)
+}
+
 // MARK: - MPSGraph Argmax Sampler
 
 /// MPSGraph-based argmax sampler using Apple's optimized reductionArgMaximum.
@@ -230,11 +248,15 @@ final class MPSGraphArgmaxSampler: @unchecked Sendable {
     private let mpsDevice: MPSGraphDevice
     private let graph: MPSGraph
     private let inputPlaceholder: MPSGraphTensor
+    private let additivePlaceholder: MPSGraphTensor?
     private let outputTensor: MPSGraphTensor
     private let executable: MPSGraphExecutable
 
     /// The vocabulary size this sampler was compiled for
     let vocabSize: Int
+
+    /// Whether an additive delta (frequency/presence penalty + logit bias) is compiled into the graph.
+    let additiveEnabled: Bool
 
     // Pre-allocated objects reused every step to avoid ~70µs of CPU object creation.
     // MPSGraphTensorData wraps MTLBuffer references — safe to reuse when buffers match.
@@ -243,10 +265,15 @@ final class MPSGraphArgmaxSampler: @unchecked Sendable {
     private var cachedInputBuffer: MTLBuffer?
     private var cachedOutputBuffer: MTLBuffer?
 
+    // Pre-allocated neutral additive buffer (all 0.0 in f16) used by non-additive encode paths
+    // when the executable was compiled with additive support.
+    private let neutralAdditiveData: MPSGraphTensorData?
+
     // Constrained sampling — compiled lazily on first applyBitmask: true call.
     private var constrainedExecutable: MPSGraphExecutable?
     private var constrainedBitmaskBuffer: MTLBuffer?
     private var constrainedBitmaskData: MPSGraphTensorData?
+    private var constrainedAdditivePlaceholder: MPSGraphTensor?
 
     /// Number of Int32 words in the bitmask.
     let bitmaskSize: Int
@@ -255,13 +282,16 @@ final class MPSGraphArgmaxSampler: @unchecked Sendable {
     /// - Parameters:
     ///   - device: Metal device
     ///   - vocabSize: Vocabulary size (fixed for compilation)
-    init(device: MTLDevice, vocabSize: Int) throws {
+    ///   - additiveEnabled: Whether to compile in an additive-delta stage (frequency/presence
+    ///     penalty + logit bias) applied before argmax.
+    init(device: MTLDevice, vocabSize: Int, additiveEnabled: Bool = false) throws {
         guard vocabSize > 0 else {
             throw MPSGraphSamplerError.graphCompilationFailed
         }
         self.device = device
         self.mpsDevice = MPSGraphDevice(mtlDevice: device)
         self.vocabSize = vocabSize
+        self.additiveEnabled = additiveEnabled
         self.bitmaskSize = (vocabSize + 31) / 32
 
         // Build the argmax graph
@@ -276,10 +306,25 @@ final class MPSGraphArgmaxSampler: @unchecked Sendable {
         )
         self.inputPlaceholder = inputPlaceholder
 
+        // Optional additive delta [1, vocabSize] f16 (frequency/presence penalty + logit bias)
+        let argmaxInput: MPSGraphTensor
+        if additiveEnabled {
+            let additive = graph.placeholder(
+                shape: [1, vocabSize as NSNumber], dataType: .float16, name: "additive")
+            self.additivePlaceholder = additive
+            let logitsF32 = graph.cast(inputPlaceholder, to: .float32, name: "logits_f32")
+            let biased = applyAdditiveStage(
+                graph: graph, logits: logitsF32, additiveTensor: additive, name: "additive")
+            argmaxInput = biased
+        } else {
+            self.additivePlaceholder = nil
+            argmaxInput = inputPlaceholder
+        }
+
         // Argmax along axis 1 (vocab dimension) - returns Int64
         // No reshape needed! Just reduce along the vocab dimension.
         let argmaxInt64 = graph.reductionArgMaximum(
-            with: inputPlaceholder,
+            with: argmaxInput,
             axis: 1,  // axis 1 = vocab dimension in [1, vocabSize]
             name: "argmax"
         )
@@ -293,12 +338,15 @@ final class MPSGraphArgmaxSampler: @unchecked Sendable {
         self.outputTensor = outputTensor
 
         // Compile to executable
-        let feeds: [MPSGraphTensor: MPSGraphShapedType] = [
+        var feeds: [MPSGraphTensor: MPSGraphShapedType] = [
             inputPlaceholder: MPSGraphShapedType(
                 shape: [1, vocabSize as NSNumber],
                 dataType: .float16
             )
         ]
+        if let additive = additivePlaceholder {
+            feeds[additive] = MPSGraphShapedType(shape: [1, vocabSize as NSNumber], dataType: .float16)
+        }
 
         let targetTensors = [outputTensor]
 
@@ -313,6 +361,36 @@ final class MPSGraphArgmaxSampler: @unchecked Sendable {
             targetOperations: nil,
             compilationDescriptor: compilationDescriptor
         )
+
+        // Pre-allocate a neutral additive buffer (all 0.0 in f16) so non-additive encode paths can
+        // feed the additive-enabled executable without a caller-provided delta buffer.
+        if additiveEnabled {
+            let neutralByteCount = vocabSize * MemoryLayout<UInt16>.size
+            guard let neutralBuf = device.makeBuffer(length: neutralByteCount, options: .storageModeShared) else {
+                throw MPSGraphSamplerError.bufferAllocationFailed
+            }
+            // Float16 0.0 is all-zero bits, so a single memset is the additive identity.
+            memset(neutralBuf.contents(), 0, neutralByteCount)
+            self.neutralAdditiveData = MPSGraphTensorData(
+                neutralBuf, shape: [1, vocabSize as NSNumber], dataType: .float16)
+        } else {
+            self.neutralAdditiveData = nil
+        }
+    }
+
+    /// Build the argmax executable inputs in feed order, injecting the additive delta when enabled.
+    private func argmaxInputs(
+        logitsData: MPSGraphTensorData, additiveData: MPSGraphTensorData?
+    ) -> [MPSGraphTensorData] {
+        let effectiveAdditive = additiveData ?? neutralAdditiveData
+        return executable.feedTensors!.map { tensor -> MPSGraphTensorData in
+            switch tensor.operation.name {
+            case "logits": return logitsData
+            case "additive": return effectiveAdditive!
+            default:
+                fatalError("MPSGraphArgmaxSampler: unknown feed tensor '\(tensor.operation.name)'")
+            }
+        }
     }
 
     // MARK: - Constrained Sampling (Lazy)
@@ -356,13 +434,29 @@ final class MPSGraphArgmaxSampler: @unchecked Sendable {
             graph: cGraph, logits: cLogits, bitmaskPlaceholder: cBitmask,
             vocabSize: vocabSize, bitmaskSize: bitmaskSize)
 
-        let cArgmax = cGraph.reductionArgMaximum(with: maskedLogits, axis: 1, name: "argmax")
+        // Apply the additive delta after masking so grammar bans stay authoritative.
+        let argmaxInput: MPSGraphTensor
+        if additiveEnabled {
+            let cAdditive = cGraph.placeholder(
+                shape: [1, vocabSize as NSNumber], dataType: .float16, name: "additive")
+            self.constrainedAdditivePlaceholder = cAdditive
+            let maskedF32 = cGraph.cast(maskedLogits, to: .float32, name: "logits_f32")
+            argmaxInput = applyAdditiveStage(
+                graph: cGraph, logits: maskedF32, additiveTensor: cAdditive, name: "additive")
+        } else {
+            argmaxInput = maskedLogits
+        }
+
+        let cArgmax = cGraph.reductionArgMaximum(with: argmaxInput, axis: 1, name: "argmax")
         let cOutput = cGraph.cast(cArgmax, to: .int32, name: "token_id")
 
-        let cFeeds: [MPSGraphTensor: MPSGraphShapedType] = [
+        var cFeeds: [MPSGraphTensor: MPSGraphShapedType] = [
             cLogits: MPSGraphShapedType(shape: [1, vocabSize as NSNumber], dataType: .float16),
             cBitmask: MPSGraphShapedType(shape: [bitmaskSize as NSNumber], dataType: .int32),
         ]
+        if let cAdditive = constrainedAdditivePlaceholder {
+            cFeeds[cAdditive] = MPSGraphShapedType(shape: [1, vocabSize as NSNumber], dataType: .float16)
+        }
         let desc = MPSGraphCompilationDescriptor()
         desc.optimizationLevel = .level0
 
@@ -372,6 +466,22 @@ final class MPSGraphArgmaxSampler: @unchecked Sendable {
             compilationDescriptor: desc)
         constrainedExecutable = exec
         return (exec, constrainedBitmaskData!)
+    }
+
+    /// Build the constrained argmax inputs in feed order, injecting bitmask and additive delta.
+    private func constrainedInputs(
+        logitsData: MPSGraphTensorData, bitmaskData: MPSGraphTensorData, additiveData: MPSGraphTensorData?
+    ) -> [MPSGraphTensorData] {
+        let effectiveAdditive = additiveData ?? neutralAdditiveData
+        return constrainedExecutable!.feedTensors!.map { tensor -> MPSGraphTensorData in
+            switch tensor.operation.name {
+            case "logits": return logitsData
+            case "bitmask": return bitmaskData
+            case "additive": return effectiveAdditive!
+            default:
+                fatalError("MPSGraphArgmaxSampler: unknown constrained feed tensor '\(tensor.operation.name)'")
+            }
+        }
     }
 
     /// Encode argmax sampling with optional bitmask constraint.
@@ -388,6 +498,23 @@ final class MPSGraphArgmaxSampler: @unchecked Sendable {
         applyBitmask: Bool,
         completion: @escaping (Int32, Error?) -> Void
     ) throws {
+        try encode(
+            to: queue, logitsBuffer: logitsBuffer, logitsOffset: logitsOffset,
+            outputBuffer: outputBuffer, outputOffset: outputOffset,
+            applyBitmask: applyBitmask, additiveBuffer: nil, completion: completion)
+    }
+
+    /// Encode argmax sampling with optional bitmask constraint and an optional additive delta.
+    func encode(
+        to queue: MTLCommandQueue,
+        logitsBuffer: MTLBuffer,
+        logitsOffset: Int,
+        outputBuffer: MTLBuffer,
+        outputOffset: Int,
+        applyBitmask: Bool,
+        additiveBuffer: MTLBuffer?,
+        completion: @escaping (Int32, Error?) -> Void
+    ) throws {
         if applyBitmask {
             guard let (constrained, bitmaskTensorData) = try? ensureConstrainedResources() else {
                 completion(0, MPSGraphSamplerError.bufferAllocationFailed)
@@ -397,6 +524,9 @@ final class MPSGraphArgmaxSampler: @unchecked Sendable {
                 logitsBuffer, shape: [1, vocabSize as NSNumber], dataType: .float16)
             let outputData = MPSGraphTensorData(
                 outputBuffer, shape: [1 as NSNumber], dataType: .int32)
+            let additiveData = additiveBuffer.map {
+                MPSGraphTensorData($0, shape: [1, vocabSize as NSNumber], dataType: .float16)
+            }
             let execDesc = MPSGraphExecutableExecutionDescriptor()
             execDesc.completionHandler = { [outputBuffer, outputOffset] (_, error) in
                 if let error = error {
@@ -409,11 +539,14 @@ final class MPSGraphArgmaxSampler: @unchecked Sendable {
                 completion(result, nil)
             }
             constrained.runAsync(
-                with: queue, inputs: [inputData, bitmaskTensorData],
+                with: queue,
+                inputs: constrainedInputs(
+                    logitsData: inputData, bitmaskData: bitmaskTensorData, additiveData: additiveData),
                 results: [outputData], executionDescriptor: execDesc)
         } else {
             encode(
                 to: queue, logitsBuffer: logitsBuffer, logitsOffset: logitsOffset,
+                additiveBuffer: additiveBuffer,
                 outputBuffer: outputBuffer, outputOffset: outputOffset,
                 completion: completion)
         }
@@ -531,7 +664,51 @@ final class MPSGraphArgmaxSampler: @unchecked Sendable {
 
         executable.runAsync(
             with: queue,
-            inputs: [inputData],
+            inputs: argmaxInputs(logitsData: inputData, additiveData: nil),
+            results: [outputData],
+            executionDescriptor: execDescriptor
+        )
+    }
+
+    /// Encode argmax sampling with an additive delta (frequency/presence penalty + logit bias).
+    func encode(
+        to queue: MTLCommandQueue,
+        logitsBuffer: MTLBuffer,
+        logitsOffset: Int,
+        additiveBuffer: MTLBuffer?,
+        outputBuffer: MTLBuffer,
+        outputOffset: Int,
+        completion: @escaping (Int32, Error?) -> Void
+    ) {
+        guard additiveEnabled, let additiveBuffer else {
+            encode(
+                to: queue, logitsBuffer: logitsBuffer, logitsOffset: logitsOffset,
+                outputBuffer: outputBuffer, outputOffset: outputOffset, completion: completion)
+            return
+        }
+        let inputData = MPSGraphTensorData(
+            logitsBuffer, shape: [1, vocabSize as NSNumber], dataType: .float16)
+        let additiveData = MPSGraphTensorData(
+            additiveBuffer, shape: [1, vocabSize as NSNumber], dataType: .float16)
+        let outputData = MPSGraphTensorData(
+            outputBuffer, shape: [1 as NSNumber], dataType: .int32)
+
+        let execDescriptor = MPSGraphExecutableExecutionDescriptor()
+        execDescriptor.completionHandler = { [outputBuffer, outputOffset] (_, error) in
+            if error != nil {
+                completion(0, error)
+                return
+            }
+            let result = outputBuffer.contents()
+                .advanced(by: outputOffset)
+                .assumingMemoryBound(to: Int32.self)
+                .pointee
+            completion(result, nil)
+        }
+
+        executable.runAsync(
+            with: queue,
+            inputs: argmaxInputs(logitsData: inputData, additiveData: additiveData),
             results: [outputData],
             executionDescriptor: execDescriptor
         )
@@ -635,10 +812,57 @@ final class MPSGraphArgmaxSampler: @unchecked Sendable {
         // Run async - GPU naturally orders this after the blit due to queue ordering
         executable.runAsync(
             with: queue,
-            inputs: [inputData],
+            inputs: argmaxInputs(logitsData: inputData, additiveData: nil),
             results: [outputData],
             executionDescriptor: execDescriptor
         )
+    }
+
+    /// Encode argmax sampling with slice support and an additive delta.
+    ///
+    /// For prefill (`queryLength > 1`) the last token's logits are blitted to a temporary buffer
+    /// and sampled with the additive delta applied.
+    func encodeWithSlice(
+        to queue: MTLCommandQueue,
+        logitsBuffer: MTLBuffer,
+        queryLength: Int,
+        additiveBuffer: MTLBuffer?,
+        outputBuffer: MTLBuffer,
+        outputOffset: Int,
+        completion: @escaping (Int32, Error?) -> Void
+    ) {
+        guard additiveEnabled, let additiveBuffer else {
+            encodeWithSlice(
+                to: queue, logitsBuffer: logitsBuffer, queryLength: queryLength,
+                outputBuffer: outputBuffer, outputOffset: outputOffset, completion: completion)
+            return
+        }
+        if queryLength == 1 {
+            encode(
+                to: queue, logitsBuffer: logitsBuffer, logitsOffset: 0,
+                additiveBuffer: additiveBuffer,
+                outputBuffer: outputBuffer, outputOffset: outputOffset, completion: completion)
+            return
+        }
+        let logitsOffset = (queryLength - 1) * vocabSize * MemoryLayout<UInt16>.size
+        let sliceSize = vocabSize * MemoryLayout<UInt16>.size
+        guard let tempBuffer = device.makeBuffer(length: sliceSize, options: .storageModeShared),
+            let blitCmdBuffer = queue.makeCommandBuffer(),
+            let blitEncoder = blitCmdBuffer.makeBlitCommandEncoder()
+        else {
+            completion(0, MPSGraphSamplerError.bufferAllocationFailed)
+            return
+        }
+        blitEncoder.copy(
+            from: logitsBuffer, sourceOffset: logitsOffset,
+            to: tempBuffer, destinationOffset: 0, size: sliceSize)
+        blitEncoder.endEncoding()
+        blitCmdBuffer.commit()
+
+        encode(
+            to: queue, logitsBuffer: tempBuffer, logitsOffset: 0,
+            additiveBuffer: additiveBuffer,
+            outputBuffer: outputBuffer, outputOffset: outputOffset, completion: completion)
     }
 }
 
@@ -672,6 +896,7 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
     // Graph tensors
     private let logitsPlaceholder: MPSGraphTensor
     private let penaltyPlaceholder: MPSGraphTensor?
+    private let additivePlaceholder: MPSGraphTensor?
     private let temperaturePlaceholder: MPSGraphTensor
     private let randomPlaceholder: MPSGraphTensor
     private let topPPlaceholder: MPSGraphTensor
@@ -697,6 +922,9 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
 
     /// Whether repetition penalty is compiled into this sampler's graph
     let penaltyEnabled: Bool
+
+    /// Whether an additive delta (frequency/presence penalty + logit bias) is compiled into the graph.
+    let additiveEnabled: Bool
 
     /// Pre-allocated buffer for random value
     private let randomBuffer: MTLBuffer
@@ -724,10 +952,15 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
     // encode paths when the executable was compiled with penalty support.
     private let neutralPenaltyData: MPSGraphTensorData?
 
+    // Pre-allocated neutral additive buffer (all 0.0 in f16) used by non-additive
+    // encode paths when the executable was compiled with additive support.
+    private let neutralAdditiveData: MPSGraphTensorData?
+
     // Constrained sampling — compiled lazily on first applyBitmask: true call.
     private var constrainedExecutable: MPSGraphExecutable?
     private var constrainedBitmaskBuffer: MTLBuffer?
     private var constrainedBitmaskData: MPSGraphTensorData?
+    private var constrainedAdditivePlaceholder: MPSGraphTensor?
 
     /// Number of Int32 words in the bitmask.
     let bitmaskSize: Int
@@ -745,7 +978,7 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
     ///   - minP: Minimum probability threshold (0.0 = disabled)
     init(
         device: MTLDevice, vocabSize: Int, k: Int = 40, temperature: Float = 1.0, topP: Float = 1.0, minP: Float = 0.0,
-        penaltyEnabled: Bool = false
+        penaltyEnabled: Bool = false, additiveEnabled: Bool = false
     )
         throws
     {
@@ -757,6 +990,7 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
         self.topP = topP
         self.minP = minP
         self.penaltyEnabled = penaltyEnabled
+        self.additiveEnabled = additiveEnabled
         self.bitmaskSize = (vocabSize + 31) / 32
 
         // Pre-allocate buffers
@@ -793,6 +1027,17 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
             self.penaltyPlaceholder = pp
         } else {
             self.penaltyPlaceholder = nil
+        }
+
+        if additiveEnabled {
+            let ap = graph.placeholder(
+                shape: [1, vocabSize as NSNumber],
+                dataType: .float16,
+                name: "additive"
+            )
+            self.additivePlaceholder = ap
+        } else {
+            self.additivePlaceholder = nil
         }
 
         // Temperature scalar [1]
@@ -839,8 +1084,18 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
             penalizedLogits = logitsFloat32
         }
 
+        // Apply the additive delta (frequency/presence penalty + logit bias) after the
+        // multiplicative repetition penalty, matching the CPU ordering.
+        let adjustedLogits: MPSGraphTensor
+        if additiveEnabled {
+            adjustedLogits = applyAdditiveStage(
+                graph: graph, logits: penalizedLogits, additiveTensor: additivePlaceholder!, name: "additive")
+        } else {
+            adjustedLogits = penalizedLogits
+        }
+
         let (topKValues, topKIndices) = Self.topKStage(
-            graph: graph, logits: penalizedLogits, k: k, name: "topk")
+            graph: graph, logits: adjustedLogits, k: k, name: "topk")
 
         let scaledValues = Self.temperatureStage(
             graph: graph, values: topKValues, temperature: temperaturePlaceholder, name: "temp")
@@ -873,6 +1128,9 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
         ]
         if let pp = penaltyPlaceholder {
             feeds[pp] = MPSGraphShapedType(shape: [1, vocabSize as NSNumber], dataType: .float16)
+        }
+        if let ap = additivePlaceholder {
+            feeds[ap] = MPSGraphShapedType(shape: [1, vocabSize as NSNumber], dataType: .float16)
         }
 
         let compilationDescriptor = MPSGraphCompilationDescriptor()
@@ -926,6 +1184,21 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
         } else {
             self.neutralPenaltyData = nil
         }
+
+        // Pre-allocate a neutral additive buffer (all 0.0 in f16) so that non-additive encode
+        // paths can feed the additive-enabled executable without a caller-provided delta buffer.
+        if additiveEnabled {
+            let neutralByteCount = vocabSize * MemoryLayout<UInt16>.size
+            guard let neutralBuf = device.makeBuffer(length: neutralByteCount, options: .storageModeShared) else {
+                throw MPSGraphSamplerError.bufferAllocationFailed
+            }
+            // Float16 0.0 is all-zero bits, so a single memset is the additive identity.
+            memset(neutralBuf.contents(), 0, neutralByteCount)
+            self.neutralAdditiveData = MPSGraphTensorData(
+                neutralBuf, shape: [1, vocabSize as NSNumber], dataType: .float16)
+        } else {
+            self.neutralAdditiveData = nil
+        }
     }
 
     // MARK: - Feed Tensor Ordering
@@ -938,13 +1211,16 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
     /// (e.g. f32 scalar data landing where an f16 penalty tensor is expected).
     private func buildInputs(
         logitsData: MPSGraphTensorData,
-        penaltyData: MPSGraphTensorData? = nil
+        penaltyData: MPSGraphTensorData? = nil,
+        additiveData: MPSGraphTensorData? = nil
     ) -> [MPSGraphTensorData] {
         let effectivePenalty = penaltyData ?? neutralPenaltyData
+        let effectiveAdditive = additiveData ?? neutralAdditiveData
         return executable.feedTensors!.map { tensor -> MPSGraphTensorData in
             switch tensor.operation.name {
             case "logits": return logitsData
             case "penalty": return effectivePenalty!
+            case "additive": return effectiveAdditive!
             case "temperature": return temperatureData
             case "random": return randomData
             case "topP": return topPData
@@ -997,7 +1273,20 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
             vocabSize: vocabSize, bitmaskSize: bitmaskSize)
 
         let cLogitsF32 = cGraph.cast(cMaskedLogits, to: .float32, name: "logits_f32")
-        let cTopK = cGraph.topK(cLogitsF32, k: k, name: "topk")
+
+        // Apply the additive delta after masking so grammar bans stay authoritative.
+        let cAdjusted: MPSGraphTensor
+        if additiveEnabled {
+            let cAdditive = cGraph.placeholder(
+                shape: [1, vocabSize as NSNumber], dataType: .float16, name: "additive")
+            self.constrainedAdditivePlaceholder = cAdditive
+            cAdjusted = applyAdditiveStage(
+                graph: cGraph, logits: cLogitsF32, additiveTensor: cAdditive, name: "additive")
+        } else {
+            cAdjusted = cLogitsF32
+        }
+
+        let cTopK = cGraph.topK(cAdjusted, k: k, name: "topk")
         let cScaled = cGraph.division(cTopK[0], cTemp, name: "scaled")
         let cProbs = cGraph.softMax(with: cScaled, axis: 1, name: "probs")
 
@@ -1025,7 +1314,7 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
         let cSelFlat = cGraph.reshape(cSelI32, shape: [1 as NSNumber], name: "selected_flat")
         let cOutput = cGraph.gatherAlongAxis(0, updates: cIndFlat, indices: cSelFlat, name: "token_id")
 
-        let cFeeds: [MPSGraphTensor: MPSGraphShapedType] = [
+        var cFeeds: [MPSGraphTensor: MPSGraphShapedType] = [
             cLogits: MPSGraphShapedType(shape: [1, vocabSize as NSNumber], dataType: .float16),
             cTemp: MPSGraphShapedType(shape: [1 as NSNumber], dataType: .float32),
             cRandom: MPSGraphShapedType(shape: [1 as NSNumber], dataType: .float32),
@@ -1033,6 +1322,9 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
             cMinP: MPSGraphShapedType(shape: [1 as NSNumber], dataType: .float32),
             cBitmask: MPSGraphShapedType(shape: [bitmaskSize as NSNumber], dataType: .int32),
         ]
+        if let cAdditive = constrainedAdditivePlaceholder {
+            cFeeds[cAdditive] = MPSGraphShapedType(shape: [1, vocabSize as NSNumber], dataType: .float16)
+        }
         let desc = MPSGraphCompilationDescriptor()
         desc.optimizationLevel = .level0
 
@@ -1042,6 +1334,26 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
             compilationDescriptor: desc)
         constrainedExecutable = exec
         return (exec, constrainedBitmaskData!)
+    }
+
+    /// Build the constrained composite inputs in feed order, injecting the additive delta.
+    private func constrainedInputs(
+        logitsData: MPSGraphTensorData, bitmaskData: MPSGraphTensorData, additiveData: MPSGraphTensorData?
+    ) -> [MPSGraphTensorData] {
+        let effectiveAdditive = additiveData ?? neutralAdditiveData
+        return constrainedExecutable!.feedTensors!.map { tensor -> MPSGraphTensorData in
+            switch tensor.operation.name {
+            case "logits": return logitsData
+            case "bitmask": return bitmaskData
+            case "additive": return effectiveAdditive!
+            case "temperature": return temperatureData
+            case "random": return randomData
+            case "topP": return topPData
+            case "minP": return minPData
+            default:
+                fatalError("MPSGraphCompositeSampler: unknown constrained feed tensor '\(tensor.operation.name)'")
+            }
+        }
     }
 
     /// Encode composite sampling with optional bitmask constraint.
@@ -1055,6 +1367,23 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
         outputBuffer: MTLBuffer,
         outputOffset: Int,
         applyBitmask: Bool,
+        completion: @escaping (Int32, Error?) -> Void
+    ) throws {
+        try encode(
+            to: queue, logitsBuffer: logitsBuffer, logitsOffset: logitsOffset,
+            outputBuffer: outputBuffer, outputOffset: outputOffset,
+            applyBitmask: applyBitmask, additiveBuffer: nil, completion: completion)
+    }
+
+    /// Encode composite sampling with optional bitmask constraint and an optional additive delta.
+    func encode(
+        to queue: MTLCommandQueue,
+        logitsBuffer: MTLBuffer,
+        logitsOffset: Int,
+        outputBuffer: MTLBuffer,
+        outputOffset: Int,
+        applyBitmask: Bool,
+        additiveBuffer: MTLBuffer?,
         completion: @escaping (Int32, Error?) -> Void
     ) throws {
         if applyBitmask {
@@ -1072,6 +1401,9 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
                 logitsBuffer, shape: [1, vocabSize as NSNumber], dataType: .float16)
             let outputData = MPSGraphTensorData(
                 outputBuffer, shape: [1 as NSNumber], dataType: .int32)
+            let additiveData = additiveBuffer.map {
+                MPSGraphTensorData($0, shape: [1, vocabSize as NSNumber], dataType: .float16)
+            }
             let execDesc = MPSGraphExecutableExecutionDescriptor()
             execDesc.completionHandler = { [outputBuffer, outputOffset] (_, error) in
                 if let error = error {
@@ -1085,11 +1417,13 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
             }
             constrained.runAsync(
                 with: queue,
-                inputs: [logitsData, temperatureData, randomData, topPData, minPData, bitmaskTensorData],
+                inputs: constrainedInputs(
+                    logitsData: logitsData, bitmaskData: bitmaskTensorData, additiveData: additiveData),
                 results: [outputData], executionDescriptor: execDesc)
         } else {
             encode(
                 to: queue, logitsBuffer: logitsBuffer, logitsOffset: logitsOffset,
+                penaltyBuffer: nil, additiveBuffer: additiveBuffer,
                 outputBuffer: outputBuffer, outputOffset: outputOffset,
                 completion: completion)
         }
@@ -1143,16 +1477,20 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
 
     /// Encode sampling with repetition penalty buffer.
     /// The penalty buffer must be Float16[vocabSize] with 1.0 for unpenalized tokens.
+    /// The additive buffer must be Float16[vocabSize] with 0.0 for unbiased tokens.
     func encode(
         to queue: MTLCommandQueue,
         logitsBuffer: MTLBuffer,
         logitsOffset: Int,
-        penaltyBuffer: MTLBuffer,
+        penaltyBuffer: MTLBuffer?,
+        additiveBuffer: MTLBuffer? = nil,
         outputBuffer: MTLBuffer,
         outputOffset: Int,
         completion: @escaping (Int32, Error?) -> Void
     ) {
-        guard penaltyEnabled else {
+        // If the executable carries neither penalty nor additive placeholders, or the caller
+        // supplied no buffers, fall back to the plain path (which feeds neutral values).
+        if (!penaltyEnabled && !additiveEnabled) || (penaltyBuffer == nil && additiveBuffer == nil) {
             encode(
                 to: queue, logitsBuffer: logitsBuffer, logitsOffset: logitsOffset,
                 outputBuffer: outputBuffer, outputOffset: outputOffset, completion: completion)
@@ -1167,12 +1505,16 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
 
         let logitsData = MPSGraphTensorData(
             logitsBuffer, shape: [1, vocabSize as NSNumber], dataType: .float16)
-        let penaltyData = MPSGraphTensorData(
-            penaltyBuffer, shape: [1, vocabSize as NSNumber], dataType: .float16)
+        let penaltyData = penaltyBuffer.map {
+            MPSGraphTensorData($0, shape: [1, vocabSize as NSNumber], dataType: .float16)
+        }
+        let additiveData = additiveBuffer.map {
+            MPSGraphTensorData($0, shape: [1, vocabSize as NSNumber], dataType: .float16)
+        }
         let outputData = MPSGraphTensorData(
             outputBuffer, shape: [1 as NSNumber], dataType: .int32)
 
-        let inputs = buildInputs(logitsData: logitsData, penaltyData: penaltyData)
+        let inputs = buildInputs(logitsData: logitsData, penaltyData: penaltyData, additiveData: additiveData)
 
         let execDesc = MPSGraphExecutableExecutionDescriptor()
         execDesc.completionHandler = { [outputBuffer, outputOffset] (_, error) in
@@ -1336,6 +1678,52 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
             results: [outputData],
             executionDescriptor: prefillExecDescriptor
         )
+    }
+
+    /// Encode composite sampling with slice support and an additive delta (frequency/presence
+    /// penalty + logit bias). Used for the first sampled token after prefill.
+    func encodeWithSlice(
+        to queue: MTLCommandQueue,
+        logitsBuffer: MTLBuffer,
+        queryLength: Int,
+        additiveBuffer: MTLBuffer?,
+        outputBuffer: MTLBuffer,
+        outputOffset: Int,
+        completion: @escaping (Int32, Error?) -> Void
+    ) {
+        guard additiveEnabled, let additiveBuffer else {
+            encodeWithSlice(
+                to: queue, logitsBuffer: logitsBuffer, queryLength: queryLength,
+                outputBuffer: outputBuffer, outputOffset: outputOffset, completion: completion)
+            return
+        }
+        if queryLength == 1 {
+            encode(
+                to: queue, logitsBuffer: logitsBuffer, logitsOffset: 0,
+                penaltyBuffer: nil, additiveBuffer: additiveBuffer,
+                outputBuffer: outputBuffer, outputOffset: outputOffset, completion: completion)
+            return
+        }
+
+        let logitsOffset = (queryLength - 1) * vocabSize * MemoryLayout<UInt16>.size
+        let sliceSize = vocabSize * MemoryLayout<UInt16>.size
+        guard let tempBuffer = device.makeBuffer(length: sliceSize, options: .storageModeShared),
+            let blitCmdBuffer = queue.makeCommandBuffer(),
+            let blitEncoder = blitCmdBuffer.makeBlitCommandEncoder()
+        else {
+            completion(0, MPSGraphSamplerError.bufferAllocationFailed)
+            return
+        }
+        blitEncoder.copy(
+            from: logitsBuffer, sourceOffset: logitsOffset,
+            to: tempBuffer, destinationOffset: 0, size: sliceSize)
+        blitEncoder.endEncoding()
+        blitCmdBuffer.commit()
+
+        encode(
+            to: queue, logitsBuffer: tempBuffer, logitsOffset: 0,
+            penaltyBuffer: nil, additiveBuffer: additiveBuffer,
+            outputBuffer: outputBuffer, outputOffset: outputOffset, completion: completion)
     }
 
     // MARK: - Graph Stage Helpers

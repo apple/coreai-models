@@ -191,13 +191,7 @@ func runChatCompletion(chatRequest: ChatCompletionRequest, state: ServerState, s
     let requestID = RequestID.next()
     let created = Int(Date().timeIntervalSince1970)
 
-    let samplingConfig = state.makeSamplingConfig(
-        temperature: chatRequest.temperature,
-        topP: chatRequest.topP,
-        topK: chatRequest.topK,
-        minP: nil,
-        seed: chatRequest.seed
-    )
+    let samplingConfig = try makeSamplingConfig(for: chatRequest, state: state)
 
     let reasoningEffort = ReasoningEffort.resolve(
         request: chatRequest.reasoningEffort, default: state.config.defaultReasoningEffort)
@@ -406,13 +400,7 @@ func prepareStreaming(chatRequest: ChatCompletionRequest, state: ServerState, se
     }
     let requestID = RequestID.next()
 
-    let samplingConfig = state.makeSamplingConfig(
-        temperature: chatRequest.temperature,
-        topP: chatRequest.topP,
-        topK: chatRequest.topK,
-        minP: nil,
-        seed: chatRequest.seed
-    )
+    let samplingConfig = try makeSamplingConfig(for: chatRequest, state: state)
 
     let reasoningEffort = ReasoningEffort.resolve(
         request: chatRequest.reasoningEffort, default: state.config.defaultReasoningEffort)
@@ -741,6 +729,61 @@ private func buildStopSequences(from request: ChatCompletionRequest, state: Serv
         additionalSequences: additionalSequences,
         additionalEosTokenIds: state.config.additionalEosTokenIds
     )
+}
+
+// MARK: - Sampling options
+
+/// Builds the sampling configuration from a chat request, validating the additive-penalty and
+/// logit-bias parameters and mapping logit-bias string keys to token ids.
+private func makeSamplingConfig(
+    for chatRequest: ChatCompletionRequest, state: ServerState
+) throws -> SamplingConfiguration {
+    try validatePenalty(chatRequest.frequencyPenalty, name: "frequency_penalty")
+    try validatePenalty(chatRequest.presencePenalty, name: "presence_penalty")
+    let logitBias = try parseLogitBias(chatRequest.logitBias, vocabSize: state.config.vocabSize)
+    return state.makeSamplingConfig(
+        temperature: chatRequest.temperature,
+        topP: chatRequest.topP,
+        topK: chatRequest.topK,
+        minP: nil,
+        seed: chatRequest.seed,
+        frequencyPenalty: chatRequest.frequencyPenalty,
+        presencePenalty: chatRequest.presencePenalty,
+        logitBias: logitBias
+    )
+}
+
+/// Validates that a frequency/presence penalty is within the accepted [-2, 2] range.
+private func validatePenalty(_ value: Double?, name: String) throws {
+    guard let value else { return }
+    guard value >= -2 && value <= 2 else {
+        throw ServerError.badRequest("\(name) must be in [-2, 2], got \(value)")
+    }
+}
+
+/// Parses the request's logit-bias object (token-id string → bias) into `[Int32: Float]`,
+/// validating the token ids against the vocabulary and the bias values against [-100, 100].
+private func parseLogitBias(_ raw: [String: Double]?, vocabSize: Int?) throws -> [Int32: Float]? {
+    guard let raw, !raw.isEmpty else { return nil }
+    var result = [Int32: Float](minimumCapacity: raw.count)
+    for (key, value) in raw {
+        guard let tokenID = Int32(key) else {
+            throw ServerError.badRequest("logit_bias keys must be integer token ids, got '\(key)'")
+        }
+        guard tokenID >= 0 else {
+            throw ServerError.badRequest("logit_bias token id must be non-negative, got \(tokenID)")
+        }
+        if let vocabSize, Int(tokenID) >= vocabSize {
+            throw ServerError.badRequest(
+                "logit_bias token id \(tokenID) out of range (vocab size \(vocabSize))")
+        }
+        guard value >= -100 && value <= 100 else {
+            throw ServerError.badRequest(
+                "logit_bias values must be in [-100, 100], got \(value) for token \(tokenID)")
+        }
+        result[tokenID] = Float(value)
+    }
+    return result
 }
 
 // Per-request diagnostics go to stderr so a `--replay` stdout redirect captures clean JSONL.
