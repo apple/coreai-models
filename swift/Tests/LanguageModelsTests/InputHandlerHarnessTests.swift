@@ -298,6 +298,41 @@ struct InputHandlerFuzzTests {
         }
     }
 
+    @Test(
+        "Additive causal attn_mask [1,1,query,key] correctness",
+        arguments: [
+            (4, 0),  // prefill: query==key, processed==0
+            (1, 0),  // single-token prompt
+            (1, 5),  // decode step after 5 processed tokens
+            (8, 100),  // prefill chunk mid-sequence
+            (16, 0),
+            (3, 250),
+        ] as [(Int, Int)])
+    func additiveCausalMaskFill(queryLen: Int, processedTokenCount: Int) {
+        let keyLen = processedTokenCount + queryLen
+        var mask = NDArray(shape: [1, 1, queryLen, keyLen], scalarType: .float16)
+
+        fillAdditiveCausalMask(&mask, processedTokenCount: processedTokenCount)
+
+        // Row-major [1, 1, queryLen, keyLen]: flat index = query * keyLen + key.
+        let result = readNDArray(mask, as: Float16.self, count: queryLen * keyLen)
+        for query in 0..<queryLen {
+            let attendUpTo = processedTokenCount + query  // absolute query position
+            for key in 0..<keyLen {
+                let value = result[query * keyLen + key]
+                if key <= attendUpTo {
+                    #expect(
+                        value == 0,
+                        "(q=\(query),k=\(key)) should attend (attendUpTo=\(attendUpTo))")
+                } else {
+                    #expect(
+                        value == causalMaskSentinel,
+                        "(q=\(query),k=\(key)) should be masked (attendUpTo=\(attendUpTo))")
+                }
+            }
+        }
+    }
+
     @Test("Rapid re-fill does not corrupt")
     func rapidRefill() {
         var array = NDArray(shape: [1, 256], scalarType: .float16)

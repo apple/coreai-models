@@ -37,7 +37,11 @@ public struct TokenInputHandler: SyncInputHandler {
         self.useCompactPositionIds = useCompactPositionIds
         self.inputNames = [inputIdsName, positionIdsName]
 
-        let initDesc = inputIdsDescriptor.resolvingDynamicDimensions([1, 1])
+        // Leading (request-batch) dim comes from the descriptor: 1 for the usual single-batch
+        // graph, N for a fixed batch=N graph. resolvingDynamicDimensions requires pinned dims to
+        // match, so we cannot hardcode 1 here.
+        let batch = (inputIdsDescriptor.shape.first ?? 1) > 0 ? inputIdsDescriptor.shape[0] : 1
+        let initDesc = inputIdsDescriptor.resolvingDynamicDimensions([batch, 1])
         self.inputIdsArray = NDArray(descriptor: initDesc)
         self.cachedBatchSize = 1
     }

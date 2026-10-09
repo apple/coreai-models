@@ -68,6 +68,51 @@ struct ModelBundleTests {
         }
     }
 
+    @Test("0.3 schema is accepted and metadataVersion is preserved (not hard-coded)")
+    func decodes03AndPreservesVersion() throws {
+        let url = try Self.tempBundle(
+            """
+            {
+              "metadata_version": "0.3",
+              "kind": "llm",
+              "name": "qwen3-0.6b",
+              "assets": { "main": "model.aimodel" },
+              "language": {
+                "tokenizer": "Qwen/Qwen3-0.6B",
+                "vocab_size": 151936,
+                "max_context_length": 8192
+              }
+            }
+            """, named: "v03")
+        let bundle = try ModelBundle(at: url)
+        // A 0.3 runtime accepts 0.3 bundles, and reports the actual version
+        // (the reader must not keep hard-coding "0.2").
+        #expect(bundle.metadataVersion == "0.3")
+        #expect(bundle.kind == .llm)
+        #expect(bundle.name == "qwen3-0.6b")
+    }
+
+    @Test("An unknown future version still throws unsupportedVersion")
+    func unknownFutureVersionThrows() throws {
+        let url = try Self.tempBundle(
+            """
+            {
+              "metadata_version": "0.4",
+              "kind": "llm",
+              "name": "from-the-future",
+              "assets": { "main": "model.aimodel" }
+            }
+            """, named: "v04")
+        let error = #expect(throws: ModelBundle.BundleError.self) {
+            _ = try ModelBundle(at: url)
+        }
+        guard case .unsupportedVersion(let v) = error else {
+            Issue.record("expected unsupportedVersion, got \(String(describing: error))")
+            return
+        }
+        #expect(v == "0.4")
+    }
+
     @Test("Missing metadata.json throws")
     func missingMetadataThrows() throws {
         let dir = FileManager.default.temporaryDirectory.appending(

@@ -26,8 +26,8 @@ enum SequentialIterator {
     /// Select the next token: the forced-continuation token when replaying, otherwise the
     /// sampler's choice.
     ///
-    /// `logits` is taken by value; the sampler mutates a copy-on-write copy so the caller's
-    /// buffer (which it may also return to the consumer) is left untouched.
+    /// Delegates to ``BatchedSampler`` with a single row (N=1). `logits` is taken by value, so the
+    /// caller's buffer is not mutated.
     static func nextToken(
         fromLogits logits: [LogitsScalarType],
         forced: [Int32]?,
@@ -38,7 +38,11 @@ enum SequentialIterator {
         if let forced {
             return forced[step]
         }
-        var mutableLogits = logits
-        return sampling.fallbackSampler(from: &mutableLogits, tokenHistory: tokenHistory, step: step)
+        return BatchedSampler.sample(
+            rows: [logits],
+            configurations: [sampling],
+            histories: [tokenHistory],
+            steps: [step]
+        )[0]
     }
 }

@@ -93,6 +93,11 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
     public let vocabSize: Int
     public let maxContextLength: Int
 
+    /// Max request batch the exported graph can serve: a dynamic-batch graph's upper bound, or 1
+    /// for a single-sequence graph. Runtimes reject a requested batch larger than this. Defaults
+    /// to 1 when omitted (pre-batched bundles).
+    public let maxBatchSize: Int
+
     /// `true` if the bundle ships its own tokenizer directory; `false` to
     /// load via HuggingFace at runtime. Defaults to `true` when omitted.
     public let embeddedTokenizer: Bool
@@ -128,7 +133,8 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
         states: [String: StateKind]? = nil,
         prefillChunkSize: Int? = nil,
         prefillChunkThreshold: Int? = nil,
-        overrides: LanguageOverrides? = nil
+        overrides: LanguageOverrides? = nil,
+        maxBatchSize: Int = 1
     ) {
         self.tokenizer = tokenizer
         self.vocabSize = vocabSize
@@ -140,6 +146,7 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
         self.prefillChunkSize = prefillChunkSize
         self.prefillChunkThreshold = prefillChunkThreshold
         self.overrides = overrides
+        self.maxBatchSize = maxBatchSize
     }
 
     enum CodingKeys: String, CodingKey {
@@ -153,6 +160,7 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
         case prefillChunkSize = "prefill_chunk_size"
         case prefillChunkThreshold = "prefill_chunk_threshold"
         case overrides
+        case maxBatchSize = "max_batch_size"
     }
 
     public init(from decoder: Swift.Decoder) throws {
@@ -167,6 +175,7 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
         self.prefillChunkSize = try c.decodeIfPresent(Int.self, forKey: .prefillChunkSize)
         self.prefillChunkThreshold = try c.decodeIfPresent(Int.self, forKey: .prefillChunkThreshold)
         self.overrides = try c.decodeIfPresent(LanguageOverrides.self, forKey: .overrides)
+        self.maxBatchSize = try c.decodeIfPresent(Int.self, forKey: .maxBatchSize) ?? 1
     }
 
     // MARK: - Additional Stop Tokens
