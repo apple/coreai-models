@@ -38,7 +38,11 @@ enum SequentialIterator {
         if let forced {
             return forced[step]
         }
-        var mutableLogits = logits
-        return sampling.fallbackSampler(from: &mutableLogits, tokenHistory: tokenHistory, step: step)
+        return BatchedSampler.sample(
+            rows: [logits],
+            configurations: [sampling],
+            histories: [tokenHistory],
+            steps: [step]
+        )[0]
     }
 }
