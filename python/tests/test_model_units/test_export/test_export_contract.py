@@ -300,6 +300,196 @@ class TestReferenceInputsAsArgs:
         assert len(m.reference_inputs_as_args(self._graph(m, config))) == 4
 
 
+class _MaskLM(_StandardLM):
+    """Default contract plus an opt-in additive ``attn_mask`` input.
+
+    ``forward`` takes ``attn_mask`` after the KV pair; the extra graph input only
+    appears when the model is built with ``use_attention_mask=True``.
+    """
+
+    @override
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.IntTensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        attn_mask: torch.Tensor = None,
+    ) -> torch.Tensor:
+        raise NotImplementedError("shape contract only; never traced in these tests")
+
+
+class TestMaskContract:
+    """The opt-in additive ``attn_mask`` graph input, gated on ``use_attention_mask``."""
+
+    def _built(self, model, config, spec=None):
+        spec = spec or TraceSpec(max_context_length=MAX_CONTEXT_LENGTH)
+        return (
+            model.build_reference_inputs(config, torch.float16, spec),
+            model.build_dynamic_shapes(config, spec),
+        )
+
+    def test_mask_mode_declares_attn_mask_input(self, config) -> None:
+        m = _MaskLM(config, use_attention_mask=True)
+        assert m.export_input_names()[MAIN] == ("input_ids", "position_ids", "attn_mask")
+
+    def test_mask_mode_appends_attn_mask_last(self, config) -> None:
+        m = _MaskLM(config, use_attention_mask=True)
+        refs, _ = self._built(m, config)
+        assert list(refs[MAIN]) == [
+            "input_ids",
+            "position_ids",
+            "k_cache",
+            "v_cache",
+            "attn_mask",
+        ]
+        mask = refs[MAIN]["attn_mask"]
+        # Scores are [B, heads, query_len, key_len]; the key length is the fetched
+        # cache prefix, which equals the position_ids length (query_len + offset).
+        assert mask.shape == (
+            1,
+            1,
+            QUANT_TRACE_QUERY_LEN,
+            QUANT_TRACE_QUERY_LEN + QUANT_TRACE_OFFSET,
+        )
+        assert mask.dtype == torch.float16
+
+    def test_mask_mode_dynamic_shapes_reuse_dims(self, config) -> None:
+        m = _MaskLM(config, use_attention_mask=True)
+        _, shapes = self._built(m, config)
+        graph = shapes[MAIN]
+        assert "attn_mask" in graph
+        # Query axis is the same dim as input_ids; key axis is the attention key
+        # length, which is tied to position_ids (not the k_cache tensor's seq dim).
+        assert graph["attn_mask"][2] is graph["input_ids"][1]
+        assert graph["attn_mask"][3] is graph["position_ids"][1]
+
+    def test_mask_mode_validates_and_converts_to_args(self, config) -> None:
+        m = _MaskLM(config, use_attention_mask=True)
+        refs, shapes = self._built(m, config)
+        m.validate_export_contract(refs, shapes)
+        args = m.reference_inputs_as_args(refs[MAIN])
+        assert len(args) == 5
+
+    def test_mask_mode_static_cache_still_ties_key_to_position_ids(self, config) -> None:
+        config.max_position_embeddings = TRACE_KV_CACHE_SEQ_LEN
+        spec = TraceSpec(
+            max_context_length=TRACE_KV_CACHE_SEQ_LEN, cache_seq_len=TRACE_KV_CACHE_SEQ_LEN
+        )
+        assert spec.caches_are_static
+        m = _MaskLM(config, use_attention_mask=True)
+        refs, shapes = self._built(m, config, spec)
+        # Caches are pinned, but position_ids stays dynamic, so the mask's key axis
+        # does too -- it tracks the attention key length, not the cache tensor.
+        assert shapes[MAIN]["k_cache"] is None
+        assert shapes[MAIN]["attn_mask"] == {
+            2: shapes[MAIN]["input_ids"][1],
+            3: shapes[MAIN]["position_ids"][1],
+        }
+        m.validate_export_contract(refs, shapes)
+
+    def test_flag_off_leaves_the_contract_unchanged(self, config) -> None:
+        m = _MaskLM(config)  # flag defaults off
+        refs, shapes = self._built(m, config)
+        assert m.export_input_names()[MAIN] == ("input_ids", "position_ids")
+        assert "attn_mask" not in refs[MAIN]
+        assert "attn_mask" not in shapes[MAIN]
+        m.validate_export_contract(refs, shapes)
+
+    def test_batched_contract_traces_at_batch_size_with_dim0_pinned(self, config) -> None:
+        """batch_size>1 traces reference tensors at B with dim0/cache-dim1 PINNED (static batch)."""
+        spec = TraceSpec(max_context_length=MAX_CONTEXT_LENGTH, batch_size=2)
+        m = _MaskLM(config, use_attention_mask=True)
+        refs = m.build_reference_inputs(config, torch.float16, spec)[MAIN]
+        shapes = m.build_dynamic_shapes(config, spec)[MAIN]
+
+        # Reference tensors carry the fixed batch on dim0 (ids/pos/mask) and cache dim1.
+        assert refs["input_ids"].shape[0] == 2
+        assert refs["position_ids"].shape[0] == 2
+        assert refs["attn_mask"].shape[0] == 2
+        assert refs["k_cache"].shape[1] == 2  # cache batch dim is index 1
+        assert refs["v_cache"].shape[1] == 2
+
+        # The batch dim is PINNED (static), not a dynamic Dim: dim0 / cache-dim1 absent from shapes.
+        assert shapes["input_ids"].get(0) is None
+        assert shapes["position_ids"].get(0) is None
+        assert shapes["attn_mask"].get(0) is None
+        assert (shapes["k_cache"] or {}).get(1) is None
+        assert (shapes["v_cache"] or {}).get(1) is None
+        m.validate_export_contract({MAIN: refs}, {MAIN: shapes})
+
+    def test_batch_size_one_traces_single_batch(self, config) -> None:
+        """Default batch_size=1 keeps the validated single-batch contract untouched."""
+        spec = TraceSpec(max_context_length=MAX_CONTEXT_LENGTH)  # batch_size defaults to 1
+        m = _MaskLM(config, use_attention_mask=True)
+        refs = m.build_reference_inputs(config, torch.float16, spec)[MAIN]
+        shapes = m.build_dynamic_shapes(config, spec)[MAIN]
+        assert refs["input_ids"].shape[0] == 1
+        assert shapes["input_ids"].get(0) is None  # dim0 pinned, not dynamic
+        assert shapes["k_cache"].get(1) is None  # cache batch dim pinned
+
+    def test_dynamic_batch_declares_one_shared_batch_dim(self, config) -> None:
+        """max_batch_size declares ONE dynamic ``batch`` Dim on dim0 of ids/pos/mask and
+        dim1 of the caches, while reference tensors still trace at the smaller batch_size
+        (torch.export rejects a dim whose only legal value is the trace size)."""
+        spec = TraceSpec(max_context_length=MAX_CONTEXT_LENGTH, batch_size=2, max_batch_size=8)
+        m = _MaskLM(config, use_attention_mask=True)
+        refs = m.build_reference_inputs(config, torch.float16, spec)[MAIN]
+        shapes = m.build_dynamic_shapes(config, spec)[MAIN]
+
+        # Reference tensors still trace at batch_size (the trace size), NOT the max.
+        assert refs["input_ids"].shape[0] == 2
+        assert refs["k_cache"].shape[1] == 2  # cache batch dim is index 1
+
+        batch_dim = shapes["input_ids"][0]
+        assert batch_dim.min == 1
+        assert batch_dim.max == 8
+        # The SAME Dim object on every batch axis, so torch.export ties them together.
+        assert shapes["position_ids"][0] is batch_dim
+        assert shapes["attn_mask"][0] is batch_dim
+        assert shapes["k_cache"][1] is batch_dim
+        assert shapes["v_cache"][1] is batch_dim
+        m.validate_export_contract({MAIN: refs}, {MAIN: shapes})
+
+    def test_dynamic_batch_static_cache_still_declares_batch_dim(self, config) -> None:
+        """With seq-static caches, dim1 still carries the batch Dim (not pinned to None)."""
+        config.max_position_embeddings = TRACE_KV_CACHE_SEQ_LEN
+        spec = TraceSpec(
+            max_context_length=TRACE_KV_CACHE_SEQ_LEN,
+            cache_seq_len=TRACE_KV_CACHE_SEQ_LEN,
+            batch_size=2,
+            max_batch_size=8,
+        )
+        assert spec.caches_are_static
+        m = _MaskLM(config, use_attention_mask=True)
+        refs = m.build_reference_inputs(config, torch.float16, spec)[MAIN]
+        shapes = m.build_dynamic_shapes(config, spec)[MAIN]
+        batch_dim = shapes["input_ids"][0]
+        # Seq dim pinned, batch dim dynamic: dim1 carries the batch Dim, seq axis absent.
+        assert shapes["k_cache"] == {1: batch_dim}
+        assert shapes["v_cache"] == {1: batch_dim}
+        m.validate_export_contract({MAIN: refs}, {MAIN: shapes})
+
+    def test_dynamic_batch_without_mask_still_declares_batch_dim(self, config) -> None:
+        """Batching is independent of the attn_mask flag: ids/pos/caches get the batch Dim
+        even with the mask off (there is simply no attn_mask axis to tie)."""
+        spec = TraceSpec(max_context_length=MAX_CONTEXT_LENGTH, batch_size=2, max_batch_size=8)
+        m = _MaskLM(config)  # mask flag off
+        shapes = m.build_dynamic_shapes(config, spec)[MAIN]
+        batch_dim = shapes["input_ids"][0]
+        assert batch_dim.min == 1 and batch_dim.max == 8
+        assert shapes["position_ids"][0] is batch_dim
+        assert shapes["k_cache"][1] is batch_dim
+        assert "attn_mask" not in shapes
+
+    def test_max_batch_size_must_exceed_trace_batch(self) -> None:
+        """Trace size must be strictly below the max, and >= 2, or torch.export specializes it."""
+        with pytest.raises(ValueError, match="max_batch_size"):
+            TraceSpec(max_context_length=MAX_CONTEXT_LENGTH, batch_size=2, max_batch_size=2)
+        with pytest.raises(ValueError, match="max_batch_size"):
+            TraceSpec(max_context_length=MAX_CONTEXT_LENGTH, batch_size=1, max_batch_size=8)
+
+
 class TestRegisteredModelsSatisfyTheContract:
     """Pins the real registry, so renaming a forward parameter fails here."""
 

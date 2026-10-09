@@ -17,6 +17,7 @@ import os
 import re
 import tempfile
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any, Literal
 
@@ -49,6 +50,17 @@ from coreai_models.models.registry import get_model_entry
 logger = logging.getLogger(__name__)
 
 
+class AttentionMaskMode(str, Enum):
+    """How the exported macOS graph handles the attention mask / per-row KV writes."""
+
+    #: Implicit ``is_causal`` mask (the shipping contract).
+    DEFAULT = "default"
+    #: Additive ``attn_mask`` graph input; enables the dense batched / ragged decode path.
+    BATCHED = "batched"
+    #: Reserved for the hardware paged-attention backend; not yet supported at export.
+    PAGED = "paged"
+
+
 @dataclass
 class ExportConfig:
     """Everything needed to export a model."""
@@ -77,12 +89,53 @@ class ExportConfig:
     model_type_override: str | None = None
     # Speculative decoding: export the drafter model alongside the target.
     with_drafter: bool = False
+    # Experimental, macOS only. Attention-mask / KV-write mode of the exported graph;
+    # see ``AttentionMaskMode`` for the per-value contract. Default keeps the implicit causal mask.
+    attention_mask_mode: AttentionMaskMode = AttentionMaskMode.DEFAULT
+    # Experimental, macOS only. Max of the dynamic ``batch`` dim across input_ids/position_ids/
+    # attn_mask and the KV cache. Defaults to 8 for batched exports; None for the causal mode.
+    dynamic_max_batch_size: int | None = None
+
+    @property
+    def emits_attn_mask(self) -> bool:
+        """True when the exported graph declares an additive ``attn_mask`` input."""
+        return self.attention_mask_mode is not AttentionMaskMode.DEFAULT
 
     def __post_init__(self) -> None:
+        if self.attention_mask_mode is AttentionMaskMode.PAGED:
+            raise NotImplementedError(
+                "The 'paged' attention-mask option is not available: it is reserved for the "
+                "hardware paged-attention backend, which does not ship yet. "
+                "Use --attention-mask default or --attention-mask batched."
+            )
         if self.quantization_mode == "graph" and self.variant != "macOS":
             raise ValueError(
                 f"quantization_mode='graph' is macOS only (got variant '{self.variant}')."
             )
+        if self.emits_attn_mask and self.variant != "macOS":
+            raise ValueError(
+                f"attention_mask_mode={self.attention_mask_mode.value!r} is macOS only "
+                f"(got variant '{self.variant}'). iOS has its own causal-mask export contract."
+            )
+        # Batched export implies a dynamic batch dim; default its max to 8 so `--attention-mask
+        # batched` alone yields a batch-8-capable graph (serves 1..8). An explicit
+        # --dynamic-batch-size overrides.
+        if self.emits_attn_mask and self.dynamic_max_batch_size is None:
+            self.dynamic_max_batch_size = 8
+        if self.dynamic_max_batch_size is not None:
+            if self.variant != "macOS":
+                raise ValueError(
+                    f"dynamic_max_batch_size is macOS only (got variant '{self.variant}')."
+                )
+            if self.dynamic_max_batch_size < 2:
+                raise ValueError(
+                    f"dynamic_max_batch_size must be >= 2 (got {self.dynamic_max_batch_size})."
+                )
+            if not self.emits_attn_mask:
+                raise ValueError(
+                    "dynamic batch export requires attention_mask_mode=BATCHED; a batched graph "
+                    "without an attn_mask input cannot be served."
+                )
 
 
 def _generate_output_name(config: ExportConfig) -> str:
@@ -216,6 +269,12 @@ async def _async_export_model(config: ExportConfig) -> str:
         else contextlib.nullcontext(None)
     )
 
+    # Only forward `use_attention_mask` when a batched export actually needs it. In default mode we
+    # omit it entirely so every model's `from_hf*` override keeps working unchanged (gpt_oss,
+    # muse_glimmer, gemma3n, ... override the factory with signatures that predate this flag); this
+    # keeps default-mode export byte-identical to before the attention-mask work.
+    attn_mask_kw = {"use_attention_mask": True} if config.emits_attn_mask else {}
+
     with temp_dir_ctx as temp_dir:
         if use_memory_efficient:
             assert temp_dir is not None  # nullcontext yields None only when not memory-efficient
@@ -229,6 +288,7 @@ async def _async_export_model(config: ExportConfig) -> str:
                 num_layers=config.num_layers,
                 hf_config_attr=entry.hf_config_attr,
                 hf_state_dict_prefix=entry.hf_state_dict_prefix,
+                **attn_mask_kw,
             )
         else:
             model = model_class.from_hf(
@@ -237,6 +297,7 @@ async def _async_export_model(config: ExportConfig) -> str:
                 target_dtype=target_dtype,
                 num_layers=config.num_layers,
                 disable_embedding_quantization=config.disable_embedding_quantization,
+                **attn_mask_kw,
             )
         model = model.eval()
         # ---- 3. Resolve compression preset ----
@@ -434,6 +495,7 @@ async def _async_export_model(config: ExportConfig) -> str:
             tokenizer_model_id=entry.tokenizer_model_id,
             drafter_name=drafter_name,
             speculative_config=entry.drafter_config if drafter_name else None,
+            max_batch_size=config.dynamic_max_batch_size or 1,
         )
 
     logger.info(f"Export complete: {bundle_path}")
