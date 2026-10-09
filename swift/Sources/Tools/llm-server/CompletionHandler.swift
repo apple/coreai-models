@@ -69,6 +69,17 @@ func handleCompletionsFromBody(body: ByteBuffer, state: ServerState) async throw
 // MARK: - Loglikelihood Implementation
 
 private func handleLoglikelihood(req: CompletionRequest, state: ServerState) async throws -> Response {
+    let response = try await runLoglikelihood(req: req, state: state)
+    let data = try JSONEncoder().encode(response)
+    return Response(
+        status: .ok,
+        headers: [.contentType: "application/json"],
+        body: .init(byteBuffer: ByteBuffer(data: data))
+    )
+}
+
+/// The socket-free loglikelihood scoring core, shared by the HTTP handler and `--replay`.
+func runLoglikelihood(req: CompletionRequest, state: ServerState) async throws -> CompletionResponse {
     let requestID = RequestID.next()
     let created = Int(Date().timeIntervalSince1970)
     let wantsEcho = req.echo ?? false
@@ -102,16 +113,9 @@ private func handleLoglikelihood(req: CompletionRequest, state: ServerState) asy
         "[\(requestID)] logprobs: \(req.prompts.count) prompts, \(totalTokens) tokens, \(String(format: "%.2f", seconds))s (\(String(format: "%.0f", tokPerSec)) tok/s)"
     )
 
-    let response = CompletionResponse(
+    return CompletionResponse(
         id: requestID, object: "text_completion", created: created,
         model: state.config.modelName, choices: choices
-    )
-
-    let data = try JSONEncoder().encode(response)
-    return Response(
-        status: .ok,
-        headers: [.contentType: "application/json"],
-        body: .init(byteBuffer: ByteBuffer(data: data))
     )
 }
 

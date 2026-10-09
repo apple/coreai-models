@@ -8,9 +8,11 @@ import Foundation
 
 /// Drives the server's generation core over a JSONL request file instead of HTTP.
 ///
-/// Requests run in arrival-timestamp order through the same cores the HTTP handler uses:
-/// `runChatCompletion` for `stream:false`, `runStreamingLoop` for `stream:true` (deltas folded
-/// back into the result). The engine is single-active, so requests run sequentially, matching the
+/// Each line carries either a chat body or a loglikelihood body. Chat lines run through the same
+/// cores the HTTP handler uses: `runChatCompletion` for `stream:false`, `runStreamingLoop` for
+/// `stream:true` (deltas folded back into the result). Loglikelihood lines run through
+/// `runLoglikelihood`, the teacher-forced scorer behind `/v1/completions`. Requests run in
+/// arrival-timestamp order. The engine is single-active, so requests run sequentially, matching the
 /// server. Interleaving sessions in the input reproduces the same per-session cache behavior. Each
 /// result is one JSONL line with per-request instrumentation.
 enum ReplayRunner {
@@ -23,19 +25,30 @@ enum ReplayRunner {
         for req in requests {
             let sessionID = req.session ?? "default"
             let result: ReplayResult
-            do {
-                if req.isStreaming {
-                    result = try await runStreamed(req, sessionID: sessionID, state: state)
-                } else {
-                    result = try await runNonStreamed(req, sessionID: sessionID, state: state)
+            if let loglikelihood = req.loglikelihood {
+                result = await runLoglikelihoodLine(req: req, body: loglikelihood, state: state)
+            } else if let chat = req.request {
+                do {
+                    if chat.stream == true {
+                        result = try await runStreamed(req, chat: chat, sessionID: sessionID, state: state)
+                    } else {
+                        result = try await runNonStreamed(req, chat: chat, sessionID: sessionID, state: state)
+                    }
+                } catch {
+                    result = ReplayResult(
+                        id: req.id, session: req.session, t: req.t,
+                        choices: nil, systemFingerprint: nil,
+                        promptTokens: 0, completionTokens: 0, prefixReuseTokens: 0,
+                        ttftMs: 0, totalMs: 0, decodeTps: 0,
+                        streamed: chat.stream == true, error: "\(error)")
                 }
-            } catch {
+            } else {
+                // The decoder guarantees one body; keep a defensive branch anyway.
                 result = ReplayResult(
                     id: req.id, session: req.session, t: req.t,
                     choices: nil, systemFingerprint: nil,
                     promptTokens: 0, completionTokens: 0, prefixReuseTokens: 0,
-                    ttftMs: 0, totalMs: 0, decodeTps: 0,
-                    streamed: req.isStreaming, error: "\(error)")
+                    ttftMs: 0, totalMs: 0, decodeTps: 0, error: "empty replay request")
             }
             lines.append(try ReplayIO.encodeResult(result))
         }
@@ -49,11 +62,11 @@ enum ReplayRunner {
     }
 
     /// Non-streaming path: the same `runChatCompletion` core the HTTP handler uses.
-    private static func runNonStreamed(_ req: ReplayRequest, sessionID: String, state: ServerState) async throws
-        -> ReplayResult
-    {
+    private static func runNonStreamed(
+        _ req: ReplayRequest, chat: ChatCompletionRequest, sessionID: String, state: ServerState
+    ) async throws -> ReplayResult {
         let outcome = try await runChatCompletion(
-            chatRequest: req.request, state: state, sessionID: sessionID)
+            chatRequest: chat, state: state, sessionID: sessionID)
         let genSeconds = max(0, outcome.totalSeconds - outcome.ttftSeconds)
         let decodeTps = genSeconds > 0 ? Double(outcome.genTokenCount) / genSeconds : 0
         return ReplayResult(
@@ -71,13 +84,13 @@ enum ReplayRunner {
 
     /// Streaming path: drives the real `runStreamingLoop` (the SSE handler's core) and folds the
     /// emitted deltas back into a result, so `stream:true` requests exercise incremental parsing.
-    private static func runStreamed(_ req: ReplayRequest, sessionID: String, state: ServerState) async throws
-        -> ReplayResult
-    {
-        let prepared = try await prepareStreaming(chatRequest: req.request, state: state, sessionID: sessionID)
+    private static func runStreamed(
+        _ req: ReplayRequest, chat: ChatCompletionRequest, sessionID: String, state: ServerState
+    ) async throws -> ReplayResult {
+        let prepared = try await prepareStreaming(chatRequest: chat, state: state, sessionID: sessionID)
         var aggregator = ReplayStreamAggregator()
         let outcome = try await runStreamingLoop(
-            prepared: prepared, chatRequest: req.request, state: state,
+            prepared: prepared, chatRequest: chat, state: state,
             emit: { aggregator.consume($0) })
         let genSeconds = max(0, outcome.totalSeconds - outcome.ttftSeconds)
         let decodeTps = genSeconds > 0 ? Double(outcome.genTokenCount) / genSeconds : 0
@@ -92,5 +105,43 @@ enum ReplayRunner {
             totalMs: outcome.totalSeconds * 1000,
             decodeTps: decodeTps,
             streamed: true)
+    }
+
+    /// Scores a single loglikelihood prompt (one window per line) and surfaces its per-token
+    /// logprobs. Requires the sequential variant, same as the HTTP `/v1/completions` path.
+    private static func runLoglikelihoodLine(
+        req: ReplayRequest, body: CompletionRequest, state: ServerState
+    ) async -> ReplayResult {
+        guard state.config.supportsLogprobs else {
+            return ReplayResult(
+                id: req.id, session: req.session, t: req.t,
+                choices: nil, systemFingerprint: nil,
+                promptTokens: 0, completionTokens: 0, prefixReuseTokens: 0,
+                ttftMs: 0, totalMs: 0, decodeTps: 0,
+                error: "Logprobs not supported. Use --variant coreai-sequential")
+        }
+        let t0 = SuspendingClock().now
+        do {
+            let response = try await runLoglikelihood(req: body, state: state)
+            let elapsed = SuspendingClock().now - t0
+            let totalMs =
+                (Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18) * 1000
+            let logprobs = response.choices.first?.logprobs
+            return ReplayResult(
+                id: req.id, session: req.session, t: req.t,
+                choices: nil, systemFingerprint: nil,
+                promptTokens: logprobs?.tokens.count ?? 0,
+                completionTokens: 0, prefixReuseTokens: 0,
+                ttftMs: 0, totalMs: totalMs, decodeTps: 0,
+                tokens: logprobs?.tokens,
+                tokenLogprobs: logprobs?.tokenLogprobs,
+                textOffset: logprobs?.textOffset)
+        } catch {
+            return ReplayResult(
+                id: req.id, session: req.session, t: req.t,
+                choices: nil, systemFingerprint: nil,
+                promptTokens: 0, completionTokens: 0, prefixReuseTokens: 0,
+                ttftMs: 0, totalMs: 0, decodeTps: 0, error: "\(error)")
+        }
     }
 }

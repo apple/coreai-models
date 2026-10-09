@@ -7,11 +7,14 @@ import Foundation
 
 // MARK: - Replay format
 
-/// One replayed chat request. Wraps the exact `ChatCompletionRequest` the HTTP server
-/// decodes, plus a session id and an arrival timestamp, so a JSONL file can drive the real
-/// generation stack without an HTTP surface. One JSON object per line:
+/// One replayed request, driving the real generation stack without an HTTP surface. A line
+/// carries exactly one of two bodies: `request` (a chat completion, identical to what
+/// `/v1/chat/completions` decodes) or `loglikelihood` (a teacher-forced scoring request,
+/// identical to what `/v1/completions` decodes). Plus a session id and an arrival timestamp.
+/// One JSON object per line:
 ///
 ///     {"id":"r1","session":"A","t":0.0,"request":{"messages":[{"role":"user","content":"hi"}],"seed":7,"max_tokens":64}}
+///     {"id":"w1","loglikelihood":{"prompt":[1,2,3],"echo":true,"logprobs":0}}
 public struct ReplayRequest: Decodable, Sendable {
     /// Caller-supplied id, echoed on the result. Optional.
     public let id: String?
@@ -19,18 +22,44 @@ public struct ReplayRequest: Decodable, Sendable {
     public let session: String?
     /// Arrival timestamp in seconds. Used to order requests; optional.
     public let t: Double?
-    /// The chat request body, identical to what the HTTP endpoint accepts.
-    public let request: ChatCompletionRequest
+    /// The chat request body. Mutually exclusive with `loglikelihood`.
+    public let request: ChatCompletionRequest?
+    /// The loglikelihood-scoring body. Mutually exclusive with `request`.
+    public let loglikelihood: CompletionRequest?
 
-    public init(id: String?, session: String?, t: Double?, request: ChatCompletionRequest) {
+    public init(
+        id: String?, session: String?, t: Double?,
+        request: ChatCompletionRequest? = nil, loglikelihood: CompletionRequest? = nil
+    ) {
         self.id = id
         self.session = session
         self.t = t
         self.request = request
+        self.loglikelihood = loglikelihood
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, session, t, request, loglikelihood
+    }
+
+    public init(from decoder: any Swift.Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(String.self, forKey: .id)
+        session = try container.decodeIfPresent(String.self, forKey: .session)
+        t = try container.decodeIfPresent(Double.self, forKey: .t)
+        request = try container.decodeIfPresent(ChatCompletionRequest.self, forKey: .request)
+        loglikelihood = try container.decodeIfPresent(CompletionRequest.self, forKey: .loglikelihood)
+        // Exactly one body per line keeps the record unambiguous.
+        guard (request == nil) != (loglikelihood == nil) else {
+            throw DecodingError.dataCorrupted(
+                .init(
+                    codingPath: decoder.codingPath,
+                    debugDescription: "A replay line needs exactly one of 'request' or 'loglikelihood'"))
+        }
     }
 
     /// Whether this request asks for the streaming path.
-    public var isStreaming: Bool { request.stream == true }
+    public var isStreaming: Bool { request?.stream == true }
 }
 
 /// Per-request result with instrumentation, emitted as one JSON object per line. The generated
@@ -54,6 +83,10 @@ public struct ReplayResult: Encodable, Sendable {
     public let decodeTps: Double
     /// True when the streaming path produced this result (request had `stream:true`).
     public let streamed: Bool
+    /// Loglikelihood scoring output (present only for `loglikelihood` replay lines).
+    public let tokens: [String]?
+    public let tokenLogprobs: [Double?]?
+    public let textOffset: [Int]?
     public let error: String?
 
     public init(
@@ -61,7 +94,9 @@ public struct ReplayResult: Encodable, Sendable {
         choices: [ChatCompletionResponse.Choice]?, systemFingerprint: String?,
         promptTokens: Int, completionTokens: Int, prefixReuseTokens: Int,
         ttftMs: Double, totalMs: Double, decodeTps: Double,
-        streamed: Bool = false, error: String? = nil
+        streamed: Bool = false,
+        tokens: [String]? = nil, tokenLogprobs: [Double?]? = nil, textOffset: [Int]? = nil,
+        error: String? = nil
     ) {
         self.id = id
         self.session = session
@@ -75,11 +110,14 @@ public struct ReplayResult: Encodable, Sendable {
         self.totalMs = totalMs
         self.decodeTps = decodeTps
         self.streamed = streamed
+        self.tokens = tokens
+        self.tokenLogprobs = tokenLogprobs
+        self.textOffset = textOffset
         self.error = error
     }
 
     enum CodingKeys: String, CodingKey {
-        case id, session, t, choices, streamed, error
+        case id, session, t, choices, streamed, error, tokens
         case systemFingerprint = "system_fingerprint"
         case promptTokens = "prompt_tokens"
         case completionTokens = "completion_tokens"
@@ -87,6 +125,8 @@ public struct ReplayResult: Encodable, Sendable {
         case ttftMs = "ttft_ms"
         case totalMs = "total_ms"
         case decodeTps = "decode_tps"
+        case tokenLogprobs = "token_logprobs"
+        case textOffset = "text_offset"
     }
 }
 
