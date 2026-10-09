@@ -130,6 +130,7 @@ def _get_registry() -> dict[str, ModelEntry]:
     from coreai_models.models.macos.phi3 import Phi3ForCausalLM
     from coreai_models.models.macos.qwen2 import Qwen2ForCausalLM
     from coreai_models.models.macos.qwen3 import Qwen3ForCausalLM
+    from coreai_models.models.macos.qwen3_5 import Qwen3_5ForCausalLM
     from coreai_models.models.macos.qwen3_moe import Qwen3MoeForCausalLM
     from coreai_models.models.macos.qwen3_vl import (
         Qwen3VLForCausalLM,
@@ -192,6 +193,18 @@ def _get_registry() -> dict[str, ModelEntry]:
         ),
         "qwen3_moe": ModelEntry(
             macos_class=Qwen3MoeForCausalLM,
+        ),
+        # Qwen3.5 / Qwen3.5-MoE: hybrid full-attention + gated-delta-net decoders.
+        # Both checkpoints wrap the decoder under `text_config` / `model.language_model.`.
+        "qwen3_5": ModelEntry(
+            macos_class=Qwen3_5ForCausalLM,
+            hf_config_attr="text_config",
+            hf_state_dict_prefix="model.language_model.",
+        ),
+        "qwen3_5_moe": ModelEntry(
+            macos_class=Qwen3_5ForCausalLM,
+            hf_config_attr="text_config",
+            hf_state_dict_prefix="model.language_model.",
         ),
         # Qwen3-VL: vision-language model.
         # macos_class = standard text decoder (input_ids, for text-only use).

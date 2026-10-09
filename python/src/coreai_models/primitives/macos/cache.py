@@ -404,3 +404,75 @@ class RingKVCache:
         k_out = self._k_cache.narrow(0, layer_idx, 1).squeeze(0)
         v_out = self._v_cache.narrow(0, layer_idx, 1).squeeze(0)
         return k_out, v_out
+
+
+class DeltaNetCache:
+    """Conv and recurrent state for gated-delta (linear attention) layers.
+
+    Two ``SSMState`` tensors, both indexed by layer:
+
+    - ``conv_states``: the trailing ``conv_kernel_size`` tokens feeding the depthwise
+      causal conv, ``(n_layers, batch, conv_kernel_size, conv_dim)``.
+    - ``recurrent_states``: ``(n_layers, batch, num_v_heads, head_k_dim, head_v_dim)``
+      — the gated-delta rule's carried state.
+
+    In a hybrid decoder ``n_layers`` counts the linear-attention layers, so the leading
+    dim is indexed by position among *those* layers. Unlike ``KVCache`` neither grows
+    with sequence length, so both are traced and exported at fixed shape.
+    """
+
+    def __init__(self: Self, conv_states: torch.Tensor, recurrent_states: torch.Tensor) -> None:
+        self._conv_state = SSMState(conv_states)
+        self._recurrent_state = SSMState(recurrent_states)
+
+    @classmethod
+    def create_cache_tensors(
+        cls,
+        config,
+        *,
+        n_layers: int,
+        dtype: torch.dtype = torch.float32,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Create zero-initialized DeltaNet cache tensors from a model config.
+
+        The conv window is stored channels-last, ``(..., conv_kernel_size, conv_dim)``:
+        the ``(batch, seq, conv_dim)`` layout the fused input projection emits, so the
+        conv reads and writes the state with plain slices.
+
+        Args:
+            config: Model config supplying the head dimensions.
+            n_layers: Number of state rows: the count of linear-attention layers.
+            dtype: State dtype.
+
+        Returns:
+            ``(conv_states, recurrent_states)`` tensors.
+        """
+        batch_size = 1
+        num_v_heads = config.linear_num_value_heads
+        num_k_heads = config.linear_num_key_heads
+        head_k_dim = config.linear_key_head_dim
+        head_v_dim = config.linear_value_head_dim
+        key_dim = head_k_dim * num_k_heads
+        value_dim = head_v_dim * num_v_heads
+        conv_dim = key_dim * 2 + value_dim
+        conv_kernel_size = config.linear_conv_kernel_dim
+
+        conv_states = torch.zeros(n_layers, batch_size, conv_kernel_size, conv_dim, dtype=dtype)
+        recurrent_states = torch.zeros(
+            n_layers, batch_size, num_v_heads, head_k_dim, head_v_dim, dtype=dtype
+        )
+        return conv_states, recurrent_states
+
+    def update_conv_state(self: Self, layer_idx: int, new_state: torch.Tensor) -> None:
+        self._conv_state.update_states(layer_idx, new_state)
+
+    def update_recurrent_state(self: Self, layer_idx: int, new_state: torch.Tensor) -> None:
+        self._recurrent_state.update_states(layer_idx, new_state)
+
+    @property
+    def conv_states(self) -> torch.Tensor:
+        return self._conv_state.states
+
+    @property
+    def recurrent_states(self) -> torch.Tensor:
+        return self._recurrent_state.states
