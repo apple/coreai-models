@@ -109,9 +109,7 @@ def export_diffusion_gemma(
         # encoder_len and surfaced as keyCache/valueCache state.
         ids0 = torch.zeros(1, encoder_len, dtype=torch.int32)
         pos0 = torch.arange(encoder_len, dtype=torch.int32).unsqueeze(0)
-        kc = torch.zeros(
-            n_layers_eff, 1, cache_n_kv, encoder_len, cache_hd, dtype=dtype
-        )
+        kc = torch.zeros(n_layers_eff, 1, cache_n_kv, encoder_len, cache_hd, dtype=dtype)
         vc = torch.zeros_like(kc)
         enc_prog = export_to_coreai(
             encoder,
@@ -156,9 +154,7 @@ def export_diffusion_gemma(
 
     # -- Decoder (bidirectional canvas denoiser, self-conditioning folded in) -
     logger.info("Loading + exporting DECODER ...")
-    decoder = load_diffusion_gemma_decoder(
-        hf_model_id, target_dtype=dtype, num_layers=num_layers
-    )
+    decoder = load_diffusion_gemma_decoder(hf_model_id, target_dtype=dtype, num_layers=num_layers)
     h = text_cfg.hidden_size
     decoder_input_ids = torch.zeros(1, canvas_length, dtype=torch.int32)
     prev_soft_embeds = torch.zeros(1, canvas_length, h, dtype=dtype)
@@ -274,9 +270,7 @@ def _quantize_encoder(encoder, compression, dtype):
     preset = get_preset(compression)
     quant_cfg = preset.get("torch_quantization_config")
     if quant_cfg is None:
-        logger.warning(
-            "Compression '%s' has no torch_quantization_config; skipping", compression
-        )
+        logger.warning("Compression '%s' has no torch_quantization_config; skipping", compression)
         return encoder
     quant_cfg = dict(quant_cfg)
 
@@ -332,9 +326,7 @@ def _quantize_decoder(decoder, compression, dec_inputs):
     preset = get_preset(compression)
     quant_cfg = preset.get("torch_quantization_config")
     if quant_cfg is None:
-        logger.warning(
-            "Compression '%s' has no torch_quantization_config; skipping", compression
-        )
+        logger.warning("Compression '%s' has no torch_quantization_config; skipping", compression)
         return decoder
     quant_cfg = dict(quant_cfg)
 
@@ -405,9 +397,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Encoder KV-cache max context",
     )
     parser.add_argument("--canvas-length", type=int, default=256, help="Canvas length")
-    parser.add_argument(
-        "--compression", default="none", help="Compression preset or 'none'"
-    )
+    parser.add_argument("--compression", default="none", help="Compression preset or 'none'")
     parser.add_argument(
         "--compute-precision",
         choices=["float16", "bfloat16", "float32"],
@@ -415,9 +405,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output-dir", default="./exports")
     parser.add_argument("--output-name", default=None)
-    parser.add_argument(
-        "--num-layers", type=int, default=None, help="Truncate to N layers (smoke)"
-    )
+    parser.add_argument("--num-layers", type=int, default=None, help="Truncate to N layers (smoke)")
     parser.add_argument(
         "--encoder-len",
         type=int,

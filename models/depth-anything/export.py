@@ -47,9 +47,7 @@ def _patch_depth_anything_for_export() -> None:
     # `RotaryPositionEmbedding2D.forward` uses `int(positions.max()) + 1`, a
     # data-dependent guard that breaks torch.export. Swap in a shape-based
     # equivalent.
-    def _rope_forward(
-        self, tokens: torch.Tensor, positions: torch.Tensor
-    ) -> torch.Tensor:
+    def _rope_forward(self, tokens: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         assert tokens.size(-1) % 2 == 0
         assert positions.ndim == 3 and positions.shape[-1] == 2
         feature_dim = tokens.size(-1) // 2
@@ -59,9 +57,7 @@ def _patch_depth_anything_for_export() -> None:
         )
         vertical, horizontal = tokens.chunk(2, dim=-1)
         vertical = self._apply_1d_rope(vertical, positions[..., 0], cos_comp, sin_comp)
-        horizontal = self._apply_1d_rope(
-            horizontal, positions[..., 1], cos_comp, sin_comp
-        )
+        horizontal = self._apply_1d_rope(horizontal, positions[..., 1], cos_comp, sin_comp)
         return torch.cat((vertical, horizontal), dim=-1)
 
     _rope.RotaryPositionEmbedding2D.forward = _rope_forward
@@ -110,9 +106,7 @@ def _asset_path(output_dir: str, model_name: str, dtype: torch.dtype) -> Path:
 def _save_asset(coreai_program, model_path: Path, overwrite: bool) -> None:
     if model_path.exists():
         if not overwrite:
-            raise FileExistsError(
-                f"{model_path} already exists. Pass --overwrite to replace it."
-            )
+            raise FileExistsError(f"{model_path} already exists. Pass --overwrite to replace it.")
         if model_path.is_dir():
             shutil.rmtree(model_path)
         else:
@@ -126,7 +120,11 @@ def _build_aimodel_metadata() -> AIModelAssetMetadata:
     metadata = AIModelAssetMetadata()
     metadata.author = "H. Lin et al."
     metadata.license = "Apache-2.0"
-    metadata.model_description = "Depth Anything v3 is a monocular depth estimation model that predicts depth, confidence, camera intrinsics, and extrinsics from a batch of image views. Source: https://github.com/ByteDance-Seed/Depth-Anything-3"
+    metadata.model_description = (
+        "Depth Anything v3 is a monocular depth estimation model that predicts depth, confidence, "
+        "camera intrinsics, and extrinsics from a batch of image views. Source: "
+        "https://github.com/ByteDance-Seed/Depth-Anything-3"
+    )
     metadata.creation_date = int(time.time())
     return metadata
 
@@ -154,9 +152,7 @@ def create_depth_anything(
     exported = exported.run_decompositions(get_decomp_table())
     print("[INFO] Model exported. Converting to Core AI...")
 
-    mode = (
-        TorchConverter.Mode.DEBUG if include_debug_info else TorchConverter.Mode.RELEASE
-    )
+    mode = TorchConverter.Mode.DEBUG if include_debug_info else TorchConverter.Mode.RELEASE
     converter = TorchConverter(mode=mode).add_exported_program(
         exported_program=exported,
         input_names=["image"],
@@ -200,7 +196,8 @@ def main():
         "--include-debug-info",
         action="store_true",
         help="Embed debug information in the exported .aimodel for debugging a conversion. "
-        "Default: off, which embeds minimum debug information and makes the exported asset smaller.",
+        "Default: off, which embeds minimum debug information and makes the exported asset "
+        "smaller.",
     )
     args = parser.parse_args()
 

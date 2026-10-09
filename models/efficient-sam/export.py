@@ -88,14 +88,10 @@ def _bundle_paths(
     return bundle_dir, bundle_dir / f"{variant}.aimodel"
 
 
-def _save_asset(
-    coreai_program, bundle_dir: Path, model_path: Path, overwrite: bool
-) -> None:
+def _save_asset(coreai_program, bundle_dir: Path, model_path: Path, overwrite: bool) -> None:
     if bundle_dir.exists():
         if not overwrite:
-            raise FileExistsError(
-                f"{bundle_dir} already exists. Pass --overwrite to replace it."
-            )
+            raise FileExistsError(f"{bundle_dir} already exists. Pass --overwrite to replace it.")
         shutil.rmtree(bundle_dir)
     bundle_dir.mkdir(parents=True, exist_ok=True)
     coreai_program.save_asset(model_path, _build_aimodel_metadata())
@@ -106,7 +102,11 @@ def _build_aimodel_metadata() -> AIModelAssetMetadata:
     metadata = AIModelAssetMetadata()
     metadata.author = "Y. Xiong et al."
     metadata.license = "Apache-2.0"
-    metadata.model_description = "EfficientSAM is a lightweight, promptable image segmentation model that uses a masked autoencoder pretrained ViT-Tiny encoder to reduce compute while preserving accuracy. Source: https://github.com/yformer/EfficientSAM"
+    metadata.model_description = (
+        "EfficientSAM is a lightweight, promptable image segmentation model that uses a masked "
+        "autoencoder pretrained ViT-Tiny encoder to reduce compute while preserving accuracy. "
+        "Source: https://github.com/yformer/EfficientSAM"
+    )
     metadata.creation_date = int(time.time())
     return metadata
 
@@ -143,9 +143,7 @@ def create_efficient_sam(
         )
 
     print("[INFO] Downloading weights and sourcing model...")
-    checkpoint = (
-        "https://huggingface.co/merve/EfficientSAM/resolve/main/efficient_sam_vitt.pt"
-    )
+    checkpoint = "https://huggingface.co/merve/EfficientSAM/resolve/main/efficient_sam_vitt.pt"
     state_dict = torch.hub.load_state_dict_from_url(
         checkpoint, map_location="cpu", progress=True, weights_only=True
     )
@@ -165,15 +163,11 @@ def create_efficient_sam(
     ds = dynamic_shapes() if dynamic else None
 
     with torch.autocast(device_type="cpu", dtype=dtype):
-        exported = torch.export.export(
-            model, args=(), kwargs=example_inputs, dynamic_shapes=ds
-        )
+        exported = torch.export.export(model, args=(), kwargs=example_inputs, dynamic_shapes=ds)
     exported = exported.run_decompositions(get_decomp_table())
     print("[INFO] Model exported. Converting to Core AI...")
 
-    mode = (
-        TorchConverter.Mode.DEBUG if include_debug_info else TorchConverter.Mode.RELEASE
-    )
+    mode = TorchConverter.Mode.DEBUG if include_debug_info else TorchConverter.Mode.RELEASE
     converter = TorchConverter(mode=mode).add_exported_program(
         exported_program=exported,
         input_names=["batched_images", "batched_points", "batched_point_labels"],
@@ -188,9 +182,7 @@ def create_efficient_sam(
     _save_asset(coreai_program, bundle_dir, model_path, overwrite)
     print(f"[INFO] Successfully created and saved Core AI model to {model_path}.")
 
-    _write_metadata(
-        bundle_dir, _variant_name(model_name, dtype, dynamic, num_queries, num_pts)
-    )
+    _write_metadata(bundle_dir, _variant_name(model_name, dtype, dynamic, num_queries, num_pts))
 
 
 def main():
@@ -248,7 +240,8 @@ def main():
         "--include-debug-info",
         action="store_true",
         help="Embed debug information in the exported .aimodel for debugging a conversion. "
-        "Default: off, which embeds minimum debug information and makes the exported asset smaller.",
+        "Default: off, which embeds minimum debug information and makes the exported asset "
+        "smaller.",
     )
     args = parser.parse_args()
 
