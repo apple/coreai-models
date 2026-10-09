@@ -32,7 +32,7 @@ import os
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import torch
 from coreai.authoring import AIProgram
@@ -67,9 +67,7 @@ from coreai_models.models.ios.gemma4_text import (
 logger = logging.getLogger("gemma4.export")
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_IOS_COMPRESSION_CONFIG = (
-    Path(__file__).resolve().parent / "4bit_palettized.yaml"
-)
+DEFAULT_IOS_COMPRESSION_CONFIG = Path(__file__).resolve().parent / "4bit_palettized.yaml"
 
 # Checkpoints whose exports have been accuracy- and performance-verified. These
 # are the ones the model card advertises as supported. Other Gemma 4 checkpoints
@@ -142,9 +140,7 @@ def _ios_metadata_extras(text_config: Any) -> dict[str, Any]:
                 "global_head_dim": text_config.global_head_dim,
                 "sliding_rope_theta": rope["sliding_attention"]["rope_theta"],
                 "global_rope_theta": rope["full_attention"]["rope_theta"],
-                "partial_rotary_factor": rope["full_attention"][
-                    "partial_rotary_factor"
-                ],
+                "partial_rotary_factor": rope["full_attention"]["partial_rotary_factor"],
             },
         }
     except (AttributeError, KeyError, TypeError) as exc:
@@ -162,8 +158,8 @@ def _patch_language_metadata(
     bundle_path: Path,
     hf_model_id: str,
     text_config: Any,
-    extras: Optional[dict[str, Any]] = None,
-    auxiliary_assets: Optional[dict[str, Any]] = None,
+    extras: dict[str, Any] | None = None,
+    auxiliary_assets: dict[str, Any] | None = None,
 ) -> None:
     """Add Gemma4-specific keys to a written bundle.
 
@@ -200,18 +196,14 @@ def _text_config(hf_model_id: str) -> Any:
     return getattr(raw_config, HF_CONFIG_ATTR, raw_config)
 
 
-def _resolve_bundle_paths(
-    output_dir: str, output_name: str, overwrite: bool
-) -> tuple[Path, Path]:
+def _resolve_bundle_paths(output_dir: str, output_name: str, overwrite: bool) -> tuple[Path, Path]:
     """Create the bundle directory, failing fast on an existing asset without
     ``--overwrite``. Returns (bundle, asset). The existing asset is only removed just
     before the new one is saved, so a failed export leaves it in place."""
     bundle_path = Path(output_dir) / output_name
     aimodel_path = bundle_path / f"{output_name}.aimodel"
     if aimodel_path.exists() and not overwrite:
-        raise SystemExit(
-            f"{aimodel_path} already exists. Use --overwrite to replace it."
-        )
+        raise SystemExit(f"{aimodel_path} already exists. Use --overwrite to replace it.")
     bundle_path.mkdir(parents=True, exist_ok=True)
     return bundle_path, aimodel_path
 
@@ -300,12 +292,8 @@ def _export_programs(
     decomp_table = _ios_decomp_table()
     block_size = model.extend.model.kv_block_size
 
-    def trace(
-        module, kwargs: dict, dynamic_shapes=None
-    ) -> torch.export.ExportedProgram:
-        return torch.export.export(
-            module, args=(), kwargs=kwargs, dynamic_shapes=dynamic_shapes
-        )
+    def trace(module, kwargs: dict, dynamic_shapes=None) -> torch.export.ExportedProgram:
+        return torch.export.export(module, args=(), kwargs=kwargs, dynamic_shapes=dynamic_shapes)
 
     programs: list[tuple[str, str, int, torch.export.ExportedProgram]] = []
     with torch.no_grad():
@@ -351,8 +339,7 @@ def _export_programs(
                 for q in qlens:
                     name = f"{entrypoint}_{ctx}_{q}"
                     logger.info(
-                        f"Exporting {name} "
-                        f"(flash chunks={(ctx + block_size - 1) // block_size})..."
+                        f"Exporting {name} (flash chunks={(ctx + block_size - 1) // block_size})..."
                     )
                     ref, _ = _reference_inputs(
                         model,
@@ -389,9 +376,7 @@ async def _convert_to_coreai(
     states = model.export_state_names()
     outputs = model.export_output_names()
 
-    mode = (
-        TorchConverter.Mode.DEBUG if include_debug_info else TorchConverter.Mode.RELEASE
-    )
+    mode = TorchConverter.Mode.DEBUG if include_debug_info else TorchConverter.Mode.RELEASE
     converter = TorchConverter(mode=mode)
     register_custom_torch_lowering(converter)
     for name, graph, _, program in programs:
@@ -434,14 +419,10 @@ async def _export_blocked_ladder(
     logger.info(f"iOS context ladder: {buckets}")
     programs = _export_programs(model, config, buckets)
     gather_qlens = set(SHIPPING_EXTEND_QLENS) | set(SHIPPING_PROMPT_QLENS)
-    return await _convert_to_coreai(
-        model, programs, config, gather_qlens, include_debug_info
-    )
+    return await _convert_to_coreai(model, programs, config, gather_qlens, include_debug_info)
 
 
-def _palettization_inputs(
-    model: Gemma4ForCausalLMForiOS, config, max_context_length: int
-) -> tuple:
+def _palettization_inputs(model: Gemma4ForCausalLMForiOS, config, max_context_length: int) -> tuple:
     """The palettizer's calibration inputs: the smallest rung's reference inputs,
     as ``model.forward``'s positional arguments.
 
@@ -479,9 +460,7 @@ async def _export_ios(args: argparse.Namespace) -> str:
     # unset. Resolved before any weights are loaded so a bad recipe fails fast.
     palettization_config = None
     if args.compression_config is not None:
-        palettization_config = _load_compression_config_object(
-            args.compression_config, "iOS"
-        )
+        palettization_config = _load_compression_config_object(args.compression_config, "iOS")
         compression = args.compression_config.stem
     else:
         compression = "none"
@@ -494,13 +473,9 @@ async def _export_ios(args: argparse.Namespace) -> str:
             compression_config_object=palettization_config,
         )
     )
-    bundle_path, aimodel_path = _resolve_bundle_paths(
-        args.output_dir, output_name, args.overwrite
-    )
+    bundle_path, aimodel_path = _resolve_bundle_paths(args.output_dir, output_name, args.overwrite)
 
-    logger.info(
-        f"Loading {hf_model_id} (iOS, dtype={target_dtype}, max_ctx={max_ctx})..."
-    )
+    logger.info(f"Loading {hf_model_id} (iOS, dtype={target_dtype}, max_ctx={max_ctx})...")
 
     # Move loaded weights to disk-backed mmap tensors so the OS can evict weight
     # pages during palettization and the long blocked-ladder conversion. The temp
@@ -617,8 +592,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-context-length",
         type=int,
         default=None,
-        help="Maximum context length, a power of two "
-        f"(default and max: {IOS_MAX_CONTEXT_LENGTH})",
+        help=f"Maximum context length, a power of two (default and max: {IOS_MAX_CONTEXT_LENGTH})",
     )
     parser.add_argument(
         "--output-dir",
@@ -630,9 +604,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Custom bundle name (without extension)",
     )
-    parser.add_argument(
-        "--overwrite", action="store_true", help="Overwrite an existing bundle"
-    )
+    parser.add_argument("--overwrite", action="store_true", help="Overwrite an existing bundle")
     parser.add_argument(
         "--include-debug-info",
         action="store_true",
@@ -640,9 +612,7 @@ def build_parser() -> argparse.ArgumentParser:
         "Default: off, which embeds minimum debug information and makes the exported "
         "asset smaller.",
     )
-    parser.add_argument(
-        "--verbose", "-v", action="store_true", help="Enable DEBUG logging"
-    )
+    parser.add_argument("--verbose", "-v", action="store_true", help="Enable DEBUG logging")
 
     return parser
 
@@ -655,10 +625,7 @@ def _resolve_defaults(args: argparse.Namespace) -> None:
     recipe. ``--compression`` only accepts ``none``, which skips compression
     entirely.
     """
-    if (
-        args.max_context_length is not None
-        and args.max_context_length > IOS_MAX_CONTEXT_LENGTH
-    ):
+    if args.max_context_length is not None and args.max_context_length > IOS_MAX_CONTEXT_LENGTH:
         raise SystemExit(
             f"--max-context-length supports at most {IOS_MAX_CONTEXT_LENGTH} tokens "
             f"(got {args.max_context_length}); the static-shape ladder tops out "
@@ -667,8 +634,7 @@ def _resolve_defaults(args: argparse.Namespace) -> None:
 
     # The top context bucket is --max-context-length itself, so it must be one.
     if args.max_context_length is not None and (
-        args.max_context_length <= 0
-        or args.max_context_length & (args.max_context_length - 1)
+        args.max_context_length <= 0 or args.max_context_length & (args.max_context_length - 1)
     ):
         raise SystemExit(
             f"--max-context-length must be a power of two (got {args.max_context_length})."

@@ -34,4 +34,24 @@ struct VectorMathTests {
         #expect(sigmoid(-100) < 1e-40)
         #expect(sigmoid(-100).isNaN == false)
     }
+
+    // MARK: - cosineSimilarity
+
+    @Test("cosineSimilarity: identical, orthogonal, and opposite vectors")
+    func cosineKnownValues() {
+        #expect(abs(cosineSimilarity([1, 2, 3], [1, 2, 3]) - 1.0) < 1e-6)
+        #expect(abs(cosineSimilarity([1, 0], [0, 1])) < 1e-6)
+        #expect(abs(cosineSimilarity([1, 2, 3], [-1, -2, -3]) + 1.0) < 1e-6)
+    }
+
+    @Test("cosineSimilarity: zero-norm convention matches speech parity")
+    func cosineDegenerate() {
+        // Two zero-norm (or empty) vectors are identical and score 1; a single zero-norm vector
+        // has no direction to compare and scores 0; a length mismatch scores 0. This matches the
+        // speech parity convention so every harness that shares this helper agrees.
+        #expect(cosineSimilarity([], []) == 1)
+        #expect(cosineSimilarity([0, 0], [0, 0]) == 1)
+        #expect(cosineSimilarity([0, 0], [1, 2]) == 0)
+        #expect(cosineSimilarity([1, 2], [1, 2, 3]) == 0)
+    }
 }
