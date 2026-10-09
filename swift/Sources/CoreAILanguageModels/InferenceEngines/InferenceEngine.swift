@@ -112,7 +112,7 @@ public struct InferenceOptions: Sendable {
 
 /// Presets for the common (tokens, logits) pairs.
 extension InferenceOptions {
-    /// Warm the KV cache; no token or logits generation.
+    /// Warm the KV cache; does not need token or logits
     public static func prefill(maxTokens: Int? = nil) -> InferenceOptions {
         InferenceOptions(maxTokens: maxTokens, tokens: .none, logits: .none)
     }
