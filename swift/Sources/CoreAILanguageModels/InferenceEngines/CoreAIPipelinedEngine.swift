@@ -1562,6 +1562,9 @@ private struct EngineImpl: ~Copyable {
         var asyncStates = InferenceFunction.AsyncMutableViews()
         asyncStates.insert(&keyState, for: keyCacheName)
         asyncStates.insert(&valState, for: valueCacheName)
+        // Non-growing states (e.g. sliding-ring caches) are bound here too, like
+        // the plain-decode and prefill paths; nil for standard two-state bundles.
+        additionalStates?.bind(into: &asyncStates)
 
         // Safe: constrained loop awaits each token before encoding the next step, so logits are consumed before overwrite.
         let logitsBuffer = logits.metalBuffer
