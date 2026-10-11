@@ -160,7 +160,8 @@ class Attention(nn.Module):
         query = self.rope(query, position_ids=rope_positions, freqs=freqs)
         key = self.rope(key, position_ids=rope_positions, freqs=freqs)
 
-        # Write draft KV to cache, fetch full cache (injected + draft)
+        # Write draft KV, then fetch. Write-first is safe here (unlike the target):
+        # the block-level dflash mask isn't per-query. Parity harness, not exported.
         key, value = cache.update_and_fetch(self.layer_idx, offset, key, value, query_len=query_len)
 
         attn_output = (

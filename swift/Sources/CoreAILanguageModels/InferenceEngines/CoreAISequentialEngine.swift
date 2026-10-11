@@ -45,6 +45,12 @@ public final class CoreAISequentialEngine: InferenceEngine, IdempotentEngine, @u
     // no logits, so the last prompt token still goes through `function`.
     private let prefillFunction: InferenceFunction?
 
+    // True when a sliding-window (ring) KV state is present. The decode graph
+    // (`function`) writes the ring write-first, which is only correct for a
+    // single query token; a multi-token decode step would silently evict
+    // still-in-window history. The guard in `processTokenBatch` refuses it.
+    private let hasSlidingState: Bool
+
     // I/O names from descriptor
     private let logitsName: String
 
@@ -128,6 +134,7 @@ public final class CoreAISequentialEngine: InferenceEngine, IdempotentEngine, @u
             options: options
         )
         self.options = options
+        self.hasSlidingState = stateHandlers.hasSlidingCache
         self.session = GenerationSessionState(
             kvCache: stateHandlers.kvCache,
             additionalStates: stateHandlers.additionalStates,
@@ -238,6 +245,15 @@ public final class CoreAISequentialEngine: InferenceEngine, IdempotentEngine, @u
         let batchSize = tokens.count
         guard batchSize > 0 else {
             throw InferenceRuntimeError.invalidState("Cannot process empty token batch")
+        }
+
+        // Write-first sliding ring is correct only at query_len == 1; refuse Q>1.
+        guard !hasSlidingState || batchSize == 1 else {
+            throw InferenceRuntimeError.invalidState(
+                "Sliding-window (ring) model received a \(batchSize)-token decode batch on the "
+                    + "write-first 'main' graph, which is only correct for query_len == 1. "
+                    + "Route multi-token steps through the prefill graph; spec-decode verify and "
+                    + "all-logits over a sliding model need a Q>1 concat-with-logits path.")
         }
 
         _ = try sessionState.kvCache.ensureCapacity(

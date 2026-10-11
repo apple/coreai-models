@@ -398,6 +398,10 @@ class TestConcatWindowAttention:
         before the chunk's earliest queries read them. Decode (query_len=1)
         never hits that, so it is the trusted reference here.
 
+        The guarded model picks the ring path by ``prefill_mode``: Q==1 decode
+        runs write-first (``prefill_mode=False``), multi-token prefill runs
+        read-before-write concat (``prefill_mode=True``). Both must match.
+
         ``chunk`` divides the window so no write straddles the ring boundary.
         """
         config = _glimmer_config(window=16)
@@ -419,6 +423,7 @@ class TestConcatWindowAttention:
                             torch.arange(end).unsqueeze(0),
                             global_cache,
                             sliding_cache,
+                            prefill_mode=step > 1,
                         )
                     )
             return torch.cat(outs, dim=1)
@@ -510,6 +515,37 @@ def _ring_chunk_attention(cache, layer_idx, q, k, v, offset, window_size):
     attn = torch.softmax(scores, dim=-1)
     out = torch.einsum("hql,hld->hqd", attn, fv)  # (n_heads, Q, head_dim)
     cache.update(layer_idx, offset, k, v, query_len=q_len)
+    return out
+
+
+def _ring_chunk_attention_writefirst(cache, layer_idx, q, k, v, offset, window_size):
+    """One chunk of sliding attention through the write-before-read ring path.
+
+    Mirrors the target's ``main``/decode graph (``prefill_mode=False``):
+    update_and_fetch writes the chunk into the ring and returns the whole
+    ``capacity`` window, then attention runs with ring_window_causal_mask. This
+    is cheaper (no per-step window copy) but only correct for ``query_len == 1``;
+    a multi-token chunk written after the ring is full evicts the oldest
+    ``query_len - 1`` in-window positions before its earliest queries read them.
+    q is (n_heads, Q, head_dim); k, v are (1, n_kv, Q, head_dim).
+    """
+    q_len = q.shape[1]
+    head_dim = q.shape[-1]
+    scale = 1.0 / math.sqrt(head_dim)
+    full_k, full_v = cache.update_and_fetch(layer_idx, offset, k, v, query_len=q_len)
+    mask = ring_window_causal_mask(
+        query_len=q_len,
+        capacity=cache.capacity(),
+        offset=offset,
+        window_size=window_size,
+        device="cpu",
+    )  # (Q, cap)
+    fk = full_k[0]  # (n_kv, cap, head_dim)
+    fv = full_v[0]
+    scores = torch.einsum("hqd,hld->hql", q, fk) * scale  # (n_heads, Q, cap)
+    scores = scores.masked_fill(~mask.unsqueeze(0), float("-inf"))
+    attn = torch.softmax(scores, dim=-1)
+    out = torch.einsum("hql,hld->hqd", attn, fv)  # (n_heads, Q, head_dim)
     return out
 
 
@@ -695,3 +731,64 @@ class TestConcatWriteIndexIsShapeSymint:
                 "ring write index must be a shape symint, not a runtime data "
                 f"tensor, or the slice_update kernel crashes; found {data_ops}"
             )
+
+
+class TestGuardedPathSelection:
+    """Pin the write-first correctness boundary the Swift guard relies on.
+
+    Muse's decode (``main``) graph is write-before-read: correct at query_len == 1
+    but WRONG for query_len > 1 after the ring wraps -- the regime the engine's
+    guard refuses. (Concat correctness is covered by TestRingConcatOracleParity.)
+    """
+
+    WINDOW = 8
+    HEAD_DIM = 4
+    N_HEADS = 2  # == n_kv, so the oracle stays exact (no GQA broadcast)
+
+    def _prefill_full_ring(self, seed, chunk_len):
+        """Fill the ring with two full wraps, then stage one chunk at offset=2W."""
+        window, head_dim, n_heads = self.WINDOW, self.HEAD_DIM, self.N_HEADS
+        offset = 2 * window  # two full wraps -> ring is full, every slot live
+        total = offset + chunk_len
+        torch.manual_seed(seed)
+        k_log = torch.randn(n_heads, total, head_dim)
+        v_log = torch.randn(n_heads, total, head_dim)
+        q_log = torch.randn(n_heads, total, head_dim)
+
+        cache = RingKVCache(
+            torch.zeros(1, 1, n_heads, window, head_dim),
+            torch.zeros(1, 1, n_heads, window, head_dim),
+        )
+        for start in (0, window):
+            k = k_log[:, start : start + window, :].unsqueeze(0)
+            v = v_log[:, start : start + window, :].unsqueeze(0)
+            cache.update(0, start, k, v, query_len=window)
+
+        q = q_log[:, offset:total, :]
+        k = k_log[:, offset:total, :].unsqueeze(0)
+        v = v_log[:, offset:total, :].unsqueeze(0)
+        oracle = _sliding_window_oracle(q, k_log, v_log, offset, window)
+        return cache, q, k, v, offset, oracle
+
+    def test_write_first_matches_oracle_at_decode(self):
+        """query_len == 1: the write-first path (main graph) is correct."""
+        cache, q, k, v, offset, oracle = self._prefill_full_ring(seed=1, chunk_len=1)
+        out = _ring_chunk_attention_writefirst(cache, 0, q, k, v, offset, self.WINDOW)
+        diff = (out - oracle).abs().max().item()
+        assert diff < 1e-5, f"write-first decode diverges from oracle: {diff}"
+
+    @pytest.mark.parametrize("chunk_len", [2, 4, 8])
+    def test_write_first_diverges_for_multitoken_after_wrap(self, chunk_len):
+        """query_len > 1 after wrap: write-first is WRONG (must not match oracle).
+
+        This is the silent corruption the Swift guard exists to prevent: sending
+        a multi-token chunk through the write-first ``main`` graph evicts
+        still-needed history. The guard throws instead of producing this.
+        """
+        cache, q, k, v, offset, oracle = self._prefill_full_ring(seed=7, chunk_len=chunk_len)
+        out = _ring_chunk_attention_writefirst(cache, 0, q, k, v, offset, self.WINDOW)
+        diff = (out - oracle).abs().max().item()
+        assert diff > 1e-2, (
+            f"write-first should diverge from oracle for query_len={chunk_len} "
+            f"after wrap, but diff={diff} (bug would be silent)"
+        )

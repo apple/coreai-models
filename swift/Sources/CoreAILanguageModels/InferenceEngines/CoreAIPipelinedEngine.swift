@@ -598,6 +598,9 @@ private struct EngineImpl: ~Copyable {
     var additionalStates: FixedMTLBufferState?
     var hasNonTruncatableStates: Bool
 
+    // True when a sliding-window (ring) KV state is present.
+    let hasSlidingState: Bool
+
     // Logits — reuses GrowingLogitsBuffer from TensorStorage+CoreAI.swift
     var logits: GrowingLogitsBuffer
 
@@ -853,6 +856,7 @@ private struct EngineImpl: ~Copyable {
         self.kvCache = kvCacheLocal
         self.additionalStates = additionalStatesLocal
         self.hasNonTruncatableStates = classified.contains(where: { $0.kind == .fixed })
+        self.hasSlidingState = classified.contains(where: { $0.kind == .slidingCache })
         self.logits = logitsRef
         self.cachedSampler = nil
         self.cachedSamplerTemperature = nil
@@ -928,6 +932,15 @@ private struct EngineImpl: ~Copyable {
 
         let actualTokenCount = tokens.isEmpty ? 1 : tokens.count
         let queryLength = actualTokenCount
+
+        // Write-first `main` graph is correct only at query_len == 1 on a sliding ring.
+        guard !hasSlidingState || queryLength == 1 else {
+            throw InferenceRuntimeError.invalidState(
+                "Sliding-window (ring) model received a \(queryLength)-token decode step on the "
+                    + "write-first 'main' graph, which is only correct for query_len == 1. "
+                    + "Multi-token verify/all-logits over a sliding model needs a Q>1 "
+                    + "concat-with-logits path.")
+        }
 
         defer {
             processedTokenCount += actualTokenCount
@@ -1502,6 +1515,13 @@ private struct EngineImpl: ~Copyable {
         let actualTokenCount = tokens.isEmpty ? 1 : tokens.count
         let queryLength = actualTokenCount
 
+        // Constrained gen runs the write-first `main` graph: query_len == 1 only.
+        guard !hasSlidingState || queryLength == 1 else {
+            throw InferenceRuntimeError.invalidState(
+                "Sliding-window (ring) model received a \(queryLength)-token constrained step on "
+                    + "the write-first 'main' graph, which is only correct for query_len == 1.")
+        }
+
         defer {
             processedTokenCount += actualTokenCount
             step += 1
@@ -1740,6 +1760,14 @@ private struct EngineImpl: ~Copyable {
                 additionalStates: additionalStates,
                 computeStream: computeStream)
         } else {
+            // No prefill graph: write-first `main` chunk is query_len == 1 only.
+            guard !hasSlidingState || queryLength == 1 else {
+                throw InferenceRuntimeError.invalidState(
+                    "Sliding-window (ring) model ran a \(queryLength)-token chunk on the "
+                        + "write-first 'main' graph (no prefill graph present), which is only "
+                        + "correct for query_len == 1. Export a prefill graph for multi-token "
+                        + "prompt chunks, or route them through the concat path.")
+            }
             let logitsShape = [1, queryLength, vocabSize]
             try encodeWithStates(
                 function: function, inputs: asyncInputs,
