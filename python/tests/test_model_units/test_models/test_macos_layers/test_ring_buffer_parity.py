@@ -8,15 +8,26 @@
 Validates that incremental decode with the ring buffer produces the same
 logits as full recompute (ground truth), both within and across the window
 boundary (wrap-around). Uses chunked prefill to stay within buffer capacity.
+
+TestConcatWindowAttention covers the read-before-write path used by
+muse_glimmer: fetch_and_concat -> attention -> update, which (unlike
+update_and_fetch) is correct for multi-token prefill chunks.
 """
 
+import math
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from coreai_models.models.macos.muse_glimmer import MuseGlimmerModel
 from coreai_models.models.macos.muse_glimmer_drafter_ring import DrafterRingModel
-from coreai_models.primitives.macos.cache import RingKVCache, ring_window_causal_mask
+from coreai_models.primitives.macos.cache import (
+    KVCache,
+    RingKVCache,
+    concat_window_causal_mask,
+    ring_window_causal_mask,
+)
 
 
 def _drafter_config(window: int = 64) -> SimpleNamespace:
@@ -249,3 +260,535 @@ class TestRingBufferParity:
         assert mask.shape == (1, 8)
         # All 8 slots should be valid (we've filled the buffer and window=8=capacity)
         assert mask[0].sum() == 8
+
+
+def _simulate_ring_mask(query_len, capacity, offset, window_size):
+    """Ground truth for concat_window_causal_mask.
+
+    Replays the ring writes for every position before ``offset`` to learn which
+    absolute position each slot physically holds, then applies the sliding
+    window predicate directly. Deliberately naive — no modular arithmetic
+    tricks to mirror the implementation's.
+    """
+    slot_pos = [-1] * capacity
+    for pos in range(offset):
+        slot_pos[pos % capacity] = pos
+
+    mask = torch.zeros(query_len, capacity + query_len, dtype=torch.bool)
+    for i in range(query_len):
+        q = offset + i
+        for slot in range(capacity):
+            k = slot_pos[slot]
+            mask[i, slot] = k >= 0 and k <= q and (q - k) < window_size
+        for j in range(query_len):
+            k = offset + j
+            mask[i, capacity + j] = k <= q and (q - k) < window_size
+    return mask
+
+
+def _glimmer_config(window: int = 16, n_layers: int = 4) -> SimpleNamespace:
+    """All-sliding Muse Glimmer config, so tests isolate the ring path."""
+    return SimpleNamespace(
+        hidden_size=64,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        intermediate_size=128,
+        num_hidden_layers=n_layers,
+        vocab_size=128,
+        rms_norm_eps=1e-5,
+        sliding_window=window,
+        layer_types=["sliding_attention"] * n_layers,
+        layer_rope_theta=[500000.0] * n_layers,
+        qk_scale_factor=1.0,
+        max_position_embeddings=256,
+    )
+
+
+def _glimmer_caches(model, config, global_len: int = 256):
+    def zeros(n_layers, seq_len):
+        return torch.zeros(n_layers, 1, config.num_key_value_heads, seq_len, config.head_dim)
+
+    n_global = max(model.n_global_layers, 1)
+    n_sliding = model.n_sliding_layers
+    window = config.sliding_window
+    return (
+        KVCache(zeros(n_global, global_len), zeros(n_global, global_len)),
+        RingKVCache(zeros(n_sliding, window), zeros(n_sliding, window)),
+    )
+
+
+class TestConcatWindowAttention:
+    """Read-before-write ring path (fetch_and_concat -> attend -> update)."""
+
+    @pytest.mark.parametrize("capacity", [8, 16])
+    @pytest.mark.parametrize("window_divisor", [1, 2])
+    def test_mask_matches_ring_simulation(self, capacity, window_divisor):
+        """Mask matches a naive replay of the ring, at every offset through 3 wraps."""
+        window_size = capacity // window_divisor
+        for offset in range(0, 3 * capacity + 3):
+            for query_len in (1, 2, 3, capacity // 2, capacity):
+                got = concat_window_causal_mask(
+                    query_len=query_len,
+                    capacity=capacity,
+                    offset=offset,
+                    window_size=window_size,
+                    device="cpu",
+                )
+                want = _simulate_ring_mask(query_len, capacity, offset, window_size)
+                assert got.shape == (query_len, capacity + query_len)
+                assert torch.equal(got, want), (
+                    f"capacity={capacity} window={window_size} "
+                    f"offset={offset} query_len={query_len}"
+                )
+
+    def test_mask_from_empty_cache_ignores_ring(self):
+        """At offset=0 nothing is cached, so only the new-key block is live."""
+        mask = concat_window_causal_mask(
+            query_len=4, capacity=8, offset=0, window_size=8, device="cpu"
+        )
+        assert mask.shape == (4, 12)
+        assert mask[:, :8].sum() == 0  # ring is entirely unwritten
+        # New-key block is plain causal
+        assert torch.equal(mask[:, 8:], torch.tril(torch.ones(4, 4, dtype=torch.bool)))
+
+    def test_mask_excludes_slot_about_to_be_overwritten(self):
+        """With a full ring, the oldest slot falls outside every query's window."""
+        capacity = 8
+        mask = concat_window_causal_mask(
+            query_len=1, capacity=capacity, offset=16, window_size=capacity, device="cpu"
+        )
+        # Query at position 16 attends to 9..16: 7 cached slots + itself.
+        assert mask[:, :capacity].sum() == capacity - 1
+        assert mask[0, capacity] == 1
+        # The excluded slot holds position 8 (16 - capacity), written at 8 % 8 = 0.
+        assert mask[0, 0] == 0
+
+    def test_fetch_and_concat_does_not_mutate_cache(self):
+        """fetch_and_concat is read-only; the write happens in update()."""
+        capacity, n_layers, n_kv, head_dim = 8, 2, 2, 4
+        k_buf = torch.randn(n_layers, 1, n_kv, capacity, head_dim)
+        v_buf = torch.randn(n_layers, 1, n_kv, capacity, head_dim)
+        cache = RingKVCache(k_buf.clone(), v_buf.clone())
+
+        k = torch.randn(1, n_kv, 3, head_dim)
+        v = torch.randn(1, n_kv, 3, head_dim)
+        full_k, full_v = cache.fetch_and_concat(0, k, v)
+
+        assert full_k.shape == (1, n_kv, capacity + 3, head_dim)
+        assert torch.equal(cache._k_cache, k_buf), "fetch_and_concat mutated the K cache"
+        assert torch.equal(cache._v_cache, v_buf), "fetch_and_concat mutated the V cache"
+        # Concatenated result is [cached window, new keys]
+        assert torch.equal(full_k[:, :, :capacity], k_buf[0])
+        assert torch.equal(full_k[:, :, capacity:], k)
+        assert torch.equal(full_v[:, :, capacity:], v)
+
+        # The subsequent update must not disturb the already-returned tensors.
+        snapshot = full_k.clone()
+        cache.update(0, offset=0, k=k, v=v, query_len=3)
+        assert torch.equal(full_k, snapshot), "update() aliased fetch_and_concat output"
+        assert torch.equal(cache._k_cache[0, :, :, :3], k)
+
+    @pytest.mark.parametrize("chunk", [2, 4, 8, 16])
+    def test_chunked_prefill_matches_decode_past_window(self, chunk):
+        """Multi-token prefill matches token-by-token decode, well past the window.
+
+        Regression test for history loss during prefill: a write-first ring lets
+        a chunk's own K/V evict the oldest ``chunk - 1`` in-window positions
+        before the chunk's earliest queries read them. Decode (query_len=1)
+        never hits that, so it is the trusted reference here.
+
+        The guarded model picks the ring path by ``prefill_mode``: Q==1 decode
+        runs write-first (``prefill_mode=False``), multi-token prefill runs
+        read-before-write concat (``prefill_mode=True``). Both must match.
+
+        ``chunk`` divides the window so no write straddles the ring boundary.
+        """
+        config = _glimmer_config(window=16)
+        torch.manual_seed(0)
+        model = MuseGlimmerModel(config).eval().to(torch.float32)
+
+        seq_len = 48  # 3 full wraps of the 16-slot ring
+        input_ids = torch.randint(0, config.vocab_size, (1, seq_len))
+
+        def run(step):
+            global_cache, sliding_cache = _glimmer_caches(model, config)
+            outs = []
+            for start in range(0, seq_len, step):
+                end = min(start + step, seq_len)
+                with torch.no_grad():
+                    outs.append(
+                        model(
+                            input_ids[:, start:end],
+                            torch.arange(end).unsqueeze(0),
+                            global_cache,
+                            sliding_cache,
+                            prefill_mode=step > 1,
+                        )
+                    )
+            return torch.cat(outs, dim=1)
+
+        reference = run(1)
+        diff = (run(chunk) - reference).abs().max().item()
+        assert diff < 1e-4, f"chunk={chunk} diverges from decode reference: {diff}"
+
+    @pytest.mark.parametrize("chunk", [2, 4, 8, 16])
+    def test_drafter_chunked_prefill_matches_decode_past_window(self, chunk):
+        """Same regression check for the drafter, whose layers are all sliding.
+
+        TestRingBufferParity.test_chunked_prefill_matches_single_prefill cannot
+        catch this: it prefills 48 tokens into a 64-slot ring, so the buffer
+        never fills and no history is evicted. Here the ring wraps three times.
+        """
+        config = _drafter_config(window=16)
+        torch.manual_seed(11)
+        model = DrafterRingModel(config)
+        model.eval()
+
+        seq_len = 48  # 3 full wraps of the 16-slot ring
+        input_ids = torch.randint(0, config.vocab_size, (1, seq_len))
+
+        def run(step):
+            cache = _make_ring_cache(config)
+            outs = []
+            for start in range(0, seq_len, step):
+                end = min(start + step, seq_len)
+                with torch.no_grad():
+                    outs.append(
+                        model(input_ids[:, start:end], torch.arange(end).unsqueeze(0), cache)
+                    )
+            return torch.cat(outs, dim=1)
+
+        reference = run(1)
+        diff = (run(chunk) - reference).abs().max().item()
+        assert diff < 1e-4, f"chunk={chunk} diverges from decode reference: {diff}"
+
+
+def _sliding_window_oracle(q, k_log, v_log, offset, window_size):
+    """Brute-force sliding-window causal attention, independent of the ring.
+
+    For each query ``i`` at absolute position ``p = offset + i``, attend over the
+    true key/value positions ``[max(0, p - window_size + 1), p]`` taken straight
+    from a full non-ring K/V log. There is no ring arithmetic here, so a ring
+    that drops or reorders in-window history cannot hide behind a matching bug in
+    the reference.
+
+    q, k_log, v_log are (n_heads, seq_len, head_dim); returns (n_heads, Q, head_dim).
+    """
+    n_heads, q_len, head_dim = q.shape
+    scale = 1.0 / math.sqrt(head_dim)
+    out = torch.zeros(n_heads, q_len, head_dim)
+    for i in range(q_len):
+        p = offset + i
+        lo = max(0, p - window_size + 1)
+        ks = k_log[:, lo : p + 1, :]  # (n_heads, L, head_dim)
+        vs = v_log[:, lo : p + 1, :]
+        scores = torch.einsum("hd,hld->hl", q[:, i, :], ks) * scale
+        attn = torch.softmax(scores, dim=-1)
+        out[:, i, :] = torch.einsum("hl,hld->hd", attn, vs)
+    return out
+
+
+def _ring_chunk_attention(cache, layer_idx, q, k, v, offset, window_size):
+    """One chunk of sliding attention through the read-before-write ring path.
+
+    Mirrors what the sliding layers do: fetch_and_concat -> attend over the
+    ``capacity + query_len`` keys with concat_window_causal_mask -> update. q is
+    (n_heads, Q, head_dim); k, v are (1, n_kv, Q, head_dim). n_heads == n_kv here
+    to keep the oracle exact.
+    """
+    q_len = q.shape[1]
+    head_dim = q.shape[-1]
+    scale = 1.0 / math.sqrt(head_dim)
+    full_k, full_v = cache.fetch_and_concat(layer_idx, k, v)  # (1, n_kv, cap+Q, head_dim)
+    mask = concat_window_causal_mask(
+        query_len=q_len,
+        capacity=cache.capacity(),
+        offset=offset,
+        window_size=window_size,
+        device="cpu",
+    )  # (Q, cap+Q)
+    fk = full_k[0]  # (n_kv, L, head_dim)
+    fv = full_v[0]
+    scores = torch.einsum("hqd,hld->hql", q, fk) * scale  # (n_heads, Q, L)
+    scores = scores.masked_fill(~mask.unsqueeze(0), float("-inf"))
+    attn = torch.softmax(scores, dim=-1)
+    out = torch.einsum("hql,hld->hqd", attn, fv)  # (n_heads, Q, head_dim)
+    cache.update(layer_idx, offset, k, v, query_len=q_len)
+    return out
+
+
+def _ring_chunk_attention_writefirst(cache, layer_idx, q, k, v, offset, window_size):
+    """One chunk of sliding attention through the write-before-read ring path.
+
+    Mirrors the target's ``main``/decode graph (``prefill_mode=False``):
+    update_and_fetch writes the chunk into the ring and returns the whole
+    ``capacity`` window, then attention runs with ring_window_causal_mask. This
+    is cheaper (no per-step window copy) but only correct for ``query_len == 1``;
+    a multi-token chunk written after the ring is full evicts the oldest
+    ``query_len - 1`` in-window positions before its earliest queries read them.
+    q is (n_heads, Q, head_dim); k, v are (1, n_kv, Q, head_dim).
+    """
+    q_len = q.shape[1]
+    head_dim = q.shape[-1]
+    scale = 1.0 / math.sqrt(head_dim)
+    full_k, full_v = cache.update_and_fetch(layer_idx, offset, k, v, query_len=q_len)
+    mask = ring_window_causal_mask(
+        query_len=q_len,
+        capacity=cache.capacity(),
+        offset=offset,
+        window_size=window_size,
+        device="cpu",
+    )  # (Q, cap)
+    fk = full_k[0]  # (n_kv, cap, head_dim)
+    fv = full_v[0]
+    scores = torch.einsum("hqd,hld->hql", q, fk) * scale  # (n_heads, Q, cap)
+    scores = scores.masked_fill(~mask.unsqueeze(0), float("-inf"))
+    attn = torch.softmax(scores, dim=-1)
+    out = torch.einsum("hql,hld->hqd", attn, fv)  # (n_heads, Q, head_dim)
+    return out
+
+
+class TestRingConcatOracleParity:
+    """Independent brute-force sliding-window oracle for the ring cache primitive.
+
+    TestConcatWindowAttention trusts token-by-token decode as its reference.
+    This trusts nothing produced by the ring: it recomputes each query's
+    attention over the true last-``window`` positions from a full K/V log
+    (_sliding_window_oracle) and compares the ring path against it. The bug the
+    fix addresses only appears for a multi-token chunk (query_len > 1) written
+    after the ring is full (offset >= window), so these cases target exactly
+    that, including a chunk whose read window straddles the physical wrap.
+
+    On the write-first path this test would fail: at query_len > 1 the chunk's
+    own K/V overwrites the oldest query_len - 1 in-window positions before the
+    chunk's earliest queries read them.
+    """
+
+    WINDOW = 8
+    HEAD_DIM = 4
+    N_HEADS = 2  # == n_kv, so the oracle stays exact (no GQA broadcast)
+
+    def _run(self, prefill_schedule, chunk_len, seed):
+        """Prefill with the given chunk sizes, then attend one chunk_len chunk.
+
+        prefill_schedule is the list of chunk sizes used to fill positions
+        ``[0, sum(schedule))`` into the ring; each must satisfy the no-wrap
+        write rule. Returns max abs diff between the ring path and the oracle
+        for the chunk written at offset == sum(schedule).
+        """
+        window, head_dim, n_heads = self.WINDOW, self.HEAD_DIM, self.N_HEADS
+        offset = sum(prefill_schedule)
+        total = offset + chunk_len
+        torch.manual_seed(seed)
+        k_log = torch.randn(n_heads, total, head_dim)
+        v_log = torch.randn(n_heads, total, head_dim)
+        q_log = torch.randn(n_heads, total, head_dim)
+
+        cache = RingKVCache(
+            torch.zeros(1, 1, n_heads, window, head_dim),
+            torch.zeros(1, 1, n_heads, window, head_dim),
+        )
+        start = 0
+        for size in prefill_schedule:
+            k = k_log[:, start : start + size, :].unsqueeze(0)
+            v = v_log[:, start : start + size, :].unsqueeze(0)
+            cache.update(0, start, k, v, query_len=size)
+            start += size
+
+        q = q_log[:, offset:total, :]
+        k = k_log[:, offset:total, :].unsqueeze(0)
+        v = v_log[:, offset:total, :].unsqueeze(0)
+        ring_out = _ring_chunk_attention(cache, 0, q, k, v, offset, window)
+        oracle_out = _sliding_window_oracle(q, k_log, v_log, offset, window)
+        return (ring_out - oracle_out).abs().max().item()
+
+    def test_decode_control_matches_oracle(self):
+        """query_len == 1 after the ring is full: passing control on both paths."""
+        # Prefill 16 into an 8-slot ring (two full wraps), then a single query.
+        diff = self._run(prefill_schedule=[8, 8], chunk_len=1, seed=1)
+        assert diff < 1e-5, f"decode control diverges from oracle: {diff}"
+
+    def test_full_chunk_after_wrap_matches_oracle(self):
+        """A window-sized chunk written after the ring is full (offset >= window).
+
+        Ring holds positions [8, 15]; the chunk's queries at 16..23 each need
+        in-window positions the write-first path would have already destroyed.
+        """
+        diff = self._run(prefill_schedule=[8, 8], chunk_len=self.WINDOW, seed=2)
+        assert diff < 1e-5, f"post-wrap chunk diverges from oracle: {diff}"
+
+    def test_chunk_straddling_physical_wrap_matches_oracle(self):
+        """A chunk whose read window spans the physical wrap of the ring slots.
+
+        Prefill 8 then 4 leaves the ring physically rotated: slots 0..3 hold
+        positions 8..11, slots 4..7 hold 4..7. The chunk at offset 12 (Q=4)
+        writes slots 4..7, and each query's last-8-position window straddles the
+        slot-0 wrap, so the mask's slot-position reconstruction is exercised.
+        """
+        diff = self._run(prefill_schedule=[8, 4], chunk_len=4, seed=3)
+        assert diff < 1e-5, f"wrap-straddling chunk diverges from oracle: {diff}"
+
+    @pytest.mark.parametrize("chunk_len", [2, 3, 4])
+    def test_partial_chunks_after_wrap_match_oracle(self, chunk_len):
+        """Multi-token chunks of varied size, all written after the ring fills."""
+        # offset = 16 (two wraps), write_start = 0 so chunk_len <= window never wraps.
+        diff = self._run(prefill_schedule=[8, 8], chunk_len=chunk_len, seed=4 + chunk_len)
+        assert diff < 1e-5, f"chunk_len={chunk_len} diverges from oracle: {diff}"
+
+
+def _write_index_ancestry_targets(exported_program, write_dim_arg_name):
+    """Collect the call_function targets feeding a write node's begin index.
+
+    Walks the exported graph backwards from the node whose output name is
+    ``write_dim_arg_name`` (the ``begin`` bounds of the ring write) and returns
+    the set of op targets (as strings) that produce it, plus the set of
+    placeholder names it depends on.
+    """
+    name_to_node = {n.name: n for n in exported_program.graph.nodes}
+
+    def ancestors(name, seen):
+        if name in seen or name not in name_to_node:
+            return seen
+        seen.add(name)
+        for inp in name_to_node[name].all_input_nodes:
+            ancestors(inp.name, seen)
+        return seen
+
+    anc = ancestors(write_dim_arg_name, set())
+    targets = {str(name_to_node[a].target) for a in anc if name_to_node[a].op == "call_function"}
+    placeholders = {a for a in anc if name_to_node[a].op == "placeholder"}
+    return targets, placeholders
+
+
+class TestConcatWriteIndexIsShapeSymint:
+    """The ring write index must stay a shape symint, never a runtime data tensor.
+
+    The concat path derives its ring write column from ``offset % capacity`` where
+    ``offset = seq_len - query_len`` is a shape-derived symint. This must never
+    collapse into an index read out of tensor *data*: the underlying
+    slice_update kernel crashes on the GPU backend when its write column comes
+    from a runtime data tensor rather than from a shape symint. This test pins
+    that property on the exported graph so a future refactor cannot silently
+    reintroduce a data-dependent write index.
+    """
+
+    def _export_concat_update(self):
+        capacity, n_kv, head_dim, query_len = 8, 1, 4, 4
+
+        class _ConcatUpdate(torch.nn.Module):
+            def forward(self, k, v, k_cache, v_cache, position_ids):
+                seq_len = position_ids.shape[-1]
+                q_len = k.shape[-2]
+                torch._check_is_size(seq_len)
+                torch._check_is_size(q_len)
+                offset = seq_len - q_len  # shape symint, not a data value
+                torch._check_is_size(offset)
+                cache = RingKVCache(k_cache, v_cache)
+                full_k, full_v = cache.fetch_and_concat(0, k, v)
+                cache.update(0, offset, k, v, query_len=q_len)
+                return full_k + 0.0, full_v + 0.0
+
+        k = torch.zeros(1, n_kv, query_len, head_dim)
+        v = torch.zeros(1, n_kv, query_len, head_dim)
+        k_cache = torch.zeros(1, 1, n_kv, capacity, head_dim)
+        v_cache = torch.zeros(1, 1, n_kv, capacity, head_dim)
+        position_ids = torch.arange(6, dtype=torch.int32)[None]  # seq_len dynamic
+
+        seq = torch.export.Dim("seq", min=query_len, max=capacity * 4)
+        dynamic_shapes = {
+            "k": None,
+            "v": None,
+            "k_cache": None,
+            "v_cache": None,
+            "position_ids": {1: seq},
+        }
+        return torch.export.export(
+            _ConcatUpdate(),
+            (k, v, k_cache, v_cache, position_ids),
+            dynamic_shapes=dynamic_shapes,
+        )
+
+    def test_write_index_derives_from_shape_not_data(self):
+        exported = self._export_concat_update()
+
+        write_nodes = [n for n in exported.graph.nodes if "mutable_slice_update" in str(n.target)]
+        assert write_nodes, "concat path produced no ring write (mutable_slice_update)"
+
+        for node in write_nodes:
+            begin_arg = node.args[2]  # (x, update, begin, end)
+            targets, _ = _write_index_ancestry_targets(exported, begin_arg.name)
+
+            # Shape-derived: the write column traces back to a tensor shape query.
+            assert any("sym_size" in t for t in targets), (
+                "ring write index must be derived from a shape symint "
+                f"(no sym_size op in its ancestry: {sorted(targets)})"
+            )
+            # Not data-derived: nothing pulls a value out of a tensor to index with.
+            # A data-tensor write index makes the slice_update kernel crash.
+            data_ops = [t for t in targets if "_local_scalar_dense" in t or ".item" in t]
+            assert not data_ops, (
+                "ring write index must be a shape symint, not a runtime data "
+                f"tensor, or the slice_update kernel crashes; found {data_ops}"
+            )
+
+
+class TestGuardedPathSelection:
+    """Pin the write-first correctness boundary the Swift guard relies on.
+
+    Muse's decode (``main``) graph is write-before-read: correct at query_len == 1
+    but WRONG for query_len > 1 after the ring wraps -- the regime the engine's
+    guard refuses. (Concat correctness is covered by TestRingConcatOracleParity.)
+    """
+
+    WINDOW = 8
+    HEAD_DIM = 4
+    N_HEADS = 2  # == n_kv, so the oracle stays exact (no GQA broadcast)
+
+    def _prefill_full_ring(self, seed, chunk_len):
+        """Fill the ring with two full wraps, then stage one chunk at offset=2W."""
+        window, head_dim, n_heads = self.WINDOW, self.HEAD_DIM, self.N_HEADS
+        offset = 2 * window  # two full wraps -> ring is full, every slot live
+        total = offset + chunk_len
+        torch.manual_seed(seed)
+        k_log = torch.randn(n_heads, total, head_dim)
+        v_log = torch.randn(n_heads, total, head_dim)
+        q_log = torch.randn(n_heads, total, head_dim)
+
+        cache = RingKVCache(
+            torch.zeros(1, 1, n_heads, window, head_dim),
+            torch.zeros(1, 1, n_heads, window, head_dim),
+        )
+        for start in (0, window):
+            k = k_log[:, start : start + window, :].unsqueeze(0)
+            v = v_log[:, start : start + window, :].unsqueeze(0)
+            cache.update(0, start, k, v, query_len=window)
+
+        q = q_log[:, offset:total, :]
+        k = k_log[:, offset:total, :].unsqueeze(0)
+        v = v_log[:, offset:total, :].unsqueeze(0)
+        oracle = _sliding_window_oracle(q, k_log, v_log, offset, window)
+        return cache, q, k, v, offset, oracle
+
+    def test_write_first_matches_oracle_at_decode(self):
+        """query_len == 1: the write-first path (main graph) is correct."""
+        cache, q, k, v, offset, oracle = self._prefill_full_ring(seed=1, chunk_len=1)
+        out = _ring_chunk_attention_writefirst(cache, 0, q, k, v, offset, self.WINDOW)
+        diff = (out - oracle).abs().max().item()
+        assert diff < 1e-5, f"write-first decode diverges from oracle: {diff}"
+
+    @pytest.mark.parametrize("chunk_len", [2, 4, 8])
+    def test_write_first_diverges_for_multitoken_after_wrap(self, chunk_len):
+        """query_len > 1 after wrap: write-first is WRONG (must not match oracle).
+
+        This is the silent corruption the Swift guard exists to prevent: sending
+        a multi-token chunk through the write-first ``main`` graph evicts
+        still-needed history. The guard throws instead of producing this.
+        """
+        cache, q, k, v, offset, oracle = self._prefill_full_ring(seed=7, chunk_len=chunk_len)
+        out = _ring_chunk_attention_writefirst(cache, 0, q, k, v, offset, self.WINDOW)
+        diff = (out - oracle).abs().max().item()
+        assert diff > 1e-2, (
+            f"write-first should diverge from oracle for query_len={chunk_len} "
+            f"after wrap, but diff={diff} (bug would be silent)"
+        )

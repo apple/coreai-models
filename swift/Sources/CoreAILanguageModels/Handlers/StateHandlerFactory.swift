@@ -27,6 +27,8 @@ struct SyncStateHandlerSet {
     /// True when ALL states are sliding caches (ring buffer model).
     /// The engine uses compact position_ids [offset, ..., offset+queryLen-1] instead of [0, ..., N-1].
     var isAllSlidingCache: Bool
+    /// True when any state is a sliding (ring) cache (hybrid or pure-ring).
+    var hasSlidingCache: Bool
 }
 
 /// Creates state handlers from a model's function descriptor.
@@ -169,7 +171,8 @@ enum StateHandlerFactory {
             kvCache: kvCache,
             additionalStates: additionalStates,
             hasNonTruncatableStates: hasNonTruncatable,
-            isAllSlidingCache: classified.allSatisfy { $0.kind == .slidingCache }
+            isAllSlidingCache: classified.allSatisfy { $0.kind == .slidingCache },
+            hasSlidingCache: classified.contains { $0.kind == .slidingCache }
         )
     }
 }

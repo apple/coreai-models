@@ -13,6 +13,9 @@ Architecture:
 - No gated attention, no sandwich norms
 - Shares embed_tokens and lm_head with the target model
 - Ring buffer KV cache with explicit attention mask
+
+Sliding attention reads before writing (concat), so a multi-token chunk can't
+evict window history it still needs.
 """
 
 import gc
@@ -38,7 +41,7 @@ from coreai_models.models.base import (
     _load_tensors_for_keys,
     _resolve_safetensors_files,
 )
-from coreai_models.primitives.macos.cache import RingKVCache, ring_window_causal_mask
+from coreai_models.primitives.macos.cache import RingKVCache, concat_window_causal_mask
 from coreai_models.primitives.macos.mlp import MLP
 from coreai_models.primitives.macos.rms_norm import RMSNorm
 from coreai_models.primitives.macos.rope import RoPE
@@ -111,15 +114,20 @@ class Attention(nn.Module):
         key = self.rope(key, position_ids=rope_positions, freqs=freqs)
 
         if cache is not None:
-            key, value = cache.update_and_fetch(
-                self.layer_idx, offset, key, value, query_len=query_len
-            )
+            # Read before write (concat), else a multi-token chunk garbles output.
+            attn_key, attn_value = cache.fetch_and_concat(self.layer_idx, key, value)
+        else:
+            attn_key, attn_value = key, value
 
         attn_output = (
-            self.sdpa(query=query, key=key, value=value, attn_mask=attn_mask)
+            self.sdpa(query=query, key=attn_key, value=attn_value, attn_mask=attn_mask)
             .permute(0, 2, 1, 3)
             .reshape(batch_size, query_len, self.n_heads * self.head_dim)
         )
+
+        if cache is not None:
+            cache.update(self.layer_idx, offset, key, value, query_len=query_len)
+
         return self.o_proj(attn_output)
 
 
@@ -175,7 +183,9 @@ class DrafterRingModel(nn.Module):
         h = h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + self.config.rms_norm_eps)
 
         if cache is not None:
-            attn_mask = ring_window_causal_mask(
+            # Drafter is always multi-token (one main graph, no decode split), so
+            # it stays on the read-before-write concat path.
+            attn_mask = concat_window_causal_mask(
                 query_len=query_len,
                 capacity=cache.capacity(),
                 offset=offset,

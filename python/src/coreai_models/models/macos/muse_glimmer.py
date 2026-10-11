@@ -18,6 +18,10 @@ Meta's 30B on-device agentic model (Apache 2.0). Architecture features:
 KV cache: split into sliding (ring buffer, fixed size) and global (growing).
 Sliding layers use RingKVCache at window_size capacity; global layers use
 standard KVCache with dynamic sequence length.
+
+Sliding attention is guarded by ``prefill_mode``: prefill reads before writing
+(concat, correct for any query_len); decode writes first (fast, query_len == 1
+only -- the Swift engine rejects query_len > 1 on this path).
 """
 
 import gc
@@ -44,11 +48,36 @@ from coreai_models.models.base import (
     _load_tensors_for_keys,
     _resolve_safetensors_files,
 )
-from coreai_models.primitives.macos.cache import KVCache, RingKVCache, ring_window_causal_mask
+from coreai_models.primitives.macos.cache import (
+    KVCache,
+    RingKVCache,
+    concat_window_causal_mask,
+    ring_window_causal_mask,
+)
 from coreai_models.primitives.macos.mlp import MLP
 from coreai_models.primitives.macos.rms_norm import RMSNorm, RMSNormPlusOne
 from coreai_models.primitives.macos.rope import RoPE
 from coreai_models.primitives.macos.sdpa import SDPA
+
+
+def _sliding_window_mask(
+    prefill_mode: bool,
+    query_len: int,
+    capacity: int,
+    offset: int,
+    window_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Pick the sliding-window mask that matches the ring access pattern.
+
+    ``prefill_mode`` picks the matching pair: prefill uses fetch_and_concat +
+    concat_window_causal_mask (correct after the ring wraps); decode uses
+    update_and_fetch + ring_window_causal_mask (cheaper, query_len == 1 only,
+    Swift guards query_len > 1). Resolved at trace time.
+    """
+    if prefill_mode:
+        return concat_window_causal_mask(query_len, capacity, offset, window_size, device)
+    return ring_window_causal_mask(query_len, capacity, offset, window_size, device)
 
 
 class Attention(nn.Module):
@@ -99,6 +128,7 @@ class Attention(nn.Module):
         global_cache: KVCache | None = None,
         sliding_kv_cache: RingKVCache | None = None,
         sliding_mask: torch.Tensor | None = None,
+        prefill_mode: bool = False,
     ) -> torch.Tensor:
         batch_size = x.shape[0]
         n_heads, n_kv_heads = self.n_heads, self.n_kv_heads
@@ -132,10 +162,27 @@ class Attention(nn.Module):
             key = self.rope(key, position_ids=rope_positions, freqs=freqs)
 
         if self.is_sliding and sliding_kv_cache is not None:
-            key, value = sliding_kv_cache.update_and_fetch(
-                self.cache_slot_idx, offset, key, value, query_len=query_len
-            )
-            attn_output = self.sdpa(query=query, key=key, value=value, attn_mask=sliding_mask)
+            if prefill_mode:
+                # Prefill: read before write (concat) -- writing first would
+                # corrupt a multi-token chunk that still needs the evicted history.
+                full_key, full_value = sliding_kv_cache.fetch_and_concat(
+                    self.cache_slot_idx, key, value
+                )
+                attn_output = self.sdpa(
+                    query=query, key=full_key, value=full_value, attn_mask=sliding_mask
+                )
+                sliding_kv_cache.update(
+                    self.cache_slot_idx, offset, key, value, query_len=query_len
+                )
+            else:
+                # Decode: write first (cheaper). Correct for query_len == 1 only;
+                # Swift rejects query_len > 1 on this path.
+                full_key, full_value = sliding_kv_cache.update_and_fetch(
+                    self.cache_slot_idx, offset, key, value, query_len=query_len
+                )
+                attn_output = self.sdpa(
+                    query=query, key=full_key, value=full_value, attn_mask=sliding_mask
+                )
         elif not self.is_sliding and global_cache is not None:
             key, value = global_cache.update_and_fetch(
                 self.cache_slot_idx, offset, key, value, seq_len=seq_len, query_len=query_len
@@ -173,6 +220,7 @@ class TransformerBlock(nn.Module):
         global_cache: KVCache | None = None,
         sliding_kv_cache: RingKVCache | None = None,
         sliding_mask: torch.Tensor | None = None,
+        prefill_mode: bool = False,
     ) -> torch.Tensor:
         r = self.self_attn(
             self.input_layernorm(x),
@@ -182,6 +230,7 @@ class TransformerBlock(nn.Module):
             global_cache,
             sliding_kv_cache,
             sliding_mask,
+            prefill_mode,
         )
         r = self.post_attention_layernorm(r)
         h = x + r
@@ -222,6 +271,7 @@ class MuseGlimmerModel(nn.Module):
         position_ids: torch.IntTensor,
         global_cache: KVCache | None = None,
         sliding_kv_cache: RingKVCache | None = None,
+        prefill_mode: bool = False,
     ) -> torch.Tensor:
         query_len = input_ids.shape[-1]
         seq_len = position_ids.shape[-1]
@@ -235,7 +285,8 @@ class MuseGlimmerModel(nn.Module):
 
         sliding_mask = None
         if sliding_kv_cache is not None:
-            sliding_mask = ring_window_causal_mask(
+            sliding_mask = _sliding_window_mask(
+                prefill_mode,
                 query_len,
                 sliding_kv_cache.capacity(),
                 offset,
@@ -252,6 +303,7 @@ class MuseGlimmerModel(nn.Module):
                 global_cache,
                 sliding_kv_cache,
                 sliding_mask,
+                prefill_mode,
             )
         h = self.norm(h)
         h = h * self.output_multiplier
@@ -411,7 +463,9 @@ class MuseGlimmerForCausalLM(BaseForCausalLM):
     ) -> torch.Tensor | tuple:
         global_cache = KVCache(global_k_cache, global_v_cache)
         sliding_kv_cache = RingKVCache(sliding_k_cache, sliding_v_cache)
-        out = self.model(input_ids, position_ids, global_cache, sliding_kv_cache)
+        out = self.model(
+            input_ids, position_ids, global_cache, sliding_kv_cache, prefill_mode=self.prefill_mode
+        )
         if self.prefill_mode:
             return ()
         logits = self.lm_head(out)
@@ -577,6 +631,7 @@ class MuseGlimmerModelWithDrafter(MuseGlimmerModel):
         position_ids: torch.IntTensor,
         global_cache: KVCache | None = None,
         sliding_cache: RingKVCache | None = None,
+        prefill_mode: bool = False,
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         query_len = input_ids.shape[-1]
         seq_len = position_ids.shape[-1]
@@ -590,7 +645,8 @@ class MuseGlimmerModelWithDrafter(MuseGlimmerModel):
 
         sliding_mask = None
         if sliding_cache is not None:
-            sliding_mask = ring_window_causal_mask(
+            sliding_mask = _sliding_window_mask(
+                prefill_mode,
                 query_len,
                 sliding_cache.capacity(),
                 offset,
@@ -609,6 +665,7 @@ class MuseGlimmerModelWithDrafter(MuseGlimmerModel):
                 global_cache,
                 sliding_cache,
                 sliding_mask,
+                prefill_mode,
             )
             if idx in self._tap_set:
                 extracted.append(h)
@@ -648,7 +705,9 @@ class MuseGlimmerForCausalLMWithDrafter(MuseGlimmerForCausalLM):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         global_cache = KVCache(global_k_cache, global_v_cache)
         sliding_cache = RingKVCache(sliding_k_cache, sliding_v_cache)
-        hidden, extracted = self.model(input_ids, position_ids, global_cache, sliding_cache)
+        hidden, extracted = self.model(
+            input_ids, position_ids, global_cache, sliding_cache, prefill_mode=self.prefill_mode
+        )
 
         logits = self.lm_head(hidden)
         if self._softcap:
