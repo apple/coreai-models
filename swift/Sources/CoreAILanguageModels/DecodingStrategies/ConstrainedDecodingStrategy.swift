@@ -168,8 +168,10 @@ public struct ConstrainedDecodingStrategy: DecodingStrategy {
         let fullDecodedText = tokenizer.decode(tokens: generatedTokens.map { Int($0) })
         decodeSpan.end()
 
-        let common = fullDecodedText.commonPrefix(with: previousDecodedText)
-        let delta = String(fullDecodedText.dropFirst(common.count))
+        // Compare Unicode scalars: a Character-wise prefix re-emits the grapheme a token extends.
+        let fullScalars = fullDecodedText.unicodeScalars
+        let common = zip(fullScalars, previousDecodedText.unicodeScalars).prefix(while: { $0 == $1 }).count
+        let delta = String(String.UnicodeScalarView(fullScalars.dropFirst(common)))
 
         if delta.unicodeScalars.contains(where: { $0 == "\u{FFFD}" }) {
             return ""

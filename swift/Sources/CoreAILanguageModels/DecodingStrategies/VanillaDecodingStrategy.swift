@@ -192,9 +192,13 @@ extension VanillaDecodingStrategy.VanillaDecodedSequence {
                 let safeEnd = VanillaDecodingStrategy.safeUTF8Prefix(of: fullDecode)
                 let emittable = String(fullDecode[fullDecode.startIndex..<safeEnd])
 
+                // Compare Unicode scalars, not Characters: a token that merges into the previous grapheme
+                // (ZWJ emoji, combining marks, Indic vowel signs) leaves the Character count unchanged.
+                let emittedScalars = emittable.unicodeScalars
+                let pendingScalars = pendingText.unicodeScalars
                 let newText: String
-                if emittable.count > pendingText.count, emittable.hasPrefix(pendingText) {
-                    newText = String(emittable.dropFirst(pendingText.count))
+                if emittedScalars.count > pendingScalars.count, emittedScalars.starts(with: pendingScalars) {
+                    newText = String(String.UnicodeScalarView(emittedScalars.dropFirst(pendingScalars.count)))
                     pendingText = emittable
                 } else if emittable != pendingText {
                     newText = emittable
@@ -273,8 +277,10 @@ extension VanillaDecodingStrategy.VanillaDecodedSequence {
 
             let finalDecode = tokenizer.decode(tokens: newlyGeneratedTokens)
             let trailing: GenerationResult?
-            if finalDecode.count > pendingText.count, finalDecode.hasPrefix(pendingText) {
-                let remaining = String(finalDecode.dropFirst(pendingText.count))
+            let finalScalars = finalDecode.unicodeScalars
+            let pendingScalars = pendingText.unicodeScalars
+            if finalScalars.count > pendingScalars.count, finalScalars.starts(with: pendingScalars) {
+                let remaining = String(String.UnicodeScalarView(finalScalars.dropFirst(pendingScalars.count)))
                 trailing =
                     remaining.isEmpty
                     ? nil
