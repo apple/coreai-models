@@ -74,6 +74,31 @@ func prefillChunkSizes(
     return sizes
 }
 
+/// Step sizes for running `tokenCount` tokens through the write-first `main` graph.
+///
+/// With a sliding ring of `ringCapacity` slots, a multi-token step on `main` is only correct
+/// while it ends inside the ring (see `StateHandlerFactory.writeFirstStepEvicts`), so steps are
+/// chunks up to the ring's end and single tokens past it. Without a ring this is the plain
+/// chunk walk.
+func mainGraphStepSizes(
+    tokenCount: Int, chunkSize: Int, startOffset: Int = 0, ringCapacity: Int? = nil
+) -> [Int] {
+    guard let ring = ringCapacity, ring > 0 else {
+        return prefillChunkSizes(tokenCount: tokenCount, chunkSize: chunkSize, heldBack: 0)
+    }
+    let width = max(1, chunkSize)
+    var remaining = max(0, tokenCount)
+    var position = max(0, startOffset)
+    var sizes: [Int] = []
+    while remaining > 0 {
+        let step = position < ring ? min(width, remaining, ring - position) : 1
+        sizes.append(step)
+        remaining -= step
+        position += step
+    }
+    return sizes
+}
+
 // MARK: - Loading
 
 /// Check a prefill descriptor against `main`, throwing if it can't be bound the same way.

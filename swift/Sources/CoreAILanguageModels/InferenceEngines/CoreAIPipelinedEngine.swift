@@ -1310,7 +1310,11 @@ private struct EngineImpl: ~Copyable {
 
         // Prefill prompt (unconstrained -- grammar doesn't constrain the prompt)
         let prefillTokens: [Int32]
-        if case .chunk(let threshold, _) = inputLayout.prefillPolicy,
+        if slidingRingCapacity != nil {
+            // Ring models take the plain prefill path, which never runs a multi-token
+            // write-first step past the ring.
+            prefillTokens = Array(try await prefill(prompt: prompt))
+        } else if case .chunk(let threshold, _) = inputLayout.prefillPolicy,
             prompt.count > threshold
         {
             let remaining = try await processChunkedInput(tokens: prompt)
@@ -1385,10 +1389,20 @@ private struct EngineImpl: ~Copyable {
                 if case .terminated = postJumpMask { break }
                 let applyMaskAfterJump = postJumpMask == .constrained
 
+                // Only the last token's logits are sampled, so a step that would evict ring
+                // history can prefill the rest first.
+                var jumpStep = [lastToken] + jumpTokens
+                if let ring = slidingRingCapacity,
+                    StateHandlerFactory.writeFirstStepEvicts(
+                        offset: processedTokenCount, queryLength: jumpStep.count, ringCapacity: ring)
+                {
+                    jumpStep = Array(try await prefill(prompt: jumpStep))
+                }
+
                 lastToken = try await withCheckedThrowingContinuation { cont in
                     do {
                         try _encodeStepForConstrainedGeneration(
-                            tokens: [lastToken] + jumpTokens,
+                            tokens: jumpStep,
                             gpuSampler: gpuSampler,
                             applyBitmask: applyMaskAfterJump
                         ) { token, error in
@@ -1659,6 +1673,20 @@ private struct EngineImpl: ~Copyable {
             return prompt.suffix(1)
         }
 
+        if let ring = slidingRingCapacity {
+            // `function` writes the ring before attending: no multi-token step past the ring.
+            let plan = mainGraphStepSizes(
+                tokenCount: prompt.count, chunkSize: prefillChunkSize,
+                startOffset: processedTokenCount, ringCapacity: ring)
+            try logits.ensureCapacity(forContextLength: plan.max() ?? 1)
+            var remaining = prompt[...]
+            for size in plan.dropLast() {
+                try await _encodeChunk(tokens: Array(remaining.prefix(size)))
+                remaining = remaining.dropFirst(size)
+            }
+            return remaining
+        }
+
         if case .chunk(let threshold, _) = inputLayout.prefillPolicy,
             prompt.count > threshold
         {
@@ -1675,13 +1703,14 @@ private struct EngineImpl: ~Copyable {
         return prompt[...]
     }
 
+    /// Chunk size for prefill through `function`.
+    private var prefillChunkSize: Int {
+        if case .chunk(_, let cs) = inputLayout.prefillPolicy { return cs }
+        return config.prefillChunkSize
+    }
+
     mutating func processChunkedInput(tokens: [Int32]) async throws -> ArraySlice<Int32> {
-        let chunkSize: Int
-        if case .chunk(_, let cs) = inputLayout.prefillPolicy {
-            chunkSize = cs
-        } else {
-            chunkSize = config.prefillChunkSize
-        }
+        let chunkSize = prefillChunkSize
         var remainingTokens = tokens[...]
 
         try logits.ensureCapacity(forContextLength: chunkSize)

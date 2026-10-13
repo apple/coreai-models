@@ -164,6 +164,43 @@ struct WriteFirstGuardTests {
             try StateHandlerFactory.checkWriteFirstStep(offset: 480, queryLength: 64, ringCapacity: 512)
         }
     }
+
+    @Test("write-first steps fill up to the ring, then go one token at a time")
+    func writeFirstStepSizes() {
+        #expect(
+            mainGraphStepSizes(tokenCount: 1300, chunkSize: 512, startOffset: 0, ringCapacity: 1024)
+                == [512, 512] + Array(repeating: 1, count: 276))
+        // Turn 2 starting mid-ring: the first step stops at the ring's last slot.
+        #expect(
+            mainGraphStepSizes(tokenCount: 10, chunkSize: 512, startOffset: 1020, ringCapacity: 1024)
+                == [4, 1, 1, 1, 1, 1, 1])
+        #expect(
+            mainGraphStepSizes(tokenCount: 3, chunkSize: 512, startOffset: 4096, ringCapacity: 1024) == [1, 1, 1])
+        #expect(
+            mainGraphStepSizes(tokenCount: 0, chunkSize: 512, startOffset: 0, ringCapacity: 1024) == [])
+    }
+
+    @Test("write-first chunk plan never trips the guard")
+    func writeFirstStepSizesPassGuard() {
+        let ring = 64
+        for start in [0, 1, 31, 63, 64, 65, 200] {
+            for count in [1, 2, 63, 64, 65, 130] {
+                for chunk in [1, 7, 64, 100] {
+                    let plan = mainGraphStepSizes(
+                        tokenCount: count, chunkSize: chunk, startOffset: start, ringCapacity: ring)
+                    #expect(plan.reduce(0, +) == count)
+                    var position = start
+                    for size in plan {
+                        #expect(size <= chunk)
+                        #expect(
+                            !StateHandlerFactory.writeFirstStepEvicts(
+                                offset: position, queryLength: size, ringCapacity: ring))
+                        position += size
+                    }
+                }
+            }
+        }
+    }
 }
 
 // MARK: - Protocol Conformance Tests

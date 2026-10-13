@@ -51,6 +51,9 @@ public final class CoreAISequentialEngine: InferenceEngine, IdempotentEngine, @u
     // break at ring boundaries so no single ring write runs past the last slot.
     private let slidingRingCapacity: Int?
 
+    // Whether the single-token fallback past the ring has been logged (see `runMainSteps`).
+    private var loggedRingSingleSteps = false
+
     // I/O names from descriptor
     private let logitsName: String
 
@@ -329,6 +332,14 @@ public final class CoreAISequentialEngine: InferenceEngine, IdempotentEngine, @u
         // held back and the trailing chunk carries the logits.
         let heldBack = prefillHeldBackTokens(hasPrefillGraph: prefillFunction != nil)
 
+        // Without a prefill graph every chunk runs on write-first `main`; past a sliding ring
+        // only single-token steps are correct there.
+        if prefillFunction == nil, slidingRingCapacity != nil {
+            let logits = try await runMainSteps(
+                tokens, chunkSize: chunkSize, keepAllLogits: false, sessionState: sessionState)
+            return lastTokenLogits(from: logits, vocabSize: config.vocabSize)
+        }
+
         let chunkSignpost = InstrumentsProfiler.beginCustomInterval(
             name: "CoreAIClean Chunked Prefill",
             details: "\(tokens.count) tokens, chunkSize \(chunkSize)"
@@ -365,21 +376,44 @@ public final class CoreAISequentialEngine: InferenceEngine, IdempotentEngine, @u
         chunkSize: Int,
         sessionState: GenerationSessionState
     ) async throws -> [LogitsScalarType] {
-        var allLogits: [LogitsScalarType] = []
-        var remainingTokens = tokens
+        try await runMainSteps(tokens, chunkSize: chunkSize, keepAllLogits: true, sessionState: sessionState)
+    }
 
-        for size in prefillChunkSizes(
-            tokenCount: tokens.count, chunkSize: chunkSize, heldBack: 0,
-            startOffset: sessionState.processedTokenCount, ringCapacity: slidingRingCapacity)
+    /// Run `tokens` through `main` in steps from `mainGraphStepSizes`, returning every
+    /// position's logits (`keepAllLogits`) or just the last step's.
+    private func runMainSteps(
+        _ tokens: ArraySlice<Int32>,
+        chunkSize: Int,
+        keepAllLogits: Bool,
+        sessionState: GenerationSessionState
+    ) async throws -> [LogitsScalarType] {
+        let startOffset = sessionState.processedTokenCount
+        if let ring = slidingRingCapacity, chunkSize > 1, startOffset + tokens.count > ring,
+            !loggedRingSingleSteps
         {
-            let chunkEnd = remainingTokens.startIndex + size
-            let chunk = remainingTokens[remainingTokens.startIndex..<chunkEnd]
-            let chunkLogits = try await processTokenBatch(chunk, sessionState: sessionState)
-            allLogits.append(contentsOf: chunkLogits)
-            remainingTokens = remainingTokens[chunkEnd...]
+            loggedRingSingleSteps = true
+            CLILogger.log(
+                "Sliding-window model: positions past the \(ring)-slot ring run one token per "
+                    + "step on 'main' to keep logits correct (slower)")
         }
 
-        return allLogits
+        var logits: [LogitsScalarType] = []
+        var remaining = tokens
+        for size in mainGraphStepSizes(
+            tokenCount: tokens.count, chunkSize: chunkSize, startOffset: startOffset,
+            ringCapacity: slidingRingCapacity)
+        {
+            let end = remaining.startIndex + size
+            let stepLogits = try await processTokenBatch(
+                remaining[remaining.startIndex..<end], sessionState: sessionState)
+            if keepAllLogits {
+                logits.append(contentsOf: stepLogits)
+            } else {
+                logits = stepLogits
+            }
+            remaining = remaining[end...]
+        }
+        return logits
     }
 
     // MARK: - Generate (primary API)
@@ -679,8 +713,8 @@ extension CoreAISequentialEngine.GenerationSequence {
                     allLogits = try await engine.processChunkedPromptAllLogits(
                         tokens: allTokens[...], chunkSize: chunkSize, sessionState: sessionState)
                 case .wholeBatch:
-                    allLogits = try await engine.processTokenBatch(
-                        allTokens[...], sessionState: sessionState)
+                    allLogits = try await engine.processChunkedPromptAllLogits(
+                        tokens: allTokens[...], chunkSize: allTokens.count, sessionState: sessionState)
                 case .oneAtATime:
                     var collected: [LogitsScalarType] = []
                     for j in allTokens.indices {
@@ -734,8 +768,9 @@ extension CoreAISequentialEngine.GenerationSequence {
                     logitBuffer = try await engine.processChunkedPrompt(
                         tokens: newTokens, chunkSize: chunkSize, sessionState: sessionState)
                 case .wholeBatch:
-                    let allLogits = try await engine.processTokenBatch(
-                        newTokens, sessionState: sessionState)
+                    let allLogits = try await engine.runMainSteps(
+                        newTokens, chunkSize: newTokens.count, keepAllLogits: false,
+                        sessionState: sessionState)
                     logitBuffer = lastTokenLogits(from: allLogits, vocabSize: engine.config.vocabSize)
                 case .oneAtATime:
                     var lastLogits: [LogitsScalarType] = []

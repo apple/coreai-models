@@ -357,3 +357,52 @@ struct PrefillGraphTests {
         }
     }
 }
+
+@Suite("Main Graph Step Sizes")
+struct MainGraphStepSizesTests {
+    @Test("Without a ring, the plain chunk walk")
+    func noRing() {
+        #expect(mainGraphStepSizes(tokenCount: 5000, chunkSize: 2048) == [2048, 2048, 904])
+        #expect(mainGraphStepSizes(tokenCount: 5000, chunkSize: 2048, startOffset: 3000) == [2048, 2048, 904])
+    }
+
+    @Test("A prompt inside the ring keeps normal chunks")
+    func insideRing() {
+        #expect(mainGraphStepSizes(tokenCount: 1500, chunkSize: 512, ringCapacity: 2048) == [512, 512, 476])
+        #expect(mainGraphStepSizes(tokenCount: 2048, chunkSize: 4096, ringCapacity: 2048) == [2048])
+    }
+
+    @Test("Crossing the ring: chunks up to its end, then single tokens")
+    func crossingRing() {
+        #expect(
+            mainGraphStepSizes(tokenCount: 2051, chunkSize: 1024, ringCapacity: 2048)
+                == [1024, 1024, 1, 1, 1])
+        #expect(
+            mainGraphStepSizes(tokenCount: 10, chunkSize: 8, startOffset: 2044, ringCapacity: 2048)
+                == [4, 1, 1, 1, 1, 1, 1])
+    }
+
+    @Test("Starting past the ring: all single tokens")
+    func pastRing() {
+        #expect(
+            mainGraphStepSizes(tokenCount: 4, chunkSize: 512, startOffset: 3000, ringCapacity: 2048)
+                == [1, 1, 1, 1])
+    }
+
+    @Test("No step evicts, and the steps cover every token")
+    func invariant() {
+        for start in [0, 1, 2047, 2048, 5000] {
+            for count in [1, 2, 100, 3000] {
+                let steps = mainGraphStepSizes(
+                    tokenCount: count, chunkSize: 512, startOffset: start, ringCapacity: 2048)
+                #expect(steps.reduce(0, +) == count)
+                var offset = start
+                for q in steps {
+                    #expect(
+                        !StateHandlerFactory.writeFirstStepEvicts(offset: offset, queryLength: q, ringCapacity: 2048))
+                    offset += q
+                }
+            }
+        }
+    }
+}
