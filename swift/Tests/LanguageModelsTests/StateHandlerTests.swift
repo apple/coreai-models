@@ -203,6 +203,47 @@ struct WriteFirstGuardTests {
     }
 }
 
+@Suite("Sliding ring rewind Tests")
+struct RingRewindTests {
+    @Test("rewinds without a ring, before it wraps, or to 0 are safe")
+    func safeRewinds() {
+        #expect(StateHandlerFactory.ringRewindIsSafe(from: 5000, to: 10, ringCapacity: nil))
+        #expect(StateHandlerFactory.ringRewindIsSafe(from: 1024, to: 10, ringCapacity: 1024))
+        #expect(StateHandlerFactory.ringRewindIsSafe(from: 5000, to: 0, ringCapacity: 1024))
+    }
+
+    @Test("a one-token rewind after a wrap is safe")
+    func oneTokenRewind() {
+        // The `commonPrefix -= 1` re-feed rewrites the newest position in its own slot.
+        #expect(StateHandlerFactory.ringRewindIsSafe(from: 5000, to: 4999, ringCapacity: 1024))
+        #expect(StateHandlerFactory.ringRewindIsSafe(from: 5000, to: 5000, ringCapacity: 1024))
+    }
+
+    @Test("a longer rewind after a wrap is unsafe")
+    func wrappedRewind() {
+        #expect(!StateHandlerFactory.ringRewindIsSafe(from: 1025, to: 1023, ringCapacity: 1024))
+        #expect(!StateHandlerFactory.ringRewindIsSafe(from: 5000, to: 4998, ringCapacity: 1024))
+        #expect(!StateHandlerFactory.ringRewindIsSafe(from: 5000, to: 1, ringCapacity: 1024))
+    }
+
+    @Test("matches a slot-by-slot simulation")
+    func simulation() {
+        let ring = 8
+        for processed in 0...24 {
+            for target in 0...processed {
+                // Slot s holds the newest position p < processed with p % ring == s.
+                var slot = [Int](repeating: -1, count: ring)
+                for p in 0..<processed { slot[p % ring] = p }
+                // The query at `target` reads positions [target - ring + 1, target).
+                let readsOK = (max(0, target - ring + 1)..<target).allSatisfy { slot[$0 % ring] == $0 }
+                #expect(
+                    StateHandlerFactory.ringRewindIsSafe(from: processed, to: target, ringCapacity: ring)
+                        == readsOK, "processed=\(processed) target=\(target)")
+            }
+        }
+    }
+}
+
 // MARK: - Protocol Conformance Tests
 
 @Suite("StateHandler Conformance Tests")

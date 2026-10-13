@@ -203,6 +203,17 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
                         resolvedNewTokens = input[...]
                         commonPrefix = 0
                     }
+                } else if !StateHandlerFactory.ringRewindIsSafe(
+                    from: self.engine.processedTokenCount, to: commonPrefix,
+                    ringCapacity: self.engine.slidingRingCapacity)
+                {
+                    // The ring has overwritten slots the rewound position reads: replay.
+                    await self.engine.computeStream.currentWorkCompleted()
+                    self.engine.reset()
+                    self.history.clear()
+                    resolvedNewTokens = input[...]
+                    commonPrefix = 0
+                    self.lastPrefixHitCount = 0
                 } else if commonPrefix < self.engine.processedTokenCount {
                     // Pure extension — partial rewind (buffer phase preserved)
                     await self.engine.computeStream.currentWorkCompleted()
@@ -382,6 +393,15 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
             await engine.computeStream.currentWorkCompleted()
             guard tryAcquireEngine() else { return }
             defer { releaseEngine() }
+            guard
+                StateHandlerFactory.ringRewindIsSafe(
+                    from: engine.processedTokenCount, to: tokenIndex,
+                    ringCapacity: engine.slidingRingCapacity)
+            else {
+                throw InferenceRuntimeError.invalidState(
+                    "Partial reset past a wrapped sliding-window ring is not supported. "
+                        + "Use reset(to: 0) and replay the prefix.")
+            }
             engine.processedTokenCount = tokenIndex
             engine.step = tokenIndex
             history.truncate(to: tokenIndex)

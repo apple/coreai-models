@@ -461,6 +461,13 @@ public final class CoreAISequentialEngine: InferenceEngine, IdempotentEngine, @u
                 "Partial reset is not supported for hybrid models with recurrent state. "
                     + "Use reset(to: 0) and replay the prefix.")
         }
+        if !StateHandlerFactory.ringRewindIsSafe(
+            from: session.processedTokenCount, to: tokenIndex, ringCapacity: slidingRingCapacity)
+        {
+            throw InferenceRuntimeError.invalidState(
+                "Partial reset to \(tokenIndex) would read sliding-ring slots that have been "
+                    + "overwritten. Use reset(to: 0) and replay the prefix.")
+        }
         tokenBox.cancelActive()
         internalReset(to: tokenIndex, sessionState: session)
     }
@@ -530,7 +537,8 @@ extension CoreAISequentialEngine {
                 historyCount: sessionState.history.count,
                 processedTokenCount: sessionState.processedTokenCount,
                 inputCount: input.count,
-                hasNonTruncatableStates: sessionState.hasNonTruncatableStates
+                hasNonTruncatableStates: sessionState.hasNonTruncatableStates,
+                ringCapacity: slidingRingCapacity
             )
             if let resetTo = plan.resetTo {
                 internalReset(to: resetTo, sessionState: sessionState)
@@ -563,7 +571,8 @@ extension CoreAISequentialEngine {
         historyCount: Int,
         processedTokenCount: Int,
         inputCount: Int,
-        hasNonTruncatableStates: Bool
+        hasNonTruncatableStates: Bool,
+        ringCapacity: Int? = nil
     ) -> (resetTo: Int?, prefixHitCount: Int) {
         if hasNonTruncatableStates {
             // Hybrid model: recurrent state can't be partially rewound.
@@ -577,7 +586,15 @@ extension CoreAISequentialEngine {
             return (0, commonPrefix)
         } else if processedTokenCount >= inputCount {
             // Pure extension: all input tokens match history. Rewind for seeding.
-            return (Swift.max(0, commonPrefix - 1), commonPrefix)
+            let target = Swift.max(0, commonPrefix - 1)
+            guard
+                StateHandlerFactory.ringRewindIsSafe(
+                    from: processedTokenCount, to: target, ringCapacity: ringCapacity)
+            else {
+                // The ring has overwritten slots the rewound position reads: replay.
+                return (0, 0)
+            }
+            return (target, commonPrefix)
         } else {
             return (nil, commonPrefix)
         }

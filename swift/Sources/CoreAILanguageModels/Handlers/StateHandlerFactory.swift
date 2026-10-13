@@ -253,4 +253,16 @@ enum StateHandlerFactory {
                 + "write-first 'main' graph would evict ring history (capacity \(ringCapacity)). "
                 + "Past the ring, only single-token steps are correct on 'main'.")
     }
+
+    /// Whether rewinding from `processed` tokens to `target` leaves intact the ring slots the
+    /// query at `target` reads.
+    ///
+    /// After `processed` writes the ring holds positions `[processed - capacity, processed)`,
+    /// while the query at `target` reads `[target - capacity + 1, target)`. Slots for positions
+    /// below `processed - capacity` now hold later tokens, so the rewind is unsafe once the ring
+    /// has wrapped and the rewind spans two or more tokens.
+    static func ringRewindIsSafe(from processed: Int, to target: Int, ringCapacity: Int?) -> Bool {
+        guard let ringCapacity, target > 0 else { return true }
+        return processed <= ringCapacity || processed - target <= 1
+    }
 }
