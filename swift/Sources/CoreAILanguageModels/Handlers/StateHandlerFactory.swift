@@ -230,7 +230,7 @@ enum StateHandlerFactory {
 
     /// Ring capacity from sliding-state shapes `[layers, batch, heads, seq, head_dim]`.
     static func ringCapacity(shapes: [[Int]]) -> Int? {
-        shapes.compactMap { $0.count >= 2 ? $0[$0.count - 2] : nil }.min()
+        shapes.compactMap { $0.count >= 2 && $0[$0.count - 2] > 0 ? $0[$0.count - 2] : nil }.min()
     }
 
     /// Whether a write-first `main` step evicts ring history its own earlier queries attend to.

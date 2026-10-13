@@ -50,14 +50,26 @@ func prefillLogitsInitialCapacity(hasPrefillGraph: Bool, averagePromptSize: Int)
 ///
 /// `heldBack` comes from `prefillHeldBackTokens`. Returns an empty array when there is
 /// nothing to prefill -- a prompt at or below `heldBack` is entirely the caller's to run.
-func prefillChunkSizes(tokenCount: Int, chunkSize: Int, heldBack: Int) -> [Int] {
+///
+/// With a sliding-window ring (`ringCapacity`), each chunk also ends at the next ring
+/// boundary, counted from `startOffset` (the tokens already in the cache): the ring write
+/// is a single slice update that must not run past the last slot, so no chunk may cross a
+/// multiple of `ringCapacity`.
+func prefillChunkSizes(
+    tokenCount: Int, chunkSize: Int, heldBack: Int, startOffset: Int = 0, ringCapacity: Int? = nil
+) -> [Int] {
     let width = max(1, chunkSize)
     var remaining = max(0, tokenCount - max(0, heldBack))
+    var position = max(0, startOffset)
     var sizes: [Int] = []
     while remaining > 0 {
-        let chunk = min(width, remaining)
+        var chunk = min(width, remaining)
+        if let ring = ringCapacity, ring > 0 {
+            chunk = min(chunk, ring - position % ring)
+        }
         sizes.append(chunk)
         remaining -= chunk
+        position += chunk
     }
     return sizes
 }

@@ -47,7 +47,8 @@ public final class CoreAISequentialEngine: InferenceEngine, IdempotentEngine, @u
 
     // Ring capacity when a sliding-window (ring) KV state is present. `function` writes the
     // ring before attending, so a multi-token step past the ring would silently evict history
-    // its earlier queries still need; `processTokenBatch` refuses it.
+    // its earlier queries still need; `processTokenBatch` refuses it. Prefill chunks also
+    // break at ring boundaries so no single ring write runs past the last slot.
     private let slidingRingCapacity: Int?
 
     // I/O names from descriptor
@@ -343,7 +344,9 @@ public final class CoreAISequentialEngine: InferenceEngine, IdempotentEngine, @u
             tokens: tokens,
             chunkSize: chunkSize,
             heldBack: heldBack,
-            vocabSize: config.vocabSize
+            vocabSize: config.vocabSize,
+            startOffset: sessionState.processedTokenCount,
+            ringCapacity: slidingRingCapacity
         ) { chunk, isHeldBack in
             // Held-back tail (and every chunk when there is no prefill graph) runs through
             // `main` for logits; earlier chunks fill the KV cache via the prefill graph.
@@ -365,9 +368,11 @@ public final class CoreAISequentialEngine: InferenceEngine, IdempotentEngine, @u
         var allLogits: [LogitsScalarType] = []
         var remainingTokens = tokens
 
-        while !remainingTokens.isEmpty {
-            let currentChunkSize = min(chunkSize, remainingTokens.count)
-            let chunkEnd = remainingTokens.startIndex + currentChunkSize
+        for size in prefillChunkSizes(
+            tokenCount: tokens.count, chunkSize: chunkSize, heldBack: 0,
+            startOffset: sessionState.processedTokenCount, ringCapacity: slidingRingCapacity)
+        {
+            let chunkEnd = remainingTokens.startIndex + size
             let chunk = remainingTokens[remainingTokens.startIndex..<chunkEnd]
             let chunkLogits = try await processTokenBatch(chunk, sessionState: sessionState)
             allLogits.append(contentsOf: chunkLogits)

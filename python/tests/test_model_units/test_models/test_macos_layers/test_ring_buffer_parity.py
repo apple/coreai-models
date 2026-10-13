@@ -792,3 +792,75 @@ class TestGuardedPathSelection:
             f"write-first should diverge from oracle for query_len={chunk_len} "
             f"after wrap, but diff={diff} (bug would be silent)"
         )
+
+
+def _ring_aligned_plan(token_count, chunk_size, start_offset, ring_capacity):
+    """Mirror of the Swift ``prefillChunkSizes`` with a ring: chunks end at ring boundaries."""
+    sizes, position, remaining = [], start_offset, token_count
+    while remaining > 0:
+        chunk = min(chunk_size, remaining, ring_capacity - position % ring_capacity)
+        sizes.append(chunk)
+        remaining -= chunk
+        position += chunk
+    return sizes
+
+
+class TestRingAlignedChunkPlan:
+    """The runtime splits prefill chunks at ring boundaries so ``RingKVCache.update`` never
+    wraps. Covers the cases the bare chunk size would break: a chunk wider than the ring
+    (4096 vs 2048 at full scale) and a turn that starts mid-ring.
+    """
+
+    WINDOW = 8
+    HEAD_DIM = 4
+    N_HEADS = 2
+
+    def _run(self, first_turn, second_turn, chunk_size, seed):
+        window, head_dim, n_heads = self.WINDOW, self.HEAD_DIM, self.N_HEADS
+        total = first_turn + second_turn
+        torch.manual_seed(seed)
+        k_log = torch.randn(n_heads, total, head_dim)
+        v_log = torch.randn(n_heads, total, head_dim)
+        q_log = torch.randn(n_heads, total, head_dim)
+        cache = RingKVCache(
+            torch.zeros(1, 1, n_heads, window, head_dim),
+            torch.zeros(1, 1, n_heads, window, head_dim),
+        )
+        worst = 0.0
+        offset = 0
+        for turn in (first_turn, second_turn):
+            for size in _ring_aligned_plan(turn, chunk_size, offset, window):
+                assert offset % window + size <= window
+                sl = slice(offset, offset + size)
+                q = q_log[:, sl, :]
+                k = k_log[:, sl, :].unsqueeze(0)
+                v = v_log[:, sl, :].unsqueeze(0)
+                ring_out = _ring_chunk_attention(cache, 0, q, k, v, offset, window)
+                oracle_out = _sliding_window_oracle(q, k_log, v_log, offset, window)
+                worst = max(worst, (ring_out - oracle_out).abs().max().item())
+                offset += size
+        return worst
+
+    def test_chunk_wider_than_ring_matches_oracle(self):
+        """chunk_size = 2 x window: the plan splits it at the ring boundary."""
+        diff = self._run(first_turn=37, second_turn=0, chunk_size=2 * self.WINDOW, seed=21)
+        assert diff < 1e-5, f"wide-chunk plan diverges from oracle: {diff}"
+
+    @pytest.mark.parametrize("first_turn", [3, 5, 11, 13])
+    def test_turn_starting_mid_ring_matches_oracle(self, first_turn):
+        """A second turn begins at an unaligned slot; its first chunk stops at the boundary."""
+        diff = self._run(
+            first_turn=first_turn, second_turn=23, chunk_size=self.WINDOW, seed=first_turn
+        )
+        assert diff < 1e-5, f"mid-ring turn diverges from oracle: {diff}"
+
+    def test_unaligned_write_is_rejected_eagerly(self):
+        """Without the split, the same mid-ring chunk would wrap; eager update refuses it."""
+        window = self.WINDOW
+        cache = RingKVCache(
+            torch.zeros(1, 1, self.N_HEADS, window, self.HEAD_DIM),
+            torch.zeros(1, 1, self.N_HEADS, window, self.HEAD_DIM),
+        )
+        k = torch.randn(1, self.N_HEADS, window, self.HEAD_DIM)
+        with pytest.raises(RuntimeError):
+            cache.update(0, 5, k, k, query_len=window)

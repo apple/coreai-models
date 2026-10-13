@@ -112,6 +112,52 @@ struct PrefillGraphTests {
         #expect(sizes == [64, 64, 64, 64, 64, 64, 16])
     }
 
+    @Test("With a sliding ring, chunks end at ring boundaries")
+    func ringAlignedChunks() {
+        // A 4096-token chunk (the >=64GB default) against a 2048-slot ring: no write may
+        // run past the last slot, so the chunk splits at each multiple of 2048.
+        #expect(
+            prefillChunkSizes(tokenCount: 5000, chunkSize: 4096, heldBack: 1, ringCapacity: 2048)
+                == [2048, 2048, 903])
+    }
+
+    @Test("A turn starting mid-ring first fills to the ring boundary")
+    func ringAlignedFromUnalignedOffset() {
+        // Second turn: 3000 tokens already cached, so the ring write starts at slot 952.
+        let sizes = prefillChunkSizes(
+            tokenCount: 3001, chunkSize: 2048, heldBack: 1, startOffset: 3000, ringCapacity: 2048)
+        #expect(sizes == [1096, 1904])
+    }
+
+    @Test("Ring-aligned chunks never cross a ring boundary and cover the prompt")
+    func ringAlignedInvariant() {
+        for ring in [8, 64, 2048] {
+            for start in [0, 1, 7, 100, 2047, 3000] {
+                for width in [1, 3, 8, 64, 512, 4096] {
+                    let sizes = prefillChunkSizes(
+                        tokenCount: 1000, chunkSize: width, heldBack: 1, startOffset: start,
+                        ringCapacity: ring)
+                    #expect(sizes.reduce(0, +) == 999)
+                    var position = start
+                    for size in sizes {
+                        #expect(size >= 1 && size <= width)
+                        #expect(
+                            position % ring + size <= ring,
+                            "ring=\(ring) start=\(start) width=\(width) crosses at \(position)")
+                        position += size
+                    }
+                }
+            }
+        }
+    }
+
+    @Test("Without a ring, the start offset does not change the plan")
+    func startOffsetIgnoredWithoutRing() {
+        #expect(
+            prefillChunkSizes(tokenCount: 400, chunkSize: 64, heldBack: 1, startOffset: 37)
+                == prefillChunkSizes(tokenCount: 400, chunkSize: 64, heldBack: 1))
+    }
+
     @Test("A degenerate chunk size still terminates")
     func degenerateChunkSizeTerminates() {
         // Belt and braces: prefillQueryLength already floors at 1, but a direct caller

@@ -598,7 +598,8 @@ private struct EngineImpl: ~Copyable {
     var additionalStates: FixedMTLBufferState?
     var hasNonTruncatableStates: Bool
 
-    // Ring capacity when a sliding-window (ring) KV state is present.
+    // Slots in the sliding ring, if any. Guards write-first `main` steps, and prefill chunks
+    // break at ring boundaries.
     let slidingRingCapacity: Int?
 
     // Logits — reuses GrowingLogitsBuffer from TensorStorage+CoreAI.swift
@@ -1649,7 +1650,8 @@ private struct EngineImpl: ~Copyable {
             var head = prompt.dropLast()
             for chunk in prefillChunkSizes(
                 tokenCount: prompt.count, chunkSize: prefillMaxQueryLength,
-                heldBack: prefillHeldBackTokens(hasPrefillGraph: true))
+                heldBack: prefillHeldBackTokens(hasPrefillGraph: true),
+                startOffset: processedTokenCount, ringCapacity: slidingRingCapacity)
             {
                 try await _encodeChunk(tokens: Array(head.prefix(chunk)))
                 head = head.dropFirst(chunk)
@@ -1684,10 +1686,13 @@ private struct EngineImpl: ~Copyable {
 
         try logits.ensureCapacity(forContextLength: chunkSize)
 
-        while remainingTokens.count > chunkSize {
-            let chunk = Array(remainingTokens.prefix(chunkSize))
-            try await _encodeChunk(tokens: chunk)
-            remainingTokens = remainingTokens.dropFirst(chunkSize)
+        // Every chunk but the last is encoded here; the last carries the logits.
+        let plan = prefillChunkSizes(
+            tokenCount: tokens.count, chunkSize: chunkSize, heldBack: 0,
+            startOffset: processedTokenCount, ringCapacity: slidingRingCapacity)
+        for size in plan.dropLast() {
+            try await _encodeChunk(tokens: Array(remainingTokens.prefix(size)))
+            remainingTokens = remainingTokens.dropFirst(size)
         }
 
         return remainingTokens
@@ -1811,6 +1816,10 @@ private struct EngineImpl: ~Copyable {
             // single-token pass.
             shapesToWarm = shapesToWarm.map { $0 > 1 ? min($0, prefillMaxQueryLength) : $0 }
             if !shapesToWarm.contains(1) { shapesToWarm.append(1) }
+        }
+        if let ring = slidingRingCapacity {
+            // A single ring write must not wrap.
+            shapesToWarm = shapesToWarm.map { min($0, ring) }
         }
 
         CLILogger.log("Running warmup for \(shapesToWarm.count) shape(s)")
