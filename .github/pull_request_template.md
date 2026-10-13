@@ -12,10 +12,9 @@ When bringing up a new model, please share your example runtime output and perfo
 ## Type of Change
 
 - [ ] Bug fix
-- [ ] New feature
+- [ ] Small feature (agreed in an issue)
 - [ ] New model (export recipe only)
 - [ ] New model (export recipe and new runtime support)
-- [ ] Breaking change
 - [ ] Documentation update
 
 ## Motivation and Context

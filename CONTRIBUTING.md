@@ -37,9 +37,10 @@ request, include sample runtime output and performance benchmark results.
 ## Set up your environment
 
 Install `uv`, then see the [README](README.md#requirements) for requirements.
-Install the pre-commit hooks:
+Install `pre-commit`, then install the hooks:
 
 ```bash
+uv tool install pre-commit  # or: brew install pre-commit
 pre-commit install --hook-type pre-commit --hook-type pre-push
 ```
 
