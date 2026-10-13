@@ -92,6 +92,36 @@ struct StateKindTests {
     }
 }
 
+// MARK: - State Classification Tests
+
+@Suite("StateHandlerFactory.inferKind Tests")
+struct InferKindTests {
+    @Test("dynamic-dim caches are KV caches")
+    func dynamicCache() {
+        #expect(StateHandlerFactory.inferKind(name: "keyCache", shape: [28, 1, 8, -1, 128]) == .kvCache)
+    }
+
+    @Test("static full-context caches stay KV caches")
+    func staticFullContextCache() {
+        // A 1024-context export pins the cache at the full context.
+        #expect(StateHandlerFactory.inferKind(name: "keyCache", shape: [28, 1, 8, 1024, 128]) == .kvCache)
+        #expect(StateHandlerFactory.inferKind(name: "valueCache", shape: [28, 1, 8, 1024, 128]) == .kvCache)
+    }
+
+    @Test("static sliding caches are ring buffers")
+    func staticSlidingCache() {
+        #expect(
+            StateHandlerFactory.inferKind(name: "slidingKeyCache", shape: [20, 1, 8, 512, 128]) == .slidingCache)
+        #expect(
+            StateHandlerFactory.inferKind(name: "slidingValueCache", shape: [20, 1, 8, 512, 128]) == .slidingCache)
+    }
+
+    @Test("other static states are fixed")
+    func staticOther() {
+        #expect(StateHandlerFactory.inferKind(name: "convState", shape: [24, 1, 4, 2048]) == .fixed)
+    }
+}
+
 // MARK: - Protocol Conformance Tests
 
 @Suite("StateHandler Conformance Tests")

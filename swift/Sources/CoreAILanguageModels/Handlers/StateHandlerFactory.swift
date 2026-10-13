@@ -33,7 +33,8 @@ struct SyncStateHandlerSet {
 ///
 /// Classification priority:
 /// 1. Explicit metadata (`"states"` field in metadata.json) — preferred
-/// 2. Shape-based heuristic — dynamic dim → kvCache, static + "cache" in name → slidingCache, else → fixed
+/// 2. Shape-based heuristic — dynamic dim → kvCache, static + "sliding" in name → slidingCache,
+///    static + "cache"/"kv" in name → kvCache (fixed capacity), else → fixed
 enum StateHandlerFactory {
     /// Classify states using metadata or heuristic fallback.
     static func classifyStates(
@@ -85,13 +86,24 @@ enum StateHandlerFactory {
         guard case .ndArray(let desc) = descriptor.stateDescriptor(of: name) else {
             return .fixed
         }
-        let hasDynamicDim = desc.shape.contains(where: { $0 < 0 })
-        if hasDynamicDim {
+        return inferKind(name: name, shape: desc.shape)
+    }
+
+    /// Infer state kind from a state's name and shape (negative entries are dynamic dims).
+    ///
+    /// A static-shape cache is only a ring buffer when its name says so: an export whose
+    /// context fits the trace-time cache length pins `keyCache`/`valueCache` to the full
+    /// context, and those are still regular KV caches.
+    static func inferKind(name: String, shape: [Int]) -> StateKind {
+        if shape.contains(where: { $0 < 0 }) {
             return .kvCache
         }
         let lower = name.lowercased()
-        if lower.contains("cache") || lower.contains("kv") {
+        if lower.contains("sliding") {
             return .slidingCache
+        }
+        if lower.contains("cache") || lower.contains("kv") {
+            return .kvCache
         }
         return .fixed
     }

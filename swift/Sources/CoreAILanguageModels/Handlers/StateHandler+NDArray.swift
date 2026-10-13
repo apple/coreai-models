@@ -77,14 +77,18 @@ public final class GrowingNDArrayState: SyncStateHandler {
         initialCapacity: Int,
         maxCapacity: Int
     ) {
-        self.maxCapacity = maxCapacity
         self.descriptors = states.map(\.descriptor)
         self.stateNames = states.map(\.name)
 
         let firstDesc = states[0].descriptor
-        self.sequenceDimIndex = firstDesc.shape.firstIndex(where: { $0 < 0 }) ?? max(0, firstDesc.shape.count - 2)
+        let dynamicDimIndex = firstDesc.shape.firstIndex(where: { $0 < 0 })
+        self.sequenceDimIndex = dynamicDimIndex ?? max(0, firstDesc.shape.count - 2)
 
-        let capacity = min(initialCapacity, maxCapacity)
+        // A static-shape cache (exported at its full context) has nowhere to grow.
+        let staticCapacity = dynamicDimIndex == nil ? firstDesc.shape[sequenceDimIndex] : nil
+        self.maxCapacity = staticCapacity ?? maxCapacity
+
+        let capacity = staticCapacity ?? min(initialCapacity, maxCapacity)
         self.currentCapacity = capacity
 
         var arrays: [String: NDArray] = [:]

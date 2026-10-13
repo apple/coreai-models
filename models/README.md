@@ -258,7 +258,7 @@ For models that fit the standard `coreai.llm.export` or `coreai.diffusion.export
 
 ### Declaring State Kinds
 
-The Swift runtime infers each language-model state's kind from its shape and name: a state with a dynamic dimension is a KV cache (`kv_cache`), a fixed-shape state whose name contains `cache` or `kv` is a sliding-window cache (`sliding_cache`), and any other state is `fixed`, such as a convolution or recurrent state. A `fixed` state cannot be partially rewound with `reset(to:)`. When the inference is wrong, for example for a KV cache with a fixed length, set the kinds in the `language` section of the bundle's `metadata.json`:
+The Swift runtime infers each language-model state's kind from its shape and name: a state with a dynamic dimension is a KV cache (`kv_cache`); a fixed-shape state whose name contains `sliding` is a sliding-window ring cache (`sliding_cache`); any other fixed-shape state whose name contains `cache` or `kv` is a KV cache with a fixed capacity, such as one exported at its full context; and any other state is `fixed`, such as a convolution or recurrent state. A `fixed` state cannot be partially rewound with `reset(to:)`. When the inference is wrong, for example for a ring cache whose name doesn't contain `sliding`, set the kinds in the `language` section of the bundle's `metadata.json`:
 
 ```json
 "language": {
