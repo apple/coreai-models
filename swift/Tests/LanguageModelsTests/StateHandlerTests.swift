@@ -122,6 +122,50 @@ struct InferKindTests {
     }
 }
 
+// MARK: - Sliding Ring Write-First Guard Tests
+
+@Suite("Sliding ring write-first guard Tests")
+struct WriteFirstGuardTests {
+    @Test("ring capacity is the sequence dim of the sliding states")
+    func ringCapacity() {
+        #expect(StateHandlerFactory.ringCapacity(shapes: []) == nil)
+        #expect(StateHandlerFactory.ringCapacity(shapes: [[20, 1, 8, 512, 128]]) == 512)
+        #expect(
+            StateHandlerFactory.ringCapacity(shapes: [[20, 1, 8, 512, 128], [20, 1, 8, 256, 128]]) == 256)
+    }
+
+    @Test("single-token steps never evict")
+    func singleToken() {
+        for offset in [0, 511, 512, 513, 10_000] {
+            #expect(!StateHandlerFactory.writeFirstStepEvicts(offset: offset, queryLength: 1, ringCapacity: 512))
+        }
+    }
+
+    @Test("multi-token steps that stay inside the ring are fine")
+    func insideRing() {
+        #expect(!StateHandlerFactory.writeFirstStepEvicts(offset: 0, queryLength: 100, ringCapacity: 512))
+        // Exactly fills the ring: nothing is overwritten yet.
+        #expect(!StateHandlerFactory.writeFirstStepEvicts(offset: 0, queryLength: 512, ringCapacity: 512))
+        #expect(!StateHandlerFactory.writeFirstStepEvicts(offset: 500, queryLength: 12, ringCapacity: 512))
+    }
+
+    @Test("multi-token steps past the ring evict")
+    func pastRing() {
+        #expect(StateHandlerFactory.writeFirstStepEvicts(offset: 0, queryLength: 513, ringCapacity: 512))
+        #expect(StateHandlerFactory.writeFirstStepEvicts(offset: 500, queryLength: 13, ringCapacity: 512))
+        #expect(StateHandlerFactory.writeFirstStepEvicts(offset: 512, queryLength: 2, ringCapacity: 512))
+    }
+
+    @Test("check throws only with a ring and an evicting step")
+    func check() throws {
+        try StateHandlerFactory.checkWriteFirstStep(offset: 4096, queryLength: 64, ringCapacity: nil)
+        try StateHandlerFactory.checkWriteFirstStep(offset: 0, queryLength: 64, ringCapacity: 512)
+        #expect(throws: InferenceRuntimeError.self) {
+            try StateHandlerFactory.checkWriteFirstStep(offset: 480, queryLength: 64, ringCapacity: 512)
+        }
+    }
+}
+
 // MARK: - Protocol Conformance Tests
 
 @Suite("StateHandler Conformance Tests")

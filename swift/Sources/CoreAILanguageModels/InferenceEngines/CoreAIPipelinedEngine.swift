@@ -598,6 +598,9 @@ private struct EngineImpl: ~Copyable {
     var additionalStates: FixedMTLBufferState?
     var hasNonTruncatableStates: Bool
 
+    // Ring capacity when a sliding-window (ring) KV state is present.
+    let slidingRingCapacity: Int?
+
     // Logits — reuses GrowingLogitsBuffer from TensorStorage+CoreAI.swift
     var logits: GrowingLogitsBuffer
 
@@ -854,6 +857,8 @@ private struct EngineImpl: ~Copyable {
         self.kvCache = kvCacheLocal
         self.additionalStates = additionalStatesLocal
         self.hasNonTruncatableStates = classified.contains(where: { $0.kind == .fixed })
+        self.slidingRingCapacity = StateHandlerFactory.slidingRingCapacity(
+            classified: classified, descriptor: descriptor)
         self.logits = logitsRef
         self.cachedSampler = nil
         self.cachedSamplerTemperature = nil
@@ -929,6 +934,10 @@ private struct EngineImpl: ~Copyable {
 
         let actualTokenCount = tokens.isEmpty ? 1 : tokens.count
         let queryLength = actualTokenCount
+
+        try StateHandlerFactory.checkWriteFirstStep(
+            offset: processedTokenCount, queryLength: queryLength,
+            ringCapacity: slidingRingCapacity)
 
         defer {
             processedTokenCount += actualTokenCount
@@ -1503,6 +1512,10 @@ private struct EngineImpl: ~Copyable {
         let actualTokenCount = tokens.isEmpty ? 1 : tokens.count
         let queryLength = actualTokenCount
 
+        try StateHandlerFactory.checkWriteFirstStep(
+            offset: processedTokenCount, queryLength: queryLength,
+            ringCapacity: slidingRingCapacity)
+
         defer {
             processedTokenCount += actualTokenCount
             step += 1
@@ -1744,6 +1757,9 @@ private struct EngineImpl: ~Copyable {
                 additionalStates: additionalStates,
                 computeStream: computeStream)
         } else {
+            try StateHandlerFactory.checkWriteFirstStep(
+                offset: processedTokenCount, queryLength: queryLength,
+                ringCapacity: slidingRingCapacity)
             let logitsShape = [1, queryLength, vocabSize]
             try encodeWithStates(
                 function: function, inputs: asyncInputs,

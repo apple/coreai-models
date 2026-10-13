@@ -45,6 +45,11 @@ public final class CoreAISequentialEngine: InferenceEngine, IdempotentEngine, @u
     // no logits, so the last prompt token still goes through `function`.
     private let prefillFunction: InferenceFunction?
 
+    // Ring capacity when a sliding-window (ring) KV state is present. `function` writes the
+    // ring before attending, so a multi-token step past the ring would silently evict history
+    // its earlier queries still need; `processTokenBatch` refuses it.
+    private let slidingRingCapacity: Int?
+
     // I/O names from descriptor
     private let logitsName: String
 
@@ -129,6 +134,7 @@ public final class CoreAISequentialEngine: InferenceEngine, IdempotentEngine, @u
             options: options
         )
         self.options = options
+        self.slidingRingCapacity = stateHandlers.slidingRingCapacity
         self.session = GenerationSessionState(
             kvCache: stateHandlers.kvCache,
             additionalStates: stateHandlers.additionalStates,
@@ -240,6 +246,10 @@ public final class CoreAISequentialEngine: InferenceEngine, IdempotentEngine, @u
         guard batchSize > 0 else {
             throw InferenceRuntimeError.invalidState("Cannot process empty token batch")
         }
+
+        try StateHandlerFactory.checkWriteFirstStep(
+            offset: sessionState.processedTokenCount, queryLength: batchSize,
+            ringCapacity: slidingRingCapacity)
 
         _ = try sessionState.kvCache.ensureCapacity(
             forContextLength: sessionState.processedTokenCount + batchSize)
