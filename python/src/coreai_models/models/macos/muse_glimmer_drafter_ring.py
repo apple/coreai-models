@@ -14,10 +14,8 @@ Architecture:
 - Shares embed_tokens and lm_head with the target model
 - Ring buffer KV cache with explicit attention mask
 
-Sliding attention is read-before-write: each step concatenates the incoming
-K/V onto the cached window, attends over ``window_size + query_len`` keys, and
-only then writes into the ring. Writing first would let a multi-token prefill
-chunk evict window history that its own earliest queries still need.
+Sliding attention reads before writing (concat), so a multi-token chunk can't
+evict window history it still needs.
 """
 
 import gc
@@ -116,10 +114,7 @@ class Attention(nn.Module):
         key = self.rope(key, position_ids=rope_positions, freqs=freqs)
 
         if cache is not None:
-            # Read-before-write: attend over [cached window ++ new K/V], then
-            # write. Writing first would let this chunk's own K/V evict the
-            # oldest query_len - 1 in-window positions that its earliest
-            # queries still need.
+            # Read before write (concat), else a multi-token chunk garbles output.
             attn_key, attn_value = cache.fetch_and_concat(self.layer_idx, key, value)
         else:
             attn_key, attn_value = key, value
@@ -188,6 +183,8 @@ class DrafterRingModel(nn.Module):
         h = h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + self.config.rms_norm_eps)
 
         if cache is not None:
+            # Drafter is always multi-token (one main graph, no decode split), so
+            # it stays on the read-before-write concat path.
             attn_mask = concat_window_causal_mask(
                 query_len=query_len,
                 capacity=cache.capacity(),
