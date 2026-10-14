@@ -178,3 +178,23 @@ struct BindTests {
         secondary.bind(into: &views)
     }
 }
+
+// MARK: - State Kind Validation
+
+@Suite("Explicit state kinds")
+struct StateKindValidationTests {
+    @Test("a dynamic-shaped state given a fixed-size kind is reported; valid kinds are not")
+    func dynamicStateWithFixedSizeKind() {
+        let isDynamic: (String) -> Bool = { $0 == "keyCache" || $0 == "valueCache" }
+        let invalid: [(name: String, kind: StateKind)] = [
+            ("keyCache", .slidingCache), ("valueCache", .fixed), ("convStates", .fixed),
+        ]
+        #expect(
+            StateHandlerFactory.dynamicStatesWithFixedSizeKind(invalid, isDynamic: isDynamic)
+                == ["keyCache", "valueCache"])
+        let valid: [(name: String, kind: StateKind)] = [
+            ("keyCache", .kvCache), ("valueCache", .kvCache), ("convStates", .fixed),
+        ]
+        #expect(StateHandlerFactory.dynamicStatesWithFixedSizeKind(valid, isDynamic: isDynamic).isEmpty)
+    }
+}
