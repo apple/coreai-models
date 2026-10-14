@@ -3,6 +3,7 @@
 // Use of this source code is governed by a BSD-3-clause license that can
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
+import CoreAI
 import Foundation
 
 /// In-memory representation of a model bundle directory (`metadata.json` + assets).
@@ -28,7 +29,13 @@ public struct ModelBundle: Sendable {
     public let userData: [String: String]?
 
     /// Role-to-filename mapping from the `"assets"` field in metadata.json.
+    /// Every entry must be a Core AI model; see `validateModelAssets()`.
     public let assets: [String: String]
+
+    /// Role-to-filename mapping from the `"auxiliary_assets"` field in metadata.json:
+    /// supporting files that are not Core AI models (e.g. raw tensor data such as the
+    /// per-layer embeddings table). Absent in most bundles.
+    public let auxiliaryAssets: [String: String]
 
     /// Full metadata.json bytes, preserved so kind-specific decoders can read
     /// their own blocks without re-reading the file.
@@ -53,10 +60,16 @@ public struct ModelBundle: Sendable {
         return bundlePath.appending(path: path)
     }
 
+    /// Resolve an auxiliary asset's URL within the bundle by role key.
+    public func auxiliaryAssetURL(for key: String) -> URL? {
+        guard let path = auxiliaryAssets[key] else { return nil }
+        return bundlePath.appending(path: path)
+    }
+
     /// Required-component variant — throws `BundleError.missingField` if absent from
-    /// `assets`. Does not check whether the resolved file exists on disk; callers that
-    /// need that guarantee should call `verifyAssetsExisting()` first (as `llm-runner`/
-    /// `llm-server` do).
+    /// `assets`. Does not check whether the resolved file exists on disk or is a valid
+    /// model; callers that need that guarantee should call `validateModelAssets()` first
+    /// (as `llm-runner`/`llm-server` do).
     public func requireModelURL(for key: String) throws -> URL {
         guard let url = modelURL(for: key) else {
             throw BundleError.missingField("assets.\(key)")
@@ -64,12 +77,25 @@ public struct ModelBundle: Sendable {
         return url
     }
 
-    /// Verify all declared assets exist on disk. Throws `BundleError.missingAsset`
-    /// with guidance if a component is missing (e.g. after manual compilation).
-    public func verifyAssetsExisting() throws {
+    /// Verify every declared asset exists on disk and is a valid Core AI model, per
+    /// `AIModelAsset.isValid(at:)` — this is the framework's own canonical check, so
+    /// supported extensions/formats never need duplicating here. Throws
+    /// `BundleError.missingAsset` if a component's declared path doesn't exist, or
+    /// `BundleError.invalidModelAsset` if it exists but isn't a valid model. Auxiliary assets
+    /// are only checked for existence, since they aren't Core AI models.
+    public func validateModelAssets() throws {
         for (key, filename) in assets {
             let url = bundlePath.appending(path: filename)
-            if !FileManager.default.fileExists(atPath: url.path) {
+            guard FileManager.default.fileExists(atPath: url.path) else {
+                throw BundleError.missingAsset(key: key, url: url)
+            }
+            guard AIModelAsset.isValid(at: url) else {
+                throw BundleError.invalidModelAsset(key: key, url: url)
+            }
+        }
+        for (key, filename) in auxiliaryAssets {
+            let url = bundlePath.appending(path: filename)
+            guard FileManager.default.fileExists(atPath: url.path) else {
                 throw BundleError.missingAsset(key: key, url: url)
             }
         }
@@ -84,14 +110,15 @@ public struct ModelBundle: Sendable {
         case kindMismatch(expected: BundleKind, got: BundleKind)
         case missingField(String)
         case missingAsset(key: String, url: URL)
+        case invalidModelAsset(key: String, url: URL)
         case pointedAtModelAsset(URL)
 
         public var description: String {
             switch self {
             case .pointedAtModelAsset(let url):
-                return "'\(url.lastPathComponent)' is a model asset, not a model bundle "
-                    + "directory. A model bundle directory contains metadata, a tokenizer, "
-                    + "and a model asset."
+                return "'\(url.lastPathComponent)' is a model, not a model bundle "
+                    + "directory. A model bundle directory contains one or more Core AI models "
+                    + "and other supporting files, e.g., metadata, or tokenizer"
             case .missingMetadata(let url):
                 return "metadata.json not found at \(url.path)"
             case .malformedMetadata(let url, let err):
@@ -105,6 +132,9 @@ public struct ModelBundle: Sendable {
             case .missingAsset(let key, let url):
                 return
                     "Asset '\(key)' of metadata.json in the bundle requires '\(url.lastPathComponent)', but not found"
+            case .invalidModelAsset(let key, let url):
+                return
+                    "Asset '\(key)' of metadata.json in the bundle at '\(url.lastPathComponent)' is not a valid Core AI model"
             }
         }
 
@@ -122,14 +152,10 @@ public struct ModelBundle: Sendable {
     }
 
     public init(at url: URL) throws {
-        // A model bundle is a *directory* (metadata.json + assets + tokenizer).
-        // If the caller points us directly at a `.aimodel`/`.aimodelc` asset,
-        // fail with actionable guidance. This must run before any filesystem
-        // read: a compiled `.aimodelc` is itself a directory holding its own
-        // unrelated metadata.json, which would otherwise parse as a bogus 0.1
-        // bundle and surface a misleading "unsupported metadata_version" error.
-        let ext = url.pathExtension.lowercased()
-        if ext == "aimodel" || ext == "aimodelc" {
+        // A model bundle is a *directory* (metadata.json + models + tokenizer).
+        // If url points directly at a Core AI model (instead of directory),
+        // fail with actionable guidance.
+        if AIModelAsset.isValid(at: url) {
             throw BundleError.pointedAtModelAsset(url)
         }
         let metadataURL = url.appending(path: "metadata.json")
@@ -175,6 +201,7 @@ public struct ModelBundle: Sendable {
         self.name = common.name
         self.userData = common.userData
         self.assets = common.assets ?? [:]
+        self.auxiliaryAssets = common.auxiliaryAssets ?? [:]
     }
 }
 
@@ -194,9 +221,11 @@ extension ModelBundle {
         let name: String
         let userData: [String: String]?
         let assets: [String: String]?
+        let auxiliaryAssets: [String: String]?
 
         enum CodingKeys: String, CodingKey {
             case kind, name, assets
+            case auxiliaryAssets = "auxiliary_assets"
             case userData = "user_data"
         }
     }

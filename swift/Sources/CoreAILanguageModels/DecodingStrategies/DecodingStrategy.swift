@@ -77,11 +77,12 @@ public struct StopSequences: Sendable {
     /// - Parameter tokenizer: Tokenizer to extract EOS token from
     /// - Parameter additionalSequences: Optional additional stop sequences to include
     /// - Parameter additionalEosTokenIds: Optional additional single-token EOS IDs
-    ///   (e.g. from tokenizer_config.json's `additional_special_tokens`)
+    ///   (e.g. from tokenizer_config.json's `additional_special_tokens`); folded
+    ///   into `sequences` in sorted order for deterministic tie-break diagnostics
     public init(
         for tokenizer: any Tokenizer,
         additionalSequences: [[Int32]] = [],
-        additionalEosTokenIds: [Int32] = []
+        additionalEosTokenIds: Set<Int32> = []
     ) {
         var allSequences = additionalSequences
 
@@ -100,8 +101,10 @@ public struct StopSequences: Sendable {
             }
         }
 
-        // Add additional EOS token IDs (e.g. from tokenizer_config.json)
-        for token in additionalEosTokenIds {
+        // Add additional EOS token IDs (e.g. from tokenizer_config.json). Sort at
+        // this ordering boundary so the built sequence order (and thus the
+        // `.stopSequence` diagnostic on ties) is deterministic.
+        for token in additionalEosTokenIds.sorted() {
             if !existingTokens.contains(token) {
                 existingTokens.insert(token)
                 allSequences.append([token])

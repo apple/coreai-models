@@ -30,9 +30,7 @@ from coreai_torch import TorchConverter, get_decomp_table
 class YolosModule(torch.nn.Module):
     def __init__(self, model_name: str):
         super().__init__()
-        self._model = transformers.AutoModelForObjectDetection.from_pretrained(
-            model_name
-        )
+        self._model = transformers.AutoModelForObjectDetection.from_pretrained(model_name)
 
     def forward(self, pixel_values):
         outputs = self._model(pixel_values=pixel_values)
@@ -74,18 +72,14 @@ def _variant_name(model_name: str, dtype: torch.dtype, dynamic: bool) -> str:
     return f"{safe_name}_{dtype_name}_{static_or_dynamic}"
 
 
-def _asset_path(
-    output_dir: str, model_name: str, dtype: torch.dtype, dynamic: bool
-) -> Path:
+def _asset_path(output_dir: str, model_name: str, dtype: torch.dtype, dynamic: bool) -> Path:
     return Path(output_dir) / f"{_variant_name(model_name, dtype, dynamic)}.aimodel"
 
 
 def _save_asset(coreai_program, model_path: Path, overwrite: bool) -> None:
     if model_path.exists():
         if not overwrite:
-            raise FileExistsError(
-                f"{model_path} already exists. Pass --overwrite to replace it."
-            )
+            raise FileExistsError(f"{model_path} already exists. Pass --overwrite to replace it.")
         if model_path.is_dir():
             shutil.rmtree(model_path)
         else:
@@ -99,7 +93,11 @@ def _build_aimodel_metadata() -> AIModelAssetMetadata:
     metadata = AIModelAssetMetadata()
     metadata.author = "Y. Fang et al."
     metadata.license = "Apache-2.0"
-    metadata.model_description = "YOLOS (You Only Look at One Sequence) applies a plain Vision Transformer directly to image patches and predicts object queries as bounding boxes and class logits. Source: https://huggingface.co/hustvl/yolos-tiny"
+    metadata.model_description = (
+        "YOLOS (You Only Look at One Sequence) applies a plain Vision Transformer directly to "
+        "image patches and predicts object queries as bounding boxes and class logits. Source: "
+        "https://huggingface.co/hustvl/yolos-tiny"
+    )
     metadata.creation_date = int(time.time())
     return metadata
 
@@ -122,15 +120,11 @@ def create_yolos(
     ds = dynamic_shapes() if dynamic else None
 
     with torch.autocast(device_type="cpu", dtype=dtype):
-        exported = torch.export.export(
-            model, args=(), kwargs=example_inputs, dynamic_shapes=ds
-        )
+        exported = torch.export.export(model, args=(), kwargs=example_inputs, dynamic_shapes=ds)
     exported = exported.run_decompositions(get_decomp_table())
     print("[INFO] Model exported. Converting to Core AI...")
 
-    mode = (
-        TorchConverter.Mode.DEBUG if include_debug_info else TorchConverter.Mode.RELEASE
-    )
+    mode = TorchConverter.Mode.DEBUG if include_debug_info else TorchConverter.Mode.RELEASE
     converter = TorchConverter(mode=mode).add_exported_program(
         exported_program=exported,
         input_names=["pixel_values"],
@@ -145,9 +139,7 @@ def create_yolos(
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Create and save a Core AI AIProgram for YOLOS."
-    )
+    parser = argparse.ArgumentParser(description="Create and save a Core AI AIProgram for YOLOS.")
     parser.add_argument(
         "--model",
         choices=["hustvl/yolos-tiny", "hustvl/yolos-base"],
@@ -179,7 +171,8 @@ def main():
         "--include-debug-info",
         action="store_true",
         help="Embed debug information in the exported .aimodel for debugging a conversion. "
-        "Default: off, which embeds minimum debug information and makes the exported asset smaller.",
+        "Default: off, which embeds minimum debug information and makes the exported asset "
+        "smaller.",
     )
     args = parser.parse_args()
 

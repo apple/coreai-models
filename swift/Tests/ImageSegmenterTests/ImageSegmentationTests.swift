@@ -3,6 +3,7 @@
 // Use of this source code is governed by a BSD-3-clause license that can
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
+import CoreAIShared
 import CoreGraphics
 import Foundation
 import Testing
@@ -95,7 +96,7 @@ struct ImageSegmentationTests {
     @Test("Decode: absent presence logits treated as 1.0")
     func decodeEmptyPresenceLogits() {
         let logit: Float = 2.0
-        let expectedScore = SegmentationPostprocessor.sigmoid(logit)
+        let expectedScore = sigmoid(logit)
 
         let output = SegmentationOutput(
             predictedMasks: [Float](repeating: 0, count: 1 * 1 * 2 * 2),
@@ -370,15 +371,6 @@ struct ImageSegmentationTests {
 
         #expect(overlay.width == w)
         #expect(overlay.height == h)
-    }
-
-    // MARK: - Sigmoid
-
-    @Test("sigmoid(0) == 0.5 and sigmoid(x) + sigmoid(-x) == 1")
-    func sigmoidKnownValues() {
-        #expect(SegmentationPostprocessor.sigmoid(0) == 0.5)
-        let x: Float = 2.5
-        #expect(abs(SegmentationPostprocessor.sigmoid(x) + SegmentationPostprocessor.sigmoid(-x) - 1.0) < 1e-6)
     }
 
     // MARK: - Helpers

@@ -153,7 +153,7 @@ struct IdempotentEngineRoutingTests {
 /// cannot run in model-free CI. Provide the fixture via environment variables:
 ///
 ///   IDEMPOTENT_PARITY_CONFIG — path to the model's config JSON
-///   IDEMPOTENT_PARITY_MODEL  — path to the `.aimodel` / `.aimodelc` asset
+///   IDEMPOTENT_PARITY_MODEL  — path to the Core AI model
 ///
 /// When either is unset the whole suite is skipped. This is a scaffold:
 /// run it on-device to validate that (1) the idempotent path is

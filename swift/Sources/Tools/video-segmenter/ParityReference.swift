@@ -7,7 +7,6 @@ import CoreAIShared
 import CoreAIVideoSegmenter
 import CoreGraphics
 import Foundation
-import ImageIO
 
 /// Per-frame detect-and-track output from a reference implementation, to compare this port
 /// against. Any producer that writes the layout below will do.
@@ -158,14 +157,13 @@ struct ParityReference {
         images.reserveCapacity(frameCount)
         for frame in manifest.frames {
             let url = directory.appending(path: String(format: "frame_%04d.png", frame))
-            guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
-                let image = CGImageSourceCreateImageAtIndex(source, 0, nil)
-            else {
+            do {
+                images.append(try CGImageUtils.load(from: url))
+            } catch {
                 throw VideoSegmentationError.parityReferenceInvalid(
                     "manifest.json declares frame images but \(url.lastPathComponent) is "
                         + "missing or unreadable.")
             }
-            images.append(image)
         }
         return images
     }

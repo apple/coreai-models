@@ -21,7 +21,7 @@ public struct ImageSegmentationBundle: Sendable {
         guard bundle.kind == .segmenter else {
             throw ModelBundle.BundleError.kindMismatch(expected: .segmenter, got: bundle.kind)
         }
-        try bundle.verifyAssetsExisting()
+        try bundle.validateModelAssets()
         self.modelBundle = bundle
         self.modelURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.main)
         self.tokenizerFolder = bundle.bundlePath.appending(path: "tokenizer")

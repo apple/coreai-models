@@ -37,9 +37,7 @@ class Wav2Vec2Module(torch.nn.Module):
         return emission
 
 
-def reference_inputs(
-    dtype: torch.dtype, dynamic: bool = False
-) -> dict[str, torch.Tensor]:
+def reference_inputs(dtype: torch.dtype, dynamic: bool = False) -> dict[str, torch.Tensor]:
     B = 2 if dynamic else 1
     # 16kHz mono audio, ~5 seconds.
     return {"waveform": torch.randn(B, 80000).to(dtype)}
@@ -66,18 +64,14 @@ def _variant_name(model_name: str, dtype: torch.dtype, dynamic: bool) -> str:
     return f"{safe_name}_{dtype_name}_{static_or_dynamic}"
 
 
-def _asset_path(
-    output_dir: str, model_name: str, dtype: torch.dtype, dynamic: bool
-) -> Path:
+def _asset_path(output_dir: str, model_name: str, dtype: torch.dtype, dynamic: bool) -> Path:
     return Path(output_dir) / f"{_variant_name(model_name, dtype, dynamic)}.aimodel"
 
 
 def _save_asset(coreai_program, model_path: Path, overwrite: bool) -> None:
     if model_path.exists():
         if not overwrite:
-            raise FileExistsError(
-                f"{model_path} already exists. Pass --overwrite to replace it."
-            )
+            raise FileExistsError(f"{model_path} already exists. Pass --overwrite to replace it.")
         if model_path.is_dir():
             shutil.rmtree(model_path)
         else:
@@ -91,7 +85,11 @@ def _build_aimodel_metadata() -> AIModelAssetMetadata:
     metadata = AIModelAssetMetadata()
     metadata.author = "A. Baevski et al."
     metadata.license = "MIT"
-    metadata.model_description = "Wav2Vec 2.0 is a self-supervised speech representation model that learns directly from raw audio and, after fine-tuning, transcribes speech into character-level token emissions. Source: https://pytorch.org/audio/stable/pipelines.html"
+    metadata.model_description = (
+        "Wav2Vec 2.0 is a self-supervised speech representation model that learns directly from "
+        "raw audio and, after fine-tuning, transcribes speech into character-level token "
+        "emissions. Source: https://pytorch.org/audio/stable/pipelines.html"
+    )
     metadata.creation_date = int(time.time())
     return metadata
 
@@ -114,15 +112,11 @@ def create_wav2vec2(
     ds = dynamic_shapes() if dynamic else None
 
     with torch.autocast(device_type="cpu", dtype=dtype):
-        exported = torch.export.export(
-            model, args=(), kwargs=example_inputs, dynamic_shapes=ds
-        )
+        exported = torch.export.export(model, args=(), kwargs=example_inputs, dynamic_shapes=ds)
     exported = exported.run_decompositions(get_decomp_table())
     print("[INFO] Model exported. Converting to Core AI...")
 
-    mode = (
-        TorchConverter.Mode.DEBUG if include_debug_info else TorchConverter.Mode.RELEASE
-    )
+    mode = TorchConverter.Mode.DEBUG if include_debug_info else TorchConverter.Mode.RELEASE
     converter = TorchConverter(mode=mode).add_exported_program(
         exported_program=exported,
         input_names=["waveform"],
@@ -171,7 +165,8 @@ def main():
         "--include-debug-info",
         action="store_true",
         help="Embed debug information in the exported .aimodel for debugging a conversion. "
-        "Default: off, which embeds minimum debug information and makes the exported asset smaller.",
+        "Default: off, which embeds minimum debug information and makes the exported asset "
+        "smaller.",
     )
     args = parser.parse_args()
 

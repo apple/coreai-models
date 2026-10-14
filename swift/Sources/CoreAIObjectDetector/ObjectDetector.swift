@@ -19,15 +19,11 @@ public struct ObjectDetector {
     private let logitsOutputName: String
     private let boxesOutputName: String
 
-    /// Loads the `.aimodel` at `path` and initializes a detector.
+    /// Loads the Core AI model at `path` and initializes a detector.
     public init(resourcesAt path: String) async throws {
         let modelURL = URL(fileURLWithPath: NSString(string: path).expandingTildeInPath)
 
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: modelURL.path, isDirectory: &isDirectory),
-            isDirectory.boolValue,
-            modelURL.pathExtension == "aimodel"
-        else {
+        guard AIModelAsset.isValid(at: modelURL) else {
             throw DetectionRuntimeError.modelNotFound(modelURL.path)
         }
 

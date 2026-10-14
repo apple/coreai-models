@@ -110,7 +110,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     // MARK: - Initialization
 
     /// - Parameter tensorData: Tensor data the graph reads alongside the model, keyed by
-    ///   `assets` role (see ``EngineOptions/TensorDataKey``). Only the roles the graph's
+    ///   `auxiliary_assets` role (see ``EngineOptions/TensorDataKey``). Only the roles the graph's
     ///   inputs need are looked up.
     public init(
         configuration: ModelConfig,
@@ -246,7 +246,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
                 throw InferenceRuntimeError.invalidState(
                     "Graph declares '\(PerLayerEmbeddingsInputHandler.inputName)' but no per-layer "
                         + "embeddings artifact was supplied. The bundle must declare it as "
-                        + "`assets.\(EngineOptions.TensorDataKey.perLayerEmbeddings)` in metadata.json; "
+                        + "`auxiliary_assets.\(EngineOptions.TensorDataKey.perLayerEmbeddings)` in metadata.json; "
                         + "EngineFactory.createEngine(bundle:) passes it through.")
             }
             let table = try PerLayerEmbeddings(contentsOf: url)

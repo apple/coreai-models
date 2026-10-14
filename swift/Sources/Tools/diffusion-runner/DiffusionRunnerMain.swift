@@ -149,11 +149,12 @@ struct DiffusionRunner: AsyncParsableCommand {
 
         var startingCGImage: CGImage? = nil
         if let imagePath = inputImage {
-            guard let img = loadCGImage(from: URL(fileURLWithPath: imagePath)) else {
+            do {
+                startingCGImage = try CGImageUtils.load(from: imagePath)
+            } catch {
                 print("Error: could not load input image at \(imagePath)")
                 throw ExitCode.failure
             }
-            startingCGImage = img
         }
 
         // --reference-grid only affects the img2img reference-token path; it is
@@ -228,12 +229,5 @@ struct DiffusionRunner: AsyncParsableCommand {
         guard CGImageDestinationFinalize(dest) else {
             throw CocoaError(.fileWriteUnknown)
         }
-    }
-
-    private func loadCGImage(from url: URL) -> CGImage? {
-        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
-            let image = CGImageSourceCreateImageAtIndex(source, 0, nil)
-        else { return nil }
-        return image
     }
 }

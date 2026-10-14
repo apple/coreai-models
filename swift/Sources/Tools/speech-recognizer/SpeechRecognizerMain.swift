@@ -171,12 +171,10 @@ struct SpeechRecognizer: AsyncParsableCommand {
         if clearCoreAICache {
             try clearCache(bundleURL: bundleURL)
         }
-        // A single asset is identified by its extension; a bundle by carrying
-        // metadata.json. Both contain a metadata.json, so the extension has to be
-        // checked first or `.aimodel` assets get misrouted to the bundle path.
-        let assetExtensions: Set<String> = ["aimodel", "aimodelc"]
+        // Determine whether the given URL points directly to an .aimodel
+        // or a bundle directory.
         let isBundle =
-            !assetExtensions.contains(bundleURL.pathExtension)
+            !AIModelAsset.isValid(at: bundleURL)
             && FileManager.default.fileExists(atPath: bundleURL.appending(path: "metadata.json").path)
         if isBundle, stream, let audioPath {
             try await runStreaming(
@@ -207,7 +205,7 @@ struct SpeechRecognizer: AsyncParsableCommand {
     /// Clear the specialization cache for this model's asset component(s).
     ///
     /// Delegates to `PreparedModel.clearCache`, which scans the bundle directory for every
-    /// `.aimodel`/`.aimodelc` component (or treats `bundleURL` as a single asset), so it stays
+    /// Core AI model (or treats `bundleURL` as a single asset), so it stays
     /// correct regardless of component filenames.
     private func clearCache(bundleURL: URL) throws {
         let cleared = try PreparedModel.clearCache(at: bundleURL)
@@ -304,7 +302,7 @@ func runLegacy(model: String, audioPath: String?, warmup: Bool) async throws {
     // so probing `.default` against a non-default load always reports a miss.
     let cacheHit = PreparedModel.isCached(at: modelURL, options: options)
 
-    print("⏳ Preparing AI asset...", terminator: "")
+    print("⏳ Preparing AI asset from \(modelURL.lastPathComponent)...", terminator: "")
     fflush(stdout)
     let loadStart = ContinuousClock.now
     let model = try await AIModel(contentsOf: modelURL, options: options)

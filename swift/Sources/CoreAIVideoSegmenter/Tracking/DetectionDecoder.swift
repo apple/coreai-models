@@ -109,15 +109,4 @@ enum DetectionDecoder {
         // prompt's own ordering.
         return kept.sorted()
     }
-
-    @inline(__always)
-    static func sigmoid(_ x: Float) -> Float {
-        // Branch on the sign to keep the exponent argument negative. `exp` of a large
-        // positive logit overflows to infinity and yields NaN.
-        if x >= 0 {
-            return 1 / (1 + Foundation.exp(-x))
-        }
-        let e = Foundation.exp(x)
-        return e / (1 + e)
-    }
 }

@@ -416,7 +416,7 @@ final class FrameProcessor {
         for (objectID, score) in newScores { trackerScores[objectID] = score }
         for (objectID, logit) in zip(trackedObjectIDs, trackerScoreLogits)
         where !removed.contains(objectID) {
-            trackerScores[objectID] = DetectionDecoder.sigmoid(logit)
+            trackerScores[objectID] = sigmoid(logit)
         }
         session.trackerScoreByFrame[frameIndex] = trackerScores
 

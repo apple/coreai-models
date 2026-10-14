@@ -50,10 +50,19 @@ from coreai_models._constants import (
     VALUE_CACHE_NAME,
     VALUE_CACHE_OUTPUT_NAME,
 )
+from coreai_models.primitives.ios.cache import KVCacheHandler, causal_mask
 from coreai_models.primitives.ios.embedding import GatherEmbeddings, LoadEmbeddings
 from coreai_models.primitives.macos.cache import KVCache
 
 T = TypeVar("T", bound="BaseForCausalLM")
+
+
+@dataclass
+class EagerState:
+    """The caches of one sequence being run eagerly, and how many positions they already hold."""
+
+    tensors: tuple[torch.Tensor, ...]
+    offset: int = 0
 
 
 @dataclass(frozen=True)
@@ -568,6 +577,30 @@ class BaseForCausalLM(torch.nn.Module):
             )
         return tuple(reference_inputs.values())
 
+    def new_eager_state(
+        self, *, dtype: torch.dtype, device: torch.device | str, max_seq_len: int | None = None
+    ) -> EagerState:
+        """Empty caches for one sequence of at most ``max_seq_len`` tokens (default: the
+        context)."""
+        with torch.device(device):
+            k_cache, v_cache = KVCache.create_cache_tensors(
+                self.config, dtype=dtype, seq_len=max_seq_len
+            )
+        return EagerState((k_cache, v_cache))
+
+    def eager_forward_args(self, input_ids: torch.Tensor, state: EagerState) -> tuple[Any, ...]:
+        """``forward``'s arguments for ``input_ids`` written at ``state.offset``."""
+        position_ids = torch.arange(
+            state.offset + input_ids.shape[1], dtype=torch.int32, device=input_ids.device
+        ).unsqueeze(0)
+        return (input_ids, position_ids, *state.tensors)
+
+    def eager_step(self, input_ids: torch.Tensor, state: EagerState) -> torch.Tensor:
+        """Logits ``[1, query_len, vocab]`` for ``input_ids``, advancing ``state`` past them."""
+        logits = self(*self.eager_forward_args(input_ids, state))
+        state.offset += input_ids.shape[1]
+        return logits.reshape(1, input_ids.shape[1], -1)
+
     @classmethod
     def _get_reauthored_config(
         cls,
@@ -876,6 +909,36 @@ class BaseForCausalLMForiOS(BaseForCausalLM):
         # iOS composes the transformer as a submodule, so the flag lives there rather
         # than on the top-level module.
         self.extend.prefill_mode = prefill_mode
+
+    @override
+    def new_eager_state(
+        self, *, dtype: torch.dtype, device: torch.device | str, max_seq_len: int | None = None
+    ) -> EagerState:
+        """iOS graphs index the cache and the mask over the whole context, so ``max_seq_len``
+        is ignored."""
+        with torch.device(device):
+            key_cache, value_cache = KVCacheHandler.get_kv_cache_from_hf(self.config, dtype=dtype)
+        return EagerState((key_cache, value_cache))
+
+    @override
+    def eager_forward_args(self, input_ids: torch.Tensor, state: EagerState) -> tuple[Any, ...]:
+        """iOS takes only the query's positions, the write offset, and an additive mask over
+        the context."""
+        query_len, device = input_ids.shape[1], input_ids.device
+        position_ids = (
+            torch.arange(state.offset, state.offset + query_len, device=device)
+            .to(torch.uint16)
+            .unsqueeze(0)
+        )
+        in_step = torch.tensor([state.offset], dtype=torch.int32, device=device)
+        mask = causal_mask(
+            self.config.max_position_embeddings,
+            query_len,
+            state.offset,
+            dtype=state.tensors[0].dtype,
+            device=device,
+        )
+        return (input_ids, position_ids, in_step, mask, *state.tensors)
 
     # ------------------------------------------------------------------
     # Export contract

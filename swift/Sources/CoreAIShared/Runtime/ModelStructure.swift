@@ -123,14 +123,11 @@ public struct PreparedModel: Sendable {
 
     // MARK: - Cache Inspection
 
-    /// File extensions that identify a Core AI model asset (source or compiled).
-    private static let assetExtensions: Set<String> = ["aimodel", "aimodelc"]
-
     /// Enumerates the Core AI model asset(s) reachable from `url`.
     ///
-    /// A model directory (e.g. an LLM bundle) contains one or more asset components alongside
+    /// A model directory contains one or more Core AI models alongside
     /// other files (tokenizer, metadata); we can't assume specific component filenames, so scan
-    /// the directory for every `.aimodel`/`.aimodelc` entry. If `url` is itself an asset, it is
+    /// the directory for every Core AI model. If `url` is itself a Core AI model, it is
     /// returned as the sole component. This filename-agnostic approach stays correct as new model
     /// families add differently-named components.
     ///
@@ -138,9 +135,9 @@ public struct PreparedModel: Sendable {
     /// - Returns: The asset URLs to operate on, sorted for stable output. Empty only if `url` is a
     ///   directory with no asset components.
     public static func modelAssetURLs(at url: URL) throws -> [URL] {
-        // A path ending in a known asset extension IS the asset (asset bundles are themselves
+        // A path that's itself a valid model IS the asset (asset bundles are themselves
         // directories, so this must be checked before treating `url` as a container to scan).
-        if assetExtensions.contains(url.pathExtension) {
+        if AIModelAsset.isValid(at: url) {
             return [url]
         }
         let entries = try FileManager.default.contentsOfDirectory(
@@ -149,7 +146,7 @@ public struct PreparedModel: Sendable {
         )
         return
             entries
-            .filter { assetExtensions.contains($0.pathExtension) }
+            .filter { AIModelAsset.isValid(at: $0) }
             .sorted { $0.path < $1.path }
     }
 
@@ -198,15 +195,15 @@ public struct PreparedModel: Sendable {
         return isCached(at: url, options: options)
     }
 
-    // MARK: - Asset Preparation
+    // MARK: - Model Preparation
 
-    /// Prepares a Core AI model asset by loading via `AIModel` and detecting its structure.
+    /// Prepares a Core AI model by loading via `AIModel` and detecting its structure.
     ///
     /// Specialization options are derived automatically from the detected model structure:
     /// dynamic models prefer GPU with frequent reshapes; chunked-static models prefer Neural Engine.
     ///
     /// - Parameters:
-    ///   - url: URL to the model asset (`.aimodel` or `.aimodelc` bundle)
+    ///   - url: URL to the Core AI model
     /// - Returns: Prepared asset with compiled library and detected structure
     /// - Throws: Error from `AIModel` if loading or specialization fails
     public static func prepare(

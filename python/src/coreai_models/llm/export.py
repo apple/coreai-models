@@ -289,6 +289,40 @@ def _resolve_registry_compression_config(relpath: str, variant: str) -> tuple[ob
     return _load_compression_config_object(yaml_path, variant), yaml_path.stem
 
 
+def resolve_compression(
+    variant: str,
+    *,
+    compression: str | None = None,
+    compression_config: Path | None = None,
+    registry_compression_config: str | None = None,
+) -> tuple[str, object]:
+    """The compression name and coreai-opt config object an export of ``variant`` uses."""
+    compression_config_object = None
+    if compression_config is not None:
+        if not compression_config.is_file():
+            raise SystemExit(f"--compression-config: file not found: {compression_config}")
+        compression_config_object = _load_compression_config_object(compression_config, variant)
+        compression = compression_config.stem
+    elif registry_compression_config is not None:
+        compression_config_object, compression = _resolve_registry_compression_config(
+            registry_compression_config, variant
+        )
+    elif compression == "none":
+        pass
+    elif not compression:
+        compression = MACOS_DEFAULT if variant == "macOS" else IOS_DEFAULT
+    elif compression in MACOS_PRESETS and variant == "iOS":
+        raise RuntimeError("macOS quantization preset provided, but platform is iOS.")
+    elif compression in IOS_PRESETS and variant == "macOS":
+        raise RuntimeError("iOS palettization preset provided, but platform is macOS.")
+    elif compression not in ALL_PRESET_NAMES and compression != "none":
+        raise RuntimeError(
+            f"Compression preset {compression} is not a valid compression "
+            f"preset. Available: {list_presets()}"
+        )
+    return compression, compression_config_object
+
+
 def _resolve_export_config(args: argparse.Namespace) -> ExportConfig:
     """Resolve CLI args + registry preset into a final ExportConfig."""
     hf_model_id = args.model
@@ -297,7 +331,6 @@ def _resolve_export_config(args: argparse.Namespace) -> ExportConfig:
     compute_precision = args.compute_precision
     max_context_length = args.max_context_length
     output_dir = args.output_dir or _default_output_dir()
-    compression_config_object = None
     registry_compression_config: str | None = None  # repo-root-relative path, e.g. models/qwen3/...
 
     preset = None
@@ -360,30 +393,12 @@ def _resolve_export_config(args: argparse.Namespace) -> ExportConfig:
     if args.quantization_mode == "graph" and variant != "macOS":
         raise SystemExit(f"--quantization-mode graph requires --platform macOS (got '{variant}').")
 
-    if args.compression_config is not None:
-        if not args.compression_config.is_file():
-            raise SystemExit(f"--compression-config: file not found: {args.compression_config}")
-        compression_config_object = _load_compression_config_object(
-            args.compression_config, variant
-        )
-        compression = args.compression_config.stem
-    elif registry_compression_config is not None:
-        compression_config_object, compression = _resolve_registry_compression_config(
-            registry_compression_config, variant
-        )
-    elif compression == "none":
-        pass
-    elif not compression:
-        compression = MACOS_DEFAULT if variant == "macOS" else IOS_DEFAULT
-    elif compression in MACOS_PRESETS and variant == "iOS":
-        raise RuntimeError("macOS quantization preset provided, but platform is iOS.")
-    elif compression in IOS_PRESETS and variant == "macOS":
-        raise RuntimeError("iOS palettization preset provided, but platform is macOS.")
-    elif compression not in ALL_PRESET_NAMES and compression != "none":
-        raise RuntimeError(
-            f"Compression preset {compression} is not a valid compression "
-            f"preset. Available: {list_presets()}"
-        )
+    compression, compression_config_object = resolve_compression(
+        variant,
+        compression=compression,
+        compression_config=args.compression_config,
+        registry_compression_config=registry_compression_config,
+    )
 
     return ExportConfig(
         hf_model_id=hf_model_id,

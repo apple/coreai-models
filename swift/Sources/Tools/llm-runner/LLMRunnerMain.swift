@@ -409,7 +409,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         }
 
         let bundle = try LanguageModelBundle(from: modelFile)
-        try bundle.modelBundle.verifyAssetsExisting()
+        try bundle.modelBundle.validateModelAssets()
         let modelName = bundle.name
         let modelVocabSize = bundle.vocabSize
 
@@ -439,9 +439,8 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             cacheHit = PreparedModel.isCached(at: languageModelURL)
         }
 
-        let assetLabel = try modelAssetTypeLabel(for: languageModelURL.pathExtension)
         if !CLILogger.isVerbose {
-            print("\n⏳ Preparing AI asset from \(assetLabel)...", terminator: "")
+            print("\n⏳ Preparing AI asset from \(languageModelURL.lastPathComponent)...", terminator: "")
             fflush(stdout)
         }
 
@@ -484,17 +483,26 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             component: "Main")
 
         // Read additional stop token IDs from tokenizer_config.json (e.g. <end_of_turn> for Gemma)
-        let additionalEosTokenIds: [Int32]
+        var additionalEosTokenIds: Set<Int32>
         if let tokenizerDir = bundle.tokenizerPath {
             additionalEosTokenIds = LanguageConfig.additionalStopTokenIds(
                 from: tokenizerDir, tokenizer: tokenizer)
             if !additionalEosTokenIds.isEmpty {
                 CLILogger.log(
-                    "Found \(additionalEosTokenIds.count) additional stop token(s) from tokenizer config: \(additionalEosTokenIds)",
+                    "Found \(additionalEosTokenIds.count) additional stop token(s) from tokenizer config: \(additionalEosTokenIds.sorted())",
                     component: "Main")
             }
         } else {
             additionalEosTokenIds = []
+        }
+
+        // Agentic models use <|eot|> as a turn boundary. It may not appear in
+        // tokenizer_config.json, so add it explicitly (skipping the main EOS).
+        let thinkingFormat = detectThinkingFormat(using: tokenizer)
+        if let eotId = agenticEndOfTurnTokenId(thinkingFormat: thinkingFormat, tokenizer: tokenizer),
+            eotId != tokenizer.eosTokenId.map({ Int32($0) })
+        {
+            additionalEosTokenIds.insert(eotId)
         }
 
         CLILogger.log("Model loaded successfully:", component: "Main")
@@ -782,7 +790,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         maxTokens: Int,
         actualInputTokens: Int,
         modelVocabSize: Int?,
-        additionalEosTokenIds: [Int32] = []
+        additionalEosTokenIds: Set<Int32> = []
     ) async throws {
         let schema: String
         if FileManager.default.fileExists(atPath: schemaInput) {
@@ -906,7 +914,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     func validateAndEncodeStopTokens(
         stopTokens: [String],
         tokenizer: any Tokenizer,
-        additionalEosTokenIds: [Int32] = []
+        additionalEosTokenIds: Set<Int32> = []
     ) throws -> StopSequences {
         var sequences: [[Int32]] = []
 
@@ -955,7 +963,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         tokenizer: any Tokenizer,
         samplingConfiguration: SamplingConfiguration,
         maxTokens: Int,
-        additionalEosTokenIds: [Int32],
+        additionalEosTokenIds: Set<Int32>,
         displayPrompt: String
     ) async throws {
         guard let vlmEngine = inferenceEngine as? any MultimodalInferenceEngine else {
@@ -1021,7 +1029,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         tokenizer: any Tokenizer,
         samplingConfiguration: SamplingConfiguration,
         maxTokens: Int,
-        additionalEosTokenIds: [Int32],
+        additionalEosTokenIds: Set<Int32>,
         displayPrompt: String
     ) async throws {
         guard let vlmEngine = inferenceEngine as? any MultimodalInferenceEngine else {
@@ -1075,7 +1083,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         tokenizer: any Tokenizer,
         samplingConfiguration: SamplingConfiguration,
         maxTokens: Int,
-        additionalEosTokenIds: [Int32],
+        additionalEosTokenIds: Set<Int32>,
         displayPrompt: String
     ) async throws {
         let imageTokenCount = embeddedInput.tokenCount
@@ -1239,18 +1247,6 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         // If we never found the placeholder, the template didn't produce it — fall back
         guard foundPlaceholder else { return nil }
         return result
-    }
-
-    // MARK: - Asset Type Label
-
-    private func modelAssetTypeLabel(for ext: String) throws -> String {
-        switch ext.lowercased() {
-        case "aimodelc": return "compiled"
-        case "aimodel": return "source"
-        default:
-            print("Unsupported model file: only .aimodel or .aimodelc")
-            throw ExitCode.failure
-        }
     }
 
     // MARK: - Warmup

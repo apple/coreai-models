@@ -228,7 +228,7 @@ class GptOssForCausalLM(BaseForCausalLM):
     _HF_MODEL_CLASS = HFGptOssForCausalLM
 
     # Emit a second, prefill-only ``prefill`` entrypoint beside ``main``.
-    exports_prefill_graph = False
+    exports_prefill_graph = True
 
     @override
     def _init_model(self: Self, config: GptOssConfig) -> None:

@@ -64,12 +64,12 @@ public struct LanguageModelBundle: Sendable {
     /// Model-specific runtime settings (`language.overrides`); nil for most models.
     public var overrides: LanguageOverrides? { language.overrides }
 
-    /// Tensor data the engine reads alongside the model, keyed by `assets` role. Only
-    /// roles the bundle declares are present.
+    /// Tensor data the engine reads alongside the model, keyed by `auxiliary_assets`
+    /// role. Only roles the bundle declares are present.
     public var tensorData: [String: URL] {
         var resolved: [String: URL] = [:]
         let key = EngineOptions.TensorDataKey.perLayerEmbeddings
-        if let url = modelBundle.modelURL(for: key) {
+        if let url = modelBundle.auxiliaryAssetURL(for: key) {
             resolved[key] = url
         }
         return resolved

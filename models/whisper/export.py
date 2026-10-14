@@ -38,9 +38,7 @@ class WhisperModule(torch.nn.Module):
         )
 
     def forward(self, input_features, decoder_input_ids):
-        outputs = self._model(
-            input_features=input_features, decoder_input_ids=decoder_input_ids
-        )
+        outputs = self._model(input_features=input_features, decoder_input_ids=decoder_input_ids)
         return outputs.logits
 
 
@@ -73,9 +71,7 @@ def _asset_path(output_dir: str, model_name: str, dtype: torch.dtype) -> Path:
 def _save_asset(coreai_program, model_path: Path, overwrite: bool) -> None:
     if model_path.exists():
         if not overwrite:
-            raise FileExistsError(
-                f"{model_path} already exists. Pass --overwrite to replace it."
-            )
+            raise FileExistsError(f"{model_path} already exists. Pass --overwrite to replace it.")
         if model_path.is_dir():
             shutil.rmtree(model_path)
         else:
@@ -89,7 +85,11 @@ def _build_aimodel_metadata() -> AIModelAssetMetadata:
     metadata = AIModelAssetMetadata()
     metadata.author = "A. Radford et al."
     metadata.license = "Apache-2.0"
-    metadata.model_description = "Whisper is an automatic speech recognition (ASR) encoder-decoder model from OpenAI, trained on a large multilingual and multitask supervised dataset. Source: https://huggingface.co/openai/whisper-large-v3"
+    metadata.model_description = (
+        "Whisper is an automatic speech recognition (ASR) encoder-decoder model from OpenAI, "
+        "trained on a large multilingual and multitask supervised dataset. Source: "
+        "https://huggingface.co/openai/whisper-large-v3"
+    )
     metadata.creation_date = int(time.time())
     return metadata
 
@@ -122,9 +122,7 @@ def create_whisper(
     exported = exported.run_decompositions(get_decomp_table())
     print("[INFO] Model exported. Converting to Core AI...")
 
-    mode = (
-        TorchConverter.Mode.DEBUG if include_debug_info else TorchConverter.Mode.RELEASE
-    )
+    mode = TorchConverter.Mode.DEBUG if include_debug_info else TorchConverter.Mode.RELEASE
     converter = TorchConverter(mode=mode).add_exported_program(
         exported_program=exported,
         input_names=["input_features", "decoder_input_ids"],
@@ -139,9 +137,7 @@ def create_whisper(
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Create and save a Core AI AIProgram for Whisper."
-    )
+    parser = argparse.ArgumentParser(description="Create and save a Core AI AIProgram for Whisper.")
     parser.add_argument(
         "--model",
         choices=["openai/whisper-large-v3-turbo", "openai/whisper-large-v3"],
@@ -168,7 +164,8 @@ def main():
         "--include-debug-info",
         action="store_true",
         help="Embed debug information in the exported .aimodel for debugging a conversion. "
-        "Default: off, which embeds minimum debug information and makes the exported asset smaller.",
+        "Default: off, which embeds minimum debug information and makes the exported asset "
+        "smaller.",
     )
     args = parser.parse_args()
 
@@ -179,9 +176,7 @@ def main():
     }[args.dtype]
 
     output_dir = args.output_dir or _default_output_dir()
-    create_whisper(
-        output_dir, args.model, dtype, args.overwrite, args.include_debug_info
-    )
+    create_whisper(output_dir, args.model, dtype, args.overwrite, args.include_debug_info)
 
 
 if __name__ == "__main__":

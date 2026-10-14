@@ -26,7 +26,7 @@ struct ServerConfig: Sendable {
     let supportsLogprobs: Bool
     let maxContextLength: Int
     let vocabSize: Int?
-    let additionalEosTokenIds: [Int32]
+    let additionalEosTokenIds: Set<Int32>
     let maxQueueDepth: Int
 }
 

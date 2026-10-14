@@ -77,7 +77,7 @@ struct LLMBenchmark: AsyncParsableCommand {
         #endif
 
         let bundle = try LanguageModelBundle(from: model)
-        try bundle.modelBundle.verifyAssetsExisting()
+        try bundle.modelBundle.validateModelAssets()
         let vocabSize = bundle.vocabSize
 
         let modelURL = try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.main)
@@ -93,7 +93,7 @@ struct LLMBenchmark: AsyncParsableCommand {
 
         let engineConfig = ModelConfig(bundle: bundle)
         let configData = try JSONEncoder().encode(engineConfig)
-        print("\n⏳ Preparing AI asset...", terminator: "")
+        print("\n⏳ Preparing AI asset from \(modelURL.lastPathComponent)...", terminator: "")
         fflush(stdout)
         // Resolve chunking config with CLI flags taking precedence over metadata.json.
         // A nil result preserves the lower layers (deprecated env var, memory-based default).

@@ -121,7 +121,7 @@ struct LLMServer: AsyncParsableCommand {
         }
 
         let bundle = try LanguageModelBundle(from: url.path)
-        try bundle.modelBundle.verifyAssetsExisting()
+        try bundle.modelBundle.validateModelAssets()
 
         if clearCoreAICache {
             let cleared = try PreparedModel.clearCache(at: bundle.bundlePath)
@@ -145,10 +145,9 @@ struct LLMServer: AsyncParsableCommand {
         let modelURL = try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.main)
 
         let cacheHit = PreparedModel.isCached(at: modelURL)
-        let assetLabel: String = modelURL.pathExtension == "aimodelc" ? "compiled" : "source"
 
         if !verbose && replayPath == nil {
-            print("\n⏳ Preparing AI asset from \(assetLabel)...", terminator: "")
+            print("\n⏳ Preparing AI asset from \(modelURL.lastPathComponent)...", terminator: "")
             fflush(stdout)
         }
 
@@ -164,7 +163,7 @@ struct LLMServer: AsyncParsableCommand {
 
         let tokenizer = try await bundle.loadTokenizer()
 
-        var additionalEosTokenIds: [Int32]
+        var additionalEosTokenIds: Set<Int32>
         if let tokenizerDir = bundle.tokenizerPath {
             additionalEosTokenIds = LanguageConfig.additionalStopTokenIds(
                 from: tokenizerDir, tokenizer: tokenizer)
@@ -172,17 +171,13 @@ struct LLMServer: AsyncParsableCommand {
             additionalEosTokenIds = []
         }
 
-        // Agentic models use <|eot|> / <|eom|> as turn boundaries.
-        // These may not appear in tokenizer_config.json, so add them explicitly.
+        // Agentic models use <|eot|> as a turn boundary. It may not appear in
+        // tokenizer_config.json, so add it explicitly (skipping the main EOS).
         let thinkingFormat = detectThinkingFormat(using: tokenizer)
-        if case .agentic(_, _, _, let eot) = thinkingFormat {
-            let mainEos = tokenizer.eosTokenId.map { Int32($0) }
-            if let id = tokenizer.convertTokenToId(eot) {
-                let id32 = Int32(id)
-                if id32 != mainEos && !additionalEosTokenIds.contains(id32) {
-                    additionalEosTokenIds.append(id32)
-                }
-            }
+        if let eotId = agenticEndOfTurnTokenId(thinkingFormat: thinkingFormat, tokenizer: tokenizer),
+            eotId != tokenizer.eosTokenId.map({ Int32($0) })
+        {
+            additionalEosTokenIds.insert(eotId)
         }
 
         let samplingConfig = SamplingConfiguration(

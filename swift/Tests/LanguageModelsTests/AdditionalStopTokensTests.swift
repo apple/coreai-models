@@ -12,7 +12,7 @@ import Tokenizers
 
 @Suite("LanguageConfig.additionalStopTokenIds")
 struct AdditionalStopTokensTests {
-    /// Vocabulary shared by the tests. `<eos>` must be ID 2 to match
+    /// Vocabulary shared by the parsing tests. `<eos>` must be ID 2 to match
     /// `MockTokenizer.eosTokenId`, so it is expected to be filtered out.
     private static let vocab: [String: Int] = [
         "<eot>": 1,
@@ -49,9 +49,7 @@ struct AdditionalStopTokensTests {
     private static func stopIds(config: String, tokenizerJSON: String? = nil) throws -> Set<Int32> {
         let dir = try tokenizerDir(config: config, tokenizerJSON: tokenizerJSON)
         defer { try? FileManager.default.removeItem(at: dir) }
-        return Set(
-            LanguageConfig.additionalStopTokenIds(from: dir, tokenizer: tokenizer())
-        )
+        return LanguageConfig.additionalStopTokenIds(from: dir, tokenizer: tokenizer())
     }
 
     // MARK: - Top-level turn-ending tokens
@@ -198,9 +196,9 @@ struct AdditionalStopTokensTests {
 
     @Test("same turn-end ID from added_tokens_decoder and tokenizer.json is deduped")
     func dedupAcrossBothSources() throws {
-        // <end_of_turn> (106) appears in both added_tokens_decoder and
+        // <end_of_turn> (3) appears in both added_tokens_decoder and
         // tokenizer.json's added_tokens; <|im_end|> (4) only in the former.
-        // Result must still be a set: 106 once, plus 4.
+        // Result must still be a set: 3 once, plus 4.
         let ids = try Self.stopIds(
             config: """
                 {
@@ -219,5 +217,19 @@ struct AdditionalStopTokensTests {
                 }
                 """)
         #expect(ids == [3, 4])
+    }
+
+    // MARK: - Base-vocab <|im_end|> is not folded by the resolver
+
+    @Test("base-vocab <|im_end|> is not folded by the resolver")
+    func doesNotFoldBaseVocabImEnd() throws {
+        // A base-vocab-only <|im_end|> (not declared as an added/special token) is
+        // the runtime baseline handled by Tokenizer.runtimeStopTokens, not this
+        // resolver, so the config resolving nothing yields an empty set.
+        let dir = try Self.tokenizerDir(config: #"{ "eos_token": "<eos>" }"#)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let ids = LanguageConfig.additionalStopTokenIds(
+            from: dir, tokenizer: MockTokenizer(vocab: ["<eos>": 2, "<|im_end|>": 4]))
+        #expect(ids.isEmpty)
     }
 }

@@ -91,6 +91,9 @@ struct ObjectDetectorCLI: AsyncParsableCommand {
         if verbose { print("Loading model from \(model)...") }
 
         let modelURL = URL(fileURLWithPath: NSString(string: model).expandingTildeInPath)
+        guard AIModelAsset.isValid(at: modelURL) else {
+            throw DetectionRuntimeError.modelNotFound(modelURL.path)
+        }
 
         if clearCoreAICache {
             let cleared = try PreparedModel.clearCache(at: modelURL)
@@ -108,7 +111,7 @@ struct ObjectDetectorCLI: AsyncParsableCommand {
         )
         if let h = inputHeight { params.inputHeight = h }
         if let w = inputWidth { params.inputWidth = w }
-        print("⏳ Preparing AI asset...", terminator: "")
+        print("⏳ Preparing AI asset from \(modelURL.lastPathComponent)...", terminator: "")
         fflush(stdout)
         let loadStart = ContinuousClock.now
         let detector = try await ObjectDetector(resourcesAt: modelURL.path)
@@ -116,7 +119,12 @@ struct ObjectDetectorCLI: AsyncParsableCommand {
         print(" done in \(String(format: "%.3f", loadElapsed.inSeconds))s\(cacheHit ? " (cache hit)" : "")")
 
         let loaded: [(path: String, image: CGImage)] = try image.map { path in
-            let cgImage = try loadCGImage(from: path)
+            let cgImage: CGImage
+            do {
+                cgImage = try CGImageUtils.load(from: path)
+            } catch {
+                throw ValidationError("Cannot load image at \(path)")
+            }
             if verbose { print("Loaded image \(path): \(cgImage.width)×\(cgImage.height)") }
             return (path, cgImage)
         }
@@ -228,20 +236,6 @@ struct ObjectDetectorCLI: AsyncParsableCommand {
             print("Output image written to \(outURL.path)")
         }
     }
-}
-
-// MARK: - Image Loading
-
-private func loadCGImage(from path: String) throws -> CGImage {
-    let expanded = NSString(string: path).expandingTildeInPath
-    let url = URL(fileURLWithPath: expanded)
-    guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
-        throw ValidationError("Cannot open image at \(path)")
-    }
-    guard let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
-        throw ValidationError("Cannot decode image at \(path)")
-    }
-    return cgImage
 }
 
 // MARK: - Rendering

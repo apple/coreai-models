@@ -97,18 +97,14 @@ def _variant_name(model_name: str, dtype: torch.dtype, dynamic: bool) -> str:
     return f"{safe_name}_{dtype_name}_{static_or_dynamic}"
 
 
-def _asset_path(
-    output_dir: str, model_name: str, dtype: torch.dtype, dynamic: bool
-) -> Path:
+def _asset_path(output_dir: str, model_name: str, dtype: torch.dtype, dynamic: bool) -> Path:
     return Path(output_dir) / f"{_variant_name(model_name, dtype, dynamic)}.aimodel"
 
 
 def _save_asset(coreai_program, model_path: Path, overwrite: bool) -> None:
     if model_path.exists():
         if not overwrite:
-            raise FileExistsError(
-                f"{model_path} already exists. Pass --overwrite to replace it."
-            )
+            raise FileExistsError(f"{model_path} already exists. Pass --overwrite to replace it.")
         if model_path.is_dir():
             shutil.rmtree(model_path)
         else:
@@ -122,7 +118,11 @@ def _build_aimodel_metadata() -> AIModelAssetMetadata:
     metadata = AIModelAssetMetadata()
     metadata.author = "Y. Wu et al."
     metadata.license = "Apache-2.0"
-    metadata.model_description = "CLAP (Contrastive Language-Audio Pretraining) learns joint representations of audio and text, enabling zero-shot audio classification with natural language labels. Source: https://huggingface.co/laion/clap-htsat-unfused"
+    metadata.model_description = (
+        "CLAP (Contrastive Language-Audio Pretraining) learns joint representations of audio and "
+        "text, enabling zero-shot audio classification with natural language labels. Source: "
+        "https://huggingface.co/laion/clap-htsat-unfused"
+    )
     metadata.creation_date = int(time.time())
     return metadata
 
@@ -145,15 +145,11 @@ def create_clap(
     ds = dynamic_shapes() if dynamic else None
 
     with torch.autocast(device_type="cpu", dtype=dtype):
-        exported = torch.export.export(
-            model, args=(), kwargs=example_inputs, dynamic_shapes=ds
-        )
+        exported = torch.export.export(model, args=(), kwargs=example_inputs, dynamic_shapes=ds)
     exported = exported.run_decompositions(get_decomp_table())
     print("[INFO] Model exported. Converting to Core AI...")
 
-    mode = (
-        TorchConverter.Mode.DEBUG if include_debug_info else TorchConverter.Mode.RELEASE
-    )
+    mode = TorchConverter.Mode.DEBUG if include_debug_info else TorchConverter.Mode.RELEASE
     converter = TorchConverter(mode=mode).add_exported_program(
         exported_program=exported,
         input_names=["input_ids", "attention_mask", "input_features", "is_longer"],
@@ -173,9 +169,7 @@ def create_clap(
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Create and save a Core AI AIProgram for CLAP."
-    )
+    parser = argparse.ArgumentParser(description="Create and save a Core AI AIProgram for CLAP.")
     parser.add_argument(
         "--model",
         choices=["laion/clap-htsat-unfused"],
@@ -207,7 +201,8 @@ def main():
         "--include-debug-info",
         action="store_true",
         help="Embed debug information in the exported .aimodel for debugging a conversion. "
-        "Default: off, which embeds minimum debug information and makes the exported asset smaller.",
+        "Default: off, which embeds minimum debug information and makes the exported asset "
+        "smaller.",
     )
     args = parser.parse_args()
 

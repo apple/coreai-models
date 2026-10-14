@@ -18,7 +18,7 @@ import re
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 
 import torch
 from transformers import AutoConfig, AutoTokenizer
@@ -44,7 +44,8 @@ from coreai_models.export.presets import (
     DEFAULT_MACOS_COMPRESSION_PRESET,
     get_preset,
 )
-from coreai_models.models.registry import get_model_entry
+from coreai_models.model_registry import ModelPreset
+from coreai_models.models.registry import ModelEntry, get_model_entry
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +85,39 @@ class ExportConfig:
                 f"quantization_mode='graph' is macOS only (got variant '{self.variant}')."
             )
 
+    @classmethod
+    def from_preset(
+        cls,
+        preset: ModelPreset,
+        *,
+        platform: str | None = None,
+        compression: str | None = None,
+        compression_config_object: Any = None,
+        compute_precision: str | None = None,
+        max_context_length: int | None = None,
+        **options: Any,
+    ) -> "ExportConfig":
+        """The config that exports ``preset``, with any value passed here winning over the preset's.
+
+        Raises:
+            ValueError: If neither ``compute_precision`` nor the preset names a precision.
+        """
+        precision = compute_precision or preset.compute_precision
+        if precision is None:
+            raise ValueError(
+                f"{preset.short_name!r} registers no compute precision; pass one explicitly."
+            )
+        return cls(
+            hf_model_id=preset.hf_id,
+            variant=platform or preset.variant or "macOS",
+            compression=compression if compression is not None else preset.compression,
+            compression_config_object=compression_config_object,
+            compute_precision=precision,
+            max_context_length=max_context_length or preset.max_context_length,
+            model_type_override=preset._model_type_override,
+            **options,
+        )
+
 
 def _generate_output_name(config: ExportConfig) -> str:
     """Generate a filesystem-safe output name from config."""
@@ -118,34 +152,30 @@ def _resolve_precision(precision_str: str) -> torch.dtype:
     return dtype
 
 
-def export_model(config_or_model_id: ExportConfig | str) -> str:
-    """Export a HuggingFace model to Core AI format.
+@dataclass(frozen=True)
+class ResolvedModel:
+    """What an ``ExportConfig`` resolves to before any weight is read."""
 
-    This is the main public API. It orchestrates:
-    1. Resolve model class from HuggingFace config
-    2. Load model with HF weights
-    3. Apply pre-export compression (torch quantization)
-    4. Variant-specific export (macOS or iOS)
-    5. Save as .aimodel
-
-    Args:
-        config_or_model_id: Either an ExportConfig or a HuggingFace model ID string.
-            If a string, uses default settings (macOS, 4bit compression).
-
-    Returns:
-        Path to the exported .aimodel file.
-    """
-    if isinstance(config_or_model_id, str):
-        config = ExportConfig(hf_model_id=config_or_model_id)
-    else:
-        config = config_or_model_id
-
-    return asyncio.run(_async_export_model(config))
+    config: ExportConfig
+    entry: ModelEntry
+    model_type: str
+    model_class: Any
+    hf_config: Any
+    target_dtype: torch.dtype
+    max_context_length: int | None
+    quantization_config: dict | None
+    palettization_config: Any
 
 
-async def _async_export_model(config: ExportConfig) -> str:
-    """Async implementation of export_model."""
+class BuiltModel(NamedTuple):
+    """The torch model a ``ResolvedModel`` describes, loaded and compressed."""
 
+    model: Any
+    externalized_model: torch.nn.Module | None
+
+
+def resolve_model(config: ExportConfig) -> ResolvedModel:
+    """Resolve ``config`` against the registry and the checkpoint's config, reading no weights."""
     # ---- 1. Resolve model class ----
     hf_config = AutoConfig.from_pretrained(config.hf_model_id)
     model_type = config.model_type_override or getattr(hf_config, "model_type", None)
@@ -203,7 +233,202 @@ async def _async_export_model(config: ExportConfig) -> str:
     if config.num_layers is not None:
         hf_config.num_hidden_layers = config.num_layers
 
+    # ---- 3. Resolve compression preset ----
+    if config.compression_config_object is not None:
+        torch_quantization_config, torch_palettization_config = split_compression_config(
+            config.compression_config_object
+        )
+    else:
+        preset = get_preset(config.compression)
+        torch_quantization_config = preset.get("torch_quantization_config")
+        torch_palettization_config = preset.get("torch_palettization_config")
+
+    assert not (torch_quantization_config is not None and torch_palettization_config is not None), (
+        "Both a quantization and a palettization config were provided, this should never happen."
+    )
+
+    return ResolvedModel(
+        config=config,
+        entry=entry,
+        model_type=model_type,
+        model_class=model_class,
+        hf_config=hf_config,
+        target_dtype=target_dtype,
+        max_context_length=max_context_length,
+        quantization_config=torch_quantization_config,
+        palettization_config=torch_palettization_config,
+    )
+
+
+def build_model(
+    resolved: ResolvedModel, temp_dir: str | None = None, export_backend: object | None = None
+) -> BuiltModel:
+    """Load ``resolved``'s weights and apply its compression.
+
+    Args:
+        temp_dir: Where macOS weights and quantizer checkpoints are disk-backed. None keeps
+            them in RAM.
+        export_backend: The backend coreai-opt finalizes quantized weights for. None is
+            Core AI.
+    """
+    config, entry, model_class = resolved.config, resolved.entry, resolved.model_class
+    hf_config, target_dtype = resolved.hf_config, resolved.target_dtype
+    max_context_length = resolved.max_context_length
+
     logger.info(f"Loading {config.hf_model_id} ({config.variant}, dtype={target_dtype})...")
+    use_memory_efficient = config.variant == "macOS"
+    if use_memory_efficient:
+        layer_mmap_dir = None
+        if temp_dir is not None:
+            layer_mmap_dir = os.path.join(temp_dir, "layers")
+            os.makedirs(layer_mmap_dir, exist_ok=True)
+        model = model_class.from_hf_memory_efficient(
+            config.hf_model_id,
+            max_context_length=max_context_length,
+            target_dtype=target_dtype,
+            mmap_path=layer_mmap_dir,
+            num_layers=config.num_layers,
+            hf_config_attr=entry.hf_config_attr,
+            hf_state_dict_prefix=entry.hf_state_dict_prefix,
+        )
+    else:
+        model = model_class.from_hf(
+            config.hf_model_id,
+            max_context_length=max_context_length,
+            target_dtype=target_dtype,
+            num_layers=config.num_layers,
+            disable_embedding_quantization=config.disable_embedding_quantization,
+        )
+    model = model.eval()
+    torch_quantization_config = resolved.quantization_config
+    torch_palettization_config = resolved.palettization_config
+
+    # ---- 3a. Pre-export torch quantization (if configured) ----
+    effective_max_ctx = max_context_length or getattr(
+        hf_config, "max_position_embeddings", TRACE_KV_CACHE_SEQ_LEN
+    )
+    vocab_size = hf_config.vocab_size
+    batch_size = 1
+    # Set when composite ops are marked for externalization before quantization.
+    externalized_model: torch.nn.Module | None = None
+    if torch_quantization_config is not None:
+        logger.info(f"Applying pre-export torch quantization (preset={config.compression})")
+
+        def get_calibration_data():  # type: ignore[no-untyped-def]
+            tokenizer = AutoTokenizer.from_pretrained(config.hf_model_id)
+            return get_c4(tokenizer)
+
+        # Copy so we don't mutate the shared preset.
+        quant_cfg = dict(torch_quantization_config)
+
+        # The preset or YAML is the source of truth; `--quantization-mode` overrides
+        # it only when given.
+        if config.quantization_mode is not None:
+            logger.warning(
+                "Overriding execution_mode for `coreai-opt` compression with "
+                f"{config.quantization_mode}"
+            )
+            quant_cfg["execution_mode"] = config.quantization_mode
+        elif "execution_mode" not in quant_cfg:
+            raise ValueError(
+                f"Compression config '{config.compression}' does not set "
+                "'execution_mode'. Set it there, or pass --quantization-mode "
+                "{eager,graph}."
+            )
+
+        graph_mode = is_compression_mode_graph(quant_cfg)
+
+        quantizer_mmap_dir: str | None = None
+        # coreai-opt only supports mmap-backed finalization in eager mode.
+        if use_memory_efficient and temp_dir is not None and not graph_mode:
+            quantizer_mmap_dir = os.path.join(temp_dir, "quantized")
+            os.makedirs(quantizer_mmap_dir, exist_ok=True)
+
+        if graph_mode and export_backend is None:
+            patch_model_for_externalization(model)
+            # externalization patches live on the eager module's composite op
+            # submodules but quantize_for_export in graph-mode below returns a
+            # new GraphModule which get overwritten to `model`.
+            # So, keep a handle on the eager module the composites were patched on,
+            # for the sub-export later.
+            externalized_model = model
+
+        model = quantize_for_export(
+            model,
+            hf_config,
+            target_dtype,
+            quant_cfg,
+            calibration_data_fn=get_calibration_data,
+            mmap_dir=quantizer_mmap_dir,
+            export_backend=export_backend,
+        )
+
+    if torch_palettization_config is not None:
+        assert config.variant == "iOS", "palettization is only supported for iOS variant."
+
+        query_len = 8
+        input_ids = torch.randint(1, vocab_size, (batch_size, query_len), dtype=torch.int32)
+        position_ids = (
+            torch.arange(query_len).to(torch.uint16).unsqueeze(0).expand(batch_size, query_len)
+        )
+        in_step = torch.zeros((1,), dtype=torch.int32)
+        causal_mask = torch.zeros(1, effective_max_ctx, 1, query_len, dtype=torch.float16)
+        if hasattr(hf_config, "head_dim") and isinstance(hf_config.head_dim, int):
+            head_dim = hf_config.head_dim
+        else:
+            head_dim = hf_config.hidden_size // hf_config.num_attention_heads
+        key_cache = torch.zeros(
+            hf_config.num_hidden_layers,
+            1,  # batch_size
+            hf_config.num_key_value_heads * head_dim,
+            1,
+            effective_max_ctx,
+            dtype=torch.float16,
+        )
+        value_cache = key_cache.clone()
+        palettization_inputs = (
+            input_ids,
+            position_ids,
+            in_step,
+            causal_mask,
+            key_cache,
+            value_cache,
+        )
+        model = palettize_pytorch_model(model, palettization_inputs, torch_palettization_config)
+
+    return BuiltModel(model, externalized_model)
+
+
+def export_model(config_or_model_id: ExportConfig | str) -> str:
+    """Export a HuggingFace model to Core AI format.
+
+    This is the main public API. It orchestrates:
+    1. Resolve model class from HuggingFace config
+    2. Load model with HF weights
+    3. Apply pre-export compression (torch quantization)
+    4. Variant-specific export (macOS or iOS)
+    5. Save as .aimodel
+
+    Args:
+        config_or_model_id: Either an ExportConfig or a HuggingFace model ID string.
+            If a string, uses default settings (macOS, 4bit compression).
+
+    Returns:
+        Path to the exported .aimodel file.
+    """
+    if isinstance(config_or_model_id, str):
+        config = ExportConfig(hf_model_id=config_or_model_id)
+    else:
+        config = config_or_model_id
+
+    return asyncio.run(_async_export_model(config))
+
+
+async def _async_export_model(config: ExportConfig) -> str:
+    """Async implementation of export_model."""
+    resolved = resolve_model(config)
+    entry, hf_config, model_type = resolved.entry, resolved.hf_config, resolved.model_type
+    target_dtype, max_context_length = resolved.target_dtype, resolved.max_context_length
 
     # Memory-efficient layer-by-layer loading + quantizer disk-checkpointing
     # is macOS-only for now. The iOS variant keeps the legacy full-RAM path
@@ -217,134 +442,7 @@ async def _async_export_model(config: ExportConfig) -> str:
     )
 
     with temp_dir_ctx as temp_dir:
-        if use_memory_efficient:
-            assert temp_dir is not None  # nullcontext yields None only when not memory-efficient
-            layer_mmap_dir = os.path.join(temp_dir, "layers")
-            os.makedirs(layer_mmap_dir, exist_ok=True)
-            model = model_class.from_hf_memory_efficient(
-                config.hf_model_id,
-                max_context_length=max_context_length,
-                target_dtype=target_dtype,
-                mmap_path=layer_mmap_dir,
-                num_layers=config.num_layers,
-                hf_config_attr=entry.hf_config_attr,
-                hf_state_dict_prefix=entry.hf_state_dict_prefix,
-            )
-        else:
-            model = model_class.from_hf(
-                config.hf_model_id,
-                max_context_length=max_context_length,
-                target_dtype=target_dtype,
-                num_layers=config.num_layers,
-                disable_embedding_quantization=config.disable_embedding_quantization,
-            )
-        model = model.eval()
-        # ---- 3. Resolve compression preset ----
-        if config.compression_config_object is not None:
-            torch_quantization_config, torch_palettization_config = split_compression_config(
-                config.compression_config_object
-            )
-        else:
-            preset = get_preset(config.compression)
-            torch_quantization_config = preset.get("torch_quantization_config")
-            torch_palettization_config = preset.get("torch_palettization_config")
-
-        assert not (
-            torch_quantization_config is not None and torch_palettization_config is not None
-        ), "Both a quantization and a palettization config were provided, this should never happen."
-
-        # ---- 3a. Pre-export torch quantization (if configured) ----
-        effective_max_ctx = max_context_length or getattr(
-            hf_config, "max_position_embeddings", TRACE_KV_CACHE_SEQ_LEN
-        )
-        vocab_size = hf_config.vocab_size
-        batch_size = 1
-        # Set when composite ops are marked for externalization before quantization.
-        externalized_model: torch.nn.Module | None = None
-        if torch_quantization_config is not None:
-            logger.info(f"Applying pre-export torch quantization (preset={config.compression})")
-
-            def get_calibration_data():  # type: ignore[no-untyped-def]
-                tokenizer = AutoTokenizer.from_pretrained(config.hf_model_id)
-                return get_c4(tokenizer)
-
-            # Copy so we don't mutate the shared preset.
-            quant_cfg = dict(torch_quantization_config)
-
-            # The preset or YAML is the source of truth; `--quantization-mode` overrides
-            # it only when given.
-            if config.quantization_mode is not None:
-                logger.warning(
-                    "Overriding execution_mode for `coreai-opt` compression with "
-                    f"{config.quantization_mode}"
-                )
-                quant_cfg["execution_mode"] = config.quantization_mode
-            elif "execution_mode" not in quant_cfg:
-                raise ValueError(
-                    f"Compression config '{config.compression}' does not set "
-                    "'execution_mode'. Set it there, or pass --quantization-mode "
-                    "{eager,graph}."
-                )
-
-            graph_mode = is_compression_mode_graph(quant_cfg)
-
-            quantizer_mmap_dir: str | None = None
-            # coreai-opt only supports mmap-backed finalization in eager mode.
-            if use_memory_efficient and not graph_mode:
-                assert temp_dir is not None
-                quantizer_mmap_dir = os.path.join(temp_dir, "quantized")
-                os.makedirs(quantizer_mmap_dir, exist_ok=True)
-
-            if graph_mode:
-                patch_model_for_externalization(model)
-                # externalization patches live on the eager module's composite op
-                # submodules but quantize_for_export in graph-mode below returns a
-                # new GraphModule which get overwritten to `model`.
-                # So, keep a handle on the eager module the composites were patched on,
-                # for the sub-export later.
-                externalized_model = model
-
-            model = quantize_for_export(
-                model,
-                hf_config,
-                target_dtype,
-                quant_cfg,
-                calibration_data_fn=get_calibration_data,
-                mmap_dir=quantizer_mmap_dir,
-            )
-
-        if torch_palettization_config is not None:
-            assert config.variant == "iOS", "palettization is only supported for iOS variant."
-
-            query_len = 8
-            input_ids = torch.randint(1, vocab_size, (batch_size, query_len), dtype=torch.int32)
-            position_ids = (
-                torch.arange(query_len).to(torch.uint16).unsqueeze(0).expand(batch_size, query_len)
-            )
-            in_step = torch.zeros((1,), dtype=torch.int32)
-            causal_mask = torch.zeros(1, effective_max_ctx, 1, query_len, dtype=torch.float16)
-            if hasattr(hf_config, "head_dim") and isinstance(hf_config.head_dim, int):
-                head_dim = hf_config.head_dim
-            else:
-                head_dim = hf_config.hidden_size // hf_config.num_attention_heads
-            key_cache = torch.zeros(
-                hf_config.num_hidden_layers,
-                1,  # batch_size
-                hf_config.num_key_value_heads * head_dim,
-                1,
-                effective_max_ctx,
-                dtype=torch.float16,
-            )
-            value_cache = key_cache.clone()
-            palettization_inputs = (
-                input_ids,
-                position_ids,
-                in_step,
-                causal_mask,
-                key_cache,
-                value_cache,
-            )
-            model = palettize_pytorch_model(model, palettization_inputs, torch_palettization_config)
+        model, externalized_model = build_model(resolved, temp_dir)
 
         # ---- 4. Variant-specific export ----
         if config.variant == "macOS":

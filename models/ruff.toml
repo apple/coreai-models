@@ -1,0 +1,2 @@
+# models/ is held to the same ruff rules as python/ (line length, rule set, isort).
+extend = "../python/pyproject.toml"

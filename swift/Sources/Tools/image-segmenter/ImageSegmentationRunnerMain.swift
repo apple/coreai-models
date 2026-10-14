@@ -181,14 +181,19 @@ struct ImageSegmenterCLI: AsyncParsableCommand {
         let cacheHit = PreparedModel.isCached(at: modelURL)
 
         if verbose { print("Creating image segmenter...") }
-        print("⏳ Preparing AI asset...", terminator: "")
+        print("⏳ Preparing AI asset from \(modelURL.lastPathComponent)...", terminator: "")
         fflush(stdout)
         let loadStart = ContinuousClock.now
         let runner = try await ImageSegmenter(resourcesAt: model)
         let loadElapsed = ContinuousClock.now - loadStart
         print(" done in \(String(format: "%.3f", loadElapsed.inSeconds))s\(cacheHit ? " (cache hit)" : "")")
 
-        let cgImage = try loadCGImage(from: imagePath)
+        let cgImage: CGImage
+        do {
+            cgImage = try CGImageUtils.load(from: imagePath)
+        } catch {
+            throw ValidationError("Cannot load image at \(imagePath)")
+        }
         if verbose { print("Loaded image: \(cgImage.width)×\(cgImage.height)") }
 
         let params = SegmentationParameters(maskThreshold: maskThreshold, maxSegments: maxSegments)
@@ -598,20 +603,6 @@ struct ImageSegmenterCLI: AsyncParsableCommand {
         return Float(10.0 * log10((peak * peak) / mse))
     }
 
-    private func cosineSimilarity(_ a: [Float], _ b: [Float]) -> Float {
-        guard a.count == b.count, !a.isEmpty else { return 0 }
-        var dot: Double = 0
-        var normA: Double = 0
-        var normB: Double = 0
-        for i in 0..<a.count {
-            dot += Double(a[i]) * Double(b[i])
-            normA += Double(a[i]) * Double(a[i])
-            normB += Double(b[i]) * Double(b[i])
-        }
-        let denom = (normA * normB).squareRoot()
-        return denom > 0 ? Float(dot / denom) : 0
-    }
-
     /// Return the leading slice of `ids` up to and including the first EOT
     /// (token id 49407) after position 0. Trailing pad tokens are excluded.
     /// If no EOT is found, returns the full sequence.
@@ -669,20 +660,6 @@ struct ImageSegmenterCLI: AsyncParsableCommand {
             ok: false
         )
     }
-}
-
-// MARK: - Helpers
-
-private func loadCGImage(from path: String) throws -> CGImage {
-    let expanded = NSString(string: path).expandingTildeInPath
-    let url = URL(fileURLWithPath: expanded)
-    guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
-        throw ValidationError("Cannot open image at \(path)")
-    }
-    guard let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
-        throw ValidationError("Cannot decode image at \(path)")
-    }
-    return cgImage
 }
 
 // MARK: - JSON output types
