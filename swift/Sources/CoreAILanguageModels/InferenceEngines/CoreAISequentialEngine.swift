@@ -125,6 +125,7 @@ public final class CoreAISequentialEngine: InferenceEngine, IdempotentEngine, @u
         let stateHandlers = try StateHandlerFactory.createSyncHandlers(
             descriptor: descriptor,
             maxContextLength: config.maxContextLength,
+            stateKinds: config.states,
             options: options
         )
         self.options = options
@@ -448,6 +449,7 @@ extension CoreAISequentialEngine {
         let stateHandlers = try StateHandlerFactory.createSyncHandlers(
             descriptor: functionDescriptor,
             maxContextLength: config.maxContextLength,
+            stateKinds: config.states,
             options: options)
         return GenerationSessionState(
             kvCache: stateHandlers.kvCache,
