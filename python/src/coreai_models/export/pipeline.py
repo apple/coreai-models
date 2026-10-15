@@ -268,8 +268,8 @@ def build_model(
     Args:
         temp_dir: Where macOS weights and quantizer checkpoints are disk-backed. None keeps
             them in RAM.
-        export_backend: The backend coreai-opt finalizes quantized weights for. None is
-            Core AI.
+        export_backend: The backend coreai-opt finalizes quantized or palettized weights for.
+            None is Core AI.
     """
     config, entry, model_class = resolved.config, resolved.entry, resolved.model_class
     hf_config, target_dtype = resolved.hf_config, resolved.target_dtype
@@ -394,7 +394,9 @@ def build_model(
             key_cache,
             value_cache,
         )
-        model = palettize_pytorch_model(model, palettization_inputs, torch_palettization_config)
+        model = palettize_pytorch_model(
+            model, palettization_inputs, torch_palettization_config, export_backend=export_backend
+        )
 
     return BuiltModel(model, externalized_model)
 

@@ -326,7 +326,7 @@ def palettize_pytorch_model(
     model: nn.Module,
     example_inputs: tuple,
     palettization_config: "dict | KMeansPalettizerConfig",
-    export_backend: ExportBackend = ExportBackend.CoreAI,
+    export_backend: object | None = None,
 ) -> nn.Module:
     """
     Palettize a PyTorch model using post-training palettization with coreai-opt.
@@ -339,6 +339,7 @@ def palettize_pytorch_model(
             inner shape coreai-opt expects under `kmeans_palettization_config`)
             or a prebuilt KMeansPalettizerConfig instance.
         export_backend: Backend for the finalized palettized model.
+            Defaults to ExportBackend.CoreAI if not specified.
 
     Returns:
         Palettized model ready for export.
@@ -347,6 +348,9 @@ def palettize_pytorch_model(
         ImportError: If coreai-opt is not installed.
     """
     _require_coreai_opt()
+
+    if export_backend is None:
+        export_backend = ExportBackend.CoreAI
 
     logger.info("Palettizing model with coreai-opt")
 
