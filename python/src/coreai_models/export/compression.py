@@ -326,7 +326,7 @@ def palettize_pytorch_model(
     model: nn.Module,
     example_inputs: tuple,
     palettization_config: "dict | KMeansPalettizerConfig",
-    export_backend: object | None = None,
+    export_backend: ExportBackend | None = None,
 ) -> nn.Module:
     """
     Palettize a PyTorch model using post-training palettization with coreai-opt.
