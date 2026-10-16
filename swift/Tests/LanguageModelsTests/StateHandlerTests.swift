@@ -92,6 +92,87 @@ struct StateKindTests {
     }
 }
 
+// MARK: - State Classification Tests
+
+@Suite("StateHandlerFactory.inferKind Tests")
+struct InferKindTests {
+    @Test(
+        "states classify by shape and name",
+        arguments: [
+            ("keyCache", [28, 1, 8, -1, 128], StateKind.kvCache),
+            // A 1024-context export pins the cache at the full context: still a KV cache.
+            ("valueCache", [28, 1, 8, 1024, 128], .kvCache),
+            ("slidingKeyCache", [20, 1, 8, 512, 128], .slidingCache),
+            ("convState", [24, 1, 4, 2048], .fixed),
+        ])
+    func classify(state: (String, [Int], StateKind)) {
+        #expect(StateHandlerFactory.inferKind(name: state.0, shape: state.1) == state.2)
+    }
+}
+
+// MARK: - Sliding Ring Write-First Guard Tests
+
+@Suite("Sliding ring write-first guard Tests")
+struct WriteFirstGuardTests {
+    @Test("ring capacity is the smallest sliding sequence dim")
+    func ringCapacity() {
+        #expect(StateHandlerFactory.ringCapacity(shapes: []) == nil)
+        #expect(
+            StateHandlerFactory.ringCapacity(shapes: [[20, 1, 8, 512, 128], [20, 1, 8, 256, 128]]) == 256)
+    }
+
+    @Test(
+        "a step evicts only with more than one token ending past the ring",
+        arguments: [
+            (10_000, 1, false),  // single token: never
+            (0, 512, false),  // exactly fills the ring
+            (0, 513, true),  // one past
+            (512, 2, true),
+        ])
+    func evicts(step: (offset: Int, queryLength: Int, evicts: Bool)) {
+        #expect(
+            StateHandlerFactory.writeFirstStepEvicts(
+                offset: step.offset, queryLength: step.queryLength, ringCapacity: 512) == step.evicts)
+    }
+
+    @Test("check throws only with a ring and an evicting step")
+    func check() throws {
+        try StateHandlerFactory.checkWriteFirstStep(offset: 4096, queryLength: 64, ringCapacity: nil)
+        try StateHandlerFactory.checkWriteFirstStep(offset: 0, queryLength: 64, ringCapacity: 512)
+        #expect(throws: InferenceRuntimeError.self) {
+            try StateHandlerFactory.checkWriteFirstStep(offset: 480, queryLength: 64, ringCapacity: 512)
+        }
+    }
+}
+
+@Suite("Sliding ring rewind Tests")
+struct RingRewindTests {
+    @Test("without a ring any rewind is safe; after a wrap the one-token re-feed is too")
+    func examples() {
+        #expect(StateHandlerFactory.ringRewindIsSafe(from: 5000, to: 10, ringCapacity: nil))
+        // The `commonPrefix -= 1` re-feed rewrites the newest position in its own slot.
+        #expect(StateHandlerFactory.ringRewindIsSafe(from: 5000, to: 4999, ringCapacity: 1024))
+        #expect(!StateHandlerFactory.ringRewindIsSafe(from: 5000, to: 4998, ringCapacity: 1024))
+    }
+
+    @Test("matches a slot-by-slot simulation")
+    func simulation() {
+        let ring = 8
+        for processed in 0...24 {
+            for target in 0...processed {
+                // Slot s holds the newest position p < processed with p % ring == s.
+                var slot = [Int](repeating: -1, count: ring)
+                for p in 0..<processed { slot[p % ring] = p }
+                // The query at `target` reads positions [target - ring + 1, target).
+                let readsOK = (max(0, target - ring + 1)..<target).allSatisfy { slot[$0 % ring] == $0 }
+                #expect(
+                    StateHandlerFactory.ringRewindIsSafe(from: processed, to: target, ringCapacity: ring)
+                        == readsOK, "processed=\(processed) target=\(target)")
+            }
+        }
+    }
+}
+
 // MARK: - Protocol Conformance Tests
 
 @Suite("StateHandler Conformance Tests")

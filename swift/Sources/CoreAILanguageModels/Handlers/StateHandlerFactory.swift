@@ -27,13 +27,16 @@ struct SyncStateHandlerSet {
     /// True when ALL states are sliding caches (ring buffer model).
     /// The engine uses compact position_ids [offset, ..., offset+queryLen-1] instead of [0, ..., N-1].
     var isAllSlidingCache: Bool
+    /// Capacity of the sliding (ring) caches, nil when there are none (hybrid or pure-ring).
+    var slidingRingCapacity: Int?
 }
 
 /// Creates state handlers from a model's function descriptor.
 ///
 /// Classification priority:
 /// 1. Explicit metadata (`"states"` field in metadata.json) — preferred
-/// 2. Shape-based heuristic — dynamic dim → kvCache, static + "cache" in name → slidingCache, else → fixed
+/// 2. Shape-based heuristic — dynamic dim → kvCache, static + "sliding" in name → slidingCache,
+///    static + "cache"/"kv" in name → kvCache (fixed capacity), else → fixed
 enum StateHandlerFactory {
     /// Classify states using metadata or heuristic fallback.
     static func classifyStates(
@@ -85,13 +88,24 @@ enum StateHandlerFactory {
         guard case .ndArray(let desc) = descriptor.stateDescriptor(of: name) else {
             return .fixed
         }
-        let hasDynamicDim = desc.shape.contains(where: { $0 < 0 })
-        if hasDynamicDim {
+        return inferKind(name: name, shape: desc.shape)
+    }
+
+    /// Infer state kind from a state's name and shape (negative entries are dynamic dims).
+    ///
+    /// A static-shape cache is only a ring buffer when its name says so: an export whose
+    /// context fits the trace-time cache length pins `keyCache`/`valueCache` to the full
+    /// context, and those are still regular KV caches.
+    static func inferKind(name: String, shape: [Int]) -> StateKind {
+        if shape.contains(where: { $0 < 0 }) {
             return .kvCache
         }
         let lower = name.lowercased()
-        if lower.contains("cache") || lower.contains("kv") {
+        if lower.contains("sliding") {
             return .slidingCache
+        }
+        if lower.contains("cache") || lower.contains("kv") {
+            return .kvCache
         }
         return .fixed
     }
@@ -196,7 +210,59 @@ enum StateHandlerFactory {
             kvCache: kvCache,
             additionalStates: additionalStates,
             hasNonTruncatableStates: hasNonTruncatable,
-            isAllSlidingCache: classified.allSatisfy { $0.kind == .slidingCache }
+            isAllSlidingCache: classified.allSatisfy { $0.kind == .slidingCache },
+            slidingRingCapacity: slidingRingCapacity(classified: classified, descriptor: descriptor)
         )
+    }
+
+    // MARK: - Sliding Ring Write-First Guard
+
+    /// Capacity of the sliding (ring) states, nil when there are none.
+    static func slidingRingCapacity(
+        classified: [(name: String, kind: StateKind)], descriptor: InferenceFunctionDescriptor
+    ) -> Int? {
+        let shapes = classified.filter { $0.kind == .slidingCache }.compactMap { state -> [Int]? in
+            guard case .ndArray(let desc) = descriptor.stateDescriptor(of: state.name) else { return nil }
+            return desc.shape
+        }
+        return ringCapacity(shapes: shapes)
+    }
+
+    /// Ring capacity from sliding-state shapes `[layers, batch, heads, seq, head_dim]`.
+    static func ringCapacity(shapes: [[Int]]) -> Int? {
+        shapes.compactMap { $0.count >= 2 && $0[$0.count - 2] > 0 ? $0[$0.count - 2] : nil }.min()
+    }
+
+    /// Whether a write-first `main` step evicts ring history its own earlier queries attend to.
+    ///
+    /// Write-first stores the step's keys before attention, so the ring then holds positions
+    /// `[offset + queryLength - capacity, offset + queryLength)`. Query 0 needs
+    /// `[offset - capacity + 1, offset]`, so it loses keys exactly when the step has more than
+    /// one token and ends past the ring. Assumes the window equals the ring capacity.
+    static func writeFirstStepEvicts(offset: Int, queryLength: Int, ringCapacity: Int) -> Bool {
+        queryLength > 1 && offset + queryLength > ringCapacity
+    }
+
+    /// Throws when a write-first `main` step would evict in-window ring history.
+    static func checkWriteFirstStep(offset: Int, queryLength: Int, ringCapacity: Int?) throws {
+        guard let ringCapacity,
+            writeFirstStepEvicts(offset: offset, queryLength: queryLength, ringCapacity: ringCapacity)
+        else { return }
+        throw InferenceRuntimeError.invalidState(
+            "Sliding-window model: a \(queryLength)-token step at position \(offset) on the "
+                + "write-first 'main' graph would evict ring history (capacity \(ringCapacity)). "
+                + "Past the ring, only single-token steps are correct on 'main'.")
+    }
+
+    /// Whether rewinding from `processed` tokens to `target` leaves intact the ring slots the
+    /// query at `target` reads.
+    ///
+    /// After `processed` writes the ring holds positions `[processed - capacity, processed)`,
+    /// while the query at `target` reads `[target - capacity + 1, target)`. Slots for positions
+    /// below `processed - capacity` now hold later tokens, so the rewind is unsafe once the ring
+    /// has wrapped and the rewind spans two or more tokens.
+    static func ringRewindIsSafe(from processed: Int, to target: Int, ringCapacity: Int?) -> Bool {
+        guard let ringCapacity, target > 0 else { return true }
+        return processed <= ringCapacity || processed - target <= 1
     }
 }

@@ -45,6 +45,15 @@ public final class CoreAISequentialEngine: InferenceEngine, IdempotentEngine, @u
     // no logits, so the last prompt token still goes through `function`.
     private let prefillFunction: InferenceFunction?
 
+    // Ring capacity when a sliding-window (ring) KV state is present. `function` writes the
+    // ring before attending, so a multi-token step past the ring would silently evict history
+    // its earlier queries still need; `processTokenBatch` refuses it. Prefill chunks also
+    // break at ring boundaries so no single ring write runs past the last slot.
+    private let slidingRingCapacity: Int?
+
+    // Whether the single-token fallback past the ring has been logged (see `runMainSteps`).
+    private var loggedRingSingleSteps = false
+
     // I/O names from descriptor
     private let logitsName: String
 
@@ -129,6 +138,7 @@ public final class CoreAISequentialEngine: InferenceEngine, IdempotentEngine, @u
             options: options
         )
         self.options = options
+        self.slidingRingCapacity = stateHandlers.slidingRingCapacity
         self.session = GenerationSessionState(
             kvCache: stateHandlers.kvCache,
             additionalStates: stateHandlers.additionalStates,
@@ -241,6 +251,10 @@ public final class CoreAISequentialEngine: InferenceEngine, IdempotentEngine, @u
             throw InferenceRuntimeError.invalidState("Cannot process empty token batch")
         }
 
+        try StateHandlerFactory.checkWriteFirstStep(
+            offset: sessionState.processedTokenCount, queryLength: batchSize,
+            ringCapacity: slidingRingCapacity)
+
         _ = try sessionState.kvCache.ensureCapacity(
             forContextLength: sessionState.processedTokenCount + batchSize)
 
@@ -318,6 +332,14 @@ public final class CoreAISequentialEngine: InferenceEngine, IdempotentEngine, @u
         // held back and the trailing chunk carries the logits.
         let heldBack = prefillHeldBackTokens(hasPrefillGraph: prefillFunction != nil)
 
+        // Without a prefill graph every chunk runs on write-first `main`; past a sliding ring
+        // only single-token steps are correct there.
+        if prefillFunction == nil, slidingRingCapacity != nil {
+            let logits = try await runMainSteps(
+                tokens, chunkSize: chunkSize, keepAllLogits: false, sessionState: sessionState)
+            return lastTokenLogits(from: logits, vocabSize: config.vocabSize)
+        }
+
         let chunkSignpost = InstrumentsProfiler.beginCustomInterval(
             name: "CoreAIClean Chunked Prefill",
             details: "\(tokens.count) tokens, chunkSize \(chunkSize)"
@@ -333,7 +355,9 @@ public final class CoreAISequentialEngine: InferenceEngine, IdempotentEngine, @u
             tokens: tokens,
             chunkSize: chunkSize,
             heldBack: heldBack,
-            vocabSize: config.vocabSize
+            vocabSize: config.vocabSize,
+            startOffset: sessionState.processedTokenCount,
+            ringCapacity: slidingRingCapacity
         ) { chunk, isHeldBack in
             // Held-back tail (and every chunk when there is no prefill graph) runs through
             // `main` for logits; earlier chunks fill the KV cache via the prefill graph.
@@ -352,19 +376,44 @@ public final class CoreAISequentialEngine: InferenceEngine, IdempotentEngine, @u
         chunkSize: Int,
         sessionState: GenerationSessionState
     ) async throws -> [LogitsScalarType] {
-        var allLogits: [LogitsScalarType] = []
-        var remainingTokens = tokens
+        try await runMainSteps(tokens, chunkSize: chunkSize, keepAllLogits: true, sessionState: sessionState)
+    }
 
-        while !remainingTokens.isEmpty {
-            let currentChunkSize = min(chunkSize, remainingTokens.count)
-            let chunkEnd = remainingTokens.startIndex + currentChunkSize
-            let chunk = remainingTokens[remainingTokens.startIndex..<chunkEnd]
-            let chunkLogits = try await processTokenBatch(chunk, sessionState: sessionState)
-            allLogits.append(contentsOf: chunkLogits)
-            remainingTokens = remainingTokens[chunkEnd...]
+    /// Run `tokens` through `main` in steps from `mainGraphStepSizes`, returning every
+    /// position's logits (`keepAllLogits`) or just the last step's.
+    private func runMainSteps(
+        _ tokens: ArraySlice<Int32>,
+        chunkSize: Int,
+        keepAllLogits: Bool,
+        sessionState: GenerationSessionState
+    ) async throws -> [LogitsScalarType] {
+        let startOffset = sessionState.processedTokenCount
+        if let ring = slidingRingCapacity, chunkSize > 1, startOffset + tokens.count > ring,
+            !loggedRingSingleSteps
+        {
+            loggedRingSingleSteps = true
+            CLILogger.log(
+                "Sliding-window model: positions past the \(ring)-slot ring run one token per "
+                    + "step on 'main' to keep logits correct (slower)")
         }
 
-        return allLogits
+        var logits: [LogitsScalarType] = []
+        var remaining = tokens
+        for size in mainGraphStepSizes(
+            tokenCount: tokens.count, chunkSize: chunkSize, startOffset: startOffset,
+            ringCapacity: slidingRingCapacity)
+        {
+            let end = remaining.startIndex + size
+            let stepLogits = try await processTokenBatch(
+                remaining[remaining.startIndex..<end], sessionState: sessionState)
+            if keepAllLogits {
+                logits.append(contentsOf: stepLogits)
+            } else {
+                logits = stepLogits
+            }
+            remaining = remaining[end...]
+        }
+        return logits
     }
 
     // MARK: - Generate (primary API)
@@ -411,6 +460,13 @@ public final class CoreAISequentialEngine: InferenceEngine, IdempotentEngine, @u
             throw InferenceRuntimeError.invalidState(
                 "Partial reset is not supported for hybrid models with recurrent state. "
                     + "Use reset(to: 0) and replay the prefix.")
+        }
+        if !StateHandlerFactory.ringRewindIsSafe(
+            from: session.processedTokenCount, to: tokenIndex, ringCapacity: slidingRingCapacity)
+        {
+            throw InferenceRuntimeError.invalidState(
+                "Partial reset to \(tokenIndex) would read sliding-ring slots that have been "
+                    + "overwritten. Use reset(to: 0) and replay the prefix.")
         }
         tokenBox.cancelActive()
         internalReset(to: tokenIndex, sessionState: session)
@@ -481,7 +537,8 @@ extension CoreAISequentialEngine {
                 historyCount: sessionState.history.count,
                 processedTokenCount: sessionState.processedTokenCount,
                 inputCount: input.count,
-                hasNonTruncatableStates: sessionState.hasNonTruncatableStates
+                hasNonTruncatableStates: sessionState.hasNonTruncatableStates,
+                ringCapacity: slidingRingCapacity
             )
             if let resetTo = plan.resetTo {
                 internalReset(to: resetTo, sessionState: sessionState)
@@ -514,7 +571,8 @@ extension CoreAISequentialEngine {
         historyCount: Int,
         processedTokenCount: Int,
         inputCount: Int,
-        hasNonTruncatableStates: Bool
+        hasNonTruncatableStates: Bool,
+        ringCapacity: Int? = nil
     ) -> (resetTo: Int?, prefixHitCount: Int) {
         if hasNonTruncatableStates {
             // Hybrid model: recurrent state can't be partially rewound.
@@ -528,7 +586,15 @@ extension CoreAISequentialEngine {
             return (0, commonPrefix)
         } else if processedTokenCount >= inputCount {
             // Pure extension: all input tokens match history. Rewind for seeding.
-            return (Swift.max(0, commonPrefix - 1), commonPrefix)
+            let target = Swift.max(0, commonPrefix - 1)
+            guard
+                StateHandlerFactory.ringRewindIsSafe(
+                    from: processedTokenCount, to: target, ringCapacity: ringCapacity)
+            else {
+                // The ring has overwritten slots the rewound position reads: replay.
+                return (0, 0)
+            }
+            return (target, commonPrefix)
         } else {
             return (nil, commonPrefix)
         }
@@ -664,8 +730,8 @@ extension CoreAISequentialEngine.GenerationSequence {
                     allLogits = try await engine.processChunkedPromptAllLogits(
                         tokens: allTokens[...], chunkSize: chunkSize, sessionState: sessionState)
                 case .wholeBatch:
-                    allLogits = try await engine.processTokenBatch(
-                        allTokens[...], sessionState: sessionState)
+                    allLogits = try await engine.processChunkedPromptAllLogits(
+                        tokens: allTokens[...], chunkSize: allTokens.count, sessionState: sessionState)
                 case .oneAtATime:
                     var collected: [LogitsScalarType] = []
                     for j in allTokens.indices {
@@ -719,8 +785,9 @@ extension CoreAISequentialEngine.GenerationSequence {
                     logitBuffer = try await engine.processChunkedPrompt(
                         tokens: newTokens, chunkSize: chunkSize, sessionState: sessionState)
                 case .wholeBatch:
-                    let allLogits = try await engine.processTokenBatch(
-                        newTokens, sessionState: sessionState)
+                    let allLogits = try await engine.runMainSteps(
+                        newTokens, chunkSize: newTokens.count, keepAllLogits: false,
+                        sessionState: sessionState)
                     logitBuffer = lastTokenLogits(from: allLogits, vocabSize: engine.config.vocabSize)
                 case .oneAtATime:
                     var lastLogits: [LogitsScalarType] = []
