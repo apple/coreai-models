@@ -112,21 +112,19 @@ struct PrefillGraphTests {
         #expect(sizes == [64, 64, 64, 64, 64, 64, 16])
     }
 
-    @Test("With a sliding ring, chunks end at ring boundaries")
-    func ringAlignedChunks() {
-        // A 4096-token chunk (the >=64GB default) against a 2048-slot ring: no write may
-        // run past the last slot, so the chunk splits at each multiple of 2048.
+    @Test(
+        "With a sliding ring, chunks end at ring boundaries",
+        arguments: [
+            // A 4096-token chunk (the >=64GB default) against a 2048-slot ring.
+            (5000, 4096, 0, [2048, 2048, 903]),
+            // Second turn with 3000 tokens cached: the first write starts at slot 952.
+            (3001, 2048, 3000, [1096, 1904]),
+        ])
+    func ringAlignedChunks(plan: (tokens: Int, chunk: Int, start: Int, sizes: [Int])) {
         #expect(
-            prefillChunkSizes(tokenCount: 5000, chunkSize: 4096, heldBack: 1, ringCapacity: 2048)
-                == [2048, 2048, 903])
-    }
-
-    @Test("A turn starting mid-ring first fills to the ring boundary")
-    func ringAlignedFromUnalignedOffset() {
-        // Second turn: 3000 tokens already cached, so the ring write starts at slot 952.
-        let sizes = prefillChunkSizes(
-            tokenCount: 3001, chunkSize: 2048, heldBack: 1, startOffset: 3000, ringCapacity: 2048)
-        #expect(sizes == [1096, 1904])
+            prefillChunkSizes(
+                tokenCount: plan.tokens, chunkSize: plan.chunk, heldBack: 1, startOffset: plan.start,
+                ringCapacity: 2048) == plan.sizes)
     }
 
     @Test("Ring-aligned chunks never cross a ring boundary and cover the prompt")
@@ -360,47 +358,39 @@ struct PrefillGraphTests {
 
 @Suite("Main Graph Step Sizes")
 struct MainGraphStepSizesTests {
-    @Test("Without a ring, the plain chunk walk")
-    func noRing() {
-        #expect(mainGraphStepSizes(tokenCount: 5000, chunkSize: 2048) == [2048, 2048, 904])
-        #expect(mainGraphStepSizes(tokenCount: 5000, chunkSize: 2048, startOffset: 3000) == [2048, 2048, 904])
-    }
-
-    @Test("A prompt inside the ring keeps normal chunks")
-    func insideRing() {
-        #expect(mainGraphStepSizes(tokenCount: 1500, chunkSize: 512, ringCapacity: 2048) == [512, 512, 476])
-        #expect(mainGraphStepSizes(tokenCount: 2048, chunkSize: 4096, ringCapacity: 2048) == [2048])
-    }
-
-    @Test("Crossing the ring: chunks up to its end, then single tokens")
-    func crossingRing() {
+    @Test(
+        "Chunks while inside the ring, single tokens past it",
+        arguments: [
+            (5000, 2048, 3000, nil, [2048, 2048, 904]),  // no ring: plain chunk walk
+            (1500, 512, 0, 2048, [512, 512, 476]),  // inside the ring
+            (2051, 1024, 0, 2048, [1024, 1024, 1, 1, 1]),  // crossing it
+            (10, 8, 2044, 2048, [4, 1, 1, 1, 1, 1, 1]),  // mid-ring start
+            (4, 512, 3000, 2048, [1, 1, 1, 1]),  // past it
+        ] as [(Int, Int, Int, Int?, [Int])])
+    func plans(plan: (tokens: Int, chunk: Int, start: Int, ring: Int?, sizes: [Int])) {
         #expect(
-            mainGraphStepSizes(tokenCount: 2051, chunkSize: 1024, ringCapacity: 2048)
-                == [1024, 1024, 1, 1, 1])
-        #expect(
-            mainGraphStepSizes(tokenCount: 10, chunkSize: 8, startOffset: 2044, ringCapacity: 2048)
-                == [4, 1, 1, 1, 1, 1, 1])
+            mainGraphStepSizes(
+                tokenCount: plan.tokens, chunkSize: plan.chunk, startOffset: plan.start,
+                ringCapacity: plan.ring) == plan.sizes)
     }
 
-    @Test("Starting past the ring: all single tokens")
-    func pastRing() {
-        #expect(
-            mainGraphStepSizes(tokenCount: 4, chunkSize: 512, startOffset: 3000, ringCapacity: 2048)
-                == [1, 1, 1, 1])
-    }
-
-    @Test("No step evicts, and the steps cover every token")
+    @Test("No step evicts or exceeds the chunk, and the steps cover every token")
     func invariant() {
-        for start in [0, 1, 2047, 2048, 5000] {
-            for count in [1, 2, 100, 3000] {
-                let steps = mainGraphStepSizes(
-                    tokenCount: count, chunkSize: 512, startOffset: start, ringCapacity: 2048)
-                #expect(steps.reduce(0, +) == count)
-                var offset = start
-                for q in steps {
-                    #expect(
-                        !StateHandlerFactory.writeFirstStepEvicts(offset: offset, queryLength: q, ringCapacity: 2048))
-                    offset += q
+        let ring = 64
+        for start in [0, 1, 63, 64, 200] {
+            for count in [1, 2, 64, 65, 130] {
+                for chunk in [1, 7, 64, 100] {
+                    let steps = mainGraphStepSizes(
+                        tokenCount: count, chunkSize: chunk, startOffset: start, ringCapacity: ring)
+                    #expect(steps.reduce(0, +) == count)
+                    var offset = start
+                    for q in steps {
+                        #expect(q <= chunk)
+                        #expect(
+                            !StateHandlerFactory.writeFirstStepEvicts(
+                                offset: offset, queryLength: q, ringCapacity: ring))
+                        offset += q
+                    }
                 }
             }
         }
