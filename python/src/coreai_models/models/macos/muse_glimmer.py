@@ -317,6 +317,9 @@ class MuseGlimmerForCausalLM(BaseForCausalLM):
 
     # Emit a second, prefill-only ``prefill`` entrypoint beside ``main``.
     exports_prefill_graph = True
+    # A flattened module derives ``prefill`` by trimming ``main``, which writes the ring
+    # before attending; the ring needs prefill traced on its own (read before write).
+    supports_graph_quantization = False
 
     @classmethod
     def _get_reauthored_config(cls, hf_config, max_context_length=None, num_layers=None):
