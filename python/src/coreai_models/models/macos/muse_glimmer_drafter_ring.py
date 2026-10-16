@@ -13,6 +13,11 @@ Architecture:
 - No gated attention, no sandwich norms
 - Shares embed_tokens and lm_head with the target model
 - Ring buffer KV cache with explicit attention mask
+
+Sliding attention is read-before-write: each step concatenates the incoming
+K/V onto the cached window, attends over ``window_size + query_len`` keys, and
+only then writes into the ring. Writing first would let a multi-token prefill
+chunk evict window history that its own earliest queries still need.
 """
 
 import gc
@@ -38,7 +43,7 @@ from coreai_models.models.base import (
     _load_tensors_for_keys,
     _resolve_safetensors_files,
 )
-from coreai_models.primitives.macos.cache import RingKVCache, ring_window_causal_mask
+from coreai_models.primitives.macos.cache import RingKVCache, concat_window_causal_mask
 from coreai_models.primitives.macos.mlp import MLP
 from coreai_models.primitives.macos.rms_norm import RMSNorm
 from coreai_models.primitives.macos.rope import RoPE
@@ -111,15 +116,23 @@ class Attention(nn.Module):
         key = self.rope(key, position_ids=rope_positions, freqs=freqs)
 
         if cache is not None:
-            key, value = cache.update_and_fetch(
-                self.layer_idx, offset, key, value, query_len=query_len
-            )
+            # Read-before-write: attend over [cached window ++ new K/V], then
+            # write. Writing first would let this chunk's own K/V evict the
+            # oldest query_len - 1 in-window positions that its earliest
+            # queries still need.
+            attn_key, attn_value = cache.fetch_and_concat(self.layer_idx, key, value)
+        else:
+            attn_key, attn_value = key, value
 
         attn_output = (
-            self.sdpa(query=query, key=key, value=value, attn_mask=attn_mask)
+            self.sdpa(query=query, key=attn_key, value=attn_value, attn_mask=attn_mask)
             .permute(0, 2, 1, 3)
             .reshape(batch_size, query_len, self.n_heads * self.head_dim)
         )
+
+        if cache is not None:
+            cache.update(self.layer_idx, offset, key, value, query_len=query_len)
+
         return self.o_proj(attn_output)
 
 
@@ -175,7 +188,7 @@ class DrafterRingModel(nn.Module):
         h = h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + self.config.rms_norm_eps)
 
         if cache is not None:
-            attn_mask = ring_window_causal_mask(
+            attn_mask = concat_window_causal_mask(
                 query_len=query_len,
                 capacity=cache.capacity(),
                 offset=offset,

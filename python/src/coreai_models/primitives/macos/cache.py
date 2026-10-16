@@ -295,7 +295,10 @@ def ring_window_causal_mask(
     """Sliding-window causal mask for a ring-buffer KV cache.
 
     Reconstructs each slot's absolute position from the ring layout and applies
-    causal + window + validity predicates. Companion to RingKVCache.
+    causal + window + validity predicates. Companion to
+    :meth:`RingKVCache.update_and_fetch`, i.e. the new K/V is assumed to be
+    already written into the ring. Only correct for ``query_len == 1``; for
+    multi-token steps use :func:`concat_window_causal_mask` instead.
 
     Args:
         query_len: number of query positions in this forward call
@@ -328,12 +331,80 @@ def ring_window_causal_mask(
     return causal & in_window & nonneg
 
 
+def concat_window_causal_mask(
+    query_len: int,
+    capacity: int,
+    offset: int,
+    window_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Sliding-window causal mask for ``[cached ring window ++ new keys]``.
+
+    Companion to :meth:`RingKVCache.fetch_and_concat`. Unlike
+    :func:`ring_window_causal_mask` -- which describes the ring *after* the new
+    K/V has been written into it -- this describes the key layout *before* the
+    write: ``capacity`` ring slots holding positions ``< offset``, followed by
+    the ``query_len`` new keys at positions ``offset .. offset + query_len - 1``.
+
+    Reading the ring before overwriting it is what makes a multi-token step
+    correct. With a write-first ring the chunk's own K/V evicts the oldest
+    ``query_len - 1`` positions of the window, which the earliest queries in the
+    same chunk still need to attend to.
+
+    Args:
+        query_len: number of query positions in this forward call
+        capacity: ring buffer size (number of physical slots)
+        offset: absolute position of the first query token
+        window_size: sliding window size (typically == capacity)
+        device: target device
+
+    Returns:
+        Boolean mask [query_len, capacity + query_len] — True means "attend
+        to this key". Columns ``[0, capacity)`` index ring slots, columns
+        ``[capacity, capacity + query_len)`` index the new keys in order.
+    """
+    row = torch.arange(query_len, device=device)
+    q_pos = row.unsqueeze(-1) + offset  # (query_len, 1)
+
+    # --- cached ring slots -------------------------------------------------
+    # The newest position already in the ring is offset - 1. Reconstruct each
+    # slot's absolute position by walking backwards from it, same trick as
+    # ring_window_causal_mask (no tensor aten.remainder). Adding `capacity`
+    # keeps the modulo operand non-negative when offset == 0.
+    slot = torch.arange(capacity, device=device)  # (capacity,)
+    last_pos = offset - 1
+    r = (offset + capacity - 1) % capacity  # == last_pos % capacity
+    diff = r - slot  # (capacity,), range (-capacity, capacity)
+    ring_back = torch.where(diff >= 0, diff, diff + capacity)
+    k_pos = (last_pos - ring_back).unsqueeze(0)  # (1, capacity)
+
+    # Causality is implicit here: every cached position is < offset <= q_pos.
+    # Slots not yet written reconstruct to a negative position — drop those.
+    ring_mask = ((q_pos - k_pos) < window_size) & (k_pos >= 0)
+
+    # --- new keys ----------------------------------------------------------
+    new_pos = (row + offset).unsqueeze(0)  # (1, query_len)
+    new_mask = (new_pos <= q_pos) & ((q_pos - new_pos) < window_size)
+
+    return torch.cat([ring_mask, new_mask], dim=-1)
+
+
 class RingKVCache:
     """Ring-buffer KV cache for sliding window attention layers.
 
     Fixed-size cache [n_layers, 1, n_kv_heads, capacity, head_dim] that writes
-    at position % capacity and never grows. Use ring_window_causal_mask() to
-    build the attention mask.
+    at position % capacity and never grows.
+
+    Two usage patterns:
+
+    * ``fetch_and_concat`` -> attention -> ``update`` (read-before-write).
+      Attends over ``capacity + query_len`` keys with
+      :func:`concat_window_causal_mask`. Correct for any ``query_len``, since
+      the incoming K/V cannot evict history the same step still needs.
+    * ``update_and_fetch`` -> attention (write-before-read). Attends over
+      ``capacity`` keys with :func:`ring_window_causal_mask`. Cheaper, but only
+      correct for ``query_len == 1``: a multi-token chunk overwrites the oldest
+      ``query_len - 1`` in-window positions before reading them.
     """
 
     def __init__(self, k_cache: torch.Tensor, v_cache: torch.Tensor) -> None:
@@ -343,21 +414,43 @@ class RingKVCache:
     def capacity(self) -> int:
         return self._k_cache.shape[3]
 
-    def update_and_fetch(
+    def fetch_and_concat(
+        self,
+        layer_idx: int,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return this layer's cached window with ``k``/``v`` appended.
+
+        Does not mutate the cache — call :meth:`update` after attention. The
+        returned tensors have seq length ``capacity + k.size(-2)`` and pair with
+        a :func:`concat_window_causal_mask` of matching width.
+        """
+        torch._check_is_size(layer_idx)
+        torch._check(layer_idx < self._k_cache.size(0))
+
+        cached_k = self._k_cache.narrow(0, layer_idx, 1).squeeze(0)
+        cached_v = self._v_cache.narrow(0, layer_idx, 1).squeeze(0)
+        # torch.cat copies, so the results do not alias the cache and stay
+        # valid across the subsequent update().
+        return torch.cat([cached_k, k], dim=-2), torch.cat([cached_v, v], dim=-2)
+
+    def update(
         self,
         layer_idx: int,
         offset: int,
         k: torch.Tensor,
         v: torch.Tensor,
         query_len: int | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Write K/V at ring position, return full cache for this layer.
+    ) -> None:
+        """Write K/V into this layer's ring slots starting at ``offset % capacity``.
 
         The write must not wrap around the ring boundary, i.e.
-        ``(offset % capacity) + query_len <= capacity`` must hold.
-        Decode (query_len=1) always satisfies this. For chunked prefill,
-        choose chunk sizes that align to the capacity boundary (e.g.
-        capacity // 2) so that no single chunk straddles the wrap point.
+        ``(offset % capacity) + query_len <= capacity`` must hold. Decode
+        (query_len=1) always satisfies this. For chunked prefill, choose a chunk
+        size that divides ``capacity`` (e.g. ``capacity // 2``) so that no chunk
+        straddles the wrap point. The bound cannot be branched on here because
+        ``offset`` is a symint under ``torch.export``.
 
         Raises:
             RuntimeError: If the write would wrap around the ring buffer.
@@ -401,6 +494,23 @@ class RingKVCache:
                 ),
             )
 
+    def update_and_fetch(
+        self,
+        layer_idx: int,
+        offset: int,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        query_len: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Write K/V at the ring position, then return the full cache for this layer.
+
+        Only correct for ``query_len == 1`` — see the class docstring. Prefer
+        :meth:`fetch_and_concat` + :meth:`update` for multi-token steps.
+
+        Raises:
+            RuntimeError: If the write would wrap around the ring buffer.
+        """
+        self.update(layer_idx, offset, k, v, query_len=query_len)
         k_out = self._k_cache.narrow(0, layer_idx, 1).squeeze(0)
         v_out = self._v_cache.narrow(0, layer_idx, 1).squeeze(0)
         return k_out, v_out

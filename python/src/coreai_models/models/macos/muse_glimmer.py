@@ -18,6 +18,11 @@ Meta's 30B on-device agentic model (Apache 2.0). Architecture features:
 KV cache: split into sliding (ring buffer, fixed size) and global (growing).
 Sliding layers use RingKVCache at window_size capacity; global layers use
 standard KVCache with dynamic sequence length.
+
+Sliding attention is read-before-write: each step concatenates the incoming
+K/V onto the cached window, attends over ``window_size + query_len`` keys, and
+only then writes into the ring. Writing first would let a multi-token prefill
+chunk evict window history that its own earliest queries still need.
 """
 
 import gc
@@ -44,7 +49,7 @@ from coreai_models.models.base import (
     _load_tensors_for_keys,
     _resolve_safetensors_files,
 )
-from coreai_models.primitives.macos.cache import KVCache, RingKVCache, ring_window_causal_mask
+from coreai_models.primitives.macos.cache import KVCache, RingKVCache, concat_window_causal_mask
 from coreai_models.primitives.macos.mlp import MLP
 from coreai_models.primitives.macos.rms_norm import RMSNorm, RMSNormPlusOne
 from coreai_models.primitives.macos.rope import RoPE
@@ -132,10 +137,17 @@ class Attention(nn.Module):
             key = self.rope(key, position_ids=rope_positions, freqs=freqs)
 
         if self.is_sliding and sliding_kv_cache is not None:
-            key, value = sliding_kv_cache.update_and_fetch(
-                self.cache_slot_idx, offset, key, value, query_len=query_len
+            # Read-before-write: attend over [cached window ++ new K/V], then
+            # write. Writing first would let this chunk's own K/V evict the
+            # oldest query_len - 1 in-window positions that its earliest
+            # queries still need.
+            full_key, full_value = sliding_kv_cache.fetch_and_concat(
+                self.cache_slot_idx, key, value
             )
-            attn_output = self.sdpa(query=query, key=key, value=value, attn_mask=sliding_mask)
+            attn_output = self.sdpa(
+                query=query, key=full_key, value=full_value, attn_mask=sliding_mask
+            )
+            sliding_kv_cache.update(self.cache_slot_idx, offset, key, value, query_len=query_len)
         elif not self.is_sliding and global_cache is not None:
             key, value = global_cache.update_and_fetch(
                 self.cache_slot_idx, offset, key, value, seq_len=seq_len, query_len=query_len
@@ -235,7 +247,7 @@ class MuseGlimmerModel(nn.Module):
 
         sliding_mask = None
         if sliding_kv_cache is not None:
-            sliding_mask = ring_window_causal_mask(
+            sliding_mask = concat_window_causal_mask(
                 query_len,
                 sliding_kv_cache.capacity(),
                 offset,
