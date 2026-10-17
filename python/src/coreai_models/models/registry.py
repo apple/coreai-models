@@ -203,6 +203,7 @@ def _get_registry() -> dict[str, ModelEntry]:
         # Both checkpoints wrap the decoder under `text_config` / `model.language_model.`.
         "qwen3_5": ModelEntry(
             macos_class=Qwen3_5ForCausalLM,
+            # Dense only: the static-shape variant has no expert routing.
             ios_class=Qwen3_5ForCausalLMForiOS,
             ios_export_script="models/qwen3_5/export.py",
             hf_config_attr="text_config",

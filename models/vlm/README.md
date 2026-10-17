@@ -52,9 +52,10 @@ Add a `VLMSpec(...)` entry to `SUPPORTED_MODELS` in
 HuggingFace ID, output name, image token id, and vision geometry (resolution,
 patch/merge sizes, normalization stats). `text_decoder_class` names the
 reauthored decoder the text bundle is built from; set it to `None` for a
-checkpoint without a reauthored decoder — `--vision-only` exports its vision
-encoder, and a text export raises an error naming the model. New decoder
-architectures are registered in
+checkpoint whose text decoder this exporter does not build — `--vision-only`
+exports its vision encoder, and a text export raises an error naming the model.
+Qwen3.5 is one: its embeddings-input decoder is exported with
+`spike_qwen35/spike.py export`. New decoder architectures are registered in
 [`models/registry.py`](../../python/src/coreai_models/models/registry.py).
 
 ## Image preprocessing
