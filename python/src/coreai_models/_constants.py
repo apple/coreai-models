@@ -26,6 +26,10 @@ VALUE_CACHE_NAME = "valueCache"
 SLIDING_KEY_CACHE_NAME = "slidingKeyCache"
 SLIDING_VALUE_CACHE_NAME = "slidingValueCache"
 
+# SSM state names for hybrid attention+SSM models (e.g. Qwen3.5)
+CONV_STATES_NAME = "convStates"
+RECURRENT_STATES_NAME = "recurrentStates"
+
 # Trace-time KV cache sequence length, to bound peak trace memory. At inference the
 # cache size is dynamic.
 TRACE_KV_CACHE_SEQ_LEN = 2048
@@ -67,6 +71,10 @@ OUTPUT_LOGITS_NAME = "out_logits"
 # the converter in RELEASE mode and embeds minimum debug information. The
 # --include-debug-info flag turns it on (DEBUG mode).
 DEFAULT_INCLUDE_DEBUG_INFO = False
+
+# Max of the dynamic batch dim for `--attention-mask batched` exports when
+# --dynamic-batch-size is not given.
+DEFAULT_DYNAMIC_MAX_BATCH_SIZE = 8
 
 # metadata.json schema version (default for all bundle kinds).
 METADATA_VERSION = "0.2"

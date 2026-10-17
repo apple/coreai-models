@@ -51,7 +51,7 @@ def test_rejects_paged() -> None:
 
 
 def test_rejects_dynamic_batch_on_ios() -> None:
-    with pytest.raises(ValueError, match="macOS"):
+    with pytest.raises(ValueError, match="attention_mask_mode"):
         ExportConfig(hf_model_id="org/model", variant="iOS", dynamic_max_batch_size=8)
 
 

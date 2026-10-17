@@ -650,7 +650,8 @@ private struct EngineImpl: ~Copyable {
 
         // Classify states using the shared factory logic
         let classified = StateHandlerFactory.classifyStates(
-            descriptor: descriptor, stateKinds: nil, verbose: descriptor.stateNames.count > 2)
+            descriptor: descriptor, stateKinds: config.states, verbose: descriptor.stateNames.count > 2)
+        try StateHandlerFactory.validateKinds(classified, descriptor: descriptor)
 
         // Find the growing KV pair (first two states with .kvCache kind)
         let growingNames = classified.filter { $0.kind == .kvCache }.map(\.name)

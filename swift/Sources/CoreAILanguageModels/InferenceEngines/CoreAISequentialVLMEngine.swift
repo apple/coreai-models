@@ -277,6 +277,7 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
         let stateHandlers = try StateHandlerFactory.createSyncHandlers(
             descriptor: llmDesc,
             maxContextLength: config.maxContextLength,
+            stateKinds: config.base.states,
             options: options
         )
         self.kvCache = stateHandlers.kvCache

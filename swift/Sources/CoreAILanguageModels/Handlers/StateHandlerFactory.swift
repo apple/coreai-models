@@ -96,6 +96,32 @@ enum StateHandlerFactory {
         return .fixed
     }
 
+    /// States given a fixed-size kind (`slidingCache` or `fixed`) despite a dynamic dimension.
+    /// Those kinds are allocated at a fixed size, which a dynamic shape cannot have; only a
+    /// `kvCache` grows.
+    static func dynamicStatesWithFixedSizeKind(
+        _ classified: [(name: String, kind: StateKind)], isDynamic: (String) -> Bool
+    ) -> [String] {
+        classified.filter { $0.kind != .kvCache && isDynamic($0.name) }.map(\.name)
+    }
+
+    /// Throws if a state with a dynamic dimension was given a fixed-size kind. The shape
+    /// heuristic never does this, so only an explicit `language.states` entry can.
+    static func validateKinds(
+        _ classified: [(name: String, kind: StateKind)], descriptor: InferenceFunctionDescriptor
+    ) throws {
+        let invalid = dynamicStatesWithFixedSizeKind(classified) { name in
+            guard case .ndArray(let desc) = descriptor.stateDescriptor(of: name) else { return false }
+            return desc.shape.contains(where: { $0 < 0 })
+        }
+        guard !invalid.isEmpty else { return }
+        let details = classified.filter { invalid.contains($0.name) }
+            .map { "\($0.name)=\($0.kind.rawValue)" }.joined(separator: ", ")
+        throw InferenceRuntimeError.invalidArgument(
+            "language.states gives a fixed-size kind to a state with a dynamic shape "
+                + "(\(details)); only kv_cache states may have dynamic dimensions")
+    }
+
     /// Create sync state handlers from classified states.
     static func createSyncHandlers(
         descriptor: InferenceFunctionDescriptor,
@@ -111,6 +137,7 @@ enum StateHandlerFactory {
 
         let classified = classifyStates(
             descriptor: descriptor, stateKinds: stateKinds, verbose: verbose)
+        try validateKinds(classified, descriptor: descriptor)
 
         // Separate into growing (kvCache) and fixed (slidingCache + fixed)
         var growingPairs: [(name: String, descriptor: NDArrayDescriptor)] = []

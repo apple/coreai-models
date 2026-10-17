@@ -134,6 +134,7 @@ public struct EngineFactory: Sendable {
             serializedModel: [languageModelURL.path],
             function: bundle.language.functionMap?.name(for: "main") ?? "main"
         )
+        baseConfig.states = bundle.language.states
         baseConfig.applyChunkingOverrides(
             prefillChunkSize: options.prefillChunkSize,
             prefillChunkThreshold: options.prefillChunkThreshold
@@ -182,6 +183,7 @@ public struct EngineFactory: Sendable {
         let function: String
         let modelDefinition: ModelSource.ModelDefinition
         let overrides: LanguageOverrides?
+        let states: [String: StateKind]?
     }
 
     /// Parses config data using the unified config handler.
@@ -194,7 +196,8 @@ public struct EngineFactory: Sendable {
             tokenizer: config.tokenizer,
             function: config.function,
             modelDefinition: config.resolvedModelDefinition,
-            overrides: config.overrides
+            overrides: config.overrides,
+            states: config.states
         )
     }
 
@@ -304,6 +307,7 @@ public struct EngineFactory: Sendable {
             function: config.function,
             overrides: config.overrides
         )
+        modelConfig.states = config.states
 
         modelConfig.applyChunkingOverrides(
             prefillChunkSize: options.prefillChunkSize,

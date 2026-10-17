@@ -50,10 +50,19 @@ from coreai_models._constants import (
     VALUE_CACHE_NAME,
     VALUE_CACHE_OUTPUT_NAME,
 )
+from coreai_models.primitives.ios.cache import KVCacheHandler, causal_mask
 from coreai_models.primitives.ios.embedding import GatherEmbeddings, LoadEmbeddings
 from coreai_models.primitives.macos.cache import KVCache
 
 T = TypeVar("T", bound="BaseForCausalLM")
+
+
+@dataclass
+class EagerState:
+    """The caches of one sequence being run eagerly, and how many positions they already hold."""
+
+    tensors: tuple[torch.Tensor, ...]
+    offset: int = 0
 
 
 @dataclass(frozen=True)
@@ -254,6 +263,7 @@ def _build_safetensors_key_index(
     safetensors_files: list[str],
     num_layers: int | None = None,
     hf_state_dict_prefix: str = "",
+    extra_shared_keys: list[str] | None = None,
 ) -> tuple[dict[int, dict[str, str]], dict[str, str]]:
     """Build a key-to-file index from safetensors files without loading tensors.
 
@@ -261,20 +271,30 @@ def _build_safetensors_key_index(
     to load only a sub-model from multimodal checkpoints (e.g., set
     ``hf_state_dict_prefix="language_model."`` to ignore vision/projector keys).
 
+    ``extra_shared_keys`` names exact keys to index as shared regardless of the
+    prefix, for weights stored outside the prefixed sub-model (e.g. ``lm_head.weight``
+    at the root of a checkpoint whose decoder lives under ``model.language_model.``).
+
     Returns ``(per_layer_index, shared_index)`` keyed by *original* safetensors
     keys (prefix not stripped); callers must strip before assigning.
     """
-    layer_pattern = re.compile(r"model\.layers\.(\d+)\.")
+    # "layers.{i}." is what a longer prefix such as "model.language_model." leaves.
+    layer_pattern = re.compile(r"(?:model\.)?layers\.(\d+)\.")
+    extra_keys = set(extra_shared_keys or ())
     per_layer: dict[int, dict[str, str]] = {}
     shared: dict[str, str] = {}
     for path in safetensors_files:
         with safe_open(path, framework="pt", device="cpu") as f:
             for key in f.keys():  # noqa: SIM118
+                if key in extra_keys:
+                    shared[key] = path
+                    continue
                 if not key.startswith(hf_state_dict_prefix):
                     continue
                 stripped = key.removeprefix(hf_state_dict_prefix)
 
-                if num_layers is not None and _is_layer_key_beyond(stripped, num_layers):
+                # The full key: a stripped "layers.N." lacks the "." the filter matches on.
+                if num_layers is not None and _is_layer_key_beyond(key, num_layers):
                     continue
                 match = layer_pattern.match(stripped)
                 if match:
@@ -320,6 +340,14 @@ class BaseForCausalLM(torch.nn.Module):
 
     # Subclasses must override this with their specific HuggingFace model class
     _HF_MODEL_CLASS: type | None = None
+    # Exact safetensors keys to load as shared params regardless of
+    # `hf_state_dict_prefix`, for weights sitting outside the prefixed sub-model.
+    _extra_hf_shared_keys: list[str] = []
+    # Whether `num_layers` (`--num-layers`) can truncate this model. False for hybrid
+    # models, whose per-layer-type states don't follow a plain layer-count cut.
+    supports_num_layers: bool = True
+    # Whether coreai-opt can quantize this model in graph mode (`execution_mode: graph`).
+    supports_graph_quantization: bool = True
 
     #: Whether the macOS exporter emits a second, LM-head-less ``prefill`` graph
     #: beside ``main``. Opt in per model: ``forward`` must honour
@@ -637,6 +665,30 @@ class BaseForCausalLM(torch.nn.Module):
             )
         return tuple(reference_inputs.values())
 
+    def new_eager_state(
+        self, *, dtype: torch.dtype, device: torch.device | str, max_seq_len: int | None = None
+    ) -> EagerState:
+        """Empty caches for one sequence of at most ``max_seq_len`` tokens (default: the
+        context)."""
+        with torch.device(device):
+            k_cache, v_cache = KVCache.create_cache_tensors(
+                self.config, dtype=dtype, seq_len=max_seq_len
+            )
+        return EagerState((k_cache, v_cache))
+
+    def eager_forward_args(self, input_ids: torch.Tensor, state: EagerState) -> tuple[Any, ...]:
+        """``forward``'s arguments for ``input_ids`` written at ``state.offset``."""
+        position_ids = torch.arange(
+            state.offset + input_ids.shape[1], dtype=torch.int32, device=input_ids.device
+        ).unsqueeze(0)
+        return (input_ids, position_ids, *state.tensors)
+
+    def eager_step(self, input_ids: torch.Tensor, state: EagerState) -> torch.Tensor:
+        """Logits ``[1, query_len, vocab]`` for ``input_ids``, advancing ``state`` past them."""
+        logits = self(*self.eager_forward_args(input_ids, state))
+        state.offset += input_ids.shape[1]
+        return logits.reshape(1, input_ids.shape[1], -1)
+
     @classmethod
     def _get_reauthored_config(
         cls,
@@ -661,6 +713,10 @@ class BaseForCausalLM(torch.nn.Module):
         if max_context_length is not None and hasattr(hf_config, "max_position_embeddings"):
             hf_config.max_position_embeddings = max_context_length
         if num_layers is not None:
+            if not cls.supports_num_layers:
+                raise ValueError(
+                    f"num_layers is not currently supported for hybrid models ({cls.__name__})"
+                )
             if not hasattr(hf_config, "num_hidden_layers"):
                 raise ValueError(
                     f"num_layers={num_layers} was specified but hf_config has no "
@@ -825,6 +881,7 @@ class BaseForCausalLM(torch.nn.Module):
             safetensors_files,
             num_layers=num_layers,
             hf_state_dict_prefix=hf_state_dict_prefix,
+            extra_shared_keys=cls._extra_hf_shared_keys,
         )
 
         # Shared params first (embeddings, norm, lm_head, ...).
@@ -959,6 +1016,36 @@ class BaseForCausalLMForiOS(BaseForCausalLM):
         # iOS composes the transformer as a submodule, so the flag lives there rather
         # than on the top-level module.
         self.extend.prefill_mode = prefill_mode
+
+    @override
+    def new_eager_state(
+        self, *, dtype: torch.dtype, device: torch.device | str, max_seq_len: int | None = None
+    ) -> EagerState:
+        """iOS graphs index the cache and the mask over the whole context, so ``max_seq_len``
+        is ignored."""
+        with torch.device(device):
+            key_cache, value_cache = KVCacheHandler.get_kv_cache_from_hf(self.config, dtype=dtype)
+        return EagerState((key_cache, value_cache))
+
+    @override
+    def eager_forward_args(self, input_ids: torch.Tensor, state: EagerState) -> tuple[Any, ...]:
+        """iOS takes only the query's positions, the write offset, and an additive mask over
+        the context."""
+        query_len, device = input_ids.shape[1], input_ids.device
+        position_ids = (
+            torch.arange(state.offset, state.offset + query_len, device=device)
+            .to(torch.uint16)
+            .unsqueeze(0)
+        )
+        in_step = torch.tensor([state.offset], dtype=torch.int32, device=device)
+        mask = causal_mask(
+            self.config.max_position_embeddings,
+            query_len,
+            state.offset,
+            dtype=state.tensors[0].dtype,
+            device=device,
+        )
+        return (input_ids, position_ids, in_step, mask, *state.tensors)
 
     # ------------------------------------------------------------------
     # Export contract
