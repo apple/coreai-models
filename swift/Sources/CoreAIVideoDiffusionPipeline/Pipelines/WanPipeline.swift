@@ -106,11 +106,14 @@ public struct WanPipeline: VideoPipeline {
         let tokenizer = try await AutoTokenizer.from(modelFolder: tokenizerURL)
 
         let transformerURL = try resolveExistingPipelineAsset(
-            Asset.transformer, in: url, component: DiffusionComponentKey.transformer)
+            bundle.assetFilename(for: DiffusionComponentKey.transformer, fallback: "Transformer.aimodel"),
+            in: url, component: DiffusionComponentKey.transformer)
         let textEncoderURL = try resolveExistingPipelineAsset(
-            Asset.textEncoder, in: url, component: DiffusionComponentKey.textEncoder)
+            bundle.assetFilename(for: DiffusionComponentKey.textEncoder, fallback: "TextEncoder.aimodel"),
+            in: url, component: DiffusionComponentKey.textEncoder)
         let decoderURL = try resolveExistingPipelineAsset(
-            Asset.vaeDecoder, in: url, component: DiffusionComponentKey.vaeDecoder)
+            bundle.assetFilename(for: DiffusionComponentKey.vaeDecoder, fallback: "VAEDecoder.aimodel"),
+            in: url, component: DiffusionComponentKey.vaeDecoder)
 
         self.init(
             transformer: CoreAIDiffusionModelFunction(modelURL: transformerURL),
@@ -125,13 +128,6 @@ public struct WanPipeline: VideoPipeline {
             defaultFrameCount: defaultFrameCount,
             lazyModelLoading: lazyModelLoading
         )
-    }
-
-    /// Wan bundles use fixed component filenames; the metadata `assets` names are not consulted here.
-    private enum Asset {
-        static let transformer = "Transformer.aimodel"
-        static let textEncoder = "TextEncoder.aimodel"
-        static let vaeDecoder = "VAEDecoder.aimodel"
     }
 
     // MARK: - VideoPipeline

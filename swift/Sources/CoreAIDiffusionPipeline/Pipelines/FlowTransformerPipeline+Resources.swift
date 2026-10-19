@@ -31,7 +31,7 @@ extension FlowTransformerPipeline {
         // Resolve .auto → best available mode
         let resolvedMode: DecodeResolution
         if mode == .auto {
-            resolvedMode = try Self.bestAvailableMode(at: url, bundle: bundle)
+            resolvedMode = try Self.bestAvailableMode(bundle: bundle)
         } else {
             resolvedMode = mode
         }
@@ -48,18 +48,13 @@ extension FlowTransformerPipeline {
         let transformerFnName: String
         switch resolvedMode {
         case .full, .tiled:
-            guard
-                let path = Self.resolveAsset(
-                    at: url, bundle: bundle, key: DiffusionComponentKey.transformer, name: AssetName.transformer)
-            else {
-                throw PipelineLoadError.missingComponent(AssetName.transformer)
+            guard let path = Self.resolveAsset(.transformer, in: bundle) else {
+                throw PipelineLoadError.missingComponent(Asset.transformer.stem)
             }
             transformer = CoreAIDiffusionModelFunction(modelURL: url.appendingPathComponent(path))
             transformerFnName = "main"
         case .half:
-            if let path = Self.resolveAsset(
-                at: url, bundle: bundle, key: DiffusionComponentKey.transformer, name: AssetName.transformer)
-            {
+            if let path = Self.resolveAsset(.transformer, in: bundle) {
                 let candidate = CoreAIDiffusionModelFunction(
                     modelURL: url.appendingPathComponent(path))
                 if try await candidate.hasFunction(named: "half") {
@@ -67,9 +62,7 @@ extension FlowTransformerPipeline {
                     // img2img_512_* from the same asset).
                     transformer = candidate
                     transformerFnName = "half"
-                } else if let path512 = Self.resolveAsset(
-                    at: url, bundle: bundle, key: AssetKey.transformer512, name: AssetName.transformer512)
-                {
+                } else if let path512 = Self.resolveAsset(.transformer512, in: bundle) {
                     transformer = CoreAIDiffusionModelFunction(
                         modelURL: url.appendingPathComponent(path512))
                     transformerFnName = "main"
@@ -79,14 +72,12 @@ extension FlowTransformerPipeline {
                     transformer = candidate
                     transformerFnName = "main"
                 }
-            } else if let path512 = Self.resolveAsset(
-                at: url, bundle: bundle, key: AssetKey.transformer512, name: AssetName.transformer512)
-            {
+            } else if let path512 = Self.resolveAsset(.transformer512, in: bundle) {
                 transformer = CoreAIDiffusionModelFunction(
                     modelURL: url.appendingPathComponent(path512))
                 transformerFnName = "main"
             } else {
-                throw PipelineLoadError.missingComponent("\(AssetName.transformer) or \(AssetName.transformer512)")
+                throw PipelineLoadError.missingComponent("\(Asset.transformer.stem) or \(Asset.transformer512.stem)")
             }
         case .auto:
             preconditionFailure("auto resolved above")
@@ -97,15 +88,13 @@ extension FlowTransformerPipeline {
         // Prefer the multi-function transformer when available.
         let entrypointPrefix = resolvedMode == .half ? "img2img_512_" : "img2img_"
         let assetPrefix = resolvedMode == .half ? "Transformer_512_img2img" : "Transformer_img2img"
-        let keyPrefix = resolvedMode == .half ? "transformer_512_img2img" : "transformer_img2img"
         var img2imgRoutes: [ReferenceGrid: Img2ImgRoute] = [:]
         for grid in ReferenceGrid.allCases {
             let entrypoint = "\(entrypointPrefix)\(grid.rawValue)"
             if try await transformer.hasFunction(named: entrypoint) {
                 img2imgRoutes[grid] = Img2ImgRoute(function: transformer, entrypoint: entrypoint)
             } else if let path = Self.resolveAsset(
-                at: url, bundle: bundle, key: "\(keyPrefix)_\(grid.rawValue)",
-                name: "\(assetPrefix)_\(grid.rawValue)")
+                Asset(stem: "\(assetPrefix)_\(grid.rawValue)"), in: bundle)
             {
                 // Single-function: its own asset, traced at one concatenated sequence
                 // length, always entered through "main".
@@ -120,19 +109,13 @@ extension FlowTransformerPipeline {
         let decoderName: String
         switch resolvedMode {
         case .full:
-            guard
-                let path = Self.resolveAsset(
-                    at: url, bundle: bundle, key: DiffusionComponentKey.vaeDecoder, name: AssetName.vaeDecoder)
-            else {
-                throw PipelineLoadError.missingComponent(AssetName.vaeDecoder)
+            guard let path = Self.resolveAsset(.vaeDecoder, in: bundle) else {
+                throw PipelineLoadError.missingComponent(Asset.vaeDecoder.stem)
             }
             decoderName = path
         case .half, .tiled:
-            guard
-                let path = Self.resolveAsset(
-                    at: url, bundle: bundle, key: AssetKey.vaeDecoderHalf, name: AssetName.vaeDecoderHalf)
-            else {
-                throw PipelineLoadError.missingComponent(AssetName.vaeDecoderHalf)
+            guard let path = Self.resolveAsset(.vaeDecoderHalf, in: bundle) else {
+                throw PipelineLoadError.missingComponent(Asset.vaeDecoderHalf.stem)
             }
             decoderName = path
         case .auto:
@@ -152,8 +135,7 @@ extension FlowTransformerPipeline {
         case .full:
             encoderName = bundle.vaeEncoderFilename
         case .half, .tiled:
-            encoderName = Self.resolveAsset(
-                at: url, bundle: bundle, key: AssetKey.vaeEncoderHalf, name: AssetName.vaeEncoderHalf)
+            encoderName = Self.resolveAsset(.vaeEncoderHalf, in: bundle)
         case .auto:
             preconditionFailure("auto resolved above")
         }
@@ -219,52 +201,40 @@ extension FlowTransformerPipeline {
             batchNormEps: 0)
     }
 
-    /// `metadata.json` asset keys for the optional FLUX.2 variants that
-    /// `DiffusionComponentKey` does not cover.
-    private enum AssetKey {
-        static let transformer512 = "transformer_512"
-        static let vaeDecoderHalf = "vae_decoder_half"
-        static let vaeEncoderHalf = "vae_encoder_half"
-    }
+    /// A FLUX.2 asset: its `metadata.json` key and the `<stem>.aimodel` filename the
+    /// exporter writes when the bundle doesn't name it. The key defaults to the lowercased stem.
+    private struct Asset {
+        let key: String
+        let stem: String
 
-    /// On-disk asset filename stems probed by `resolveAsset` when `metadata.json`
-    /// does not name the asset.
-    private enum AssetName {
-        static let transformer = "Transformer"
-        static let transformer512 = "Transformer_512"
-        static let vaeDecoder = "VAEDecoder"
-        static let vaeDecoderHalf = "VAEDecoder_half"
-        static let vaeEncoderHalf = "VAEEncoder_half"
-    }
-
-    /// Resolve an asset to a filename. The filename declared under `key` in
-    /// `metadata.json` wins, so ahead-of-time compiled `.aimodelc` assets load as
-    /// long as the bundle names them. Otherwise probe for `<name>.aimodel`.
-    private static func resolveAsset(
-        at url: URL, bundle: DiffusionBundle, key: String, name: String
-    ) -> String? {
-        if let declared = bundle.assetFilename(for: key) {
-            let candidate = url.appendingPathComponent(declared)
-            if FileManager.default.fileExists(atPath: candidate.path) {
-                return candidate.lastPathComponent
-            }
+        init(key: String? = nil, stem: String) {
+            self.key = key ?? stem.lowercased()
+            self.stem = stem
         }
-        let candidate = url.appendingPathComponent("\(name).aimodel")
-        guard FileManager.default.fileExists(atPath: candidate.path) else { return nil }
-        return candidate.lastPathComponent
+
+        static let transformer = Asset(key: DiffusionComponentKey.transformer, stem: "Transformer")
+        static let transformer512 = Asset(stem: "Transformer_512")
+        static let vaeDecoder = Asset(key: DiffusionComponentKey.vaeDecoder, stem: "VAEDecoder")
+        static let vaeDecoderHalf = Asset(key: "vae_decoder_half", stem: "VAEDecoder_half")
+        static let vaeEncoderHalf = Asset(key: "vae_encoder_half", stem: "VAEEncoder_half")
+    }
+
+    /// The asset's filename in the bundle (the declared one, else `<stem>.aimodel`), or nil
+    /// if neither is on disk.
+    private static func resolveAsset(_ asset: Asset, in bundle: DiffusionBundle) -> String? {
+        let filename = bundle.assetFilename(for: asset.key, fallback: "\(asset.stem).aimodel")
+        let exists = FileManager.default.fileExists(
+            atPath: bundle.bundlePath.appendingPathComponent(filename).path)
+        return exists ? filename : nil
     }
 
     /// Probe available assets and pick the highest quality mode.
     /// Priority: .full > .tiled > .half. Throws if no valid combination exists.
-    private static func bestAvailableMode(
-        at url: URL, bundle: DiffusionBundle
-    ) throws -> DecodeResolution {
-        let hasFullTransformer = bundle.transformerFilename != nil
-        let hasFullDecoder = bundle.vaeDecoderFilename != nil
-        let hasHalfDecoder =
-            resolveAsset(at: url, bundle: bundle, key: AssetKey.vaeDecoderHalf, name: AssetName.vaeDecoderHalf) != nil
-        let hasHalfTransformer =
-            resolveAsset(at: url, bundle: bundle, key: AssetKey.transformer512, name: AssetName.transformer512) != nil
+    private static func bestAvailableMode(bundle: DiffusionBundle) throws -> DecodeResolution {
+        let hasFullTransformer = resolveAsset(.transformer, in: bundle) != nil
+        let hasFullDecoder = resolveAsset(.vaeDecoder, in: bundle) != nil
+        let hasHalfDecoder = resolveAsset(.vaeDecoderHalf, in: bundle) != nil
+        let hasHalfTransformer = resolveAsset(.transformer512, in: bundle) != nil
 
         if hasFullTransformer && hasFullDecoder { return .full }
         if hasFullTransformer && hasHalfDecoder { return .tiled }

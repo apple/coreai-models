@@ -61,6 +61,15 @@ public struct DiffusionBundle: Sendable {
         modelBundle.assets[key]
     }
 
+    /// The filename declared for `key` when that file exists in the bundle, so ahead-of-time
+    /// compiled `.aimodelc` assets load; otherwise `fallback`, the exporter's default name.
+    public func assetFilename(for key: String, fallback: String) -> String {
+        guard let declared = assetFilename(for: key),
+            FileManager.default.fileExists(atPath: bundlePath.appendingPathComponent(declared).path)
+        else { return fallback }
+        return declared
+    }
+
     public var textEncoderFilename: String? { assetFilename(for: DiffusionComponentKey.textEncoder) }
     public var transformerFilename: String? { assetFilename(for: DiffusionComponentKey.transformer) }
     public var vaeDecoderFilename: String? { assetFilename(for: DiffusionComponentKey.vaeDecoder) }
