@@ -185,14 +185,6 @@ final class BucketedStaticState: StaticStateStorage {
 
     // MARK: Layout validation
 
-    private static func byteWidth(_ type: NDArray.ScalarType) -> Int? {
-        switch type {
-        case .float16, .bfloat16: return 2
-        case .float32: return 4
-        default: return nil
-        }
-    }
-
     private static func validateLayout(
         _ descriptor: NDArrayDescriptor, state: String, context: Int
     ) throws {
@@ -206,7 +198,7 @@ final class BucketedStaticState: StaticStateStorage {
                 state: state, dimension: interleave.dimension,
                 sequenceDimension: sequenceDimension)
         }
-        guard let width = byteWidth(descriptor.scalarType) else {
+        guard let width = stateElementByteWidth(descriptor.scalarType) else {
             throw LayoutError.unsupportedScalarType(
                 state: state, type: String(describing: descriptor.scalarType))
         }

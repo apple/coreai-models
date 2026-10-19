@@ -64,6 +64,55 @@ struct ZeroFillNDArrayTests {
     }
 }
 
+// MARK: - Non-Float State Tests
+
+/// 8-bit KV caches (and any other byte-addressable state) go through the same raw-byte
+/// zero-fill and grow copy as fp16 states.
+@Suite("Non-Float State Tests")
+struct NonFloatStateTests {
+    @Test(
+        "Zero-fills non-float states",
+        arguments: [NDArray.ScalarType.int8, .uint8, .float8e4m3fn, .int32])
+    func zeroFill(_ type: NDArray.ScalarType) throws {
+        var array = NDArray(shape: [2, 3, 4], scalarType: type)
+        let byteCount = 24 * (try #require(stateElementByteWidth(type)))
+        array.mutableRawView().withUnsafeMutableBytes { ptr, _, _ in
+            memset(ptr, 0x5A, byteCount)
+        }
+        zeroFillNDArray(&array)
+        array.rawView().withUnsafeBytes { ptr, _, _ in
+            let bytes = UnsafeRawBufferPointer(start: ptr, count: byteCount)
+            #expect(bytes.allSatisfy { $0 == 0 })
+        }
+    }
+
+    @Test("Copies block prefixes of an 8-bit state byte for byte")
+    func copyBlockPrefixesInt8() {
+        // Two blocks of 4 slots grown to 8 slots: the first 3 elements of each block move.
+        var source = NDArray(shape: [2, 4], scalarType: .int8)
+        source.mutableRawView().withUnsafeMutableBytes { ptr, _, _ in
+            let dst = ptr.assumingMemoryBound(to: Int8.self)
+            for i in 0..<8 { dst[i] = Int8(i + 1) }
+        }
+        var destination = NDArray(shape: [2, 8], scalarType: .int8)
+        zeroFillNDArray(&destination)
+        copyBlockPrefixes(
+            from: source, to: &destination, blockCount: 2, sourceBlockStride: 4,
+            destinationBlockStride: 8, runElements: 3)
+        destination.rawView().withUnsafeBytes { ptr, _, _ in
+            let got = Array(UnsafeBufferPointer(start: ptr.assumingMemoryBound(to: Int8.self), count: 16))
+            #expect(got == [1, 2, 3, 0, 0, 0, 0, 0, 5, 6, 7, 0, 0, 0, 0, 0])
+        }
+    }
+
+    @Test("Packed sub-byte types have no element width")
+    func subByteWidth() {
+        #expect(stateElementByteWidth(.int4) == nil)
+        #expect(stateElementByteWidth(.int8) == 1)
+        #expect(stateElementByteWidth(.float16) == 2)
+    }
+}
+
 // MARK: - StateKind Tests
 
 @Suite("StateKind Tests")
