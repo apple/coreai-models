@@ -37,6 +37,7 @@ class KVCache:
         config,
         dtype: torch.dtype = torch.float32,
         seq_len: int | None = None,
+        batch_size: int = 1,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Create zero-initialized KV cache tensors from a model config.
 
@@ -45,9 +46,10 @@ class KVCache:
             dtype: Cache dtype.
             seq_len: Sequence-dim length; defaults to ``config.max_position_embeddings``.
                 Pass explicitly to build a trace-sized cache without mutating config.
+            batch_size: Leading request-batch dim (dim 1). Defaults to 1.
 
         Returns:
-            (k_cache, v_cache) of shape (n_layers, 1, n_kv_heads, max_seq_len, head_dim).
+            (k_cache, v_cache) of shape (n_layers, batch_size, n_kv_heads, max_seq_len, head_dim).
         """
         n_kv_heads = config.num_key_value_heads
         n_layers = config.num_hidden_layers
@@ -56,8 +58,8 @@ class KVCache:
             head_dim = config.head_dim
         else:
             head_dim = config.hidden_size // config.num_attention_heads
-        k_cache = torch.zeros(n_layers, 1, n_kv_heads, max_seq_len, head_dim, dtype=dtype)
-        v_cache = torch.zeros(n_layers, 1, n_kv_heads, max_seq_len, head_dim, dtype=dtype)
+        k_cache = torch.zeros(n_layers, batch_size, n_kv_heads, max_seq_len, head_dim, dtype=dtype)
+        v_cache = torch.zeros(n_layers, batch_size, n_kv_heads, max_seq_len, head_dim, dtype=dtype)
         return k_cache, v_cache
 
     @classmethod
@@ -167,7 +169,10 @@ class KVCache:
             end=torch.cat(
                 [
                     layer_index_end,
-                    torch.tensor((int(self._v_cache.size(1)),), dtype=torch.int32, device=device),
+                    # Mirror the K path (no ``int()``): wrapping the batch dim in ``int()``
+                    # collapses a symbolic batch size to the trace constant, which breaks a
+                    # dynamic-batch export. size(2)/size(4) are genuinely static.
+                    torch.tensor((self._v_cache.size(1),), dtype=torch.int32, device=device),
                     torch.tensor((int(self._v_cache.size(2)),), dtype=torch.int32, device=device),
                     torch.tensor((offset + v.size(-2),), dtype=torch.int32, device=device),
                     torch.tensor((int(self._v_cache.size(4)),), dtype=torch.int32, device=device),
