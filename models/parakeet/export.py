@@ -13,7 +13,6 @@
 #
 # [tool.uv]
 # index-url       = "https://pypi.org/simple"
-# prerelease      = "allow"
 # index-strategy  = "unsafe-best-match"
 # override-dependencies = [
 #     "numpy>=2.3.0",
