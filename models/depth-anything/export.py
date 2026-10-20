@@ -15,7 +15,6 @@
 #
 # [tool.uv]
 # index-url       = "https://pypi.org/simple"
-# prerelease      = "allow"
 # index-strategy  = "unsafe-best-match"
 # # xformers is a hard dep in depth-anything-3's pyproject.toml, but DA3's code
 # # catches `ImportError` on `from xformers.ops import SwiGLU` and falls back to

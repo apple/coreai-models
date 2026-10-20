@@ -14,7 +14,6 @@
 #
 # [tool.uv]
 # index-url       = "https://pypi.org/simple"
-# prerelease      = "allow"
 # index-strategy  = "unsafe-best-match"
 # ///
 import argparse
