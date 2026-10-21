@@ -30,16 +30,10 @@ private final class SingleUseFlag: Sendable {
 public struct PipelinedConstrainedDecodingStrategy: DecodingStrategy {
     private let jsonSchema: String
     private let vocabSizeOverride: Int?
-    private let whitespace: JSONWhitespace
 
-    /// - Parameters:
-    ///   - jsonSchema: A valid JSON schema string that constrains output structure.
-    ///   - vocabSize: Optional vocabulary size override. If nil, derived from tokenizer.
-    ///   - whitespace: Whitespace the grammar accepts between JSON tokens (default: `.compact`).
-    public init(jsonSchema: String, vocabSize: Int? = nil, whitespace: JSONWhitespace = .compact) {
+    public init(jsonSchema: String, vocabSize: Int? = nil) {
         self.jsonSchema = jsonSchema
         self.vocabSizeOverride = vocabSize
-        self.whitespace = whitespace
     }
 
     // MARK: - DecodingStrategy conformance
@@ -72,8 +66,7 @@ public struct PipelinedConstrainedDecodingStrategy: DecodingStrategy {
             jsonSchema: jsonSchema,
             tokenizer: tokenizer,
             vocabSize: vocabSize,
-            stopTokenIds: stopTokenIds,
-            whitespace: whitespace
+            stopTokenIds: stopTokenIds
         )
 
         let inputTokens = try PromptUtils.maybeApplyTokenizerChatTemplate(input, tokenizer: tokenizer)

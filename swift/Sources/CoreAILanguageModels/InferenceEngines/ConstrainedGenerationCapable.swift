@@ -21,16 +21,14 @@ import Tokenizers
 /// - Honor `maxTokens` by finishing the stream within that limit
 /// - Return the session handle to cache in a `defer` block (even on error/cancellation)
 package protocol ConstrainedGenerationCapable: InferenceEngine {
-    /// Obtain a constrained session handle, reusing a cached one if the schema and
-    /// whitespace policy match.
+    /// Obtain a constrained session handle, reusing a cached one if the schema matches.
     ///
     /// The internal cache slot is emptied on checkout — concurrent calls create independent sessions.
     func getOrCreateConstrainedSession(
         jsonSchema: String,
         tokenizer: any Tokenizer,
         vocabSize: Int,
-        stopTokenIds: [Int32]?,
-        whitespace: JSONWhitespace
+        stopTokenIds: [Int32]?
     ) throws -> ConstrainedSessionHandle
 
     /// Stream constrained token generation using GPU-side bitmask application.

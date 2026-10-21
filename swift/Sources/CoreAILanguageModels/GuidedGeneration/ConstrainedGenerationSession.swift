@@ -33,9 +33,6 @@ public struct ConstrainedGenerationSession: ~Copyable {
     /// The JSON schema this session enforces.
     public let schema: String
 
-    /// Whitespace the compiled grammar accepts between JSON tokens.
-    public let whitespace: JSONWhitespace
-
     /// Whether the grammar has reached a terminal state (valid JSON complete).
     ///
     /// Returns true either when xgrammar explicitly marks the matcher as terminated,
@@ -58,22 +55,19 @@ public struct ConstrainedGenerationSession: ~Copyable {
     ///   - stopTokenIds: Token IDs to treat as stop tokens (e.g., EOS).
     ///     xgrammar allows these only at grammar-terminal states (valid JSON complete).
     ///     Pass `nil` to rely on xgrammar defaults.
-    ///   - whitespace: Whitespace the grammar accepts between JSON tokens (default: `.compact`).
     /// - Throws: `ConstrainedGenerationError` if the schema is invalid JSON
     public init(
         jsonSchema: String,
         vocabulary: [String],
         vocabType: VocabularyType = .byteLevel,
-        stopTokenIds: [Int32]? = nil,
-        whitespace: JSONWhitespace = .compact
+        stopTokenIds: [Int32]? = nil
     ) throws {
         try Self.validateJSONSchema(jsonSchema)
         let tokenizerInfo = TokenizerInfo(
             vocabulary: vocabulary,
             vocabType: vocabType
         )
-        try self.init(
-            jsonSchema: jsonSchema, tokenizerInfo: tokenizerInfo, whitespace: whitespace, validated: true)
+        try self.init(jsonSchema: jsonSchema, tokenizerInfo: tokenizerInfo, validated: true)
     }
 
     /// Initialize with a pre-built `TokenizerInfo` (useful when caching across sessions).
@@ -81,32 +75,26 @@ public struct ConstrainedGenerationSession: ~Copyable {
     /// - Parameters:
     ///   - jsonSchema: A valid JSON schema string
     ///   - tokenizerInfo: Pre-built tokenizer info (must include stop token IDs if needed)
-    ///   - whitespace: Whitespace the grammar accepts between JSON tokens (default: `.compact`).
     /// - Throws: `ConstrainedGenerationError` if the schema is invalid JSON,
     ///           `XGrammarError` if schema compilation fails
     public init(
         jsonSchema: String,
-        tokenizerInfo: TokenizerInfo,
-        whitespace: JSONWhitespace = .compact
+        tokenizerInfo: TokenizerInfo
     ) throws {
         try Self.validateJSONSchema(jsonSchema)
-        try self.init(
-            jsonSchema: jsonSchema, tokenizerInfo: tokenizerInfo, whitespace: whitespace, validated: true)
+        try self.init(jsonSchema: jsonSchema, tokenizerInfo: tokenizerInfo, validated: true)
     }
 
     /// Internal init that skips validation (caller must validate first).
     private init(
         jsonSchema: String,
         tokenizerInfo: TokenizerInfo,
-        whitespace: JSONWhitespace,
         validated: Bool
     ) throws {
         self.schema = jsonSchema
-        self.whitespace = whitespace
         self.tokenizerInfo = tokenizerInfo
         self.compiler = GrammarCompiler(tokenizerInfo: tokenizerInfo)
-        self.compiledGrammar = try compiler.compileJSONSchema(
-            jsonSchema, anyWhitespace: whitespace.allowsAnyWhitespace)
+        self.compiledGrammar = try compiler.compileJSONSchema(jsonSchema)
         self.matcher = GrammarMatcher(compiledGrammar: compiledGrammar, maxRollbackTokens: Self.maxRollbackTokens)
         self.vocabularySize = tokenizerInfo.vocabularySize
         self.bitmaskSize = (vocabularySize + 31) / 32
@@ -137,15 +125,13 @@ public struct ConstrainedGenerationSession: ~Copyable {
     ///   - stopTokenIds: Token IDs to treat as stop tokens (e.g., EOS).
     ///     xgrammar allows these tokens only at grammar-terminal states (valid JSON complete),
     ///     blocking them mid-generation. Pass `nil` to rely on xgrammar defaults (not recommended).
-    ///   - whitespace: Whitespace the grammar accepts between JSON tokens (default: `.compact`).
     /// - Throws: `ConstrainedGenerationError` if the schema is invalid JSON
     public init(
         jsonSchema: String,
         tokenizer: any Tokenizer,
         vocabSize: Int,
         vocabType: VocabularyType? = nil,
-        stopTokenIds: [Int32]? = nil,
-        whitespace: JSONWhitespace = .compact
+        stopTokenIds: [Int32]? = nil
     ) throws {
         // Extract vocabulary from tokenizer
         var vocabulary: [String] = []
@@ -158,7 +144,7 @@ public struct ConstrainedGenerationSession: ~Copyable {
         try self.init(
             jsonSchema: jsonSchema, vocabulary: vocabulary,
             vocabType: vocabType ?? VocabularyType.detect(vocabulary: vocabulary),
-            stopTokenIds: stopTokenIds, whitespace: whitespace)
+            stopTokenIds: stopTokenIds)
     }
 
     // MARK: - Raw Bitmask Access (for MaskProviding integration)
@@ -309,13 +295,10 @@ extension ConstrainedGenerationSession {
         schemaPath: String,
         vocabulary: [String],
         vocabType: VocabularyType = .byteLevel,
-        stopTokenIds: [Int32]? = nil,
-        whitespace: JSONWhitespace = .compact
+        stopTokenIds: [Int32]? = nil
     ) throws {
         let schema = try String(contentsOfFile: schemaPath, encoding: .utf8)
-        try self.init(
-            jsonSchema: schema, vocabulary: vocabulary, vocabType: vocabType,
-            stopTokenIds: stopTokenIds, whitespace: whitespace)
+        try self.init(jsonSchema: schema, vocabulary: vocabulary, vocabType: vocabType, stopTokenIds: stopTokenIds)
     }
 }
 

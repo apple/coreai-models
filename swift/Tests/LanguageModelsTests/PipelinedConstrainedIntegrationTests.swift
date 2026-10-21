@@ -69,13 +69,12 @@ final class MockConstrainedEngine: InferenceEngine, ConstrainedGenerationCapable
         jsonSchema: String,
         tokenizer: any Tokenizer,
         vocabSize: Int,
-        stopTokenIds: [Int32]?,
-        whitespace: JSONWhitespace
+        stopTokenIds: [Int32]?
     ) throws -> ConstrainedSessionHandle {
         getSessionCallCount += 1
         lastSchemaUsed = jsonSchema
 
-        if let handle = cached, handle.matches(schema: jsonSchema, whitespace: whitespace) {
+        if let handle = cached, handle.schema == jsonSchema {
             cached = nil
             handle.reset()
             return handle
@@ -86,8 +85,7 @@ final class MockConstrainedEngine: InferenceEngine, ConstrainedGenerationCapable
             jsonSchema: jsonSchema,
             tokenizer: tokenizer,
             vocabSize: vocabSize,
-            stopTokenIds: stopTokenIds,
-            whitespace: whitespace
+            stopTokenIds: stopTokenIds
         )
         return ConstrainedSessionHandle(session: session, tokenizer: tokenizer)
     }
@@ -344,35 +342,11 @@ extension PipelinedConstrainedDecodingStrategy {
             jsonSchema: jsonSchema,
             tokenizer: MockTokenizer(),
             vocabSize: 256,
-            stopTokenIds: nil,
-            whitespace: .compact
+            stopTokenIds: nil
         )
     }
 
     fileprivate var jsonSchema: String {
         Mirror(reflecting: self).children.first(where: { $0.label == "jsonSchema" })?.value as? String ?? ""
-    }
-}
-
-// MARK: - Session handle identity
-
-@Suite("Constrained session handle identity")
-struct ConstrainedSessionHandleIdentityTests {
-    private static let schema = #"{"type": "object", "properties": {"a": {"type": "integer"}}}"#
-
-    private func handle(whitespace: JSONWhitespace) throws -> ConstrainedSessionHandle {
-        let tokenizer = MockTokenizer()
-        let session = try ConstrainedGenerationSession(
-            jsonSchema: Self.schema, tokenizer: tokenizer, vocabSize: 256, vocabType: .raw,
-            whitespace: whitespace)
-        return ConstrainedSessionHandle(session: session, tokenizer: tokenizer)
-    }
-
-    @Test("A handle matches only the schema and whitespace policy it was built with")
-    func matchesSchemaAndWhitespace() throws {
-        let h = try handle(whitespace: .compact)
-        #expect(h.matches(schema: Self.schema, whitespace: .compact))
-        #expect(!h.matches(schema: Self.schema, whitespace: .flexible))
-        #expect(!h.matches(schema: "{}", whitespace: .compact))
     }
 }

@@ -14,9 +14,6 @@ package final class ConstrainedSessionHandle: @unchecked Sendable {
     /// Schema string is immutable after init — cached to avoid repeated access.
     let schema: String
 
-    /// Whitespace policy the session's grammar was compiled with.
-    let whitespace: JSONWhitespace
-
     /// Tokenizer used for jump-forward string encoding.
     private let tokenizer: any Tokenizer
 
@@ -24,14 +21,8 @@ package final class ConstrainedSessionHandle: @unchecked Sendable {
 
     init(session: consuming ConstrainedGenerationSession, tokenizer: any Tokenizer) {
         self.schema = session.schema
-        self.whitespace = session.whitespace
         self.tokenizer = tokenizer
         self._session = session
-    }
-
-    /// Whether this session was built for the same schema and whitespace policy, so a reset can reuse it.
-    func matches(schema: String, whitespace: JSONWhitespace) -> Bool {
-        self.schema == schema && self.whitespace == whitespace
     }
 
     var isTerminated: Bool { _session.isTerminated }

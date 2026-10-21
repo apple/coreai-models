@@ -54,8 +54,6 @@ public struct CoreAILanguageModel: LanguageModel {
     /// Gemma's `<end_of_turn>`, read from tokenizer_config.json at init, plus a
     /// base-vocab `<|im_end|>` and this model's agentic `<|eot|>` when present.
     fileprivate let additionalEosTokenIds: Set<Int32>
-    /// Whitespace policy applied to schema-guided generation from this model.
-    fileprivate let jsonWhitespace: JSONWhitespace
 
     // MARK: - Protocol Requirements
 
@@ -103,11 +101,6 @@ public struct CoreAILanguageModel: LanguageModel {
     ///   to use the model metadata or engine default.
     /// - Parameter prefillChunkThreshold: Minimum prompt tokens to trigger
     ///   chunking, or `nil` to use the model metadata or engine default.
-    /// - Parameter jsonWhitespace: Whitespace the grammar accepts between JSON
-    ///   tokens during schema-guided generation. Defaults to `.compact`, which fixes
-    ///   separators to `", "` / `": "` so generation ends once the schema is satisfied.
-    ///   `.flexible` accepts any whitespace, and a greedy-decoding model can then keep
-    ///   emitting whitespace after the last value.
     /// - Throws: If the asset bundle is invalid or the tokenizer fails to load.
     ///   With `.eager`, also throws on engine-creation failure.
     public init(
@@ -116,8 +109,7 @@ public struct CoreAILanguageModel: LanguageModel {
         variant: String? = nil,
         kvCacheStrategy: KVCacheStrategy = .auto,
         prefillChunkSize: Int? = nil,
-        prefillChunkThreshold: Int? = nil,
-        jsonWhitespace: JSONWhitespace = .compact
+        prefillChunkThreshold: Int? = nil
     ) async throws {
         let bundle = try LanguageModelBundle(at: url)
         let configuration = CoreAIExecutor.Configuration(
@@ -143,15 +135,14 @@ public struct CoreAILanguageModel: LanguageModel {
         try await engineLoad
         self.init(
             configuration: configuration, bundle: bundle, tokenizer: tokenizer,
-            resources: resources, jsonWhitespace: jsonWhitespace)
+            resources: resources)
     }
 
     private init(
         configuration: CoreAIExecutor.Configuration,
         bundle: LanguageModelBundle,
         tokenizer: any Tokenizer,
-        resources: ModelResources,
-        jsonWhitespace: JSONWhitespace
+        resources: ModelResources
     ) {
         let toolCallDetection = detectToolCallFormat(using: tokenizer)
         let thinkingFormat = detectThinkingFormat(using: tokenizer)
@@ -186,7 +177,6 @@ public struct CoreAILanguageModel: LanguageModel {
             additional.insert(id)
         }
         self.additionalEosTokenIds = additional
-        self.jsonWhitespace = jsonWhitespace
     }
 
     // MARK: - Resource control
@@ -537,12 +527,10 @@ public struct CoreAILanguageModel: LanguageModel {
             let strategy: any DecodingStrategy
             if engine is any ConstrainedGenerationCapable {
                 strategy = PipelinedConstrainedDecodingStrategy(
-                    jsonSchema: jsonSchema, vocabSize: model.bundle.vocabSize,
-                    whitespace: model.jsonWhitespace)
+                    jsonSchema: jsonSchema, vocabSize: model.bundle.vocabSize)
             } else {
                 strategy = ConstrainedDecodingStrategy(
-                    jsonSchema: jsonSchema, vocabSize: model.bundle.vocabSize,
-                    whitespace: model.jsonWhitespace)
+                    jsonSchema: jsonSchema, vocabSize: model.bundle.vocabSize)
             }
             let stopSequences = StopSequences(
                 for: model.tokenizer,
