@@ -51,9 +51,13 @@ public struct EngineFactory: Sendable {
         CLILogger.log("  - structure: \(preparedModel.structure.description)")
 
         // Step 3: Resolve variant with structure detection
+        let takesAttentionMask =
+            preparedModel.model.functionDescriptor(for: parsedConfig.function)?.inputNames
+            .contains(where: InputLayout.knownAttnMaskNames.contains) ?? false
         let variant = try resolveVariant(
             override: options.variant,
-            detectedStructure: preparedModel.structure
+            detectedStructure: preparedModel.structure,
+            takesAttentionMask: takesAttentionMask
         )
 
         CLILogger.log("  - resolved variant: \(variant.rawValue)")
@@ -205,16 +209,20 @@ public struct EngineFactory: Sendable {
 
     /// Resolves the engine variant based on override or auto-detection.
     // Internal for EngineSupportTests.
+    ///
+    /// A dynamic graph with an `attn_mask` input resolves to the sequential engine, which is the
+    /// only engine that fills the mask.
     static func resolveVariant(
         override: String?,
-        detectedStructure: ModelStructure
+        detectedStructure: ModelStructure,
+        takesAttentionMask: Bool = false
     ) throws -> Variant {
         // Handle nil, "auto", or "default" as auto-detection
         guard let overrideStr = override,
             overrideStr != "auto",
             overrideStr != "default"
         else {
-            return autoDetectVariant(structure: detectedStructure)
+            return autoDetectVariant(structure: detectedStructure, takesAttentionMask: takesAttentionMask)
         }
 
         // Parse override string to variant
@@ -227,7 +235,8 @@ public struct EngineFactory: Sendable {
         // Validate compatibility and warn if mismatch
         let (isCompatible, warning) = checkVariantCompatibility(
             variant: variant,
-            structure: detectedStructure
+            structure: detectedStructure,
+            takesAttentionMask: takesAttentionMask
         )
 
         if let warning = warning {
@@ -237,6 +246,7 @@ public struct EngineFactory: Sendable {
         if !isCompatible {
             throw InferenceRuntimeError.unsupportedEngineVariant(
                 "Variant '\(overrideStr)' incompatible with model structure"
+                    + (warning.map { ": \($0)" } ?? "")
             )
         }
 
@@ -245,13 +255,14 @@ public struct EngineFactory: Sendable {
 
     /// Auto-detects the optimal variant based on model structure.
     private static func autoDetectVariant(
-        structure: ModelStructure
+        structure: ModelStructure,
+        takesAttentionMask: Bool
     ) -> Variant {
         switch structure {
         case .chunkedStatic:
             return .staticShape
         case .dynamic:
-            return .pipelined
+            return takesAttentionMask ? .sequential : .pipelined
         default:
             // EngineFactory drives LLM engines only
             preconditionFailure(
@@ -263,9 +274,12 @@ public struct EngineFactory: Sendable {
     /// Checks if a variant override is compatible with the model structure.
     private static func checkVariantCompatibility(
         variant: Variant,
-        structure: ModelStructure
+        structure: ModelStructure,
+        takesAttentionMask: Bool
     ) -> (compatible: Bool, warning: String?) {
         switch (variant, structure) {
+        case (.pipelined, .dynamic) where takesAttentionMask:
+            return (false, "Core AI pipelined variant does not take an attn_mask input; use coreai-sequential")
         case (.staticShape, .dynamic):
             return (false, "Static-shape variant requires chunked static model (extend_* functions)")
         case (.pipelined, .chunkedStatic):

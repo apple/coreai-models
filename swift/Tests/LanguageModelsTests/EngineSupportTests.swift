@@ -177,6 +177,21 @@ struct EngineSupportTests {
         #expect(variant == .pipelined)
     }
 
+    @Test("A dynamic asset with an attn_mask input resolves to the sequential engine")
+    func attentionMaskPicksSequential() throws {
+        let variant = try EngineFactory.resolveVariant(
+            override: nil, detectedStructure: .dynamic, takesAttentionMask: true)
+        #expect(variant == .sequential)
+    }
+
+    @Test("A pipelined override on an attn_mask asset is rejected")
+    func pipelinedOnAttentionMaskRejected() {
+        #expect(throws: InferenceRuntimeError.self) {
+            try EngineFactory.resolveVariant(
+                override: "coreai-pipelined", detectedStructure: .dynamic, takesAttentionMask: true)
+        }
+    }
+
     @Test("`auto` and `default` mean auto-detect", arguments: ["auto", "default"])
     func autoOverridesDetect(_ override: String) throws {
         let variant = try EngineFactory.resolveVariant(
