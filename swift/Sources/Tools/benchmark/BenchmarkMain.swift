@@ -62,10 +62,23 @@ struct LLMBenchmark: AsyncParsableCommand {
     )
     var clearCoreAICache: Bool = false
 
+    @Option(
+        name: .customLong("inference-engine-variant"),
+        help: "Engine variant. The default picks one from the model. Batch sizes above 1 need coreai-sequential.")
+    var inferenceEngineVariant: String = "default"
+
+    @Option(
+        name: .customLong("batch-size"),
+        help:
+            "Number of requests to run as one batch. Defaults to the graph's static batch dimension. A dynamic-batch graph reports 1, so set this explicitly. Needs --inference-engine-variant coreai-sequential."
+    )
+    var batchSize: Int?
+
     func validate() throws {
         if promptTokens < 1 { throw ValidationError("--prompt-tokens must be >= 1") }
         if generationTokens < 1 { throw ValidationError("--generation-tokens must be >= 1") }
         if numTrials < 1 { throw ValidationError("--num-trials must be >= 1") }
+        if let b = batchSize, b < 1 { throw ValidationError("--batch-size must be >= 1") }
         if !FileManager.default.fileExists(atPath: model) {
             throw ValidationError("Model path not found: \(model)")
         }
@@ -100,6 +113,7 @@ struct LLMBenchmark: AsyncParsableCommand {
         let resolvedChunkSize = chunkSize ?? bundle.language.prefillChunkSize
         let resolvedChunkThreshold = chunkThreshold ?? bundle.language.prefillChunkThreshold
         let engineOptions = EngineOptions(
+            variant: inferenceEngineVariant,
             prefillChunkSize: resolvedChunkSize,
             prefillChunkThreshold: resolvedChunkThreshold,
             tensorData: bundle.tensorData
@@ -117,11 +131,37 @@ struct LLMBenchmark: AsyncParsableCommand {
         let prompt = randomPrompt(vocabSize: vocabSize, count: promptTokens, seed: seed)
         let sampling = SamplingConfiguration(temperature: 0)
 
+        // A dynamic-batch graph's batch dimension is symbolic and detects as 1, so it needs an
+        // explicit --batch-size.
+        let detectedBatch = (engine as? CoreAISequentialEngine)?.declaredBatchSize ?? 1
+        let effectiveBatch = batchSize ?? detectedBatch
+        if effectiveBatch > bundle.maxBatchSize {
+            throw ValidationError(
+                "--batch-size \(effectiveBatch) exceeds the asset's max batch size \(bundle.maxBatchSize). "
+                    + "Re-export with --dynamic-batch-size >= \(effectiveBatch), or lower --batch-size.")
+        }
+        if effectiveBatch > 1 {
+            guard engine is CoreAISequentialEngine else {
+                throw ValidationError(
+                    "batched benchmarking with batch size \(effectiveBatch) requires "
+                        + "--inference-engine-variant coreai-sequential")
+            }
+            let source = batchSize != nil ? "requested" : "auto-detected from model"
+            print("🧵 Batch size: \(effectiveBatch) (\(source); benchmarking \(effectiveBatch) rows together)")
+        }
+
+        func oneTrial() async throws -> TrialResult {
+            if effectiveBatch > 1, let seq = engine as? CoreAISequentialEngine {
+                return try await runBatchedTrial(engine: seq, prompt: prompt, batchSize: effectiveBatch)
+            }
+            return try await runTrial(engine: engine, prompt: prompt, sampling: sampling)
+        }
+
         // Warmup
         print("\n⚙️  Warming up engine...", terminator: "")
         fflush(stdout)
         let warmupStart = SuspendingClock.now
-        _ = try await runTrial(engine: engine, prompt: prompt, sampling: sampling)
+        _ = try await oneTrial()
         let warmupSeconds = (SuspendingClock.now - warmupStart).inSeconds
         print(" done in \(fmt(warmupSeconds))s")
 
@@ -130,7 +170,7 @@ struct LLMBenchmark: AsyncParsableCommand {
         var trials: [TrialResult] = []
 
         for i in 0..<numTrials {
-            let r = try await runTrial(engine: engine, prompt: prompt, sampling: sampling)
+            let r = try await oneTrial()
             trials.append(r)
             if i > 0 { print() }
             print("🧪 Trial \(i + 1)")
@@ -145,6 +185,9 @@ struct LLMBenchmark: AsyncParsableCommand {
         print(String(repeating: "=", count: 50))
         print("Prepare:    \(fmt(prepareSeconds))s\(cacheSuffix)")
         print("Warmup:     \(fmt(warmupSeconds))s")
+        if effectiveBatch > 1 {
+            print("Batch:      \(effectiveBatch) rows (the prompt and generation rates below are totals across rows)")
+        }
         print("Prompt:     \(fmt(avgPrompt)) tokens/sec")
         print("Generation: \(fmt(avgGen)) tokens/sec")
         print(String(repeating: "=", count: 50))
@@ -155,6 +198,7 @@ struct LLMBenchmark: AsyncParsableCommand {
                 promptTokens: promptTokens,
                 generationTokens: generationTokens,
                 numTrials: numTrials,
+                batchSize: effectiveBatch,
                 prepareSeconds: prepareSeconds,
                 cacheHit: cacheHit,
                 warmupSeconds: warmupSeconds,
@@ -201,6 +245,24 @@ struct LLMBenchmark: AsyncParsableCommand {
         let decodeCount = max(0, count - 1)
         let genTps = genTime > 0 ? Double(decodeCount) / genTime : 0
 
+        return TrialResult(promptTps: promptTps, genTps: genTps)
+    }
+
+    /// Runs `batchSize` copies of the prompt as one batch. Rates are totals across rows. No EOS is
+    /// set, so every row generates `generationTokens` tokens.
+    private func runBatchedTrial(
+        engine: CoreAISequentialEngine,
+        prompt: [Int32],
+        batchSize: Int
+    ) async throws -> TrialResult {
+        try? await Task.sleep(for: .milliseconds(50))
+        let rows = Array(repeating: prompt, count: batchSize)
+        let configs = Array(repeating: SamplingConfiguration(temperature: 0), count: batchSize)
+        let r = try await engine.lockstepBatchedGenerate(
+            promptRows: rows, configs: configs, maxNewTokens: generationTokens, eosTokenIds: [])
+        let generatedPerRow = r.tokens.first?.count ?? 0
+        let promptTps = r.prefillSeconds > 0 ? Double(batchSize * promptTokens) / r.prefillSeconds : 0
+        let genTps = r.decodeSeconds > 0 ? Double(batchSize * generatedPerRow) / r.decodeSeconds : 0
         return TrialResult(promptTps: promptTps, genTps: genTps)
     }
 
@@ -257,6 +319,7 @@ struct BenchmarkReport: Codable {
     let promptTokens: Int
     let generationTokens: Int
     let numTrials: Int
+    let batchSize: Int
     let prepareSeconds: Double
     let cacheHit: Bool
     let warmupSeconds: Double

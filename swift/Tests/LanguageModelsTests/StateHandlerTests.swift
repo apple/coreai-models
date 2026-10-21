@@ -237,6 +237,26 @@ struct StateHandlerConformanceTests {
     }
 }
 
+// MARK: - KV Cache Shape Resolution (batch-aware)
+
+@Suite("KV cache dynamic-shape resolution")
+struct KVCacheShapeResolutionTests {
+    /// Layout `[layers, batch, kv_heads, seq, head_dim]`: the seq dim grows to `sequenceLength`
+    /// and a dynamic batch dim resolves to `batchSize`.
+    @Test(
+        "resolves the seq dim and a dynamic batch dim",
+        arguments: [
+            ([2, -1, 4, -1, 8], 3, [2, 3, 4, 256, 8]),
+            ([2, 1, 4, -1, 8], 1, [2, 1, 4, 256, 8]),
+            ([2, -1, 4, -1, 8], 1, [2, 1, 4, 256, 8]),
+        ] as [([Int], Int, [Int])])
+    func resolves(shape: [Int], batchSize: Int, resolved: [Int]) {
+        #expect(
+            GrowingNDArrayState.resolveKVShape(
+                shape, sequenceDimIndex: 3, sequenceLength: 256, batchSize: batchSize) == resolved)
+    }
+}
+
 // MARK: - withBoundStates Tests
 
 /// Minimal state handler for testing the binding API.
@@ -326,5 +346,122 @@ struct StateKindValidationTests {
             ("keyCache", .kvCache), ("valueCache", .kvCache), ("convStates", .fixed),
         ]
         #expect(StateHandlerFactory.dynamicStatesWithFixedSizeKind(valid, isDynamic: isDynamic).isEmpty)
+    }
+}
+
+// MARK: - Per-row KV copies
+
+/// Batch layouts the engine sees: batch leading (`[B, H, seq, D]`) and batch at dim 1
+/// (`[G, B, H, seq, D]`), where code that assumes a leading batch dim copies the wrong slab.
+enum RowCopyLayout: CaseIterable, Sendable {
+    case leadingBatch, nonLeadingBatch
+
+    var batchDimIndex: Int { self == .leadingBatch ? 0 : 1 }
+    var sequenceDimIndex: Int { self == .leadingBatch ? 2 : 3 }
+
+    /// Shape with `batch` rows and `seq` slots.
+    func shape(batch: Int, seq: Int) -> [Int] {
+        self == .leadingBatch ? [batch, 2, seq, 3] : [2, batch, 2, seq, 3]
+    }
+}
+
+@Suite("Per-row KV copies")
+struct RowCopyTests {
+    /// An array whose bytes count up, so every element has a distinct bit pattern.
+    private func countingArray(_ shape: [Int], _ type: NDArray.ScalarType, offset: Int = 0) -> NDArray {
+        var array = NDArray(shape: shape, scalarType: type)
+        let byteCount = shape.reduce(1, *) * type.byteSize
+        array.mutableRawView().withUnsafeMutableBytes { ptr, _, _ in
+            let bytes = ptr.assumingMemoryBound(to: UInt8.self)
+            for i in 0..<byteCount { bytes[i] = UInt8((i + offset) % 251) }
+        }
+        return array
+    }
+
+    private func bytes(_ array: NDArray) -> [UInt8] {
+        let byteCount = array.shape.reduce(1, *) * array.scalarType.byteSize
+        var out = [UInt8](repeating: 0, count: byteCount)
+        array.rawView().withUnsafeBytes { ptr, _, _ in
+            let p = ptr.assumingMemoryBound(to: UInt8.self)
+            for i in 0..<byteCount { out[i] = p[i] }
+        }
+        return out
+    }
+
+    /// Reference copy: every destination element for which `source(index)` returns a source index
+    /// takes that source element's bytes.
+    private func expected(
+        destination: NDArray, from source: NDArray, source sourceIndex: ([Int]) -> [Int]?
+    ) -> [UInt8] {
+        var out = bytes(destination)
+        let src = bytes(source)
+        let width = destination.scalarType.byteSize
+        func flat(_ index: [Int], _ shape: [Int]) -> Int {
+            zip(index, shape).reduce(0) { $0 * $1.1 + $1.0 }
+        }
+        let shape = destination.shape
+        for element in 0..<shape.reduce(1, *) {
+            var index = [Int](repeating: 0, count: shape.count)
+            var rest = element
+            for dim in shape.indices.reversed() {
+                index[dim] = rest % shape[dim]
+                rest /= shape[dim]
+            }
+            guard let from = sourceIndex(index) else { continue }
+            let s = flat(from, source.shape) * width
+            out.replaceSubrange(element * width..<(element + 1) * width, with: src[s..<s + width])
+        }
+        return out
+    }
+
+    @Test(
+        "copyRegion moves one row's slot and leaves everything else untouched",
+        arguments: [NDArray.ScalarType.float16, .float32, .int8], RowCopyLayout.allCases)
+    func copyRegion(_ type: NDArray.ScalarType, _ layout: RowCopyLayout) {
+        var array = countingArray(layout.shape(batch: 3, seq: 6), type)
+        let (b, seq) = (layout.batchDimIndex, layout.sequenceDimIndex)
+        // Row 1's new token moves from the shared write slot 5 down to its cursor 2.
+        let want = expected(destination: array, from: array) { index in
+            guard index[b] == 1, index[seq] == 2 else { return nil }
+            var from = index
+            from[seq] = 5
+            return from
+        }
+
+        GrowingNDArrayState.copyRegion(
+            in: &array, sequenceDimIndex: seq, batchDimIndex: b, row: 1, fromSeq: 5, toSeq: 2)
+
+        #expect(bytes(array) == want)
+    }
+
+    @Test("copyRegion with fromSeq == toSeq is a no-op")
+    func copyRegionSameSlot() {
+        var array = countingArray([2, 1, 4, 2], .float16)
+        let before = bytes(array)
+        GrowingNDArrayState.copyRegion(
+            in: &array, sequenceDimIndex: 2, batchDimIndex: 0, row: 0, fromSeq: 3, toSeq: 3)
+        #expect(bytes(array) == before)
+    }
+
+    @Test(
+        "copyRowPrefix copies a batch-1 prefix into one row across different seq capacities",
+        arguments: [NDArray.ScalarType.float16, .float32, .int8], RowCopyLayout.allCases)
+    func copyRowPrefix(_ type: NDArray.ScalarType, _ layout: RowCopyLayout) {
+        let source = countingArray(layout.shape(batch: 1, seq: 4), type, offset: 100)
+        var destination = countingArray(layout.shape(batch: 3, seq: 6), type)
+        let (b, seq) = (layout.batchDimIndex, layout.sequenceDimIndex)
+        // Slots 0..<3 of row 2 come from the source; everything else keeps its bytes.
+        let want = expected(destination: destination, from: source) { index in
+            guard index[b] == 2, index[seq] < 3 else { return nil }
+            var from = index
+            from[b] = 0
+            return from
+        }
+
+        GrowingNDArrayState.copyRowPrefix(
+            from: source, sourceRow: 0, to: &destination, destRow: 2,
+            sequenceDimIndex: seq, batchDimIndex: b, count: 3)
+
+        #expect(bytes(destination) == want)
     }
 }

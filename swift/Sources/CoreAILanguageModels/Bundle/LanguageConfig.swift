@@ -93,6 +93,9 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
     public let vocabSize: Int
     public let maxContextLength: Int
 
+    /// Largest batch the graph accepts. 1 for single-sequence graphs and for bundles without `max_batch_size`.
+    package let maxBatchSize: Int
+
     /// `true` if the bundle ships its own tokenizer directory; `false` to
     /// load via HuggingFace at runtime. Defaults to `true` when omitted.
     public let embeddedTokenizer: Bool
@@ -140,6 +143,7 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
         self.prefillChunkSize = prefillChunkSize
         self.prefillChunkThreshold = prefillChunkThreshold
         self.overrides = overrides
+        self.maxBatchSize = 1
     }
 
     enum CodingKeys: String, CodingKey {
@@ -153,6 +157,7 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
         case prefillChunkSize = "prefill_chunk_size"
         case prefillChunkThreshold = "prefill_chunk_threshold"
         case overrides
+        case maxBatchSize = "max_batch_size"
     }
 
     public init(from decoder: Swift.Decoder) throws {
@@ -167,6 +172,7 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
         self.prefillChunkSize = try c.decodeIfPresent(Int.self, forKey: .prefillChunkSize)
         self.prefillChunkThreshold = try c.decodeIfPresent(Int.self, forKey: .prefillChunkThreshold)
         self.overrides = try c.decodeIfPresent(LanguageOverrides.self, forKey: .overrides)
+        self.maxBatchSize = try c.decodeIfPresent(Int.self, forKey: .maxBatchSize) ?? 1
     }
 
     // MARK: - Additional Stop Tokens
