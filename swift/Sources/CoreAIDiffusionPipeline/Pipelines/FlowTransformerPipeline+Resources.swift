@@ -36,8 +36,8 @@ extension FlowTransformerPipeline {
             resolvedMode = mode
         }
 
-        guard let textEncoderPath = bundle.textEncoderFilename else {
-            throw PipelineLoadError.missingComponent(DiffusionComponentKey.textEncoder)
+        guard let textEncoderPath = Self.resolveAsset(.textEncoder, in: bundle) else {
+            throw Self.missing(.textEncoder, in: bundle)
         }
 
         // Select transformer by mode.
@@ -49,7 +49,7 @@ extension FlowTransformerPipeline {
         switch resolvedMode {
         case .full, .tiled:
             guard let path = Self.resolveAsset(.transformer, in: bundle) else {
-                throw PipelineLoadError.missingComponent(Asset.transformer.stem)
+                throw Self.missing(.transformer, in: bundle)
             }
             transformer = CoreAIDiffusionModelFunction(modelURL: url.appendingPathComponent(path))
             transformerFnName = "main"
@@ -110,12 +110,12 @@ extension FlowTransformerPipeline {
         switch resolvedMode {
         case .full:
             guard let path = Self.resolveAsset(.vaeDecoder, in: bundle) else {
-                throw PipelineLoadError.missingComponent(Asset.vaeDecoder.stem)
+                throw Self.missing(.vaeDecoder, in: bundle)
             }
             decoderName = path
         case .half, .tiled:
             guard let path = Self.resolveAsset(.vaeDecoderHalf, in: bundle) else {
-                throw PipelineLoadError.missingComponent(Asset.vaeDecoderHalf.stem)
+                throw Self.missing(.vaeDecoderHalf, in: bundle)
             }
             decoderName = path
         case .auto:
@@ -123,9 +123,8 @@ extension FlowTransformerPipeline {
         }
 
         // Resolve compiled assets; report a missing text encoder up front.
-        let textEncoderURL = try resolveExistingPipelineAsset(
-            textEncoderPath, in: url, component: DiffusionComponentKey.textEncoder)
-        let textEncoder = CoreAIDiffusionModelFunction(modelURL: textEncoderURL)
+        let textEncoder = CoreAIDiffusionModelFunction(
+            modelURL: url.appendingPathComponent(textEncoderPath))
         let decoder = CoreAIDiffusionModelFunction(
             modelURL: url.appendingPathComponent(decoderName))
 
@@ -133,7 +132,7 @@ extension FlowTransformerPipeline {
         let encoderName: String?
         switch resolvedMode {
         case .full:
-            encoderName = bundle.vaeEncoderFilename
+            encoderName = Self.resolveAsset(.vaeEncoder, in: bundle)
         case .half, .tiled:
             encoderName = Self.resolveAsset(.vaeEncoderHalf, in: bundle)
         case .auto:
@@ -212,20 +211,30 @@ extension FlowTransformerPipeline {
             self.stem = stem
         }
 
+        static let textEncoder = Asset(key: DiffusionComponentKey.textEncoder, stem: "TextEncoder")
         static let transformer = Asset(key: DiffusionComponentKey.transformer, stem: "Transformer")
         static let transformer512 = Asset(stem: "Transformer_512")
         static let vaeDecoder = Asset(key: DiffusionComponentKey.vaeDecoder, stem: "VAEDecoder")
         static let vaeDecoderHalf = Asset(key: "vae_decoder_half", stem: "VAEDecoder_half")
+        static let vaeEncoder = Asset(key: DiffusionComponentKey.vaeEncoder, stem: "VAEEncoder")
         static let vaeEncoderHalf = Asset(key: "vae_encoder_half", stem: "VAEEncoder_half")
     }
 
-    /// The asset's filename in the bundle (the declared one, else `<stem>.aimodel`), or nil
-    /// if neither is on disk.
+    /// The asset's filename (the declared one, else `<stem>.aimodel`) when it is on disk, else nil.
     private static func resolveAsset(_ asset: Asset, in bundle: DiffusionBundle) -> String? {
-        let filename = bundle.assetFilename(for: asset.key, fallback: "\(asset.stem).aimodel")
+        let filename = expectedFilename(asset, in: bundle)
         let exists = FileManager.default.fileExists(
             atPath: bundle.bundlePath.appendingPathComponent(filename).path)
         return exists ? filename : nil
+    }
+
+    private static func expectedFilename(_ asset: Asset, in bundle: DiffusionBundle) -> String {
+        bundle.assetFilename(for: asset.key, fallback: "\(asset.stem).aimodel")
+    }
+
+    /// The error for a required asset that isn't on disk, naming the file looked for.
+    private static func missing(_ asset: Asset, in bundle: DiffusionBundle) -> PipelineLoadError {
+        .missingComponent("\(asset.key) (expected \(expectedFilename(asset, in: bundle)))")
     }
 
     /// Probe available assets and pick the highest quality mode.

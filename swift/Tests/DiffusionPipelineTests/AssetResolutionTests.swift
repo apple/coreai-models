@@ -12,10 +12,10 @@ import Testing
 @Suite("Diffusion asset resolution")
 struct AssetResolutionTests {
     @Test(
-        "A declared filename is used when it exists, else the exporter's default",
+        "A declared filename is used as is, even when missing; else the exporter's default",
         arguments: [
             (declared: true, onDisk: true, expected: "Transformer.aimodelc"),
-            (declared: true, onDisk: false, expected: "Transformer.aimodel"),
+            (declared: true, onDisk: false, expected: "Transformer.aimodelc"),
             (declared: false, onDisk: false, expected: "Transformer.aimodel"),
         ])
     func declaredFilenameWithFallback(declared: Bool, onDisk: Bool, expected: String) throws {

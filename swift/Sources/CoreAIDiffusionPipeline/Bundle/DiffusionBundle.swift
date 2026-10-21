@@ -61,13 +61,11 @@ public struct DiffusionBundle: Sendable {
         modelBundle.assets[key]
     }
 
-    /// The filename declared for `key` when that file exists in the bundle, so ahead-of-time
-    /// compiled `.aimodelc` assets load; otherwise `fallback`, the exporter's default name.
+    /// The filename declared for `key`, else `fallback`, the exporter's default name. A
+    /// declared filename is used as is, even when missing on disk, so the bundle never loads a
+    /// file other than the one it names.
     public func assetFilename(for key: String, fallback: String) -> String {
-        guard let declared = assetFilename(for: key),
-            FileManager.default.fileExists(atPath: bundlePath.appendingPathComponent(declared).path)
-        else { return fallback }
-        return declared
+        assetFilename(for: key) ?? fallback
     }
 
     public var textEncoderFilename: String? { assetFilename(for: DiffusionComponentKey.textEncoder) }
