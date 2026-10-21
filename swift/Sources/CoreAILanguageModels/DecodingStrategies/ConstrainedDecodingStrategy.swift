@@ -23,14 +23,19 @@ public struct ConstrainedDecodingStrategy: DecodingStrategy {
     /// Vocabulary size override. If nil, derived from tokenizer at generation time.
     private let vocabSizeOverride: Int?
 
+    /// Whitespace the grammar accepts between JSON tokens.
+    private let whitespace: JSONWhitespace
+
     /// Initialize with a JSON schema string.
     ///
     /// - Parameters:
     ///   - jsonSchema: A valid JSON schema string that constrains output structure
     ///   - vocabSize: Optional vocabulary size override. If nil, derived from tokenizer.
-    public init(jsonSchema: String, vocabSize: Int? = nil) {
+    ///   - whitespace: Whitespace the grammar accepts between JSON tokens (default: `.compact`).
+    public init(jsonSchema: String, vocabSize: Int? = nil, whitespace: JSONWhitespace = .compact) {
         self.jsonSchema = jsonSchema
         self.vocabSizeOverride = vocabSize
+        self.whitespace = whitespace
     }
 
     // MARK: - DecodingStrategy conformance
@@ -53,7 +58,8 @@ public struct ConstrainedDecodingStrategy: DecodingStrategy {
             jsonSchema: jsonSchema,
             vocabSizeOverride: vocabSizeOverride,
             tokenizer: tokenizer,
-            stopSequences: stopSequences
+            stopSequences: stopSequences,
+            whitespace: whitespace
         )
         let inputTokens =
             try PromptUtils
@@ -83,7 +89,8 @@ public struct ConstrainedDecodingStrategy: DecodingStrategy {
         jsonSchema: String,
         vocabSizeOverride: Int?,
         tokenizer: any Tokenizer,
-        stopSequences: StopSequences
+        stopSequences: StopSequences,
+        whitespace: JSONWhitespace
     ) throws -> ConstrainedGenerationSession {
         guard let vocabSize = vocabSizeOverride ?? Self.deriveVocabSize(from: tokenizer) else {
             throw InferenceRuntimeError.invalidArgument(
@@ -104,7 +111,8 @@ public struct ConstrainedDecodingStrategy: DecodingStrategy {
             jsonSchema: jsonSchema,
             tokenizer: tokenizer,
             vocabSize: vocabSize,
-            stopTokenIds: stopTokenIds
+            stopTokenIds: stopTokenIds,
+            whitespace: whitespace
         )
         CLILogger.log(
             "Constrained session created (vocabSize=\(vocabSize), stopTokenIds=\(stopTokenIds ?? []))",

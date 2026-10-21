@@ -130,6 +130,22 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     )
     var jsonSchema: String?
 
+    @Option(
+        name: .customLong("json-whitespace"),
+        help:
+            "Whitespace accepted between JSON tokens with --json-schema: 'compact' (fixed ', ' / ': ' separators; default) or 'flexible' (any whitespace; a greedy-decoding model can keep emitting whitespace after the last value)."
+    )
+    var jsonWhitespace: String = "compact"
+
+    /// The ``JSONWhitespace`` named by `--json-whitespace`, or nil for an unknown value.
+    private var parsedJSONWhitespace: JSONWhitespace? {
+        switch jsonWhitespace.lowercased() {
+        case "flexible": return .flexible
+        case "compact": return .compact
+        default: return nil
+        }
+    }
+
     @Option(help: "Model inference engine variant. Defaults to 'default'")
     var inferenceEngineVariant: String = "default"
 
@@ -282,6 +298,9 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             throw ValidationError(
                 "--repetition-penalty cannot be used with --json-schema"
                     + " (constrained generation does not support penalty on the pipelined engine)")
+        }
+        if parsedJSONWhitespace == nil {
+            throw ValidationError("--json-whitespace must be 'flexible' or 'compact' (got '\(jsonWhitespace)')")
         }
     }
 
@@ -818,12 +837,14 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         if inferenceEngine is any ConstrainedGenerationCapable {
             constrainedStrategy = PipelinedConstrainedDecodingStrategy(
                 jsonSchema: schema,
-                vocabSize: vocabSize
+                vocabSize: vocabSize,
+                whitespace: parsedJSONWhitespace ?? .compact
             )
         } else {
             constrainedStrategy = ConstrainedDecodingStrategy(
                 jsonSchema: schema,
-                vocabSize: vocabSize
+                vocabSize: vocabSize,
+                whitespace: parsedJSONWhitespace ?? .compact
             )
         }
 
