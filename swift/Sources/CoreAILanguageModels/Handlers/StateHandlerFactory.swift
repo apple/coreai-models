@@ -6,19 +6,26 @@
 import CoreAI
 import CoreAIShared
 
-/// Classification of a model state's lifecycle behavior.
+/// How a model state is allocated and rewound. Set per state in `language.states`, or
+/// inferred from the state's shape and name.
 public enum StateKind: String, Codable, Sendable {
-    /// KV cache — grows dynamically with context, supports truncation (causal mask).
+    /// Full-attention KV cache: one slot per position. Grows with the context when its
+    /// sequence dimension is dynamic, or has a fixed capacity when exported at its full
+    /// context. Rewinding to any earlier position is safe.
     case kvCache = "kv_cache"
-    /// Sliding window cache — fixed size, supports truncation (causal mask).
+    /// Sliding-window attention ring cache: a fixed number of slots, reused once the window
+    /// fills. Rewinding is safe until the ring wraps; after that the engines replay the
+    /// prompt instead.
     case slidingCache = "sliding_cache"
-    /// Fixed state (conv, recurrent) — fixed size, does NOT support truncation.
+    /// Fixed-size state that summarizes the whole prefix, such as a convolution or
+    /// linear-attention (recurrent) state. It can't be rewound, so the engines replay the
+    /// prompt instead.
     case fixed
 }
 
 /// Result of state handler creation.
 struct SyncStateHandlerSet {
-    /// Growing states (KV caches with dynamic sequence dimension).
+    /// KV cache states, growing or fixed-capacity.
     var kvCache: any SyncStateHandler
     /// Fixed states (sliding caches + recurrent/conv). Nil for transformer-only models.
     var additionalStates: FixedNDArrayState?
@@ -34,7 +41,7 @@ struct SyncStateHandlerSet {
 /// Creates state handlers from a model's function descriptor.
 ///
 /// Classification priority:
-/// 1. Explicit metadata (`"states"` field in metadata.json) — preferred
+/// 1. Explicit metadata (`language.states` in metadata.json) — preferred
 /// 2. Shape-based heuristic — dynamic dim → kvCache, static + "sliding" in name → slidingCache,
 ///    static + "cache"/"kv" in name → kvCache (fixed capacity), else → fixed
 enum StateHandlerFactory {

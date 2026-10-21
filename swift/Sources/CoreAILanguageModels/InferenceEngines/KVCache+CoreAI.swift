@@ -587,6 +587,8 @@ extension NDArray.ScalarType {
         case .int8: return .int8
         case .float8e4m3fn: return .float8e4m3
         case .float8e5m2: return .float8e5m2
+        // The expansion is a bitwise identity copy, so a same-width type is enough.
+        case .uint8, .float8e8m0fn: return .uInt8
         default:
             fatalError("Unsupported scalar type for KV Cache expansion: \(self).\n")
         }

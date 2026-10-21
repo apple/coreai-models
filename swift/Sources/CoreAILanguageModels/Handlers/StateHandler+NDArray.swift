@@ -174,17 +174,14 @@ public final class GrowingNDArrayState: SyncStateHandler {
 /// `source` to `destination`, whose blocks start every `sourceBlockStride` and
 /// `destinationBlockStride` elements respectively.
 ///
-/// A raw byte copy: a typed `view(as: Float16.self)` traps on a BFloat16 array (the
-/// scalar types must match), and the element values are copied verbatim either way.
+/// A raw byte copy, so it works for any byte-addressable scalar type (fp16/bf16/fp32
+/// and 8-bit KV caches alike); a typed view would trap on a mismatched type.
 func copyBlockPrefixes(
     from source: NDArray, to destination: inout NDArray,
     blockCount: Int, sourceBlockStride: Int, destinationBlockStride: Int, runElements: Int
 ) {
-    let width: Int
-    switch source.scalarType {
-    case .float16, .bfloat16: width = 2
-    case .float32: width = 4
-    default: preconditionFailure("Unsupported scalar type for state copy: \(source.scalarType)")
+    guard let width = stateElementByteWidth(source.scalarType) else {
+        preconditionFailure("Packed sub-byte scalar type for state copy: \(source.scalarType)")
     }
     source.rawView().withUnsafeBytes { sourceBytes, _, _ in
         destination.mutableRawView().withUnsafeMutableBytes { destinationBytes, _, _ in
@@ -198,20 +195,26 @@ func copyBlockPrefixes(
 }
 
 func zeroFillNDArray(_ array: inout NDArray) {
-    let count = array.shape.reduce(1, *)
-    switch array.scalarType {
-    case .float16, .bfloat16:
-        // Both 16-bit types zero to an all-zero bit pattern, so a raw view avoids the
-        // scalar-type trap a typed `mutableView(as: Float16.self)` hits on a BFloat16 array.
-        array.mutableRawView().withUnsafeMutableBytes { ptr, _, _ in
-            memset(ptr, 0, count * MemoryLayout<UInt16>.stride)
-        }
-    case .float32:
-        var view = array.mutableView(as: Float.self)
-        view.withUnsafeMutablePointer { ptr, _, _ in
-            memset(ptr, 0, count * MemoryLayout<Float>.size)
-        }
+    guard let width = stateElementByteWidth(array.scalarType) else {
+        preconditionFailure("Packed sub-byte scalar type for state: \(array.scalarType)")
+    }
+    // Every supported type zeroes to an all-zero bit pattern, so a raw memset covers them
+    // without the scalar-type trap of a typed view.
+    let byteCount = array.shape.reduce(1, *) * width
+    array.mutableRawView().withUnsafeMutableBytes { ptr, _, _ in
+        memset(ptr, 0, byteCount)
+    }
+}
+
+/// Bytes per element of a state, or nil for packed sub-byte types, whose element counts
+/// don't map to byte ranges.
+func stateElementByteWidth(_ type: NDArray.ScalarType) -> Int? {
+    switch type {
+    case .int2, .int3, .int4, .int5, .int6, .int7,
+        .uint1, .uint2, .uint3, .uint4, .uint5, .uint6, .uint7,
+        .float4e2m1fn:
+        return nil
     default:
-        preconditionFailure("Unsupported scalar type for state: \(array.scalarType)")
+        return type.byteSize
     }
 }
