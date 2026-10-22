@@ -129,6 +129,11 @@ final class ServerState: @unchecked Sendable {
     /// guaranteed while this value is unchanged; it changes when output-affecting
     /// configuration (model, engine, context length, sampling defaults) changes.
     let systemFingerprint: String
+    /// Scheduler for the batched lane, or nil when the server handles one request at a time.
+    private let batchScheduler: BatchScheduler?
+    /// Config for each `SchedulerSession`. Set it whenever `batchScheduler` is set. If it is nil
+    /// while a scheduler is present, the batched lane runs on the shared engine without the permit.
+    private let batchModelConfig: ModelConfig?
     private let _state = Mutex<InternalState>(InternalState())
 
     private struct InternalState {
@@ -140,7 +145,13 @@ final class ServerState: @unchecked Sendable {
         var totalToolCalls: Int = 0
     }
 
-    init(engine: any InferenceEngine, tokenizer: any Tokenizer, config: ServerConfig) {
+    init(
+        engine: any InferenceEngine,
+        tokenizer: any Tokenizer,
+        config: ServerConfig,
+        batchScheduler: BatchScheduler? = nil,
+        batchModelConfig: ModelConfig? = nil
+    ) {
         self.engine = engine
         self.tokenizer = tokenizer
         self.config = config
@@ -148,6 +159,74 @@ final class ServerState: @unchecked Sendable {
         self.toolCallDetection = detectToolCallFormat(using: tokenizer)
         self.thinkingFormat = detectThinkingFormat(using: tokenizer)
         self.systemFingerprint = Self.makeSystemFingerprint(config: config, engine: engine)
+        self.batchScheduler = batchScheduler
+        self.batchModelConfig = batchModelConfig
+    }
+
+    /// Token ids that retire a row in the scheduler: EOS and the additional EOS ids. Multi-token
+    /// stop sequences are still matched by the decoding strategy.
+    private var schedulerStopTokenIds: Set<Int32> {
+        var ids = Set<Int32>()
+        if let eos = tokenizer.eosTokenId { ids.insert(Int32(eos)) }
+        ids.formUnion(config.additionalEosTokenIds.map { Int32($0) })
+        return ids
+    }
+
+    /// Returns the engine one request on `lane` should run on.
+    ///
+    /// - `.batched`: a new `SchedulerSession` over `batchScheduler`, or the shared base engine when
+    ///   no scheduler is configured.
+    /// - `.fallbackBatchOne`: with a scheduler running, a new `IsolatedSessionEngine` with its own
+    ///   session, so the batched rows keep their KV state while the batch is paused for it (see
+    ///   `acquireAccess(lane:)`). Without a scheduler, the shared base engine,
+    ///   which keeps its prefix cache.
+    func engineForRequest(lane: BatchServingLane) -> any InferenceEngine {
+        switch lane {
+        case .batched:
+            guard let scheduler = batchScheduler, let modelConfig = batchModelConfig else {
+                return engine
+            }
+            return SchedulerSession(
+                sink: scheduler, config: modelConfig, stopTokenIds: schedulerStopTokenIds)
+        case .fallbackBatchOne:
+            if batchScheduler != nil, let seq = engine as? CoreAISequentialEngine {
+                return IsolatedSessionEngine(base: seq)
+            }
+            return engine
+        }
+    }
+
+    /// Waits for what a request on `lane` must hold while it uses the engine, and returns it.
+    ///
+    /// - The single-slot permit from `queue`, except on the batched lane when a continuous-batching
+    ///   scheduler admits the request. Throws `ServerError.queueFull` when the queue is full.
+    /// - On the fallback lane with a scheduler running, an `ExclusiveEngineLease` as well, so the
+    ///   batch pauses at a step boundary instead of sharing the engine.
+    ///
+    /// Pass the same lane here and to `engineForRequest(lane:)`, and release the access when the
+    /// request is done:
+    ///
+    /// ```swift
+    /// let lane = BatchServingRouter.lane(hasResponseSchema: schema != nil)
+    /// let access = try await state.acquireAccess(lane: lane)
+    /// defer { access.release() }
+    /// let engine = state.engineForRequest(lane: lane)
+    /// ```
+    func acquireAccess(lane: BatchServingLane) async throws -> RequestAccess {
+        let permit = needsServerPermit(lane: lane) ? try await queue.acquire() : nil
+        let lease = lane == .fallbackBatchOne ? await batchScheduler?.acquireExclusiveAccess() : nil
+        return RequestAccess(permit: permit, lease: lease)
+    }
+
+    /// Whether a request on `lane` needs the single-slot permit. The batched lane does not when a
+    /// continuous-batching scheduler admits it, because the scheduler enforces its own queue limit.
+    private func needsServerPermit(lane: BatchServingLane) -> Bool {
+        switch lane {
+        case .batched:
+            return !(batchScheduler?.supportsContinuousBatching ?? false)
+        case .fallbackBatchOne:
+            return true
+        }
     }
 
     /// Deterministic FNV-1a hash of a canonical config descriptor. Deterministic (not
@@ -313,5 +392,22 @@ enum RequestID {
             return val
         }
         return "coreai-\(n)"
+    }
+}
+
+/// What one request holds while it uses the engine. Releasing it more than once is harmless, and
+/// the permit and lease each release on deinit.
+final class RequestAccess: Sendable {
+    private let permit: QueuePermit?
+    private let lease: ExclusiveEngineLease?
+
+    init(permit: QueuePermit?, lease: ExclusiveEngineLease?) {
+        self.permit = permit
+        self.lease = lease
+    }
+
+    func release() {
+        lease?.release()
+        permit?.release()
     }
 }

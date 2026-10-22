@@ -4,40 +4,37 @@
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
 import CoreAILMCommon
+import CoreAILanguageModels
 import Foundation
 
 /// Drives the server's generation core over a JSONL request file instead of HTTP.
 ///
 /// Requests run in arrival-timestamp order through the same cores the HTTP handler uses:
 /// `runChatCompletion` for `stream:false`, `runStreamingLoop` for `stream:true` (deltas folded
-/// back into the result). The engine is single-active, so requests run sequentially, matching the
-/// server. Interleaving sessions in the input reproduces the same per-session cache behavior. Each
+/// back into the result). By default requests run one at a time, matching the single-request server.
+/// With `concurrent`, they all start at once so the batch scheduler can fill several rows.
+/// Interleaving sessions in the input reproduces the same per-session cache behavior. Each
 /// result is one JSONL line with per-request instrumentation.
 enum ReplayRunner {
-    static func run(inputPath: String, outputPath: String?, state: ServerState) async throws {
+    static func run(
+        inputPath: String, outputPath: String?, state: ServerState, concurrent: Bool = false
+    ) async throws {
         let text = try String(contentsOfFile: inputPath, encoding: .utf8)
         let requests = try ReplayIO.parseRequests(text)
 
-        var lines: [String] = []
-        lines.reserveCapacity(requests.count)
-        for req in requests {
-            let sessionID = req.session ?? "default"
-            let result: ReplayResult
-            do {
-                if req.isStreaming {
-                    result = try await runStreamed(req, sessionID: sessionID, state: state)
-                } else {
-                    result = try await runNonStreamed(req, sessionID: sessionID, state: state)
+        var lines = [String](repeating: "", count: requests.count)
+        if concurrent {
+            // Lines keep input order. Requests past the queue limits come back as queue-full error lines.
+            try await withThrowingTaskGroup(of: (Int, String).self) { group in
+                for (i, req) in requests.enumerated() {
+                    group.addTask { (i, await oneLine(req, state: state)) }
                 }
-            } catch {
-                result = ReplayResult(
-                    id: req.id, session: req.session, t: req.t,
-                    choices: nil, systemFingerprint: nil,
-                    promptTokens: 0, completionTokens: 0, prefixReuseTokens: 0,
-                    ttftMs: 0, totalMs: 0, decodeTps: 0,
-                    streamed: req.isStreaming, error: "\(error)")
+                for try await (i, line) in group { lines[i] = line }
             }
-            lines.append(try ReplayIO.encodeResult(result))
+        } else {
+            for (i, req) in requests.enumerated() {
+                lines[i] = await oneLine(req, state: state)
+            }
         }
 
         let output = lines.joined(separator: "\n") + (lines.isEmpty ? "" : "\n")
@@ -46,6 +43,35 @@ enum ReplayRunner {
         } else {
             print(output, terminator: "")
         }
+    }
+
+    /// Runs one replay request and encodes its result line. Errors become an error result line.
+    private static func oneLine(_ req: ReplayRequest, state: ServerState) async -> String {
+        let sessionID = req.session ?? "default"
+        let result: ReplayResult
+        do {
+            // runChatCompletion and runStreamingLoop do not take the request access, so take it here
+            // as the HTTP handler does. Without it, concurrent replay would drive the shared engine
+            // from several tasks at once.
+            let lane = BatchServingRouter.lane(
+                hasResponseSchema: req.request.responseFormat?.extractedSchema != nil)
+            let access = try await state.acquireAccess(lane: lane)
+            defer { access.release() }
+
+            if req.isStreaming {
+                result = try await runStreamed(req, sessionID: sessionID, state: state)
+            } else {
+                result = try await runNonStreamed(req, sessionID: sessionID, state: state)
+            }
+        } catch {
+            result = ReplayResult(
+                id: req.id, session: req.session, t: req.t,
+                choices: nil, systemFingerprint: nil,
+                promptTokens: 0, completionTokens: 0, prefixReuseTokens: 0,
+                ttftMs: 0, totalMs: 0, decodeTps: 0,
+                streamed: req.isStreaming, error: "\(error)")
+        }
+        return (try? ReplayIO.encodeResult(result)) ?? "{\"error\":\"encode failed\"}"
     }
 
     /// Non-streaming path: the same `runChatCompletion` core the HTTP handler uses.
@@ -76,8 +102,9 @@ enum ReplayRunner {
     {
         let prepared = try await prepareStreaming(chatRequest: req.request, state: state, sessionID: sessionID)
         var aggregator = ReplayStreamAggregator()
+        let started = try await startStreamingDecode(prepared: prepared, chatRequest: req.request, state: state)
         let outcome = try await runStreamingLoop(
-            prepared: prepared, chatRequest: req.request, state: state,
+            started: started, prepared: prepared, chatRequest: req.request, state: state,
             emit: { aggregator.consume($0) })
         let genSeconds = max(0, outcome.totalSeconds - outcome.ttftSeconds)
         let decodeTps = genSeconds > 0 ? Double(outcome.genTokenCount) / genSeconds : 0

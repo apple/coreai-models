@@ -30,9 +30,10 @@ func handleCompletionsFromBody(body: ByteBuffer, state: ServerState) async throw
             status: .notImplemented, headers: [.contentType: "application/json"],
             body: .init(byteBuffer: ByteBuffer(data: data)))
     }
-    let permit: QueuePermit
+    // Scoring needs per-step logits, so it takes the fallback lane.
+    let access: RequestAccess
     do {
-        permit = try await state.queue.acquire()
+        access = try await state.acquireAccess(lane: .fallbackBatchOne)
     } catch let error as ServerError {
         let err = ErrorResponse(
             error: .init(
@@ -42,7 +43,7 @@ func handleCompletionsFromBody(body: ByteBuffer, state: ServerState) async throw
             status: .tooManyRequests, headers: [.contentType: "application/json"],
             body: .init(byteBuffer: ByteBuffer(data: data)))
     }
-    defer { permit.release() }
+    defer { access.release() }
     let req: CompletionRequest
     do {
         req = try JSONDecoder().decode(CompletionRequest.self, from: body)
@@ -149,9 +150,11 @@ private func processOnePrompt(
         forcedContinuation: continuation
     )
 
-    try await state.engine.reset()
+    // Scoring needs per-token logits and a forced continuation, which only the fallback lane supports.
+    let scoringEngine = state.engineForRequest(lane: .fallbackBatchOne)
+    try await scoringEngine.reset()
 
-    let stream = try await state.engine.generate(
+    let stream = try await scoringEngine.generate(
         with: [allTokens[0]],
         samplingConfiguration: .greedy,
         inferenceOptions: options

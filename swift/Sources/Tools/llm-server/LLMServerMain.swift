@@ -52,6 +52,14 @@ struct LLMServer: AsyncParsableCommand {
     @Option(name: .customLong("replay-output"), help: "Write replay results JSONL here (default: stdout)")
     var replayOutput: String?
 
+    @Flag(
+        name: .customLong("replay-concurrent"),
+        help: ArgumentHelp(
+            "Run all --replay requests concurrently instead of one at a time, so the batch scheduler can "
+                + "fill several rows. Use with --concurrency N.")
+    )
+    var replayConcurrent: Bool = false
+
     @Option(name: .customLong("variant"), help: "Engine variant: auto, coreai-pipelined, coreai-sequential")
     var inferenceEngineVariant: String = "default"
 
@@ -78,6 +86,14 @@ struct LLMServer: AsyncParsableCommand {
     @Option(name: .customLong("max-queue-depth"), help: "Max requests queued before returning 429 (default: 16)")
     var maxQueueDepth: Int = 16
 
+    @Option(
+        name: .customLong("concurrency"),
+        help: ArgumentHelp(
+            "Max requests decoded together in one batch (default: 1). Values above 1 enable the batch "
+                + "scheduler when the model supports batching, and are ignored with a warning otherwise.")
+    )
+    var concurrency: Int = 1
+
     @Flag(
         name: .customLong("no-thinking"),
         help: "Disable thinking/reasoning (alias for --default-reasoning-effort none)"
@@ -102,6 +118,9 @@ struct LLMServer: AsyncParsableCommand {
     func validate() throws {
         guard maxQueueDepth >= 0 else {
             throw ValidationError("--max-queue-depth must be >= 0 (got \(maxQueueDepth))")
+        }
+        guard concurrency >= 1 else {
+            throw ValidationError("--concurrency must be >= 1 (got \(concurrency))")
         }
         do {
             _ = try ReasoningEffort.resolveDefault(
@@ -218,14 +237,41 @@ struct LLMServer: AsyncParsableCommand {
             maxQueueDepth: maxQueueDepth
         )
 
+        // Batched serving needs --concurrency above 1 and a CoreAISequentialEngine whose graph has an
+        // attention mask input and a batch dimension above 1. The scheduler holds up to
+        // concurrency + --max-queue-depth requests, decoding or waiting, and rejects the next one.
+        var batchScheduler: BatchScheduler? = nil
+        if concurrency > 1 {
+            if let seq = engine as? CoreAISequentialEngine, seq.supportsBatching {
+                let assetMax = bundle.maxBatchSize
+                guard concurrency <= assetMax else {
+                    throw ValidationError(
+                        "--concurrency \(concurrency) exceeds the asset's max batch size \(assetMax). "
+                            + "Re-export with --dynamic-batch-size \(concurrency) or higher, or lower --concurrency.")
+                }
+                batchScheduler = try BatchScheduler(
+                    engine: seq, maxConcurrent: concurrency, maxQueued: maxQueueDepth)
+                print("Batched serving: concurrency \(concurrency) (asset max batch \(assetMax))")
+            } else {
+                print(
+                    "⚠️  --concurrency \(concurrency) ignored: batched serving needs the coreai-sequential engine "
+                        + "and an asset exported with --attention-mask batched --dynamic-batch-size N. "
+                        + "Serving one request at a time.")
+            }
+        }
+
         let state = ServerState(
             engine: engine,
             tokenizer: tokenizer,
-            config: config
+            config: config,
+            batchScheduler: batchScheduler,
+            batchModelConfig: batchScheduler != nil ? engineConfig : nil
         )
 
         if let replayPath {
-            try await ReplayRunner.run(inputPath: replayPath, outputPath: replayOutput, state: state)
+            try await ReplayRunner.run(
+                inputPath: replayPath, outputPath: replayOutput, state: state,
+                concurrent: replayConcurrent)
             return
         }
 
