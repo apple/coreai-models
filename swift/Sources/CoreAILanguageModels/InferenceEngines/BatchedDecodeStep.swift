@@ -47,13 +47,13 @@ protocol BatchedDecodeStep {
         session: GenerationSessionState
     ) async throws -> [LogitsScalarType]
 
-    /// Runs `tokensPerRow` (`[N][q]`, every row at `startPosition`) and returns each row's logits at
-    /// every position as `[N][q * vocab]`.
+    /// Runs `tokensPerRow` (`[N][q]`, every row at `startPosition`) and returns the logits at every
+    /// position, flat row-major `[N, q, vocab]`.
     func allPositionLogits(
         tokensPerRow: [[Int32]],
         startPosition: Int,
         session: GenerationSessionState
-    ) async throws -> [[LogitsScalarType]]
+    ) async throws -> [LogitsScalarType]
 
     /// Creates a session whose KV cache holds `batchSize` rows, at most `maxBatchCapacity`.
     func makeSessionState(batchSize: Int) throws -> GenerationSessionState

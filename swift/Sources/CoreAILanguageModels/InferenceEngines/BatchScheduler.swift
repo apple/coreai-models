@@ -6,85 +6,20 @@
 import Dispatch
 import Synchronization
 
-/// A generation request for a `RequestSink`: prompt, sampling and stop conditions.
-package struct BatchRequest: Sendable {
-    /// List of prompt tokens, cannot be empty.
-    let promptTokens: [Int32]
-    let sampling: SamplingConfiguration
-    let eosTokenIds: Set<Int32>
-    let maxTokens: Int
-    let stopSequences: StopSequences
-    /// Converts a matched stop sequence's tokens to the text reported in `StopReason.stopSequence`.
-    /// Defaults to an empty string.
-    let decodeStopText: @Sendable ([Int32]) -> String
-
-    init(
-        promptTokens: [Int32],
-        sampling: SamplingConfiguration,
-        eosTokenIds: Set<Int32>,
-        maxTokens: Int,
-        stopSequences: StopSequences = StopSequences(sequences: []),
-        decodeStopText: @escaping @Sendable ([Int32]) -> String = { _ in "" }
-    ) {
-        self.promptTokens = promptTokens
-        self.sampling = sampling
-        self.eosTokenIds = eosTokenIds
-        self.maxTokens = maxTokens
-        self.stopSequences = stopSequences
-        self.decodeStopText = decodeStopText
-    }
-}
-
-/// A scoring request for `BatchScheduler.score(_:)`: prompt tokens and the target token to score at
-/// each position.
-///
-/// For a prompt `[t0, t1, t2]` the usual targets are `[t1, t2, x]`. `x` can be any token, and the
-/// caller ignores the last position's entry in the result.
-package struct ScoreRequest: Sendable {
-    /// Prompt tokens, cannot be empty.
-    let tokens: [Int32]
-    /// Token scored at each position of `tokens`, same length as `tokens`. `targets[p]` is scored
-    /// against the logits at position `p`.
-    let targets: [Int32]
-    /// Number of top alternatives reported per position.
-    let topK: Int
-
-    package init(tokens: [Int32], targets: [Int32], topK: Int) {
-        self.tokens = tokens
-        self.targets = targets
-        self.topK = topK
-    }
-}
-
-/// Generated tokens and stop reason for one request from `BatchScheduler.run(_:)`.
-struct RowResult: Sendable {
-    let tokens: [Int32]
-    let stopReason: StopReason
-}
-
-/// An event on a request's stream from a `RequestSink`. A stream yields `.token` events, then one
-/// `.finished`, or ends by throwing.
-package enum BatchSinkEvent: Sendable {
-    /// A sampled token and, when the sink provides them, its logits. `BatchScheduler` always sends
-    /// `nil` logits.
-    case token(Int32, logits: [LogitsScalarType]?)
-    /// The reason the request stopped. Always the last event.
-    case finished(StopReason)
-}
-
-/// A batched backend shared by many requests, each with its own event stream. Wrap it in a
-/// `SchedulerSession`, one per request, to use it as an `InferenceEngine`.
-package protocol RequestSink: Sendable {
-    /// Maximum number of requests decoded in one batch. At least 1.
-    var maxConcurrent: Int { get }
-
-    /// Queues `request` and returns its event stream. Throws when the sink rejects the request, such
-    /// as `InferenceRuntimeError.queueFull` when its queue is full.
-    func submit(_ request: BatchRequest) throws -> AsyncThrowingStream<BatchSinkEvent, Error>
-}
-
 /// A `RequestSink` that decodes up to `maxConcurrent` requests in one shared batch session and
 /// admits new requests while others are still decoding. Safe to call from any task.
+///
+/// ```
+///   submit(_:) ---> waiting queue ---> free row? ---> prefill the prompt into that row
+///                   [ F ][ G ]
+///
+///   batch session, N = 4 rows, one decodeBatch per step over all rows:
+///
+///     row 0   A A A A A a       a = token sampled this step
+///     row 1   B B b             every row decodes at its own cursor
+///     row 2   E e               E took the row that D freed when it finished
+///     row 3   C C C C c
+/// ```
 ///
 /// Slot `i` is row `i` of the batch KV cache, and `N` is `maxConcurrent`. A slot goes through these
 /// phases:
@@ -93,6 +28,8 @@ package protocol RequestSink: Sendable {
 /// - Decode: each step runs `decodeBatch` over all `N` rows, every live row at its own cursor.
 /// - Retirement: the row ends on EOS, a stop sequence or `maxTokens`, and the slot takes the next
 ///   queued request while the other rows keep decoding.
+///
+/// `score(_:)` requests run as their own padded batch between decode steps.
 package final class BatchScheduler: RequestSink, @unchecked Sendable {
     private let decodeStep: any BatchedDecodeStep
     private let session: GenerationSessionState
@@ -430,20 +367,22 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
             }
             let logits = try await decodeStep.allPositionLogits(
                 tokensPerRow: tokensPerRow, startPosition: start, session: session)
-            let vocab = logits[0].count / q
+            let vocab = logits.count / (rows * q)
             let chunkEntries = Mutex([[LogProbabilities.Entry]](repeating: [], count: requests.count))
             let chunkStart = start
-            DispatchQueue.concurrentPerform(iterations: requests.count) { row in
-                let request = requests[row]
-                let real = min(q, request.tokens.count - chunkStart)
-                guard real > 0 else { return }
-                let rowLogits = (0..<real).map { p in Array(logits[row][p * vocab..<(p + 1) * vocab]) }
-                let targets = Array(request.targets[chunkStart..<chunkStart + real])
-                let rowEntries =
-                    LogProbabilities.compute(
-                        logits: rowLogits, targets: targets, topK: request.topK
-                    ).entries
-                chunkEntries.withLock { $0[row] = rowEntries }
+            logits.withUnsafeBufferPointer { buffer in
+                DispatchQueue.concurrentPerform(iterations: requests.count) { row in
+                    let request = requests[row]
+                    let real = min(q, request.tokens.count - chunkStart)
+                    guard real > 0 else { return }
+                    let rowStart = row * q * vocab
+                    let rowEntries = LogProbabilities.compute(
+                        logits: UnsafeBufferPointer(rebasing: buffer[rowStart..<rowStart + real * vocab]),
+                        vocabSize: vocab,
+                        targets: request.targets[chunkStart..<chunkStart + real],
+                        topK: request.topK)
+                    chunkEntries.withLock { $0[row] = rowEntries }
+                }
             }
             for (row, rowEntries) in chunkEntries.withLock({ $0 }).enumerated() { entries[row] += rowEntries }
             start += q
@@ -457,12 +396,13 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
     /// gives the caller sole use of the engine until `release()`. Resident rows keep their slots and
     /// resume decoding after release.
     ///
-    /// A request running on its own session of the same engine holds a lease for as long as it runs:
+    /// A request that runs directly on the scheduler's engine holds a lease for as long as it runs:
     ///
     /// ```swift
     /// let lease = await scheduler.acquireExclusiveAccess()
     /// defer { lease.release() }
-    /// // Generate on an IsolatedSessionEngine over the same CoreAISequentialEngine.
+    /// let sequence = try await engine.generate(
+    ///     with: promptTokens, samplingConfiguration: sampling, inferenceOptions: options)
     /// ```
     package func acquireExclusiveAccess() async -> ExclusiveEngineLease {
         await engineLock.lock()
@@ -497,6 +437,56 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
             return results
         }
     }
+}
+
+/// A batched backend shared by many requests, each with its own event stream. Wrap it in a
+/// `SchedulerSession`, one per request, to use it as an `InferenceEngine`.
+package protocol RequestSink: Sendable {
+    /// Maximum number of requests decoded in one batch. At least 1.
+    var maxConcurrent: Int { get }
+
+    /// Queues `request` and returns its event stream. Throws when the sink rejects the request, such
+    /// as `InferenceRuntimeError.queueFull` when its queue is full.
+    func submit(_ request: BatchRequest) throws -> AsyncThrowingStream<BatchSinkEvent, Error>
+}
+
+/// A generation request for a `RequestSink`: prompt, sampling and stop conditions.
+package struct BatchRequest: Sendable {
+    /// List of prompt tokens, cannot be empty.
+    let promptTokens: [Int32]
+    let sampling: SamplingConfiguration
+    let eosTokenIds: Set<Int32>
+    let maxTokens: Int
+    let stopSequences: StopSequences
+    /// Converts a matched stop sequence's tokens to the text reported in `StopReason.stopSequence`.
+    /// Defaults to an empty string.
+    let decodeStopText: @Sendable ([Int32]) -> String
+
+    init(
+        promptTokens: [Int32],
+        sampling: SamplingConfiguration,
+        eosTokenIds: Set<Int32>,
+        maxTokens: Int,
+        stopSequences: StopSequences = StopSequences(sequences: []),
+        decodeStopText: @escaping @Sendable ([Int32]) -> String = { _ in "" }
+    ) {
+        self.promptTokens = promptTokens
+        self.sampling = sampling
+        self.eosTokenIds = eosTokenIds
+        self.maxTokens = maxTokens
+        self.stopSequences = stopSequences
+        self.decodeStopText = decodeStopText
+    }
+}
+
+/// An event on a request's stream from a `RequestSink`. A stream yields `.token` events, then one
+/// `.finished`, or ends by throwing.
+package enum BatchSinkEvent: Sendable {
+    /// A sampled token and, when the sink provides them, its logits. `BatchScheduler` always sends
+    /// `nil` logits.
+    case token(Int32, logits: [LogitsScalarType]?)
+    /// The reason the request stopped. Always the last event.
+    case finished(StopReason)
 }
 
 /// A lease on sole use of a `BatchScheduler`'s engine, returned by `acquireExclusiveAccess()`.
@@ -551,4 +541,31 @@ final class AsyncFIFOLock: Sendable {
         }
         next?.resume()
     }
+}
+
+/// A scoring request for `BatchScheduler.score(_:)`: prompt tokens and the target token to score at
+/// each position.
+///
+/// For a prompt `[t0, t1, t2]` the usual targets are `[t1, t2, x]`. `x` can be any token, and the
+/// caller ignores the last position's entry in the result.
+package struct ScoreRequest: Sendable {
+    /// Prompt tokens, cannot be empty.
+    let tokens: [Int32]
+    /// Token scored at each position of `tokens`, same length as `tokens`. `targets[p]` is scored
+    /// against the logits at position `p`.
+    let targets: [Int32]
+    /// Number of top alternatives reported per position.
+    let topK: Int
+
+    package init(tokens: [Int32], targets: [Int32], topK: Int) {
+        self.tokens = tokens
+        self.targets = targets
+        self.topK = topK
+    }
+}
+
+/// Generated tokens and stop reason for one request from `BatchScheduler.run(_:)`.
+struct RowResult: Sendable {
+    let tokens: [Int32]
+    let stopReason: StopReason
 }

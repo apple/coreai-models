@@ -173,9 +173,8 @@ final class ServerState: @unchecked Sendable {
     ///
     /// - `.batched`: a new `SchedulerSession` over the batch scheduler, or the shared engine when
     ///   batched serving is off.
-    /// - `.fallbackBatchOne`: a new `IsolatedSessionEngine` with its own KV session when
-    ///   `batchScheduler` is set and the shared engine is a `CoreAISequentialEngine`. Otherwise the
-    ///   shared engine.
+    /// - `.fallbackBatchOne`: the shared engine. With a batch scheduler running, hold the access from
+    ///   `acquireAccess(lane:)` while using it.
     func engineForRequest(lane: BatchServingLane) -> any InferenceEngine {
         switch lane {
         case .batched:
@@ -184,9 +183,6 @@ final class ServerState: @unchecked Sendable {
                 sink: batchServing.scheduler, config: batchServing.modelConfig,
                 stopTokenIds: schedulerStopTokenIds)
         case .fallbackBatchOne:
-            if batchScheduler != nil, let seq = engine as? CoreAISequentialEngine {
-                return IsolatedSessionEngine(base: seq)
-            }
             return engine
         }
     }

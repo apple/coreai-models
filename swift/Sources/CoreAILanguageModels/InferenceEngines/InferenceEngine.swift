@@ -278,8 +278,10 @@ public enum InferenceRuntimeError: Error, LocalizedError {
 
     /// True for `.queueFull`.
     package var isQueueFull: Bool {
-        if case .queueFull = self { return true }
-        return false
+        switch self {
+        case .queueFull: true
+        default: false
+        }
     }
 
     public var errorDescription: String? {

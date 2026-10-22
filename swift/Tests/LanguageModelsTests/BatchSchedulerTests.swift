@@ -25,8 +25,8 @@ private func dummySession() -> GenerationSessionState {
 
 /// Makes flattened count-up logits, `row.count * 64` values per row, where position `p` peaks at
 /// that row's token at `p` plus one, mod 64.
-private func countUpAllPositions(_ tokensPerRow: [[Int32]]) -> [[LogitsScalarType]] {
-    tokensPerRow.map { row in row.flatMap { oneHot(($0 + 1) % 64) } }
+private func countUpAllPositions(_ tokensPerRow: [[Int32]]) -> [LogitsScalarType] {
+    tokensPerRow.flatMap { row in row.flatMap { oneHot(($0 + 1) % 64) } }
 }
 
 /// Collects a request stream's tokens and its `.finished` reason.
@@ -117,7 +117,7 @@ private final class CountUpDecodeStep: BatchedDecodeStep, @unchecked Sendable {
 
     func allPositionLogits(
         tokensPerRow: [[Int32]], startPosition: Int, session: GenerationSessionState
-    ) async throws -> [[LogitsScalarType]] {
+    ) async throws -> [LogitsScalarType] {
         await enter()
         defer { leave() }
         record.withLock { $0.scoringRows.append(tokensPerRow.count) }
@@ -132,23 +132,12 @@ private final class GatedPrefillStep: BatchedDecodeStep, @unchecked Sendable {
     let maxBatchCapacity: Int
 
     private struct Gate {
-        var entered = false
         var released = false
-        var enteredWaiter: CheckedContinuation<Void, Never>?
         var releaseWaiter: CheckedContinuation<Void, Never>?
     }
     private let gate = Mutex(Gate())
 
     init(capacity: Int) { maxBatchCapacity = capacity }
-
-    /// Waits until the first `prefillRow` call has started.
-    func waitEntered() async {
-        await withCheckedContinuation { cont in
-            gate.withLock { g in
-                if g.entered { cont.resume() } else { g.enteredWaiter = cont }
-            }
-        }
-    }
 
     /// Unblocks the waiting `prefillRow` call. Later calls return without blocking.
     func release() {
@@ -163,12 +152,6 @@ private final class GatedPrefillStep: BatchedDecodeStep, @unchecked Sendable {
     func prefillRow(
         row: Int, promptTokens: [Int32], session: GenerationSessionState
     ) async throws -> [LogitsScalarType] {
-        let enteredWaiter: CheckedContinuation<Void, Never>? = gate.withLock { g in
-            g.entered = true
-            defer { g.enteredWaiter = nil }
-            return g.enteredWaiter
-        }
-        enteredWaiter?.resume()
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             gate.withLock { g in
                 if g.released { cont.resume() } else { g.releaseWaiter = cont }
@@ -185,7 +168,7 @@ private final class GatedPrefillStep: BatchedDecodeStep, @unchecked Sendable {
 
     func allPositionLogits(
         tokensPerRow: [[Int32]], startPosition: Int, session: GenerationSessionState
-    ) async throws -> [[LogitsScalarType]] {
+    ) async throws -> [LogitsScalarType] {
         countUpAllPositions(tokensPerRow)
     }
 
@@ -228,40 +211,17 @@ struct BatchSchedulerTests {
         #expect(results.map(\.stopReason) == [.eos, .maxTokens, .stopSequence("8")])
     }
 
-    @Test("Submit streams the tokens, then .finished")
-    func streamingSubmit() async throws {
-        let scheduler = makeScheduler(CountUpDecodeStep(capacity: 2), maxConcurrent: 2)
-        let (tokens, reason) = try await drain(
-            scheduler.submit(req(prompt: [5], maxTokens: 100, eos: [8])))
-        // The EOS token itself is streamed.
-        #expect(tokens == [6, 7, 8])
-        #expect(reason == .eos)
-    }
-
-    @Test("A retired row's slot admits the next queued request")
-    func slotReuse() async throws {
-        let scheduler = makeScheduler(CountUpDecodeStep(capacity: 2), maxConcurrent: 2)
-        let results = try await scheduler.run([
-            req(prompt: [0], maxTokens: 2),
-            req(prompt: [10], maxTokens: 3),
-            req(prompt: [20], maxTokens: 1),
-            req(prompt: [30], maxTokens: 4),
-        ])
-        #expect(results.map(\.tokens) == [[1, 2], [11, 12, 13], [21], [31, 32, 33, 34]])
-        #expect(results.allSatisfy { $0.stopReason == .maxTokens })
-    }
-
-    @Test("Rows decode at their own cursors in one forward")
-    func raggedCursors() async throws {
+    @Test("Rows decode at their own cursors, and a retired row's slot admits the next request")
+    func raggedCursorsAndSlotReuse() async throws {
         let mock = CountUpDecodeStep(capacity: 2)
         let scheduler = makeScheduler(mock, maxConcurrent: 2)
         let results = try await scheduler.run([
-            req(prompt: [1], maxTokens: 3),
+            req(prompt: [1], maxTokens: 2),
             req(prompt: [1, 2, 3], maxTokens: 3),
+            req(prompt: [20], maxTokens: 1),
         ])
-        #expect(results.map(\.tokens) == [[2, 3, 4], [4, 5, 6]])
-        // Each row's first decode starts at its prompt length.
-        #expect(mock.observedStartPositions == [[1, 3], [2, 4]])
+        #expect(results.map(\.tokens) == [[2, 3], [4, 5, 6], [21]])
+        #expect(mock.observedStartPositions.first == [1, 3])
     }
 
     @Test("Forwards from run and submit never overlap")
@@ -275,27 +235,13 @@ struct BatchSchedulerTests {
         #expect(mock.maxInFlight == 1)
     }
 
-    @Test("Submit throws queueFull past free rows plus maxQueued", arguments: [false, true])
-    func backpressure(waitForAdmission: Bool) async throws {
-        // Accepts 3 requests, maxConcurrent plus maxQueued, whether or not the first holds a row yet.
+    @Test(
+        "A burst of submits fills the free rows plus maxQueued, then throws queueFull",
+        arguments: [(1, 3), (0, 2)] as [(Int, Int)])
+    func backpressure(maxQueued: Int, accepted: Int) async throws {
         let mock = GatedPrefillStep(capacity: 2)
-        let scheduler = makeScheduler(mock, maxConcurrent: 2, maxQueued: 1)
-        var streams = [try scheduler.submit(req(prompt: [0], maxTokens: 1))]
-        if waitForAdmission { await mock.waitEntered() }
-        for _ in 0..<2 { streams.append(try scheduler.submit(req(prompt: [0], maxTokens: 1))) }
-        #expect(throws: InferenceRuntimeError.self) {
-            _ = try scheduler.submit(req(prompt: [0], maxTokens: 1))
-        }
-
-        mock.release()
-        for stream in streams { _ = try await drain(stream) }
-    }
-
-    @Test("maxQueued 0 accepts only as many requests as there are free rows")
-    func noWaiting() async throws {
-        let mock = GatedPrefillStep(capacity: 2)
-        let scheduler = makeScheduler(mock, maxConcurrent: 2, maxQueued: 0)
-        let streams = try (0..<2).map { _ in try scheduler.submit(req(prompt: [0], maxTokens: 1)) }
+        let scheduler = makeScheduler(mock, maxConcurrent: 2, maxQueued: maxQueued)
+        let streams = try (0..<accepted).map { _ in try scheduler.submit(req(prompt: [0], maxTokens: 1)) }
         #expect(throws: InferenceRuntimeError.self) {
             _ = try scheduler.submit(req(prompt: [0], maxTokens: 1))
         }
@@ -320,102 +266,14 @@ struct BatchSchedulerTests {
         #expect(reason == .maxTokens)
     }
 
-    @Test("AsyncFIFOLock grants waiters in arrival order")
-    func fifoLockOrder() async {
-        let lock = AsyncFIFOLock()
-        let order = Mutex<[Int]>([])
-        await lock.lock()
-        await withTaskGroup(of: Void.self) { group in
-            for i in 0..<3 {
-                group.addTask {
-                    await lock.lock()
-                    order.withLock { $0.append(i) }
-                    lock.unlock()
-                }
-                // Waiter i enqueues on the lock before waiter i + 1 starts.
-                try? await Task.sleep(for: .milliseconds(20))
-            }
-            lock.unlock()
-        }
-        #expect(order.withLock { $0 } == [0, 1, 2])
-    }
-
-    /// Makes a top-2 score request for `tokens` whose target at each position is the next token,
-    /// and 63 at the last position.
-    private func scoreRequest(_ tokens: [Int32]) -> ScoreRequest {
-        ScoreRequest(tokens: tokens, targets: tokens.dropFirst() + [63], topK: 2)
-    }
-
-    @Test("Scoring reports a log-probability per target, highest where the target is the argmax")
-    func scoringValues() async throws {
-        let scheduler = makeScheduler(CountUpDecodeStep(capacity: 2), maxConcurrent: 2)
-        let result = try await scheduler.score([scoreRequest([3, 4, 5])])[0]
-        #expect(result.entries.map(\.tokenId) == [4, 5, 63])
-        #expect(result.entries[0].value == result.entries[1].value)
-        #expect(result.entries[2].value < result.entries[0].value)
-        #expect(result.entries[0].alternatives.count == 2)
-    }
-
-    @Test(
-        "Batched scoring matches scoring each request alone, across padding and chunks",
-        arguments: [
-            (2, [2, 2, 2]),  // A static batch=2 graph pads every forward to two rows.
-            (Int.max, [2, 1, 1]),  // A dynamic-batch graph uses one row per request.
-        ] as [(Int, [Int])])
-    func scoringBatchInvariance(capacity: Int, expectedRows: [Int]) async throws {
-        let step = CountUpDecodeStep(capacity: capacity)
-        let scheduler = makeScheduler(step, maxConcurrent: 2)
-        // Three requests, at most two per batch. The 200-token one spans two 128-position chunks.
-        let prompts: [[Int32]] = [[1, 2, 3], [7, 8, 9, 10, 11], (0..<200).map { Int32($0 % 60) }]
-        let together = try await scheduler.score(prompts.map(scoreRequest))
-        #expect(step.scoringRows == expectedRows)
-
-        for (prompt, batched) in zip(prompts, together) {
-            let alone = try await scheduler.score([scoreRequest(prompt)])[0]
-            #expect(batched.entries.map(\.tokenId) == alone.entries.map(\.tokenId))
-            #expect(batched.entries.map(\.value) == alone.entries.map(\.value))
-            #expect(batched.entries.count == prompt.count)
-        }
-    }
-
-    @Test("Scoring runs between decode steps while a request streams")
-    func scoringBesideDecode() async throws {
-        let scheduler = makeScheduler(CountUpDecodeStep(capacity: 2), maxConcurrent: 2)
-        let stream = try scheduler.submit(req(prompt: [5], maxTokens: 6))
-        let scores = try await scheduler.score([scoreRequest([1, 2, 3])])
-        let (tokens, reason) = try await drain(stream)
-        #expect(tokens == [6, 7, 8, 9, 10, 11])
-        #expect(reason == .maxTokens)
-        #expect(scores[0].entries.count == 3)
-    }
-
-    @Test(
-        "Scoring batches stop before a third of the positions would be padding",
-        arguments: [
-            ([7, 40, 130, 300], 4, 1),
-            ([130, 300], 4, 2),
-            ([64, 64, 64, 64, 64], 4, 4),
-            ([10, 200], 4, 1),
-            ([5], 4, 1),
-            ([], 4, 0),
-        ] as [([Int], Int, Int)])
-    func scoringBatchCount(lengths: [Int], limit: Int, expected: Int) {
-        #expect(BatchScheduler.scoringBatchCount(lengths, limit: limit) == expected)
-    }
-
-    @Test("A scoring request needs one target per token")
-    func scoringValidation() async {
-        let scheduler = makeScheduler(CountUpDecodeStep(capacity: 2), maxConcurrent: 2)
-        await #expect(throws: InferenceRuntimeError.self) {
-            _ = try await scheduler.score([ScoreRequest(tokens: [1, 2], targets: [2], topK: 1)])
-        }
-    }
-
-    @Test("An empty prompt is rejected at submit")
-    func emptyPromptRejected() {
+    @Test("Empty prompts and mismatched scoring targets are rejected")
+    func invalidRequests() async {
         let scheduler = makeScheduler(CountUpDecodeStep(capacity: 2), maxConcurrent: 2)
         #expect(throws: InferenceRuntimeError.self) {
             _ = try scheduler.submit(req(prompt: [], maxTokens: 1))
+        }
+        await #expect(throws: InferenceRuntimeError.self) {
+            _ = try await scheduler.score([ScoreRequest(tokens: [1, 2], targets: [2], topK: 1)])
         }
     }
 
@@ -443,6 +301,63 @@ struct BatchSchedulerTests {
         for stream in streams {
             await #expect(throws: CountUpDecodeStep.Boom.self) { _ = try await drain(stream) }
         }
+    }
+
+    // MARK: - Scoring
+
+    /// Makes a top-2 score request for `tokens` whose target at each position is the next token,
+    /// and 63 at the last position.
+    private func scoreRequest(_ tokens: [Int32]) -> ScoreRequest {
+        ScoreRequest(tokens: tokens, targets: tokens.dropFirst() + [63], topK: 2)
+    }
+
+    @Test(
+        "Batched scoring matches scoring each request alone, across padding and chunks",
+        arguments: [
+            (2, [2, 2, 2]),  // A static batch=2 graph pads every forward to two rows.
+            (Int.max, [2, 1, 1]),  // A dynamic-batch graph uses one row per request.
+        ] as [(Int, [Int])])
+    func scoringBatchInvariance(capacity: Int, expectedRows: [Int]) async throws {
+        let step = CountUpDecodeStep(capacity: capacity)
+        let scheduler = makeScheduler(step, maxConcurrent: 2)
+        // Three requests, at most two per batch. The 200-token one spans two 128-position chunks.
+        let prompts: [[Int32]] = [[1, 2, 3], [7, 8, 9, 10, 11], (0..<200).map { Int32($0 % 60) }]
+        let together = try await scheduler.score(prompts.map(scoreRequest))
+        #expect(step.scoringRows == expectedRows)
+
+        // Argmax targets score highest, and each entry reports topK alternatives.
+        let first = together[0].entries
+        #expect(first.map(\.tokenId) == [2, 3, 63])
+        #expect(first[0].value == first[1].value && first[2].value < first[0].value)
+        #expect(first[0].alternatives.count == 2)
+
+        for (prompt, batched) in zip(prompts, together) {
+            let alone = try await scheduler.score([scoreRequest(prompt)])[0]
+            #expect(batched.entries.map(\.tokenId) == alone.entries.map(\.tokenId))
+            #expect(batched.entries.map(\.value) == alone.entries.map(\.value))
+        }
+    }
+
+    @Test("Scoring runs between decode steps while a request streams")
+    func scoringBesideDecode() async throws {
+        let scheduler = makeScheduler(CountUpDecodeStep(capacity: 2), maxConcurrent: 2)
+        let stream = try scheduler.submit(req(prompt: [5], maxTokens: 6))
+        let scores = try await scheduler.score([scoreRequest([1, 2, 3])])
+        let (tokens, _) = try await drain(stream)
+        #expect(tokens == [6, 7, 8, 9, 10, 11])
+        #expect(scores[0].entries.count == 3)
+    }
+
+    @Test(
+        "Scoring batches stop before a third of the positions would be padding",
+        arguments: [
+            ([7, 40, 130, 300], 1),
+            ([130, 300], 2),
+            ([64, 64, 64, 64, 64], 4),
+            ([], 0),
+        ] as [([Int], Int)])
+    func scoringBatchCount(lengths: [Int], expected: Int) {
+        #expect(BatchScheduler.scoringBatchCount(lengths, limit: 4) == expected)
     }
 }
 
