@@ -105,15 +105,9 @@ public struct WanPipeline: VideoPipeline {
         let tokenizerURL = url.appendingPathComponent("tokenizer")
         let tokenizer = try await AutoTokenizer.from(modelFolder: tokenizerURL)
 
-        let transformerURL = try resolveExistingPipelineAsset(
-            bundle.assetFilename(for: DiffusionComponentKey.transformer, fallback: "Transformer.aimodel"),
-            in: url, component: DiffusionComponentKey.transformer)
-        let textEncoderURL = try resolveExistingPipelineAsset(
-            bundle.assetFilename(for: DiffusionComponentKey.textEncoder, fallback: "TextEncoder.aimodel"),
-            in: url, component: DiffusionComponentKey.textEncoder)
-        let decoderURL = try resolveExistingPipelineAsset(
-            bundle.assetFilename(for: DiffusionComponentKey.vaeDecoder, fallback: "VAEDecoder.aimodel"),
-            in: url, component: DiffusionComponentKey.vaeDecoder)
+        let transformerURL = try resolveDeclaredPipelineAsset(DiffusionComponentKey.transformer, in: bundle)
+        let textEncoderURL = try resolveDeclaredPipelineAsset(DiffusionComponentKey.textEncoder, in: bundle)
+        let decoderURL = try resolveDeclaredPipelineAsset(DiffusionComponentKey.vaeDecoder, in: bundle)
 
         self.init(
             transformer: CoreAIDiffusionModelFunction(modelURL: transformerURL),

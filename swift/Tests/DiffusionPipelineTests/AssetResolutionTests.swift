@@ -7,12 +7,12 @@ import CoreAIDiffusionPipeline
 import Foundation
 import Testing
 
-/// Asset lookup must honour the filenames `metadata.json` declares, so bundles whose assets
-/// were compiled ahead of time to `.aimodelc` load.
+/// `metadata.json` is the only source of asset filenames: a declared asset must exist, and an
+/// undeclared one is never picked up by its default name.
 @Suite("Diffusion asset resolution")
 struct AssetResolutionTests {
     /// A FLUX.2 bundle directory declaring `assets`, with an empty entry on disk for each of
-    /// `files`. Lookup only checks existence.
+    /// `files`.
     private static func makeBundle(assets: [String: String], files: [String]) throws -> URL {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("assets_\(UUID())")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -33,41 +33,55 @@ struct AssetResolutionTests {
     }
 
     @Test(
-        "A declared filename is used as is, even when missing; else the exporter's default",
+        "An undeclared or missing asset is an error, never its default filename",
         arguments: [
-            (declared: true, onDisk: true, expected: "Transformer.aimodelc"),
-            (declared: true, onDisk: false, expected: "Transformer.aimodelc"),
-            (declared: false, onDisk: false, expected: "Transformer.aimodel"),
+            // Undeclared: the default-named file on disk is not picked up.
+            (assets: [String: String](), detail: "transformer (not declared in metadata.json)"),
+            // Declared but missing: no substitute.
+            (assets: ["transformer": "Transformer.aimodelc"], detail: "transformer (expected Transformer.aimodelc)"),
         ])
-    func declaredFilenameWithFallback(declared: Bool, onDisk: Bool, expected: String) throws {
-        let dir = try Self.makeBundle(
-            assets: declared ? ["transformer": "Transformer.aimodelc"] : [:],
-            files: onDisk ? ["Transformer.aimodelc"] : [])
+    func declaredAssetsOnly(assets: [String: String], detail: String) throws {
+        let dir = try Self.makeBundle(assets: assets, files: ["Transformer.aimodel"])
         defer { try? FileManager.default.removeItem(at: dir) }
 
         let bundle = try DiffusionBundle(at: dir)
-        #expect(
-            bundle.assetFilename(for: DiffusionComponentKey.transformer, fallback: "Transformer.aimodel")
-                == expected)
+        do {
+            _ = try resolveDeclaredPipelineAsset(DiffusionComponentKey.transformer, in: bundle)
+            Issue.record("resolved an asset that should have been rejected")
+        } catch PipelineLoadError.missingComponent(let message) {
+            #expect(message == detail)
+        }
     }
 
     @Test(
-        "FLUX.2 refuses a declared asset that is missing instead of falling back to .aimodel",
+        "FLUX.2 loads only the assets metadata.json declares",
         arguments: [
-            // Required: the default-named file is present but must not be used.
-            (key: "transformer", declared: "Transformer.aimodelc", onDisk: ["Transformer.aimodel"]),
-            // Optional variant: declared but absent is an error, not "variant not exported".
-            (key: "transformer_512", declared: "Transformer_512.aimodelc", onDisk: [String]()),
+            // A declared required asset that is missing; the default-named file is ignored.
+            (
+                assets: ["transformer": "Transformer.aimodelc"], onDisk: ["Transformer.aimodel"],
+                detail: "transformer (expected Transformer.aimodelc)"
+            ),
+            // A declared optional variant that is missing is an error, not "not exported".
+            (
+                assets: ["transformer_512": "Transformer_512.aimodelc"], onDisk: [String](),
+                detail: "transformer_512 (expected Transformer_512.aimodelc)"
+            ),
+            // Default-named files that metadata.json doesn't declare don't count.
+            (
+                assets: [String: String](), onDisk: ["Transformer.aimodel", "VAEDecoder.aimodel"],
+                detail: "No valid component combination declared in metadata.json. Need "
+                    + "transformer+vae_decoder, transformer+vae_decoder_half, or transformer_512+vae_decoder_half."
+            ),
         ])
-    func declaredMissingAssetThrows(key: String, declared: String, onDisk: [String]) async throws {
-        let dir = try Self.makeBundle(assets: [key: declared], files: onDisk)
+    func fluxDeclaredAssetsOnly(assets: [String: String], onDisk: [String], detail: String) async throws {
+        let dir = try Self.makeBundle(assets: assets, files: onDisk)
         defer { try? FileManager.default.removeItem(at: dir) }
 
         do {
             _ = try await FlowTransformerPipeline(from: dir)
-            Issue.record("loaded a bundle whose declared \(declared) is missing")
-        } catch PipelineLoadError.missingComponent(let detail) {
-            #expect(detail == "\(key) (expected \(declared))")
+            Issue.record("loaded a bundle that should have been rejected")
+        } catch PipelineLoadError.missingComponent(let message) {
+            #expect(message == detail)
         }
     }
 }

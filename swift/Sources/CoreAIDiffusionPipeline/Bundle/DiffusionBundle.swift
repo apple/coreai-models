@@ -61,13 +61,6 @@ public struct DiffusionBundle: Sendable {
         modelBundle.assets[key]
     }
 
-    /// The filename declared for `key`, else `fallback`, the exporter's default name. A
-    /// declared filename is used as is, even when missing on disk, so the bundle never loads a
-    /// file other than the one it names.
-    public func assetFilename(for key: String, fallback: String) -> String {
-        assetFilename(for: key) ?? fallback
-    }
-
     public var textEncoderFilename: String? { assetFilename(for: DiffusionComponentKey.textEncoder) }
     public var transformerFilename: String? { assetFilename(for: DiffusionComponentKey.transformer) }
     public var vaeDecoderFilename: String? { assetFilename(for: DiffusionComponentKey.vaeDecoder) }
