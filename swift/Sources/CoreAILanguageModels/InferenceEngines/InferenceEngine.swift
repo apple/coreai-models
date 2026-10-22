@@ -272,7 +272,15 @@ public enum InferenceRuntimeError: Error, LocalizedError {
     case unsupportedEngine(String)
     case unsupportedEngineVariant(String)
     case bufferAllocationFailed(String)
+    /// The scheduler rejected the request because its wait queue is at its limit of `depth`.
+    case queueFull(depth: Int)
     case genericError(String)
+
+    /// Whether this is `.queueFull`, which the server reports as HTTP 429.
+    package var isQueueFull: Bool {
+        if case .queueFull = self { return true }
+        return false
+    }
 
     public var errorDescription: String? {
         switch self {
@@ -305,6 +313,8 @@ public enum InferenceRuntimeError: Error, LocalizedError {
             return "Unknown variant \(variant)"
         case .bufferAllocationFailed(let details):
             return "GPU buffer allocation failed: \(details)"
+        case .queueFull(let depth):
+            return "Request queue full (depth: \(depth))"
         case .genericError(let message):
             return message
         }

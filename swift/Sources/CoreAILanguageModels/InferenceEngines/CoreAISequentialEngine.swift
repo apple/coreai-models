@@ -98,6 +98,13 @@ public final class CoreAISequentialEngine: InferenceEngine, IdempotentEngine, Ba
         return 1  // Single-batch graph.
     }
 
+    /// Whether this graph can run several requests in one forward. It needs an attention-mask input
+    /// and a batch dimension above 1, static or dynamic.
+    package var supportsBatching: Bool {
+        functionDescriptor.inputNames.contains(where: InputLayout.knownAttnMaskNames.contains)
+            && maxBatchCapacity > 1
+    }
+
     /// The prefix hit count of the most recent generation. With several sessions in use, this is
     /// the count of whichever session ran last.
     public private(set) var lastPrefixHitCount: Int = 0
