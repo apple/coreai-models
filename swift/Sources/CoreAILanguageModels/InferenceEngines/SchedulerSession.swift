@@ -14,8 +14,8 @@ import CoreAIShared
 /// Differences from a single-request engine:
 /// - `reset(to:)` does nothing. The sink owns the shared KV cache, so there is no per-request
 ///   history to rewind.
-/// - `supportsLogits` is false. The sink samples internally, so guided generation and
-///   loglikelihood scoring must use the fallback lane (see `BatchServingRouter`).
+/// - `supportsLogits` is false. The sink samples internally, so guided generation must use the
+///   fallback lane (see `BatchServingRouter`). Scoring goes through `BatchScheduler.score(_:)`.
 /// - The sink stops a row only on `stopTokenIds` or `maxTokens`. Multi-token stop sequences and
 ///   detokenization stay in the per-request `DecodingStrategy`.
 ///

@@ -417,7 +417,38 @@ public final class CoreAISequentialEngine: InferenceEngine, IdempotentEngine, Ba
         startPositions: [Int],
         session: GenerationSessionState
     ) async throws -> [[LogitsScalarType]] {
-        precondition(!tokensPerRow.isEmpty, "decodeBatch requires at least one row")
+        let flat = try await runBatchedForward(
+            tokensPerRow: tokensPerRow, startPositions: startPositions, session: session)
+        let n = tokensPerRow.count
+        let q = tokensPerRow[0].count
+        let vocab = config.vocabSize
+        return (0..<n).map { b in
+            let base = (b * q + (q - 1)) * vocab
+            return Array(flat[base..<base + vocab])
+        }
+    }
+
+    func allPositionLogits(
+        tokensPerRow: [[Int32]],
+        startPosition: Int,
+        session: GenerationSessionState
+    ) async throws -> [[LogitsScalarType]] {
+        let n = tokensPerRow.count
+        let flat = try await runBatchedForward(
+            tokensPerRow: tokensPerRow, startPositions: Array(repeating: startPosition, count: n),
+            session: session)
+        let rowLength = flat.count / n
+        return (0..<n).map { b in Array(flat[b * rowLength..<(b + 1) * rowLength]) }
+    }
+
+    /// Runs one batched forward step and returns the logits for every row and position, flat
+    /// `[N, q, vocab]`. `decodeBatch` and `allPositionLogits` slice this buffer.
+    private func runBatchedForward(
+        tokensPerRow: [[Int32]],
+        startPositions: [Int],
+        session: GenerationSessionState
+    ) async throws -> [LogitsScalarType] {
+        precondition(!tokensPerRow.isEmpty, "a batched forward requires at least one row")
         let n = tokensPerRow.count
         precondition(startPositions.count == n, "one start position per row")
         let q = tokensPerRow[0].count
@@ -496,11 +527,7 @@ public final class CoreAISequentialEngine: InferenceEngine, IdempotentEngine, Ba
             }
         }
 
-        let flat = readNDArray(out, as: LogitsScalarType.self, count: n * q * vocab)
-        return (0..<n).map { b in
-            let base = (b * q + (q - 1)) * vocab
-            return Array(flat[base..<base + vocab])
-        }
+        return readNDArray(out, as: LogitsScalarType.self, count: n * q * vocab)
     }
 
     /// See ``BatchedDecodeStep`` for the contract.

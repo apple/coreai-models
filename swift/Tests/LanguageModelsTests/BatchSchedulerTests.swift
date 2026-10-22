@@ -15,6 +15,19 @@ private func oneHot(_ token: Int32) -> [LogitsScalarType] {
     return row
 }
 
+/// A session with no real KV cache, for mock decode steps.
+private func dummySession() -> GenerationSessionState {
+    GenerationSessionState(
+        kvCache: MockStateHandler(names: ["k"], shape: [1, 1, 1, 1, 1]),
+        additionalStates: nil,
+        hasNonTruncatableStates: false)
+}
+
+/// Count-up logits at every position: position `p` of a row predicts that row's token at `p` plus one.
+private func countUpAllPositions(_ tokensPerRow: [[Int32]]) -> [[LogitsScalarType]] {
+    tokensPerRow.map { row in row.flatMap { oneHot(($0 + 1) % 64) } }
+}
+
 /// Collects a request stream's tokens and its `.finished` reason.
 private func drain(
     _ stream: AsyncThrowingStream<BatchSinkEvent, Error>
@@ -50,11 +63,14 @@ private final class CountUpDecodeStep: BatchedDecodeStep, @unchecked Sendable {
         var inFlight = 0
         var maxInFlight = 0
         var forwards = 0
+        var scoringRows: [Int] = []
     }
     private let record = Mutex(Record())
 
     var observedStartPositions: [[Int]] { record.withLock { $0.startPositions } }
     var maxInFlight: Int { record.withLock { $0.maxInFlight } }
+    /// Row count of each scoring forward so far.
+    var scoringRows: [Int] { record.withLock { $0.scoringRows } }
     /// Prefill and decode calls so far.
     var forwards: Int { record.withLock { $0.forwards } }
 
@@ -97,6 +113,17 @@ private final class CountUpDecodeStep: BatchedDecodeStep, @unchecked Sendable {
         if failDecode { throw Boom() }
         return tokensPerRow.map { oneHot(($0.last ?? 0) + 1) }
     }
+
+    func allPositionLogits(
+        tokensPerRow: [[Int32]], startPosition: Int, session: GenerationSessionState
+    ) async throws -> [[LogitsScalarType]] {
+        await enter()
+        defer { leave() }
+        record.withLock { $0.scoringRows.append(tokensPerRow.count) }
+        return countUpAllPositions(tokensPerRow)
+    }
+
+    func makeSessionState(batchSize: Int) throws -> GenerationSessionState { dummySession() }
 }
 
 /// A count-up `BatchedDecodeStep` whose `prefillRow` blocks until `release()`, so a test can keep a
@@ -155,6 +182,14 @@ private final class GatedPrefillStep: BatchedDecodeStep, @unchecked Sendable {
     ) async throws -> [[LogitsScalarType]] {
         tokensPerRow.map { oneHot(($0.last ?? 0) + 1) }
     }
+
+    func allPositionLogits(
+        tokensPerRow: [[Int32]], startPosition: Int, session: GenerationSessionState
+    ) async throws -> [[LogitsScalarType]] {
+        countUpAllPositions(tokensPerRow)
+    }
+
+    func makeSessionState(batchSize: Int) throws -> GenerationSessionState { dummySession() }
 }
 
 @Suite("BatchScheduler")
@@ -164,10 +199,7 @@ struct BatchSchedulerTests {
     ) -> BatchScheduler {
         BatchScheduler(
             decodeStep: step,
-            session: GenerationSessionState(
-                kvCache: MockStateHandler(names: ["k"], shape: [1, 1, 1, 1, 1]),
-                additionalStates: nil,
-                hasNonTruncatableStates: false),
+            session: dummySession(),
             maxConcurrent: maxConcurrent,
             maxQueued: maxQueued)
     }
@@ -307,6 +339,77 @@ struct BatchSchedulerTests {
             lock.unlock()
         }
         #expect(order.withLock { $0 } == [0, 1, 2])
+    }
+
+    /// Count-up targets for `tokens`: each position's argmax, except the last, which has no real
+    /// next token.
+    private func scoreRequest(_ tokens: [Int32]) -> ScoreRequest {
+        ScoreRequest(tokens: tokens, targets: tokens.dropFirst() + [63], topK: 2)
+    }
+
+    @Test("Scoring reports a log-probability per target, highest where the target is the argmax")
+    func scoringValues() async throws {
+        let scheduler = makeScheduler(CountUpDecodeStep(capacity: 2), maxConcurrent: 2)
+        let result = try await scheduler.score([scoreRequest([3, 4, 5])])[0]
+        #expect(result.entries.map(\.tokenId) == [4, 5, 63])
+        #expect(result.entries[0].value == result.entries[1].value)
+        #expect(result.entries[2].value < result.entries[0].value)
+        #expect(result.entries[0].alternatives.count == 2)
+    }
+
+    @Test(
+        "Batched scoring matches scoring each request alone, across padding and chunks",
+        arguments: [
+            (2, [2, 2, 2]),  // A static batch=2 graph pads every forward to two rows.
+            (Int.max, [2, 1, 1]),  // A dynamic-batch graph uses one row per request.
+        ] as [(Int, [Int])])
+    func scoringBatchInvariance(capacity: Int, expectedRows: [Int]) async throws {
+        let step = CountUpDecodeStep(capacity: capacity)
+        let scheduler = makeScheduler(step, maxConcurrent: 2)
+        // Three requests over two rows. The third is longer than a 128-position chunk.
+        let prompts: [[Int32]] = [[1, 2, 3], [7, 8, 9, 10, 11], (0..<200).map { Int32($0 % 60) }]
+        let together = try await scheduler.score(prompts.map(scoreRequest))
+        #expect(step.scoringRows == expectedRows)
+
+        for (prompt, batched) in zip(prompts, together) {
+            let alone = try await scheduler.score([scoreRequest(prompt)])[0]
+            #expect(batched.entries.map(\.tokenId) == alone.entries.map(\.tokenId))
+            #expect(batched.entries.map(\.value) == alone.entries.map(\.value))
+            #expect(batched.entries.count == prompt.count)
+        }
+    }
+
+    @Test("Scoring runs between decode steps while a request streams")
+    func scoringBesideDecode() async throws {
+        let scheduler = makeScheduler(CountUpDecodeStep(capacity: 2), maxConcurrent: 2)
+        let stream = try scheduler.submit(req(prompt: [5], maxTokens: 6))
+        let scores = try await scheduler.score([scoreRequest([1, 2, 3])])
+        let (tokens, reason) = try await drain(stream)
+        #expect(tokens == [6, 7, 8, 9, 10, 11])
+        #expect(reason == .maxTokens)
+        #expect(scores[0].entries.count == 3)
+    }
+
+    @Test(
+        "Scoring batches stop before a third of the positions would be padding",
+        arguments: [
+            ([7, 40, 130, 300], 4, 1),
+            ([130, 300], 4, 2),
+            ([64, 64, 64, 64, 64], 4, 4),
+            ([10, 200], 4, 1),
+            ([5], 4, 1),
+            ([], 4, 0),
+        ] as [([Int], Int, Int)])
+    func scoringBatchCount(lengths: [Int], limit: Int, expected: Int) {
+        #expect(BatchScheduler.scoringBatchCount(lengths, limit: limit) == expected)
+    }
+
+    @Test("A scoring request needs one target per token")
+    func scoringValidation() async {
+        let scheduler = makeScheduler(CountUpDecodeStep(capacity: 2), maxConcurrent: 2)
+        await #expect(throws: InferenceRuntimeError.self) {
+            _ = try await scheduler.score([ScoreRequest(tokens: [1, 2], targets: [2], topK: 1)])
+        }
     }
 
     @Test("An empty prompt is rejected at submit")

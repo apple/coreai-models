@@ -3,6 +3,7 @@
 // Use of this source code is governed by a BSD-3-clause license that can
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
+import Dispatch
 import Synchronization
 
 /// One request submitted to a `RequestSink`.
@@ -35,6 +36,24 @@ package struct BatchRequest: Sendable {
 }
 
 /// The tokens one request generated in `BatchScheduler.run(_:)` and why it stopped.
+/// One scoring request for `BatchScheduler.score(_:)`.
+///
+/// `targets[p]` is scored against the logits at position `p` of `tokens`, so both have the same
+/// length. For a prompt `[t0, t1, t2]` the usual targets are `[t1, t2, x]`, where the last entry has
+/// no real next token and the caller ignores it.
+package struct ScoreRequest: Sendable {
+    let tokens: [Int32]
+    let targets: [Int32]
+    /// How many alternatives to report per position.
+    let topK: Int
+
+    package init(tokens: [Int32], targets: [Int32], topK: Int) {
+        self.tokens = tokens
+        self.targets = targets
+        self.topK = topK
+    }
+}
+
 struct RowResult: Sendable {
     let tokens: [Int32]
     let stopReason: StopReason
@@ -101,12 +120,22 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
         var queue: [Pending] = []
         /// Rows held by admitted requests.
         var occupiedRows = 0
+        /// Scoring requests waiting for the pump, in arrival order.
+        var scoring: [ScoringJob] = []
         var pumping = false
     }
     private let state = Mutex(State())
     /// Held by the pump for each step and by an `ExclusiveEngineLease` for its whole lifetime, so
     /// the engine never runs work from two tasks at once.
     private let engineLock = AsyncFIFOLock()
+    /// Positions per scoring forward. Each chunk's logits are reduced to log-probabilities and
+    /// dropped, so memory stays at `rows * scoringChunkLength * vocab` logits however long the prompt.
+    private let scoringChunkLength = 128
+
+    private struct ScoringJob {
+        let request: ScoreRequest
+        let continuation: AsyncThrowingStream<LogProbabilities, Error>.Continuation
+    }
 
     /// Creates a scheduler with a new `maxConcurrent`-row session on `engine`.
     /// `engine.supportsBatching` must be true, and `maxConcurrent` must not exceed the graph's batch
@@ -202,6 +231,7 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
             while true {
                 await engineLock.lock()
                 defer { engineLock.unlock() }
+                await runPendingScoring()
                 await admit(into: &active)
 
                 let liveSlots = active.indices.filter { active[$0] != nil }
@@ -209,7 +239,7 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
                     // Recheck the queue under the lock. A request enqueued after `admit` saw
                     // `pumping == true` and did not start a pump, so this one must keep going.
                     let more = state.withLock { s -> Bool in
-                        if s.queue.isEmpty {
+                        if s.queue.isEmpty && s.scoring.isEmpty {
                             s.pumping = false
                             return false
                         }
@@ -230,14 +260,16 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
             for row in active where row != nil { row!.continuation.finish(throwing: error) }
             // Drain the queue under the same lock that clears `pumping`. A queued request left
             // behind would wait forever on a pump that has stopped.
-            let orphaned = state.withLock { s -> [Pending] in
-                let waiting = s.queue
+            let (orphaned, orphanedScoring) = state.withLock { s -> ([Pending], [ScoringJob]) in
+                let waiting = (s.queue, s.scoring)
                 s.queue.removeAll()
+                s.scoring.removeAll()
                 s.occupiedRows = 0
                 s.pumping = false
                 return waiting
             }
             for pending in orphaned { pending.continuation.finish(throwing: error) }
+            for job in orphanedScoring { job.continuation.finish(throwing: error) }
         }
     }
 
@@ -286,6 +318,144 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
             active[slot] = nil
             state.withLock { $0.occupiedRows -= 1 }
         }
+    }
+
+    // MARK: - Scoring
+
+    /// Returns the log-probability of each request's targets, in request order.
+    ///
+    /// The requests join the pump's scoring queue. Between decode steps the pump takes up to
+    /// `maxConcurrent` waiting requests and runs them as one batch on a separate session:
+    /// - Rows shorter than the longest prompt are padded at the end. The causal mask keeps padding
+    ///   from affecting real positions, and its logits are ignored.
+    /// - The batch advances `scoringChunkLength` positions per forward, and each chunk's logits are
+    ///   reduced to log-probabilities before the next chunk runs.
+    ///
+    /// Running decode rows wait for the scoring batch but keep their KV state. A failed scoring
+    /// forward fails only the requests in that batch.
+    package func score(_ requests: [ScoreRequest]) async throws -> [LogProbabilities] {
+        if requests.contains(where: { $0.tokens.isEmpty || $0.targets.count != $0.tokens.count }) {
+            throw InferenceRuntimeError.invalidArgument(
+                "a scoring request needs a non-empty prompt and one target per token")
+        }
+        // Queue the requests shortest first so each batch holds similar lengths and pads less. The
+        // sort is stable, so the same requests always form the same batches.
+        let order = requests.indices.sorted { requests[$0].tokens.count < requests[$1].tokens.count }
+        var jobs: [ScoringJob] = []
+        var streams = [AsyncThrowingStream<LogProbabilities, Error>?](repeating: nil, count: requests.count)
+        for index in order {
+            let (stream, continuation) = AsyncThrowingStream.makeStream(of: LogProbabilities.self)
+            jobs.append(ScoringJob(request: requests[index], continuation: continuation))
+            streams[index] = stream
+        }
+        let shouldStart = state.withLock { s -> Bool in
+            s.scoring.append(contentsOf: jobs)
+            if s.pumping { return false }
+            s.pumping = true
+            return true
+        }
+        if shouldStart { Task { await self.pump() } }
+
+        var results: [LogProbabilities] = []
+        results.reserveCapacity(streams.count)
+        for stream in streams {
+            var iterator = stream!.makeAsyncIterator()
+            guard let result = try await iterator.next() else {
+                throw InferenceRuntimeError.invalidState("scoring ended without a result")
+            }
+            results.append(result)
+        }
+        return results
+    }
+
+    /// Runs every waiting scoring request, `maxConcurrent` at a time. Called by the pump while it
+    /// holds the engine lock.
+    private func runPendingScoring() async {
+        while true {
+            let jobs = state.withLock { s -> [ScoringJob] in
+                let count = Self.scoringBatchCount(s.scoring.map(\.request.tokens.count), limit: maxConcurrent)
+                let taken = Array(s.scoring.prefix(count))
+                s.scoring.removeFirst(taken.count)
+                return taken
+            }
+            if jobs.isEmpty { return }
+            do {
+                let results = try await scoreBatch(jobs.map(\.request))
+                for (job, result) in zip(jobs, results) {
+                    job.continuation.yield(result)
+                    job.continuation.finish()
+                }
+            } catch {
+                for job in jobs { job.continuation.finish(throwing: error) }
+            }
+        }
+    }
+
+    /// How many of the waiting scoring requests, with prompt lengths `lengths` in queue order, go into
+    /// the next batch. It takes up to `limit` requests and stops before one that would make more than
+    /// a third of the batch's positions padding, where batching stops paying for itself. For lengths
+    /// `[7, 40, 130, 300]` the batches are `[7]`, `[40]` and `[130, 300]`.
+    static func scoringBatchCount(_ lengths: [Int], limit: Int) -> Int {
+        guard let first = lengths.first else { return 0 }
+        var count = 1
+        var total = first
+        var longest = first
+        while count < min(limit, lengths.count) {
+            let next = lengths[count]
+            let padded = (count + 1) * max(longest, next)
+            if 2 * padded > 3 * (total + next) { break }
+            count += 1
+            total += next
+            longest = max(longest, next)
+        }
+        return count
+    }
+
+    /// Scores up to `maxConcurrent` requests in one padded batch.
+    ///
+    /// For prompts of lengths 3 and 5 with a chunk length of 4, the rows are
+    /// ```
+    /// chunk 0: [a0 a1 a2 a2] [b0 b1 b2 b3]    positions 0..<4
+    /// chunk 1: [a2]          [b4]             position 4, row a is padding only
+    /// ```
+    private func scoreBatch(_ requests: [ScoreRequest]) async throws -> [LogProbabilities] {
+        // A static batch=N graph needs exactly N rows, so fill it with padding rows.
+        let capacity = decodeStep.maxBatchCapacity
+        let rows = capacity == Int.max ? requests.count : capacity
+        let session = try decodeStep.makeSessionState(batchSize: rows)
+        let longest = requests.map(\.tokens.count).max() ?? 0
+        var entries = Array(repeating: [LogProbabilities.Entry](), count: requests.count)
+
+        var start = 0
+        while start < longest {
+            let q = min(scoringChunkLength, longest - start)
+            let tokensPerRow = (0..<rows).map { row -> [Int32] in
+                guard row < requests.count else { return Array(repeating: 0, count: q) }
+                let tokens = requests[row].tokens
+                return (start..<start + q).map { tokens[min($0, tokens.count - 1)] }
+            }
+            let logits = try await decodeStep.allPositionLogits(
+                tokensPerRow: tokensPerRow, startPosition: start, session: session)
+            let vocab = logits[0].count / q
+            // Reducing logits to log-probabilities is CPU work, so rows run in parallel.
+            let chunkEntries = Mutex([[LogProbabilities.Entry]](repeating: [], count: requests.count))
+            let chunkStart = start
+            DispatchQueue.concurrentPerform(iterations: requests.count) { row in
+                let request = requests[row]
+                let real = min(q, request.tokens.count - chunkStart)
+                guard real > 0 else { return }
+                let rowLogits = (0..<real).map { p in Array(logits[row][p * vocab..<(p + 1) * vocab]) }
+                let targets = Array(request.targets[chunkStart..<chunkStart + real])
+                let rowEntries =
+                    LogProbabilities.compute(
+                        logits: rowLogits, targets: targets, topK: request.topK
+                    ).entries
+                chunkEntries.withLock { $0[row] = rowEntries }
+            }
+            for (row, rowEntries) in chunkEntries.withLock({ $0 }).enumerated() { entries[row] += rowEntries }
+            start += q
+        }
+        return entries.map { LogProbabilities(entries: $0) }
     }
 
     // MARK: - Exclusive engine access

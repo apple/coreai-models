@@ -45,4 +45,15 @@ protocol BatchedDecodeStep {
         promptTokens: [Int32],
         session: GenerationSessionState
     ) async throws -> [LogitsScalarType]
+
+    /// Runs `tokensPerRow` (`[N][q]`, every row at `startPosition`) and returns each row's logits at
+    /// every position, flat `[q * vocab]`. Scoring uses this to read all positions in one pass.
+    func allPositionLogits(
+        tokensPerRow: [[Int32]],
+        startPosition: Int,
+        session: GenerationSessionState
+    ) async throws -> [[LogitsScalarType]]
+
+    /// A new session whose KV cache holds `batchSize` rows.
+    func makeSessionState(batchSize: Int) throws -> GenerationSessionState
 }

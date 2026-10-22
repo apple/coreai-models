@@ -3,8 +3,8 @@
 // Use of this source code is governed by a BSD-3-clause license that can
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
-/// An `InferenceEngine` that runs one fallback-lane request (guided generation or loglikelihood
-/// scoring) on a `CoreAISequentialEngine` through its own `GenerationSessionState`.
+/// An `InferenceEngine` that runs one fallback-lane request, such as guided generation, on a
+/// `CoreAISequentialEngine` through its own `GenerationSessionState`.
 ///
 /// Create one per request. The KV cache, token history and prefix-hit count belong to this session
 /// rather than the engine's default session, so other sessions keep their state. It does not make
@@ -46,8 +46,7 @@ package final class IsolatedSessionEngine: InferenceEngine, @unchecked Sendable 
     }
 
     /// Replaces this request's session with a fresh one, whatever `tokenIndex` is. Guided generation
-    /// and loglikelihood scoring both reset to 0 before generating, so this lane never needs a
-    /// partial rewind.
+    /// resets to 0 before generating, so this lane never needs a partial rewind.
     package func reset(to tokenIndex: Int) async throws {
         sessionState = try base.makeSessionState()
     }

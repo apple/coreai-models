@@ -218,6 +218,16 @@ final class ServerState: @unchecked Sendable {
         return RequestAccess(permit: permit, lease: lease)
     }
 
+    /// The scheduler that scores completions prompts in batches, or nil when the server scores them
+    /// one at a time on the shared engine.
+    var scoringScheduler: BatchScheduler? { batchScheduler }
+
+    /// Waits for the single-slot permit a scoring request holds. Scoring takes no lease: with a
+    /// scheduler, its prompts run on the scheduler's own task between decode steps.
+    func acquireScoringAccess() async throws -> RequestAccess {
+        RequestAccess(permit: try await queue.acquire(), lease: nil)
+    }
+
     /// Whether a request on `lane` needs the single-slot permit. The batched lane does not when a
     /// continuous-batching scheduler admits it, because the scheduler enforces its own queue limit.
     private func needsServerPermit(lane: BatchServingLane) -> Bool {
