@@ -454,10 +454,11 @@ extension CoreAIPipelinedEngine {
         jsonSchema: String,
         tokenizer: any Tokenizer,
         vocabSize: Int,
-        stopTokenIds: [Int32]?
+        stopTokenIds: [Int32]?,
+        maxWhitespaceCount: Int?
     ) throws -> ConstrainedSessionHandle {
         if let cached: ConstrainedSessionHandle = _constrainedSessionCache.withLock({ cache in
-            guard let box = cache, box.schema == jsonSchema else {
+            guard let box = cache, box.matches(schema: jsonSchema, maxWhitespaceCount: maxWhitespaceCount) else {
                 cache = nil
                 return nil
             }
@@ -471,7 +472,8 @@ extension CoreAIPipelinedEngine {
             jsonSchema: jsonSchema,
             tokenizer: tokenizer,
             vocabSize: vocabSize,
-            stopTokenIds: stopTokenIds
+            stopTokenIds: stopTokenIds,
+            maxWhitespaceCount: maxWhitespaceCount
         )
         return ConstrainedSessionHandle(session: session, tokenizer: tokenizer)
     }
