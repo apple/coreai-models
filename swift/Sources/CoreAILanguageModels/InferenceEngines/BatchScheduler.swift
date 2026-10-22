@@ -6,16 +6,16 @@
 import Dispatch
 import Synchronization
 
-/// One request submitted to a `RequestSink`.
+/// A generation request for a `RequestSink`: prompt, sampling and stop conditions.
 package struct BatchRequest: Sendable {
-    /// Must not be empty; `submit(_:)` throws `invalidArgument` for an empty prompt.
+    /// List of prompt tokens, cannot be empty.
     let promptTokens: [Int32]
     let sampling: SamplingConfiguration
     let eosTokenIds: Set<Int32>
     let maxTokens: Int
     let stopSequences: StopSequences
-    /// Turns a matched stop sequence's tokens into the text reported in `StopReason.stopSequence`,
-    /// so the scheduler needs no tokenizer. The default returns an empty string.
+    /// Converts a matched stop sequence's tokens to the text reported in `StopReason.stopSequence`.
+    /// Defaults to an empty string.
     let decodeStopText: @Sendable ([Int32]) -> String
 
     init(
@@ -35,16 +35,18 @@ package struct BatchRequest: Sendable {
     }
 }
 
-/// The tokens one request generated in `BatchScheduler.run(_:)` and why it stopped.
-/// One scoring request for `BatchScheduler.score(_:)`.
+/// A scoring request for `BatchScheduler.score(_:)`: prompt tokens and the target token to score at
+/// each position.
 ///
-/// `targets[p]` is scored against the logits at position `p` of `tokens`, so both have the same
-/// length. For a prompt `[t0, t1, t2]` the usual targets are `[t1, t2, x]`, where the last entry has
-/// no real next token and the caller ignores it.
+/// For a prompt `[t0, t1, t2]` the usual targets are `[t1, t2, x]`. `x` can be any token, and the
+/// caller ignores the last position's entry in the result.
 package struct ScoreRequest: Sendable {
+    /// Prompt tokens, cannot be empty.
     let tokens: [Int32]
+    /// Token scored at each position of `tokens`, same length as `tokens`. `targets[p]` is scored
+    /// against the logits at position `p`.
     let targets: [Int32]
-    /// How many alternatives to report per position.
+    /// Number of top alternatives reported per position.
     let topK: Int
 
     package init(tokens: [Int32], targets: [Int32], topK: Int) {
@@ -54,62 +56,51 @@ package struct ScoreRequest: Sendable {
     }
 }
 
+/// Generated tokens and stop reason for one request from `BatchScheduler.run(_:)`.
 struct RowResult: Sendable {
     let tokens: [Int32]
     let stopReason: StopReason
 }
 
-/// One event on a request's stream from a `RequestSink`. A stream yields `.token` events and then
-/// one `.finished`, or ends by throwing.
+/// An event on a request's stream from a `RequestSink`. A stream yields `.token` events, then one
+/// `.finished`, or ends by throwing.
 package enum BatchSinkEvent: Sendable {
-    /// A sampled token. `BatchScheduler` always sends nil `logits` because it samples internally.
+    /// A sampled token and, when the sink provides them, its logits. `BatchScheduler` always sends
+    /// `nil` logits.
     case token(Int32, logits: [LogitsScalarType]?)
-    /// Why the request stopped. Nothing follows it.
+    /// The reason the request stopped. Always the last event.
     case finished(StopReason)
 }
 
-/// A shared batched backend that gives each submitted request its own event stream.
-///
-/// The server does not call `submit(_:)` directly. It wraps the sink in one `SchedulerSession` per
-/// request, which submits on `generate` and presents the stream as an ordinary `InferenceEngine`.
-///
-/// ```swift
-/// let engine = SchedulerSession(sink: scheduler, config: modelConfig, stopTokenIds: eosIds)
-/// let sequence = try await engine.generate(
-///     with: promptTokens, samplingConfiguration: sampling, inferenceOptions: options)
-/// ```
+/// A batched backend shared by many requests, each with its own event stream. Wrap it in a
+/// `SchedulerSession`, one per request, to use it as an `InferenceEngine`.
 package protocol RequestSink: Sendable {
-    /// The most requests that decode in the same batch.
+    /// Maximum number of requests decoded in one batch. At least 1.
     var maxConcurrent: Int { get }
 
-    /// Queues `request` and returns its event stream. When the sink rejects the request, for example
-    /// with `InferenceRuntimeError.queueFull`, this throws before any stream exists.
+    /// Queues `request` and returns its event stream. Throws when the sink rejects the request, such
+    /// as `InferenceRuntimeError.queueFull` when its queue is full.
     func submit(_ request: BatchRequest) throws -> AsyncThrowingStream<BatchSinkEvent, Error>
 }
 
-/// Runs up to `maxConcurrent` requests through one shared batch-N session and admits new requests
-/// while others are still decoding.
+/// A `RequestSink` that decodes up to `maxConcurrent` requests in one shared batch session and
+/// admits new requests while others are still decoding. Safe to call from any task.
 ///
-/// Slot `i` is row `i` of the batch KV cache. A slot goes through these phases:
-/// - Admission: a queued request takes a free slot and is prefilled into its row with
-///   `BatchedDecodeStep.prefillRow`.
-/// - Decode: each step runs `decodeBatch` over all `N` rows, every live row at its own cursor, so a
-///   short request admitted late runs beside an older long one.
-/// - Retirement: `BatchSessionAdapter` ends the row on EOS, a stop sequence or `maxTokens`. The next
-///   pump iteration refills the slot from the queue while the other rows keep decoding.
-///
-/// The class is `@unchecked Sendable` because the queue and row count sit behind a `Mutex`, and at
-/// most one pump task runs at a time. That task alone drives the session.
+/// Slot `i` is row `i` of the batch KV cache, and `N` is `maxConcurrent`. A slot goes through these
+/// phases:
+/// - Admission: a queued request takes a free slot, is prefilled into its row and samples its first
+///   token.
+/// - Decode: each step runs `decodeBatch` over all `N` rows, every live row at its own cursor.
+/// - Retirement: the row ends on EOS, a stop sequence or `maxTokens`, and the slot takes the next
+///   queued request while the other rows keep decoding.
 package final class BatchScheduler: RequestSink, @unchecked Sendable {
     private let decodeStep: any BatchedDecodeStep
     private let session: GenerationSessionState
     package let maxConcurrent: Int
-    /// How many requests may wait beyond the free rows before `submit(_:)` throws. `nil` means
-    /// unbounded.
+    /// Requests allowed to wait beyond the free rows, or `nil` for no limit. At least 0.
     private let maxQueued: Int?
 
-    /// Whether the server can skip its single-slot permit for the batched lane. This scheduler queues
-    /// and bounds requests itself, so that holds whenever it has more than one row.
+    /// True when more than one request can decode at a time (`maxConcurrent > 1`).
     package var supportsContinuousBatching: Bool { maxConcurrent > 1 }
 
     private struct Pending {
@@ -120,16 +111,17 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
         var queue: [Pending] = []
         /// Rows held by admitted requests.
         var occupiedRows = 0
-        /// Scoring requests waiting for the pump, in arrival order.
+        /// Scoring jobs waiting for the pump. Each `score(_:)` call appends its jobs shortest prompt
+        /// first.
         var scoring: [ScoringJob] = []
         var pumping = false
     }
     private let state = Mutex(State())
-    /// Held by the pump for each step and by an `ExclusiveEngineLease` for its whole lifetime, so
-    /// the engine never runs work from two tasks at once.
+    /// Lock held by the pump during each iteration, and by an `ExclusiveEngineLease` until it is
+    /// released.
     private let engineLock = AsyncFIFOLock()
-    /// Positions per scoring forward. Each chunk's logits are reduced to log-probabilities and
-    /// dropped, so memory stays at `rows * scoringChunkLength * vocab` logits however long the prompt.
+    /// Maximum number of positions per scoring forward pass. Each pass returns at most
+    /// `rows * scoringChunkLength * vocab` logits.
     private let scoringChunkLength = 128
 
     private struct ScoringJob {
@@ -137,10 +129,18 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
         let continuation: AsyncThrowingStream<LogProbabilities, Error>.Continuation
     }
 
-    /// Creates a scheduler with a new `maxConcurrent`-row session on `engine`.
-    /// `engine.supportsBatching` must be true, and `maxConcurrent` must not exceed the graph's batch
-    /// capacity or a precondition fails.
+    /// Creates a scheduler over `engine` with a new `maxConcurrent`-row session.
+    ///
+    /// - Parameters:
+    ///   - maxConcurrent: Rows in the batch, from 1 to the graph's batch capacity. Above 1,
+    ///     `engine.supportsBatching` must be true.
+    ///   - maxQueued: Requests allowed to wait beyond the free rows, at least 0. `nil` means no limit.
+    ///
+    /// Throws when the session cannot be created. Out-of-range values fail a precondition.
     package convenience init(engine: CoreAISequentialEngine, maxConcurrent: Int, maxQueued: Int? = nil) throws {
+        precondition(
+            maxConcurrent == 1 || engine.supportsBatching,
+            "maxConcurrent \(maxConcurrent) needs a graph with an attn_mask input and a batch dimension above 1")
         self.init(
             decodeStep: engine, session: try engine.makeSessionState(batchSize: maxConcurrent),
             maxConcurrent: maxConcurrent, maxQueued: maxQueued)
@@ -165,20 +165,17 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
 
     /// Queues `request` and returns its event stream.
     ///
-    /// Throws `InferenceRuntimeError.queueFull`, which the server maps to HTTP 429, when
-    /// `queue.count + 1 > freeRows + maxQueued`. With `maxConcurrent == 2`, `maxQueued == 1` and both
-    /// rows busy, one request may wait and the next one throws. With `maxQueued == nil` it never throws.
-    ///
-    /// `queue.count` includes requests the pump has not admitted yet, so free rows absorb a burst
-    /// before `maxQueued` applies. In the same configuration with both rows free, a burst of four
-    /// requests accepts three and the fourth throws.
+    /// Throws `invalidArgument` when the prompt is empty, and `InferenceRuntimeError.queueFull` when
+    /// admitted plus queued requests would exceed `maxConcurrent + maxQueued`. With
+    /// `maxConcurrent == 2` and `maxQueued == 1`, a request throws while three others are admitted or
+    /// queued. With `maxQueued == nil`, it throws only for an empty prompt.
     package func submit(_ request: BatchRequest) throws -> AsyncThrowingStream<BatchSinkEvent, Error> {
         try enqueue([request])[0]
     }
 
-    /// Enqueues `requests` atomically and starts the pump if none is running. Returns one stream per
-    /// request, in order. `submit(_:)` and `run(_:)` both go through here, so only the pump ever
-    /// drives `session`.
+    /// Enqueues `requests` as one unit and starts the pump if none is running. Returns one stream per
+    /// request, in order. Throws `invalidArgument` when a prompt is empty and `queueFull` when the
+    /// queue cannot take all of `requests`. A throw enqueues nothing.
     private func enqueue(
         _ requests: [BatchRequest]
     ) throws -> [AsyncThrowingStream<BatchSinkEvent, Error>] {
@@ -216,15 +213,17 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
         var cursor: Int
     }
 
-    /// The single pump. Each iteration does the following:
-    /// 1. Admit queued requests into free slots.
-    /// 2. If no slot is live and the queue is empty, clear `pumping` and return.
-    /// 3. Run one `decodeBatch` over all `N` slots with `tokens` `[N][1]` and `cursors` `[N]`. A free
+    /// Scheduling loop, run by at most one task at a time. Each iteration does the following:
+    /// 1. Run every waiting scoring job.
+    /// 2. Admit queued requests into free slots.
+    /// 3. If no slot is live, loop again when requests or scoring jobs are waiting, otherwise clear
+    ///    `pumping` and return.
+    /// 4. Run one `decodeBatch` over all `N` slots with `tokens` `[N][1]` and `cursors` `[N]`. A free
     ///    slot gets token 0 at cursor 0 and its logits are dropped.
-    /// 4. Advance each live cursor, then sample, emit or retire each live row.
+    /// 5. Advance each live cursor, then sample, emit or retire each live row.
     ///
-    /// The step always spans `maxConcurrent` rows, so a lone request still pays for a full batch.
-    /// If `decodeBatch` throws, every resident row and every queued request ends with that error.
+    /// If `decodeBatch` throws, every resident row, queued request and queued scoring job ends with
+    /// that error.
     private func pump() async {
         var active: [ActiveRow?] = Array(repeating: nil, count: maxConcurrent)
         do {
@@ -236,8 +235,7 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
 
                 let liveSlots = active.indices.filter { active[$0] != nil }
                 if liveSlots.isEmpty {
-                    // Recheck the queue under the lock. A request enqueued after `admit` saw
-                    // `pumping == true` and did not start a pump, so this one must keep going.
+                    // Requests and scoring jobs enqueued while `pumping` is set start no pump.
                     let more = state.withLock { s -> Bool in
                         if s.queue.isEmpty && s.scoring.isEmpty {
                             s.pumping = false
@@ -258,8 +256,6 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
             }
         } catch {
             for row in active where row != nil { row!.continuation.finish(throwing: error) }
-            // Drain the queue under the same lock that clears `pumping`. A queued request left
-            // behind would wait forever on a pump that has stopped.
             let (orphaned, orphanedScoring) = state.withLock { s -> ([Pending], [ScoringJob]) in
                 let waiting = (s.queue, s.scoring)
                 s.queue.removeAll()
@@ -274,7 +270,7 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
     }
 
     /// Fills free slots from the queue. Each admitted request is prefilled into its row and its first
-    /// token is sampled at once, so a request can also retire here.
+    /// token is sampled immediately. A request can retire during admission.
     ///
     /// A prefill error fails only that request's stream and leaves its slot free.
     private func admit(into active: inout [ActiveRow?]) async {
@@ -300,7 +296,7 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
         }
     }
 
-    /// Samples one token for `slot`, emits it, and retires the row if the adapter says it is done.
+    /// Samples one token for `slot`, emits it, and retires the row when its request is done.
     private func stepSlot(_ slot: Int, logits: [LogitsScalarType], active: inout [ActiveRow?]) {
         guard active[slot] != nil else { return }
         let token = BatchedSampler.sample(
@@ -322,24 +318,20 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
 
     // MARK: - Scoring
 
-    /// Returns the log-probability of each request's targets, in request order.
+    /// Scores each request's targets. Returns one `LogProbabilities` per request, in request order,
+    /// with one entry per position: the target's log-probability and the top `topK` alternatives.
     ///
-    /// The requests join the pump's scoring queue. Between decode steps the pump takes up to
-    /// `maxConcurrent` waiting requests and runs them as one batch on a separate session:
-    /// - Rows shorter than the longest prompt are padded at the end. The causal mask keeps padding
-    ///   from affecting real positions, and its logits are ignored.
-    /// - The batch advances `scoringChunkLength` positions per forward, and each chunk's logits are
-    ///   reduced to log-probabilities before the next chunk runs.
+    /// Throws `invalidArgument` when a request has no tokens or its `targets` and `tokens` counts
+    /// differ. Rethrows the error of a failed scoring batch or decode step.
     ///
-    /// Running decode rows wait for the scoring batch but keep their KV state. A failed scoring
-    /// forward fails only the requests in that batch.
+    /// Requests run between decode steps, grouped by prompt length into batches of up to
+    /// `maxConcurrent` requests, each batch on a new session. Decode rows pause during a scoring
+    /// batch and keep their KV state. A failed scoring batch fails only its own requests.
     package func score(_ requests: [ScoreRequest]) async throws -> [LogProbabilities] {
         if requests.contains(where: { $0.tokens.isEmpty || $0.targets.count != $0.tokens.count }) {
             throw InferenceRuntimeError.invalidArgument(
                 "a scoring request needs a non-empty prompt and one target per token")
         }
-        // Queue the requests shortest first so each batch holds similar lengths and pads less. The
-        // sort is stable, so the same requests always form the same batches.
         let order = requests.indices.sorted { requests[$0].tokens.count < requests[$1].tokens.count }
         var jobs: [ScoringJob] = []
         var streams = [AsyncThrowingStream<LogProbabilities, Error>?](repeating: nil, count: requests.count)
@@ -368,8 +360,8 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
         return results
     }
 
-    /// Runs every waiting scoring request, `maxConcurrent` at a time. Called by the pump while it
-    /// holds the engine lock.
+    /// Runs every waiting scoring job, in batches of up to `maxConcurrent` sized by
+    /// `scoringBatchCount(_:limit:)`. Call only while holding `engineLock`.
     private func runPendingScoring() async {
         while true {
             let jobs = state.withLock { s -> [ScoringJob] in
@@ -391,10 +383,10 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
         }
     }
 
-    /// How many of the waiting scoring requests, with prompt lengths `lengths` in queue order, go into
-    /// the next batch. It takes up to `limit` requests and stops before one that would make more than
-    /// a third of the batch's positions padding, where batching stops paying for itself. For lengths
-    /// `[7, 40, 130, 300]` the batches are `[7]`, `[40]` and `[130, 300]`.
+    /// Counts the leading entries of `lengths`, prompt lengths in queue order, that form the next
+    /// scoring batch. Takes up to `limit` entries and stops before one that would make more than a
+    /// third of the batch's positions padding. Returns 0 when `lengths` is empty. With `limit` 4 and
+    /// lengths `[7, 40, 130, 300]`, successive batches are `[7]`, `[40]` and `[130, 300]`.
     static func scoringBatchCount(_ lengths: [Int], limit: Int) -> Int {
         guard let first = lengths.first else { return 0 }
         var count = 1
@@ -411,15 +403,17 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
         return count
     }
 
-    /// Scores up to `maxConcurrent` requests in one padded batch.
+    /// Scores `requests` in one padded batch on a new session. At most `decodeStep.maxBatchCapacity`
+    /// requests.
     ///
-    /// For prompts of lengths 3 and 5 with a chunk length of 4, the rows are
+    /// Short rows repeat their last token. For prompts of lengths 3 and 5 with a chunk length of 4,
+    /// the rows are
     /// ```
     /// chunk 0: [a0 a1 a2 a2] [b0 b1 b2 b3]    positions 0..<4
     /// chunk 1: [a2]          [b4]             position 4, row a is padding only
     /// ```
     private func scoreBatch(_ requests: [ScoreRequest]) async throws -> [LogProbabilities] {
-        // A static batch=N graph needs exactly N rows, so fill it with padding rows.
+        // Static graphs take exactly `capacity` rows; dynamic graphs (`Int.max`) take one per request.
         let capacity = decodeStep.maxBatchCapacity
         let rows = capacity == Int.max ? requests.count : capacity
         let session = try decodeStep.makeSessionState(batchSize: rows)
@@ -437,7 +431,6 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
             let logits = try await decodeStep.allPositionLogits(
                 tokensPerRow: tokensPerRow, startPosition: start, session: session)
             let vocab = logits[0].count / q
-            // Reducing logits to log-probabilities is CPU work, so rows run in parallel.
             let chunkEntries = Mutex([[LogProbabilities.Entry]](repeating: [], count: requests.count))
             let chunkStart = start
             DispatchQueue.concurrentPerform(iterations: requests.count) { row in
@@ -460,11 +453,11 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
 
     // MARK: - Exclusive engine access
 
-    /// Waits until the pump finishes its current step, then gives the caller sole use of the engine
-    /// until the lease is released. Resident rows stay in their slots and resume afterwards.
+    /// Waits behind the current scheduling step and any earlier lease, then returns a lease that
+    /// gives the caller sole use of the engine until `release()`. Resident rows keep their slots and
+    /// resume decoding after release.
     ///
-    /// A request that runs on its own session of the same engine, such as one that needs per-step
-    /// logits, holds a lease for as long as it runs:
+    /// A request running on its own session of the same engine holds a lease for as long as it runs:
     ///
     /// ```swift
     /// let lease = await scheduler.acquireExclusiveAccess()
@@ -478,8 +471,10 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
 
     // MARK: - Closed batch
 
-    /// Submits `requests` together and waits for all of them. Returns one `RowResult` per request, in
-    /// order. It shares the pump with `submit(_:)`, so it is safe to call while other requests stream.
+    /// Submits `requests` together, waits for all of them, and returns one `RowResult` per request, in
+    /// request order. Can be called while other requests stream. Throws `invalidArgument` when a
+    /// prompt is empty, `queueFull` when the queue cannot take all of `requests`, and any error that
+    /// ends a request's stream.
     func run(_ requests: [BatchRequest]) async throws -> [RowResult] {
         let streams = try enqueue(requests)
         return try await withThrowingTaskGroup(of: (Int, RowResult).self) { group in
@@ -504,8 +499,8 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
     }
 }
 
-/// Sole use of a `BatchScheduler`'s engine, from `acquireExclusiveAccess()`. Releasing it more than
-/// once is harmless, and it releases on deinit, so a dropped lease cannot stall the batch.
+/// A lease on sole use of a `BatchScheduler`'s engine, returned by `acquireExclusiveAccess()`.
+/// Calls to `release()` after the first do nothing. Deinit releases a lease that is still held.
 package final class ExclusiveEngineLease: Sendable {
     private let lock: AsyncFIFOLock
     private let released = Mutex(false)
@@ -523,8 +518,8 @@ package final class ExclusiveEngineLease: Sendable {
     deinit { release() }
 }
 
-/// An async lock that grants waiters in arrival order. `unlock()` hands the lock straight to the
-/// next waiter, so a task that unlocks and locks again goes to the back of the line.
+/// An async lock granted to waiters in arrival order. `unlock()` hands the lock directly to the next
+/// waiter, and a task that unlocks and locks again queues behind the existing waiters.
 final class AsyncFIFOLock: Sendable {
     private struct State {
         var held = false

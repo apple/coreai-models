@@ -129,11 +129,10 @@ final class ServerState: @unchecked Sendable {
     /// guaranteed while this value is unchanged; it changes when output-affecting
     /// configuration (model, engine, context length, sampling defaults) changes.
     let systemFingerprint: String
-    /// Scheduler for the batched lane, or nil when the server handles one request at a time.
-    private let batchScheduler: BatchScheduler?
-    /// Config for each `SchedulerSession`. Set it whenever `batchScheduler` is set. If it is nil
-    /// while a scheduler is present, the batched lane runs on the shared engine without the permit.
-    private let batchModelConfig: ModelConfig?
+    /// Scheduler for the batched lane and completions scoring, and the model config for each
+    /// `SchedulerSession`. Nil when batched serving is off.
+    private let batchServing: (scheduler: BatchScheduler, modelConfig: ModelConfig)?
+    private var batchScheduler: BatchScheduler? { batchServing?.scheduler }
     private let _state = Mutex<InternalState>(InternalState())
 
     private struct InternalState {
@@ -149,8 +148,7 @@ final class ServerState: @unchecked Sendable {
         engine: any InferenceEngine,
         tokenizer: any Tokenizer,
         config: ServerConfig,
-        batchScheduler: BatchScheduler? = nil,
-        batchModelConfig: ModelConfig? = nil
+        batchServing: (scheduler: BatchScheduler, modelConfig: ModelConfig)? = nil
     ) {
         self.engine = engine
         self.tokenizer = tokenizer
@@ -159,12 +157,11 @@ final class ServerState: @unchecked Sendable {
         self.toolCallDetection = detectToolCallFormat(using: tokenizer)
         self.thinkingFormat = detectThinkingFormat(using: tokenizer)
         self.systemFingerprint = Self.makeSystemFingerprint(config: config, engine: engine)
-        self.batchScheduler = batchScheduler
-        self.batchModelConfig = batchModelConfig
+        self.batchServing = batchServing
     }
 
-    /// Token ids that retire a row in the scheduler: EOS and the additional EOS ids. Multi-token
-    /// stop sequences are still matched by the decoding strategy.
+    /// Token ids that end a row in the scheduler: the tokenizer's EOS id and
+    /// `config.additionalEosTokenIds`. Stop sequences are not included.
     private var schedulerStopTokenIds: Set<Int32> {
         var ids = Set<Int32>()
         if let eos = tokenizer.eosTokenId { ids.insert(Int32(eos)) }
@@ -172,22 +169,20 @@ final class ServerState: @unchecked Sendable {
         return ids
     }
 
-    /// Returns the engine one request on `lane` should run on.
+    /// Returns the engine for one request on `lane`. Call once per request.
     ///
-    /// - `.batched`: a new `SchedulerSession` over `batchScheduler`, or the shared base engine when
-    ///   no scheduler is configured.
-    /// - `.fallbackBatchOne`: with a scheduler running, a new `IsolatedSessionEngine` with its own
-    ///   session, so the batched rows keep their KV state while the batch is paused for it (see
-    ///   `acquireAccess(lane:)`). Without a scheduler, the shared base engine,
-    ///   which keeps its prefix cache.
+    /// - `.batched`: a new `SchedulerSession` over the batch scheduler, or the shared engine when
+    ///   batched serving is off.
+    /// - `.fallbackBatchOne`: a new `IsolatedSessionEngine` with its own KV session when
+    ///   `batchScheduler` is set and the shared engine is a `CoreAISequentialEngine`. Otherwise the
+    ///   shared engine.
     func engineForRequest(lane: BatchServingLane) -> any InferenceEngine {
         switch lane {
         case .batched:
-            guard let scheduler = batchScheduler, let modelConfig = batchModelConfig else {
-                return engine
-            }
+            guard let batchServing else { return engine }
             return SchedulerSession(
-                sink: scheduler, config: modelConfig, stopTokenIds: schedulerStopTokenIds)
+                sink: batchServing.scheduler, config: batchServing.modelConfig,
+                stopTokenIds: schedulerStopTokenIds)
         case .fallbackBatchOne:
             if batchScheduler != nil, let seq = engine as? CoreAISequentialEngine {
                 return IsolatedSessionEngine(base: seq)
@@ -196,12 +191,15 @@ final class ServerState: @unchecked Sendable {
         }
     }
 
-    /// Waits for what a request on `lane` must hold while it uses the engine, and returns it.
+    /// Waits for and returns the access a request on `lane` holds while it uses the engine.
     ///
-    /// - The single-slot permit from `queue`, except on the batched lane when a continuous-batching
-    ///   scheduler admits the request. Throws `ServerError.queueFull` when the queue is full.
-    /// - On the fallback lane with a scheduler running, an `ExclusiveEngineLease` as well, so the
-    ///   batch pauses at a step boundary instead of sharing the engine.
+    /// - Single-slot permit from `queue`: on every lane except `.batched` with a scheduler that
+    ///   supports continuous batching.
+    /// - `ExclusiveEngineLease`: on `.fallbackBatchOne` when `batchScheduler` is set. The batch
+    ///   does not step while the lease is held.
+    ///
+    /// Throws `ServerError.queueFull` when the queue is full, and `CancellationError` when the task
+    /// is cancelled while waiting for the permit.
     ///
     /// Pass the same lane here and to `engineForRequest(lane:)`, and release the access when the
     /// request is done:
@@ -218,18 +216,18 @@ final class ServerState: @unchecked Sendable {
         return RequestAccess(permit: permit, lease: lease)
     }
 
-    /// The scheduler that scores completions prompts in batches, or nil when the server scores them
-    /// one at a time on the shared engine.
+    /// Scheduler that scores completion prompts in batches, or nil when batched serving is off.
     var scoringScheduler: BatchScheduler? { batchScheduler }
 
-    /// Waits for the single-slot permit a scoring request holds. Scoring takes no lease: with a
-    /// scheduler, its prompts run on the scheduler's own task between decode steps.
+    /// Waits for and returns the single-slot permit for a scoring request, with no engine lease.
+    /// Throws `ServerError.queueFull` when the queue is full, and `CancellationError` when the task
+    /// is cancelled while waiting.
     func acquireScoringAccess() async throws -> RequestAccess {
         RequestAccess(permit: try await queue.acquire(), lease: nil)
     }
 
-    /// Whether a request on `lane` needs the single-slot permit. The batched lane does not when a
-    /// continuous-batching scheduler admits it, because the scheduler enforces its own queue limit.
+    /// True when a request on `lane` needs the single-slot permit: every lane except `.batched`
+    /// with a scheduler that supports continuous batching.
     private func needsServerPermit(lane: BatchServingLane) -> Bool {
         switch lane {
         case .batched:
@@ -405,8 +403,8 @@ enum RequestID {
     }
 }
 
-/// What one request holds while it uses the engine. Releasing it more than once is harmless, and
-/// the permit and lease each release on deinit.
+/// Single-slot permit and engine lease a request holds while it uses the engine. Either can be nil.
+/// `release()` can be called more than once, and the permit and lease also release on deinit.
 final class RequestAccess: Sendable {
     private let permit: QueuePermit?
     private let lease: ExclusiveEngineLease?

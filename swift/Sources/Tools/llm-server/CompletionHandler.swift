@@ -30,8 +30,6 @@ func handleCompletionsFromBody(body: ByteBuffer, state: ServerState) async throw
             status: .notImplemented, headers: [.contentType: "application/json"],
             body: .init(byteBuffer: ByteBuffer(data: data)))
     }
-    // One scoring request runs at a time. With a batch scheduler its prompts score together
-    // between decode steps, so it holds the permit but no lease.
     let access: RequestAccess
     do {
         access = try await state.acquireScoringAccess()
@@ -131,15 +129,15 @@ private func handleLoglikelihood(req: CompletionRequest, state: ServerState) asy
     )
 }
 
-/// One prompt ready to score: its tokens and the target each position predicts.
+/// Tokenized prompt to score, with the target token each position predicts.
 private struct PreparedPrompt {
     let tokens: [Int32]
-    /// `tokens.dropFirst()` plus a padding token. lm-eval sends echo=true, max_tokens=1 and slices
-    /// logprobs[ctxlen:-1], so the extra last entry is the one it drops.
+    /// `tokens.dropFirst()` followed by `tokens[0]` as padding. Same count as `tokens`.
     let targets: [Int32]
 }
 
-/// Tokenizes `prompt`, or returns nil when it has fewer than two tokens and nothing to score.
+/// Tokenizes `prompt` into tokens and targets. Returns nil when it has fewer than two tokens.
+/// Throws `ServerError.badRequest` when it has more than `state.config.maxContextLength` tokens.
 private func preparePrompt(_ prompt: Prompt, state: ServerState) throws -> PreparedPrompt? {
     let allTokens: [Int32]
     switch prompt {
@@ -158,7 +156,8 @@ private func preparePrompt(_ prompt: Prompt, state: ServerState) throws -> Prepa
     return PreparedPrompt(tokens: allTokens, targets: Array(allTokens.dropFirst()) + [allTokens[0]])
 }
 
-/// Scores one prompt on the shared engine, which runs it in one prefill with every position's logits.
+/// Scores `prompt` on the `.fallbackBatchOne` engine after a reset, by feeding `tokens[0]` and
+/// forcing `targets`. Reports the top `topN` alternatives per position.
 private func scoreOnEngine(_ prompt: PreparedPrompt, topN: Int, state: ServerState) async throws
     -> LogProbabilities
 {

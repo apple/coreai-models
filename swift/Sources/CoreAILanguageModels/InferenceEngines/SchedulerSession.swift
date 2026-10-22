@@ -5,19 +5,10 @@
 
 import CoreAIShared
 
-/// An `InferenceEngine` that represents one request inside a `RequestSink` such as `BatchScheduler`.
+/// An `InferenceEngine` that runs one request on a `RequestSink`, such as `BatchScheduler`.
 ///
-/// Create one per request. Decoding strategies and the server see an ordinary engine while several
-/// requests share one batched forward. `generate` submits a `BatchRequest` and returns the sink's
-/// per-request event stream as a `GenerationSequence`.
-///
-/// Differences from a single-request engine:
-/// - `reset(to:)` does nothing. The sink owns the shared KV cache, so there is no per-request
-///   history to rewind.
-/// - `supportsLogits` is false. The sink samples internally, so guided generation must use the
-///   fallback lane (see `BatchServingRouter`). Scoring goes through `BatchScheduler.score(_:)`.
-/// - The sink stops a row only on `stopTokenIds` or `maxTokens`. Multi-token stop sequences and
-///   detokenization stay in the per-request `DecodingStrategy`.
+/// Create one per request. The sink ends the request only on `stopTokenIds` or `maxTokens`. Match
+/// multi-token stop sequences in the caller's `DecodingStrategy`.
 ///
 /// ```swift
 /// let engine = SchedulerSession(sink: scheduler, config: modelConfig, stopTokenIds: eosIds)
@@ -30,7 +21,7 @@ package final class SchedulerSession: InferenceEngine, @unchecked Sendable {
 
     package let config: ModelConfig
     private let sink: any RequestSink
-    /// Token ids that end the row inside the sink, usually EOS plus any additional EOS ids.
+    /// Token ids that end the request inside the sink.
     private let stopTokenIds: Set<Int32>
 
     package init(sink: any RequestSink, config: ModelConfig, stopTokenIds: Set<Int32>) {
@@ -39,14 +30,16 @@ package final class SchedulerSession: InferenceEngine, @unchecked Sendable {
         self.stopTokenIds = stopTokenIds
     }
 
+    /// Submits `input` to the sink and returns the request's output sequence.
+    ///
+    /// The request's token limit is `inferenceOptions.maxTokens` capped at the context room left after
+    /// the prompt, and defaults to that room. At least 1. Throws when the sink rejects the request,
+    /// for example with `InferenceRuntimeError.queueFull`.
     package func generate(
         with input: [TokenId],
         samplingConfiguration: SamplingConfiguration,
         inferenceOptions: InferenceOptions
     ) async throws -> GenerationSequence {
-        // Cap `maxTokens` at the room left in the context window after the prompt. Decoding past
-        // the window would make the shared batched forward throw, and a failed forward fails every
-        // resident row, so each row must retire with `.maxTokens` before that point.
         let contextRoom = Swift.max(1, config.maxContextLength - input.count)
         let requested = inferenceOptions.maxTokens ?? contextRoom
         let stream = try sink.submit(
@@ -58,14 +51,13 @@ package final class SchedulerSession: InferenceEngine, @unchecked Sendable {
         return GenerationSequence(events: stream)
     }
 
-    /// Does nothing. The sink reclaims this request's state, and resetting the shared engine would
-    /// destroy the other rows.
+    /// Does nothing.
     package func reset(to tokenIndex: Int) async throws {}
 
-    /// Always false because the sink samples internally and returns no per-step logits.
+    /// Always false.
     package var supportsLogits: Bool { false }
 
-    /// Always false. Each session is one request, and the sink runs several at once.
+    /// Always false.
     package var isBusy: Bool { false }
 
     package var maxContextLength: Int { config.maxContextLength }
@@ -74,7 +66,10 @@ package final class SchedulerSession: InferenceEngine, @unchecked Sendable {
 // MARK: - Output sequence
 
 extension SchedulerSession {
-    /// The sink's per-request event stream, presented as an engine output sequence.
+    /// The sink's event stream for one request, as an `InferenceOutputSequence`.
+    ///
+    /// `stopReason` is the sink's `.finished` reason, or `.maxTokens` when the stream ends without
+    /// one. A reason set with `setStopReason(_:)` takes precedence.
     package struct GenerationSequence: InferenceOutputSequence {
         package typealias Element = InferenceOutput
         package typealias Failure = Error
@@ -114,8 +109,6 @@ extension SchedulerSession.GenerationSequence {
                 case .token(let id, let logits):
                     return InferenceOutput(tokenId: id, logits: logits)
                 case .finished(let reason):
-                    // Record the sink's reason unless the consumer already set one. The
-                    // `.maxTokens` default below only covers a stream that ends without `.finished`.
                     stopReasonStore.setIfUnset(reason)
                 }
             }

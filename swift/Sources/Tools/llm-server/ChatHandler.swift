@@ -114,8 +114,6 @@ private func handleChatCompletionsFromBody(body: ByteBuffer, state: ServerState,
             body: .init(byteBuffer: ByteBuffer(data: data)))
     }
 
-    // Requests with a JSON schema take the fallback lane. The streaming path hands the access to its
-    // body closure, and the non-streaming path releases it at each return.
     let lane = BatchServingRouter.lane(
         hasResponseSchema: chatRequest.responseFormat?.extractedSchema != nil)
     let access: RequestAccess
@@ -144,9 +142,7 @@ private func handleChatCompletionsFromBody(body: ByteBuffer, state: ServerState,
             return response
         }
     } catch let error as InferenceRuntimeError where error.isQueueFull {
-        // The batch scheduler rejects a submit once it holds maxConcurrent + maxQueued requests, so
-        // free rows absorb a burst before the queue limit applies. Streaming requests submit before
-        // their SSE response starts, so they get the same 429.
+        // Thrown by a full batch scheduler on submit, on both the streaming and non-streaming paths.
         access.release()
         let err = ErrorResponse(
             error: .init(message: error.localizedDescription, type: "server_error", code: "queue_full"))
@@ -245,7 +241,6 @@ func runChatCompletion(chatRequest: ChatCompletionRequest, state: ServerState, s
         strategy = VanillaDecodingStrategy()
     }
 
-    // Guided generation needs per-step logits, which only the fallback lane provides.
     let lane = BatchServingRouter.lane(hasResponseSchema: schema != nil)
     let stream = try await strategy.decode(
         from: input,
@@ -459,17 +454,16 @@ func prepareStreaming(chatRequest: ChatCompletionRequest, state: ServerState, se
         requestMaxTokens: requestMaxTokens, prefixReuseTokens: prefixReused)
 }
 
-/// A streaming decode that has started. On the batched lane, starting it submits the request to
-/// the batch scheduler, so a full scheduler throws before the handler sends any SSE headers.
-///
-/// `@unchecked Sendable` because it is created once and then handed to a single consumer, the
-/// response body or the replay runner, which iterates it on one task.
+/// Token stream and start time of a streaming decode. On the batched lane the request is already in
+/// the batch scheduler. Iterate `tokens` from one task only.
 struct StartedDecode: @unchecked Sendable {
     let tokens: any AsyncSequence<GenerationResult, Error>
     let start: SuspendingClock.Instant
 }
 
-/// Picks the decoding strategy for `chatRequest` and starts it on the engine for its lane.
+/// Starts decoding `prepared` on the engine for the request's lane, with constrained decoding when
+/// `chatRequest` has a JSON schema. Throws `InferenceRuntimeError.queueFull` when the batch
+/// scheduler is full.
 func startStreamingDecode(
     prepared: PreparedStream, chatRequest: ChatCompletionRequest, state: ServerState
 ) async throws -> StartedDecode {
@@ -494,10 +488,9 @@ func startStreamingDecode(
     return StartedDecode(tokens: tokens, start: start)
 }
 
-/// The streaming generation core, shared by the HTTP SSE handler and `--replay`. Drives the
-/// incremental token loop with per-chunk think/tool parsing, delivering each `Delta` to `emit`,
-/// and returns per-request instrumentation. The caller owns SSE framing: the leading role chunk
-/// and the trailing done/`[DONE]` frames are added by the HTTP handler.
+/// Iterates `started.tokens`, splits reasoning and tool calls out of the text unless the request is
+/// raw, and passes each `Delta` to `emit`. Records the request in `state.stats` and returns its
+/// timing, token counts and finish reason. Emits no role chunk, finish chunk or `[DONE]` frame.
 func runStreamingLoop(
     started: StartedDecode, prepared: PreparedStream, chatRequest: ChatCompletionRequest,
     state: ServerState, emit: (ChatCompletionChunk.Delta) async throws -> Void
@@ -620,20 +613,20 @@ func runStreamingLoop(
     )
 }
 
+/// Starts a streaming chat completion and returns its SSE response, which releases `access` when
+/// the stream ends. On a throw the caller still owns `access`. Throws `ServerError.badRequest` for
+/// a bad request and `InferenceRuntimeError.queueFull` when the batch scheduler is full.
 private func handleStreamingRequest(
     chatRequest: ChatCompletionRequest, state: ServerState, sessionID: String? = nil, access: RequestAccess
 )
     async throws -> Response
 {
-    // Preflight throws for bad requests before any SSE framing (mapped to HTTP 400 upstream), and
-    // starting the decode throws queueFull (mapped to HTTP 429) when the batch scheduler is full.
     let prepared = try await prepareStreaming(chatRequest: chatRequest, state: state, sessionID: sessionID)
     let started = try await startStreamingDecode(prepared: prepared, chatRequest: chatRequest, state: state)
     let created = Int(Date().timeIntervalSince1970)
 
     let responseBody = ResponseBody { writer in
-        // The closure owns the access for the stream's lifetime. Its deinit releases it if the
-        // framework drops the response before running this closure.
+        // If this closure never runs, the permit and lease release on deinit.
         defer { access.release() }
         do {
             let encoder = JSONEncoder()

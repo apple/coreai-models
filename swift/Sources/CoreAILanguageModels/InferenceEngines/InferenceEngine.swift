@@ -272,11 +272,11 @@ public enum InferenceRuntimeError: Error, LocalizedError {
     case unsupportedEngine(String)
     case unsupportedEngineVariant(String)
     case bufferAllocationFailed(String)
-    /// The scheduler rejected the request because its wait queue is at its limit of `depth`.
+    /// The scheduler's wait queue is full. `depth` is the queue limit.
     case queueFull(depth: Int)
     case genericError(String)
 
-    /// Whether this is `.queueFull`, which the server reports as HTTP 429.
+    /// True for `.queueFull`.
     package var isQueueFull: Bool {
         if case .queueFull = self { return true }
         return false

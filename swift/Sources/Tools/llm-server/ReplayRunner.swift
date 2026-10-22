@@ -11,10 +11,10 @@ import Foundation
 ///
 /// Requests run in arrival-timestamp order through the same cores the HTTP handler uses:
 /// `runChatCompletion` for `stream:false`, `runStreamingLoop` for `stream:true` (deltas folded
-/// back into the result). By default requests run one at a time, matching the single-request server.
-/// With `concurrent`, they all start at once so the batch scheduler can fill several rows.
-/// Interleaving sessions in the input reproduces the same per-session cache behavior. Each
-/// result is one JSONL line with per-request instrumentation.
+/// back into the result). By default requests run one at a time. With `concurrent`, all requests
+/// start at once, and requests over the queue limits produce queue-full error lines. Output lines
+/// keep arrival-timestamp order in both modes. Interleaving sessions in the input reproduces the
+/// same per-session cache behavior. Each result is one JSONL line with per-request instrumentation.
 enum ReplayRunner {
     static func run(
         inputPath: String, outputPath: String?, state: ServerState, concurrent: Bool = false
@@ -24,7 +24,6 @@ enum ReplayRunner {
 
         var lines = [String](repeating: "", count: requests.count)
         if concurrent {
-            // Lines keep input order. Requests past the queue limits come back as queue-full error lines.
             try await withThrowingTaskGroup(of: (Int, String).self) { group in
                 for (i, req) in requests.enumerated() {
                     group.addTask { (i, await oneLine(req, state: state)) }
@@ -45,14 +44,12 @@ enum ReplayRunner {
         }
     }
 
-    /// Runs one replay request and encodes its result line. Errors become an error result line.
+    /// Runs `req` while holding the access for its lane and returns its encoded result line. An
+    /// error, including queue-full, produces an error result line.
     private static func oneLine(_ req: ReplayRequest, state: ServerState) async -> String {
         let sessionID = req.session ?? "default"
         let result: ReplayResult
         do {
-            // runChatCompletion and runStreamingLoop do not take the request access, so take it here
-            // as the HTTP handler does. Without it, concurrent replay would drive the shared engine
-            // from several tasks at once.
             let lane = BatchServingRouter.lane(
                 hasResponseSchema: req.request.responseFormat?.extractedSchema != nil)
             let access = try await state.acquireAccess(lane: lane)

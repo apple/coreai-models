@@ -8,14 +8,14 @@ import Testing
 
 @testable import CoreAILanguageModels
 
-/// Logits over a 64-token vocabulary that greedy sampling resolves to `token`.
+/// Makes logits over a 64-token vocabulary with the maximum at `token`.
 private func oneHot(_ token: Int32) -> [LogitsScalarType] {
     var row = [LogitsScalarType](repeating: 0, count: 64)
     row[Int(token)] = 1
     return row
 }
 
-/// A session with no real KV cache, for mock decode steps.
+/// Makes a session state backed by a one-element mock KV cache.
 private func dummySession() -> GenerationSessionState {
     GenerationSessionState(
         kvCache: MockStateHandler(names: ["k"], shape: [1, 1, 1, 1, 1]),
@@ -23,7 +23,8 @@ private func dummySession() -> GenerationSessionState {
         hasNonTruncatableStates: false)
 }
 
-/// Count-up logits at every position: position `p` of a row predicts that row's token at `p` plus one.
+/// Makes flattened count-up logits, `row.count * 64` values per row, where position `p` peaks at
+/// that row's token at `p` plus one, mod 64.
 private func countUpAllPositions(_ tokensPerRow: [[Int32]]) -> [[LogitsScalarType]] {
     tokensPerRow.map { row in row.flatMap { oneHot(($0 + 1) % 64) } }
 }
@@ -43,18 +44,18 @@ private func drain(
     return (tokens, reason)
 }
 
-/// A `BatchedDecodeStep` that predicts the input token plus one, so a request with prompt `[..., k]`
-/// and `maxTokens: m` generates `k+1` through `k+m` whatever its slot or admission time.
+/// Mock `BatchedDecodeStep` that predicts the last input token plus one. A request with prompt
+/// `[..., k]` and `maxTokens: m` generates `k+1` through `k+m`.
 ///
-/// It records each decode's `startPositions` and the peak number of overlapping forward calls.
-/// `forwardDelay` keeps each call in flight longer so that an overlap is reliably observed.
+/// Records the forward count, each decode's `startPositions`, each scoring forward's row count, and
+/// the peak number of overlapping forward calls. `forwardDelay` is a sleep added to every forward call.
 private final class CountUpDecodeStep: BatchedDecodeStep, @unchecked Sendable {
     struct Boom: Error {}
 
     let maxBatchCapacity: Int
-    /// `prefillRow` throws for prompts that start with this token.
+    /// `prefillRow` throws `Boom` for a prompt that starts with this token.
     private let failPrefillFor: Int32?
-    /// Every `decodeBatch` throws.
+    /// When true, every `decodeBatch` throws `Boom`.
     private let failDecode: Bool
     private let forwardDelay: Duration?
 
@@ -69,9 +70,9 @@ private final class CountUpDecodeStep: BatchedDecodeStep, @unchecked Sendable {
 
     var observedStartPositions: [[Int]] { record.withLock { $0.startPositions } }
     var maxInFlight: Int { record.withLock { $0.maxInFlight } }
-    /// Row count of each scoring forward so far.
+    /// Row count of each scoring forward, in call order.
     var scoringRows: [Int] { record.withLock { $0.scoringRows } }
-    /// Prefill and decode calls so far.
+    /// Number of prefill, decode and scoring forward calls so far.
     var forwards: Int { record.withLock { $0.forwards } }
 
     init(
@@ -126,8 +127,7 @@ private final class CountUpDecodeStep: BatchedDecodeStep, @unchecked Sendable {
     func makeSessionState(batchSize: Int) throws -> GenerationSessionState { dummySession() }
 }
 
-/// A count-up `BatchedDecodeStep` whose `prefillRow` blocks until `release()`, so a test can keep a
-/// row occupying its slot while it fills the queue.
+/// Mock count-up `BatchedDecodeStep` whose `prefillRow` blocks until `release()`.
 private final class GatedPrefillStep: BatchedDecodeStep, @unchecked Sendable {
     let maxBatchCapacity: Int
 
@@ -141,7 +141,7 @@ private final class GatedPrefillStep: BatchedDecodeStep, @unchecked Sendable {
 
     init(capacity: Int) { maxBatchCapacity = capacity }
 
-    /// Returns once a `prefillRow` call has started, which means its row holds a slot.
+    /// Waits until the first `prefillRow` call has started.
     func waitEntered() async {
         await withCheckedContinuation { cont in
             gate.withLock { g in
@@ -150,7 +150,7 @@ private final class GatedPrefillStep: BatchedDecodeStep, @unchecked Sendable {
         }
     }
 
-    /// Unblocks the waiting `prefillRow`. Later calls no longer block.
+    /// Unblocks the waiting `prefillRow` call. Later calls return without blocking.
     func release() {
         let waiter: CheckedContinuation<Void, Never>? = gate.withLock { g in
             g.released = true
@@ -260,11 +260,11 @@ struct BatchSchedulerTests {
             req(prompt: [1, 2, 3], maxTokens: 3),
         ])
         #expect(results.map(\.tokens) == [[2, 3, 4], [4, 5, 6]])
-        // Each cursor starts at the row's prompt length.
+        // Each row's first decode starts at its prompt length.
         #expect(mock.observedStartPositions == [[1, 3], [2, 4]])
     }
 
-    @Test("Run and submit share one pump, so forwards never overlap")
+    @Test("Forwards from run and submit never overlap")
     func singlePump() async throws {
         let mock = CountUpDecodeStep(capacity: 4, forwardDelay: .milliseconds(5))
         let scheduler = makeScheduler(mock, maxConcurrent: 4)
@@ -277,8 +277,7 @@ struct BatchSchedulerTests {
 
     @Test("Submit throws queueFull past free rows plus maxQueued", arguments: [false, true])
     func backpressure(waitForAdmission: Bool) async throws {
-        // Queued plus admitted requests may total maxConcurrent + maxQueued, here 3. The limit is
-        // the same whether the first request is still queued (a burst) or already holds a row.
+        // Accepts 3 requests, maxConcurrent plus maxQueued, whether or not the first holds a row yet.
         let mock = GatedPrefillStep(capacity: 2)
         let scheduler = makeScheduler(mock, maxConcurrent: 2, maxQueued: 1)
         var streams = [try scheduler.submit(req(prompt: [0], maxTokens: 1))]
@@ -333,7 +332,7 @@ struct BatchSchedulerTests {
                     order.withLock { $0.append(i) }
                     lock.unlock()
                 }
-                // Let each waiter enqueue before starting the next one.
+                // Waiter i enqueues on the lock before waiter i + 1 starts.
                 try? await Task.sleep(for: .milliseconds(20))
             }
             lock.unlock()
@@ -341,8 +340,8 @@ struct BatchSchedulerTests {
         #expect(order.withLock { $0 } == [0, 1, 2])
     }
 
-    /// Count-up targets for `tokens`: each position's argmax, except the last, which has no real
-    /// next token.
+    /// Makes a top-2 score request for `tokens` whose target at each position is the next token,
+    /// and 63 at the last position.
     private func scoreRequest(_ tokens: [Int32]) -> ScoreRequest {
         ScoreRequest(tokens: tokens, targets: tokens.dropFirst() + [63], topK: 2)
     }
@@ -366,7 +365,7 @@ struct BatchSchedulerTests {
     func scoringBatchInvariance(capacity: Int, expectedRows: [Int]) async throws {
         let step = CountUpDecodeStep(capacity: capacity)
         let scheduler = makeScheduler(step, maxConcurrent: 2)
-        // Three requests over two rows. The third is longer than a 128-position chunk.
+        // Three requests, at most two per batch. The 200-token one spans two 128-position chunks.
         let prompts: [[Int32]] = [[1, 2, 3], [7, 8, 9, 10, 11], (0..<200).map { Int32($0 % 60) }]
         let together = try await scheduler.score(prompts.map(scoreRequest))
         #expect(step.scoringRows == expectedRows)
@@ -440,8 +439,7 @@ struct BatchSchedulerTests {
         let streams = try [Int32(1), 2, 3].map {
             try scheduler.submit(req(prompt: [$0], maxTokens: 4))
         }
-        // With one slot, requests 2 and 3 wait in the queue while request 1's decode throws. If
-        // the queue were not drained, iterating their streams would hang.
+        // With one slot, requests 2 and 3 are still queued when request 1's decode throws.
         for stream in streams {
             await #expect(throws: CountUpDecodeStep.Boom.self) { _ = try await drain(stream) }
         }

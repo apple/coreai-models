@@ -3,21 +3,17 @@
 // Use of this source code is governed by a BSD-3-clause license that can
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
-/// An `InferenceEngine` that runs one fallback-lane request, such as guided generation, on a
-/// `CoreAISequentialEngine` through its own `GenerationSessionState`.
+/// An `InferenceEngine` that runs one request on a `CoreAISequentialEngine` with its own
+/// `GenerationSessionState`. Used for `.fallbackBatchOne` lane requests, such as guided generation.
 ///
-/// Create one per request. The KV cache, token history and prefix-hit count belong to this session
-/// rather than the engine's default session, so other sessions keep their state. It does not make
-/// concurrent use of the engine safe: next to a `BatchScheduler`, hold an `ExclusiveEngineLease`
-/// while the request runs.
-///
-/// The class is `@unchecked Sendable` because a single request owns it, so no two tasks drive it at
-/// once.
+/// Create one per request and drive it from one task at a time. The KV cache, token history and
+/// `lastPrefixHitCount` belong to this engine's session, separate from `base`'s. When `base` also
+/// backs a `BatchScheduler`, hold the scheduler's `ExclusiveEngineLease` while the request runs.
 package final class IsolatedSessionEngine: InferenceEngine, @unchecked Sendable {
     package typealias ConfigType = ModelConfig
 
     private let base: CoreAISequentialEngine
-    /// Created on first use so `init` cannot throw. `reset(to:)` replaces it with a fresh one.
+    /// Session for the request, created on first use. `reset(to:)` replaces it.
     private var sessionState: GenerationSessionState?
 
     package init(base: CoreAISequentialEngine) {
@@ -45,15 +41,14 @@ package final class IsolatedSessionEngine: InferenceEngine, @unchecked Sendable 
             inferenceOptions: inferenceOptions)
     }
 
-    /// Replaces this request's session with a fresh one, whatever `tokenIndex` is. Guided generation
-    /// resets to 0 before generating, so this lane never needs a partial rewind.
+    /// Replaces this request's session with a fresh one. Ignores `tokenIndex`.
     package func reset(to tokenIndex: Int) async throws {
         sessionState = try base.makeSessionState()
     }
 
     package var supportsLogits: Bool { base.supportsLogits }
 
-    /// This session's busy state. The base engine's flag would reflect other sessions too.
+    /// True while a generation on this request's session is in flight.
     package var isBusy: Bool { sessionState?.tokenBox.isBusy ?? false }
 
     package var lastPrefixHitCount: Int { sessionState?.lastPrefixHitCount ?? 0 }

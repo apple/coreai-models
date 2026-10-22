@@ -98,8 +98,8 @@ public final class CoreAISequentialEngine: InferenceEngine, IdempotentEngine, Ba
         return 1  // Single-batch graph.
     }
 
-    /// Whether this graph can run several requests in one forward. It needs an attention-mask input
-    /// and a batch dimension above 1, static or dynamic.
+    /// True when the graph has an attention-mask input and a batch dimension above 1, static or
+    /// dynamic.
     package var supportsBatching: Bool {
         functionDescriptor.inputNames.contains(where: InputLayout.knownAttnMaskNames.contains)
             && maxBatchCapacity > 1
@@ -442,7 +442,7 @@ public final class CoreAISequentialEngine: InferenceEngine, IdempotentEngine, Ba
     }
 
     /// Runs one batched forward step and returns the logits for every row and position, flat
-    /// `[N, q, vocab]`. `decodeBatch` and `allPositionLogits` slice this buffer.
+    /// `[N, q, vocab]`.
     private func runBatchedForward(
         tokensPerRow: [[Int32]],
         startPositions: [Int],

@@ -55,8 +55,7 @@ struct LLMServer: AsyncParsableCommand {
     @Flag(
         name: .customLong("replay-concurrent"),
         help: ArgumentHelp(
-            "Run all --replay requests concurrently instead of one at a time, so the batch scheduler can "
-                + "fill several rows. Use with --concurrency N.")
+            "Run all --replay requests concurrently instead of one at a time. Use with --concurrency N.")
     )
     var replayConcurrent: Bool = false
 
@@ -237,9 +236,7 @@ struct LLMServer: AsyncParsableCommand {
             maxQueueDepth: maxQueueDepth
         )
 
-        // Batched serving needs --concurrency above 1 and a CoreAISequentialEngine whose graph has an
-        // attention mask input and a batch dimension above 1. The scheduler holds up to
-        // concurrency + --max-queue-depth requests, decoding or waiting, and rejects the next one.
+        // The scheduler holds up to --concurrency plus --max-queue-depth requests, then rejects.
         var batchScheduler: BatchScheduler? = nil
         if concurrency > 1 {
             if let seq = engine as? CoreAISequentialEngine, seq.supportsBatching {
@@ -264,8 +261,7 @@ struct LLMServer: AsyncParsableCommand {
             engine: engine,
             tokenizer: tokenizer,
             config: config,
-            batchScheduler: batchScheduler,
-            batchModelConfig: batchScheduler != nil ? engineConfig : nil
+            batchServing: batchScheduler.map { (scheduler: $0, modelConfig: engineConfig) }
         )
 
         if let replayPath {
