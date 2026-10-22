@@ -250,7 +250,20 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     @Option(name: .customLong("verbose-level"), help: "Verbosity level (default: 1, implies --verbose)")
     var verboseLevel: Int?
 
+    @Option(
+        name: .customLong("batch-prototype"),
+        help:
+            "Diagnostic: run the prompt as a batch of N identical rows through lockstep batched decode. Row 0 is greedy and the other rows sample with temperature. Needs a model exported with --attention-mask batched --dynamic-batch-size N or more."
+    )
+    var batchPrototypeRows: Int?
+
     func validate() throws {
+        if let rows = batchPrototypeRows {
+            if rows < 1 { throw ValidationError("--batch-prototype must be >= 1") }
+            if !["default", "auto", "coreai-sequential"].contains(inferenceEngineVariant) {
+                throw ValidationError("--batch-prototype runs on the coreai-sequential engine")
+            }
+        }
         if warmup == .exact && warmupLength == nil {
             throw ValidationError("--warmup exact requires --warmup-length N")
         }
@@ -565,6 +578,17 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         CLILogger.log("   Max generation tokens: \(maxTokens)", component: "Main")
         CLILogger.log("   Required context length: \(requiredContextLength)", component: "Main")
         // Engines will validate context length during inference
+
+        if let rows = batchPrototypeRows {
+            try await runBatchPrototype(
+                rows: rows,
+                inferenceEngine: inferenceEngine,
+                bundle: bundle,
+                tokenizer: tokenizer,
+                promptTokens: promptTokens,
+                additionalEosTokenIds: additionalEosTokenIds)
+            return
+        }
 
         // VLM path: if --image is provided and engine supports multimodal
         if let imagePath = imagePath {
@@ -955,6 +979,47 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     }
 
     // MARK: - VLM Inference
+
+    /// Runs `rows` copies of the prompt through `lockstepBatchedGenerate` and prints each row.
+    ///
+    /// Row 0 is greedy, so it should match a normal greedy run of the same prompt. The other rows
+    /// sample at `--temperature` (0.8 if that is 0) with a fixed seed per row, so reruns repeat.
+    private func runBatchPrototype(
+        rows: Int,
+        inferenceEngine: any InferenceEngine,
+        bundle: LanguageModelBundle,
+        tokenizer: any Tokenizer,
+        promptTokens: [Int],
+        additionalEosTokenIds: Set<Int32>
+    ) async throws {
+        guard let engine = inferenceEngine as? CoreAISequentialEngine else {
+            throw ValidationError(
+                "--batch-prototype needs a model with an attn_mask input, or --inference-engine-variant coreai-sequential"
+            )
+        }
+        guard rows <= bundle.maxBatchSize else {
+            throw ValidationError(
+                "--batch-prototype \(rows) exceeds the model's max batch size \(bundle.maxBatchSize). "
+                    + "Re-export with --dynamic-batch-size \(rows) or more.")
+        }
+        var eosTokenIds = additionalEosTokenIds
+        if let eos = tokenizer.eosTokenId { eosTokenIds.insert(Int32(eos)) }
+        let rowTemperature = temperature > 0 ? temperature : 0.8
+        let configs: [SamplingConfiguration] =
+            [.greedy]
+            + (1..<rows).map { SamplingConfiguration(temperature: rowTemperature, seed: UInt64(1234 + $0)) }
+
+        print("Batched prototype: \(rows) rows, prompt \(promptTokens.count) tokens")
+        let result = try await engine.lockstepBatchedGenerate(
+            promptRows: Array(repeating: promptTokens.map { Int32($0) }, count: rows),
+            configs: configs,
+            maxNewTokens: maxTokens,
+            eosTokenIds: eosTokenIds)
+        for (i, row) in result.tokens.enumerated() {
+            let label = i == 0 ? "greedy" : "temperature \(rowTemperature)"
+            print("\n=== row \(i) (\(label)) ===\n" + tokenizer.decode(tokens: row.map { Int($0) }))
+        }
+    }
 
     private func runVLMInference(
         imagePath: String,
