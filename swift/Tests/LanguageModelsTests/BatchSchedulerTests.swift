@@ -357,7 +357,7 @@ struct BatchSchedulerTests {
             ([], 0),
         ] as [([Int], Int)])
     func scoringBatchCount(lengths: [Int], expected: Int) {
-        #expect(BatchScheduler.scoringBatchCount(lengths, limit: 4) == expected)
+        #expect(BatchScheduler.Scorer.batchCount(lengths, limit: 4) == expected)
     }
 }
 
