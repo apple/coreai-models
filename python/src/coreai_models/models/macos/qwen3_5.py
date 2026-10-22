@@ -30,7 +30,7 @@ from coreai_models._constants import (
     RECURRENT_STATES_NAME,
 )
 from coreai_models._hf import resolve_rope_theta
-from coreai_models.models.base import BaseForCausalLM, TraceSpec
+from coreai_models.models.base import BaseForCausalLM, EagerState, TraceSpec
 from coreai_models.primitives.macos.cache import DeltaNetCache, KVCache
 from coreai_models.primitives.macos.mlp import MLP
 from coreai_models.primitives.macos.rms_norm import RMSNormGated
@@ -202,6 +202,9 @@ class GatedDeltaNet(nn.Module):
             # below. Only the older conv_kernel_size - 1 rows are history for this step.
             conv_state = cache.conv_states[self.cache_layer_idx].narrow(1, 1, conv_kernel_size - 1)
             recurrent_state = cache.recurrent_states[self.cache_layer_idx]
+            if conv_state.device != mixed_qkv.device:
+                conv_state = conv_state.to(mixed_qkv.device)
+                recurrent_state = recurrent_state.to(mixed_qkv.device)
         else:
             conv_state = torch.zeros(B, conv_kernel_size - 1, self.conv_dim, dtype=x.dtype)
             recurrent_state = torch.zeros(
@@ -455,6 +458,16 @@ class Qwen3_5ForCausalLM(BaseForCausalLM):
         return KVCache.create_cache_tensors(
             cls._kv_sized_config(config), dtype=dtype, seq_len=seq_len
         )
+
+    @override
+    def new_eager_state(
+        self, *, dtype: torch.dtype, device: torch.device | str, max_seq_len: int | None = None
+    ) -> EagerState:
+        """The KV pair, then the conv and recurrent states: the order ``forward`` takes them."""
+        with torch.device(device):
+            kv = self.create_kv_cache_tensors(self.config, dtype=dtype, seq_len=max_seq_len)
+            delta = self.create_delta_cache_tensors(self.config, dtype=dtype)
+        return EagerState((*kv, *delta))
 
     @classmethod
     def create_delta_cache_tensors(
