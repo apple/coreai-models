@@ -58,16 +58,11 @@ from coreai_models.models.base import (
     _load_tensors_for_keys,
     _resolve_safetensors_files,
 )
+from coreai_models.primitives.macos.rope import rotate_half
 
 # ---------------------------------------------------------------------------
 # RoPE helpers
 # ---------------------------------------------------------------------------
-
-
-def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-    """Rotate second half of the last dimension: ``cat(-x2, x1)``."""
-    mid = x.shape[-1] // 2
-    return torch.cat((-x[..., mid:], x[..., :mid]), dim=-1)
 
 
 def _apply_rotary_pos_emb_vision(
@@ -86,8 +81,8 @@ def _apply_rotary_pos_emb_vision(
     q, k = q.float(), k.float()
     cos = cos.unsqueeze(-2).float()  # [1, seq_len, 1, head_dim]
     sin = sin.unsqueeze(-2).float()
-    q_embed = (q * cos) + (_rotate_half(q) * sin)
-    k_embed = (k * cos) + (_rotate_half(k) * sin)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed.to(orig_q_dtype), k_embed.to(orig_k_dtype)
 
 
