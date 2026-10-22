@@ -11,6 +11,9 @@ public struct InputLayout: Sendable {
     public let positionIdsName: String
     public let logitsName: String
 
+    /// Name of the additive attention-mask input, or `nil` when the graph applies its own causal mask.
+    public let attnMaskName: String?
+
     public let queryPolicy: QueryPolicy
     public let logitsPolicy: LogitsPolicy
     public let positionPolicy: PositionPolicy
@@ -111,6 +114,8 @@ extension InputLayout {
             from: inputNames, candidates: knownPositionIdNames, label: "position_ids")
         let logitsName = outputNames[0]
 
+        let attnMaskName = knownAttnMaskNames.first(where: inputNames.contains)
+
         let queryPolicy: QueryPolicy =
             if let s = inputIdsSeqLen, s > 0 { .fixed(s) } else { .dynamic }
 
@@ -132,6 +137,7 @@ extension InputLayout {
             inputIdsName: inputIdsName,
             positionIdsName: positionIdsName,
             logitsName: logitsName,
+            attnMaskName: attnMaskName,
             queryPolicy: queryPolicy,
             logitsPolicy: logitsPolicy,
             positionPolicy: positionPolicy,
@@ -140,6 +146,7 @@ extension InputLayout {
 
     static let knownInputIdNames = ["input_ids", "in_new_token_ids"]
     static let knownPositionIdNames = ["position_ids", "pos_ids"]
+    static let knownAttnMaskNames = ["attn_mask"]
 
     static func resolveRequired(
         from names: [String], candidates: [String], label: String

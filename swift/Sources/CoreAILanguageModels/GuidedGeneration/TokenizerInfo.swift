@@ -102,10 +102,22 @@ public actor TokenizerInfoCache {
     }
 }
 
-public enum VocabularyType: Sendable {
+public enum VocabularyType: Sendable, Equatable {
     case raw
     case byteFallback
     case byteLevel
+
+    /// Infers the encoding from the token strings. SentencePiece byte-fallback vocabularies
+    /// (Gemma, Llama) carry all 256 `<0xHH>` byte tokens; anything else is treated as
+    /// byte-level BPE. A mismatched type makes xgrammar map token ids to the wrong strings.
+    public static func detect(vocabulary: [String]) -> VocabularyType {
+        var byteTokens = Set<String>()
+        for token in vocabulary where token.utf8.count == 6 && token.hasPrefix("<0x") && token.hasSuffix(">") {
+            byteTokens.insert(token.uppercased())
+            if byteTokens.count == 256 { return .byteFallback }
+        }
+        return .byteLevel
+    }
 
     var cValue: XGrammarVocabType {
         switch self {

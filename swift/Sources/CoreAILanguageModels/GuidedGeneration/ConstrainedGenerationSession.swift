@@ -120,7 +120,8 @@ public struct ConstrainedGenerationSession: ~Copyable {
     ///   - jsonSchema: A valid JSON schema string
     ///   - tokenizer: A swift-transformers Tokenizer for vocabulary extraction
     ///   - vocabSize: Size of the tokenizer vocabulary
-    ///   - vocabType: The vocabulary encoding type (default: `.byteLevel`)
+    ///   - vocabType: The vocabulary encoding type (default: inferred from the vocabulary with
+    ///     `VocabularyType.detect(vocabulary:)`)
     ///   - stopTokenIds: Token IDs to treat as stop tokens (e.g., EOS).
     ///     xgrammar allows these tokens only at grammar-terminal states (valid JSON complete),
     ///     blocking them mid-generation. Pass `nil` to rely on xgrammar defaults (not recommended).
@@ -129,7 +130,7 @@ public struct ConstrainedGenerationSession: ~Copyable {
         jsonSchema: String,
         tokenizer: any Tokenizer,
         vocabSize: Int,
-        vocabType: VocabularyType = .byteLevel,
+        vocabType: VocabularyType? = nil,
         stopTokenIds: [Int32]? = nil
     ) throws {
         // Extract vocabulary from tokenizer
@@ -140,7 +141,10 @@ public struct ConstrainedGenerationSession: ~Copyable {
             // have gaps in their ID space, so nil here is expected, not an error.
             vocabulary.append(tokenizer.convertIdToToken(i) ?? "")
         }
-        try self.init(jsonSchema: jsonSchema, vocabulary: vocabulary, vocabType: vocabType, stopTokenIds: stopTokenIds)
+        try self.init(
+            jsonSchema: jsonSchema, vocabulary: vocabulary,
+            vocabType: vocabType ?? VocabularyType.detect(vocabulary: vocabulary),
+            stopTokenIds: stopTokenIds)
     }
 
     // MARK: - Raw Bitmask Access (for MaskProviding integration)

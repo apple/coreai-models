@@ -60,6 +60,8 @@ public struct LanguageModelBundle: Sendable {
     public var tokenizer: String { language.tokenizer }
     public var vocabSize: Int { language.vocabSize }
     public var maxContextLength: Int { language.maxContextLength }
+    /// Largest batch the graph accepts. 1 for single-sequence graphs.
+    package var maxBatchSize: Int { language.maxBatchSize }
 
     /// Model-specific runtime settings (`language.overrides`); nil for most models.
     public var overrides: LanguageOverrides? { language.overrides }
