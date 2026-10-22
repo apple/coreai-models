@@ -673,6 +673,36 @@ class TestmacOSQwen3_5ForCausalLM:
         torch.testing.assert_close(our_prefill, hf_logits[:, :6], atol=1e-4, rtol=1e-4)
         torch.testing.assert_close(our_decode, hf_logits[:, 6:], atol=1e-4, rtol=1e-4)
 
+    @pytest.mark.parametrize(
+        "make_config, hf_class",
+        [
+            (_make_qwen3_5_config, HFQwen3_5ForCausalLM),
+            (_make_qwen3_5_moe_config, HFQwen3_5MoeForCausalLM),
+        ],
+        ids=["dense", "moe"],
+    )
+    def test_eager_step_matches_hf(self, make_config, hf_class) -> None:
+        """The eager path the pytorch runner scores through: the hybrid state (conv and
+        recurrent, beside the KV pair) has to ride along, prefill then one decode step."""
+        torch.manual_seed(0)
+        config = make_config()
+        hf_model = hf_class(config).to(torch.float32).eval()
+        our_model = Qwen3_5ForCausalLM(config, model_device="cpu").to(torch.float32).eval()
+        sd = dict(hf_model.state_dict())
+        our_model._mutate_state_dict(sd)
+        our_model.load_state_dict(sd, assign=True, strict=True)
+        input_ids = torch.randint(0, config.vocab_size, (1, 7))
+
+        state = our_model.new_eager_state(dtype=torch.float32, device="cpu", max_seq_len=16)
+        with torch.no_grad():
+            prefill = our_model.eager_step(input_ids[:, :6].to(torch.int32), state)
+            decode = our_model.eager_step(input_ids[:, 6:].to(torch.int32), state)
+            hf_logits = hf_model(input_ids=input_ids).logits
+
+        assert state.offset == 7
+        torch.testing.assert_close(prefill, hf_logits[:, :6], atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(decode, hf_logits[:, 6:], atol=1e-4, rtol=1e-4)
+
     def test_num_layers_is_rejected(self) -> None:
         with pytest.raises(ValueError, match="not currently supported for hybrid models"):
             Qwen3_5ForCausalLM._get_reauthored_config(_make_qwen3_5_config(), num_layers=1)
