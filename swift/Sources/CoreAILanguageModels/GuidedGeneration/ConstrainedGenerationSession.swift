@@ -19,6 +19,13 @@ import Tokenizers
 public struct ConstrainedGenerationSession: ~Copyable {
     static let maxRollbackTokens = 64
 
+    /// Most whitespace characters allowed between two JSON tokens unless a caller passes another
+    /// limit. The limit ends a model that keeps choosing whitespace after the last value. It is far
+    /// above what models write: pretty-printed output uses a newline and two spaces per nesting
+    /// level, so 32 covers 15 levels, or 7 at four spaces per level. The session enforces the limit
+    /// on the next-token mask, so it does not enlarge the compiled grammar.
+    public static let defaultMaxWhitespaceCount = 32
+
     private let tokenizerInfo: TokenizerInfo
     private let compiler: GrammarCompiler
     private let compiledGrammar: CompiledGrammar
@@ -29,9 +36,14 @@ public struct ConstrainedGenerationSession: ~Copyable {
     // Tracks termination via all-zeros bitmask (xgrammar signals completion this way
     // when no EOS token is present, returning false from fillNextTokenBitmask).
     private var allTokensBlocked = false
+    /// Enforces ``maxWhitespaceCount`` on the next-token mask; nil when unlimited.
+    private var whitespaceGuard: WhitespaceGuard?
 
     /// The JSON schema this session enforces.
     public let schema: String
+
+    /// Most whitespace characters allowed between two JSON tokens; nil when unlimited.
+    public let maxWhitespaceCount: Int?
 
     /// Whether the grammar has reached a terminal state (valid JSON complete).
     ///
@@ -55,19 +67,25 @@ public struct ConstrainedGenerationSession: ~Copyable {
     ///   - stopTokenIds: Token IDs to treat as stop tokens (e.g., EOS).
     ///     xgrammar allows these only at grammar-terminal states (valid JSON complete).
     ///     Pass `nil` to rely on xgrammar defaults.
-    /// - Throws: `ConstrainedGenerationError` if the schema is invalid JSON
+    ///   - maxWhitespaceCount: Most whitespace characters allowed between two JSON tokens (default:
+    ///     ``defaultMaxWhitespaceCount``), or `nil` for no limit. Must be positive.
+    /// - Throws: `ConstrainedGenerationError` if the schema is invalid JSON or the limit is not positive
     public init(
         jsonSchema: String,
         vocabulary: [String],
         vocabType: VocabularyType = .byteLevel,
-        stopTokenIds: [Int32]? = nil
+        stopTokenIds: [Int32]? = nil,
+        maxWhitespaceCount: Int? = ConstrainedGenerationSession.defaultMaxWhitespaceCount
     ) throws {
         try Self.validateJSONSchema(jsonSchema)
+        try Self.validateMaxWhitespaceCount(maxWhitespaceCount)
         let tokenizerInfo = TokenizerInfo(
             vocabulary: vocabulary,
             vocabType: vocabType
         )
-        try self.init(jsonSchema: jsonSchema, tokenizerInfo: tokenizerInfo, validated: true)
+        try self.init(
+            jsonSchema: jsonSchema, tokenizerInfo: tokenizerInfo, maxWhitespaceCount: maxWhitespaceCount,
+            validated: true)
     }
 
     /// Initialize with a pre-built `TokenizerInfo` (useful when caching across sessions).
@@ -75,26 +93,37 @@ public struct ConstrainedGenerationSession: ~Copyable {
     /// - Parameters:
     ///   - jsonSchema: A valid JSON schema string
     ///   - tokenizerInfo: Pre-built tokenizer info (must include stop token IDs if needed)
-    /// - Throws: `ConstrainedGenerationError` if the schema is invalid JSON,
+    ///   - maxWhitespaceCount: Most whitespace characters allowed between two JSON tokens (default:
+    ///     ``defaultMaxWhitespaceCount``), or `nil` for no limit. Must be positive.
+    /// - Throws: `ConstrainedGenerationError` if the schema is invalid JSON or the limit is not positive,
     ///           `XGrammarError` if schema compilation fails
     public init(
         jsonSchema: String,
-        tokenizerInfo: TokenizerInfo
+        tokenizerInfo: TokenizerInfo,
+        maxWhitespaceCount: Int? = ConstrainedGenerationSession.defaultMaxWhitespaceCount
     ) throws {
         try Self.validateJSONSchema(jsonSchema)
-        try self.init(jsonSchema: jsonSchema, tokenizerInfo: tokenizerInfo, validated: true)
+        try Self.validateMaxWhitespaceCount(maxWhitespaceCount)
+        try self.init(
+            jsonSchema: jsonSchema, tokenizerInfo: tokenizerInfo, maxWhitespaceCount: maxWhitespaceCount,
+            validated: true)
     }
 
     /// Internal init that skips validation (caller must validate first).
     private init(
         jsonSchema: String,
         tokenizerInfo: TokenizerInfo,
+        maxWhitespaceCount: Int?,
         validated: Bool
     ) throws {
         self.schema = jsonSchema
+        self.maxWhitespaceCount = maxWhitespaceCount
         self.tokenizerInfo = tokenizerInfo
         self.compiler = GrammarCompiler(tokenizerInfo: tokenizerInfo)
         self.compiledGrammar = try compiler.compileJSONSchema(jsonSchema)
+        self.whitespaceGuard = maxWhitespaceCount.map {
+            WhitespaceGuard(limit: $0, vocabulary: tokenizerInfo.vocabulary, vocabType: tokenizerInfo.vocabType)
+        }
         self.matcher = GrammarMatcher(compiledGrammar: compiledGrammar, maxRollbackTokens: Self.maxRollbackTokens)
         self.vocabularySize = tokenizerInfo.vocabularySize
         self.bitmaskSize = (vocabularySize + 31) / 32
@@ -102,6 +131,12 @@ public struct ConstrainedGenerationSession: ~Copyable {
     }
 
     /// Validate that a string is valid JSON.
+    private static func validateMaxWhitespaceCount(_ limit: Int?) throws {
+        if let limit, limit <= 0 {
+            throw ConstrainedGenerationError.invalidMaxWhitespaceCount(limit)
+        }
+    }
+
     private static func validateJSONSchema(_ schema: String) throws {
         guard let data = schema.data(using: .utf8),
             (try? JSONSerialization.jsonObject(with: data)) != nil
@@ -125,13 +160,16 @@ public struct ConstrainedGenerationSession: ~Copyable {
     ///   - stopTokenIds: Token IDs to treat as stop tokens (e.g., EOS).
     ///     xgrammar allows these tokens only at grammar-terminal states (valid JSON complete),
     ///     blocking them mid-generation. Pass `nil` to rely on xgrammar defaults (not recommended).
-    /// - Throws: `ConstrainedGenerationError` if the schema is invalid JSON
+    ///   - maxWhitespaceCount: Most whitespace characters allowed between two JSON tokens (default:
+    ///     ``defaultMaxWhitespaceCount``), or `nil` for no limit. Must be positive.
+    /// - Throws: `ConstrainedGenerationError` if the schema is invalid JSON or the limit is not positive
     public init(
         jsonSchema: String,
         tokenizer: any Tokenizer,
         vocabSize: Int,
         vocabType: VocabularyType? = nil,
-        stopTokenIds: [Int32]? = nil
+        stopTokenIds: [Int32]? = nil,
+        maxWhitespaceCount: Int? = ConstrainedGenerationSession.defaultMaxWhitespaceCount
     ) throws {
         // Extract vocabulary from tokenizer
         var vocabulary: [String] = []
@@ -144,7 +182,7 @@ public struct ConstrainedGenerationSession: ~Copyable {
         try self.init(
             jsonSchema: jsonSchema, vocabulary: vocabulary,
             vocabType: vocabType ?? VocabularyType.detect(vocabulary: vocabulary),
-            stopTokenIds: stopTokenIds)
+            stopTokenIds: stopTokenIds, maxWhitespaceCount: maxWhitespaceCount)
     }
 
     // MARK: - Raw Bitmask Access (for MaskProviding integration)
@@ -159,7 +197,9 @@ public struct ConstrainedGenerationSession: ~Copyable {
         if isTerminated { return nil }
 
         let hasConstraints = bitmaskBuffer.withUnsafeMutableBufferPointer { buffer in
-            matcher.fillNextTokenBitmask(buffer.baseAddress!)
+            let constrained = matcher.fillNextTokenBitmask(buffer.baseAddress!)
+            if constrained { whitespaceGuard?.restrict(buffer.baseAddress!) }
+            return constrained
         }
         // xgrammar may signal completion either by returning false, or by filling
         // an all-zeros bitmask (no tokens allowed). Both indicate the grammar is done.
@@ -191,12 +231,15 @@ public struct ConstrainedGenerationSession: ~Copyable {
     /// - Returns: `true` if the token was accepted, `false` if rejected by the grammar
     @discardableResult
     public mutating func acceptToken(_ tokenId: Int32) -> Bool {
-        matcher.acceptToken(tokenId)
+        let accepted = matcher.acceptToken(tokenId)
+        if accepted { whitespaceGuard?.accept(tokenId) }
+        return accepted
     }
 
     /// Reset the session to the initial state for reuse with the same schema.
     public mutating func reset() {
         matcher.reset()
+        whitespaceGuard?.reset()
         allTokensBlocked = false
     }
 
@@ -205,7 +248,9 @@ public struct ConstrainedGenerationSession: ~Copyable {
     @discardableResult
     public mutating func rollback(_ numTokens: Int = 1) -> Bool {
         guard numTokens >= 0 else { return false }
-        return matcher.rollback(numTokens)
+        let rolledBack = matcher.rollback(numTokens)
+        if rolledBack { whitespaceGuard?.rollback(numTokens) }
+        return rolledBack
     }
 
     /// Find the longest deterministic string from the current grammar state.
@@ -236,6 +281,7 @@ public struct ConstrainedGenerationSession: ~Copyable {
             // xgrammar signals all tokens are allowed — no mask needed
             return .unconstrained
         }
+        whitespaceGuard?.restrict(pointer)
         // Check for all-zeros (no tokens allowed — grammar done)
         for i in 0..<bitmaskSize {
             if pointer[i] != 0 { return .constrained }
@@ -268,12 +314,15 @@ extension ConstrainedGenerationSession {
 
 public enum ConstrainedGenerationError: Error, LocalizedError {
     case invalidSchema(String)
+    case invalidMaxWhitespaceCount(Int)
     case generationFailed(String)
 
     public var errorDescription: String? {
         switch self {
         case .invalidSchema(let schema):
             return "Invalid JSON schema: \(schema.prefix(100))..."
+        case .invalidMaxWhitespaceCount(let value):
+            return "The whitespace limit must be positive, or nil for no limit (got \(value))"
         case .generationFailed(let reason):
             return "Constrained generation failed: \(reason)"
         }
@@ -295,10 +344,13 @@ extension ConstrainedGenerationSession {
         schemaPath: String,
         vocabulary: [String],
         vocabType: VocabularyType = .byteLevel,
-        stopTokenIds: [Int32]? = nil
+        stopTokenIds: [Int32]? = nil,
+        maxWhitespaceCount: Int? = ConstrainedGenerationSession.defaultMaxWhitespaceCount
     ) throws {
         let schema = try String(contentsOfFile: schemaPath, encoding: .utf8)
-        try self.init(jsonSchema: schema, vocabulary: vocabulary, vocabType: vocabType, stopTokenIds: stopTokenIds)
+        try self.init(
+            jsonSchema: schema, vocabulary: vocabulary, vocabType: vocabType,
+            stopTokenIds: stopTokenIds, maxWhitespaceCount: maxWhitespaceCount)
     }
 }
 
