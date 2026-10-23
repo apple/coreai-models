@@ -282,3 +282,11 @@ class TestiOSStandardRope(BaseRoPETest):
             apply_rotary_fn=apply_rotary_fn,
             head_is_different=head_is_different,
         )
+
+
+def test_apply_rope_rejects_ndim_not_dividing_last_dim():
+    x = torch.randn(1, 2, 3, 6)
+    cos = torch.randn(1, 3, 6)
+    sin = torch.randn(1, 3, 6)
+    with pytest.raises((RuntimeError, ValueError)):
+        apply_rope(x, cos, sin, ndim=4)

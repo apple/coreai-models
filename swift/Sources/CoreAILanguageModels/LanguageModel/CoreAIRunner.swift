@@ -66,6 +66,23 @@ public struct CoreAIRunner {
         try bundle.modelBundle.validateModelAssets()
 
         let config = makeConfig()
+
+        // A VLM whose decoder gathers its own token embeddings (`vision.token_merge` is
+        // `decoder_gather`, e.g. Gemma 4): the factory builds the multimodal StaticShapeEngine so
+        // `encodeImage` + soft-token scatter work. VLMs with a separate `embedding` asset are
+        // constructed elsewhere (`CoreAIVisionLanguageModel`), not through this runner.
+        if bundle.modelBundle.kind == .vlm, bundle.visionConfig?.tokenMerge == .decoderGather {
+            return try await EngineFactory.createEngine(
+                bundle: bundle,
+                options: EngineOptions(
+                    variant: engineVariant,
+                    kvCacheStrategy: kvCacheStrategy,
+                    prefillChunkSize: prefillChunkSizeOverride ?? bundle.language.prefillChunkSize,
+                    prefillChunkThreshold: prefillChunkThresholdOverride
+                        ?? bundle.language.prefillChunkThreshold,
+                    tensorData: bundle.tensorData))
+        }
+
         let configData = try JSONEncoder().encode(config)
 
         let resolvedChunkSize = prefillChunkSizeOverride ?? bundle.language.prefillChunkSize
