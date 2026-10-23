@@ -55,7 +55,7 @@ struct LLMServer: AsyncParsableCommand {
     @Flag(
         name: .customLong("replay-concurrent"),
         help: ArgumentHelp(
-            "Run all --replay requests concurrently instead of one at a time. Use with --concurrency N.")
+            "Run all --replay requests concurrently instead of one at a time. Use with --concurrent-requests N.")
     )
     var replayConcurrent: Bool = false
 
@@ -86,12 +86,12 @@ struct LLMServer: AsyncParsableCommand {
     var maxQueueDepth: Int = 16
 
     @Option(
-        name: .customLong("concurrency"),
+        name: .customLong("concurrent-requests"),
         help: ArgumentHelp(
             "Max requests decoded together in one batch (default: 1). Values above 1 enable the batch "
                 + "scheduler when the model supports batching, and are ignored with a warning otherwise.")
     )
-    var concurrency: Int = 1
+    var concurrentRequests: Int = 1
 
     @Flag(
         name: .customLong("no-thinking"),
@@ -118,8 +118,8 @@ struct LLMServer: AsyncParsableCommand {
         guard maxQueueDepth >= 0 else {
             throw ValidationError("--max-queue-depth must be >= 0 (got \(maxQueueDepth))")
         }
-        guard concurrency >= 1 else {
-            throw ValidationError("--concurrency must be >= 1 (got \(concurrency))")
+        guard concurrentRequests >= 1 else {
+            throw ValidationError("--concurrent-requests must be >= 1 (got \(concurrentRequests))")
         }
         do {
             _ = try ReasoningEffort.resolveDefault(
@@ -236,22 +236,23 @@ struct LLMServer: AsyncParsableCommand {
             maxQueueDepth: maxQueueDepth
         )
 
-        // The scheduler holds up to --concurrency plus --max-queue-depth requests, then rejects.
+        // The scheduler holds up to --concurrent-requests plus --max-queue-depth requests, then rejects.
         var batchScheduler: BatchScheduler? = nil
-        if concurrency > 1 {
+        if concurrentRequests > 1 {
             if let seq = engine as? CoreAISequentialEngine, seq.supportsBatching {
                 let assetMax = bundle.maxBatchSize
-                guard concurrency <= assetMax else {
+                guard concurrentRequests <= assetMax else {
                     throw ValidationError(
-                        "--concurrency \(concurrency) exceeds the asset's max batch size \(assetMax). "
-                            + "Re-export with --dynamic-batch-size \(concurrency) or higher, or lower --concurrency.")
+                        "--concurrent-requests \(concurrentRequests) exceeds the asset's max batch size \(assetMax). "
+                            + "Re-export with --dynamic-batch-size \(concurrentRequests) or higher, or lower --concurrent-requests."
+                    )
                 }
                 batchScheduler = try BatchScheduler(
-                    engine: seq, maxConcurrent: concurrency, maxQueued: maxQueueDepth)
-                print("Batched serving: concurrency \(concurrency) (asset max batch \(assetMax))")
+                    engine: seq, maxConcurrent: concurrentRequests, maxQueued: maxQueueDepth)
+                print("Batched serving: \(concurrentRequests) concurrent requests (asset max batch \(assetMax))")
             } else {
                 print(
-                    "⚠️  --concurrency \(concurrency) ignored: batched serving needs the coreai-sequential engine "
+                    "⚠️  --concurrent-requests \(concurrentRequests) ignored: batched serving needs the coreai-sequential engine "
                         + "and an asset exported with --attention-mask batched --dynamic-batch-size N. "
                         + "Serving one request at a time.")
             }
