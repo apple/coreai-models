@@ -410,3 +410,53 @@ def test_final_logit_softcap_left_to_runner():
     # The cap is monotonic, so it cannot move an argmax — which is why greedy sampling
     # is unaffected by *where* it runs, and only the logit values need the runner's pass.
     assert (ios_logits.argmax(-1) == hf_logits.argmax(-1)).all()
+
+
+def test_emit_hidden_states_adds_the_final_hidden_output():
+    """With ``emit_hidden_states`` the decode forward returns ``(logits, final_hidden)``.
+
+    The logits are unchanged, and the hidden state is the post-norm activation the tied
+    projection consumes, one row per query position.
+    """
+    torch.manual_seed(3)
+    cfg = _make_config()
+    hf = Gemma4ForCausalLM(cfg).to(DTYPE).eval()
+    ios = _build_ios_model(cfg, dict(hf.state_dict()))
+
+    q_len, ctx = 4, 32
+    S = sliding_ring_size(cfg.sliding_window, q_len)
+    n_kv = cfg.num_key_value_heads
+    sliding_storing, global_storing, _ = _compute_kv_layout(cfg)
+    token_ids = torch.randint(0, cfg.vocab_size, (q_len,))
+    rope_cos, rope_sin = _combined_rope(cfg, ctx, DTYPE).gather_cos_sin(
+        torch.arange(q_len, dtype=torch.int32).reshape(1, q_len)
+    )
+
+    def forward():
+        key_cache = torch.zeros(
+            len(global_storing), 1, n_kv * cfg.global_head_dim, 1, ctx, dtype=DTYPE
+        )
+        skey_cache = torch.zeros(len(sliding_storing), 1, n_kv * cfg.head_dim, 1, S, dtype=DTYPE)
+        with torch.no_grad():
+            return ios(
+                token_ids.reshape(1, q_len),
+                rope_cos,
+                rope_sin,
+                torch.zeros(1, dtype=torch.int32),
+                torch.zeros(1, dtype=torch.int32),
+                _global_mask(ctx, q_len, 0),
+                _sliding_mask(S, q_len, 0, cfg.sliding_window),
+                key_cache,
+                key_cache.clone(),
+                skey_cache,
+                skey_cache.clone(),
+                _ple_input_fp(hf, cfg, token_ids),
+            )
+
+    plain = forward()
+    assert isinstance(plain, torch.Tensor)
+
+    ios.extend.emit_hidden_states = True
+    logits, hidden = forward()
+    torch.testing.assert_close(logits, plain)
+    assert hidden.shape == (1, q_len, cfg.hidden_size)
