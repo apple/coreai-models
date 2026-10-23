@@ -1,0 +1,346 @@
+# Copyright 2026 Apple Inc.
+#
+# Use of this source code is governed by a BSD-3-clause license that can
+# be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
+
+"""The Gemma 4 draft-head export (``models/gemma4/export_drafter.py``).
+
+The recipe is not part of the installed package, so it is loaded by path, after ``export.py``,
+which it imports as ``export``. Covered: the draft step's grouped-query attention and scaled
+RMSNorm, the scan table, the checkpoint checks, and declaring the draft head in a target bundle.
+"""
+
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+import pytest
+import torch
+
+pytest.importorskip("transformers")
+pytest.importorskip("safetensors")
+
+from safetensors.torch import save_file  # noqa: E402
+
+from tests._runner_infra._deps import _HAS_COREAI, _MSG_COREAI_NOT_FOUND  # noqa: E402
+
+pytestmark = pytest.mark.skipif(not _HAS_COREAI, reason=_MSG_COREAI_NOT_FOUND)
+
+_GEMMA4 = Path(__file__).resolve().parents[4] / "models/gemma4"
+
+
+def _load(name: str):
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(name, _GEMMA4 / f"{name}.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+if _HAS_COREAI:
+    export_g4 = _load("export")
+    export_drafter = _load("export_drafter")
+    _ios_metadata_extras = export_g4._ios_metadata_extras
+    DRAFTER_AUXILIARY_KEYS = export_drafter.DRAFTER_AUXILIARY_KEYS
+    SCAN_NAME = export_drafter.SCAN_NAME
+    DecoderLayer = export_drafter.DecoderLayer
+    RMSNorm = export_drafter.RMSNorm
+    add_to_bundle = export_drafter.add_to_bundle
+    check_checkpoint = export_drafter.check_checkpoint
+    full_windows = export_drafter.full_windows
+    load_drafter = export_drafter.load_drafter
+    output_table = export_drafter.output_table
+    rotate_half = export_drafter.rotate_half
+    write_scan_table = export_drafter.write_scan_table
+
+
+# ---- Draft step ----
+
+
+def layer_weights(hidden, heads, kv_heads, head_dim, ffn, seed):
+    g = torch.Generator().manual_seed(seed)
+
+    def r(*shape):
+        return torch.randn(*shape, generator=g) * 0.05
+
+    p = "model.layers.0."
+    return {
+        p + "self_attn.q_proj.weight": r(heads * head_dim, hidden),
+        p + "self_attn.o_proj.weight": r(hidden, heads * head_dim),
+        p + "self_attn.q_norm.weight": r(head_dim),
+        p + "mlp.gate_proj.weight": r(ffn, hidden),
+        p + "mlp.up_proj.weight": r(ffn, hidden),
+        p + "mlp.down_proj.weight": r(hidden, ffn),
+        p + "input_layernorm.weight": r(hidden),
+        p + "post_attention_layernorm.weight": r(hidden),
+        p + "pre_feedforward_layernorm.weight": r(hidden),
+        p + "post_feedforward_layernorm.weight": r(hidden),
+        p + "layer_scalar": torch.ones(1),
+    }
+
+
+def copied_kv_attention(layer, x, cos, sin, k, v, mask):
+    """The attention before grouping: K and V repeated to every query head."""
+    b, s, _ = x.shape
+    q = layer.q_proj(layer.input_layernorm(x)).view(b, s, layer.num_heads, layer.head_dim)
+    q = layer.q_norm(q).transpose(1, 2)
+    q = q * cos + rotate_half(q) * sin
+    groups = layer.num_heads // layer.num_kv_heads
+    k, v = k.repeat_interleave(groups, dim=1), v.repeat_interleave(groups, dim=1)
+    attn = torch.matmul(v, torch.softmax(torch.matmul(q, k) + mask, dim=-1).transpose(-1, -2))
+    return attn.permute(0, 3, 1, 2).reshape(b, s, layer.num_heads * layer.head_dim)
+
+
+@pytest.mark.parametrize("kv_heads", [1, 2, 4])
+@pytest.mark.parametrize("queries", [1, 3])
+def test_grouped_attention_matches_copied_kv(kv_heads, queries):
+    hidden, heads, head_dim, window = 64, 8, 16, 12
+    layer = DecoderLayer(
+        layer_weights(hidden, heads, kv_heads, head_dim, 96, seed=kv_heads * 10 + queries),
+        0,
+        heads,
+        kv_heads,
+    ).eval()
+    g = torch.Generator().manual_seed(7)
+    x = torch.randn(1, queries, hidden, generator=g)
+    angles = torch.randn(1, 1, queries, head_dim // 2, generator=g)
+    cos, sin = torch.cat([angles.cos()] * 2, -1), torch.cat([angles.sin()] * 2, -1)
+    k = torch.randn(1, kv_heads, head_dim, window, generator=g)
+    v = torch.randn(1, kv_heads, head_dim, window, generator=g)
+    mask = torch.zeros(1, 1, 1, window)
+    mask[..., -3:] = -40000  # padding slots, as the drafter masks empty positions
+
+    captured = {}
+    # The hook reads o_proj's input (the attention output) and leaves the output unchanged.
+    layer.o_proj.register_forward_hook(lambda _m, inputs, _o: captured.update(attn=inputs[0]))
+    with torch.no_grad():
+        layer(x, cos, sin, k, v, mask)
+        expected = copied_kv_attention(layer, x, cos, sin, k, v, mask)
+    torch.testing.assert_close(captured["attn"], expected, atol=1e-5, rtol=1e-5)
+
+
+def test_full_windows_double_up_to_max_context():
+    assert full_windows(512, 4096) == [512, 1024, 2048, 4096]
+    # A max context that is not a power-of-two multiple of the window is still the last.
+    assert full_windows(512, 3000) == [512, 1024, 2048, 3000]
+    assert full_windows(512, 512) == [512]
+
+
+# ---- Scan table ----
+
+
+VOCAB, HIDDEN, CENTROIDS = 8, 4, 2
+
+
+def scan_checkpoint(untied: bool) -> dict[str, torch.Tensor]:
+    g = torch.Generator().manual_seed(0)
+    t = {
+        "model.embed_tokens.weight": torch.randn(VOCAB, HIDDEN, generator=g),
+        "masked_embedding.token_ordering": torch.randperm(VOCAB, generator=g),
+        "masked_embedding.centroids.weight": torch.randn(CENTROIDS, HIDDEN, generator=g),
+    }
+    if untied:
+        t["lm_head.weight"] = torch.randn(VOCAB, HIDDEN, generator=g)
+    return t
+
+
+def test_output_table_prefers_untied_head():
+    t = scan_checkpoint(untied=True)
+    assert output_table(t) is t["lm_head.weight"]
+
+
+def test_output_table_falls_back_to_embedding():
+    t = scan_checkpoint(untied=False)
+    assert output_table(t) is t["model.embed_tokens.weight"]
+
+
+def test_scan_table_permutes_the_untied_head(tmp_path):
+    t = scan_checkpoint(untied=True)
+    path = tmp_path / "draft_scan.bin"
+    write_scan_table(t, 1, path)
+    index = json.loads(path.with_suffix(".json").read_text())["tensors"]["embed_perm_f16"]
+    blob = torch.frombuffer(bytearray(path.read_bytes()), dtype=torch.float16)
+    start = index["offset"] // 2
+    rows = blob[start : start + VOCAB * HIDDEN].reshape(VOCAB, HIDDEN)
+    expected = t["lm_head.weight"][t["masked_embedding.token_ordering"]].to(torch.float16)
+    assert torch.equal(rows, expected)
+
+
+def test_load_drafter_accepts_bracketed_directory(tmp_path):
+    drafter = tmp_path / "model_[v1]"
+    drafter.mkdir()
+    save_file({"w": torch.ones(2, 2)}, str(drafter / "model.safetensors"))
+    assert set(load_drafter(drafter)) == {"w"}
+
+
+# ---- Checkpoint checks and bundle component ----
+
+
+def checkpoint(vocab=8, hidden=4, centroids=2, scale=1.0, layers=1):
+    g = torch.Generator().manual_seed(0)
+    t = {
+        "model.embed_tokens.weight": torch.randn(vocab, hidden, generator=g) * scale,
+        "masked_embedding.token_ordering": torch.randperm(vocab, generator=g),
+        "masked_embedding.centroids.weight": torch.randn(centroids, hidden, generator=g),
+        "pre_projection.weight": torch.randn(hidden, 2 * hidden, generator=g),
+        "post_projection.weight": torch.randn(hidden, hidden, generator=g),
+        "model.norm.weight": torch.randn(hidden, generator=g),
+    }
+    for i in range(layers):
+        p = f"model.layers.{i}."
+        for name in (
+            "input_layernorm",
+            "post_attention_layernorm",
+            "pre_feedforward_layernorm",
+            "post_feedforward_layernorm",
+            "self_attn.q_norm",
+        ):
+            t[p + name + ".weight"] = torch.ones(hidden)
+        t[p + "layer_scalar"] = torch.ones(1)
+        for name in (
+            "self_attn.q_proj",
+            "self_attn.o_proj",
+            "mlp.gate_proj",
+            "mlp.up_proj",
+            "mlp.down_proj",
+        ):
+            t[p + name + ".weight"] = torch.randn(hidden, hidden, generator=g)
+    return t
+
+
+def test_scan_table_rejects_vocab_not_divisible_by_centroids(tmp_path):
+    # vocab 10 / 4 centroids -> 2 per centroid: the tokens in slots 8 and 9 would be unreachable.
+    with pytest.raises(SystemExit, match="not divisible"):
+        write_scan_table(checkpoint(vocab=10, centroids=4), 1, tmp_path / SCAN_NAME)
+
+
+def test_scan_table_rejects_zero_centroids(tmp_path):
+    t = checkpoint()
+    t["masked_embedding.centroids.weight"] = torch.zeros(0, 4)
+    with pytest.raises(SystemExit, match="not divisible"):
+        write_scan_table(t, 1, tmp_path / SCAN_NAME)
+
+
+def test_rejects_weights_that_overflow_fp16():
+    with pytest.raises(SystemExit, match="float16"):
+        check_checkpoint(checkpoint(scale=1e6))
+
+
+def test_rejects_non_finite_weights():
+    t = checkpoint()
+    t["model.norm.weight"][0] = float("nan")
+    with pytest.raises(SystemExit, match="non-finite"):
+        check_checkpoint(t)
+
+
+def test_names_a_missing_tensor():
+    t = checkpoint()
+    del t["pre_projection.weight"]
+    with pytest.raises(SystemExit, match="pre_projection.weight"):
+        check_checkpoint(t)
+
+
+def test_names_a_missing_layer_tensor():
+    t = checkpoint(layers=2)
+    del t["model.layers.1.mlp.up_proj.weight"]
+    with pytest.raises(SystemExit, match="model.layers.1.mlp.up_proj.weight"):
+        check_checkpoint(t)
+
+
+def test_rejects_a_layer_pattern_the_runtime_does_not_implement():
+    # The runtime treats only the last layer as full attention.
+    with pytest.raises(SystemExit, match="layer_types"):
+        check_checkpoint(
+            checkpoint(layers=2), {"layer_types": ["full_attention", "sliding_attention"]}
+        )
+
+
+def test_accepts_the_supported_layer_pattern():
+    check_checkpoint(checkpoint(layers=2), {"layer_types": ["sliding_attention", "full_attention"]})
+    check_checkpoint(checkpoint(layers=2))
+
+
+def test_sidecars_carry_a_format_version(tmp_path):
+    write_scan_table(checkpoint(), 1, tmp_path / SCAN_NAME)
+    assert json.loads((tmp_path / "draft_scan.json").read_text())["version"] == 1
+
+
+def test_scaled_rms_norm_matches_the_textbook_form_without_overflowing_fp16():
+    g = torch.Generator().manual_seed(0)
+    weight = torch.randn(64, generator=g)
+    x = torch.randn(3, 64, generator=g) * 100
+    norm = RMSNorm(weight)
+    reference = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + norm.eps) * weight
+    torch.testing.assert_close(norm(x), reference, rtol=1e-5, atol=1e-5)
+    # |x| = 1000 squares past fp16's range (65504); the scaled square stays inside it.
+    big = torch.full((1, 64), 1000.0, dtype=torch.float16)
+    out = norm.half()(big)
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(
+        out.float(), weight.half().float().expand(1, 64), rtol=2e-3, atol=2e-3
+    )
+
+
+def write_bundle(tmp_path, emits_hidden_states):
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    overrides = {"sliding_window": 512}
+    if emits_hidden_states:
+        overrides["emits_hidden_states"] = True
+    metadata = {
+        "assets": {"main": "model.aimodel"},
+        "auxiliary_assets": {"per_layer_embeddings": "ple.safetensors"},
+        "language": {"overrides": overrides},
+    }
+    (bundle / "metadata.json").write_text(json.dumps(metadata))
+    return bundle
+
+
+def write_drafter_files(tmp_path):
+    out = tmp_path / "drafter"
+    (out / "draft_step.aimodel").mkdir(parents=True)
+    (out / "draft_step.aimodel" / "model.mlir").write_text("program")
+    for name in DRAFTER_AUXILIARY_KEYS.values():
+        (out / name).write_text(name)
+    return out
+
+
+def test_add_to_bundle_declares_the_drafter_component(tmp_path):
+    bundle = write_bundle(tmp_path, emits_hidden_states=True)
+    add_to_bundle(write_drafter_files(tmp_path), bundle)
+    metadata = json.loads((bundle / "metadata.json").read_text())
+    assert metadata["assets"] == {"main": "model.aimodel", "drafter": "draft_step.aimodel"}
+    assert metadata["auxiliary_assets"] == {
+        "per_layer_embeddings": "ple.safetensors",
+        "drafter_config": "draft_step.json",
+        "drafter_scan": "draft_scan.bin",
+        "drafter_scan_index": "draft_scan.json",
+    }
+    assert (bundle / "draft_step.aimodel" / "model.mlir").read_text() == "program"
+    for name in DRAFTER_AUXILIARY_KEYS.values():
+        assert (bundle / name).read_text() == name
+
+
+def test_add_to_bundle_refuses_a_target_without_hidden_states(tmp_path):
+    bundle = write_bundle(tmp_path, emits_hidden_states=False)
+    with pytest.raises(SystemExit, match="--emit-hidden-states"):
+        add_to_bundle(write_drafter_files(tmp_path), bundle)
+
+
+class _TextConfig:
+    sliding_window = 512
+    head_dim = 256
+    global_head_dim = 512
+    final_logit_softcapping = 30.0
+    rope_parameters = {
+        "sliding_attention": {"rope_theta": 10000.0},
+        "full_attention": {"rope_theta": 1000000.0, "partial_rotary_factor": 0.25},
+    }
+
+
+def test_metadata_records_hidden_states_only_when_emitted():
+    assert "emits_hidden_states" not in _ios_metadata_extras(_TextConfig())["overrides"]
+    assert _ios_metadata_extras(_TextConfig(), True)["overrides"]["emits_hidden_states"] is True
