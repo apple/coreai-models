@@ -127,7 +127,9 @@ final class ServerState: @unchecked Sendable {
     /// Stable identifier for the backend configuration, echoed on responses as
     /// `system_fingerprint`. Reproducible outputs (same `seed` + prompt) are only
     /// guaranteed while this value is unchanged; it changes when output-affecting
-    /// configuration (model, engine, context length, sampling defaults) changes.
+    /// configuration (model, engine, batch size, context length, sampling defaults) changes. The
+    /// batch size is part of it because batched decoding sums in a different order, so the same
+    /// seed can give slightly different logits.
     let systemFingerprint: String
     /// Scheduler for the batched lane and completions scoring, and the model config for each
     /// `SchedulerSession`. Nil when batched serving is off.
@@ -156,7 +158,8 @@ final class ServerState: @unchecked Sendable {
         self.queue = RequestQueue(maxDepth: config.maxQueueDepth)
         self.toolCallDetection = detectToolCallFormat(using: tokenizer)
         self.thinkingFormat = detectThinkingFormat(using: tokenizer)
-        self.systemFingerprint = Self.makeSystemFingerprint(config: config, engine: engine)
+        self.systemFingerprint = Self.makeSystemFingerprint(
+            config: config, engine: engine, batchSize: batchServing?.scheduler.maxConcurrent ?? 1)
         self.batchServing = batchServing
     }
 
@@ -236,10 +239,13 @@ final class ServerState: @unchecked Sendable {
     /// Deterministic FNV-1a hash of a canonical config descriptor. Deterministic (not
     /// Swift's per-process-seeded `Hasher`) so two identical launches produce the same
     /// fingerprint and a config change produces a different one.
-    private static func makeSystemFingerprint(config: ServerConfig, engine: any InferenceEngine) -> String {
+    private static func makeSystemFingerprint(
+        config: ServerConfig, engine: any InferenceEngine, batchSize: Int
+    ) -> String {
         let descriptor = [
             config.modelName,
             String(describing: type(of: engine)),
+            "batch=\(batchSize)",
             "ctx=\(config.maxContextLength)",
             "t=\(config.defaultTemperature)",
             "k=\(config.defaultTopK.map { "\($0)" } ?? "nil")",
