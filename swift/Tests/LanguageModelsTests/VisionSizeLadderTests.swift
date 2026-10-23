@@ -52,49 +52,39 @@ private func makeCGImage(
         provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)!
 }
 
-private func makeBuckets() -> [VisionImageBucket] {
-    [
-        VisionImageBucket(imageSize: 384, numSoftTokens: 64, pooledGrid: 8, function: "encode_image_384"),
-        VisionImageBucket(imageSize: 768, numSoftTokens: 256, pooledGrid: 16, function: "encode_image_768"),
-        VisionImageBucket(imageSize: 1152, numSoftTokens: 576, pooledGrid: 24, function: "encode_image_1152"),
-    ]
-}
+private let ladder = [384, 768, 1152]
 
 @Suite("Gemma4 vision size-ladder Tests")
 struct VisionSizeLadderTests {
-    // MARK: - chooseBucket
+    // MARK: - chooseImageSize
 
-    @Test("Picks the smallest bucket that fits without upscaling")
-    func choosesSmallestFittingBucket() {
-        let buckets = makeBuckets()
+    @Test("Picks the smallest size that fits without upscaling")
+    func choosesSmallestFittingSize() {
         let image = makeSolidCGImage(width: 300, height: 300)
-        let chosen = StaticShapeEngine.chooseBucket(for: image, buckets: buckets)
-        #expect(chosen.imageSize == 384)
+        let chosen = StaticShapeEngine.chooseImageSize(for: image, imageSizes: ladder)
+        #expect(chosen == 384)
     }
 
-    @Test("Picks the exact bucket on a boundary match")
-    func choosesExactBoundaryBucket() {
-        let buckets = makeBuckets()
+    @Test("Picks the exact size on a boundary match")
+    func choosesExactBoundarySize() {
         let image = makeSolidCGImage(width: 768, height: 500)
-        let chosen = StaticShapeEngine.chooseBucket(for: image, buckets: buckets)
-        #expect(chosen.imageSize == 768)
+        let chosen = StaticShapeEngine.chooseImageSize(for: image, imageSizes: ladder)
+        #expect(chosen == 768)
     }
 
-    @Test("Falls back to the largest bucket when the image exceeds every bucket")
-    func fallsBackToLargestBucket() {
-        let buckets = makeBuckets()
+    @Test("Falls back to the largest size when the image exceeds every size")
+    func fallsBackToLargestSize() {
         let image = makeSolidCGImage(width: 2000, height: 1500)
-        let chosen = StaticShapeEngine.chooseBucket(for: image, buckets: buckets)
-        #expect(chosen.imageSize == 1152)
+        let chosen = StaticShapeEngine.chooseImageSize(for: image, imageSizes: ladder)
+        #expect(chosen == 1152)
     }
 
     @Test("Uses the longer side, regardless of orientation")
     func usesLongerSide() {
-        let buckets = makeBuckets()
         // Portrait: height is the long side.
         let image = makeSolidCGImage(width: 300, height: 900)
-        let chosen = StaticShapeEngine.chooseBucket(for: image, buckets: buckets)
-        #expect(chosen.imageSize == 1152)
+        let chosen = StaticShapeEngine.chooseImageSize(for: image, imageSizes: ladder)
+        #expect(chosen == 1152)
     }
 
     // MARK: - letterbox

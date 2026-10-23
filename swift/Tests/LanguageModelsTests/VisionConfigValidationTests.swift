@@ -19,24 +19,18 @@ struct VisionConfigValidationTests {
     }
 
     private func vision(
-        patch: Int = 16, pool: Int = 3, buckets: String? = nil, imageSize: Int = 768
+        patch: Int = 16, pool: Int = 3, sizes: String = "[384, 768]", imageSize: Int = 768
     ) -> String {
-        let ladder =
-            buckets
-                ?? """
-                [{"image_size": 384, "num_soft_tokens": 64, "pooled_grid": 8, "function": "encode_image_384"},
-                 {"image_size": 768, "num_soft_tokens": 256, "pooled_grid": 16, "function": "encode_image_768"}]
-                """
-        return """
-            {"image_size": \(imageSize), "patch_size": \(patch), "pooling_kernel_size": \(pool),
-             "image_token_count": 256, "image_token_id": 7, "image_buckets": \(ladder)}
-            """
+        """
+        {"image_size": \(imageSize), "patch_size": \(patch), "pooling_kernel_size": \(pool),
+         "image_token_count": 256, "image_token_id": 7, "image_sizes": \(sizes)}
+        """
     }
 
     @Test("A valid size ladder decodes")
     func validLadder() throws {
         let config = try decode(vision: vision())
-        #expect(config.vision?.imageBuckets?.map(\.imageSize) == [384, 768])
+        #expect(config.vision?.imageSizes == [384, 768])
     }
 
     @Test("A vision block without a ladder decodes (fixed-size encoders)")
@@ -52,37 +46,26 @@ struct VisionConfigValidationTests {
         #expect(throws: DecodingError.self) { try decode(vision: vision(pool: 0)) }
     }
 
-    @Test("Buckets must be positive multiples of the block size")
-    func bucketsMultipleOfBlock() {
-        let unaligned = """
-            [{"image_size": 100, "num_soft_tokens": 4, "pooled_grid": 2, "function": "f"}]
-            """
-        #expect(throws: DecodingError.self) { try decode(vision: vision(buckets: unaligned)) }
-        let zero = """
-            [{"image_size": 0, "num_soft_tokens": 0, "pooled_grid": 0, "function": "f"}]
-            """
-        #expect(throws: DecodingError.self) { try decode(vision: vision(buckets: zero)) }
+    @Test("Sizes must be positive multiples of the block size")
+    func sizesMultipleOfBlock() {
+        #expect(throws: DecodingError.self) { try decode(vision: vision(sizes: "[100]")) }
+        #expect(throws: DecodingError.self) { try decode(vision: vision(sizes: "[0]")) }
+        #expect(throws: DecodingError.self) { try decode(vision: vision(sizes: "[-48]")) }
     }
 
-    @Test("Buckets must be sorted ascending and unique")
-    func bucketsSorted() {
-        let b384 = "{\"image_size\": 384, \"num_soft_tokens\": 64, \"pooled_grid\": 8, \"function\": \"a\"}"
-        let b768 = "{\"image_size\": 768, \"num_soft_tokens\": 256, \"pooled_grid\": 16, \"function\": \"b\"}"
-        #expect(throws: DecodingError.self) { try decode(vision: vision(buckets: "[\(b768), \(b384)]")) }
-        #expect(throws: DecodingError.self) { try decode(vision: vision(buckets: "[\(b384), \(b384)]")) }
-        #expect(throws: DecodingError.self) { try decode(vision: vision(buckets: "[]")) }
+    @Test("Sizes must be sorted ascending, unique and non-empty")
+    func sizesSorted() {
+        #expect(throws: DecodingError.self) { try decode(vision: vision(sizes: "[768, 384]")) }
+        #expect(throws: DecodingError.self) { try decode(vision: vision(sizes: "[384, 384]")) }
+        #expect(throws: DecodingError.self) { try decode(vision: vision(sizes: "[]")) }
     }
 
-    @Test("A bucket whose pooled grid or soft-token count disagrees with its size is rejected")
-    func inconsistentBucket() {
-        let wrongGrid = """
-            [{"image_size": 384, "num_soft_tokens": 64, "pooled_grid": 7, "function": "f"}]
-            """
-        let wrongCount = """
-            [{"image_size": 384, "num_soft_tokens": 60, "pooled_grid": 8, "function": "f"}]
-            """
-        #expect(throws: DecodingError.self) { try decode(vision: vision(buckets: wrongGrid)) }
-        #expect(throws: DecodingError.self) { try decode(vision: vision(buckets: wrongCount)) }
+    @Test("The pooled grid and soft-token count follow from the size and the block")
+    func derivedGeometry() throws {
+        let config = try #require(try decode(vision: vision(patch: 14, pool: 2, sizes: "[28, 56]")).vision)
+        #expect(config.blockPixels == 28)
+        #expect(config.pooledGrid(imageSize: 56) == 2)
+        #expect(config.softTokenCount(imageSize: 56) == 4)
     }
 
     @Test("A non-positive vocabulary or context length is rejected")

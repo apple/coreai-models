@@ -111,8 +111,8 @@ struct MultimodalTypeTests {
         #expect(config.imageTokenCount == 256)
     }
 
-    @Test("VisionConfig decodes a Gemma4-style size-ladder bucket list")
-    func visionConfigWithImageBuckets() throws {
+    @Test("VisionConfig decodes a Gemma4-style size ladder")
+    func visionConfigWithImageSizes() throws {
         let json = """
             {
                 "image_size": 1152,
@@ -123,29 +123,26 @@ struct MultimodalTypeTests {
                 "boi_token_id": 255999,
                 "eoi_token_id": 258882,
                 "pad_token_id": 0,
-                "image_buckets": [
-                    {"image_size": 384, "num_soft_tokens": 64, "pooled_grid": 8, "function": "encode_image_384"},
-                    {"image_size": 768, "num_soft_tokens": 256, "pooled_grid": 16, "function": "encode_image_768"},
-                    {"image_size": 1152, "num_soft_tokens": 576, "pooled_grid": 24, "function": "encode_image_1152"}
-                ]
+                "image_sizes": [384, 768, 1152]
             }
             """
         let config = try JSONDecoder().decode(VisionConfig.self, from: json.data(using: .utf8)!)
         #expect(config.poolingKernelSize == 3)
         #expect(config.padTokenId == 0)
-        #expect(config.imageBuckets?.count == 3)
-        #expect(config.imageBuckets?.first?.imageSize == 384)
-        #expect(config.imageBuckets?.first?.function == "encode_image_384")
-        #expect(config.imageBuckets?.last?.pooledGrid == 24)
+        #expect(config.imageSizes == [384, 768, 1152])
+        #expect(config.blockPixels == 48)
+        #expect(config.pooledGrid(imageSize: 1152) == 24)
+        #expect(config.softTokenCount(imageSize: 384) == 64)
+        #expect(VisionConfig.encoderFunctionName(imageSize: 768) == "encode_image_768")
     }
 
-    @Test("VisionConfig backwards compatible without a bucket list (Qwen-style)")
-    func visionConfigWithoutImageBuckets() throws {
+    @Test("VisionConfig backwards compatible without a size list (Qwen-style)")
+    func visionConfigWithoutImageSizes() throws {
         let json = """
             {"image_size": 896, "patch_size": 14, "image_token_count": 256, "image_token_id": 255999}
             """
         let config = try JSONDecoder().decode(VisionConfig.self, from: json.data(using: .utf8)!)
-        #expect(config.imageBuckets == nil)
+        #expect(config.imageSizes == nil)
         #expect(config.poolingKernelSize == nil)
     }
 }

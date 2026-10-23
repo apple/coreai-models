@@ -19,14 +19,14 @@ import Foundation
 /// growing single cache), this reuses the ladder's dual-cache/PLE engine and only
 /// adds the encode + scatter steps.
 ///
-/// `vision.aimodel` is itself a ladder of canvas-size buckets
-/// (`VisionConfig.imageBuckets`), not one fixed size: `encodeImage` picks the
-/// smallest bucket that fits the input image without upscaling it, letterboxes
+/// `vision.aimodel` is itself a ladder of canvas sizes
+/// (`VisionConfig.imageSizes`), not one fixed size: `encodeImage` picks the
+/// smallest size that fits the input image without upscaling it, letterboxes
 /// (aspect-preserving resize + zero-pad, block-aligned — see `letterbox`) into that
-/// bucket's canvas, builds the `attn_mask` excluding the padding patches from
+/// canvas, builds the `attn_mask` excluding the padding patches from
 /// attention, and drops the padding-only pooled cells from the output before
 /// wrapping it as `InputEmbeddings` — so the number of soft tokens per image varies
-/// with its content, not just the chosen bucket.
+/// with its content, not just the chosen canvas size.
 extension StaticShapeEngine: MultimodalInferenceEngine {
     /// Overwrite image-placeholder rows of this batch's gathered embeddings with the
     /// encoded image soft tokens. Called from `buildInputs`, after the token-embedding
@@ -116,37 +116,39 @@ extension StaticShapeEngine: MultimodalInferenceEngine {
             throw InferenceRuntimeError.invalidState(
                 "encodeImage called on an engine with no vision model/config")
         }
-        guard let buckets = vc.imageBuckets, !buckets.isEmpty else {
+        guard let imageSizes = vc.imageSizes, !imageSizes.isEmpty else {
             throw InferenceRuntimeError.invalidState(
-                "encodeImage requires VisionConfig.imageBuckets (a Gemma4-style size ladder); "
+                "encodeImage requires VisionConfig.imageSizes (a Gemma4-style size ladder); "
                     + "none present in this bundle's metadata.json")
         }
         let patchSize = vc.patchSize
-        let poolK = vc.poolingKernelSize ?? 1
-        let blockPx = patchSize * poolK
+        let blockPx = vc.blockPixels
 
-        let bucket = Self.chooseBucket(for: cgImage, buckets: buckets)
-        let letterboxed = try Self.letterbox(cgImage: cgImage, bucketSize: bucket.imageSize, blockPx: blockPx)
-        let grid = bucket.imageSize / patchSize
+        let canvasSize = Self.chooseImageSize(for: cgImage, imageSizes: imageSizes)
+        let functionName = VisionConfig.encoderFunctionName(imageSize: canvasSize)
+        let pooledGrid = vc.pooledGrid(imageSize: canvasSize)
+        let softTokenCount = vc.softTokenCount(imageSize: canvasSize)
+        let letterboxed = try Self.letterbox(cgImage: cgImage, bucketSize: canvasSize, blockPx: blockPx)
+        let grid = canvasSize / patchSize
         let numPatches = grid * grid
         let realPatchWidth = letterboxed.realWidthPx / patchSize
         let realPatchHeight = letterboxed.realHeightPx / patchSize
         let realPooledWidth = letterboxed.realWidthPx / blockPx
         let realPooledHeight = letterboxed.realHeightPx / blockPx
 
-        guard let fn = try visionModel.loadFunction(named: bucket.function) else {
-            throw InferenceRuntimeError.invalidState("Cannot load vision function '\(bucket.function)'")
+        guard let fn = try visionModel.loadFunction(named: functionName) else {
+            throw InferenceRuntimeError.invalidState("Cannot load vision function '\(functionName)'")
         }
         let desc = fn.descriptor
         guard let outName = desc.outputNames.first else {
             throw InferenceRuntimeError.invalidState(
-                "Vision function '\(bucket.function)' has no output names")
+                "Vision function '\(functionName)' has no output names")
         }
 
         guard case .ndArray(let pixelDesc) = desc.inputDescriptor(of: "pixel_values") else {
             throw InferenceRuntimeError.invalidInputType("No ndArray descriptor for 'pixel_values'")
         }
-        let resolvedPixel = pixelDesc.resolvingDynamicDimensions([1, 3, bucket.imageSize, bucket.imageSize])
+        let resolvedPixel = pixelDesc.resolvingDynamicDimensions([1, 3, canvasSize, canvasSize])
         var pixelArray = NDArray(descriptor: resolvedPixel)
         fillNDArray(&pixelArray, as: Float16.self, with: letterboxed.chw.map { Float16($0) })
 
@@ -164,7 +166,7 @@ extension StaticShapeEngine: MultimodalInferenceEngine {
             throw InferenceRuntimeError.invalidOutputType("No ndArray descriptor for '\(outName)'")
         }
         let resolvedOut = outDesc.resolvingDynamicDimensions(
-            outDesc.shape.map { $0 < 0 ? bucket.numSoftTokens : $0 })
+            outDesc.shape.map { $0 < 0 ? softTokenCount : $0 })
         var outArray = NDArray(descriptor: resolvedOut)
 
         var outputViews = InferenceFunction.MutableViews()
@@ -175,31 +177,30 @@ extension StaticShapeEngine: MultimodalInferenceEngine {
 
         let realCount = realPooledWidth * realPooledHeight
         let compacted: NDArray
-        if realCount >= bucket.numSoftTokens {
+        if realCount >= softTokenCount {
             // Fully real (image filled the whole bucket) -- nothing to drop.
             compacted = outArray
         } else {
             compacted = try Self.compactRealSoftTokens(
-                from: outArray, pooledGrid: bucket.pooledGrid,
+                from: outArray, pooledGrid: pooledGrid,
                 realPooledWidth: realPooledWidth, realPooledHeight: realPooledHeight)
         }
 
         CLILogger.log(
-            "Vision encode complete: bucket=\(bucket.imageSize) real="
+            "Vision encode complete: canvas=\(canvasSize) real="
                 + "\(letterboxed.realWidthPx)x\(letterboxed.realHeightPx)px "
-                + "\(realCount)/\(bucket.numSoftTokens) soft tokens")
+                + "\(realCount)/\(softTokenCount) soft tokens")
         return try InputEmbeddings(embeddings: compacted, embeddingPositions: 0..<realCount)
     }
 
     // MARK: - Size-ladder helpers
 
-    /// Smallest bucket that fits `cgImage`'s longer side without upscaling it;
-    /// falls back to the largest bucket (downscale) if the image exceeds every
-    /// bucket. `buckets` must be sorted ascending by `imageSize` (guaranteed by the
-    /// exporter — see `export/gemma4_vision.py`).
-    static func chooseBucket(for cgImage: CGImage, buckets: [VisionImageBucket]) -> VisionImageBucket {
+    /// Smallest canvas size that fits `cgImage`'s longer side without upscaling it; falls back
+    /// to the largest size (downscale) if the image exceeds every size. `imageSizes` must be
+    /// sorted ascending (checked when `VisionConfig` is decoded).
+    static func chooseImageSize(for cgImage: CGImage, imageSizes: [Int]) -> Int {
         let longSide = max(cgImage.width, cgImage.height)
-        return buckets.first(where: { $0.imageSize >= longSide }) ?? buckets[buckets.count - 1]
+        return imageSizes.first(where: { $0 >= longSide }) ?? imageSizes[imageSizes.count - 1]
     }
 
     struct LetterboxedImage {
@@ -245,31 +246,15 @@ extension StaticShapeEngine: MultimodalInferenceEngine {
         let targetW = roundUpToBlock(drawW)
         let targetH = roundUpToBlock(drawH)
 
-        guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) else {
-            throw ImagePreprocessorError.renderFailed
-        }
-        guard
-            let ctx = CGContext(
-                data: nil, width: bucketSize, height: bucketSize, bitsPerComponent: 8,
-                bytesPerRow: bucketSize * 4, space: colorSpace,
-                bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)
-        else {
-            throw ImagePreprocessorError.renderFailed
-        }
-        ctx.interpolationQuality = .high
-        ctx.draw(
-            cgImage,
-            in: CGRect(x: 0, y: bucketSize - drawH, width: drawW, height: drawH))
-        guard let canvasImage = ctx.makeImage() else {
-            throw ImagePreprocessorError.renderFailed
-        }
-
         // Rest of the canvas is already zero from the fresh context; mean=0/std=1/
         // rescale=1 (this model's convention -- see export/gemma4_vision.py) keeps a
         // true zero after normalization.
         let preprocessor = ImagePreprocessor(
             targetSize: CGSize(width: bucketSize, height: bucketSize),
             mean: (0, 0, 0), std: (1, 1, 1), rescaleFactor: 1.0)
+        let canvasImage = try preprocessor.renderToContext(
+            cgImage: cgImage, canvasWidth: bucketSize, canvasHeight: bucketSize,
+            drawRect: CGRect(x: 0, y: bucketSize - drawH, width: drawW, height: drawH))
         let chw = try preprocessor.preprocessCHW(cgImage: canvasImage)
 
         return LetterboxedImage(chw: chw, realWidthPx: targetW, realHeightPx: targetH)
@@ -316,7 +301,7 @@ extension StaticShapeEngine: MultimodalInferenceEngine {
             throw InferenceRuntimeError.invalidState(
                 "vision encoder returned \(outputRows) soft tokens, but the bucket's pooled grid is "
                     + "\(pooledGrid)x\(pooledGrid) with a real area of \(realPooledWidth)x\(realPooledHeight); "
-                    + "the bundle's image_buckets do not match its vision program")
+                    + "the bundle's image_sizes do not match its vision program")
         }
         // The copy below views both arrays as `LogitsScalarType`, which traps on any other type.
         guard outArray.scalarType == (LogitsScalarType.self == Float16.self ? .float16 : .float32) else {

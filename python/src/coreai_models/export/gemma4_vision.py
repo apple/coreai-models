@@ -101,6 +101,73 @@ def validate_image_sizes_for_model(
     )
 
 
+def encoder_function_name(image_size: int) -> str:
+    """Name of the ``vision.aimodel`` function for one canvas size. The Swift runtime derives the
+    same name from the size (``VisionConfig.encoderFunctionName(imageSize:)``)."""
+    return f"encode_image_{image_size}"
+
+
+def _write_vision_asset(
+    export_module: torch.nn.Module,
+    encoder: Gemma4VisionEncoderForiOS,
+    image_sizes: tuple[int, ...],
+    *,
+    target_dtype: torch.dtype,
+    vision_path: Path,
+    hf_model_id: str,
+    overwrite: bool,
+) -> None:
+    """Trace one static program per canvas size and save them as one multi-function asset.
+
+    One TorchConverter accumulates every size's traced program as its own named entrypoint,
+    mirroring how models/gemma4/export.py's text ladder registers one extend_<ctx>/prompt_opt_<ctx>
+    pair per context bucket. A single ``to_coreai()`` + ``save_asset()`` then produces one asset
+    that shares the (already palettized) weight tensors across every function.
+    """
+    converter = coreai_torch.TorchConverter(mode=coreai_torch.TorchConverter.Mode.RELEASE)
+    register_custom_torch_lowering(converter)
+    decomp_table = coreai_torch.get_decomp_table()
+
+    for size in image_sizes:
+        if encoder.image_size != size:
+            encoder.resize_to(size)
+        pixel_values = torch.zeros(1, 3, size, size, dtype=target_dtype)
+        attn_mask = torch.zeros(1, encoder.num_patches, 1, encoder.num_patches, dtype=target_dtype)
+        with torch.no_grad():
+            out = export_module(pixel_values, attn_mask)
+        logger.info(
+            f"Vision encoder size {size}: input [1,3,{size},{size}] -> "
+            f"output {tuple(out.shape)} {out.dtype} ({encoder.num_soft_tokens} soft tokens)"
+        )
+
+        entrypoint = encoder_function_name(size)
+        logger.info(f"Tracing {entrypoint}...")
+        with torch.no_grad():
+            exported = torch.export.export(
+                export_module,
+                args=(),
+                kwargs={"pixel_values": pixel_values, "attn_mask": attn_mask},
+                dynamic_shapes=None,
+            ).run_decompositions(decomp_table)
+        remove_functionalization(exported)
+        converter.add_exported_program(
+            exported,
+            input_names=["pixel_values", "attn_mask"],
+            output_names=["image_features"],
+            entrypoint_name=entrypoint,
+        )
+
+    coreai_program = converter.to_coreai()
+
+    if vision_path.exists():
+        if not overwrite:
+            raise FileExistsError(f"{vision_path} exists. Use --overwrite.")
+        shutil.rmtree(vision_path)
+
+    logger.info(f"Saving {vision_path} ({len(image_sizes)} size(s): {list(image_sizes)})...")
+    coreai_program.save_asset(vision_path, build_aimodel_metadata(hf_model_id, component="vision"))
+
+
 def export_gemma4_vision_encoder(
     hf_model_id: str,
     bundle_path: Path,
@@ -183,73 +250,21 @@ def export_gemma4_vision_encoder(
             encoder, (calib_pixels, calib_mask), palettization_cfg
         )
 
-    buckets: list[dict[str, object]] = []
-    entrypoint_names: list[str] = []
-    # One TorchConverter accumulates every bucket's traced program as its own named
-    # entrypoint, mirroring how models/gemma4/export.py's text ladder registers one
-    # extend_<ctx>/prompt_opt_<ctx> pair per context bucket -- a single `to_coreai()`
-    # + `save_asset()` at the end produces one multi-function `.aimodel`, sharing the
-    # (already palettized) weight tensors across every bucket's function.
-    converter = coreai_torch.TorchConverter(mode=coreai_torch.TorchConverter.Mode.RELEASE)
-    register_custom_torch_lowering(converter)
-    decomp_table = coreai_torch.get_decomp_table()
-
-    for size in image_sizes:
-        if size != image_sizes[0]:
-            encoder.resize_to(size)
-        pixel_values = torch.zeros(1, 3, size, size, dtype=target_dtype)
-        attn_mask = torch.zeros(1, encoder.num_patches, 1, encoder.num_patches, dtype=target_dtype)
-        with torch.no_grad():
-            out = export_module(pixel_values, attn_mask)
-        logger.info(
-            f"Vision encoder bucket {size}: input [1,3,{size},{size}] -> "
-            f"output {tuple(out.shape)} {out.dtype} ({encoder.num_soft_tokens} soft tokens)"
-        )
-
-        entrypoint = f"encode_image_{size}"
-        logger.info(f"Tracing {entrypoint}...")
-        with torch.no_grad():
-            exported = torch.export.export(
-                export_module,
-                args=(),
-                kwargs={"pixel_values": pixel_values, "attn_mask": attn_mask},
-                dynamic_shapes=None,
-            ).run_decompositions(decomp_table)
-        remove_functionalization(exported)
-        converter.add_exported_program(
-            exported,
-            input_names=["pixel_values", "attn_mask"],
-            output_names=["image_features"],
-            entrypoint_name=entrypoint,
-        )
-        entrypoint_names.append(entrypoint)
-        buckets.append(
-            {
-                "image_size": size,
-                "num_soft_tokens": encoder.num_soft_tokens,
-                "pooled_grid": encoder.pooled_grid,
-                "function": entrypoint,
-            }
-        )
-
-    logger.info("Applying optimization passes...")
-    coreai_program = converter.to_coreai()
-    coreai_program.optimize()
-
-    vision_path = bundle_path / "vision.aimodel"
-    if vision_path.exists():
-        if not overwrite:
-            raise FileExistsError(f"{vision_path} exists. Use --overwrite.")
-        shutil.rmtree(vision_path)
-
-    logger.info(f"Saving {vision_path} ({len(entrypoint_names)} bucket(s): {entrypoint_names})...")
-    coreai_program.save_asset(vision_path, build_aimodel_metadata(hf_model_id, component="vision"))
+    _write_vision_asset(
+        export_module,
+        encoder,
+        image_sizes,
+        target_dtype=target_dtype,
+        vision_path=bundle_path / "vision.aimodel",
+        hf_model_id=hf_model_id,
+        overwrite=overwrite,
+    )
 
     _patch_metadata(
         bundle_path,
         patch_size=patch_size,
         pooling_kernel_size=pool_k,
-        buckets=buckets,
+        image_sizes=image_sizes,
         image_token_id=image_token_id,
         boi_token_id=boi_token_id,
         eoi_token_id=eoi_token_id,
@@ -264,7 +279,7 @@ def _patch_metadata(
     *,
     patch_size: int,
     pooling_kernel_size: int,
-    buckets: list[dict[str, object]],
+    image_sizes: tuple[int, ...],
     image_token_id: int,
     boi_token_id: int | None,
     eoi_token_id: int | None,
@@ -277,25 +292,25 @@ def _patch_metadata(
 
     metadata["kind"] = "vlm"
     metadata.setdefault("assets", {})["vision"] = "vision.aimodel"
-    # Every bucket's function lives in the one vision asset; register all of them.
+    # Every size's function lives in the one vision asset; register all of them.
     lang = metadata.setdefault("language", {})
     fn_map = lang.setdefault("function_map", {})
-    fn_map["vision"] = [b["function"] for b in buckets]
-    # Top-level `vision` block consumed by Swift VisionConfig (snake_case keys).
-    # `image_size`/`image_token_count` mirror the *largest* bucket for callers that
-    # only look at a single scalar size (e.g. a quick metadata inspection); the
-    # `image_buckets` list is what the runner actually uses to pick a bucket.
-    largest = buckets[-1]
+    fn_map["vision"] = [encoder_function_name(size) for size in image_sizes]
+    # Top-level `vision` block consumed by Swift VisionConfig (snake_case keys). `image_size` and
+    # `image_token_count` describe the *largest* size for callers that only look at a single
+    # scalar (e.g. a quick metadata inspection); `image_sizes` is what the runner uses to pick a
+    # canvas, deriving each size's function name and soft-token count from it.
+    largest = max(image_sizes)
     vision: dict[str, object] = {
-        "image_size": largest["image_size"],
+        "image_size": largest,
         "patch_size": patch_size,
         "pooling_kernel_size": pooling_kernel_size,
-        "image_token_count": largest["num_soft_tokens"],
+        "image_token_count": (largest // (patch_size * pooling_kernel_size)) ** 2,
         "image_token_id": image_token_id,
         "image_mean": list(_IMAGE_MEAN),
         "image_std": list(_IMAGE_STD),
         "rescale_factor": _RESCALE_FACTOR,
-        "image_buckets": buckets,
+        "image_sizes": list(image_sizes),
     }
     if boi_token_id is not None:
         vision["boi_token_id"] = boi_token_id

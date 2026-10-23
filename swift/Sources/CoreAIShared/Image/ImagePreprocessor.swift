@@ -194,7 +194,10 @@ public struct ImagePreprocessor: Sendable {
 
     // MARK: - Private Helpers
 
-    private func renderToContext(
+    /// Draws `cgImage` into `drawRect` of a new sRGB canvas of `canvasWidth` x `canvasHeight`
+    /// pixels (8-bit RGBX, high-quality interpolation) and returns the canvas. Pixels outside
+    /// `drawRect` are zero. The context origin is at the bottom left, as in CoreGraphics.
+    public func renderToContext(
         cgImage: CGImage, canvasWidth: Int, canvasHeight: Int,
         drawRect: CGRect
     ) throws -> CGImage {
