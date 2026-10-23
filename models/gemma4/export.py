@@ -22,6 +22,14 @@ loop, so the graph depends on the context length. The gather is traced and
 specialized as ``ios.py`` does it. A flat global KV cache pairs with a fixed-depth
 sliding-window ring, RoPE arrives precomputed as ``rope_cos``/``rope_sin``, and the
 INT8 Per-Layer Embeddings table is written as a sidecar next to the asset.
+
+``--include-vision`` runs a post-step (``coreai_models.export.gemma4_vision``) that
+adds a ``vision.aimodel`` encoder to the just-exported bundle and upgrades it to
+``kind:"vlm"``, for the multimodal (image input) checkpoints. The vision encoder is
+itself a ladder of canvas-size buckets (``--vision-image-sizes``), not one fixed
+size: the runner letterboxes an input image into the smallest bucket that fits it
+and masks out the padding, so arbitrary input image shapes are supported without
+upscaling small images or squashing large ones to a single resolution.
 """
 
 import argparse
@@ -562,6 +570,19 @@ async def _export_ios(args: argparse.Namespace) -> str:
 # ===========================================================================
 
 
+def _int_list(raw: str) -> tuple[int, ...]:
+    """argparse type for a comma-separated positive-int list."""
+    try:
+        values = tuple(int(x) for x in raw.split(",") if x.strip())
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"expected comma-separated integers, got {raw!r}") from exc
+    if not values:
+        raise argparse.ArgumentTypeError("expected at least one integer")
+    if any(v <= 0 for v in values):
+        raise argparse.ArgumentTypeError(f"values must be positive, got {list(values)}")
+    return values
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Export a Gemma 4 text decoder to a Core AI bundle (iOS).",
@@ -613,6 +634,30 @@ def build_parser() -> argparse.ArgumentParser:
         "asset smaller.",
     )
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable DEBUG logging")
+    parser.add_argument(
+        "--include-vision",
+        action="store_true",
+        help="Also export the vision encoder as vision.aimodel and upgrade the bundle "
+        "to kind:vlm, for multimodal (image input) Gemma4 checkpoints.",
+    )
+    parser.add_argument(
+        "--vision-image-sizes",
+        type=_int_list,
+        metavar="N[,N...]",
+        default=None,
+        help="Square canvas-size buckets (px) for the vision encoder's size ladder, "
+        "smallest first; the runner letterboxes an input image into the smallest "
+        "bucket that fits it (default: coreai_models.export.gemma4_vision."
+        "SHIPPING_IMAGE_SIZE_LADDER). Each must be a multiple of "
+        "patch_size*pooling_kernel_size (48 for E2B/E4B).",
+    )
+    parser.add_argument(
+        "--vision-compression",
+        default="4bit_weight_palettized_group32",
+        help="Palettization preset for the vision tower (default: "
+        "4bit_weight_palettized_group32, matching the text decoder). Use 'none' to "
+        "ship the fp16 tower.",
+    )
 
     return parser
 
@@ -668,7 +713,34 @@ def main() -> None:
             "performance of the result have not been verified."
         )
 
-    print(f"Export complete: {asyncio.run(_export_ios(args))}")
+    if args.include_vision:
+        from coreai_models.export.gemma4_vision import (
+            SHIPPING_IMAGE_SIZE_LADDER,
+            export_gemma4_vision_encoder,
+            validate_image_sizes_for_model,
+        )
+
+        # Check the size ladder against the checkpoint before the expensive text export.
+        try:
+            validate_image_sizes_for_model(
+                args.model, tuple(args.vision_image_sizes or SHIPPING_IMAGE_SIZE_LADDER)
+            )
+        except ValueError as e:
+            raise SystemExit(str(e)) from e
+
+    bundle_path = asyncio.run(_export_ios(args))
+    print(f"Export complete: {bundle_path}")
+
+    if args.include_vision:
+        logger.info("Exporting Gemma4 vision encoder into the bundle...")
+        export_gemma4_vision_encoder(
+            args.model,
+            Path(bundle_path),
+            image_sizes=tuple(args.vision_image_sizes or SHIPPING_IMAGE_SIZE_LADDER),
+            overwrite=args.overwrite,
+            compression=args.vision_compression,
+        )
+        print(f"Vision encoder added (kind:vlm): {bundle_path}")
 
 
 if __name__ == "__main__":

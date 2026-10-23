@@ -102,9 +102,31 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
 
     public var isBusy: Bool { _activeToken.withLock { $0 != nil } }
 
+    // MARK: Multimodal (vision) — nil for text-only bundles
+
+    let visionModel: AIModel?
+    let visionConfig: VisionConfig?
+
+    // Per-generation image state, set by `generate(with: InputEmbeddings, ...)` and
+    // consumed during `buildInputs`. Cleared by the text-only `generate` entry so a
+    // subsequent text turn never scatters stale embeddings.
+    var pendingImageEmbeddings: NDArray?
+    var imageTokenPositions: [Int] = []
+
     /// Clear the engine's active token if it matches the given token.
     func clearTokenIfActive(_ token: GenerationToken) {
-        _activeToken.withLock { if $0 === token { $0 = nil } }
+        let wasActive = _activeToken.withLock { current -> Bool in
+            guard current === token else { return false }
+            current = nil
+            return true
+        }
+        // Only drop image state if this token was still the active one — a
+        // superseded iterator finishing late (after a newer generate() call already
+        // replaced both the token and any image state) must not clobber the new turn.
+        if wasActive {
+            pendingImageEmbeddings = nil
+            imageTokenPositions = []
+        }
     }
 
     // MARK: - Initialization
@@ -115,11 +137,15 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     public init(
         configuration: ModelConfig,
         preparedModel: PreparedModel,
-        tensorData: [String: URL] = [:]
+        tensorData: [String: URL] = [:],
+        visionModel: AIModel? = nil,
+        visionConfig: VisionConfig? = nil
     ) async throws {
         self.config = configuration
         self.model = preparedModel.model
         self.functions = [:]
+        self.visionModel = visionModel
+        self.visionConfig = visionConfig
 
         let allNames = model.functionNames
         CLILogger.log("Model loaded: \(allNames.count) functions: \(allNames.sorted())")
@@ -298,6 +324,44 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
             tensorData: tensorData)
     }
 
+    /// Multimodal convenience init: main ladder at `modelURL` (+ its `tensorData` sidecars)
+    /// plus a separate vision encoder asset. Used for `kind:vlm` bundles whose decoder
+    /// is a Gemma4-style ladder (no separate `embedding` asset).
+    public convenience init(
+        configuration: ModelConfig,
+        modelURL: URL,
+        tensorData: [String: URL] = [:],
+        visionModel: AIModel,
+        visionConfig: VisionConfig
+    ) async throws {
+        let preparedModel = try await PreparedModel.prepare(at: modelURL)
+        try await self.init(
+            configuration: configuration,
+            preparedModel: preparedModel,
+            tensorData: tensorData,
+            visionModel: visionModel,
+            visionConfig: visionConfig)
+    }
+
+    /// Multimodal convenience init from URLs (prepares both assets internally). Lets
+    /// callers wire vision without importing `PreparedModel`/`AIModel` (e.g. `CoreAIRunner`).
+    public convenience init(
+        configuration: ModelConfig,
+        modelURL: URL,
+        tensorData: [String: URL] = [:],
+        visionModelURL: URL,
+        visionConfig: VisionConfig
+    ) async throws {
+        let preparedModel = try await PreparedModel.prepare(at: modelURL)
+        let preparedVision = try await PreparedModel.prepare(at: visionModelURL)
+        try await self.init(
+            configuration: configuration,
+            preparedModel: preparedModel,
+            tensorData: tensorData,
+            visionModel: preparedVision.model,
+            visionConfig: visionConfig)
+    }
+
     // MARK: - Initialization Helpers
 
     private func canRewind(to target: Int) -> Bool {
@@ -438,6 +502,32 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         samplingConfiguration: SamplingConfiguration,
         inferenceOptions: InferenceOptions
     ) async throws -> GenerationSequence {
+        // Text-only entry: drop any image state left over from a prior multimodal
+        // turn so a stale scatter can't corrupt this sequence.
+        pendingImageEmbeddings = nil
+        imageTokenPositions = []
+        return try startGeneration(
+            with: input,
+            samplingConfiguration: samplingConfiguration,
+            inferenceOptions: inferenceOptions)
+    }
+
+    /// Number of leading tokens of `matchedPrefix` whose cached KV can be reused: the token-id
+    /// match, cut at the first position that an image will be scattered into.
+    static func reusablePrefixLength(matchedPrefix: Int, firstImagePosition: Int?) -> Int {
+        guard let firstImagePosition else { return matchedPrefix }
+        return Swift.min(matchedPrefix, firstImagePosition)
+    }
+
+    /// Shared generation setup (prefix-cache resolution + token/sequence creation), used
+    /// by both the text-only `generate` above and the multimodal
+    /// `generate(with: InputEmbeddings, ...)` (see `CoreAIStaticShapeEngine+Multimodal.swift`),
+    /// which sets image state first and so must not go through the clearing entry point.
+    func startGeneration(
+        with input: [TokenId],
+        samplingConfiguration: SamplingConfiguration,
+        inferenceOptions: InferenceOptions
+    ) throws -> GenerationSequence {
         // Cancel any prior generation so its Iterator stops on next poll.
         _activeToken.withLock {
             $0?.cancel()
@@ -446,7 +536,13 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
 
         // Implicit prefix caching: resolve input against history.
         if history.count > 0 {
-            let (commonPrefix, _) = history.resolve(input: input)
+            let (matchedPrefix, _) = history.resolve(input: input)
+            // Every image position carries the same placeholder id, so a token-id match says
+            // nothing about image content: a pending image invalidates the cached prefix from
+            // its first position on.
+            let commonPrefix = Self.reusablePrefixLength(
+                matchedPrefix: matchedPrefix,
+                firstImagePosition: pendingImageEmbeddings == nil ? nil : imageTokenPositions.min())
             if let position = Self.resumePosition(
                 commonPrefix: commonPrefix, inputCount: input.count, historyCount: history.count,
                 processed: processedTokenCount, canRewind: canRewind(to:))
@@ -584,8 +680,34 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
             batchSize: batchSize,
             slidingWindow: nil,
             contextBucket: contextBucket)
+
+        // Multimodal: HF masks image-placeholder positions to the pad token BEFORE the
+        // per-layer-embedding gather (`llm_input_ids = where(image_mask, pad_token_id,
+        // input_ids)`). The image rows carry vision soft tokens, not a real token, so
+        // gathering the placeholder id's own per-layer embedding would inject a spurious
+        // per-layer signal at every layer and corrupt the image representation. Only the
+        // PLE handler needs this correction — the raw embedding-table gather below is
+        // harmless waste for those rows since the scatter overwrites them afterward.
+        let pleContext: InputContext
+        if let imgId = visionConfig?.imageTokenId, pendingImageEmbeddings != nil {
+            let padId = visionConfig?.padTokenId ?? 0
+            let pleTokens = batchTokens.map { $0 == imgId ? padId : $0 }
+            pleContext = InputContext.static(
+                tokens: ArraySlice(pleTokens),
+                alignedStep: alignedStep,
+                batchSize: batchSize,
+                slidingWindow: config.overrides?.slidingWindow,
+                contextBucket: contextBucket)
+        } else {
+            pleContext = context
+        }
+
         for handler in inputHandlers {
-            try handler.fill(context, into: &inputBuffers)
+            if handler is PerLayerEmbeddingsInputHandler {
+                try handler.fill(pleContext, into: &inputBuffers)
+            } else {
+                try handler.fill(context, into: &inputBuffers)
+            }
         }
         var inputs = inputBuffers.borrowedInputs()
 
@@ -602,11 +724,14 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
                     "No gather function '\(gatherName)' for batch size \(batchSize)")
             }
             let gatherSpan = InstrumentsProfiler.beginGatherEmbeddings()
-            let gathered = try await runGather(tokenIDs: Array(batchTokens), batchSize: batchSize)
+            let gatherResult = try await runGather(tokenIDs: Array(batchTokens), batchSize: batchSize)
             gatherSpan.end()
-            guard let gathered else {
+            guard var gathered = gatherResult else {
                 throw InferenceRuntimeError.invalidState("Gather '\(gatherName)' returned no output")
             }
+            // Multimodal: overwrite image-placeholder rows in this batch with the encoded
+            // image soft tokens before they enter the decoder.
+            try scatterImageEmbeddings(into: &gathered, alignedStep: alignedStep, batchSize: batchSize)
             inputs[txName] = gathered
         }
 
@@ -664,22 +789,29 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
             $0?.cancel()
             $0 = nil
         }
+        pendingImageEmbeddings = nil
+        imageTokenPositions = []
     }
 
+    /// Rewinds to `tokenIndex` processed tokens. Throws, leaving the engine unchanged, when
+    /// the index is out of range or the sliding-window ring no longer holds the keys the
+    /// restarted forward needs.
     public func reset(to tokenIndex: Int) async throws {
         precondition(
             tokenIndex >= 0 && tokenIndex <= processedTokenCount,
             "reset(to: \(tokenIndex)) out of range [0, \(processedTokenCount)]")
-        _activeToken.withLock {
-            $0?.cancel()
-            $0 = nil
-        }
         guard canRewind(to: tokenIndex) else {
             throw InferenceRuntimeError.invalidState(
                 "reset(to: \(tokenIndex)) needs keys the sliding-window ring has overwritten "
                     + "(\(processedTokenCount) tokens processed). Use reset(to: 0) and replay "
                     + "the prefix.")
         }
+        _activeToken.withLock {
+            $0?.cancel()
+            $0 = nil
+        }
+        pendingImageEmbeddings = nil
+        imageTokenPositions = []
         let resetSpan = InstrumentsProfiler.beginReset(engine: "StaticShape")
         rewind(to: tokenIndex)
         resetSpan.end()

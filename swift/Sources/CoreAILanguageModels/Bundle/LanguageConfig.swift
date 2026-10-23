@@ -165,6 +165,15 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
         self.tokenizer = try c.decode(String.self, forKey: .tokenizer)
         self.vocabSize = try c.decode(Int.self, forKey: .vocabSize)
         self.maxContextLength = try c.decode(Int.self, forKey: .maxContextLength)
+        guard vocabSize > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .vocabSize, in: c, debugDescription: "vocab_size must be positive, got \(vocabSize)")
+        }
+        guard maxContextLength > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .maxContextLength, in: c,
+                debugDescription: "max_context_length must be positive, got \(maxContextLength)")
+        }
         self.embeddedTokenizer = try c.decodeIfPresent(Bool.self, forKey: .embeddedTokenizer) ?? true
         self.functionMap = try c.decodeIfPresent(FunctionMap.self, forKey: .functionMap)
         self.vision = try c.decodeIfPresent(VisionConfig.self, forKey: .vision)
@@ -344,6 +353,28 @@ public struct VisionConfig: Codable, Sendable, Equatable {
     /// Visual tokens produced per frame. Nil defaults to `imageTokenCount`.
     public let tokensPerFrame: Int?
 
+    /// Begin-of-image / end-of-image marker token IDs that wrap the image-placeholder
+    /// block in the prompt (Gemma4: `<|image>` / `<image|>`). Nil for models that don't
+    /// delimit the image region (e.g. Qwen). When present, the prompt builder emits
+    /// `boi + imageToken×count + eoi`.
+    public let boiTokenId: Int32?
+    public let eoiTokenId: Int32?
+
+    /// Pad token ID. Used to mask image-placeholder positions before the per-layer
+    /// embedding gather (matching HF's `where(image_mask, pad_token_id, input_ids)`),
+    /// so a placeholder's own per-layer embedding isn't spuriously injected. Nil for
+    /// bundles exported before this field existed — callers fall back to `0`.
+    public let padTokenId: Int32?
+
+    /// Patch count per pooled soft token, along one axis (Gemma4's 3x3 average pool).
+    /// Nil for models with no pooling stage (e.g. Qwen).
+    public let poolingKernelSize: Int?
+
+    /// Canvas-size buckets for a variable-input-shape vision encoder (Gemma4), one
+    /// exported function per bucket, smallest first. Nil for a fixed single-size
+    /// encoder (e.g. Qwen), which uses `imageSize`/`imageTokenCount` directly instead.
+    public let imageBuckets: [VisionImageBucket]?
+
     /// CLIP normalization (Qwen VL, Pixtral, InternVL, Phi-3.5-vision).
     public static let clipMean = [0.48145466, 0.4578275, 0.40821073]
     public static let clipStd = [0.26862954, 0.26130258, 0.27577711]
@@ -359,7 +390,12 @@ public struct VisionConfig: Codable, Sendable, Equatable {
         imageStrategy: ImageStrategy? = nil,
         includeImageInfo: Bool? = nil,
         maxVideoFrames: Int? = nil,
-        tokensPerFrame: Int? = nil
+        tokensPerFrame: Int? = nil,
+        boiTokenId: Int32? = nil,
+        eoiTokenId: Int32? = nil,
+        padTokenId: Int32? = nil,
+        poolingKernelSize: Int? = nil,
+        imageBuckets: [VisionImageBucket]? = nil
     ) {
         self.imageSize = imageSize
         self.patchSize = patchSize
@@ -372,6 +408,11 @@ public struct VisionConfig: Codable, Sendable, Equatable {
         self.includeImageInfo = includeImageInfo ?? false
         self.maxVideoFrames = maxVideoFrames
         self.tokensPerFrame = tokensPerFrame
+        self.boiTokenId = boiTokenId
+        self.eoiTokenId = eoiTokenId
+        self.padTokenId = padTokenId
+        self.poolingKernelSize = poolingKernelSize
+        self.imageBuckets = imageBuckets
     }
 
     enum CodingKeys: String, CodingKey {
@@ -386,6 +427,11 @@ public struct VisionConfig: Codable, Sendable, Equatable {
         case includeImageInfo = "include_image_info"
         case maxVideoFrames = "max_video_frames"
         case tokensPerFrame = "tokens_per_frame"
+        case boiTokenId = "boi_token_id"
+        case eoiTokenId = "eoi_token_id"
+        case padTokenId = "pad_token_id"
+        case poolingKernelSize = "pooling_kernel_size"
+        case imageBuckets = "image_buckets"
     }
 
     public init(from decoder: Swift.Decoder) throws {
@@ -401,5 +447,83 @@ public struct VisionConfig: Codable, Sendable, Equatable {
         self.includeImageInfo = try c.decodeIfPresent(Bool.self, forKey: .includeImageInfo) ?? false
         self.maxVideoFrames = try c.decodeIfPresent(Int.self, forKey: .maxVideoFrames)
         self.tokensPerFrame = try c.decodeIfPresent(Int.self, forKey: .tokensPerFrame)
+        self.boiTokenId = try c.decodeIfPresent(Int32.self, forKey: .boiTokenId)
+        self.eoiTokenId = try c.decodeIfPresent(Int32.self, forKey: .eoiTokenId)
+        self.padTokenId = try c.decodeIfPresent(Int32.self, forKey: .padTokenId)
+        self.poolingKernelSize = try c.decodeIfPresent(Int.self, forKey: .poolingKernelSize)
+        self.imageBuckets = try c.decodeIfPresent([VisionImageBucket].self, forKey: .imageBuckets)
+        try validate(in: c)
+    }
+
+    /// The geometry the vision path divides and indexes by. A size ladder must be sorted
+    /// ascending and unique (bucket selection takes the first that fits), every bucket a multiple
+    /// of `patchSize * poolingKernelSize` (the letterbox pads in whole pool blocks), and each
+    /// pooled grid and soft-token count consistent with its size.
+    private func validate(in c: KeyedDecodingContainer<CodingKeys>) throws {
+        func fail(_ key: CodingKeys, _ message: String) -> DecodingError {
+            DecodingError.dataCorruptedError(forKey: key, in: c, debugDescription: message)
+        }
+        guard imageSize > 0 else { throw fail(.imageSize, "image_size must be positive, got \(imageSize)") }
+        guard patchSize > 0 else { throw fail(.patchSize, "patch_size must be positive, got \(patchSize)") }
+        if let poolingKernelSize, poolingKernelSize <= 0 {
+            throw fail(.poolingKernelSize, "pooling_kernel_size must be positive, got \(poolingKernelSize)")
+        }
+        guard let imageBuckets else { return }
+        guard !imageBuckets.isEmpty else { throw fail(.imageBuckets, "image_buckets must not be empty") }
+        let block = patchSize * (poolingKernelSize ?? 1)
+        var previous = 0
+        for bucket in imageBuckets {
+            guard bucket.imageSize > previous else {
+                throw fail(
+                    .imageBuckets,
+                    "image_buckets must be positive, ascending and unique by image_size (\(bucket.imageSize) "
+                        + "follows \(previous))")
+            }
+            previous = bucket.imageSize
+            guard bucket.imageSize % block == 0 else {
+                throw fail(
+                    .imageBuckets,
+                    "image_buckets image_size \(bucket.imageSize) is not a multiple of patch_size * "
+                        + "pooling_kernel_size (\(block))")
+            }
+            let grid = bucket.imageSize / block
+            guard bucket.pooledGrid == grid, bucket.numSoftTokens == grid * grid, !bucket.function.isEmpty else {
+                throw fail(
+                    .imageBuckets,
+                    "image_buckets entry for \(bucket.imageSize) must have pooled_grid \(grid), num_soft_tokens "
+                        + "\(grid * grid) and a function name")
+            }
+        }
+    }
+}
+
+/// One canvas-size bucket of a variable-input-shape vision encoder (Gemma4's size
+/// ladder): a runner picks the smallest bucket that fits an input image and calls
+/// its `function`. See `Gemma4VisionEncoderForiOS`'s docstring (python side) for why
+/// the ladder exists and how padding/masking works within a bucket.
+public struct VisionImageBucket: Codable, Sendable, Equatable {
+    /// Square canvas size (px) this bucket's function expects as `pixel_values`.
+    public let imageSize: Int
+    /// Soft tokens this bucket's function always outputs (`pooledGrid * pooledGrid`);
+    /// the real (non-padding) subset is generally fewer — see the pooled-grid math in
+    /// `CoreAIStaticShapeEngine+Multimodal.swift`.
+    public let numSoftTokens: Int
+    /// Side length of the pooled output grid (`imageSize / patchSize / poolingKernelSize`).
+    public let pooledGrid: Int
+    /// Physical function name in `vision.aimodel` for this bucket (e.g. `encode_image_768`).
+    public let function: String
+
+    public init(imageSize: Int, numSoftTokens: Int, pooledGrid: Int, function: String) {
+        self.imageSize = imageSize
+        self.numSoftTokens = numSoftTokens
+        self.pooledGrid = pooledGrid
+        self.function = function
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case imageSize = "image_size"
+        case numSoftTokens = "num_soft_tokens"
+        case pooledGrid = "pooled_grid"
+        case function
     }
 }

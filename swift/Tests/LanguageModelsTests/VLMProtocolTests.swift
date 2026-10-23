@@ -110,4 +110,42 @@ struct MultimodalTypeTests {
         #expect(config.imageSize == 896)
         #expect(config.imageTokenCount == 256)
     }
+
+    @Test("VisionConfig decodes a Gemma4-style size-ladder bucket list")
+    func visionConfigWithImageBuckets() throws {
+        let json = """
+            {
+                "image_size": 1152,
+                "patch_size": 16,
+                "pooling_kernel_size": 3,
+                "image_token_count": 576,
+                "image_token_id": 258880,
+                "boi_token_id": 255999,
+                "eoi_token_id": 258882,
+                "pad_token_id": 0,
+                "image_buckets": [
+                    {"image_size": 384, "num_soft_tokens": 64, "pooled_grid": 8, "function": "encode_image_384"},
+                    {"image_size": 768, "num_soft_tokens": 256, "pooled_grid": 16, "function": "encode_image_768"},
+                    {"image_size": 1152, "num_soft_tokens": 576, "pooled_grid": 24, "function": "encode_image_1152"}
+                ]
+            }
+            """
+        let config = try JSONDecoder().decode(VisionConfig.self, from: json.data(using: .utf8)!)
+        #expect(config.poolingKernelSize == 3)
+        #expect(config.padTokenId == 0)
+        #expect(config.imageBuckets?.count == 3)
+        #expect(config.imageBuckets?.first?.imageSize == 384)
+        #expect(config.imageBuckets?.first?.function == "encode_image_384")
+        #expect(config.imageBuckets?.last?.pooledGrid == 24)
+    }
+
+    @Test("VisionConfig backwards compatible without a bucket list (Qwen-style)")
+    func visionConfigWithoutImageBuckets() throws {
+        let json = """
+            {"image_size": 896, "patch_size": 14, "image_token_count": 256, "image_token_id": 255999}
+            """
+        let config = try JSONDecoder().decode(VisionConfig.self, from: json.data(using: .utf8)!)
+        #expect(config.imageBuckets == nil)
+        #expect(config.poolingKernelSize == nil)
+    }
 }

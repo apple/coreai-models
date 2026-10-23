@@ -440,12 +440,12 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         let modelVocabSize = bundle.vocabSize
 
         // Resolve component model URLs once; reused for the cache check and model loading below.
-        // An LLM bundle has only `main`; VLM bundles also have `vision` and `embedding`.
+        // An LLM bundle has only `main`; VLM bundles also have `vision`, plus `embedding` for
+        // Qwen-style engines (Gemma4-style ladder VLMs have no separate `embedding` asset).
         let isVLM = bundle.modelBundle.kind == .vlm
         let languageModelURL = try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.main)
         let visionModelURL = isVLM ? try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.vision) : nil
-        let embeddingModelURL =
-            isVLM ? try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.embedding) : nil
+        let embeddingModelURL = isVLM ? bundle.modelBundle.modelURL(for: ModelBundle.ComponentKey.embedding) : nil
 
         if clearCoreAICache {
             let cleared = try PreparedModel.clearCache(at: bundle.bundlePath)
@@ -454,13 +454,16 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
 
         // Detect an existing cached specialization before loading so we can annotate the load
         // time below. This only inspects the cache; it never triggers specialization. For VLM
-        // bundles, all three components must be cached to count as a hit.
+        // bundles, every component the bundle actually declares must be cached to count as a hit.
         let cacheHit: Bool
         if let visionModelURL, let embeddingModelURL {
             cacheHit =
                 PreparedModel.isCached(at: visionModelURL)
                 && PreparedModel.isCached(at: embeddingModelURL)
                 && PreparedModel.isCached(at: languageModelURL)
+        } else if let visionModelURL {
+            cacheHit =
+                PreparedModel.isCached(at: visionModelURL) && PreparedModel.isCached(at: languageModelURL)
         } else {
             cacheHit = PreparedModel.isCached(at: languageModelURL)
         }

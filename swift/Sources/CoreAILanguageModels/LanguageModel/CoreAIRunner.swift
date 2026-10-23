@@ -66,6 +66,27 @@ public struct CoreAIRunner {
         try bundle.modelBundle.validateModelAssets()
 
         let config = makeConfig()
+
+        // Gemma4-style ladder VLM (dual-cache + PLE, no separate `embedding` asset): the
+        // factory builds the multimodal StaticShapeEngine so `encodeImage` + soft-token
+        // scatter work. Qwen-style VLMs (with a separate `embedding` asset for
+        // `embed_tokens`) are constructed elsewhere (`CoreAIVisionLanguageModel`), not
+        // through this runner.
+        if bundle.modelBundle.kind == .vlm,
+            bundle.modelBundle.modelURL(for: ModelBundle.ComponentKey.embedding) == nil,
+            bundle.visionConfig != nil
+        {
+            return try await EngineFactory.createEngine(
+                bundle: bundle,
+                options: EngineOptions(
+                    variant: engineVariant,
+                    kvCacheStrategy: kvCacheStrategy,
+                    prefillChunkSize: prefillChunkSizeOverride ?? bundle.language.prefillChunkSize,
+                    prefillChunkThreshold: prefillChunkThresholdOverride
+                        ?? bundle.language.prefillChunkThreshold,
+                    tensorData: bundle.tensorData))
+        }
+
         let configData = try JSONEncoder().encode(config)
 
         let resolvedChunkSize = prefillChunkSizeOverride ?? bundle.language.prefillChunkSize

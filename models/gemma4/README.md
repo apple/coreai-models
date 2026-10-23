@@ -87,6 +87,33 @@ Embeddings table is written as a sidecar next to the asset.
 
 Due to a known issue with coreai-build in Xcode 27.2 beta, Ahead-of-time compilation is not supported for this model. Please use on-device specialization from .aimodel directly.
 
+### Image input (vision)
+
+Pass `--include-vision` to also export a vision encoder into the bundle,
+upgrading it to `kind:vlm`:
+
+```bash
+uv run export.py --model google/gemma-4-E2B-it --include-vision
+```
+
+The vision encoder is a ladder of canvas-size buckets, not one fixed
+resolution: at runtime, an input image is letterboxed (aspect-preserving
+resize + zero-pad, never upscaled) into the smallest bucket that fits it, and
+the padding is masked out of attention. Options:
+
+```bash
+# Custom bucket ladder (px), smallest first. Each must be a multiple of
+# patch_size * pooling_kernel_size (48 for E2B/E4B) so padding stays
+# pool-block-aligned. Defaults to 384/768/1152.
+uv run export.py --model google/gemma-4-E2B-it --include-vision \
+  --vision-image-sizes 384,768,1152
+
+# Compression for the vision tower (default matches the text decoder's
+# 4-bit palettization). Use 'none' to ship the tower at fp16.
+uv run export.py --model google/gemma-4-E2B-it --include-vision \
+  --vision-compression none
+```
+
 ### Runner side
 
 There is no Gemma-specific engine. The generic static-shape engine drives these
@@ -123,6 +150,13 @@ print(response)
 
 ```bash
 swift run -c release llm-runner --model path/to/exported_model_folder --prompt "Hello"
+```
+
+For a bundle exported with `--include-vision`, pass `--image`:
+
+```bash
+swift run -c release llm-runner --model path/to/exported_model_folder \
+  --image path/to/photo.jpg --prompt "Describe this image."
 ```
 
 ## Benchmark a Core AI Language Model
