@@ -130,6 +130,16 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     )
     var jsonSchema: String?
 
+    @Option(
+        name: .customLong("json-max-whitespace"),
+        help:
+            "With --json-schema: most whitespace characters allowed between two JSON tokens (default: 32; 0 for no limit). Ends a model that keeps emitting whitespace after the last value; output that stays within the limit is unchanged."
+    )
+    var jsonMaxWhitespace: Int = ConstrainedGenerationSession.defaultMaxWhitespaceCount
+
+    /// The whitespace limit named by `--json-max-whitespace`; nil for no limit.
+    private var maxWhitespaceCount: Int? { jsonMaxWhitespace > 0 ? jsonMaxWhitespace : nil }
+
     @Option(help: "Model inference engine variant. Defaults to 'default'")
     var inferenceEngineVariant: String = "default"
 
@@ -295,6 +305,9 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             throw ValidationError(
                 "--repetition-penalty cannot be used with --json-schema"
                     + " (constrained generation does not support penalty on the pipelined engine)")
+        }
+        if jsonMaxWhitespace < 0 {
+            throw ValidationError("--json-max-whitespace must be >= 0 (0 for no limit)")
         }
     }
 
@@ -842,12 +855,14 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         if inferenceEngine is any ConstrainedGenerationCapable {
             constrainedStrategy = PipelinedConstrainedDecodingStrategy(
                 jsonSchema: schema,
-                vocabSize: vocabSize
+                vocabSize: vocabSize,
+                maxWhitespaceCount: maxWhitespaceCount
             )
         } else {
             constrainedStrategy = ConstrainedDecodingStrategy(
                 jsonSchema: schema,
-                vocabSize: vocabSize
+                vocabSize: vocabSize,
+                maxWhitespaceCount: maxWhitespaceCount
             )
         }
 
