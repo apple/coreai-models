@@ -44,8 +44,8 @@ private func drain(
     return (tokens, reason)
 }
 
-/// Mock `BatchedDecodeStep` that predicts the last input token plus one. A request with prompt
-/// `[..., k]` and `maxTokens: m` generates `k+1` through `k+m`.
+/// Mock `BatchedDecodeStep` that predicts the last input token plus one, mod 64. A request with
+/// prompt `[..., k]` and `maxTokens: m` generates `k+1` through `k+m`.
 ///
 /// Records the forward count, each decode's `startPositions`, each scoring forward's row count, and
 /// the peak number of overlapping forward calls. `forwardDelay` is a sleep added to every forward call.
@@ -102,7 +102,7 @@ private final class CountUpDecodeStep: BatchedDecodeStep, @unchecked Sendable {
         await enter()
         defer { leave() }
         if let failPrefillFor, promptTokens.first == failPrefillFor { throw Boom() }
-        return oneHot((promptTokens.last ?? 0) + 1)
+        return oneHot(((promptTokens.last ?? 0) + 1) % 64)
     }
 
     func decodeBatch(
@@ -112,7 +112,7 @@ private final class CountUpDecodeStep: BatchedDecodeStep, @unchecked Sendable {
         defer { leave() }
         record.withLock { $0.startPositions.append(startPositions) }
         if failDecode { throw Boom() }
-        return tokensPerRow.map { oneHot(($0.last ?? 0) + 1) }
+        return tokensPerRow.map { oneHot((($0.last ?? 0) + 1) % 64) }
     }
 
     func allPositionLogits(
@@ -303,6 +303,36 @@ struct BatchSchedulerTests {
         }
     }
 
+    @Test("Dropped streams free their row, and a dropped queued request is never decoded")
+    func droppedStreamsFreeRows() async throws {
+        let mock = CountUpDecodeStep(capacity: 1, forwardDelay: .milliseconds(1))
+        let scheduler = makeScheduler(mock, maxConcurrent: 1)
+        do {
+            var reading = try scheduler.submit(req(prompt: [1], maxTokens: 1000)).makeAsyncIterator()
+            _ = try await reading.next()
+            _ = try scheduler.submit(req(prompt: [2], maxTokens: 1000))
+        }
+        let (tokens, _) = try await drain(try scheduler.submit(req(prompt: [5], maxTokens: 2)))
+        #expect(tokens == [6, 7])
+        #expect(mock.forwards < 100)
+    }
+
+    @Test("setStopReason on the output sequence ends the request within one decode step")
+    func setStopReasonCancels() async throws {
+        let mock = CountUpDecodeStep(capacity: 1, forwardDelay: .milliseconds(1))
+        let scheduler = makeScheduler(mock, maxConcurrent: 1)
+        let request = req(prompt: [1], maxTokens: 1000)
+        let sequence = SchedulerSession.GenerationSequence(
+            events: try scheduler.submit(request), cancellation: request.cancellation)
+        var forwardsAtStop = 0
+        for try await _ in sequence where forwardsAtStop == 0 {
+            forwardsAtStop = mock.forwards
+            sequence.setStopReason(.stopSequence("4"))
+        }
+        #expect(mock.forwards - forwardsAtStop <= 1)
+        #expect(sequence.stopReason == .stopSequence("4"))
+    }
+
     // MARK: - Scoring
 
     /// Makes a top-2 score request for `tokens` whose target at each position is the next token,
@@ -373,7 +403,7 @@ struct SchedulerSessionSequenceTests {
         if let finished { continuation.yield(.finished(finished)) }
         continuation.finish()
 
-        let sequence = SchedulerSession.GenerationSequence(events: stream)
+        let sequence = SchedulerSession.GenerationSequence(events: stream, cancellation: RequestCancellation())
         var tokens: [Int32] = []
         for try await output in sequence { tokens.append(output.tokenId) }
         #expect(tokens == [10, 20])

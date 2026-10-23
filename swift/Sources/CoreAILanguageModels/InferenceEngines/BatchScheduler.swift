@@ -25,8 +25,11 @@ import Synchronization
 /// - Admission: a queued request takes a free slot, is prefilled into its row and samples its first
 ///   token.
 /// - Decode: each step runs `decodeBatch` over all `N` rows, every live row at its own cursor.
-/// - Retirement: the row ends on EOS, a stop sequence or `maxTokens`, and the slot takes the next
-///   queued request while the other rows keep decoding.
+/// - Retirement: the row ends on EOS, a stop sequence, `maxTokens` or cancellation, and the slot
+///   takes the next queued request while the other rows keep decoding.
+///
+/// A request is cancelled by `BatchRequest.cancellation` or by dropping its stream. A cancelled
+/// request leaves before the next decode step, or leaves the queue without a prefill.
 ///
 /// `score(_:)` requests run as their own padded batch between decode steps.
 package final class BatchScheduler: RequestSink, @unchecked Sendable {
@@ -51,6 +54,15 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
         /// first.
         var scoring: [ScoringJob] = []
         var pumping = false
+
+        /// Removes cancelled requests from the queue and finishes their streams.
+        mutating func dropCancelledRequests() {
+            queue.removeAll { pending in
+                guard pending.request.cancellation.isCancelled else { return false }
+                pending.continuation.finish()
+                return true
+            }
+        }
     }
     private let state = Mutex(State())
     /// Lock held by the pump during each iteration, and by an `ExclusiveEngineLease` until it is
@@ -124,10 +136,14 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
         pending.reserveCapacity(requests.count)
         for request in requests {
             let (stream, continuation) = AsyncThrowingStream.makeStream(of: BatchSinkEvent.self)
+            continuation.onTermination = { [cancellation = request.cancellation] termination in
+                if case .cancelled = termination { cancellation.cancel() }
+            }
             streams.append(stream)
             pending.append(Pending(request: request, continuation: continuation))
         }
         let shouldStart = try state.withLock { s -> Bool in
+            s.dropCancelledRequests()
             let freeRows = maxConcurrent - s.occupiedRows
             if let maxQueued, s.queue.count + pending.count > freeRows + maxQueued {
                 throw InferenceRuntimeError.queueFull(depth: maxQueued)
@@ -151,7 +167,7 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
 
     /// Scheduling loop, run by at most one task at a time. Each iteration does the following:
     /// 1. Run every waiting scoring job.
-    /// 2. Admit queued requests into free slots.
+    /// 2. Admit queued requests into free slots, and retire cancelled rows.
     /// 3. If no slot is live, loop again when requests or scoring jobs are waiting, otherwise clear
     ///    `pumping` and return.
     /// 4. Run one `decodeBatch` over all `N` slots with `tokens` `[N][1]` and `cursors` `[N]`. A free
@@ -168,6 +184,10 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
                 defer { engineLock.unlock() }
                 await runPendingScoring()
                 await admit(into: &active)
+                for slot in active.indices where active[slot]?.adapter.request.cancellation.isCancelled == true {
+                    active[slot]!.continuation.finish()
+                    retire(slot, active: &active)
+                }
 
                 let liveSlots = active.indices.filter { active[$0] != nil }
                 if liveSlots.isEmpty {
@@ -212,6 +232,7 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
     private func admit(into active: inout [ActiveRow?]) async {
         for slot in active.indices where active[slot] == nil {
             let pending: Pending? = state.withLock { s in
+                s.dropCancelledRequests()
                 guard !s.queue.isEmpty else { return nil }
                 s.occupiedRows += 1
                 return s.queue.removeFirst()
@@ -247,9 +268,13 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
         } else {
             active[slot]!.continuation.yield(.finished(active[slot]!.adapter.stopReason ?? .maxTokens))
             active[slot]!.continuation.finish()
-            active[slot] = nil
-            state.withLock { $0.occupiedRows -= 1 }
+            retire(slot, active: &active)
         }
+    }
+
+    private func retire(_ slot: Int, active: inout [ActiveRow?]) {
+        active[slot] = nil
+        state.withLock { $0.occupiedRows -= 1 }
     }
 
     // MARK: - Scoring
@@ -390,6 +415,8 @@ package struct BatchRequest: Sendable {
     /// Converts a matched stop sequence's tokens to the text reported in `StopReason.stopSequence`.
     /// Defaults to an empty string.
     let decodeStopText: @Sendable ([Int32]) -> String
+    /// Cancels the request when set. Dropping the request's stream also cancels it.
+    let cancellation = RequestCancellation()
 
     init(
         promptTokens: [Int32],
@@ -406,6 +433,15 @@ package struct BatchRequest: Sendable {
         self.stopSequences = stopSequences
         self.decodeStopText = decodeStopText
     }
+}
+
+/// A flag that cancels a `BatchRequest`. Safe to set from any task.
+final class RequestCancellation: Sendable {
+    private let cancelled = Atomic<Bool>(false)
+
+    var isCancelled: Bool { cancelled.load(ordering: .relaxed) }
+
+    func cancel() { cancelled.store(true, ordering: .relaxed) }
 }
 
 /// An event on a request's stream from a `RequestSink`. A stream yields `.token` events, then one

@@ -42,13 +42,12 @@ package final class SchedulerSession: InferenceEngine, @unchecked Sendable {
     ) async throws -> GenerationSequence {
         let contextRoom = Swift.max(1, config.maxContextLength - input.count)
         let requested = inferenceOptions.maxTokens ?? contextRoom
-        let stream = try sink.submit(
-            BatchRequest(
-                promptTokens: input.map { Int32($0) },
-                sampling: samplingConfiguration,
-                eosTokenIds: stopTokenIds,
-                maxTokens: Swift.max(1, Swift.min(requested, contextRoom))))
-        return GenerationSequence(events: stream)
+        let request = BatchRequest(
+            promptTokens: input.map { Int32($0) },
+            sampling: samplingConfiguration,
+            eosTokenIds: stopTokenIds,
+            maxTokens: Swift.max(1, Swift.min(requested, contextRoom)))
+        return GenerationSequence(events: try sink.submit(request), cancellation: request.cancellation)
     }
 
     /// Does nothing.
@@ -69,17 +68,22 @@ extension SchedulerSession {
     /// The sink's event stream for one request, as an `InferenceOutputSequence`.
     ///
     /// `stopReason` is the sink's `.finished` reason, or `.maxTokens` when the stream ends without
-    /// one. A reason set with `setStopReason(_:)` takes precedence.
+    /// one. `setStopReason(_:)` overrides it and cancels the request, so the stream ends within one
+    /// decode step.
     package struct GenerationSequence: InferenceOutputSequence {
         package typealias Element = InferenceOutput
         package typealias Failure = Error
 
         let events: AsyncThrowingStream<BatchSinkEvent, Error>
+        let cancellation: RequestCancellation
         let stopReasonStore = StopReasonStore()
 
         package var stopReason: StopReason? { stopReasonStore.stopReason }
 
-        package func setStopReason(_ reason: StopReason) { stopReasonStore.set(reason) }
+        package func setStopReason(_ reason: StopReason) {
+            stopReasonStore.set(reason)
+            cancellation.cancel()
+        }
 
         package func makeAsyncIterator() -> Iterator {
             Iterator(upstream: events.makeAsyncIterator(), stopReasonStore: stopReasonStore)
