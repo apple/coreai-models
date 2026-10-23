@@ -396,3 +396,23 @@ struct MainGraphStepSizesTests {
         }
     }
 }
+
+/// Covers whether a scored continuation runs as one `main` batch. A width-1 `main` beside a
+/// prefill graph must never get one.
+@Suite("Forced continuation batching")
+struct ForcedContinuationBatchingTests {
+    @Test("Without a prefill graph, a scored continuation runs as one batch")
+    func batchesWithoutPrefillGraph() {
+        for length in [-1, 1, 64, nil] as [Int?] {
+            #expect(forcedContinuationRunsAsOneBatch(hasPrefillGraph: false, mainSequenceLength: length))
+        }
+    }
+
+    @Test("With a prefill graph, only a dynamic-width main takes the batch")
+    func batchesOnlyDynamicMainWithPrefillGraph() {
+        #expect(forcedContinuationRunsAsOneBatch(hasPrefillGraph: true, mainSequenceLength: -1))
+        #expect(!forcedContinuationRunsAsOneBatch(hasPrefillGraph: true, mainSequenceLength: 1))
+        #expect(!forcedContinuationRunsAsOneBatch(hasPrefillGraph: true, mainSequenceLength: 64))
+        #expect(!forcedContinuationRunsAsOneBatch(hasPrefillGraph: true, mainSequenceLength: nil))
+    }
+}

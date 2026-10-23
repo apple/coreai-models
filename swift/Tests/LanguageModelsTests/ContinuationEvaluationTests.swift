@@ -353,3 +353,138 @@ struct ContinuationEvaluationIntegrationTests {
         #expect(encoding.continuationTokens.count >= 1)
     }
 }
+
+// MARK: - Raw Token Scoring Tests
+
+/// Records what each `generate` call was fed, so a test can assert on the context and the forced
+/// continuation a scoring run hands the engine.
+private final class RecordingEngine: MockEngine, @unchecked Sendable {
+    private(set) var fedInputs: [[TokenId]] = []
+    private(set) var fedContinuations: [[TokenId]?] = []
+
+    override func generate(
+        with input: [TokenId],
+        samplingConfiguration: SamplingConfiguration,
+        inferenceOptions: InferenceOptions
+    ) async throws -> GenerationSequence {
+        fedInputs.append(input)
+        fedContinuations.append(inferenceOptions.forcedContinuation)
+        return try await super.generate(
+            with: input, samplingConfiguration: samplingConfiguration, inferenceOptions: inferenceOptions)
+    }
+}
+
+/// How `TextGenerator` scores and generates from pre-tokenized ids. The decisions and refusals of
+/// llm-runner's raw-token options are covered in `LLMRunnerTests`.
+@Suite("Raw token evaluation")
+struct RawTokenEvaluationTests {
+    private func makeGenerator(engine: MockEngine) async throws -> TextGenerator {
+        try await TextGeneratorBuilder()
+            .withInferenceEngine(engine)
+            .withSampling(configuration: .greedy)
+            .withDecoding(type: .vanilla, parameters: DecodingParameters())
+            .withTokenizer(MockTokenizer())
+            .build()
+    }
+
+    // MARK: Generating
+
+    @Test("Generating from raw tokens writes a tokens document for each generated position")
+    func generationWritesTokensDocument() async throws {
+        let engine = RecordingEngine(tokens: [10, 20, 30], vocabSize: 100)
+        let generator = try await makeGenerator(engine: engine)
+
+        let result = try await generator.generateWithLogits(
+            input: .tokens([1, 2, 3, 4]), maxTokens: 3, stopSequences: StopSequences(sequences: []))
+        #expect(engine.fedInputs == [[1, 2, 3, 4]])
+        #expect(engine.fedContinuations == [nil])
+
+        let tempFile = TempFile()
+        defer { tempFile.cleanup() }
+        try LogitsWriter.handleOutput(
+            logits: result.logits,
+            generatedTokenIds: result.tokenIds,
+            tokenizer: MockTokenizer(),
+            saveLogitsLength: .count(5),
+            saveJsonPath: tempFile.path,
+            printToConsole: false
+        )
+
+        let decoded = try JSONDecoder().decode(LogitsOutput.self, from: try tempFile.readData())
+        #expect(decoded.tokens.map(\.tokenId) == [10, 20, 30])
+        #expect(decoded.tokens.allSatisfy { $0.topLogits.count == 5 })
+        #expect(decoded.tokens.allSatisfy { $0.topLogits.first?.tokenId == $0.tokenId })
+
+        let json = try #require(
+            try JSONSerialization.jsonObject(with: try tempFile.readData()) as? [String: Any])
+        #expect(Set(json.keys) == ["tokens"])
+        let positions = try #require(json["tokens"] as? [[String: Any]])
+        #expect(positions.count == 3)
+        #expect(positions.allSatisfy { Set($0.keys) == ["token_id", "incremental_text", "top_logits"] })
+    }
+
+    // MARK: Scoring
+
+    @Test("Scoring feeds the whole multi-token context and scores each continuation id")
+    func scoringFeedsWholeContext() async throws {
+        let engine = RecordingEngine(tokens: [10, 20, 30], vocabSize: 100)
+        let generator = try await makeGenerator(engine: engine)
+        let context: [Int32] = [11, 12, 13, 14, 15]
+        let continuation: [Int32] = [21, 22, 23]
+
+        let result = try await generator.evaluateRawTokens(context: context, continuation: continuation)
+
+        #expect(engine.fedInputs == [context])
+        #expect(engine.fedContinuations == [continuation])
+        #expect(result.contextTokens == context)
+        #expect(result.continuationTokens == continuation)
+        #expect(result.logits.count == 3)
+
+        let tempFile = TempFile()
+        defer { tempFile.cleanup() }
+        try LogitsWriter.handleEvaluationOutput(
+            result: result,
+            context: "(raw tokens: 5 ids)",
+            continuation: "(raw continuation: 3 ids)",
+            tokenizer: MockTokenizer(),
+            saveLogitsLength: .count(5),
+            saveJsonPath: tempFile.path,
+            printToConsole: false
+        )
+        let json = try #require(
+            try JSONSerialization.jsonObject(with: try tempFile.readData()) as? [String: Any])
+        #expect(json["tokens"] == nil)
+        #expect(json["context_tokens"] as? [Int] == [11, 12, 13, 14, 15])
+        #expect(json["continuation_tokens"] as? [Int] == [21, 22, 23])
+        let positions = try #require(json["positions"] as? [[String: Any]])
+        #expect(positions.map { $0["target_token"] as? Int } == [21, 22, 23])
+        #expect(json["total_log_probability"] != nil)
+        #expect(json["perplexity"] != nil)
+    }
+
+    @Test("Scoring refuses an empty context or an empty continuation")
+    func scoringRefusesEmptySides() async throws {
+        let generator = try await makeGenerator(engine: MockEngine(vocabSize: 100))
+        await #expect(throws: ContinuationEvaluationError.self) {
+            try await generator.evaluateRawTokens(context: [], continuation: [1])
+        }
+        await #expect(throws: ContinuationEvaluationError.self) {
+            try await generator.evaluateRawTokens(context: [1], continuation: [])
+        }
+    }
+
+    @Test("Text --continuation still feeds its context and forces its continuation")
+    func textContinuationUnchanged() async throws {
+        let engine = RecordingEngine(tokens: [10, 20, 30], vocabSize: 256)
+        let generator = try await makeGenerator(engine: engine)
+        let encoding = ContinuationEncoding(context: "Hello", continuation: " world", tokenizer: MockTokenizer())
+
+        let result = try await generator.evaluateContinuation(context: "Hello", continuation: " world")
+
+        #expect(engine.fedInputs == [Array(encoding.tokens[..<encoding.continuationStartIndex])])
+        #expect(engine.fedContinuations == [Array(encoding.tokens[encoding.continuationStartIndex...])])
+        #expect(result.contextTokens == encoding.contextTokens)
+        #expect(result.continuationTokens == encoding.continuationTokens)
+        #expect(result.logits.count == encoding.continuationTokens.count)
+    }
+}

@@ -126,22 +126,69 @@ public class TextGenerator {
             component: "TextGenerator"
         )
 
-        try await inferenceEngine.reset()
-
-        // Feed context + continuation tokens via generate() with forcedContinuation.
-        // The engine runs forward passes and returns logits at each position.
         let contextTokens = Array(encoding.tokens[0..<encoding.continuationStartIndex])
         let continuationTokens = Array(
             encoding.tokens[encoding.continuationStartIndex..<encoding.tokens.count])
+        let allLogits = try await scoreForcedContinuation(context: contextTokens, continuation: continuationTokens)
 
+        return ContinuationEvaluationResult(
+            contextTokens: encoding.contextTokens,
+            continuationTokens: encoding.continuationTokens,
+            logits: allLogits
+        )
+    }
+
+    /// Score pre-tokenized ids as a forced continuation of a pre-tokenized context.
+    ///
+    /// The raw-token twin of `evaluateContinuation(context:continuation:)`, and it feeds the
+    /// model the same way: the whole context, then each continuation position. No text
+    /// tokenization or BPE boundary detection is needed. It used to take `tokens[0]` as the whole
+    /// context.
+    ///
+    /// - Parameters:
+    ///   - context: The context ids; at least one.
+    ///   - continuation: The ids to score; at least one.
+    /// - Returns: ContinuationEvaluationResult with one logits vector per continuation id
+    public func evaluateRawTokens(
+        context: [Int32],
+        continuation: [Int32]
+    ) async throws -> ContinuationEvaluationResult {
+        guard !context.isEmpty, !continuation.isEmpty else {
+            throw ContinuationEvaluationError.emptyInput
+        }
+
+        CLILogger.log(
+            "Raw token evaluation: context=\(context.count) tokens, continuation=\(continuation.count) tokens",
+            component: "TextGenerator"
+        )
+
+        let allLogits = try await scoreForcedContinuation(context: context, continuation: continuation)
+
+        return ContinuationEvaluationResult(
+            contextTokens: context,
+            continuationTokens: continuation,
+            logits: allLogits
+        )
+    }
+
+    /// Feed `context`, then force `continuation`, and return the logits that predict each
+    /// continuation id. The one feed both scoring modes share, so text and raw-token scoring
+    /// cannot drift apart.
+    private func scoreForcedContinuation(
+        context: [Int32],
+        continuation: [Int32]
+    ) async throws -> [[LogitsScalarType]] {
+        try await inferenceEngine.reset()
+
+        // The engine prefills the context and returns logits at each forced position.
         let options = InferenceOptions(
-            maxTokens: continuationTokens.count,
+            maxTokens: continuation.count,
             includeLogits: true,
-            forcedContinuation: continuationTokens
+            forcedContinuation: continuation
         )
 
         let stream = try await inferenceEngine.generate(
-            with: contextTokens,
+            with: context,
             samplingConfiguration: SamplingConfiguration.greedy,
             inferenceOptions: options
         )
@@ -159,66 +206,7 @@ public class TextGenerator {
         }
 
         try await inferenceEngine.reset()
-
-        return ContinuationEvaluationResult(
-            contextTokens: encoding.contextTokens,
-            continuationTokens: encoding.continuationTokens,
-            logits: allLogits
-        )
-    }
-
-    /// Evaluate logits for pre-tokenized raw token IDs.
-    ///
-    /// Feeds all tokens through the engine and returns logits for each position
-    /// after the first token (which serves as context seed). No text-based
-    /// tokenization or BPE boundary detection is needed.
-    ///
-    /// - Parameter tokens: Pre-tokenized token IDs (must have at least 2 tokens)
-    /// - Returns: ContinuationEvaluationResult with logits for positions 1..N
-    public func evaluateRawTokens(
-        _ tokens: [Int32]
-    ) async throws -> ContinuationEvaluationResult {
-        guard tokens.count >= 2 else {
-            throw ContinuationEvaluationError.emptyInput
-        }
-
-        let contextTokens = [tokens[0]]
-        let continuationTokens = Array(tokens.dropFirst())
-
-        CLILogger.log(
-            "Raw token evaluation: \(tokens.count) tokens "
-                + "(context=1, continuation=\(continuationTokens.count))",
-            component: "TextGenerator"
-        )
-
-        try await inferenceEngine.reset()
-
-        let options = InferenceOptions(
-            maxTokens: continuationTokens.count,
-            includeLogits: true,
-            forcedContinuation: continuationTokens
-        )
-
-        let stream = try await inferenceEngine.generate(
-            with: contextTokens,
-            samplingConfiguration: SamplingConfiguration.greedy,
-            inferenceOptions: options
-        )
-
-        var allLogits: [[LogitsScalarType]] = []
-        for try await output in stream {
-            if let logits = output.logits {
-                allLogits.append(logits)
-            }
-        }
-
-        try await inferenceEngine.reset()
-
-        return ContinuationEvaluationResult(
-            contextTokens: contextTokens,
-            continuationTokens: continuationTokens,
-            logits: allLogits
-        )
+        return allLogits
     }
 }
 

@@ -90,28 +90,14 @@ public struct ContinuationEvaluationResult: Sendable {
 
 // MARK: - Errors
 
+/// Why `TextGenerator.evaluateRawTokens(context:continuation:)` cannot score.
 public enum ContinuationEvaluationError: Error, LocalizedError {
-    case requiresDisabledChatTemplate
-    case requiresLogitsOutput
-    case engineDoesNotSupportLogits
-    case emptyContinuation
-    case rawTokensNotSupported
     case emptyInput
 
     public var errorDescription: String? {
         switch self {
-        case .requiresDisabledChatTemplate:
-            return "--continuation requires --apply-chat-template=false"
-        case .requiresLogitsOutput:
-            return "--continuation requires --print-logits or --save-logits"
-        case .engineDoesNotSupportLogits:
-            return "The current inference engine does not support returning logits"
-        case .emptyContinuation:
-            return "Continuation string cannot be empty"
-        case .rawTokensNotSupported:
-            return "--continuation requires text prompt (--prompt or --prompt-file), not --raw-tokens"
         case .emptyInput:
-            return "Raw token evaluation requires at least 2 tokens"
+            return "Raw token scoring requires at least one context id and one continuation id"
         }
     }
 }

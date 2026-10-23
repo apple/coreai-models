@@ -54,6 +54,11 @@ public final class CoreAISequentialEngine: InferenceEngine, IdempotentEngine, Ba
     // Whether the single-token fallback past the ring has been logged (see `runMainSteps`).
     private var loggedRingSingleSteps = false
 
+    // Whether a scored continuation may run through `main` as one batch
+    // (see `forcedContinuationRunsAsOneBatch`). Internal and settable only so the parity test
+    // can run both paths on one asset.
+    var scoresForcedContinuationInOneBatch: Bool
+
     // I/O names from descriptor
     private let logitsName: String
 
@@ -228,6 +233,9 @@ public final class CoreAISequentialEngine: InferenceEngine, IdempotentEngine, Ba
         if self.prefillFunction != nil {
             CLILogger.log("Found '\(prefillGraphFunctionName)' graph — prefill skips the LM head")
         }
+        self.scoresForcedContinuationInOneBatch = forcedContinuationRunsAsOneBatch(
+            hasPrefillGraph: self.prefillFunction != nil,
+            mainSequenceLength: inputIdsDesc.shape.count >= 2 ? inputIdsDesc.shape[1] : nil)
 
         guard let fn = try model.loadFunction(named: config.function) else {
             throw InferenceRuntimeError.genericError(
@@ -979,8 +987,11 @@ extension CoreAISequentialEngine.GenerationSequence {
                 return InferenceOutput(tokenId: token, logits: logits)
             }
 
-            // First call with forcedContinuation + logits: batch-process all tokens at once.
-            if let forced = forcedContinuation, returnsLogits, step == 0 {
+            // First call with forcedContinuation + logits: batch-process all tokens at once,
+            // when `main` takes a batch. Otherwise fall through to the generation path below.
+            if let forced = forcedContinuation, returnsLogits, step == 0,
+                engine.scoresForcedContinuationInOneBatch
+            {
                 let allTokens = inputTokens + forced.map { $0 }
                 let vocabSize = engine.config.vocabSize
 

@@ -88,6 +88,13 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     @Option(name: .customLong("raw-tokens"), help: "JSON file with pre-tokenized tokens: {\"tokens\": [...]}")
     var rawTokens: String?
 
+    @Option(
+        name: .customLong("raw-continuation"),
+        help:
+            "JSON file with token ids to score as a forced continuation of --raw-tokens: {\"tokens\": [...]} (requires --print-logits or --save-logits)"
+    )
+    var rawContinuation: String?
+
     @Option(help: "Maximum number of tokens to generate (default: 50)")
     var maxTokens: Int = 50
 
@@ -372,22 +379,31 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     }
 
     func runModel(path modelFile: String, resolver: ModelPaths) async throws {
+        // --raw-tokens is always the context. The run scores only when --raw-continuation names
+        // the ids to score; otherwise it generates, saving the logits of each generated token.
+        let rawContinuationTokens = try RawTokenScoring.continuation(
+            rawContinuationPath: rawContinuation,
+            rawTokensPath: rawTokens,
+            textContinuationGiven: continuation != nil,
+            logitsRequested: saveLogits != nil || printLogits
+        )
+
         // Validate continuation mode requirements
         if let continuation = continuation {
             guard !applyChatTemplate else {
                 CLILogger.log(
                     "Validation failed: chat template must be disabled for continuation mode", component: "Main")
-                throw ContinuationEvaluationError.requiresDisabledChatTemplate
+                throw ContinuationOptionError.requiresDisabledChatTemplate
             }
 
             guard saveLogits != nil || printLogits else {
                 CLILogger.log("Validation failed: logits output required for continuation mode", component: "Main")
-                throw ContinuationEvaluationError.requiresLogitsOutput
+                throw ContinuationOptionError.requiresLogitsOutput
             }
 
             guard !continuation.isEmpty else {
                 CLILogger.log("Validation failed: continuation string is empty", component: "Main")
-                throw ContinuationEvaluationError.emptyContinuation
+                throw ContinuationOptionError.emptyContinuation
             }
 
             CLILogger.log("Continuation evaluation mode enabled", component: "Main")
@@ -661,19 +677,21 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             print("Generating...")
         }
 
-        // Raw token evaluation: feed pre-tokenized IDs and save per-position logits
-        if case .rawTokens(let container) = promptInput, saveLogits != nil || printLogits {
+        // Raw token scoring (--raw-continuation): score those ids as a forced continuation of
+        // the whole --raw-tokens context.
+        if let continuationTokens = rawContinuationTokens, case .rawTokens(let container) = promptInput {
             guard inferenceEngine.supportsLogits else {
-                throw ContinuationEvaluationError.engineDoesNotSupportLogits
+                throw ContinuationOptionError.engineDoesNotSupportLogits
             }
-            let result = try await generator.evaluateRawTokens(container.tokens.map { Int32($0) })
+            let result = try await generator.evaluateRawTokens(
+                context: container.tokens, continuation: continuationTokens)
 
             await PerformanceMetrics.shared.endOverallTiming()
 
             try LogitsWriter.handleEvaluationOutput(
                 result: result,
                 context: "(raw tokens: \(container.tokens.count) ids)",
-                continuation: "(forced: \(container.tokens.count - 1) ids)",
+                continuation: "(raw continuation: \(continuationTokens.count) ids)",
                 tokenizer: tokenizer,
                 saveLogitsLength: saveLogitsLength,
                 saveJsonPath: saveLogits,
@@ -691,7 +709,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             case .text(let text):
                 contextString = text
             case .rawTokens:
-                throw ContinuationEvaluationError.rawTokensNotSupported
+                throw ContinuationOptionError.rawTokensNotSupported
             }
 
             let signpostID = InstrumentsProfiler.beginInference(promptTokens: actualInputTokens, maxTokens: 0)

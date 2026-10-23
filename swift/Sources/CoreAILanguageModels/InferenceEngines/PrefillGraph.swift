@@ -37,6 +37,22 @@ func prefillHeldBackTokens(hasPrefillGraph: Bool) -> Int {
     hasPrefillGraph ? 1 : 0
 }
 
+/// Whether a scored continuation may run as one `main` batch of context plus continuation.
+///
+/// Without a prefill graph `main` serves prefill, so it takes batches. With one, `main` may be
+/// traced for the one held-back token only: an asset can have a width-1 `main`,
+/// and a batch aborts it (`Shape at dimension 1 of 7 is not a valid substitution for source
+/// shape 1`). Such a run takes the generation path instead: the context
+/// goes through the prefill graph and each continuation id through `main`, one at a time.
+///
+/// - Parameter mainSequenceLength: The token dimension of `main`'s input ids; negative when it
+///   is dynamic, `nil` when the descriptor does not say.
+func forcedContinuationRunsAsOneBatch(hasPrefillGraph: Bool, mainSequenceLength: Int?) -> Bool {
+    guard hasPrefillGraph else { return true }
+    guard let length = mainSequenceLength else { return false }
+    return length < 0
+}
+
 /// Initial size of the logits buffer, in token rows.
 ///
 /// With a prefill graph `main` only ever sees the one held-back token, so a prompt-sized
