@@ -47,6 +47,7 @@ Key architecture facts (verified against transformers >=5.5 ``gemma4``, E2B conf
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from coreai_models.primitives.ios.rope import apply_rope
 from coreai_models.primitives.ios.sdpa import SDPA
@@ -78,7 +79,7 @@ class RMSNormNoScale(nn.Module):
     """RMSNorm without a learnable scale (v_norm and the projector pre-norm).
 
     fp16-overflow-safe via per-row max-normalization before squaring (see the comment
-    directly above, and :class:`RMSNorm` below). Exact and ANE-resident (no fp32
+    directly above, and :class:`RMSNorm`, which adds the scale). Exact and ANE-resident (no fp32
     upcast).
     """
 
@@ -101,24 +102,16 @@ class RMSNormNoScale(nn.Module):
         return xn * torch.rsqrt(mean_square + eps_term)
 
 
-class RMSNorm(nn.Module):
-    """RMSNorm with a learnable scale (last-dim reduction). fp16-overflow-safe via the
-    same per-row max-normalization as :class:`RMSNormNoScale` (see the comment above)."""
+class RMSNorm(RMSNormNoScale):
+    """:class:`RMSNormNoScale` followed by a learnable per-channel scale (last-dim reduction)."""
 
     def __init__(self, dim: int, eps: float = 1e-6) -> None:
-        super().__init__()
+        super().__init__(eps)
         with torch.device("cpu"):
             self.weight = nn.Parameter(torch.ones(dim))
-        self._eps = eps
-        self.register_buffer("_eps_sqrt", torch.tensor(eps**0.5), persistent=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        m = torch.clamp(x.abs().amax(-1, keepdim=True), min=1e-4)
-        xn = x / m
-        eps_sqrt = self._eps_sqrt.to(dtype=x.dtype)
-        eps_term = (eps_sqrt / m) * (eps_sqrt / m)  # eps/m^2, no m^2 overflow
-        mean_square = (xn * xn).mean(-1, keepdim=True)
-        return xn * torch.rsqrt(mean_square + eps_term) * self.weight
+        return super().forward(x) * self.weight
 
 
 class ClippedConvLinear(nn.Module):
@@ -314,10 +307,7 @@ class Gemma4VisionEncoderForiOS(nn.Module):
         model -- mirrors the text ladder retracing one `Gemma4Extend` instance per
         context bucket, just for grid size instead of context length.
         """
-        from transformers.models.gemma4.modeling_gemma4 import (
-            Gemma4VisionPatchEmbedder,
-            Gemma4VisionRotaryEmbedding,
-        )
+        from transformers.models.gemma4.modeling_gemma4 import Gemma4VisionRotaryEmbedding
 
         self.image_size = image_size
         self.grid = image_size // self.patch_size  # patches per side (e.g. 48)
@@ -350,19 +340,17 @@ class Gemma4VisionEncoderForiOS(nn.Module):
         pos_ids = torch.stack([cols, rows], dim=-1).unsqueeze(0)  # (1, N, 2)
 
         with torch.no_grad():
-            # Learned 2D position embeddings via the HF patch embedder helper,
-            # querying this bucket's (x, y) coordinates against the resolution-
-            # independent table loaded by from_state_dict. `.float()` guards
-            # against `self._position_embedding_table_raw` itself having already
-            # been downcast by an earlier whole-model `.to(dtype=...)` call (this
-            # method re-runs once per bucket in the size ladder, potentially long
-            # after that cast) -- computing the position embedding in fp32 avoids
-            # compounding rounding across buckets, even though the *stored* table
-            # may already carry one round of precision loss from that cast.
-            hf_patch = Gemma4VisionPatchEmbedder(self.config)
-            hf_patch.position_embedding_table.copy_(self._position_embedding_table_raw.float())
-            padding = torch.zeros(1, self.num_patches, dtype=torch.bool)
-            pos_embeds = hf_patch._position_embeddings(pos_ids, padding)  # (1, N, hidden)
+            # Learned 2D position embeddings: the x row of the table indexed by column plus the y
+            # row indexed by row (HF's patch embedder computes exactly this; no patch here is
+            # padding). `.float()` guards against `self._position_embedding_table_raw` having
+            # been downcast by an earlier whole-model `.to(dtype=...)` call (this method re-runs
+            # once per bucket in the size ladder, potentially long after that cast): computing in
+            # fp32 avoids compounding rounding across buckets, even though the *stored* table may
+            # already carry one round of precision loss from that cast.
+            x_table, y_table = self._position_embedding_table_raw.float()  # (size, hidden) each
+            pos_embeds = F.embedding(pos_ids[..., 0], x_table) + F.embedding(
+                pos_ids[..., 1], y_table
+            )
             self.pos_embeds.copy_(pos_embeds.reshape(1, self.num_patches, 1, -1))
 
             # 2D RoPE cos/sin via the HF rotary module (theta 100, default rope) --
