@@ -58,7 +58,7 @@ public struct CoreAIVisionLanguageModel: LanguageModel {
                 prefillChunkThreshold: bundle.language.prefillChunkThreshold
             )
         )
-        guard let vlmEngine = engine as? CoreAISequentialVLMEngine else {
+        guard let vlmEngine = engine as? any MultimodalInferenceEngine else {
             throw InferenceRuntimeError.invalidArgument(
                 "Expected a vision-language engine for a VLM bundle, got \(type(of: engine))")
         }
@@ -87,7 +87,7 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
 
     public struct Configuration: Hashable, Sendable {
         let bundleURL: URL
-        let engine: CoreAISequentialVLMEngine
+        let engine: any MultimodalInferenceEngine
         let tokenizer: any Tokenizer
         let visionConfig: VisionConfig
         let additionalStopTokenIds: Set<Int32>
@@ -100,7 +100,7 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
         }
     }
 
-    private let engine: CoreAISequentialVLMEngine
+    private let engine: any MultimodalInferenceEngine
     private let tokenizer: any Tokenizer
     private let visionConfig: VisionConfig
     private let additionalStopTokenIds: Set<Int32>

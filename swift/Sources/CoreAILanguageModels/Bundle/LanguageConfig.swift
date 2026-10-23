@@ -353,10 +353,10 @@ public struct VisionConfig: Codable, Sendable, Equatable {
     /// Visual tokens produced per frame. Nil defaults to `imageTokenCount`.
     public let tokensPerFrame: Int?
 
-    /// Begin-of-image / end-of-image marker token IDs that wrap the image-placeholder
-    /// block in the prompt (Gemma4: `<|image>` / `<image|>`). Nil for models that don't
-    /// delimit the image region (e.g. Qwen). When present, the prompt builder emits
-    /// `boi + imageToken×count + eoi`.
+    /// Begin-of-image / end-of-image marker token IDs of the model's image region (Gemma4:
+    /// `<|image>` / `<image|>`), as the checkpoint defines them. Nil for models that don't
+    /// delimit the image region (e.g. Qwen). They are recorded for prompt builders; the
+    /// builders that use the tokenizer's chat template do not add them.
     public let boiTokenId: Int32?
     public let eoiTokenId: Int32?
 
@@ -365,6 +365,10 @@ public struct VisionConfig: Codable, Sendable, Equatable {
     /// so a placeholder's own per-layer embedding isn't spuriously injected. Nil for
     /// bundles exported before this field existed — callers fall back to `0`.
     public let padTokenId: Int32?
+
+    /// How the encoder's soft tokens reach the decoder. Absent in bundles that predate the field,
+    /// which read as ``VisionTokenMerge/separateEmbedding``.
+    public let tokenMerge: VisionTokenMerge
 
     /// Patch count per pooled soft token, along one axis (Gemma4's 3x3 average pool).
     /// Nil for models with no pooling stage (e.g. Qwen).
@@ -395,7 +399,8 @@ public struct VisionConfig: Codable, Sendable, Equatable {
         eoiTokenId: Int32? = nil,
         padTokenId: Int32? = nil,
         poolingKernelSize: Int? = nil,
-        imageSizes: [Int]? = nil
+        imageSizes: [Int]? = nil,
+        tokenMerge: VisionTokenMerge = .separateEmbedding
     ) {
         self.imageSize = imageSize
         self.patchSize = patchSize
@@ -413,6 +418,7 @@ public struct VisionConfig: Codable, Sendable, Equatable {
         self.padTokenId = padTokenId
         self.poolingKernelSize = poolingKernelSize
         self.imageSizes = imageSizes
+        self.tokenMerge = tokenMerge
     }
 
     enum CodingKeys: String, CodingKey {
@@ -432,6 +438,7 @@ public struct VisionConfig: Codable, Sendable, Equatable {
         case padTokenId = "pad_token_id"
         case poolingKernelSize = "pooling_kernel_size"
         case imageSizes = "image_sizes"
+        case tokenMerge = "token_merge"
     }
 
     public init(from decoder: Swift.Decoder) throws {
@@ -452,6 +459,7 @@ public struct VisionConfig: Codable, Sendable, Equatable {
         self.padTokenId = try c.decodeIfPresent(Int32.self, forKey: .padTokenId)
         self.poolingKernelSize = try c.decodeIfPresent(Int.self, forKey: .poolingKernelSize)
         self.imageSizes = try c.decodeIfPresent([Int].self, forKey: .imageSizes)
+        self.tokenMerge = try c.decodeIfPresent(VisionTokenMerge.self, forKey: .tokenMerge) ?? .separateEmbedding
         try validate(in: c)
     }
 
@@ -503,4 +511,15 @@ public struct VisionConfig: Codable, Sendable, Equatable {
             }
         }
     }
+}
+
+/// How a vision encoder's soft tokens are merged into the decoder. The exporter records the choice in
+/// `vision.token_merge`, and ``EngineFactory`` picks the engine from it.
+public enum VisionTokenMerge: String, Codable, Sendable {
+    /// Text embeddings come from a separate `embedding` asset. The soft tokens are scattered into
+    /// them before the decoder, which consumes embeddings (Qwen-style, `CoreAISequentialVLMEngine`).
+    case separateEmbedding = "separate_embedding"
+    /// The decoder graph embeds its own tokens. The soft tokens overwrite the placeholder rows
+    /// after that gather (Gemma 4, `StaticShapeEngine`).
+    case decoderGather = "decoder_gather"
 }

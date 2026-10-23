@@ -67,15 +67,11 @@ public struct CoreAIRunner {
 
         let config = makeConfig()
 
-        // Gemma4-style ladder VLM (dual-cache + PLE, no separate `embedding` asset): the
-        // factory builds the multimodal StaticShapeEngine so `encodeImage` + soft-token
-        // scatter work. Qwen-style VLMs (with a separate `embedding` asset for
-        // `embed_tokens`) are constructed elsewhere (`CoreAIVisionLanguageModel`), not
-        // through this runner.
-        if bundle.modelBundle.kind == .vlm,
-            bundle.modelBundle.modelURL(for: ModelBundle.ComponentKey.embedding) == nil,
-            bundle.visionConfig != nil
-        {
+        // A VLM whose decoder gathers its own token embeddings (`vision.token_merge` is
+        // `decoder_gather`, e.g. Gemma 4): the factory builds the multimodal StaticShapeEngine so
+        // `encodeImage` + soft-token scatter work. VLMs with a separate `embedding` asset are
+        // constructed elsewhere (`CoreAIVisionLanguageModel`), not through this runner.
+        if bundle.modelBundle.kind == .vlm, bundle.visionConfig?.tokenMerge == .decoderGather {
             return try await EngineFactory.createEngine(
                 bundle: bundle,
                 options: EngineOptions(

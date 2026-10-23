@@ -123,13 +123,15 @@ struct MultimodalTypeTests {
                 "boi_token_id": 255999,
                 "eoi_token_id": 258882,
                 "pad_token_id": 0,
-                "image_sizes": [384, 768, 1152]
+                "image_sizes": [384, 768, 1152],
+                "token_merge": "decoder_gather"
             }
             """
         let config = try JSONDecoder().decode(VisionConfig.self, from: json.data(using: .utf8)!)
         #expect(config.poolingKernelSize == 3)
         #expect(config.padTokenId == 0)
         #expect(config.imageSizes == [384, 768, 1152])
+        #expect(config.tokenMerge == .decoderGather)
         #expect(config.blockPixels == 48)
         #expect(config.pooledGrid(imageSize: 1152) == 24)
         #expect(config.softTokenCount(imageSize: 384) == 64)
@@ -143,6 +145,7 @@ struct MultimodalTypeTests {
             """
         let config = try JSONDecoder().decode(VisionConfig.self, from: json.data(using: .utf8)!)
         #expect(config.imageSizes == nil)
+        #expect(config.tokenMerge == .separateEmbedding)
         #expect(config.poolingKernelSize == nil)
     }
 }

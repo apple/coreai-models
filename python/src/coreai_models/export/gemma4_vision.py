@@ -57,6 +57,11 @@ _IMAGE_STD = (1.0, 1.0, 1.0)
 # overrides this for a narrower/dev export.
 SHIPPING_IMAGE_SIZE_LADDER = (384, 768, 1152)
 
+# How the runtime merges the soft tokens into the decoder (`vision.token_merge`): the Gemma 4 text
+# decoder embeds its own tokens, and the soft tokens overwrite the placeholder rows after that
+# gather. Bundles without the field are read as a separate embedding asset (Qwen-style).
+TOKEN_MERGE = "decoder_gather"
+
 
 def _validated_image_sizes(
     image_sizes: tuple[int, ...], *, patch_size: int, pooling_kernel_size: int
@@ -311,6 +316,7 @@ def _patch_metadata(
         "image_std": list(_IMAGE_STD),
         "rescale_factor": _RESCALE_FACTOR,
         "image_sizes": list(image_sizes),
+        "token_merge": TOKEN_MERGE,
     }
     if boi_token_id is not None:
         vision["boi_token_id"] = boi_token_id

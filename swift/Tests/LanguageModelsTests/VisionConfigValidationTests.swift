@@ -74,6 +74,25 @@ struct VisionConfigValidationTests {
         #expect(throws: DecodingError.self) { try decode(context: 0) }
     }
 
+    @Test("token_merge defaults to a separate embedding asset when absent")
+    func tokenMergeDefault() throws {
+        let config = try #require(try decode(vision: vision()).vision)
+        #expect(config.tokenMerge == .separateEmbedding)
+    }
+
+    @Test("token_merge decodes both values and rejects an unknown one")
+    func tokenMergeValues() throws {
+        func withMerge(_ value: String) -> String {
+            """
+            {"image_size": 768, "patch_size": 16, "pooling_kernel_size": 3, "image_token_count": 256,
+             "image_token_id": 7, "token_merge": "\(value)"}
+            """
+        }
+        #expect(try decode(vision: withMerge("decoder_gather")).vision?.tokenMerge == .decoderGather)
+        #expect(try decode(vision: withMerge("separate_embedding")).vision?.tokenMerge == .separateEmbedding)
+        #expect(throws: DecodingError.self) { try decode(vision: withMerge("scatter")) }
+    }
+
     private func image(_ side: Int) -> CGImage {
         CGContext(
             data: nil, width: side, height: side, bitsPerComponent: 8, bytesPerRow: 0,

@@ -112,6 +112,7 @@ def test_patch_metadata_records_sizes_and_derived_fields(tmp_path) -> None:
     meta = json.loads((tmp_path / "metadata.json").read_text())
     assert meta["kind"] == "vlm" and meta["assets"]["vision"] == "vision.aimodel"
     assert meta["vision"]["image_sizes"] == [384, 768, 1152]
+    assert meta["vision"]["token_merge"] == "decoder_gather"
     assert meta["vision"]["image_size"] == 1152 and meta["vision"]["image_token_count"] == 576
     assert "eoi_token_id" not in meta["vision"] and meta["vision"]["boi_token_id"] == 8
     assert meta["language"]["function_map"]["vision"] == [

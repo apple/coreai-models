@@ -77,10 +77,11 @@ public struct EngineFactory: Sendable {
     /// Creates an inference engine from a parsed language bundle.
     ///
     /// Handles bundles that ship more than one asset. A vision-language bundle (`kind == .vlm`)
-    /// carries three components — vision, embedding, and a `main` decoder that consumes those
-    /// embeddings — and builds the sequential VLM engine. The `.vlm` kind in the metadata names
-    /// the modality, so the factory keys on it directly. Every other kind resolves its `main`
-    /// asset and hands off to ``createEngine(config:modelURL:options:)``.
+    /// carries a vision component and a `main` decoder, plus an embedding component when
+    /// `vision.token_merge` is `separate_embedding`. That field decides the engine: the sequential
+    /// VLM engine for `separate_embedding` (and bundles that predate the field), the static-shape
+    /// engine for `decoder_gather`. Every other kind resolves its `main` asset and hands off to
+    /// ``createEngine(config:modelURL:options:)``.
     ///
     /// - Parameters:
     ///   - bundle: The parsed language bundle (LLM or VLM).
@@ -96,14 +97,18 @@ public struct EngineFactory: Sendable {
         let languageModelURL = try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.main)
 
         if bundle.modelBundle.kind == .vlm {
-            // A Gemma4-style ladder VLM has no separate `embedding` asset: the vision soft
-            // tokens overlay onto the ladder's own token-embedding gather.
-            if bundle.modelBundle.modelURL(for: ModelBundle.ComponentKey.embedding) == nil {
+            guard let visionConfig = bundle.visionConfig else {
+                throw InferenceRuntimeError.invalidArgument(
+                    "VLM bundle missing 'vision' config in metadata.json")
+            }
+            switch visionConfig.tokenMerge {
+            case .decoderGather:
                 return try await makeStaticShapeVLMEngine(
                     bundle: bundle, languageModelURL: languageModelURL, options: options)
+            case .separateEmbedding:
+                return try await makeVLMEngine(
+                    bundle: bundle, languageModelURL: languageModelURL, options: options)
             }
-            return try await makeVLMEngine(
-                bundle: bundle, languageModelURL: languageModelURL, options: options)
         }
 
         // The bundle knows its own sidecars; assets passed explicitly still win.
