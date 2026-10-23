@@ -13,9 +13,35 @@ extension BatchScheduler {
         let decodeStep: any BatchedDecodeStep
         /// Maximum number of requests per scoring batch.
         let maxConcurrent: Int
+        /// Positions the KV cache holds. A padded chunk never runs past it.
+        let maxPositions: Int
         /// Maximum number of positions per scoring forward pass. Each pass returns at most
         /// `rows * chunkLength * vocab` logits.
         let chunkLength = 128
+        /// Shortest padded chunk. The last chunk of a batch pads to 16, 32, 64 or 128 positions, so
+        /// scoring reuses a few input shapes instead of compiling one per prompt length.
+        static let shortestChunk = 16
+
+        /// Positions in the chunk at `start` for a batch whose longest prompt has `longest` tokens: a
+        /// full `chunkLength`, or the remaining positions rounded up to a power of two (at least
+        /// `shortestChunk`), unless that would run past `maxPositions`. With `chunkLength` 128 and
+        /// `longest` 300, the chunks at 0, 128 and 256 take 128, 128 and 64 positions.
+        static func paddedChunk(start: Int, longest: Int, chunkLength: Int, maxPositions: Int) -> Int {
+            let remaining = min(chunkLength, longest - start)
+            var padded = shortestChunk
+            while padded < remaining { padded *= 2 }
+            let fitting = min(padded, chunkLength, maxPositions - start)
+            return max(remaining, fitting)
+        }
+
+        /// Rows in a scoring pass over `requests` requests: the graph's fixed `capacity` for a static
+        /// graph, otherwise `requests` rounded up to a power of two, at most `maxConcurrent`.
+        static func paddedRows(requests: Int, capacity: Int, maxConcurrent: Int) -> Int {
+            guard capacity == Int.max else { return capacity }
+            var rows = 1
+            while rows < requests { rows *= 2 }
+            return max(requests, min(rows, maxConcurrent))
+        }
 
         /// Counts the leading entries of `lengths`, prompt lengths in queue order, that form the next
         /// scoring batch. Takes up to `limit` entries and stops before one that would make more than a
@@ -40,23 +66,23 @@ extension BatchScheduler {
         /// Scores `requests` in one padded batch on a new session. Returns one `LogProbabilities` per
         /// request, in request order. At most `decodeStep.maxBatchCapacity` requests.
         ///
-        /// Short rows repeat their last token. For prompts of lengths 3 and 5 with a chunk length of 4,
-        /// the rows are
+        /// Short rows repeat their last token, and the last chunk pads to `paddedChunk`. For prompts of
+        /// lengths 3 and 5 with a chunk length of 4 and a shortest chunk of 2, the rows are
         /// ```
         /// chunk 0: [a0 a1 a2 a2] [b0 b1 b2 b3]    positions 0..<4
-        /// chunk 1: [a2]          [b4]             position 4, row a is padding only
+        /// chunk 1: [a2 a2]       [b4 b4]          positions 4..<6, only b4 is read
         /// ```
         func scoreBatch(_ requests: [ScoreRequest]) async throws -> [LogProbabilities] {
-            // Static graphs take exactly `capacity` rows; dynamic graphs (`Int.max`) take one per request.
-            let capacity = decodeStep.maxBatchCapacity
-            let rows = capacity == Int.max ? requests.count : capacity
+            let rows = Self.paddedRows(
+                requests: requests.count, capacity: decodeStep.maxBatchCapacity, maxConcurrent: maxConcurrent)
             let session = try decodeStep.makeSessionState(batchSize: rows)
             let longest = requests.map(\.tokens.count).max() ?? 0
             var entries = Array(repeating: [LogProbabilities.Entry](), count: requests.count)
 
             var start = 0
             while start < longest {
-                let q = min(chunkLength, longest - start)
+                let q = Self.paddedChunk(
+                    start: start, longest: longest, chunkLength: chunkLength, maxPositions: maxPositions)
                 let tokensPerRow = (0..<rows).map { row -> [Int32] in
                     guard row < requests.count else { return Array(repeating: 0, count: q) }
                     let tokens = requests[row].tokens

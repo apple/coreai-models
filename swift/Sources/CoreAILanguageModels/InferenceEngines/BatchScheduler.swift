@@ -90,12 +90,12 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
             "maxConcurrent \(maxConcurrent) needs a graph with an attn_mask input and a batch dimension above 1")
         self.init(
             decodeStep: engine, session: try engine.makeSessionState(batchSize: maxConcurrent),
-            maxConcurrent: maxConcurrent, maxQueued: maxQueued)
+            maxConcurrent: maxConcurrent, maxQueued: maxQueued, maxPositions: engine.config.maxContextLength)
     }
 
     init(
         decodeStep: any BatchedDecodeStep, session: GenerationSessionState, maxConcurrent: Int,
-        maxQueued: Int? = nil
+        maxQueued: Int? = nil, maxPositions: Int = .max
     ) {
         precondition(maxConcurrent >= 1, "maxConcurrent must be >= 1")
         precondition(
@@ -106,7 +106,7 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
         self.session = session
         self.maxConcurrent = maxConcurrent
         self.maxQueued = maxQueued
-        self.scorer = Scorer(decodeStep: decodeStep, maxConcurrent: maxConcurrent)
+        self.scorer = Scorer(decodeStep: decodeStep, maxConcurrent: maxConcurrent, maxPositions: maxPositions)
     }
 
     // MARK: - RequestSink

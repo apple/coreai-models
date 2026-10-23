@@ -65,6 +65,7 @@ private final class CountUpDecodeStep: BatchedDecodeStep, @unchecked Sendable {
         var maxInFlight = 0
         var forwards = 0
         var scoringRows: [Int] = []
+        var scoringPositions: [Int] = []
     }
     private let record = Mutex(Record())
 
@@ -72,6 +73,7 @@ private final class CountUpDecodeStep: BatchedDecodeStep, @unchecked Sendable {
     var maxInFlight: Int { record.withLock { $0.maxInFlight } }
     /// Row count of each scoring forward, in call order.
     var scoringRows: [Int] { record.withLock { $0.scoringRows } }
+    var scoringPositions: [Int] { record.withLock { $0.scoringPositions } }
     /// Number of prefill, decode and scoring forward calls so far.
     var forwards: Int { record.withLock { $0.forwards } }
 
@@ -120,7 +122,10 @@ private final class CountUpDecodeStep: BatchedDecodeStep, @unchecked Sendable {
     ) async throws -> [LogitsScalarType] {
         await enter()
         defer { leave() }
-        record.withLock { $0.scoringRows.append(tokensPerRow.count) }
+        record.withLock {
+            $0.scoringRows.append(tokensPerRow.count)
+            $0.scoringPositions.append(tokensPerRow.first?.count ?? 0)
+        }
         return countUpAllPositions(tokensPerRow)
     }
 
@@ -366,6 +371,54 @@ struct BatchSchedulerTests {
             #expect(batched.entries.map(\.tokenId) == alone.entries.map(\.tokenId))
             #expect(batched.entries.map(\.value) == alone.entries.map(\.value))
         }
+    }
+
+    @Test("Scoring pads the last chunk and the rows to a few fixed shapes, with unchanged scores")
+    func scoringPadsShapes() async throws {
+        let step = CountUpDecodeStep(capacity: Int.max)
+        let scheduler = makeScheduler(step, maxConcurrent: 4)
+        // One batch of three short prompts: 3 rows pad to 4, 6 positions pad to 16.
+        let prompts: [[Int32]] = [[1, 2, 3], [7, 8, 9, 10, 11], [20, 21, 22, 23, 24, 25]]
+        let together = try await scheduler.score(prompts.map(scoreRequest))
+        #expect(step.scoringRows == [4])
+        #expect(step.scoringPositions == [16])
+        for (prompt, batched) in zip(prompts, together) {
+            let alone = try await scheduler.score([scoreRequest(prompt)])[0]
+            #expect(batched.entries.count == prompt.count)
+            #expect(batched.entries.map(\.tokenId) == alone.entries.map(\.tokenId))
+            #expect(batched.entries.map(\.value) == alone.entries.map(\.value))
+        }
+    }
+
+    @Test(
+        "The last scoring chunk pads to a power of two, at least 16, within the context",
+        arguments: [
+            (0, 7, Int.max, 16),
+            (0, 17, Int.max, 32),
+            (0, 300, Int.max, 128),
+            (256, 300, Int.max, 64),
+            (256, 300, 300, 44),  // Padding to 64 would run past a 300-position context.
+            (128, 256, Int.max, 128),
+        ] as [(Int, Int, Int, Int)])
+    func scoringChunkLength(start: Int, longest: Int, maxPositions: Int, expected: Int) {
+        let chunk = BatchScheduler.Scorer.paddedChunk(
+            start: start, longest: longest, chunkLength: 128, maxPositions: maxPositions)
+        #expect(chunk == expected)
+    }
+
+    @Test(
+        "Scoring rows: a static graph's capacity, else a power of two up to maxConcurrent",
+        arguments: [
+            (1, 4, 4, 4),
+            (3, Int.max, 8, 4),
+            (3, Int.max, 3, 3),
+            (5, Int.max, 6, 6),
+            (1, Int.max, 8, 1),
+        ] as [(Int, Int, Int, Int)])
+    func scoringRowCount(requests: Int, capacity: Int, maxConcurrent: Int, expected: Int) {
+        let rows = BatchScheduler.Scorer.paddedRows(
+            requests: requests, capacity: capacity, maxConcurrent: maxConcurrent)
+        #expect(rows == expected)
     }
 
     @Test("Scoring runs between decode steps while a request streams")
