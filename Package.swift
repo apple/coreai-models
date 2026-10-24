@@ -194,6 +194,7 @@ let package = Package(
                 .product(name: "Hummingbird", package: "hummingbird"),
             ],
             path: "swift/Sources/Tools/llm-server",
+            exclude: ["README.md"],
             swiftSettings: [
                 .enableUpcomingFeature("MemberImportVisibility")
             ]
