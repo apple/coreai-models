@@ -352,7 +352,8 @@ final class ServerState: @unchecked Sendable {
 
     /// Readiness snapshot for /ready endpoint.
     func readySnapshot() -> ReadyResponse {
-        let busy = queue.isActive
+        let occupancy = batchScheduler?.occupancy
+        let busy = queue.isActive || (occupancy?.active ?? 0) > 0
         let usedTokens = engine.processedTokenCount
         let maxTokens = config.maxContextLength
         let utilization = maxTokens > 0 ? Double(usedTokens) / Double(maxTokens) : 0
@@ -366,7 +367,13 @@ final class ServerState: @unchecked Sendable {
                 maxTokens: maxTokens,
                 utilization: utilization
             ),
-            toolCalling: supportsToolCalling
+            toolCalling: supportsToolCalling,
+            memory: ProcessMemory.status(),
+            batching: batchScheduler.map { scheduler in
+                .init(
+                    concurrentRequests: scheduler.maxConcurrent, active: occupancy?.active ?? 0,
+                    queued: occupancy?.queued ?? 0)
+            }
         )
     }
 

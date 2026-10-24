@@ -255,6 +255,22 @@ struct BatchSchedulerTests {
         for stream in streams { _ = try await drain(stream) }
     }
 
+    @Test("occupancy counts admitted and queued requests")
+    func occupancy() async throws {
+        let mock = GatedPrefillStep(capacity: 1)
+        let scheduler = makeScheduler(mock, maxConcurrent: 1)
+        #expect(scheduler.occupancy == (0, 0))
+
+        // The first request is admitted and blocks in prefill; the second waits for its row.
+        let streams = try (0..<2).map { _ in try scheduler.submit(req(prompt: [0], maxTokens: 1)) }
+        for _ in 0..<1000 where scheduler.occupancy.active == 0 { try await Task.sleep(for: .milliseconds(1)) }
+        #expect(scheduler.occupancy == (1, 1))
+
+        mock.release()
+        for stream in streams { _ = try await drain(stream) }
+        #expect(scheduler.occupancy == (0, 0))
+    }
+
     @Test("An exclusive lease pauses the pump until it is released")
     func exclusiveLeasePausesPump() async throws {
         let step = CountUpDecodeStep(capacity: 2)

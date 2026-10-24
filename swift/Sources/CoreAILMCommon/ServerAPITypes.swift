@@ -648,10 +648,15 @@ public struct ReadyResponse: Codable, Sendable {
     public let busy: Bool
     public let cache: CacheStatus
     public let toolCalling: Bool
+    /// The server process's memory when the snapshot was taken.
+    public let memory: MemoryStatus?
+    /// Batch scheduler occupancy, present when the server decodes requests in batches.
+    public let batching: BatchingStatus?
 
     public init(
         status: String, model: String, maxContextLength: Int,
-        busy: Bool, cache: CacheStatus, toolCalling: Bool
+        busy: Bool, cache: CacheStatus, toolCalling: Bool,
+        memory: MemoryStatus? = nil, batching: BatchingStatus? = nil
     ) {
         self.status = status
         self.model = model
@@ -659,6 +664,51 @@ public struct ReadyResponse: Codable, Sendable {
         self.busy = busy
         self.cache = cache
         self.toolCalling = toolCalling
+        self.memory = memory
+        self.batching = batching
+    }
+
+    /// Process memory in megabytes.
+    public struct MemoryStatus: Codable, Sendable, Equatable {
+        /// The process's physical footprint: the memory the system charges it.
+        public let physicalFootprintMB: Double
+        /// Memory allocated on the GPU device, nil when no device is available.
+        public let gpuAllocatedMB: Double?
+        /// The GPU device's recommended working-set limit, nil when no device is available.
+        public let gpuRecommendedMaxMB: Double?
+
+        public init(physicalFootprintMB: Double, gpuAllocatedMB: Double?, gpuRecommendedMaxMB: Double?) {
+            self.physicalFootprintMB = physicalFootprintMB
+            self.gpuAllocatedMB = gpuAllocatedMB
+            self.gpuRecommendedMaxMB = gpuRecommendedMaxMB
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case physicalFootprintMB = "physical_footprint_mb"
+            case gpuAllocatedMB = "gpu_allocated_mb"
+            case gpuRecommendedMaxMB = "gpu_recommended_max_mb"
+        }
+    }
+
+    /// Batch scheduler occupancy.
+    public struct BatchingStatus: Codable, Sendable, Equatable {
+        /// Requests the scheduler decodes together at most (`--concurrent-requests`).
+        public let concurrentRequests: Int
+        /// Requests decoding now.
+        public let active: Int
+        /// Requests waiting for a free row.
+        public let queued: Int
+
+        public init(concurrentRequests: Int, active: Int, queued: Int) {
+            self.concurrentRequests = concurrentRequests
+            self.active = active
+            self.queued = queued
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case concurrentRequests = "concurrent_requests"
+            case active, queued
+        }
     }
 
     public struct CacheStatus: Codable, Sendable {
@@ -684,5 +734,6 @@ public struct ReadyResponse: Codable, Sendable {
         case maxContextLength = "max_context_length"
         case busy, cache
         case toolCalling = "tool_calling"
+        case memory, batching
     }
 }
