@@ -20,6 +20,7 @@ import pytest
 
 from coreai_models._constants import DEFAULT_INCLUDE_DEBUG_INFO
 from coreai_models.diffusion.pipeline import DiffusionExportConfig
+from coreai_models.embedding.export import build_parser as build_embedding_parser
 from coreai_models.export.pipeline import ExportConfig
 from coreai_models.llm.export import build_parser
 from coreai_models.segmentation.export import build_parser as build_segmentation_parser
@@ -76,6 +77,15 @@ def test_llm_cli_resolves_the_flag_onto_the_export_config() -> None:
     for argv, expected in ((["qwen3-0.6b"], False), (["qwen3-0.6b", "--include-debug-info"], True)):
         config = _resolve_export_config(build_parser().parse_args(argv))
         assert config.include_debug_info is expected
+
+
+# --- coreai.embedding.export ------------------------------------------
+
+
+def test_embedding_cli_defaults_to_off_and_accepts_the_flag() -> None:
+    assert build_embedding_parser().parse_args(["embeddinggemma-2"]).include_debug_info is False
+    args = build_embedding_parser().parse_args(["embeddinggemma-2", "--include-debug-info"])
+    assert args.include_debug_info is True
 
 
 # --- standalone models/*/export.py recipes ----------------------------
