@@ -648,15 +648,15 @@ public struct ReadyResponse: Codable, Sendable {
     public let busy: Bool
     public let cache: CacheStatus
     public let toolCalling: Bool
-    /// The server process's memory when the snapshot was taken.
-    public let memory: MemoryStatus?
+    /// Memory held by the server's sessions, estimated from their arrays' shapes and element sizes.
+    public let estimatedMemory: EstimatedMemory?
     /// Batch scheduler occupancy, present when the server decodes requests in batches.
     public let batching: BatchingStatus?
 
     public init(
         status: String, model: String, maxContextLength: Int,
         busy: Bool, cache: CacheStatus, toolCalling: Bool,
-        memory: MemoryStatus? = nil, batching: BatchingStatus? = nil
+        estimatedMemory: EstimatedMemory? = nil, batching: BatchingStatus? = nil
     ) {
         self.status = status
         self.model = model
@@ -664,29 +664,30 @@ public struct ReadyResponse: Codable, Sendable {
         self.busy = busy
         self.cache = cache
         self.toolCalling = toolCalling
-        self.memory = memory
+        self.estimatedMemory = estimatedMemory
         self.batching = batching
     }
 
-    /// Process memory in megabytes.
-    public struct MemoryStatus: Codable, Sendable, Equatable {
-        /// The process's physical footprint: the memory the system charges it.
-        public let physicalFootprintMB: Double
-        /// Memory allocated on the GPU device, nil when no device is available.
-        public let gpuAllocatedMB: Double?
-        /// The GPU device's recommended working-set limit, nil when no device is available.
-        public let gpuRecommendedMaxMB: Double?
+    /// Memory held by the server's sessions in megabytes, estimated from their arrays' shapes and
+    /// element sizes.
+    public struct EstimatedMemory: Codable, Sendable, Equatable {
+        /// KV cache and persistent states of the single-request session.
+        public let kvCacheMB: Double
+        /// KV cache and persistent states of the batch session, for all its rows; nil without batching.
+        public let batchKVCacheMB: Double?
+        /// Logits buffers of both sessions.
+        public let logitsScratchMB: Double
 
-        public init(physicalFootprintMB: Double, gpuAllocatedMB: Double?, gpuRecommendedMaxMB: Double?) {
-            self.physicalFootprintMB = physicalFootprintMB
-            self.gpuAllocatedMB = gpuAllocatedMB
-            self.gpuRecommendedMaxMB = gpuRecommendedMaxMB
+        public init(kvCacheMB: Double, batchKVCacheMB: Double?, logitsScratchMB: Double) {
+            self.kvCacheMB = kvCacheMB
+            self.batchKVCacheMB = batchKVCacheMB
+            self.logitsScratchMB = logitsScratchMB
         }
 
         enum CodingKeys: String, CodingKey {
-            case physicalFootprintMB = "physical_footprint_mb"
-            case gpuAllocatedMB = "gpu_allocated_mb"
-            case gpuRecommendedMaxMB = "gpu_recommended_max_mb"
+            case kvCacheMB = "kv_cache_mb"
+            case batchKVCacheMB = "batch_kv_cache_mb"
+            case logitsScratchMB = "logits_scratch_mb"
         }
     }
 
@@ -734,6 +735,7 @@ public struct ReadyResponse: Codable, Sendable {
         case maxContextLength = "max_context_length"
         case busy, cache
         case toolCalling = "tool_calling"
-        case memory, batching
+        case estimatedMemory = "estimated_memory"
+        case batching
     }
 }

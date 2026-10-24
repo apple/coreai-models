@@ -47,6 +47,12 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
         state.withLock { ($0.occupiedRows, $0.queue.count) }
     }
 
+    /// Bytes held by the shared batch session: its KV cache and persistent states for all rows, and its
+    /// logits buffer, estimated from their shapes and element sizes.
+    package var estimatedSessionBytes: (states: Int, logitsScratch: Int) {
+        (session.estimatedStateBytes, session.estimatedLogitsScratchBytes)
+    }
+
     private struct Pending {
         let request: BatchRequest
         let continuation: AsyncThrowingStream<BatchSinkEvent, Error>.Continuation

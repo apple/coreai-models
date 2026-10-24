@@ -35,7 +35,7 @@ struct LLMServer: AsyncParsableCommand {
               POST /v1/chat/completions  chat generation: streaming, tools, reasoning_effort
               POST /v1/completions       prompt scoring: echo, logprobs
               GET  /v1/models            the served model
-              GET  /ready                readiness, memory and batch occupancy
+              GET  /ready                readiness, KV-cache memory estimates and batch occupancy
               GET  /v1/stats             request and token counters
               GET  /health               liveness
             """

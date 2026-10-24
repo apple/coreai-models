@@ -196,18 +196,18 @@ struct ServerAPITypesTests {
         #expect(cache?["utilization"] as? Double == 0.03125)
     }
 
-    @Test("ReadyResponse encodes memory and batching, and omits them when absent")
-    func readyResponseMemoryAndBatching() throws {
+    @Test("ReadyResponse encodes estimated memory and batching, and omits them when absent")
+    func readyResponseEstimatedMemoryAndBatching() throws {
         let cache = ReadyResponse.CacheStatus(usedTokens: 0, maxTokens: 4096, utilization: 0)
         let full = ReadyResponse(
             status: "ready", model: "m", maxContextLength: 4096, busy: true, cache: cache, toolCalling: false,
-            memory: .init(physicalFootprintMB: 512, gpuAllocatedMB: 384, gpuRecommendedMaxMB: 24_576),
+            estimatedMemory: .init(kvCacheMB: 112, batchKVCacheMB: 896, logitsScratchMB: 4.5),
             batching: .init(concurrentRequests: 4, active: 2, queued: 1))
         let obj = try JSONSerialization.jsonObject(with: JSONEncoder().encode(full)) as! [String: Any]
-        let memory = obj["memory"] as? [String: Any]
-        #expect(memory?["physical_footprint_mb"] as? Double == 512)
-        #expect(memory?["gpu_allocated_mb"] as? Double == 384)
-        #expect(memory?["gpu_recommended_max_mb"] as? Double == 24_576)
+        let memory = obj["estimated_memory"] as? [String: Any]
+        #expect(memory?["kv_cache_mb"] as? Double == 112)
+        #expect(memory?["batch_kv_cache_mb"] as? Double == 896)
+        #expect(memory?["logits_scratch_mb"] as? Double == 4.5)
         let batching = obj["batching"] as? [String: Any]
         #expect(batching?["concurrent_requests"] as? Int == 4)
         #expect(batching?["active"] as? Int == 2)
@@ -216,15 +216,8 @@ struct ServerAPITypesTests {
         let bare = ReadyResponse(
             status: "ready", model: "m", maxContextLength: 4096, busy: false, cache: cache, toolCalling: false)
         let bareObj = try JSONSerialization.jsonObject(with: JSONEncoder().encode(bare)) as! [String: Any]
-        #expect(bareObj["memory"] == nil)
+        #expect(bareObj["estimated_memory"] == nil)
         #expect(bareObj["batching"] == nil)
-    }
-
-    @Test("ProcessMemory reports a nonzero physical footprint")
-    func processMemoryFootprint() {
-        let status = ProcessMemory.status()
-        #expect(ProcessMemory.physicalFootprintBytes() > 0)
-        #expect(status.physicalFootprintMB > 0)
     }
 
     @Test("ReadyResponse round-trips through JSON")
