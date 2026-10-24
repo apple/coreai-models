@@ -33,6 +33,7 @@ import torch
 import torch.nn as nn
 
 from coreai_models._constants import DEFAULT_INCLUDE_DEBUG_INFO
+from coreai_models._download import resolve_model_path
 
 logger = logging.getLogger(__name__)
 
@@ -199,8 +200,9 @@ async def _async_export_segmentation(config: SegmentationExportConfig) -> str:
     grid = image_size // 14
 
     logger.info("Loading SAM3 Lite (%s, image_size=%d)...", config.hf_model_id, image_size)
+    local_path = resolve_model_path(config.hf_model_id)
     sam3_lite = Sam3Lite.from_pretrained(
-        model_id=config.hf_model_id,
+        model_id=local_path,
         image_size=image_size,
     )
     sam3_lite.eval()
@@ -302,7 +304,7 @@ async def _async_export_segmentation(config: SegmentationExportConfig) -> str:
     # Write the bundle's metadata.json before fetching the tokenizer, so a tokenizer-fetch
     # failure (e.g. flaky HF network) doesn't leave the bundle unloadable by ImageSegmenter.
     _write_bundle_metadata(bundle_dir, asset_path.name)
-    _write_tokenizer(bundle_dir / "tokenizer", config.hf_model_id)
+    _write_tokenizer(bundle_dir / "tokenizer", local_path)
     return str(bundle_dir)
 
 
@@ -326,11 +328,11 @@ def _prepare_bundle_dir(bundle_dir: Path, overwrite: bool) -> None:
     bundle_dir.mkdir(parents=True, exist_ok=True)
 
 
-def _write_tokenizer(dest: Path, hf_model_id: str) -> None:
+def _write_tokenizer(dest: Path, local_path: str) -> None:
     import transformers
 
-    logger.info("Saving tokenizer from %s to %s", hf_model_id, dest)
-    tokenizer = transformers.AutoTokenizer.from_pretrained(hf_model_id)
+    logger.info("Saving tokenizer from %s to %s", local_path, dest)
+    tokenizer = transformers.AutoTokenizer.from_pretrained(local_path)
     tokenizer.save_pretrained(str(dest))
 
 
@@ -375,11 +377,11 @@ class FullExportConfig:
 class _Sam3FullModule(nn.Module):
     """Wrap ``transformers.Sam3Model`` and return the five detection tensors."""
 
-    def __init__(self, model_id: str) -> None:
+    def __init__(self, local_path: str) -> None:
         super().__init__()
         import transformers
 
-        self._model = transformers.Sam3Model.from_pretrained(model_id)
+        self._model = transformers.Sam3Model.from_pretrained(local_path)
 
     def forward(self, pixel_values: torch.Tensor, input_ids: torch.Tensor):
         outputs = self._model(pixel_values=pixel_values, input_ids=input_ids)
@@ -436,11 +438,15 @@ async def _async_export_full(config: FullExportConfig) -> str:
         config.image_size,
         config.dtype,
     )
-    model = _Sam3FullModule(model_id=config.hf_model_id)
+    # Pre-download once via the unified backend (HuggingFace or ModelScope) so
+    # that model, processor, and tokenizer all read from the same local
+    # snapshot without re-resolving.
+    local_path = resolve_model_path(config.hf_model_id)
+    model = _Sam3FullModule(local_path=local_path)
     model.eval()
     model.to(torch_dtype)
 
-    processor = transformers.Sam3Processor.from_pretrained(config.hf_model_id)
+    processor = transformers.Sam3Processor.from_pretrained(local_path)
     text_inputs = processor.tokenizer(["dummy"], return_tensors="pt")
     example_inputs = {
         "pixel_values": torch.randn(1, 3, config.image_size, config.image_size).to(torch_dtype),
@@ -479,5 +485,5 @@ async def _async_export_full(config: FullExportConfig) -> str:
     # Write the bundle's metadata.json before fetching the tokenizer, so a tokenizer-fetch
     # failure (e.g. flaky HF network) doesn't leave the bundle unloadable by ImageSegmenter.
     _write_bundle_metadata(bundle_dir, asset_path.name)
-    _write_tokenizer(bundle_dir / "tokenizer", config.hf_model_id)
+    _write_tokenizer(bundle_dir / "tokenizer", local_path)
     return str(bundle_dir)

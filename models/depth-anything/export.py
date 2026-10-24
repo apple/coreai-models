@@ -32,6 +32,7 @@
 # ///
 import argparse
 import shutil
+import sys
 import time
 from pathlib import Path
 
@@ -40,6 +41,9 @@ from coreai.runtime import AIModelAssetMetadata
 from coreai_torch import TorchConverter, get_decomp_table
 from depth_anything_3.api import DepthAnything3
 from depth_anything_3.model.dinov2.layers import rope as _rope
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from _download_shim import resolve_model_path  # noqa: E402
 
 
 def _patch_depth_anything_for_export() -> None:
@@ -136,7 +140,11 @@ def create_depth_anything(
     include_debug_info: bool,
 ):
     print("[INFO] Sourcing model...")
-    model = DepthAnythingModule(model_name)
+    # Pre-download via the unified backend (HuggingFace or ModelScope) so
+    # DepthAnything3.from_pretrained reads from a local path. The class uses
+    # huggingface_hub's PyTorchModelHubMixin, which accepts a local directory.
+    local_path = resolve_model_path(model_name)
+    model = DepthAnythingModule(local_path)
     model.eval()
     model.to(dtype)
     print("[INFO] Model sourced. Running torch export with decompositions...")

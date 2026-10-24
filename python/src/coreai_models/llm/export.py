@@ -7,6 +7,7 @@
 
 import argparse
 import logging
+import os
 from pathlib import Path
 
 import yaml
@@ -202,6 +203,17 @@ def build_parser() -> argparse.ArgumentParser:
             "Experimental, macOS only. Declare a DYNAMIC batch dim up to this max (traced at 2) "
             "across input_ids/position_ids/attn_mask and the KV cache. Must be >= 2. Pairs with "
             "--attention-mask batched."
+        ),
+    )
+    parser.add_argument(
+        "--backend",
+        choices=["huggingface", "modelscope"],
+        default=None,
+        help=(
+            "Model download backend: 'huggingface' (default) or 'modelscope'. "
+            "Can also be set via the COREAI_DOWNLOAD_BACKEND "
+            "environment variables. The modelscope backend requires the 'modelscope' "
+            "package (pip install modelscope)."
         ),
     )
     return parser
@@ -455,6 +467,13 @@ def main() -> None:
         format="%(levelname)s: %(message)s",
     )
 
+    # Propagate the download-backend choice to the environment so every download
+    # call site (pipeline, bundle, model classes) reads the same backend via
+    # coreai_models._download.resolve_backend() without threading a new field
+    # through ExportConfig.
+    if args.backend is not None:
+        os.environ["COREAI_DOWNLOAD_BACKEND"] = args.backend
+
     if args.list_presets:
         print("LLM compression presets:")
         print(f"  macOS (default: {MACOS_DEFAULT})")
@@ -518,6 +537,11 @@ def main() -> None:
             print("  with_drafter:       True")
         if config.variant == "iOS":
             print(f"  disable_embedding_quantization: {config.disable_embedding_quantization}")
+        from coreai_models._download import resolve_backend
+
+        effective_backend = resolve_backend(args.backend)
+        source = "--backend flag" if args.backend is not None else "env/default"
+        print(f"  download_backend:  {effective_backend}  (from {source})")
         return
 
     result = export_model(config)

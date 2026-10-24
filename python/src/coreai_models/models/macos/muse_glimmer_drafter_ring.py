@@ -27,7 +27,6 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from huggingface_hub import snapshot_download
 from typing_extensions import Self, override
 
 from coreai_models._constants import (
@@ -35,6 +34,7 @@ from coreai_models._constants import (
     SLIDING_KEY_CACHE_NAME,
     SLIDING_VALUE_CACHE_NAME,
 )
+from coreai_models._download import download_snapshot
 from coreai_models.models.base import (
     BaseForCausalLM,
     TraceSpec,
@@ -272,8 +272,8 @@ class MuseGlimmerDrafterForCausalLM(BaseForCausalLM):
 
         # ---- 1. Download both checkpoints (safetensors + config only) --------
         allow = ["*.safetensors", "*.safetensors.index.json", "config.json"]
-        drafter_dir = snapshot_download(huggingface_model_id, allow_patterns=allow)
-        target_dir = snapshot_download(target_model_id, allow_patterns=allow)
+        drafter_dir = download_snapshot(huggingface_model_id, allow_patterns=allow)
+        target_dir = download_snapshot(target_model_id, allow_patterns=allow)
 
         # ---- 2. Build drafter config, inject vocab_size from target ----------
         with open(os.path.join(drafter_dir, "config.json")) as f:

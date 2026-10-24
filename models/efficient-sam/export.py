@@ -19,6 +19,7 @@
 import argparse
 import json
 import shutil
+import sys
 import time
 from pathlib import Path
 
@@ -26,6 +27,9 @@ import torch
 from coreai.runtime import AIModelAssetMetadata
 from coreai_torch import TorchConverter, get_decomp_table
 from efficient_sam.build_efficient_sam import build_efficient_sam
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from _download_shim import _resolve_backend  # noqa: E402
 
 
 def reference_inputs(
@@ -142,7 +146,12 @@ def create_efficient_sam(
         )
 
     print("[INFO] Downloading weights and sourcing model...")
-    checkpoint = "https://huggingface.co/merve/EfficientSAM/resolve/main/efficient_sam_vitt.pt"
+    if _resolve_backend() == "modelscope":
+        # ModelScope web resolve path (verified HTTP 200, 39.1 MB file).
+        # merve/EfficientSAM exists on ModelScope under the same org/name.
+        checkpoint = "https://www.modelscope.cn/models/merve/EfficientSAM/resolve/master/efficient_sam_vitt.pt"
+    else:
+        checkpoint = "https://huggingface.co/merve/EfficientSAM/resolve/main/efficient_sam_vitt.pt"
     state_dict = torch.hub.load_state_dict_from_url(
         checkpoint, map_location="cpu", progress=True, weights_only=True
     )

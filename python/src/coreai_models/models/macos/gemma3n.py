@@ -442,12 +442,12 @@ class Gemma3nForCausalLM(BaseForCausalLM):
         import re
         from types import SimpleNamespace
 
-        from huggingface_hub import snapshot_download
         from safetensors import safe_open
 
+        from coreai_models._download import download_snapshot
         from coreai_models.models.base import _load_tensors_for_keys, _resolve_safetensors_files
 
-        model_dir = snapshot_download(
+        model_dir = download_snapshot(
             huggingface_model_id,
             allow_patterns=["*.safetensors", "*.safetensors.index.json", "config.json"],
         )

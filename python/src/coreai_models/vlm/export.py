@@ -32,11 +32,11 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from transformers import AutoConfig, AutoTokenizer
 
 from coreai_models._constants import DEFAULT_INCLUDE_DEBUG_INFO
+from coreai_models._download import download_snapshot, resolve_model_path
 from coreai_models.export.macos import export_to_coreai
 from coreai_models.export.metadata import build_aimodel_metadata
 from coreai_models.models.macos.muse_glimmer import MuseGlimmerForCausalLMEmbeddings
@@ -332,7 +332,7 @@ async def export_text_bundle(
 
     # ---- 1. Download weights + load config ----
     logging.info(f"Downloading {spec.hf_model_id}...")
-    model_dir = snapshot_download(
+    model_dir = download_snapshot(
         spec.hf_model_id,
         allow_patterns=[
             "*.safetensors",
@@ -728,8 +728,22 @@ async def export_vision_encoder(
     if not bundle_path.exists():
         raise FileNotFoundError(f"Bundle not found: {bundle_path}. Export the text decoder first.")
 
-    # ---- 1. Text hidden size (projection target) from the HF config ----
-    text_hidden = AutoConfig.from_pretrained(spec.hf_model_id).text_config.hidden_size
+    # ---- 1. Resolve local snapshot (download via unified backend) ----
+    local_path = resolve_model_path(
+        spec.hf_model_id,
+        allow_patterns=[
+            "*.safetensors",
+            "*.safetensors.index.json",
+            "config.json",
+            "tokenizer*",
+            "vocab.json",
+            "merges.txt",
+            "*.model",
+        ],
+    )
+
+    # ---- 2. Text hidden size (projection target) from the HF config ----
+    text_hidden = AutoConfig.from_pretrained(local_path).text_config.hidden_size
 
     if spec.short_name == "muse-glimmer-vl":
         # Muse Glimmer: use our standalone MuseGlimmerVisionModel which
@@ -741,7 +755,7 @@ async def export_vision_encoder(
                 f"(num_frames=1), got {num_frames}"
             )
         logging.info(f"Loading {spec.hf_model_id} vision encoder (MuseGlimmerVisionModel)...")
-        vision_model = MuseGlimmerVisionModel.from_pretrained(spec.hf_model_id, dtype=torch.float32)
+        vision_model = MuseGlimmerVisionModel.from_pretrained(local_path, dtype=torch.float32)
         # MuseGlimmerVisionModel.forward already returns [1, N, text_hidden]
         # so we only need the f16 cast wrapper (no unsqueeze needed).
         export_module = CastF16VisionEncoder(vision_model).eval()
@@ -759,9 +773,9 @@ async def export_vision_encoder(
 
         _patch_fast_pos_embed_interpolate(Qwen3VLVisionModel)
 
-        # ---- 2. Load HF model (vision part only) ----
+        # ---- 3. Load HF model (vision part only) ----
         logging.info(f"Loading {spec.hf_model_id} for vision encoder extraction...")
-        hf_model = HFModel.from_pretrained(spec.hf_model_id, dtype=torch.float32)
+        hf_model = HFModel.from_pretrained(local_path, dtype=torch.float32)
         hf_model = hf_model.eval()
 
         wrapper = StaticVisionEncoder(
@@ -781,7 +795,7 @@ async def export_vision_encoder(
         else:
             pixel_shape = (1, 3 * num_frames, spec.image_size, spec.image_size)
 
-        # ---- 3. Validate output shape before export ----
+        # ---- 4. Validate output shape before export ----
         with torch.no_grad():
             test_out = wrapper(torch.randn(*pixel_shape, dtype=torch.float32))
             # merger returns (hidden_states, deepstack_features) in newer transformers
@@ -792,7 +806,7 @@ async def export_vision_encoder(
                 f"expected [{num_visual_tokens}, {text_hidden}]"
             )
 
-        # ---- 4. Wrap merger to handle tuple output ----
+        # ---- 5. Wrap merger to handle tuple output ----
         if isinstance(wrapper(torch.randn(*pixel_shape)), tuple):
             original_merger = wrapper.merger
 
@@ -951,6 +965,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Enable verbose (DEBUG) logging",
     )
+    parser.add_argument(
+        "--backend",
+        choices=["huggingface", "modelscope"],
+        default=None,
+        help=(
+            "Model download backend: 'huggingface' (default) or 'modelscope'. "
+            "Can also be set via the COREAI_DOWNLOAD_BACKEND "
+            "environment variables. The modelscope backend requires the 'modelscope' "
+            "package (pip install modelscope)."
+        ),
+    )
     return parser
 
 
@@ -985,6 +1010,12 @@ def main() -> None:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(levelname)s: %(message)s",
     )
+
+    # Propagate the download-backend choice to the environment so every download
+    # call site (text decoder, vision encoder, tokenizer) reads the same backend
+    # via coreai_models._download.resolve_backend().
+    if args.backend is not None:
+        os.environ["COREAI_DOWNLOAD_BACKEND"] = args.backend
 
     if args.list_models:
         print("VLM model types:")

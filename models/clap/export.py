@@ -17,6 +17,7 @@
 # ///
 import argparse
 import shutil
+import sys
 import time
 from pathlib import Path
 
@@ -25,6 +26,9 @@ import torch
 import transformers
 from coreai.runtime import AIModelAssetMetadata
 from coreai_torch import TorchConverter, get_decomp_table
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from _download_shim import resolve_model_path  # noqa: E402
 
 
 class ClapModule(torch.nn.Module):
@@ -135,12 +139,13 @@ def create_clap(
     include_debug_info: bool,
 ):
     print("[INFO] Sourcing model...")
-    model = ClapModule(model_name)
+    local_path = resolve_model_path(model_name)
+    model = ClapModule(local_path)
     model.eval()
     model.to(dtype)
     print("[INFO] Model sourced. Running torch export with decompositions...")
 
-    example_inputs = reference_inputs(model_name, dtype)
+    example_inputs = reference_inputs(local_path, dtype)
     ds = dynamic_shapes() if dynamic else None
 
     with torch.autocast(device_type="cpu", dtype=dtype):

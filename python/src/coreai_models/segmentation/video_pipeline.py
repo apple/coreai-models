@@ -44,6 +44,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from coreai_models._constants import DEFAULT_INCLUDE_DEBUG_INFO
+from coreai_models._download import resolve_model_path
 from coreai_models.segmentation.pipeline import _prepare_bundle_dir, _write_tokenizer
 
 logger = logging.getLogger(__name__)
@@ -703,11 +704,12 @@ async def _async_export_video(config: VideoExportConfig) -> str:
     _prepare_bundle_dir(bundle_dir, config.overwrite)
 
     logger.info("Loading %s (image_size=%d)...", config.hf_model_id, config.image_size)
-    model_config = transformers.Sam3VideoConfig.from_pretrained(config.hf_model_id)
+    local_path = resolve_model_path(config.hf_model_id)
+    model_config = transformers.Sam3VideoConfig.from_pretrained(local_path)
 
     # Modify the config with the given image size before constructing the model
     _apply_image_size(model_config, config.image_size)
-    model = transformers.Sam3VideoModel.from_pretrained(config.hf_model_id, config=model_config)
+    model = transformers.Sam3VideoModel.from_pretrained(local_path, config=model_config)
     model.eval()
     model.to(torch_dtype)
 
@@ -747,7 +749,7 @@ async def _async_export_video(config: VideoExportConfig) -> str:
 
     # Metadata before tokenizer, so a flaky HF fetch can't leave an unloadable bundle.
     _write_bundle_metadata(bundle_dir, asset_path.name, config, model.config)
-    _write_tokenizer(bundle_dir / "tokenizer", config.hf_model_id)
+    _write_tokenizer(bundle_dir / "tokenizer", local_path)
     return str(bundle_dir)
 
 

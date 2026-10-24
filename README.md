@@ -52,6 +52,11 @@ uv run coreai.model.registry --list-models
 
 Run `uv run coreai.model.registry --help` for details.
 
+> **ModelScope download:** Models are fetched from the HuggingFace Hub by
+> default. To download from [ModelScope](https://modelscope.cn) instead, see
+> [Downloading from ModelScope](models/README.md#downloading-from-modelscope)
+> in the models README.
+
 ## Agent Skills
 
 This repo includes a plugin with skills to enable coding agents to use Core AI like an expert.

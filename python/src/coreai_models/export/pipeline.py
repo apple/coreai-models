@@ -30,6 +30,7 @@ from coreai_models._constants import (
     IOS_DEFAULT_MAX_CONTEXT_LENGTH,
     TRACE_KV_CACHE_SEQ_LEN,
 )
+from coreai_models._download import resolve_model_path
 from coreai_models.export.bundle import bundle_llm_asset
 from coreai_models.export.compression import (
     get_c4,
@@ -215,6 +216,7 @@ class ResolvedModel:
     max_context_length: int | None
     quantization_config: dict | None
     palettization_config: Any
+    local_model_path: str
 
 
 class BuiltModel(NamedTuple):
@@ -226,8 +228,27 @@ class BuiltModel(NamedTuple):
 
 def resolve_model(config: ExportConfig) -> ResolvedModel:
     """Resolve ``config`` against the registry and the checkpoint's config, reading no weights."""
+    # ---- 0. Resolve the model id to a local snapshot ----
+    # Pre-download config + tokenizer files through the unified abstraction
+    # (HuggingFace or ModelScope) so that downstream AutoConfig/AutoTokenizer
+    # calls read from the local path instead of hitting the hub. Weight files
+    # are fetched separately by the model class's from_hf* methods (with their
+    # own allow_patterns), so we don't pull safetensors here.
+    local_model_path = resolve_model_path(
+        config.hf_model_id,
+        allow_patterns=[
+            "*.json",
+            "tokenizer*",
+            "vocab.json",
+            "merges.txt",
+            "*.model",
+            "*.txt",
+            "*.jinja",
+        ],
+    )
+
     # ---- 1. Resolve model class ----
-    hf_config = AutoConfig.from_pretrained(config.hf_model_id)
+    hf_config = AutoConfig.from_pretrained(local_model_path)
     model_type = config.model_type_override or getattr(hf_config, "model_type", None)
     if model_type is None:
         raise ValueError(
@@ -316,6 +337,7 @@ def resolve_model(config: ExportConfig) -> ResolvedModel:
         max_context_length=max_context_length,
         quantization_config=torch_quantization_config,
         palettization_config=torch_palettization_config,
+        local_model_path=local_model_path,
     )
 
 
@@ -332,7 +354,7 @@ def build_model(
     """
     config, entry, model_class = resolved.config, resolved.entry, resolved.model_class
     hf_config, target_dtype = resolved.hf_config, resolved.target_dtype
-    max_context_length = resolved.max_context_length
+    max_context_length, local_model_path = resolved.max_context_length, resolved.local_model_path
 
     logger.info(f"Loading {config.hf_model_id} ({config.variant}, dtype={target_dtype})...")
     use_memory_efficient = config.variant == "macOS"
@@ -381,7 +403,7 @@ def build_model(
         logger.info(f"Applying pre-export torch quantization (preset={config.compression})")
 
         def get_calibration_data():  # type: ignore[no-untyped-def]
-            tokenizer = AutoTokenizer.from_pretrained(config.hf_model_id)
+            tokenizer = AutoTokenizer.from_pretrained(local_model_path)
             return get_c4(tokenizer)
 
         # Copy so we don't mutate the shared preset.
