@@ -127,8 +127,14 @@ final class ServerState: @unchecked Sendable {
     /// Stable identifier for the backend configuration, echoed on responses as
     /// `system_fingerprint`. Reproducible outputs (same `seed` + prompt) are only
     /// guaranteed while this value is unchanged; it changes when output-affecting
-    /// configuration (model, engine, context length, sampling defaults) changes.
+    /// configuration (model, engine, batch size, context length, sampling defaults) changes. The
+    /// batch size is part of it because batched decoding sums in a different order, so the same
+    /// seed can give slightly different logits.
     let systemFingerprint: String
+    /// Scheduler for the batched lane and completions scoring, and the model config for each
+    /// `SchedulerSession`. Nil when batched serving is off.
+    private let batchServing: (scheduler: BatchScheduler, modelConfig: ModelConfig)?
+    private var batchScheduler: BatchScheduler? { batchServing?.scheduler }
     private let _state = Mutex<InternalState>(InternalState())
 
     private struct InternalState {
@@ -140,23 +146,106 @@ final class ServerState: @unchecked Sendable {
         var totalToolCalls: Int = 0
     }
 
-    init(engine: any InferenceEngine, tokenizer: any Tokenizer, config: ServerConfig) {
+    init(
+        engine: any InferenceEngine,
+        tokenizer: any Tokenizer,
+        config: ServerConfig,
+        batchServing: (scheduler: BatchScheduler, modelConfig: ModelConfig)? = nil
+    ) {
         self.engine = engine
         self.tokenizer = tokenizer
         self.config = config
         self.queue = RequestQueue(maxDepth: config.maxQueueDepth)
         self.toolCallDetection = detectToolCallFormat(using: tokenizer)
         self.thinkingFormat = detectThinkingFormat(using: tokenizer)
-        self.systemFingerprint = Self.makeSystemFingerprint(config: config, engine: engine)
+        self.systemFingerprint = Self.makeSystemFingerprint(
+            config: config, engine: engine, batchSize: batchServing?.scheduler.maxConcurrent ?? 1)
+        self.batchServing = batchServing
+    }
+
+    /// Token ids that end a row in the scheduler: the tokenizer's EOS id and
+    /// `config.additionalEosTokenIds`. Stop sequences are not included.
+    private var schedulerStopTokenIds: Set<Int32> {
+        var ids = Set<Int32>()
+        if let eos = tokenizer.eosTokenId { ids.insert(Int32(eos)) }
+        ids.formUnion(config.additionalEosTokenIds.map { Int32($0) })
+        return ids
+    }
+
+    /// Returns the engine for one request on `lane`. Call once per request.
+    ///
+    /// - `.batched`: a new `SchedulerSession` over the batch scheduler, or the shared engine when
+    ///   batched serving is off.
+    /// - `.fallbackBatchOne`: the shared engine. With a batch scheduler running, hold the access from
+    ///   `acquireAccess(lane:)` while using it.
+    func engineForRequest(lane: BatchServingLane) -> any InferenceEngine {
+        switch lane {
+        case .batched:
+            guard let batchServing else { return engine }
+            return SchedulerSession(
+                sink: batchServing.scheduler, config: batchServing.modelConfig,
+                stopTokenIds: schedulerStopTokenIds)
+        case .fallbackBatchOne:
+            return engine
+        }
+    }
+
+    /// Waits for and returns the access a request on `lane` holds while it uses the engine.
+    ///
+    /// - Single-slot permit from `queue`: on every lane except `.batched` with a scheduler that
+    ///   supports continuous batching.
+    /// - `ExclusiveEngineLease`: on `.fallbackBatchOne` when `batchScheduler` is set. The batch
+    ///   does not step while the lease is held.
+    ///
+    /// Throws `ServerError.queueFull` when the queue is full, and `CancellationError` when the task
+    /// is cancelled while waiting for the permit.
+    ///
+    /// Pass the same lane here and to `engineForRequest(lane:)`, and release the access when the
+    /// request is done:
+    ///
+    /// ```swift
+    /// let lane = BatchServingRouter.lane(hasResponseSchema: schema != nil)
+    /// let access = try await state.acquireAccess(lane: lane)
+    /// defer { access.release() }
+    /// let engine = state.engineForRequest(lane: lane)
+    /// ```
+    func acquireAccess(lane: BatchServingLane) async throws -> RequestAccess {
+        let permit = needsServerPermit(lane: lane) ? try await queue.acquire() : nil
+        let lease = lane == .fallbackBatchOne ? await batchScheduler?.acquireExclusiveAccess() : nil
+        return RequestAccess(permit: permit, lease: lease)
+    }
+
+    /// Scheduler that scores completion prompts in batches, or nil when batched serving is off.
+    var scoringScheduler: BatchScheduler? { batchScheduler }
+
+    /// Waits for and returns the single-slot permit for a scoring request, with no engine lease.
+    /// Throws `ServerError.queueFull` when the queue is full, and `CancellationError` when the task
+    /// is cancelled while waiting.
+    func acquireScoringAccess() async throws -> RequestAccess {
+        RequestAccess(permit: try await queue.acquire(), lease: nil)
+    }
+
+    /// True when a request on `lane` needs the single-slot permit: every lane except `.batched`
+    /// with a scheduler that supports continuous batching.
+    private func needsServerPermit(lane: BatchServingLane) -> Bool {
+        switch lane {
+        case .batched:
+            return !(batchScheduler?.supportsContinuousBatching ?? false)
+        case .fallbackBatchOne:
+            return true
+        }
     }
 
     /// Deterministic FNV-1a hash of a canonical config descriptor. Deterministic (not
     /// Swift's per-process-seeded `Hasher`) so two identical launches produce the same
     /// fingerprint and a config change produces a different one.
-    private static func makeSystemFingerprint(config: ServerConfig, engine: any InferenceEngine) -> String {
+    private static func makeSystemFingerprint(
+        config: ServerConfig, engine: any InferenceEngine, batchSize: Int
+    ) -> String {
         let descriptor = [
             config.modelName,
             String(describing: type(of: engine)),
+            "batch=\(batchSize)",
             "ctx=\(config.maxContextLength)",
             "t=\(config.defaultTemperature)",
             "k=\(config.defaultTopK.map { "\($0)" } ?? "nil")",
@@ -313,5 +402,22 @@ enum RequestID {
             return val
         }
         return "coreai-\(n)"
+    }
+}
+
+/// Single-slot permit and engine lease a request holds while it uses the engine. Either can be nil.
+/// `release()` can be called more than once, and the permit and lease also release on deinit.
+final class RequestAccess: Sendable {
+    private let permit: QueuePermit?
+    private let lease: ExclusiveEngineLease?
+
+    init(permit: QueuePermit?, lease: ExclusiveEngineLease?) {
+        self.permit = permit
+        self.lease = lease
+    }
+
+    func release() {
+        lease?.release()
+        permit?.release()
     }
 }

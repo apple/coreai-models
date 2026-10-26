@@ -46,90 +46,113 @@ public struct LogProbabilities: Sendable {
         targets: [Int32],
         topK: Int = 0
     ) -> LogProbabilities {
+        var scratch = Scratch()
         var entries: [Entry] = []
         entries.reserveCapacity(min(logits.count, targets.count))
-
         for (logitVec, targetToken) in zip(logits, targets) {
-            let tokenIndex = Int(targetToken)
-            guard tokenIndex >= 0 && tokenIndex < logitVec.count else {
-                entries.append(Entry(tokenId: targetToken, value: -.infinity, alternatives: []))
-                continue
+            logitVec.withUnsafeBufferPointer { row in
+                entries.append(entry(row: row, target: targetToken, topK: topK, scratch: &scratch))
             }
-
-            let vocabSize = logitVec.count
-            let (logSumExp, floatBuffer) = computeLogSumExpVectorized(logitVec)
-
-            let targetLogProb: Double
-            if logSumExp.isInfinite {
-                // +Inf logits: tokens with +Inf get log-prob 0, others get -Inf
-                targetLogProb = Double(floatBuffer[tokenIndex]).isInfinite ? 0.0 : -.infinity
-            } else {
-                let raw = Double(floatBuffer[tokenIndex]) - logSumExp
-                targetLogProb = raw.isNaN ? 0.0 : raw
-            }
-
-            var alts: [(tokenId: Int32, value: Double)] = []
-            if topK > 0 {
-                alts = findTopK(floatBuffer, k: topK, logSumExp: logSumExp, vocabSize: vocabSize)
-            }
-
-            entries.append(Entry(tokenId: targetToken, value: targetLogProb, alternatives: alts))
         }
-
         return LogProbabilities(entries: entries)
     }
 
-    /// Vectorized log-sum-exp using Accelerate.
-    /// Returns (logSumExp, floatBuffer) where floatBuffer is the Float32-converted logits.
+    /// Computes one entry per target from `logits`, a row-major `[targets.count, vocabSize]` buffer
+    /// whose row `p` holds the logits that predict `targets[p]`.
+    static func compute(
+        logits: UnsafeBufferPointer<LogitsScalarType>,
+        vocabSize: Int,
+        targets: ArraySlice<Int32>,
+        topK: Int
+    ) -> [Entry] {
+        precondition(logits.count >= targets.count * vocabSize, "logits buffer is shorter than targets")
+        var scratch = Scratch()
+        var entries: [Entry] = []
+        entries.reserveCapacity(targets.count)
+        for (position, targetToken) in targets.enumerated() {
+            let start = position * vocabSize
+            let row = UnsafeBufferPointer(rebasing: logits[start..<start + vocabSize])
+            entries.append(entry(row: row, target: targetToken, topK: topK, scratch: &scratch))
+        }
+        return entries
+    }
+
+    /// Float32 buffers reused across positions, sized to the vocabulary on first use.
+    private struct Scratch {
+        var floats: [Float] = []
+        var shifted: [Float] = []
+    }
+
+    private static func entry(
+        row: UnsafeBufferPointer<LogitsScalarType>, target: Int32, topK: Int, scratch: inout Scratch
+    ) -> Entry {
+        let tokenIndex = Int(target)
+        guard tokenIndex >= 0 && tokenIndex < row.count else {
+            return Entry(tokenId: target, value: -.infinity, alternatives: [])
+        }
+
+        let vocabSize = row.count
+        if scratch.floats.count != vocabSize {
+            scratch.floats = [Float](repeating: 0, count: vocabSize)
+            scratch.shifted = [Float](repeating: 0, count: vocabSize)
+        }
+        let logSumExp = computeLogSumExpVectorized(row, floats: &scratch.floats, shifted: &scratch.shifted)
+
+        let targetLogProb: Double
+        if logSumExp.isInfinite {
+            // +Inf logits: tokens with +Inf get log-prob 0, others get -Inf
+            targetLogProb = Double(scratch.floats[tokenIndex]).isInfinite ? 0.0 : -.infinity
+        } else {
+            let raw = Double(scratch.floats[tokenIndex]) - logSumExp
+            targetLogProb = raw.isNaN ? 0.0 : raw
+        }
+
+        var alts: [(tokenId: Int32, value: Double)] = []
+        if topK > 0 {
+            alts = findTopK(scratch.floats, k: topK, logSumExp: logSumExp, vocabSize: vocabSize)
+        }
+        return Entry(tokenId: target, value: targetLogProb, alternatives: alts)
+    }
+
+    /// Converts `logits` to Float32 into `floats` and returns their log-sum-exp, using `shifted` as
+    /// working space. Returns infinity when the maximum logit is infinite.
     private static func computeLogSumExpVectorized(
-        _ logits: [LogitsScalarType]
-    ) -> (Double, [Float]) {
+        _ logits: UnsafeBufferPointer<LogitsScalarType>, floats: inout [Float], shifted: inout [Float]
+    ) -> Double {
         let count = logits.count
 
         // Float16 → Float32 via vFloatConversion (Accelerate)
-        var floatBuffer = [Float](repeating: 0, count: count)
-        logits.withUnsafeBufferPointer { src in
-            src.baseAddress!.withMemoryRebound(to: UInt16.self, capacity: count) { halfPtr in
-                floatBuffer.withUnsafeMutableBufferPointer { dst in
-                    var bufferSrc = vImage_Buffer(
-                        data: UnsafeMutableRawPointer(mutating: halfPtr),
-                        height: 1, width: vImagePixelCount(count), rowBytes: count * 2)
-                    var bufferDst = vImage_Buffer(
-                        data: dst.baseAddress!, height: 1,
-                        width: vImagePixelCount(count), rowBytes: count * 4)
-                    vImageConvert_Planar16FtoPlanarF(&bufferSrc, &bufferDst, 0)
-                }
+        logits.baseAddress!.withMemoryRebound(to: UInt16.self, capacity: count) { halfPtr in
+            floats.withUnsafeMutableBufferPointer { dst in
+                var bufferSrc = vImage_Buffer(
+                    data: UnsafeMutableRawPointer(mutating: halfPtr),
+                    height: 1, width: vImagePixelCount(count), rowBytes: count * 2)
+                var bufferDst = vImage_Buffer(
+                    data: dst.baseAddress!, height: 1,
+                    width: vImagePixelCount(count), rowBytes: count * 4)
+                vImageConvert_Planar16FtoPlanarF(&bufferSrc, &bufferDst, 0)
             }
         }
 
         var maxVal: Float = 0
-        vDSP_maxv(floatBuffer, 1, &maxVal, vDSP_Length(count))
+        vDSP_maxv(floats, 1, &maxVal, vDSP_Length(count))
 
         if maxVal.isInfinite {
-            return (Double.infinity, floatBuffer)
+            return Double.infinity
         }
 
-        // log-sum-exp with temporary stack buffers
         var negMax = -maxVal
         let countLen = vDSP_Length(count)
         var countInt32 = Int32(count)
 
-        return withUnsafeTemporaryAllocation(of: Float.self, capacity: count) { shiftedBuf in
-            vDSP_vsadd(floatBuffer, 1, &negMax, shiftedBuf.baseAddress!, 1, countLen)
-
-            return withUnsafeTemporaryAllocation(of: Float.self, capacity: count) { expBuf in
-                vvexpf(expBuf.baseAddress!, shiftedBuf.baseAddress!, &countInt32)
-
-                var sumExp: Float = 0
-                vDSP_sve(expBuf.baseAddress!, 1, &sumExp, countLen)
-
-                let logSumExp = Double(maxVal) + Double(log(sumExp))
-                return (logSumExp, floatBuffer)
-            }
+        return shifted.withUnsafeMutableBufferPointer { work in
+            vDSP_vsadd(floats, 1, &negMax, work.baseAddress!, 1, countLen)
+            vvexpf(work.baseAddress!, work.baseAddress!, &countInt32)
+            var sumExp: Float = 0
+            vDSP_sve(work.baseAddress!, 1, &sumExp, countLen)
+            return Double(maxVal) + Double(log(sumExp))
         }
     }
-
-    /// Find top-K elements using partial sort (O(n) for small K).
     private static func findTopK(
         _ floatBuffer: [Float],
         k: Int,

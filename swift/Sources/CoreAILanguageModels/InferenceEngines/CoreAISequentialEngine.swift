@@ -98,6 +98,13 @@ public final class CoreAISequentialEngine: InferenceEngine, IdempotentEngine, Ba
         return 1  // Single-batch graph.
     }
 
+    /// True when the graph has an attention-mask input and a batch dimension above 1, static or
+    /// dynamic.
+    package var supportsBatching: Bool {
+        functionDescriptor.inputNames.contains(where: InputLayout.knownAttnMaskNames.contains)
+            && maxBatchCapacity > 1
+    }
+
     /// The prefix hit count of the most recent generation. With several sessions in use, this is
     /// the count of whichever session ran last.
     public private(set) var lastPrefixHitCount: Int = 0
@@ -410,7 +417,58 @@ public final class CoreAISequentialEngine: InferenceEngine, IdempotentEngine, Ba
         startPositions: [Int],
         session: GenerationSessionState
     ) async throws -> [[LogitsScalarType]] {
-        precondition(!tokensPerRow.isEmpty, "decodeBatch requires at least one row")
+        let out = try await runBatchedForward(
+            tokensPerRow: tokensPerRow, startPositions: startPositions, session: session)
+        let n = tokensPerRow.count
+        let q = tokensPerRow[0].count
+        let vocab = config.vocabSize
+        return Self.logitsRows(
+            out, count: n, rowLength: vocab, firstOffset: (q - 1) * vocab, rowStride: q * vocab)
+    }
+
+    func allPositionLogits(
+        tokensPerRow: [[Int32]],
+        startPosition: Int,
+        session: GenerationSessionState
+    ) async throws -> [LogitsScalarType] {
+        let n = tokensPerRow.count
+        let out = try await runBatchedForward(
+            tokensPerRow: tokensPerRow, startPositions: Array(repeating: startPosition, count: n),
+            session: session)
+        return readNDArray(out, as: LogitsScalarType.self, count: n * tokensPerRow[0].count * config.vocabSize)
+    }
+
+    /// Copies `count` rows of `rowLength` logits out of `array`. Row `b` starts at element
+    /// `firstOffset + b * rowStride` in row-major order.
+    private static func logitsRows(
+        _ array: NDArray, count: Int, rowLength: Int, firstOffset: Int, rowStride: Int
+    ) -> [[LogitsScalarType]] {
+        let view = array.view(as: LogitsScalarType.self)
+        let contiguous = view.withUnsafePointer { _, shape, strides in
+            isContiguousRowMajor(shape: shape, strides: strides)
+        }
+        guard contiguous else {
+            let total = firstOffset + (count - 1) * rowStride + rowLength
+            let flat = readNDArray(array, as: LogitsScalarType.self, count: total)
+            return (0..<count).map { b in
+                let start = firstOffset + b * rowStride
+                return Array(flat[start..<start + rowLength])
+            }
+        }
+        return view.withUnsafePointer { pointer, _, _ in
+            (0..<count).map { b in
+                Array(UnsafeBufferPointer(start: pointer + firstOffset + b * rowStride, count: rowLength))
+            }
+        }
+    }
+
+    /// Runs one batched forward step and returns the logits output, `[N, q, vocab]`.
+    private func runBatchedForward(
+        tokensPerRow: [[Int32]],
+        startPositions: [Int],
+        session: GenerationSessionState
+    ) async throws -> NDArray {
+        precondition(!tokensPerRow.isEmpty, "a batched forward requires at least one row")
         let n = tokensPerRow.count
         precondition(startPositions.count == n, "one start position per row")
         let q = tokensPerRow[0].count
@@ -489,11 +547,7 @@ public final class CoreAISequentialEngine: InferenceEngine, IdempotentEngine, Ba
             }
         }
 
-        let flat = readNDArray(out, as: LogitsScalarType.self, count: n * q * vocab)
-        return (0..<n).map { b in
-            let base = (b * q + (q - 1)) * vocab
-            return Array(flat[base..<base + vocab])
-        }
+        return out
     }
 
     /// See ``BatchedDecodeStep`` for the contract.

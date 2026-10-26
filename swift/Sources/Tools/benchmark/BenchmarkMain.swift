@@ -64,13 +64,13 @@ struct LLMBenchmark: AsyncParsableCommand {
 
     @Option(
         name: .customLong("inference-engine-variant"),
-        help: "Engine variant. The default picks one from the model. Batch sizes above 1 need coreai-sequential.")
+        help: "Engine variant. The default picks one from the model: coreai-sequential when it has an attn_mask input.")
     var inferenceEngineVariant: String = "default"
 
     @Option(
         name: .customLong("batch-size"),
         help:
-            "Number of requests to run as one batch. Defaults to the graph's static batch dimension. A dynamic-batch graph reports 1, so set this explicitly. Needs --inference-engine-variant coreai-sequential."
+            "Number of requests to run as one batch. Defaults to the graph's static batch dimension. A dynamic-batch graph reports 1, so set this explicitly. Above 1, needs a model exported with --attention-mask batched."
     )
     var batchSize: Int?
 
@@ -143,8 +143,8 @@ struct LLMBenchmark: AsyncParsableCommand {
         if effectiveBatch > 1 {
             guard engine is CoreAISequentialEngine else {
                 throw ValidationError(
-                    "batched benchmarking with batch size \(effectiveBatch) requires "
-                        + "--inference-engine-variant coreai-sequential")
+                    "batched benchmarking with batch size \(effectiveBatch) needs the coreai-sequential engine "
+                        + "and a model exported with --attention-mask batched")
             }
             let source = batchSize != nil ? "requested" : "auto-detected from model"
             print("🧵 Batch size: \(effectiveBatch) (\(source); benchmarking \(effectiveBatch) rows together)")

@@ -1000,10 +1000,13 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
 
     // MARK: - VLM Inference
 
-    /// Runs `rows` copies of the prompt through `lockstepBatchedGenerate` and prints each row.
+    /// Runs `rows` copies of `promptTokens` through `lockstepBatchedGenerate`, up to `--max-tokens`
+    /// new tokens per row, and prints each row's decoded text.
     ///
-    /// Row 0 is greedy, so it should match a normal greedy run of the same prompt. The other rows
-    /// sample at `--temperature` (0.8 if that is 0) with a fixed seed per row, so reruns repeat.
+    /// Row 0 is greedy. Rows 1 and up sample at `--temperature` (0.8 when it is 0 or less) with
+    /// seed `1234 + row`. A row stops on the tokenizer's EOS or an `additionalEosTokenIds` token.
+    /// Throws `ValidationError` when the engine is not a `CoreAISequentialEngine` or `rows` exceeds
+    /// `bundle.maxBatchSize`.
     private func runBatchPrototype(
         rows: Int,
         inferenceEngine: any InferenceEngine,
