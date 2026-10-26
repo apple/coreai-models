@@ -31,6 +31,21 @@ struct AutoregressiveDrafterGuardTests {
         }
     }
 
+    @Test("Asking for no drafts proposes nothing and leaves the draft engine untouched", arguments: [0, -3])
+    func noDraftsRequested(count: Int) async throws {
+        let engine = HashEngine(model: HashModel(vocab: 8, levels: 5, salt: 1))
+        let drafter = AutoregressiveDrafter(engine: engine)
+        var rng = SystemRandomNumberGenerator()
+        let proposal = try await drafter.draftAll(
+            confirmedPrefix: [1, 2, 3], count: count, policy: .greedy, using: &rng)
+        #expect(proposal.tokens.isEmpty)
+        #expect(engine.processedTokenCount == 0)
+        // The same prefix can still be drafted from afterwards.
+        let later = try await drafter.draftAll(
+            confirmedPrefix: [1, 2, 3], count: 2, policy: .greedy, using: &rng)
+        #expect(later.tokens.count == 2)
+    }
+
     @Test("Greedy drafting reads each step's argmax and never copies a logits row")
     func greedyDraftsAvoidTheLogitsCopy() async throws {
         let model = HashModel(vocab: 30, levels: 1000, salt: 2)

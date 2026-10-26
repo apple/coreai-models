@@ -10,6 +10,19 @@ import Testing
 
 @Suite("Prompt lookup equivalence")
 struct PromptLookupEquivalenceTests {
+    @Test("Parameters below their minimum are clamped, so a short context never traps")
+    func clampedParameters() {
+        let lookup = PromptLookup(maxNgram: -2, minNgram: 0, maxProposal: 0)
+        #expect(lookup.minNgram == 1)
+        #expect(lookup.maxNgram == 1)
+        #expect(lookup.maxProposal == 1)
+        // Every context, however short, is searched without an out-of-range index.
+        for context in [[], [5], [5, 5], [1, 2, 1], [4, 4, 4, 4]] as [[Int32]] {
+            #expect(lookup.propose(context: context, count: 3).count <= 3)
+        }
+        #expect(lookup.propose(context: [4, 4, 4, 4], count: 3) == [4])
+    }
+
     /// Element-by-element reference: longest suffix first, latest earlier occurrence first.
     private func reference(_ lookup: PromptLookup, _ context: [Int32], _ count: Int) -> [Int32] {
         guard count > 0 else { return [] }

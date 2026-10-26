@@ -72,6 +72,9 @@ package final class AutoregressiveDrafter: DrafterEngine, @unchecked Sendable {
         confirmedPrefix: [Int32], count: Int, policy: VerificationPolicy,
         using rng: inout some RandomNumberGenerator
     ) async throws -> DraftProposal {
+        // Nothing to propose: leave the draft engine untouched, so a later call with the same prefix
+        // still finds its tail unseen.
+        guard count > 0 else { return DraftProposal(tokens: []) }
         // Prefill any confirmed tail the drafter hasn't seen, leaving the last
         // token to seed the first draft step.
         let unseen = confirmedPrefix.count - engine.processedTokenCount

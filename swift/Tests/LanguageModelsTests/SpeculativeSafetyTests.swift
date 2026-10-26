@@ -123,6 +123,81 @@ extension SpeculativeSafetyTests {
     }
 }
 
+extension SpeculativeSafetyTests {
+    @Test("A prompt longer than the context is refused before anything is prefilled")
+    func promptLongerThanTheContext() async throws {
+        let model = HashModel(vocab: 30, levels: 1000, salt: 3)
+        let target = HashEngine(model: model, maxContextLength: 8)
+        let decoder = SpeculativeDecoder(
+            drafter: FuzzDrafter(model: model, seed: 1, maxContextLength: 8), target: target,
+            numDraftTokens: 3)
+        await #expect(throws: InferenceRuntimeError.self) {
+            _ = try await decoder.generateGreedy(
+                promptTokens: Array(repeating: 1, count: 9), maxNewTokens: 5, stopTokenIds: [],
+                onToken: { _ in })
+        }
+        #expect(target.processedTokenCount == 0)
+        // A prompt that exactly fills the context still yields the one token that fits.
+        var got: [Int32] = []
+        _ = try await decoder.generateGreedy(
+            promptTokens: Array(repeating: 1, count: 8), maxNewTokens: 5, stopTokenIds: [],
+            onToken: { got.append($0) })
+        #expect(got.count == 1)
+    }
+
+    @Test("Sampling never accepts a token the target gives no probability, even if the draft gave none")
+    func zeroProbabilityTokensAreRejected() async throws {
+        // Token 3 has no mass under the target (row entries of -inf) or under the scripted draft.
+        let blocked: Float = -.infinity
+        let row: [Float] = [0, 0, 0, blocked]
+        let target = TableEngine(table: [row, row, row, row])
+        let draft = ScriptedDrafter(token: 3, logits: row)
+        let decoder = SpeculativeDecoder(drafter: draft, target: target, numDraftTokens: 1)
+        for seed in 0..<40 {
+            var got: [Int32] = []
+            _ = try await decoder.generateSampling(
+                promptTokens: [0], maxNewTokens: 12, stopTokenIds: [], temperature: 1,
+                seed: UInt64(seed), onToken: { got.append($0) })
+            #expect(!got.contains(3), "seed \(seed): \(got)")
+        }
+    }
+
+    @Test("A draft token outside the vocabulary throws instead of indexing past the distribution")
+    func draftTokenOutsideTheVocabulary() async throws {
+        // The engine can be fed token 9 (it has a row for it), but its distributions are 4 wide.
+        let row: [Float] = [0, 0, 0, 0]
+        let target = TableEngine(table: Array(repeating: row, count: 16))
+        let decoder = SpeculativeDecoder(
+            drafter: ScriptedDrafter(token: 9, logits: row), target: target, numDraftTokens: 1)
+        await #expect(throws: InferenceRuntimeError.self) {
+            _ = try await decoder.generateSampling(
+                promptTokens: [0], maxNewTokens: 4, stopTokenIds: [], temperature: 1, seed: 1,
+                onToken: { _ in })
+        }
+    }
+}
+
+/// Always proposes one fixed token with a fixed draft distribution.
+private final class ScriptedDrafter: DrafterEngine, @unchecked Sendable {
+    let token: Int32
+    let logits: [LogitsScalarType]
+    let maxContextLength = 100_000
+
+    init(token: Int32, logits: [Float]) {
+        self.token = token
+        self.logits = logits.map { LogitsScalarType($0) }
+    }
+
+    func reset(to tokenIndex: Int) async throws {}
+    func commit(confirmedLength: Int, features: DrafterFeatures?) async throws {}
+    func draftAll(
+        confirmedPrefix: [Int32], count: Int, policy: VerificationPolicy,
+        using rng: inout some RandomNumberGenerator
+    ) async throws -> DraftProposal {
+        DraftProposal(tokens: [token], logits: [logits])
+    }
+}
+
 /// Wraps an engine and drops the first row of every per-position argmax, as an engine would that
 /// scores fewer positions than a verify block holds.
 private final class ShortRowsEngine: SpeculativeEngine, @unchecked Sendable {

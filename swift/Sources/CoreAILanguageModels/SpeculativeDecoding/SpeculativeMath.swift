@@ -39,14 +39,15 @@ enum SpeculativeMath {
         guard largest > -.infinity else {
             return [Float](repeating: 1 / Float(probs.count), count: probs.count)
         }
-        guard temperature > 0 else {
+        // A positive Double below Float's range is zero as a Float, so test the Float.
+        var t = Float(temperature)
+        guard t > 0 else {
             var best = 0
             for i in 1..<probs.count where probs[i] > probs[best] { best = i }
             var oneHot = [Float](repeating: 0, count: probs.count)
             oneHot[best] = 1
             return oneHot
         }
-        var t = Float(temperature)
         vDSP_vsdiv(probs, 1, &t, &probs, 1, vDSP_Length(probs.count))
         CompositeSampler.softmaxVectorized(&probs)
         return probs

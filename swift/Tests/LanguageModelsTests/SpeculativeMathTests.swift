@@ -21,6 +21,13 @@ struct SpeculativeMathTests {
         #expect(SpeculativeMath.argmax([]) == 0)
     }
 
+    @Test("A temperature too small for Float is the greedy limit, not a division by zero")
+    func temperatureBelowFloatRange() {
+        let probs = SpeculativeMath.temperatureSoftmax(logits([0, 3, 1, 3]), temperature: 1e-50)
+        #expect(probs == [0, 1, 0, 0])  // one-hot at the first maximum
+        #expect(probs.allSatisfy { $0.isFinite })
+    }
+
     @Test("temperatureSoftmax matches a Double reference and sums to one", arguments: [0.5, 1.0, 2.0])
     func softmaxMatchesReference(temperature: Double) {
         let values: [Double] = [2, -1, 0.5, 3, 3, -6, 0]

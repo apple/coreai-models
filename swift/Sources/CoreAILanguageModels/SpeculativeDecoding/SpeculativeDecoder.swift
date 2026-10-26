@@ -211,6 +211,10 @@ package final class SpeculativeDecoder: @unchecked Sendable {
         guard maxNewTokens > 0, !promptTokens.isEmpty else { return stats }
 
         let maxContext = min(drafter.maxContextLength, target.config.maxContextLength)
+        guard promptTokens.count <= maxContext else {
+            throw InferenceRuntimeError.invalidArgument(
+                "the prompt of \(promptTokens.count) tokens exceeds the \(maxContext)-token context")
+        }
 
         // `tokens` = prompt + every confirmed generated token.
         var tokens = promptTokens
@@ -399,7 +403,13 @@ package final class SpeculativeDecoder: @unchecked Sendable {
             let p = SpeculativeMath.temperatureSoftmax(targetLogits[accepted], temperature: temperature)
             let q = SpeculativeMath.temperatureSoftmax(draftLogits[accepted], temperature: temperature)
             let x = Int(proposal.tokens[accepted])
-            let acceptProb = q[x] > 0 ? min(1.0, Double(p[x]) / Double(q[x])) : 1.0
+            guard x >= 0, x < p.count, x < q.count else {
+                throw InferenceRuntimeError.invalidState(
+                    "draft token \(x) is outside the vocabulary (target \(p.count), draft \(q.count))")
+            }
+            // A token the draft gave no mass cannot have been drawn from it, so the ratio is
+            // undefined: accept it only if the target can produce it.
+            let acceptProb = q[x] > 0 ? min(1.0, Double(p[x]) / Double(q[x])) : (p[x] > 0 ? 1.0 : 0.0)
             if Double.random(in: 0..<1, using: &rng) < acceptProb {
                 accepted += 1
             } else {

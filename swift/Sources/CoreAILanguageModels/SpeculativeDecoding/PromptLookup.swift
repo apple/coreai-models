@@ -8,10 +8,10 @@
 /// when the output copies spans from the context (rewrites, extraction, document QA).
 package struct PromptLookup: Sendable {
     /// Longest and shortest suffix lengths matched; longer matches are tried first.
-    package var maxNgram: Int
-    package var minNgram: Int
+    package let maxNgram: Int
+    package let minNgram: Int
     /// Most tokens proposed per block.
-    package var maxProposal: Int
+    package let maxProposal: Int
 
     package init(maxNgram: Int = 4, minNgram: Int = 3, maxProposal: Int = 7) {
         self.minNgram = max(1, minNgram)
