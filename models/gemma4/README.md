@@ -126,13 +126,23 @@ uv run export_drafter.py --model google/gemma-4-E2B-it \
   --drafter <assistant checkpoint dir> --bundle <bundle>
 ```
 
+`--drafter` is a local directory that already holds the assistant checkpoint (its `*.safetensors`
+and `config.json`); the script does not download it. Fetch it first, for example:
+
+```bash
+hf download google/gemma-4-E2B-it-assistant --local-dir <assistant checkpoint dir>
+```
+
+(`google/gemma-4-E4B-it-assistant` for E4B.) `--bundle` takes the bundle that `export.py` wrote with
+`--emit-hidden-states`; the script refuses a bundle exported without it.
+
 `--emit-hidden-states` makes the decode graphs return their post-norm final hidden state as a
 second output, `hidden_states`, and records `language.overrides.emits_hidden_states` in the bundle
 metadata. The default export is unchanged.
 
 `export_drafter.py` exports the head's layer stack as one static-shape program, `draft_step.aimodel`,
-with one function per context bucket of the target export's ladder, up to `--max-context-length`. The token-embedding
-lookup and the candidate scan stay outside the program, over `draft_scan.bin`. `--bundle` copies
+with one function per context bucket of the target export's ladder, up to `--max-context-length`.
+The token-embedding lookup and the candidate scan stay outside the program, over `draft_scan.bin`. `--bundle` copies
 the files into the bundle and declares them as the `drafter` component: the program under
 `assets.drafter`, and `drafter_config`, `drafter_scan` and `drafter_scan_index` under
 `auxiliary_assets`. It also sets `speculative.drafter_kind` to `mtp`, because other drafters use
