@@ -131,11 +131,13 @@ second output, `hidden_states`, and records `language.overrides.emits_hidden_sta
 metadata. The default export is unchanged.
 
 `export_drafter.py` exports the head's layer stack as one static-shape program, `draft_step.aimodel`,
-with one function per full-attention window up to `--max-context-length`. The token-embedding
+with one function per context bucket of the target export's ladder, up to `--max-context-length`. The token-embedding
 lookup and the candidate scan stay outside the program, over `draft_scan.bin`. `--bundle` copies
 the files into the bundle and declares them as the `drafter` component: the program under
 `assets.drafter`, and `drafter_config`, `drafter_scan` and `drafter_scan_index` under
-`auxiliary_assets`. The head attends to the target's K/V in the most recent 512 positions in its
+`auxiliary_assets`. It also sets `speculative.drafter_kind` to `mtp`, because other drafters use
+the same `drafter` asset key with different semantics; `--bundle` refuses a bundle that already
+declares one. The head attends to the target's K/V in the most recent 512 positions in its
 sliding layers and to the whole context in its full-attention layer.
 
 ### Runner side

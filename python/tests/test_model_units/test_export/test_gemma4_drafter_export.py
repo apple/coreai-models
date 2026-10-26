@@ -45,11 +45,14 @@ if _HAS_COREAI:
     export_drafter = _load("export_drafter")
     _ios_metadata_extras = export_g4._ios_metadata_extras
     DRAFTER_AUXILIARY_KEYS = export_drafter.DRAFTER_AUXILIARY_KEYS
+    DRAFTER_KIND = export_drafter.DRAFTER_KIND
     SCAN_NAME = export_drafter.SCAN_NAME
     DecoderLayer = export_drafter.DecoderLayer
+    DraftStep = export_drafter.DraftStep
     RMSNorm = export_drafter.RMSNorm
     add_to_bundle = export_drafter.add_to_bundle
     check_checkpoint = export_drafter.check_checkpoint
+    example_inputs = export_drafter.example_inputs
     full_windows = export_drafter.full_windows
     load_drafter = export_drafter.load_drafter
     output_table = export_drafter.output_table
@@ -122,11 +125,147 @@ def test_grouped_attention_matches_copied_kv(kv_heads, queries):
     torch.testing.assert_close(captured["attn"], expected, atol=1e-5, rtol=1e-5)
 
 
-def test_full_windows_double_up_to_max_context():
-    assert full_windows(512, 4096) == [512, 1024, 2048, 4096]
-    # A max context that is not a power-of-two multiple of the window is still the last.
-    assert full_windows(512, 3000) == [512, 1024, 2048, 3000]
-    assert full_windows(512, 512) == [512]
+def test_full_windows_are_the_targets_context_buckets():
+    # The default covers the model's full context with the target's own sparse ladder, not a
+    # function for every doubling of the window.
+    assert full_windows(export_g4.IOS_MAX_CONTEXT_LENGTH) == [1024, 8192, 32768, 131072]
+    assert full_windows(export_g4.IOS_MAX_CONTEXT_LENGTH) == export_g4.context_ladder(131072)
+    assert full_windows(4096) == export_g4.context_ladder(4096) == [1024, 4096]
+    assert full_windows(512) == [512]
+
+
+# ---- DraftStep ----
+
+
+def _step_inputs(module, window=8, full_window=16, seed=0):
+    """Random float32 inputs for one draft step; the masks leave every position visible."""
+    g = torch.Generator().manual_seed(seed)
+    hd, full_hd = module.layers[0].head_dim, module.layers[-1].head_dim
+    backbone = module.pre_projection.in_features // 2
+
+    def r(*shape):
+        return torch.randn(*shape, generator=g)
+
+    return {
+        "inputs_embeds": r(1, 1, 2 * backbone),
+        "cos_sliding": r(1, 1, 1, hd),
+        "sin_sliding": r(1, 1, 1, hd),
+        "cos_full": r(1, 1, 1, full_hd),
+        "sin_full": r(1, 1, 1, full_hd),
+        "k_sliding": r(1, 1, hd, window),
+        "v_sliding": r(1, 1, hd, window),
+        "mask_sliding": torch.zeros(1, 1, 1, window),
+        "k_full": r(1, 1, full_hd, full_window),
+        "v_full": r(1, 1, full_hd, full_window),
+        "mask_full": torch.zeros(1, 1, 1, full_window),
+    }
+
+
+def _draft_step(layers):
+    return DraftStep(checkpoint(layers=layers), num_kv_heads=1).eval()
+
+
+def test_draft_step_outputs_are_consistent_with_its_layers():
+    module = _draft_step(layers=2)
+    with torch.no_grad():
+        hidden, centroid_logits, x = module(**_step_inputs(module))
+    assert hidden.shape == x.shape == (1, 1, 4)
+    assert centroid_logits.shape == (1, 1, 2)  # one score per centroid
+    torch.testing.assert_close(hidden, module.post_projection(x))
+    torch.testing.assert_close(centroid_logits, module.centroids(x))
+
+
+def test_draft_step_is_deterministic():
+    module = _draft_step(layers=2)
+    inputs = _step_inputs(module)
+    with torch.no_grad():
+        first, second = module(**inputs), module(**inputs)
+    for a, b in zip(first, second, strict=True):
+        assert torch.equal(a, b)
+
+
+def _output(module, **overrides):
+    inputs = _step_inputs(module) | overrides
+    with torch.no_grad():
+        return module(**inputs)[2]
+
+
+def test_draft_step_runs_the_sliding_layers_then_the_full_attention_layer():
+    module = _draft_step(layers=3)
+    i = _step_inputs(module)
+    sliding = (
+        i["cos_sliding"],
+        i["sin_sliding"],
+        i["k_sliding"],
+        i["v_sliding"],
+        i["mask_sliding"],
+    )
+    full = (i["cos_full"], i["sin_full"], i["k_full"], i["v_full"], i["mask_full"])
+    with torch.no_grad():
+        x = module.pre_projection(i["inputs_embeds"])
+        for layer in module.layers[:-1]:
+            x = layer(x, *sliding)
+        x = module.norm(module.layers[-1](x, *full))
+        torch.testing.assert_close(_output(module), x)
+
+
+def test_the_last_layer_attends_to_the_full_cache_and_the_others_to_the_sliding_cache():
+    # With two layers the first is sliding and the last is full attention: both caches matter.
+    two = _draft_step(layers=2)
+    base = _output(two)
+    assert not torch.allclose(
+        base, _output(two, k_full=torch.randn_like(_step_inputs(two)["k_full"]))
+    )
+    assert not torch.allclose(
+        base, _output(two, k_sliding=torch.randn_like(_step_inputs(two)["k_sliding"]))
+    )
+    # With one layer it is the full-attention layer, so the sliding cache is never read.
+    one = _draft_step(layers=1)
+    base = _output(one)
+    torch.testing.assert_close(
+        base, _output(one, k_sliding=torch.randn_like(_step_inputs(one)["k_sliding"]))
+    )
+    assert not torch.allclose(
+        base, _output(one, v_full=torch.randn_like(_step_inputs(one)["v_full"]))
+    )
+
+
+@pytest.mark.parametrize("cache", ["sliding", "full"])
+def test_masked_positions_do_not_change_the_output(cache):
+    module = _draft_step(layers=2)
+    inputs = _step_inputs(module)
+    width = inputs[f"k_{cache}"].shape[-1]
+    keep = width // 2
+    mask = torch.zeros(1, 1, 1, width)
+    mask[..., keep:] = float("-inf")
+    base = _output(module, **{f"mask_{cache}": mask})
+    # Rewriting the masked half of K and V, as stale cache entries would be, changes nothing ...
+    noisy_k = inputs[f"k_{cache}"].clone()
+    noisy_v = inputs[f"v_{cache}"].clone()
+    noisy_k[..., keep:] = torch.randn_like(noisy_k[..., keep:]) * 10
+    noisy_v[..., keep:] = torch.randn_like(noisy_v[..., keep:]) * 10
+    torch.testing.assert_close(
+        base,
+        _output(module, **{f"mask_{cache}": mask, f"k_{cache}": noisy_k, f"v_{cache}": noisy_v}),
+    )
+    # ... while the same rewrite of the visible half does.
+    visible_k = inputs[f"k_{cache}"].clone()
+    visible_k[..., :keep] = torch.randn_like(visible_k[..., :keep]) * 10
+    assert not torch.allclose(
+        base, _output(module, **{f"mask_{cache}": mask, f"k_{cache}": visible_k})
+    )
+
+
+def test_draft_step_traces_once_per_context_bucket():
+    module = DraftStep(checkpoint(layers=2), num_kv_heads=1).half().eval()
+    for full_window in (16, 32):
+        program = torch.export.export(module, example_inputs(module, 1, 8, full_window))
+        # The full-attention K/V follow the bucket; the sliding ones stay at the window.
+        placeholders = {
+            n.name: n.meta["val"].shape for n in program.graph.nodes if n.op == "placeholder"
+        }
+        assert tuple(placeholders["k_full"]) == (1, 1, 4, full_window)
+        assert tuple(placeholders["k_sliding"]) == (1, 1, 4, 8)
 
 
 # ---- Scan table ----
@@ -319,9 +458,47 @@ def test_add_to_bundle_declares_the_drafter_component(tmp_path):
         "drafter_scan": "draft_scan.bin",
         "drafter_scan_index": "draft_scan.json",
     }
+    assert metadata["speculative"] == {"drafter_kind": DRAFTER_KIND}
     assert (bundle / "draft_step.aimodel" / "model.mlir").read_text() == "program"
     for name in DRAFTER_AUXILIARY_KEYS.values():
         assert (bundle / name).read_text() == name
+
+
+def test_add_to_bundle_keeps_the_rest_of_the_speculative_block(tmp_path):
+    bundle = write_bundle(tmp_path, emits_hidden_states=True)
+    path = bundle / "metadata.json"
+    metadata = json.loads(path.read_text())
+    metadata["speculative"] = {"num_draft_tokens": 4}
+    path.write_text(json.dumps(metadata))
+    add_to_bundle(write_drafter_files(tmp_path), bundle)
+    assert json.loads(path.read_text())["speculative"] == {
+        "num_draft_tokens": 4,
+        "drafter_kind": DRAFTER_KIND,
+    }
+
+
+def test_add_to_bundle_can_be_repeated(tmp_path):
+    bundle = write_bundle(tmp_path, emits_hidden_states=True)
+    out = write_drafter_files(tmp_path)
+    add_to_bundle(out, bundle)
+    add_to_bundle(out, bundle)
+    assert (
+        json.loads((bundle / "metadata.json").read_text())["assets"]["drafter"]
+        == "draft_step.aimodel"
+    )
+
+
+@pytest.mark.parametrize("speculative", [{}, {"drafter_kind": "dflash"}])
+def test_add_to_bundle_refuses_a_bundle_with_another_drafter(tmp_path, speculative):
+    bundle = write_bundle(tmp_path, emits_hidden_states=True)
+    path = bundle / "metadata.json"
+    metadata = json.loads(path.read_text())
+    metadata["assets"]["drafter"] = "other.aimodel"
+    metadata["speculative"] = speculative
+    path.write_text(json.dumps(metadata))
+    with pytest.raises(SystemExit, match="already declares a drafter"):
+        add_to_bundle(write_drafter_files(tmp_path), bundle)
+    assert json.loads(path.read_text())["assets"]["drafter"] == "other.aimodel"
 
 
 def test_add_to_bundle_refuses_a_target_without_hidden_states(tmp_path):

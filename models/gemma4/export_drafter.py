@@ -18,7 +18,8 @@ gather before it and the masked embedder's candidate scan after it.
 The drafter owns no K/V: each layer attends to the target's last sliding or full storing layer,
 masked where empty. The sliding layers see the most recent ``window`` positions, as the target's do;
 the full-attention layer sees the whole context, so the program has one ``draft_step_<n>`` function
-per full-attention window ``n`` up to ``--max-context-length``. Keys and values arrive as
+per context bucket ``n`` of the target export's ladder (``export.context_ladder``), up to
+``--max-context-length``. Keys and values arrive as
 ``(1, kv_heads, head_dim, n)``, the layout the target's cache already uses. Rotary tables are inputs
 because the angle for a large position is not representable in fp16.
 
@@ -43,7 +44,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 from coreai_torch import TorchConverter, get_decomp_table
-from export import IOS_MAX_CONTEXT_LENGTH
+from export import IOS_MAX_CONTEXT_LENGTH, context_ladder
 from safetensors import safe_open
 from transformers import AutoConfig
 
@@ -68,6 +69,12 @@ SCAN_NAME = "draft_scan.bin"
 # The bundle's `drafter` component: the program under `assets`, its sidecars under
 # `auxiliary_assets`.
 DRAFTER_ASSET_KEY = "drafter"
+# `speculative.drafter_kind` says how the `drafter` component proposes tokens, since other drafters
+# declare the same asset key with different semantics. This head runs off the target's final hidden
+# state and shared K/V.
+SPECULATIVE_KEY = "speculative"
+DRAFTER_KIND_KEY = "drafter_kind"
+DRAFTER_KIND = "mtp"
 DRAFTER_AUXILIARY_KEYS = {
     "drafter_config": f"{FUNCTION_NAME}.json",
     "drafter_scan": SCAN_NAME,
@@ -297,14 +304,13 @@ def example_inputs(
     )
 
 
-def full_windows(window: int, max_context: int) -> list[int]:
-    """`window` doubled until `max_context`, which is always the last."""
-    sizes = []
-    w = window
-    while w < max_context:
-        sizes.append(w)
-        w *= 2
-    return sizes + [max_context]
+def full_windows(max_context: int) -> list[int]:
+    """The full-attention windows to export: the target export's context buckets.
+
+    The runtime picks the smallest bucket that covers the context, so using the target's ladder
+    keeps the draft step's bucket the same as the target's.
+    """
+    return context_ladder(max_context)
 
 
 async def export(
@@ -335,9 +341,10 @@ async def export(
     out_dir.mkdir(parents=True, exist_ok=True)
     write_scan_table(t, len(module.layers), out_dir / SCAN_NAME)
     del t  # the module cloned its weights; free the 134 MB table before converting
-    # A single function at `max_context` costs twice as much per step at short contexts.
+    # One function per context bucket: a single function at `max_context` costs more per step at
+    # short contexts.
     converter = TorchConverter()
-    sizes = full_windows(window, max_context)
+    sizes = full_windows(max_context)
     for full_window in sizes:
         with torch.no_grad():
             program = torch.export.export(
@@ -375,7 +382,7 @@ async def export(
 
 
 def write_scan_table(t: dict[str, torch.Tensor], num_layers: int, path: Path) -> None:
-    """The masked embedder's candidate-scan inputs, in the flat blob + json index `DraftPack` reads.
+    """The masked embedder's candidate-scan inputs: a flat blob and a JSON index of its sections.
 
     Only what stays on the CPU: the output table permuted so each centroid's tokens are contiguous,
     and the permutation to map a slot back to a token. The layer weights and centroids are already
@@ -433,6 +440,14 @@ def add_to_bundle(out_dir: Path, bundle: Path) -> None:
             f"{bundle} was not exported with --emit-hidden-states: its decode graphs do not output "
             "the hidden state the draft head seeds from"
         )
+    speculative = metadata.get(SPECULATIVE_KEY, {})
+    if DRAFTER_ASSET_KEY in metadata.get("assets", {}) and (
+        speculative.get(DRAFTER_KIND_KEY) != DRAFTER_KIND
+    ):
+        raise SystemExit(
+            f"{bundle} already declares a drafter ({DRAFTER_KIND_KEY} "
+            f"{speculative.get(DRAFTER_KIND_KEY)!r}); adding this head would replace it"
+        )
     aimodel = f"{FUNCTION_NAME}.aimodel"
     if (bundle / aimodel).exists():
         shutil.rmtree(bundle / aimodel)
@@ -441,6 +456,7 @@ def add_to_bundle(out_dir: Path, bundle: Path) -> None:
         shutil.copyfile(out_dir / name, bundle / name)
     metadata.setdefault("assets", {})[DRAFTER_ASSET_KEY] = aimodel
     metadata.setdefault("auxiliary_assets", {}).update(DRAFTER_AUXILIARY_KEYS)
+    metadata.setdefault(SPECULATIVE_KEY, {})[DRAFTER_KIND_KEY] = DRAFTER_KIND
     metadata_path.write_text(json.dumps(metadata, indent=2))
     print(f"Added the draft head to {bundle}")
 
