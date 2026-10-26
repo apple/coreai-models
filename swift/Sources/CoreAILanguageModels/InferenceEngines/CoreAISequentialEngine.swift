@@ -69,6 +69,12 @@ public final class CoreAISequentialEngine: InferenceEngine, IdempotentEngine, Ba
     // semantics. Idempotent callers pass their own session instead.
     private let session: GenerationSessionState
 
+    /// Bytes held by the engine's own session: its KV cache and persistent states, and its logits
+    /// buffer, estimated from their shapes and element sizes.
+    package var estimatedSessionBytes: (states: Int, logitsScratch: Int) {
+        (session.estimatedStateBytes, session.estimatedLogitsScratchBytes)
+    }
+
     // The single-row logits buffer lives on each session (`GenerationSessionState.logitsScratch`).
     private let logitsDescriptor: NDArrayDescriptor
 

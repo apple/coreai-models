@@ -350,9 +350,23 @@ final class ServerState: @unchecked Sendable {
         case reuse(prefixLength: Int)
     }
 
+    /// Memory held by the single-request and batch sessions, or nil when the engine keeps no session
+    /// the server can size.
+    private func estimatedMemory() -> ReadyResponse.EstimatedMemory? {
+        let single = (engine as? CoreAISequentialEngine)?.estimatedSessionBytes
+        let batch = batchScheduler?.estimatedSessionBytes
+        guard single != nil || batch != nil else { return nil }
+        let megabyte = 1024.0 * 1024.0
+        return ReadyResponse.EstimatedMemory(
+            kvCacheMB: Double(single?.states ?? 0) / megabyte,
+            batchKVCacheMB: batch.map { Double($0.states) / megabyte },
+            logitsScratchMB: Double((single?.logitsScratch ?? 0) + (batch?.logitsScratch ?? 0)) / megabyte)
+    }
+
     /// Readiness snapshot for /ready endpoint.
     func readySnapshot() -> ReadyResponse {
-        let busy = queue.isActive
+        let occupancy = batchScheduler?.occupancy
+        let busy = queue.isActive || (occupancy?.active ?? 0) > 0
         let usedTokens = engine.processedTokenCount
         let maxTokens = config.maxContextLength
         let utilization = maxTokens > 0 ? Double(usedTokens) / Double(maxTokens) : 0
@@ -366,7 +380,13 @@ final class ServerState: @unchecked Sendable {
                 maxTokens: maxTokens,
                 utilization: utilization
             ),
-            toolCalling: supportsToolCalling
+            toolCalling: supportsToolCalling,
+            estimatedMemory: estimatedMemory(),
+            batching: batchScheduler.map { scheduler in
+                .init(
+                    concurrentRequests: scheduler.maxConcurrent, active: occupancy?.active ?? 0,
+                    queued: occupancy?.queued ?? 0)
+            }
         )
     }
 

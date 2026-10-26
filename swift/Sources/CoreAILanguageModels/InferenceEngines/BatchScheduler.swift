@@ -42,6 +42,17 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
     /// True when more than one request can decode at a time (`maxConcurrent > 1`).
     package var supportsContinuousBatching: Bool { maxConcurrent > 1 }
 
+    /// Requests holding a row, and requests waiting for one, at the time of the call.
+    package var occupancy: (active: Int, queued: Int) {
+        state.withLock { ($0.occupiedRows, $0.queue.count) }
+    }
+
+    /// Bytes held by the shared batch session: its KV cache and persistent states for all rows, and its
+    /// logits buffer, estimated from their shapes and element sizes.
+    package var estimatedSessionBytes: (states: Int, logitsScratch: Int) {
+        (session.estimatedStateBytes, session.estimatedLogitsScratchBytes)
+    }
+
     private struct Pending {
         let request: BatchRequest
         let continuation: AsyncThrowingStream<BatchSinkEvent, Error>.Continuation
