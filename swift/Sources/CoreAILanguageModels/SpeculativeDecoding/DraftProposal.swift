@@ -27,8 +27,8 @@ package struct DraftProposal: Sendable {
     }
 }
 
-/// Final hidden-state features emitted by a fused target for an attached-head
-/// (MTP / EAGLE-style) drafter to consume via ``DrafterEngine/commit(confirmedLength:features:)``.
+/// Final hidden-state features emitted by a fused target for a feature-driven drafter to
+/// consume via ``DrafterEngine/commit(confirmedLength:features:)``.
 ///
 /// Row-major `values[p * hiddenDim + d]`; row `p` is the feature vector for the
 /// token at absolute position `startPosition + p`.
@@ -47,27 +47,6 @@ package struct DrafterFeatures: Sendable {
         self.positionCount = positionCount
         self.hiddenDim = hiddenDim
         self.startPosition = startPosition
-    }
-
-    /// The feature row that seeds a drafter's recurrence once `confirmedLength` tokens are
-    /// committed: the row of the last committed token, clamped to the rows present. `nil` when
-    /// there are no rows.
-    package func seedRow(confirmedLength: Int) -> [Float]? {
-        guard hiddenDim > 0, positionCount > 0 else { return nil }
-        let row = Swift.max(0, Swift.min(confirmedLength - startPosition - 1, positionCount - 1))
-        return Array(values[row * hiddenDim..<(row + 1) * hiddenDim])
-    }
-
-    /// The first `count` rows, re-based to `startPosition` — the committed-prefix
-    /// features an attached-head drafter injects after acceptance.
-    package func prefixRows(_ count: Int) -> DrafterFeatures {
-        let n = Swift.max(0, Swift.min(count, positionCount))
-        return DrafterFeatures(
-            values: Array(values.prefix(n * hiddenDim)),
-            positionCount: n,
-            hiddenDim: hiddenDim,
-            startPosition: startPosition
-        )
     }
 }
 

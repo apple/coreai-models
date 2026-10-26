@@ -15,14 +15,84 @@ struct AutoregressiveDrafterGuardTests {
         let model = HashModel(vocab: 8, levels: 5, salt: 1)
         let engine = HashEngine(model: model)
         let drafter = AutoregressiveDrafter(engine: engine)
-        _ = try await drafter.draftAll(confirmedPrefix: [1, 2, 3], count: 2, policy: .greedy)
+        var rng = SystemRandomNumberGenerator()
+        _ = try await drafter.draftAll(
+            confirmedPrefix: [1, 2, 3], count: 2, policy: .greedy, using: &rng)
         #expect(engine.processedTokenCount >= 3)
         await #expect(throws: (any Error).self) {
-            _ = try await drafter.draftAll(confirmedPrefix: [1], count: 2, policy: .greedy)
+            var rng = SystemRandomNumberGenerator()
+            _ = try await drafter.draftAll(
+                confirmedPrefix: [1], count: 2, policy: .greedy, using: &rng)
         }
         await #expect(throws: (any Error).self) {
+            var rng = SystemRandomNumberGenerator()
             _ = try await drafter.draftAll(
-                confirmedPrefix: [1, 2, 3], count: 2, policy: .greedy)
+                confirmedPrefix: [1, 2, 3], count: 2, policy: .greedy, using: &rng)
         }
+    }
+
+    @Test("Greedy drafting reads each step's argmax and never copies a logits row")
+    func greedyDraftsAvoidTheLogitsCopy() async throws {
+        let model = HashModel(vocab: 30, levels: 1000, salt: 2)
+        let engine = CountingEngine(inner: HashEngine(model: model))
+        let drafter = AutoregressiveDrafter(engine: engine)
+        var rng = SystemRandomNumberGenerator()
+        let greedy = try await drafter.draftAll(
+            confirmedPrefix: [1, 2, 3], count: 4, policy: .greedy, using: &rng)
+        #expect(engine.logitsCalls == 0)
+        #expect(engine.argmaxCalls == 4)  // the seed token and the first three drafts
+        #expect(greedy.logits == nil)
+
+        // The drafts are the draft model's own greedy continuation.
+        let reference = HashEngine(model: model)
+        var expected: [Int32] = []
+        var context: [Int32] = [1, 2, 3]
+        try await reference.advance([1, 2])
+        for _ in 0..<4 {
+            let next = try await reference.forwardPerPositionArgmax([context.last!])[0]
+            expected.append(next)
+            context.append(next)
+        }
+        #expect(greedy.tokens == expected)
+
+        // Sampling needs the rows: they are the proposal's `q` distributions.
+        engine.resetCounts()
+        try await drafter.reset(to: 0)
+        let sampled = try await drafter.draftAll(
+            confirmedPrefix: [1, 2, 3], count: 4, policy: .sampling(temperature: 1), using: &rng)
+        #expect(engine.logitsCalls == 4)
+        #expect(sampled.logits?.count == 4)
+    }
+}
+
+/// Counts which verify primitive a drafter reads its draft model through.
+private final class CountingEngine: SpeculativeEngine, @unchecked Sendable {
+    let inner: HashEngine
+    private(set) var logitsCalls = 0
+    private(set) var argmaxCalls = 0
+    init(inner: HashEngine) { self.inner = inner }
+
+    func resetCounts() {
+        logitsCalls = 0
+        argmaxCalls = 0
+    }
+
+    var config: RowEngine.Config { inner.config }
+    var processedTokenCount: Int { inner.processedTokenCount }
+    func reset(to tokenIndex: Int) async throws { try await inner.reset(to: tokenIndex) }
+    func advance(_ tokens: [Int32]) async throws { try await inner.advance(tokens) }
+    func forwardPerPositionArgmax(_ tokens: [Int32]) async throws -> [Int32] {
+        argmaxCalls += 1
+        return try await inner.forwardPerPositionArgmax(tokens)
+    }
+    func forwardWithPerPositionLogits(_ tokens: [Int32]) async throws -> [[LogitsScalarType]] {
+        logitsCalls += 1
+        return try await inner.forwardWithPerPositionLogits(tokens)
+    }
+    func generate(
+        with input: [TokenId], samplingConfiguration: SamplingConfiguration,
+        inferenceOptions: InferenceOptions
+    ) async throws -> EmptyOutputSequence {
+        throw InferenceRuntimeError.invalidState("CountingEngine implements only the speculative primitives")
     }
 }

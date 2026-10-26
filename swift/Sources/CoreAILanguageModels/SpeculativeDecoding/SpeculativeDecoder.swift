@@ -26,8 +26,9 @@ import Tokenizers
 ///
 /// The decoder names no concrete engine type: draft and target may run on
 /// different backends, and the drafter may be a separate model
-/// (``AutoregressiveDrafter``) or an attached head that drafts off the target's
-/// injected hidden-state features. Drafter and target must share a vocabulary.
+/// (``AutoregressiveDrafter``), a model-free drafter such as ``PromptLookupDrafter``, or a
+/// head that drafts off the target's hidden-state features, which it receives through
+/// ``DrafterEngine/commit(confirmedLength:features:)``. Drafter and target must share a vocabulary.
 ///
 /// Single-owner: set its properties before generating, and run one generation at a time; it holds
 /// no lock, and the engines it drives each hold one sequence.
@@ -61,8 +62,8 @@ package final class SpeculativeDecoder: @unchecked Sendable {
         /// Number of propose/verify iterations (= target forward passes).
         package var iterations: Int = 0
         /// Wall-clock seconds spent in the generation loop only (excludes the
-        /// one-time prompt prefill / graph specialization), so it is comparable to
-        /// the base runner's "Generation:" metric.
+        /// one-time prompt prefill / graph specialization), so it is comparable to the time
+        /// plain decoding spends generating the same tokens.
         package var generationSeconds: Double = 0
         /// Iterations whose proposal came from prompt lookup, and its proposed/accepted tokens.
         package var lookupProposals: Int = 0
@@ -100,8 +101,7 @@ package final class SpeculativeDecoder: @unchecked Sendable {
         self.adaptiveDraftCount = adaptiveDraftCount
     }
 
-    /// Drive an arbitrary ``DrafterEngine`` (e.g. an attached MTP / EAGLE head)
-    /// against a target.
+    /// Drive an arbitrary ``DrafterEngine`` against a target.
     ///
     /// - Parameters:
     ///   - drafter: proposal source.
@@ -132,13 +132,17 @@ package final class SpeculativeDecoder: @unchecked Sendable {
         onPrefillReady: (() async throws -> Void)? = nil,
         onToken: (Int32) -> Void
     ) async throws -> Stats {
-        try await run(
+        // Greedy decoding draws nothing; the run takes a generator all the same.
+        var rng = SystemRandomNumberGenerator()
+        return try await run(
             policy: .greedy, promptTokens: promptTokens, maxNewTokens: maxNewTokens,
-            stopTokenIds: stopTokenIds, onPrefillReady: onPrefillReady, onToken: onToken)
+            stopTokenIds: stopTokenIds, onPrefillReady: onPrefillReady, onToken: onToken, rng: &rng)
     }
 
     /// Run speculative **sampling** at the given temperature (distributionally
-    /// identical to sampling the target).
+    /// identical to sampling the target), drawing from `rng` for the whole run: the drafter's
+    /// samples, the accept/reject tests and the correction or bonus token. A known generator
+    /// makes the run reproducible.
     ///
     /// - Note: temperature-only (no top-k/top-p); those would have to be applied
     ///   consistently to both `p` and `q` to preserve the guarantee.
@@ -147,13 +151,39 @@ package final class SpeculativeDecoder: @unchecked Sendable {
         maxNewTokens: Int,
         stopTokenIds: Set<Int32>,
         temperature: Double,
+        using rng: inout some RandomNumberGenerator,
         onPrefillReady: (() async throws -> Void)? = nil,
         onToken: (Int32) -> Void
     ) async throws -> Stats {
         try await run(
             policy: .sampling(temperature: temperature), promptTokens: promptTokens,
             maxNewTokens: maxNewTokens, stopTokenIds: stopTokenIds,
-            onPrefillReady: onPrefillReady, onToken: onToken)
+            onPrefillReady: onPrefillReady, onToken: onToken, rng: &rng)
+    }
+
+    /// Run speculative sampling with a generator made once for the run: a
+    /// ``SeededRandomNumberGenerator`` when `seed` is set, so the same seed, prompt and models
+    /// reproduce the same tokens, else the system generator.
+    package func generateSampling(
+        promptTokens: [Int32],
+        maxNewTokens: Int,
+        stopTokenIds: Set<Int32>,
+        temperature: Double,
+        seed: UInt64? = nil,
+        onPrefillReady: (() async throws -> Void)? = nil,
+        onToken: (Int32) -> Void
+    ) async throws -> Stats {
+        if let seed {
+            var rng = SeededRandomNumberGenerator(seed: seed)
+            return try await generateSampling(
+                promptTokens: promptTokens, maxNewTokens: maxNewTokens, stopTokenIds: stopTokenIds,
+                temperature: temperature, using: &rng, onPrefillReady: onPrefillReady,
+                onToken: onToken)
+        }
+        var rng = SystemRandomNumberGenerator()
+        return try await generateSampling(
+            promptTokens: promptTokens, maxNewTokens: maxNewTokens, stopTokenIds: stopTokenIds,
+            temperature: temperature, using: &rng, onPrefillReady: onPrefillReady, onToken: onToken)
     }
 
     // MARK: - Core loop
@@ -164,7 +194,8 @@ package final class SpeculativeDecoder: @unchecked Sendable {
         maxNewTokens: Int,
         stopTokenIds: Set<Int32>,
         onPrefillReady: (() async throws -> Void)? = nil,
-        onToken: (Int32) -> Void
+        onToken: (Int32) -> Void,
+        rng: inout some RandomNumberGenerator
     ) async throws -> Stats {
         var stats = Stats()
         if case .sampling(let temperature) = policy {
@@ -179,7 +210,6 @@ package final class SpeculativeDecoder: @unchecked Sendable {
         }
         guard maxNewTokens > 0, !promptTokens.isEmpty else { return stats }
 
-        var rng = SystemRandomNumberGenerator()
         let maxContext = min(drafter.maxContextLength, target.config.maxContextLength)
 
         // `tokens` = prompt + every confirmed generated token.
@@ -189,12 +219,10 @@ package final class SpeculativeDecoder: @unchecked Sendable {
         try await target.reset(to: 0)
         try await drafter.reset(to: 0)
 
-        // After the reset (which clears any pending image) and before the prompt
-        // prefill, let the caller stage per-run target state — e.g. set the pending
-        // image embeddings so the multimodal prefill scatters them into the KV.
-        // Only the initial prefill needs this; the verification-rollback resets in
-        // the loop re-advance only committed text tokens (the image prefix is already
-        // in the KV), so no re-staging is required.
+        // After the reset (which clears any per-run state the target holds) and before the
+        // prompt prefill, let the caller stage per-run target state that the prefill consumes.
+        // Only the initial prefill needs this; the verification-rollback resets in the loop
+        // re-advance only committed tokens, so no re-staging is required.
         try await onPrefillReady?()
 
         // Invariant across iterations: the target has processed every token *except
@@ -248,7 +276,8 @@ package final class SpeculativeDecoder: @unchecked Sendable {
                 let count = min(k, proposalLimit)
                 proposal =
                     count > 0
-                    ? try await drafter.draftAll(confirmedPrefix: tokens, count: count, policy: policy)
+                    ? try await drafter.draftAll(
+                        confirmedPrefix: tokens, count: count, policy: policy, using: &rng)
                     : DraftProposal(tokens: [])
             }
             stats.draftTokensProposed += proposal.tokens.count
@@ -351,9 +380,12 @@ package final class SpeculativeDecoder: @unchecked Sendable {
     /// sample a bonus token from the target's next distribution.
     private func acceptSampling(
         proposal: DraftProposal, targetLogits: [[LogitsScalarType]],
-        temperature: Double, rng: inout SystemRandomNumberGenerator
+        temperature: Double, rng: inout some RandomNumberGenerator
     ) throws -> (path: [Int], next: Int32) {
-        guard let draftLogits = proposal.logits, draftLogits.count >= proposal.tokens.count else {
+        // An empty proposal (no draft fits, as at the end of the context) needs no draft logits: the
+        // round only samples the target's next token.
+        let draftLogits = proposal.logits ?? []
+        guard draftLogits.count >= proposal.tokens.count else {
             throw InferenceRuntimeError.invalidState(
                 "Speculative sampling needs per-candidate draft logits; prompt lookup and drafters "
                     + "that return none support greedy decoding only.")

@@ -11,8 +11,10 @@ import Foundation
 /// This is the seam behind which different drafting mechanisms live, all
 /// presenting the same propose / commit surface to the decoder:
 /// - a **separate draft model** run autoregressively (``AutoregressiveDrafter``),
-/// - an **attached head** (MTP / EAGLE-style) that drafts off the target's
-///   injected hidden-state features (`usesInjectedFeatures == true`).
+/// - a drafter that drafts off the target's hidden-state features (for example an attached
+///   MTP / EAGLE-style head), which the decoder hands it through
+///   ``commit(confirmedLength:features:)``,
+/// - a **model-free** drafter such as ``PromptLookupDrafter``.
 ///
 /// The decoder owns verification and acceptance; a drafter only proposes and
 /// keeps its own state in step with the confirmed prefix.
@@ -27,14 +29,17 @@ package protocol DrafterEngine: Sendable {
     /// Propose up to `count` candidates following `confirmedPrefix` (whose last
     /// token is the anchor). `policy` selects greedy (argmax) vs sampled drafts;
     /// sampled drafts also populate `DraftProposal.logits` (the `q` distribution
-    /// the accept/reject scheme needs).
-    func draftAll(confirmedPrefix: [Int32], count: Int, policy: VerificationPolicy) async throws
-        -> DraftProposal
+    /// the accept/reject scheme needs) and draw from `rng`, the generator the decoder uses for the
+    /// whole run, so a seeded run is reproducible.
+    func draftAll(
+        confirmedPrefix: [Int32], count: Int, policy: VerificationPolicy,
+        using rng: inout some RandomNumberGenerator
+    ) async throws -> DraftProposal
 
     /// Bring the drafter into step with the newly committed prefix (of length
     /// `confirmedLength`). `features` carries the target's fused hidden states for
-    /// the verified slots when the target emits them; an attached-head drafter
-    /// injects the committed rows, a token-model drafter ignores them.
+    /// the verified slots when the target emits them; a feature-driven drafter
+    /// takes the committed rows, a token-model drafter ignores them.
     func commit(confirmedLength: Int, features: DrafterFeatures?) async throws
 }
 
@@ -63,9 +68,10 @@ package final class AutoregressiveDrafter: DrafterEngine, @unchecked Sendable {
         try await engine.reset(to: min(confirmedLength, engine.processedTokenCount))
     }
 
-    package func draftAll(confirmedPrefix: [Int32], count: Int, policy: VerificationPolicy) async throws
-        -> DraftProposal
-    {
+    package func draftAll(
+        confirmedPrefix: [Int32], count: Int, policy: VerificationPolicy,
+        using rng: inout some RandomNumberGenerator
+    ) async throws -> DraftProposal {
         // Prefill any confirmed tail the drafter hasn't seen, leaving the last
         // token to seed the first draft step.
         let unseen = confirmedPrefix.count - engine.processedTokenCount
@@ -78,28 +84,31 @@ package final class AutoregressiveDrafter: DrafterEngine, @unchecked Sendable {
         if pending.count > 1 {
             try await engine.advance(Array(pending.dropLast()))
         }
+        let seed = pending[pending.count - 1]
 
         var tokens: [Int32] = []
         tokens.reserveCapacity(count)
-        var stepLogits: [[LogitsScalarType]]? = policy.isSampling ? [] : nil
 
-        // The system generator is stateless, so each call owns its own and the drafter keeps no
-        // mutable random state.
-        var rng = SystemRandomNumberGenerator()
-        var step = try await engine.forwardWithPerPositionLogits([pending[pending.count - 1]])[0]
+        guard policy.isSampling else {
+            // Greedy drafts need only each step's argmax, so the draft engine never copies a
+            // `[vocabSize]` row out.
+            var token = try await engine.forwardPerPositionArgmax([seed])[0]
+            for i in 0..<count {
+                tokens.append(token)
+                if i < count - 1 { token = try await engine.forwardPerPositionArgmax([token])[0] }
+            }
+            return DraftProposal(tokens: tokens)
+        }
+
+        var stepLogits: [[LogitsScalarType]] = []
+        stepLogits.reserveCapacity(count)
+        var step = try await engine.forwardWithPerPositionLogits([seed])[0]
         for i in 0..<count {
-            let token: Int32
-            if policy.isSampling {
-                let q = SpeculativeMath.temperatureSoftmax(step, temperature: policy.temperature)
-                token = SpeculativeMath.sampleFromProbs(q, using: &rng)
-                stepLogits?.append(step)
-            } else {
-                token = SpeculativeMath.argmax(step)
-            }
+            let q = SpeculativeMath.temperatureSoftmax(step, temperature: policy.temperature)
+            let token = SpeculativeMath.sampleFromProbs(q, using: &rng)
+            stepLogits.append(step)
             tokens.append(token)
-            if i < count - 1 {
-                step = try await engine.forwardWithPerPositionLogits([token])[0]
-            }
+            if i < count - 1 { step = try await engine.forwardWithPerPositionLogits([token])[0] }
         }
         return DraftProposal(tokens: tokens, logits: stepLogits)
     }

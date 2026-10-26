@@ -9,7 +9,7 @@ import Testing
 
 @testable import CoreAILanguageModels
 
-/// Inputs that used to trap or produce NaN now throw or yield valid distributions.
+/// Inputs that would trap or produce NaN throw, or yield valid distributions, instead.
 @Suite("Speculative decoding input safety")
 struct SpeculativeSafetyTests {
     @Test("Softmax of an all negative-infinity row is a valid distribution")
@@ -102,8 +102,29 @@ struct SpeculativeSafetyTests {
     }
 }
 
-/// Wraps an engine and drops the first row of every per-position argmax, as a verify block wider
-/// than the widest graph used to.
+extension SpeculativeSafetyTests {
+    @Test("Sampling runs to the end of the context, where no draft fits")
+    func samplingReachesTheEndOfTheContext() async throws {
+        for maxContext in Array(6...40) {
+            let model = HashModel(vocab: 40, levels: 1000, salt: UInt64(maxContext))
+            let decoder = SpeculativeDecoder(
+                draft: HashEngine(model: model, maxContextLength: maxContext),
+                target: HashEngine(model: model, maxContextLength: maxContext),
+                numDraftTokens: 4)
+            var got: [Int32] = []
+            _ = try await decoder.generateSampling(
+                promptTokens: [1], maxNewTokens: 1000, stopTokenIds: [], temperature: 1,
+                onToken: { got.append($0) })
+            // The context fills exactly as it does for plain decoding.
+            let plain = plainGreedy(
+                model: model, prompt: [1], maxNew: 1000, stops: [], capacity: maxContext)
+            #expect(got.count == plain.count, "maxContext \(maxContext)")
+        }
+    }
+}
+
+/// Wraps an engine and drops the first row of every per-position argmax, as an engine would that
+/// scores fewer positions than a verify block holds.
 private final class ShortRowsEngine: SpeculativeEngine, @unchecked Sendable {
     let inner: HashEngine
     init(inner: HashEngine) { self.inner = inner }

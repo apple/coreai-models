@@ -11,9 +11,8 @@ import Foundation
 /// The draft comes from the model's *own* running output — it finds the most recent
 /// earlier occurrence of the last `n` generated tokens and proposes the tokens that
 /// followed it. There is no draft model and no forward pass, so drafting is
-/// essentially free. Because the target still verifies on the (ANE) engine and the
-/// draft costs ~0, *any* accepted draft token reduces the number of expensive target
-/// passes — so this beats base whenever acceptance > 0 (unlike full-model
+/// essentially free. Because the target still verifies every token and the draft costs ~0,
+/// *any* accepted draft token reduces the number of target passes (unlike full-model
 /// self-speculation, whose draft is as expensive as the target).
 ///
 /// Greedy-only (no draft distribution), which is the common prompt-lookup setting.
@@ -34,9 +33,10 @@ package final class PromptLookupDrafter: DrafterEngine, @unchecked Sendable {
     package func reset(to tokenIndex: Int) async throws {}
     package func commit(confirmedLength: Int, features: DrafterFeatures?) async throws {}
 
-    package func draftAll(confirmedPrefix: [Int32], count: Int, policy: VerificationPolicy) async throws
-        -> DraftProposal
-    {
+    package func draftAll(
+        confirmedPrefix: [Int32], count: Int, policy: VerificationPolicy,
+        using rng: inout some RandomNumberGenerator
+    ) async throws -> DraftProposal {
         // No match: no speculation this step (target advances one token as usual).
         DraftProposal(tokens: lookup.propose(context: confirmedPrefix, count: count))
     }

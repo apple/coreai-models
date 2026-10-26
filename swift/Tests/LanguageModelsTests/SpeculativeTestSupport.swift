@@ -194,8 +194,8 @@ class RowEngine: SpeculativeEngine, @unchecked Sendable {
 
 /// An engine over a ``HashModel`` with a bounded KV capacity.
 ///
-/// A verify block wider than `maxVerifyBlockLength` throws, as the static-shape engine does for a
-/// block wider than its widest graph.
+/// A verify block wider than `maxVerifyBlockLength` throws, as an engine with a fixed widest graph
+/// does.
 final class HashEngine: RowEngine, @unchecked Sendable {
     let model: HashModel
     private(set) var hashes: [UInt64] = []
@@ -264,9 +264,10 @@ final class FuzzDrafter: DrafterEngine, @unchecked Sendable {
     func reset(to tokenIndex: Int) async throws {}
     func commit(confirmedLength: Int, features: DrafterFeatures?) async throws {}
 
-    func draftAll(confirmedPrefix: [Int32], count: Int, policy: VerificationPolicy) async throws
-        -> DraftProposal
-    {
+    func draftAll(
+        confirmedPrefix: [Int32], count: Int, policy: VerificationPolicy,
+        using generator: inout some RandomNumberGenerator
+    ) async throws -> DraftProposal {
         let mode = Int(rng.next() % 5)
         if mode == 0 { return DraftProposal(tokens: []) }
         var h: UInt64 = 0

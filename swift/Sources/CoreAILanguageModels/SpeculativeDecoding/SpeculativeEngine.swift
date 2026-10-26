@@ -11,8 +11,8 @@ import Foundation
 ///
 /// The decoder drives propose / verify / accept / rollback purely through this
 /// protocol and never names a concrete engine type, so:
-/// - draft and target may run on *different* backends (e.g. a small draft on the
-///   CPU verifying against a target on the GPU or Neural Engine), and
+/// - draft and target may run on *different* backends (e.g. a small draft on the CPU
+///   verifying against a target on an accelerator), and
 /// - the loop is testable against an in-memory double without any model assets.
 ///
 /// A conforming engine is an ``InferenceEngine``: it owns a KV cache indexed by committed-token
@@ -62,8 +62,7 @@ package protocol SpeculativeEngine: InferenceEngine {
     /// (greedy) successor — everything greedy acceptance needs — plus the fused
     /// hidden-state `features` when the engine emits them. This avoids
     /// materializing a `[vocabSize]` distribution per slot, which for a large vocab
-    /// dominates the verify cost and is what previously made speculative decoding
-    /// slower than base.
+    /// dominates the verify cost.
     func forwardProposalGreedy(
         anchor: Int32, proposal: DraftProposal
     ) async throws -> (argmax: [Int32], features: DrafterFeatures?)
