@@ -477,11 +477,13 @@ def test_add_to_bundle_keeps_the_rest_of_the_speculative_block(tmp_path):
     }
 
 
-def test_add_to_bundle_can_be_repeated(tmp_path):
+def test_add_to_bundle_can_be_repeated_and_warns_when_it_replaces_the_program(tmp_path, capsys):
     bundle = write_bundle(tmp_path, emits_hidden_states=True)
     out = write_drafter_files(tmp_path)
     add_to_bundle(out, bundle)
+    assert "Warning" not in capsys.readouterr().out
     add_to_bundle(out, bundle)
+    assert "Warning: replacing the existing draft_step.aimodel" in capsys.readouterr().out
     assert (
         json.loads((bundle / "metadata.json").read_text())["assets"]["drafter"]
         == "draft_step.aimodel"

@@ -36,7 +36,6 @@ as the bundle's ``drafter`` component in ``metadata.json``.
 from __future__ import annotations
 
 import argparse
-import asyncio
 import json
 import shutil
 from pathlib import Path
@@ -48,9 +47,9 @@ from export import IOS_MAX_CONTEXT_LENGTH, context_ladder
 from safetensors import safe_open
 from transformers import AutoConfig
 
+from coreai_models._constants import DRAFT_STEP_FUNCTION_NAME
 from coreai_models.export.metadata import build_aimodel_metadata
 
-FUNCTION_NAME = "draft_step"
 INPUT_NAMES = [
     "inputs_embeds",
     "cos_sliding",
@@ -76,7 +75,7 @@ SPECULATIVE_KEY = "speculative"
 DRAFTER_KIND_KEY = "drafter_kind"
 DRAFTER_KIND = "mtp"
 DRAFTER_AUXILIARY_KEYS = {
-    "drafter_config": f"{FUNCTION_NAME}.json",
+    "drafter_config": f"{DRAFT_STEP_FUNCTION_NAME}.json",
     "drafter_scan": SCAN_NAME,
     "drafter_scan_index": "draft_scan.json",
 }
@@ -101,7 +100,8 @@ TOP_LEVEL_TENSORS = (
     "post_projection.weight",
     "model.norm.weight",
 )
-# Sidecar format version; the runtime rejects a newer one and reads a missing one as 1.
+# Sidecar format version. A consumer reads a missing version as 1 and rejects one newer than it
+# understands, so bump it when a field is removed or changes meaning; adding a field needs no bump.
 SIDECAR_VERSION = 1
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -283,6 +283,23 @@ def check_checkpoint(t: dict[str, torch.Tensor], text: dict | None = None) -> No
 def example_inputs(
     module: DraftStep, num_kv_heads: int, window: int, full_window: int
 ) -> tuple[torch.Tensor, ...]:
+    """Zero inputs that fix the shapes one ``draft_step_<full_window>`` function is traced at.
+
+    The order is ``INPUT_NAMES``. ``hd`` and ``full_hd`` are the head dims of the sliding layers and
+    of the full-attention layer, ``kv`` is the target's KV head count, ``window`` the sliding window
+    and ``full_window`` the context bucket the function serves.
+
+    - ``inputs_embeds`` (1, 1, 2 * backbone_hidden): the token's embedding concatenated with the
+      target's final hidden state.
+    - ``cos_sliding``, ``sin_sliding`` (1, 1, 1, hd) and ``cos_full``, ``sin_full``
+      (1, 1, 1, full_hd): rotary tables at the draft position, written by the runtime because the
+      angle for a large position is not representable in fp16.
+    - ``k_sliding``, ``v_sliding`` (1, kv, hd, window): the target's last sliding layer's keys and
+      values for the most recent ``window`` positions, in the target cache's layout.
+    - ``mask_sliding`` (1, 1, 1, window): additive mask, 0 where a position is visible.
+    - ``k_full``, ``v_full`` (1, kv, full_hd, full_window) and ``mask_full`` (1, 1, 1, full_window):
+      the same for the target's last full-attention layer, over the whole context bucket.
+    """
     backbone = module.pre_projection.in_features // 2
     hd, full_hd = module.layers[0].head_dim, module.layers[-1].head_dim
 
@@ -313,9 +330,7 @@ def full_windows(max_context: int) -> list[int]:
     return context_ladder(max_context)
 
 
-async def export(
-    model_id: str, drafter: Path, window: int, max_context: int, out_dir: Path
-) -> Path:
+def export(model_id: str, drafter: Path, window: int, max_context: int, out_dir: Path) -> Path:
     text = AutoConfig.from_pretrained(model_id).text_config
     if not 0 < window <= text.sliding_window:
         raise SystemExit(
@@ -354,16 +369,16 @@ async def export(
             program.run_decompositions(get_decomp_table()),
             input_names=INPUT_NAMES,
             output_names=OUTPUT_NAMES,
-            entrypoint_name=f"{FUNCTION_NAME}_{full_window}",
+            entrypoint_name=f"{DRAFT_STEP_FUNCTION_NAME}_{full_window}",
         )
     coreai_program = converter.to_coreai()
 
-    aimodel = out_dir / f"{FUNCTION_NAME}.aimodel"
-    await asyncio.to_thread(coreai_program.save_asset, aimodel, build_aimodel_metadata(model_id))
+    aimodel = out_dir / f"{DRAFT_STEP_FUNCTION_NAME}.aimodel"
+    coreai_program.save_asset(aimodel, build_aimodel_metadata(model_id))
     # The runtime writes the rotary tables, so it needs the target's RoPE parameters. Gemma 4's
     # full-attention layers rotate only `partial_rotary_factor` of the frequency pairs.
     rope = text.rope_parameters
-    (out_dir / f"{FUNCTION_NAME}.json").write_text(
+    (out_dir / f"{DRAFT_STEP_FUNCTION_NAME}.json").write_text(
         json.dumps(
             {
                 "version": SIDECAR_VERSION,
@@ -374,7 +389,7 @@ async def export(
                     "partial_rotary_factor", 1.0
                 ),
             },
-            indent=1,
+            indent=2,
         )
     )
     print(f"Exported {aimodel} (window {window}, full windows {sizes})")
@@ -423,7 +438,7 @@ def write_scan_table(t: dict[str, torch.Tensor], num_layers: int, path: Path) ->
                 "layers": num_layers,
                 "tensors": index,
             },
-            indent=1,
+            indent=2,
         )
     )
 
@@ -448,13 +463,14 @@ def add_to_bundle(out_dir: Path, bundle: Path) -> None:
             f"{bundle} already declares a drafter ({DRAFTER_KIND_KEY} "
             f"{speculative.get(DRAFTER_KIND_KEY)!r}); adding this head would replace it"
         )
-    aimodel = f"{FUNCTION_NAME}.aimodel"
-    if (bundle / aimodel).exists():
-        shutil.rmtree(bundle / aimodel)
-    shutil.copytree(out_dir / aimodel, bundle / aimodel)
+    aimodel_filename = f"{DRAFT_STEP_FUNCTION_NAME}.aimodel"
+    if (bundle / aimodel_filename).exists():
+        print(f"Warning: replacing the existing {aimodel_filename} in {bundle}")
+        shutil.rmtree(bundle / aimodel_filename)
+    shutil.copytree(out_dir / aimodel_filename, bundle / aimodel_filename)
     for name in DRAFTER_AUXILIARY_KEYS.values():
         shutil.copyfile(out_dir / name, bundle / name)
-    metadata.setdefault("assets", {})[DRAFTER_ASSET_KEY] = aimodel
+    metadata.setdefault("assets", {})[DRAFTER_ASSET_KEY] = aimodel_filename
     metadata.setdefault("auxiliary_assets", {}).update(DRAFTER_AUXILIARY_KEYS)
     metadata.setdefault(SPECULATIVE_KEY, {})[DRAFTER_KIND_KEY] = DRAFTER_KIND
     metadata_path.write_text(json.dumps(metadata, indent=2))
@@ -493,9 +509,7 @@ def main() -> None:
         "head to, as its 'drafter' component",
     )
     args = parser.parse_args()
-    asyncio.run(
-        export(args.model, args.drafter, args.window, args.max_context_length, args.output_dir)
-    )
+    export(args.model, args.drafter, args.window, args.max_context_length, args.output_dir)
     if args.bundle is not None:
         add_to_bundle(args.output_dir, args.bundle)
 

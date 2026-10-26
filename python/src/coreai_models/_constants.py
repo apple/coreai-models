@@ -26,6 +26,10 @@ VALUE_CACHE_NAME = "valueCache"
 SLIDING_KEY_CACHE_NAME = "slidingKeyCache"
 SLIDING_VALUE_CACHE_NAME = "slidingValueCache"
 
+# Function name of the Gemma 4 draft head's program (one `draft_step_<n>` function per context
+# bucket, plus the `draft_step.json` sidecar and the `draft_step.aimodel` asset).
+DRAFT_STEP_FUNCTION_NAME = "draft_step"
+
 # SSM state names for hybrid attention+SSM models (e.g. Qwen3.5)
 CONV_STATES_NAME = "convStates"
 RECURRENT_STATES_NAME = "recurrentStates"

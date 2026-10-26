@@ -577,9 +577,10 @@ async def _export_ios(args: argparse.Namespace) -> str:
             compression=compression,
             name=output_name,
         )
-        # The iOS runner needs the sliding window, the dual-RoPE table parameters
-        # and the soft cap from `language.overrides`; the PLE sidecar is declared under
-        # `auxiliary_assets`; `assets` is reserved for Core AI models.
+        # The iOS runner needs the sliding window, the dual-RoPE table parameters and the soft
+        # cap from `language.overrides`, plus `emits_hidden_states` when the decode graphs also
+        # output the final hidden state (`--emit-hidden-states`). The PLE sidecar is declared
+        # under `auxiliary_assets`; `assets` is reserved for Core AI models.
         extras = _ios_metadata_extras(hf_config, args.emit_hidden_states)
         auxiliary_assets = {"per_layer_embeddings": Path(ple_path).name}
         _patch_language_metadata(
