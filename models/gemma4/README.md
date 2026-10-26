@@ -122,19 +122,18 @@ the draft head to the bundle:
 
 ```bash
 uv run export.py --model google/gemma-4-E2B-it --emit-hidden-states
-uv run export_drafter.py --model google/gemma-4-E2B-it \
-  --drafter <assistant checkpoint dir> --bundle <bundle>
+uv run export_drafter.py --model google/gemma-4-E2B-it --bundle <bundle>
 ```
 
-`--drafter` is a local directory that already holds the assistant checkpoint (its `*.safetensors`
-and `config.json`); the script does not download it. Fetch it first, for example:
+The assistant is the target's own, `<model>-assistant` on the hub (`google/gemma-4-E2B-it-assistant`
+for E2B, `google/gemma-4-E4B-it-assistant` for E4B). `export_drafter.py` downloads its safetensors
+and `config.json` on first use. `--drafter` takes another hub repo id or a local directory instead.
+An assistant is trained for one target, so the script refuses one whose hidden size does not match
+`--model`. `--bundle` takes the bundle that `export.py` wrote with `--emit-hidden-states`; the
+script refuses a bundle exported without it.
 
-```bash
-hf download google/gemma-4-E2B-it-assistant --local-dir <assistant checkpoint dir>
-```
-
-(`google/gemma-4-E4B-it-assistant` for E4B.) `--bundle` takes the bundle that `export.py` wrote with
-`--emit-hidden-states`; the script refuses a bundle exported without it.
+The draft head is an asset in the bundle for a speculative decoding runtime; nothing in this
+repository loads it yet.
 
 `--emit-hidden-states` makes the decode graphs return their post-norm final hidden state as a
 second output, `hidden_states`, and records `language.overrides.emits_hidden_states` in the bundle
@@ -142,8 +141,9 @@ metadata. The default export is unchanged.
 
 `export_drafter.py` exports the head's layer stack as one static-shape program, `draft_step.aimodel`,
 with one function per context bucket of the target export's ladder, up to `--max-context-length`.
-The token-embedding lookup and the candidate scan stay outside the program, over `draft_scan.bin`. `--bundle` copies
-the files into the bundle and declares them as the `drafter` component: the program under
+The token-embedding lookup and the candidate scan stay outside the program, over
+`draft_scan.bin`. `--bundle` copies the files into the bundle and declares them as the `drafter`
+component: the program under
 `assets.drafter`, and `drafter_config`, `drafter_scan` and `drafter_scan_index` under
 `auxiliary_assets`. It also sets `speculative.drafter_kind` to `mtp`, because other drafters use
 the same `drafter` asset key with different semantics; `--bundle` refuses a bundle that already

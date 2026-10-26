@@ -29,14 +29,17 @@ copies the four files into a target bundle exported with ``--emit-hidden-states`
 as the bundle's ``drafter`` component in ``metadata.json``.
 
     cd models/gemma4
-    uv run export_drafter.py --model google/gemma-4-E2B-it --drafter <assistant checkpoint dir> \
-        --bundle <target bundle>
+    uv run export_drafter.py --model google/gemma-4-E2B-it --bundle <target bundle>
+
+The assistant is the target's own (``<model>-assistant`` on the Hugging Face hub), downloaded on
+first use; ``--drafter`` takes another repo id or a local directory instead.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 from pathlib import Path
 
@@ -44,6 +47,8 @@ import torch
 import torch.nn as nn
 from coreai_torch import TorchConverter, get_decomp_table
 from export import IOS_MAX_CONTEXT_LENGTH, context_ladder
+from huggingface_hub import snapshot_download
+from huggingface_hub.errors import GatedRepoError, RepositoryNotFoundError
 from safetensors import safe_open
 from transformers import AutoConfig
 
@@ -226,6 +231,36 @@ class DraftStep(nn.Module):
         return self.post_projection(x), self.centroids(x), x
 
 
+HUB_REPO_ID = re.compile(r"^[\w.-]+/[\w.-]+$")
+
+
+def default_drafter(model_id: str) -> str:
+    """The assistant trained for a Gemma 4 target: ``<model id>-assistant`` on the hub."""
+    return f"{model_id}-assistant"
+
+
+def resolve_drafter(drafter: str | None, model_id: str) -> Path:
+    """A directory holding the assistant checkpoint.
+
+    ``drafter`` is a local directory (used as is) or a hub repo id; omitted, it is the target's own
+    assistant. Only the safetensors and ``config.json`` are fetched, not a model.
+    """
+    if drafter is not None and Path(drafter).expanduser().is_dir():
+        return Path(drafter).expanduser()
+    repo = drafter or default_drafter(model_id)
+    if not HUB_REPO_ID.match(repo):
+        raise SystemExit(f"--drafter {drafter!r} is neither a directory nor a hub repo id")
+    try:
+        return Path(snapshot_download(repo, allow_patterns=["*.safetensors", "config.json"]))
+    except GatedRepoError as e:
+        raise SystemExit(
+            f"{repo} is gated: accept its license on the hub and log in (`hf auth login`)"
+        ) from e
+    except RepositoryNotFoundError as e:
+        hint = "" if drafter else f"; there is no default assistant for {model_id}, pass --drafter"
+        raise SystemExit(f"hub repo {repo} was not found{hint}") from e
+
+
 def load_drafter(ckpt: Path) -> dict[str, torch.Tensor]:
     t = {}
     for f in sorted(ckpt.glob("*.safetensors")):
@@ -246,12 +281,16 @@ def output_table(t: dict[str, torch.Tensor]) -> torch.Tensor:
     return t.get("lm_head.weight", t["model.embed_tokens.weight"])
 
 
-def check_checkpoint(t: dict[str, torch.Tensor], text: dict | None = None) -> None:
+def check_checkpoint(
+    t: dict[str, torch.Tensor], text: dict | None = None, backbone_hidden_size: int | None = None
+) -> None:
     """Refuse a checkpoint the runtime cannot serve.
 
     ``text`` is the assistant's ``text_config``, when its ``config.json`` is at hand. The runtime
     treats the last layer as full attention and every other as sliding, and runs the weights in
-    float16.
+    float16. ``backbone_hidden_size`` is the target's hidden size: the assistant reads the target's
+    final hidden state, so its input projection must be twice that wide (token embedding plus
+    hidden state).
     """
     num_layers = 1 + max(
         (int(k.split(".")[2]) for k in t if k.startswith("model.layers.")), default=-1
@@ -262,6 +301,12 @@ def check_checkpoint(t: dict[str, torch.Tensor], text: dict | None = None) -> No
     missing = [n for n in names if n not in t]
     if missing:
         raise SystemExit(f"checkpoint is missing tensor(s): {', '.join(missing)}")
+    width = t["pre_projection.weight"].shape[1]
+    if backbone_hidden_size is not None and width != 2 * backbone_hidden_size:
+        raise SystemExit(
+            f"the assistant takes hidden states {width // 2} wide, but the target's hidden size is "
+            f"{backbone_hidden_size}: it was trained for a different target"
+        )
     layer_types = (text or {}).get("layer_types")
     expected = ["sliding_attention"] * (num_layers - 1) + ["full_attention"]
     if layer_types is not None and list(layer_types) != expected:
@@ -351,7 +396,7 @@ def export(model_id: str, drafter: Path, window: int, max_context: int, out_dir:
     text_config = (
         json.loads(config_path.read_text()).get("text_config") if config_path.exists() else None
     )
-    check_checkpoint(t, text_config)
+    check_checkpoint(t, text_config, backbone_hidden_size=text.hidden_size)
     module = DraftStep(t, text.num_key_value_heads).half().eval()
     out_dir.mkdir(parents=True, exist_ok=True)
     write_scan_table(t, len(module.layers), out_dir / SCAN_NAME)
@@ -482,9 +527,9 @@ def main() -> None:
     parser.add_argument("--model", required=True, help="Target HuggingFace model ID")
     parser.add_argument(
         "--drafter",
-        type=Path,
-        required=True,
-        help="Directory holding the assistant (drafter) safetensors",
+        default=None,
+        help="The assistant: a hub repo id or a local directory holding its safetensors "
+        "(default: the target's own, '<model>-assistant')",
     )
     parser.add_argument(
         "--window",
@@ -509,7 +554,8 @@ def main() -> None:
         "head to, as its 'drafter' component",
     )
     args = parser.parse_args()
-    export(args.model, args.drafter, args.window, args.max_context_length, args.output_dir)
+    drafter = resolve_drafter(args.drafter, args.model)
+    export(args.model, drafter, args.window, args.max_context_length, args.output_dir)
     if args.bundle is not None:
         add_to_bundle(args.output_dir, args.bundle)
 

@@ -52,10 +52,12 @@ if _HAS_COREAI:
     RMSNorm = export_drafter.RMSNorm
     add_to_bundle = export_drafter.add_to_bundle
     check_checkpoint = export_drafter.check_checkpoint
+    default_drafter = export_drafter.default_drafter
     example_inputs = export_drafter.example_inputs
     full_windows = export_drafter.full_windows
     load_drafter = export_drafter.load_drafter
     output_table = export_drafter.output_table
+    resolve_drafter = export_drafter.resolve_drafter
     rotate_half = export_drafter.rotate_half
     write_scan_table = export_drafter.write_scan_table
 
@@ -523,3 +525,85 @@ class _TextConfig:
 def test_metadata_records_hidden_states_only_when_emitted():
     assert "emits_hidden_states" not in _ios_metadata_extras(_TextConfig())["overrides"]
     assert _ios_metadata_extras(_TextConfig(), True)["overrides"]["emits_hidden_states"] is True
+
+
+# ---- Finding the assistant ----
+
+
+def test_the_default_assistant_is_the_targets_own():
+    assert default_drafter("google/gemma-4-E2B-it") == "google/gemma-4-E2B-it-assistant"
+    assert default_drafter("google/gemma-4-E4B-it") == "google/gemma-4-E4B-it-assistant"
+
+
+def _record_downloads(monkeypatch, result):
+    calls = []
+
+    def fake(repo, **kwargs):
+        calls.append((repo, kwargs))
+        if isinstance(result, Exception):
+            raise result
+        return str(result)
+
+    monkeypatch.setattr(export_drafter, "snapshot_download", fake)
+    return calls
+
+
+def test_a_local_directory_is_used_as_is(tmp_path, monkeypatch):
+    calls = _record_downloads(monkeypatch, tmp_path / "unused")
+    assert resolve_drafter(str(tmp_path), "google/gemma-4-E2B-it") == tmp_path
+    assert calls == []
+
+
+def test_an_omitted_drafter_downloads_the_targets_assistant(tmp_path, monkeypatch):
+    calls = _record_downloads(monkeypatch, tmp_path)
+    assert resolve_drafter(None, "google/gemma-4-E4B-it") == tmp_path
+    # Only the weights and the config are fetched, not a model.
+    assert calls == [
+        (
+            "google/gemma-4-E4B-it-assistant",
+            {"allow_patterns": ["*.safetensors", "config.json"]},
+        )
+    ]
+
+
+def test_a_repo_id_is_downloaded(tmp_path, monkeypatch):
+    calls = _record_downloads(monkeypatch, tmp_path)
+    assert resolve_drafter("someone/other-assistant", "google/gemma-4-E2B-it") == tmp_path
+    assert calls[0][0] == "someone/other-assistant"
+
+
+def test_neither_a_directory_nor_a_repo_id_is_refused(tmp_path, monkeypatch):
+    calls = _record_downloads(monkeypatch, tmp_path)
+    with pytest.raises(SystemExit, match="neither a directory nor a hub repo id"):
+        resolve_drafter(str(tmp_path / "missing"), "google/gemma-4-E2B-it")
+    assert calls == []
+
+
+def test_a_missing_default_assistant_says_to_pass_one(monkeypatch):
+    class NotFound(Exception):
+        pass
+
+    monkeypatch.setattr(export_drafter, "RepositoryNotFoundError", NotFound)
+    _record_downloads(monkeypatch, NotFound("404"))
+    with pytest.raises(SystemExit, match="no default assistant for acme/model.*--drafter"):
+        resolve_drafter(None, "acme/model")
+    with pytest.raises(SystemExit, match="was not found") as explicit:
+        resolve_drafter("acme/typo-assistant", "acme/model")
+    assert "pass --drafter" not in str(explicit.value)
+
+
+def test_a_gated_assistant_says_to_log_in(monkeypatch):
+    class Gated(Exception):
+        pass
+
+    monkeypatch.setattr(export_drafter, "GatedRepoError", Gated)
+    _record_downloads(monkeypatch, Gated("401"))
+    with pytest.raises(SystemExit, match="gated.*log in"):
+        resolve_drafter("acme/assistant", "acme/model")
+
+
+def test_an_assistant_for_another_target_is_refused():
+    t = checkpoint(hidden=4)  # takes 4-wide hidden states
+    check_checkpoint(t, backbone_hidden_size=4)
+    with pytest.raises(SystemExit, match="4 wide.*target's hidden size is 6"):
+        check_checkpoint(t, backbone_hidden_size=6)
