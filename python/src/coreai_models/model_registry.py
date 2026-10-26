@@ -520,6 +520,40 @@ LLM_PRESETS: list[ModelPreset] = [
         IOS_DEFAULT_MAX_CONTEXT_LENGTH,
         compression_config="models/olmo2/olmo2_1b_6bit.yaml",
     ),
+    ModelPreset(
+        "gemma4-e2b-it",
+        "google/gemma-4-E2B-it",
+        "gemma4",
+        "llm",
+        "iOS",
+        "none",
+        "float16",
+        131072,
+        compression_config="models/gemma4/4bit_palettized.yaml",
+        notes=(
+            "Exported via models/gemma4/export.py (standalone recipe -- doesn't fit "
+            "coreai.llm.export's single-graph pipeline: a per-context blocked ladder "
+            "of statically-shaped programs, externalized Per-Layer Embeddings, and "
+            "precomputed dual-RoPE rows). Pass --include-vision for image input."
+        ),
+    ),
+    ModelPreset(
+        "gemma4-e4b-it",
+        "google/gemma-4-E4B-it",
+        "gemma4",
+        "llm",
+        "iOS",
+        "none",
+        "float16",
+        131072,
+        compression_config="models/gemma4/4bit_palettized.yaml",
+        notes=(
+            "Exported via models/gemma4/export.py (standalone recipe -- doesn't fit "
+            "coreai.llm.export's single-graph pipeline: a per-context blocked ladder "
+            "of statically-shaped programs, externalized Per-Layer Embeddings, and "
+            "precomputed dual-RoPE rows). Pass --include-vision for image input."
+        ),
+    ),
 ]
 
 # ---------------------------------------------------------------------------

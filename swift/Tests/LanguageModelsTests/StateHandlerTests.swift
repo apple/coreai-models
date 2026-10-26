@@ -260,6 +260,33 @@ struct KVCacheShapeResolutionTests {
 // MARK: - withBoundStates Tests
 
 /// Minimal state handler for testing the binding API.
+@Suite("State memory estimates")
+struct StateMemoryEstimateTests {
+    @Test(
+        "A handler's estimate is element count times element size, summed over its states",
+        arguments: [
+            (NDArray.ScalarType.float16, 2 * 2 * 4 * 8 * 16 * 2),
+            (.float32, 2 * 2 * 4 * 8 * 16 * 4),
+            (.int8, 2 * 2 * 4 * 8 * 16),
+        ] as [(NDArray.ScalarType, Int)])
+    func handlerEstimate(scalarType: NDArray.ScalarType, expected: Int) {
+        let handler = MockStateHandler(names: ["k", "v"], shape: [2, 4, 8, 16], scalarType: scalarType)
+        #expect(handler.estimatedBytes == expected)
+    }
+
+    @Test("A session's estimate counts its KV cache, persistent states and logits buffer")
+    func sessionEstimate() {
+        let session = GenerationSessionState(
+            kvCache: MockStateHandler(names: ["k", "v"], shape: [1, 4, 8, 16], scalarType: .float16),
+            additionalStates: nil,
+            hasNonTruncatableStates: false)
+        #expect(session.estimatedStateBytes == 2 * 4 * 8 * 16 * 2)
+        #expect(session.estimatedLogitsScratchBytes == 0)
+        session.logitsScratch = NDArray(shape: [1, 1, 1000], scalarType: .float32)
+        #expect(session.estimatedLogitsScratchBytes == 1000 * 4)
+    }
+}
+
 final class MockStateHandler: SyncStateHandler {
     var stateNames: [String]
     var stateCount: Int { arrays.count }

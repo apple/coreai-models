@@ -440,12 +440,14 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         let modelVocabSize = bundle.vocabSize
 
         // Resolve component model URLs once; reused for the cache check and model loading below.
-        // An LLM bundle has only `main`; VLM bundles also have `vision` and `embedding`.
+        // An LLM bundle has only `main`; VLM bundles also have `vision`, plus `embedding` unless the
+        // decoder gathers its own token embeddings (`vision.token_merge` is `decoder_gather`).
         let isVLM = bundle.modelBundle.kind == .vlm
         let languageModelURL = try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.main)
         let visionModelURL = isVLM ? try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.vision) : nil
         let embeddingModelURL =
-            isVLM ? try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.embedding) : nil
+            isVLM && bundle.visionConfig?.tokenMerge != .decoderGather
+            ? try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.embedding) : nil
 
         if clearCoreAICache {
             let cleared = try PreparedModel.clearCache(at: bundle.bundlePath)
@@ -454,13 +456,16 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
 
         // Detect an existing cached specialization before loading so we can annotate the load
         // time below. This only inspects the cache; it never triggers specialization. For VLM
-        // bundles, all three components must be cached to count as a hit.
+        // bundles, every component the bundle actually declares must be cached to count as a hit.
         let cacheHit: Bool
         if let visionModelURL, let embeddingModelURL {
             cacheHit =
                 PreparedModel.isCached(at: visionModelURL)
                 && PreparedModel.isCached(at: embeddingModelURL)
                 && PreparedModel.isCached(at: languageModelURL)
+        } else if let visionModelURL {
+            cacheHit =
+                PreparedModel.isCached(at: visionModelURL) && PreparedModel.isCached(at: languageModelURL)
         } else {
             cacheHit = PreparedModel.isCached(at: languageModelURL)
         }
@@ -995,10 +1000,13 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
 
     // MARK: - VLM Inference
 
-    /// Runs `rows` copies of the prompt through `lockstepBatchedGenerate` and prints each row.
+    /// Runs `rows` copies of `promptTokens` through `lockstepBatchedGenerate`, up to `--max-tokens`
+    /// new tokens per row, and prints each row's decoded text.
     ///
-    /// Row 0 is greedy, so it should match a normal greedy run of the same prompt. The other rows
-    /// sample at `--temperature` (0.8 if that is 0) with a fixed seed per row, so reruns repeat.
+    /// Row 0 is greedy. Rows 1 and up sample at `--temperature` (0.8 when it is 0 or less) with
+    /// seed `1234 + row`. A row stops on the tokenizer's EOS or an `additionalEosTokenIds` token.
+    /// Throws `ValidationError` when the engine is not a `CoreAISequentialEngine` or `rows` exceeds
+    /// `bundle.maxBatchSize`.
     private func runBatchPrototype(
         rows: Int,
         inferenceEngine: any InferenceEngine,
