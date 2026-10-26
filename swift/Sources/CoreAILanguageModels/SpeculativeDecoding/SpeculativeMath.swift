@@ -10,8 +10,8 @@ import Foundation
 /// Selection and probability primitives shared by the speculative drafters and decoder.
 ///
 /// Argmax, softmax and the multinomial draw are `CompositeSampler`'s, so the drafter and the target
-/// select tokens the same way; the accept/reject step and its residual distribution (Chen et al.,
-/// 2023) are the only parts with no sampler equivalent. Every function that draws takes the random
+/// select tokens the same way; the accept/reject step and its residual distribution (Chen et al., 2023,
+/// https://arxiv.org/abs/2302.01318) are the only parts with no sampler equivalent. Every function that draws takes the random
 /// number generator it draws from.
 enum SpeculativeMath {
     /// Index of the largest logit, 0 for an empty array.

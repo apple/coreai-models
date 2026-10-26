@@ -17,12 +17,13 @@ import Tokenizers
 /// 3. A ``VerificationPolicy`` accepts a prefix / path of the proposal and picks
 ///    the next token; both KV caches roll back to the accepted length.
 ///
-/// Correctness is defined by the target:
+/// Correctness is defined by the target, through a ``VerificationPolicy``:
 /// - `.greedy` — output is **token-for-token identical** to greedy target
 ///   decoding (acceptance is exact argmax match; the correction is always the
 ///   target's own greedy token).
 /// - `.sampling` — output is **distributionally identical** to sampling the
-///   target at that temperature (Chen et al. 2023 accept/reject).
+///   target at that temperature (the accept/reject scheme of Chen et al. 2023,
+///   https://arxiv.org/abs/2302.01318).
 ///
 /// The decoder names no concrete engine type: draft and target may run on
 /// different backends, and the drafter may be a separate model
@@ -88,15 +89,20 @@ package final class SpeculativeDecoder: @unchecked Sendable {
     ///   - draft: small proposal engine (any ``SpeculativeEngine`` backend).
     ///   - target: large verification engine; its output defines correctness. May
     ///     run on a different backend than the draft.
-    ///   - numDraftTokens: tokens the draft proposes per step (`k`). Default 4.
+    ///   - numDraftTokens: tokens the draft proposes per step (`k`), from 1 to
+    ///     ``SpeculativeDefaults/maxDraftTokens``. Default ``SpeculativeDefaults/numDraftTokens``.
     ///   - adaptiveDraftCount: see ``init(drafter:target:numDraftTokens:alignDraftsToVerifyTile:adaptiveDraftCount:)``.
     package init(
-        draft: any SpeculativeEngine, target: any SpeculativeEngine, numDraftTokens: Int = 4,
+        draft: any SpeculativeEngine, target: any SpeculativeEngine,
+        numDraftTokens: Int = SpeculativeDefaults.numDraftTokens,
         adaptiveDraftCount: Bool = false
     ) {
         self.drafter = AutoregressiveDrafter(engine: draft)
         self.target = target
-        self.numDraftTokens = max(1, numDraftTokens)
+        precondition(
+            (1...SpeculativeDefaults.maxDraftTokens).contains(numDraftTokens),
+            "numDraftTokens \(numDraftTokens) must be in 1...\(SpeculativeDefaults.maxDraftTokens)")
+        self.numDraftTokens = numDraftTokens
         self.alignDraftsToVerifyTile = false
         self.adaptiveDraftCount = adaptiveDraftCount
     }
@@ -106,19 +112,24 @@ package final class SpeculativeDecoder: @unchecked Sendable {
     /// - Parameters:
     ///   - drafter: proposal source.
     ///   - target: verification engine; its output defines correctness.
-    ///   - numDraftTokens: candidates the drafter proposes per step (`k`). Default 4.
+    ///   - numDraftTokens: candidates the drafter proposes per step (`k`), from 1 to
+    ///     ``SpeculativeDefaults/maxDraftTokens``. Default ``SpeculativeDefaults/numDraftTokens``.
     ///   - alignDraftsToVerifyTile: propose only as many drafts as fit in the target's current
     ///     verify tile (see ``SpeculativeEngine/verifyTileWidth``), so every verify is one forward.
     ///   - adaptiveDraftCount: start at `numDraftTokens`, then raise the draft count by 2 after a
     ///     round whose drafts were all accepted and lower it by 1 after any rejection, within 1 and
     ///     the larger of `numDraftTokens` and the verify tile's last slot.
     package init(
-        drafter: any DrafterEngine, target: any SpeculativeEngine, numDraftTokens: Int = 4,
+        drafter: any DrafterEngine, target: any SpeculativeEngine,
+        numDraftTokens: Int = SpeculativeDefaults.numDraftTokens,
         alignDraftsToVerifyTile: Bool = false, adaptiveDraftCount: Bool = false
     ) {
         self.drafter = drafter
         self.target = target
-        self.numDraftTokens = max(1, numDraftTokens)
+        precondition(
+            (1...SpeculativeDefaults.maxDraftTokens).contains(numDraftTokens),
+            "numDraftTokens \(numDraftTokens) must be in 1...\(SpeculativeDefaults.maxDraftTokens)")
+        self.numDraftTokens = numDraftTokens
         self.alignDraftsToVerifyTile = alignDraftsToVerifyTile
         self.adaptiveDraftCount = adaptiveDraftCount
     }
@@ -270,7 +281,7 @@ package final class SpeculativeDecoder: @unchecked Sendable {
             var lookupTokens: [Int32] = []
             if let promptLookup {
                 lookupTokens = promptLookup.propose(
-                    context: tokens, count: min(promptLookup.maxProposal, proposalLimit))
+                    context: tokens, count: min(promptLookup.maxTokens, proposalLimit))
             }
             if !lookupTokens.isEmpty {
                 proposal = DraftProposal(tokens: lookupTokens)
@@ -314,7 +325,8 @@ package final class SpeculativeDecoder: @unchecked Sendable {
             if adaptiveDraftCount, lookupTokens.isEmpty, !proposal.tokens.isEmpty {
                 draftBudget =
                     acceptedTokens.count == proposal.tokens.count
-                    ? min(draftBudget + 2, maxDraftBudget) : max(draftBudget - 1, 1)
+                    ? min(draftBudget + SpeculativeDefaults.adaptiveGrowth, maxDraftBudget)
+                    : max(draftBudget - SpeculativeDefaults.adaptiveShrink, 1)
             }
 
             // 4. Roll the target KV to [confirmed prefix + accepted drafts]: the verify order
@@ -378,7 +390,7 @@ package final class SpeculativeDecoder: @unchecked Sendable {
         return (path, targetArgmax[currentSlot])
     }
 
-    /// Speculative sampling (Chen et al. 2023). Linear proposals only: accept
+    /// Speculative sampling (Chen et al. 2023, https://arxiv.org/abs/2302.01318). Linear proposals only: accept
     /// `x_i ~ q_i` with probability `min(1, p_i(x_i)/q_i(x_i))`; on rejection
     /// resample the normalized residual `norm(relu(p−q))` and stop; if all accepted,
     /// sample a bonus token from the target's next distribution.

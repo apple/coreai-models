@@ -39,9 +39,10 @@ struct SpeculativeLosslessTests {
                 alignDraftsToVerifyTile: rng.next() % 2 == 0, adaptiveDraftCount: rng.next() % 2 == 0)
             decoder.alignProposalsToForward = rng.next() % 2 == 0
             if rng.next() % 3 == 0 {
+                let minNgram = 1 + Int(rng.next() % 3)
                 decoder.promptLookup = PromptLookup(
-                    maxNgram: 1 + Int(rng.next() % 4), minNgram: 1 + Int(rng.next() % 3),
-                    maxProposal: 1 + Int(rng.next() % 20))
+                    maxNgram: minNgram + Int(rng.next() % 3), minNgram: minNgram,
+                    maxTokens: 1 + Int(rng.next() % 20))
             }
             for runIndex in 0..<3 {
                 let plen = 1 + Int(rng.next() % 20)

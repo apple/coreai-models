@@ -25,7 +25,15 @@ package final class PromptLookupDrafter: DrafterEngine, @unchecked Sendable {
     /// - Parameters:
     ///   - maxNgram: longest suffix to match (prefer longer, more-specific matches).
     ///   - minNgram: shortest suffix to accept a match on.
-    package init(maxNgram: Int = 3, minNgram: Int = 1, maxContextLength: Int = 131072) {
+    ///   - maxContextLength: context the drafter reports; the decoder takes the smaller of this and
+    ///     the target's, so any positive value at least the target's is equivalent.
+    package init(
+        maxNgram: Int = SpeculativeDefaults.lookupMaxNgram,
+        minNgram: Int = SpeculativeDefaults.lookupMinNgram,
+        maxContextLength: Int = SpeculativeDefaults.maxContextLength
+    ) {
+        precondition(maxContextLength > 0, "PromptLookupDrafter maxContextLength \(maxContextLength) must be positive")
+        // The block size is the `count` of each `draftAll` call, so the lookup's own limit is unused.
         self.lookup = PromptLookup(maxNgram: maxNgram, minNgram: minNgram)
         self.maxContextLength = maxContextLength
     }

@@ -11,12 +11,20 @@ package struct PromptLookup: Sendable {
     package let maxNgram: Int
     package let minNgram: Int
     /// Most tokens proposed per block.
-    package let maxProposal: Int
+    package let maxTokens: Int
 
-    package init(maxNgram: Int = 4, minNgram: Int = 3, maxProposal: Int = 7) {
-        self.minNgram = max(1, minNgram)
-        self.maxNgram = max(self.minNgram, maxNgram)
-        self.maxProposal = max(1, maxProposal)
+    package init(
+        maxNgram: Int = SpeculativeDefaults.lookupMaxNgram,
+        minNgram: Int = SpeculativeDefaults.lookupMinNgram,
+        maxTokens: Int = SpeculativeDefaults.lookupMaxTokens
+    ) {
+        precondition(minNgram >= 1, "PromptLookup minNgram \(minNgram) must be at least 1")
+        precondition(
+            maxNgram >= minNgram, "PromptLookup maxNgram \(maxNgram) must be at least minNgram \(minNgram)")
+        precondition(maxTokens >= 1, "PromptLookup maxTokens \(maxTokens) must be at least 1")
+        self.minNgram = minNgram
+        self.maxNgram = maxNgram
+        self.maxTokens = maxTokens
     }
 
     /// Up to `count` tokens that followed the latest earlier occurrence of the context's

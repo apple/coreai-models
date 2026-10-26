@@ -40,9 +40,12 @@ package struct DrafterFeatures: Sendable {
 
     /// - Precondition: `values` holds at least `positionCount * hiddenDim` elements.
     package init(values: [Float], positionCount: Int, hiddenDim: Int, startPosition: Int) {
+        precondition(positionCount >= 0, "DrafterFeatures positionCount \(positionCount) is negative")
+        precondition(hiddenDim >= 0, "DrafterFeatures hiddenDim \(hiddenDim) is negative")
         precondition(
-            positionCount >= 0 && hiddenDim >= 0 && values.count >= positionCount * hiddenDim,
-            "\(values.count) values for \(positionCount) positions of width \(hiddenDim)")
+            values.count >= positionCount * hiddenDim,
+            "DrafterFeatures holds \(values.count) values, but \(positionCount) positions of width "
+                + "\(hiddenDim) need \(positionCount * hiddenDim)")
         self.values = values
         self.positionCount = positionCount
         self.hiddenDim = hiddenDim
@@ -54,7 +57,7 @@ package struct DrafterFeatures: Sendable {
 ///
 /// - `greedy`: accept the longest prefix matching the target's
 ///   argmax; the output is token-for-token identical to greedy target decoding.
-/// - `sampling`: the accept/reject scheme of Chen et al. (2023) at the given
+/// - `sampling`: the accept/reject scheme of Chen et al. (2023, https://arxiv.org/abs/2302.01318) at the given
 ///   temperature; the output is distributionally identical to sampling the target.
 package enum VerificationPolicy: Sendable {
     case greedy
@@ -64,7 +67,7 @@ package enum VerificationPolicy: Sendable {
 
     /// Effective temperature (clamped away from zero for sampling; 1 for greedy).
     var temperature: Double {
-        if case .sampling(let t) = self { return Swift.max(1e-5, t) }
-        return 1
+        if case .sampling(let t) = self { return Swift.max(SpeculativeDefaults.minSamplingTemperature, t) }
+        return 1.0
     }
 }

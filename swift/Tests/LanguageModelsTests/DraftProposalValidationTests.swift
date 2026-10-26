@@ -30,4 +30,14 @@ struct DraftProposalValidationTests {
             _ = DrafterFeatures(values: [1, 2, 3], positionCount: 2, hiddenDim: 2, startPosition: 0)
         }
     }
+
+    @Test("A negative position count or width is rejected")
+    func featuresRejectNegativeSizes() async {
+        await #expect(processExitsWith: .failure) {
+            _ = DrafterFeatures(values: [], positionCount: -1, hiddenDim: 2, startPosition: 0)
+        }
+        await #expect(processExitsWith: .failure) {
+            _ = DrafterFeatures(values: [], positionCount: 1, hiddenDim: -2, startPosition: 0)
+        }
+    }
 }

@@ -10,17 +10,31 @@ import Testing
 
 @Suite("Prompt lookup equivalence")
 struct PromptLookupEquivalenceTests {
-    @Test("Parameters below their minimum are clamped, so a short context never traps")
-    func clampedParameters() {
-        let lookup = PromptLookup(maxNgram: -2, minNgram: 0, maxProposal: 0)
-        #expect(lookup.minNgram == 1)
-        #expect(lookup.maxNgram == 1)
-        #expect(lookup.maxProposal == 1)
-        // Every context, however short, is searched without an out-of-range index.
+    @Test("The defaults are the shared speculative defaults")
+    func defaults() {
+        let lookup = PromptLookup()
+        #expect(lookup.maxNgram == SpeculativeDefaults.lookupMaxNgram)
+        #expect(lookup.minNgram == SpeculativeDefaults.lookupMinNgram)
+        #expect(lookup.maxTokens == SpeculativeDefaults.lookupMaxTokens)
+        let drafter = PromptLookupDrafter()
+        #expect(drafter.maxContextLength == SpeculativeDefaults.maxContextLength)
+    }
+
+    @Test("Every context, however short, is searched without an out-of-range index")
+    func shortContexts() {
+        let lookup = PromptLookup(maxNgram: 1, minNgram: 1, maxTokens: 1)
         for context in [[], [5], [5, 5], [1, 2, 1], [4, 4, 4, 4]] as [[Int32]] {
             #expect(lookup.propose(context: context, count: 3).count <= 3)
         }
         #expect(lookup.propose(context: [4, 4, 4, 4], count: 3) == [4])
+    }
+
+    @Test("Bad parameters are refused at construction")
+    func badParameters() async {
+        await #expect(processExitsWith: .failure) { _ = PromptLookup(minNgram: 0) }
+        await #expect(processExitsWith: .failure) { _ = PromptLookup(maxNgram: 2, minNgram: 3) }
+        await #expect(processExitsWith: .failure) { _ = PromptLookup(maxTokens: 0) }
+        await #expect(processExitsWith: .failure) { _ = PromptLookupDrafter(maxContextLength: 0) }
     }
 
     /// Element-by-element reference: longest suffix first, latest earlier occurrence first.
@@ -45,9 +59,10 @@ struct PromptLookupEquivalenceTests {
     func matchesReference() {
         var rng = SplitMix(11)
         for _ in 0..<2000 {
+            let minNgram = 1 + Int(rng.next() % 3)
             let lookup = PromptLookup(
-                maxNgram: 1 + Int(rng.next() % 5), minNgram: 1 + Int(rng.next() % 3),
-                maxProposal: 1 + Int(rng.next() % 8))
+                maxNgram: minNgram + Int(rng.next() % 3), minNgram: minNgram,
+                maxTokens: 1 + Int(rng.next() % 8))
             let context = (0..<Int(rng.next() % 30)).map { _ in Int32(rng.next() % 3) }
             let count = Int(rng.next() % 9)
             #expect(lookup.propose(context: context, count: count) == reference(lookup, context, count))

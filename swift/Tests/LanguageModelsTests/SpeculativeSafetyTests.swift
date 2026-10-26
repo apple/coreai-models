@@ -198,6 +198,31 @@ private final class ScriptedDrafter: DrafterEngine, @unchecked Sendable {
     }
 }
 
+extension SpeculativeSafetyTests {
+    @Test("A draft count outside 1...maxDraftTokens is refused at construction")
+    func draftCountBounds() async {
+        // The closures run in another process, so they build their own values.
+        await #expect(processExitsWith: .failure) {
+            let model = HashModel(vocab: 10, levels: 100, salt: 1)
+            _ = SpeculativeDecoder(
+                drafter: PromptLookupDrafter(), target: HashEngine(model: model), numDraftTokens: 0)
+        }
+        await #expect(processExitsWith: .failure) {
+            let model = HashModel(vocab: 10, levels: 100, salt: 1)
+            _ = SpeculativeDecoder(
+                draft: HashEngine(model: model), target: HashEngine(model: model),
+                numDraftTokens: SpeculativeDefaults.maxDraftTokens + 1)
+        }
+        let model = HashModel(vocab: 10, levels: 100, salt: 1)
+        // Both ends are accepted.
+        for count in [1, SpeculativeDefaults.maxDraftTokens] {
+            let decoder = SpeculativeDecoder(
+                drafter: PromptLookupDrafter(), target: HashEngine(model: model), numDraftTokens: count)
+            #expect(decoder.numDraftTokens == count)
+        }
+    }
+}
+
 /// Wraps an engine and drops the first row of every per-position argmax, as an engine would that
 /// scores fewer positions than a verify block holds.
 private final class ShortRowsEngine: SpeculativeEngine, @unchecked Sendable {
