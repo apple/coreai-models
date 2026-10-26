@@ -12,7 +12,12 @@ Proves, at batch=1, that an explicit additive ``attn_mask`` reproduces the defau
 import torch
 from transformers.models.qwen3.modeling_qwen3 import Qwen3Config
 
-from coreai_models.models.macos.qwen3 import Attention, Qwen3ForCausalLM
+from coreai_models.models.macos.qwen3 import (
+    Attention,
+    Qwen3ForCausalLM,
+    Qwen3Model,
+    TransformerBlock,
+)
 from coreai_models.primitives.macos.cache import KVCache
 
 
@@ -55,6 +60,46 @@ def test_attention_mask_mode_matches_causal_single_batch() -> None:
     with torch.no_grad():
         out_causal = causal(x, position_ids)
         out_masked = masked(x, position_ids, attn_mask=_causal_additive_mask(seq_len))
+
+    torch.testing.assert_close(out_masked, out_causal, atol=1e-5, rtol=1e-5)
+
+
+def test_transformer_block_mask_mode_matches_causal_single_batch() -> None:
+    """Mask-mode TransformerBlock fed a causal additive mask == default is_causal path (B=1)."""
+    torch.manual_seed(0)
+    config = _tiny_config()
+    seq_len = 6
+
+    causal = TransformerBlock(config, layer_idx=0).eval()
+    masked = TransformerBlock(config, layer_idx=0, use_attention_mask=True).eval()
+    masked.load_state_dict(causal.state_dict())
+
+    x = torch.rand(1, seq_len, config.hidden_size)
+    position_ids = torch.arange(seq_len, dtype=torch.int32).unsqueeze(0)
+
+    with torch.no_grad():
+        out_causal = causal(x, position_ids)
+        out_masked = masked(x, position_ids, attn_mask=_causal_additive_mask(seq_len))
+
+    torch.testing.assert_close(out_masked, out_causal, atol=1e-5, rtol=1e-5)
+
+
+def test_qwen3_model_mask_mode_matches_causal_single_batch() -> None:
+    """Mask-mode Qwen3Model fed a causal additive mask == default is_causal path (B=1)."""
+    torch.manual_seed(0)
+    config = _tiny_config()
+    seq_len = 6
+
+    causal = Qwen3Model(config).eval()
+    masked = Qwen3Model(config, use_attention_mask=True).eval()
+    masked.load_state_dict(causal.state_dict())
+
+    input_ids = torch.randint(0, config.vocab_size, (1, seq_len))
+    position_ids = torch.arange(seq_len, dtype=torch.int32).unsqueeze(0)
+
+    with torch.no_grad():
+        out_causal = causal(input_ids, position_ids)
+        out_masked = masked(input_ids, position_ids, attn_mask=_causal_additive_mask(seq_len))
 
     torch.testing.assert_close(out_masked, out_causal, atol=1e-5, rtol=1e-5)
 
