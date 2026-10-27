@@ -75,6 +75,10 @@ public struct ModelConfig: InferenceConfiguration, Codable, Sendable {
     /// honored by the static-shape engine. nil for most models.
     public var overrides: LanguageOverrides?
 
+    /// Explicit state classification from the bundle's `language.states`, keyed by state
+    /// name. nil = classify by shape and name.
+    var states: [String: StateKind]?
+
     public enum InputMode: String, Codable, Sendable {
         case random
         case allZeros = "all-zeros"
@@ -118,6 +122,7 @@ public struct ModelConfig: InferenceConfiguration, Codable, Sendable {
             serializedModel: [bundle.modelAssetPath],
             function: bundle.language.functionMap?.name(for: "main") ?? "main",
             overrides: bundle.overrides)
+        self.states = bundle.language.states
     }
 
     enum CodingKeys: String, CodingKey {
@@ -130,6 +135,7 @@ public struct ModelConfig: InferenceConfiguration, Codable, Sendable {
         case function
         case inputMode = "input_mode"
         case overrides
+        case states
     }
 
     public init(from decoder: Decoder) throws {
@@ -145,6 +151,7 @@ public struct ModelConfig: InferenceConfiguration, Codable, Sendable {
         self.prefillChunkSizeOverride = nil
         self.prefillChunkThresholdOverride = nil
         self.overrides = try c.decodeIfPresent(LanguageOverrides.self, forKey: .overrides)
+        self.states = try c.decodeIfPresent([String: StateKind].self, forKey: .states)
     }
 }
 

@@ -277,6 +277,7 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
         let stateHandlers = try StateHandlerFactory.createSyncHandlers(
             descriptor: llmDesc,
             maxContextLength: config.maxContextLength,
+            stateKinds: config.base.states,
             options: options
         )
         self.kvCache = stateHandlers.kvCache
@@ -805,7 +806,8 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
         chunkSize: Int
     ) async throws -> [LogitsScalarType] {
         // The VLM decoder has no prefill graph, so nothing is held back — every chunk runs
-        // through `processTokenBatch` for logits.
+        // through `processTokenBatch` for logits. No VLM uses a sliding ring; one would need
+        // `mainGraphStepSizes` here, as in `CoreAISequentialEngine`.
         return try await runChunkedPrefill(
             tokens: tokens,
             chunkSize: chunkSize,

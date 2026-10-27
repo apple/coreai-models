@@ -50,10 +50,19 @@ from coreai_models._constants import (
     VALUE_CACHE_NAME,
     VALUE_CACHE_OUTPUT_NAME,
 )
+from coreai_models.primitives.ios.cache import KVCacheHandler, causal_mask
 from coreai_models.primitives.ios.embedding import GatherEmbeddings, LoadEmbeddings
 from coreai_models.primitives.macos.cache import KVCache
 
 T = TypeVar("T", bound="BaseForCausalLM")
+
+
+@dataclass
+class EagerState:
+    """The caches of one sequence being run eagerly, and how many positions they already hold."""
+
+    tensors: tuple[torch.Tensor, ...]
+    offset: int = 0
 
 
 @dataclass(frozen=True)
@@ -78,6 +87,14 @@ class TraceSpec:
     cache_seq_len: int = TRACE_KV_CACHE_SEQ_LEN
     query_len: int = QUANT_TRACE_QUERY_LEN
     offset: int = QUANT_TRACE_OFFSET
+    #: Request-batch size the graph is traced at. When ``max_batch_size`` is None this also
+    #: pins dim0 (the single-batch / static-batch contract).
+    batch_size: int = 1
+    #: Upper bound for a *dynamic* ``batch`` dim across input_ids/position_ids/attn_mask and the
+    #: cache's leading batch dim (index 1). None pins the batch to ``batch_size`` (the contract).
+    #: When set, the graph is traced at ``batch_size`` (which must be >= 2 and strictly below this
+    #: max) so torch.export does not specialize the batch axis to the trace size.
+    max_batch_size: int | None = None
 
     def __post_init__(self) -> None:
         # Below this there is no legal `Dim(min=query_len, max=max_context_length - 1)`.
@@ -91,6 +108,13 @@ class TraceSpec:
                 "cache_seq_len must not be greater than max_context_length. Received "
                 f"cache_seq_len = {self.cache_seq_len}, "
                 f"max_context_length = {self.max_context_length}"
+            )
+        if self.max_batch_size is not None and not 2 <= self.batch_size < self.max_batch_size:
+            # torch.export specializes a size-1 dim and rejects a dim whose only legal value is
+            # the trace size, so the trace batch must be >= 2 and strictly below the dynamic max.
+            raise ValueError(
+                "max_batch_size requires a trace batch_size in [2, max_batch_size); received "
+                f"batch_size={self.batch_size}, max_batch_size={self.max_batch_size}."
             )
 
     @property
@@ -239,6 +263,7 @@ def _build_safetensors_key_index(
     safetensors_files: list[str],
     num_layers: int | None = None,
     hf_state_dict_prefix: str = "",
+    extra_shared_keys: list[str] | None = None,
 ) -> tuple[dict[int, dict[str, str]], dict[str, str]]:
     """Build a key-to-file index from safetensors files without loading tensors.
 
@@ -246,20 +271,30 @@ def _build_safetensors_key_index(
     to load only a sub-model from multimodal checkpoints (e.g., set
     ``hf_state_dict_prefix="language_model."`` to ignore vision/projector keys).
 
+    ``extra_shared_keys`` names exact keys to index as shared regardless of the
+    prefix, for weights stored outside the prefixed sub-model (e.g. ``lm_head.weight``
+    at the root of a checkpoint whose decoder lives under ``model.language_model.``).
+
     Returns ``(per_layer_index, shared_index)`` keyed by *original* safetensors
     keys (prefix not stripped); callers must strip before assigning.
     """
-    layer_pattern = re.compile(r"model\.layers\.(\d+)\.")
+    # "layers.{i}." is what a longer prefix such as "model.language_model." leaves.
+    layer_pattern = re.compile(r"(?:model\.)?layers\.(\d+)\.")
+    extra_keys = set(extra_shared_keys or ())
     per_layer: dict[int, dict[str, str]] = {}
     shared: dict[str, str] = {}
     for path in safetensors_files:
         with safe_open(path, framework="pt", device="cpu") as f:
             for key in f.keys():  # noqa: SIM118
+                if key in extra_keys:
+                    shared[key] = path
+                    continue
                 if not key.startswith(hf_state_dict_prefix):
                     continue
                 stripped = key.removeprefix(hf_state_dict_prefix)
 
-                if num_layers is not None and _is_layer_key_beyond(stripped, num_layers):
+                # The full key: a stripped "layers.N." lacks the "." the filter matches on.
+                if num_layers is not None and _is_layer_key_beyond(key, num_layers):
                     continue
                 match = layer_pattern.match(stripped)
                 if match:
@@ -305,6 +340,14 @@ class BaseForCausalLM(torch.nn.Module):
 
     # Subclasses must override this with their specific HuggingFace model class
     _HF_MODEL_CLASS: type | None = None
+    # Exact safetensors keys to load as shared params regardless of
+    # `hf_state_dict_prefix`, for weights sitting outside the prefixed sub-model.
+    _extra_hf_shared_keys: list[str] = []
+    # Whether `num_layers` (`--num-layers`) can truncate this model. False for hybrid
+    # models, whose per-layer-type states don't follow a plain layer-count cut.
+    supports_num_layers: bool = True
+    # Whether coreai-opt can quantize this model in graph mode (`execution_mode: graph`).
+    supports_graph_quantization: bool = True
 
     #: Whether the macOS exporter emits a second, LM-head-less ``prefill`` graph
     #: beside ``main``. Opt in per model: ``forward`` must honour
@@ -313,6 +356,11 @@ class BaseForCausalLM(torch.nn.Module):
 
     #: Set while the exporter traces the prefill graph. See :meth:`set_prefill_mode`.
     prefill_mode: bool = False
+
+    #: Opt in to exporting with an explicit additive ``attn_mask`` graph input
+    #: (``is_causal`` off) instead of the implicit causal mask. Default off keeps the
+    #: standard causal export contract unchanged.
+    use_attention_mask: bool = False
 
     def set_prefill_mode(self, prefill_mode: bool) -> None:
         """Toggle prefill mode for the next trace.
@@ -360,7 +408,9 @@ class BaseForCausalLM(torch.nn.Module):
 
         return wrapper
 
-    def __init__(self: Self, config, model_device: str = "cpu") -> None:
+    def __init__(
+        self: Self, config, model_device: str = "cpu", use_attention_mask: bool = False
+    ) -> None:
         """Initialize the model using template method pattern.
 
         Initializing the model on the meta device allows us to avoid
@@ -370,9 +420,13 @@ class BaseForCausalLM(torch.nn.Module):
             config: Model configuration object
             model_device: Device to use for initializing model components
                        (e.g., "cpu" or "meta")
+            use_attention_mask: Build attention with an explicit additive mask
+                       input (``is_causal`` off) rather than the implicit causal
+                       mask. Default off preserves the standard causal contract.
         """
         super().__init__()
         self.config = config
+        self.use_attention_mask = use_attention_mask
 
         with torch.device(model_device):
             self._init_model(config)
@@ -411,10 +465,15 @@ class BaseForCausalLM(torch.nn.Module):
     # value_cache).
     # ------------------------------------------------------------------
 
-    @classmethod
-    def export_input_names(cls) -> dict[str, tuple[str, ...]]:
-        """Graph input names per graph, in relative order among the non-state args."""
-        return {MAIN_GRAPH_NAME: ("input_ids", "position_ids")}
+    def export_input_names(self) -> dict[str, tuple[str, ...]]:
+        """Graph input names per graph, in relative order among the non-state args.
+
+        Opting into :attr:`use_attention_mask` appends an additive ``attn_mask`` input.
+        """
+        names = ("input_ids", "position_ids")
+        if self.use_attention_mask:
+            names = (*names, "attn_mask")
+        return {MAIN_GRAPH_NAME: names}
 
     @classmethod
     def export_state_names(cls) -> dict[str, tuple[str, ...]]:
@@ -455,16 +514,19 @@ class BaseForCausalLM(torch.nn.Module):
         parameters in *exact* signature order. Pass ``spec`` to
         :meth:`build_dynamic_shapes` too, so the tensors and their dims cannot disagree.
         """
-        input_ids = torch.randint(1, config.vocab_size, (1, spec.query_len), dtype=torch.int32)
+        input_ids = torch.randint(
+            1, config.vocab_size, (spec.batch_size, spec.query_len), dtype=torch.int32
+        )
         position_ids = (
             torch.arange(spec.query_len + spec.offset, dtype=torch.int32)
             .unsqueeze(0)
-            .expand(1, spec.query_len + spec.offset)
+            .expand(spec.batch_size, spec.query_len + spec.offset)
+            .contiguous()
         )
         k_cache, v_cache = KVCache.create_cache_tensors(
-            config, dtype=target_dtype, seq_len=spec.cache_seq_len
+            config, dtype=target_dtype, seq_len=spec.cache_seq_len, batch_size=spec.batch_size
         )
-        return {
+        inputs: dict[str, dict[str, Any]] = {
             MAIN_GRAPH_NAME: {
                 "input_ids": input_ids,
                 "position_ids": position_ids,
@@ -472,6 +534,16 @@ class BaseForCausalLM(torch.nn.Module):
                 "v_cache": v_cache,
             }
         }
+        if self.use_attention_mask:
+            # Additive mask broadcast over heads onto the per-row score matrix
+            # [B, heads, query_len, key_len]. The key length is the fetched cache
+            # prefix, which equals the position_ids length (query_len + offset).
+            # Zeros for the trace (shape only); LAST so the dict stays a contiguous
+            # in-order prefix of ``forward``.
+            inputs[MAIN_GRAPH_NAME]["attn_mask"] = torch.zeros(
+                spec.batch_size, 1, spec.query_len, spec.query_len + spec.offset, dtype=target_dtype
+            )
+        return inputs
 
     def build_dynamic_shapes(self, config, spec: TraceSpec) -> dict[str, Any]:
         """``dynamic_shapes`` per graph, matching :meth:`build_reference_inputs`.
@@ -479,9 +551,11 @@ class BaseForCausalLM(torch.nn.Module):
         Keyed like the reference inputs; ``None`` pins that input to its traced shape.
         """
         max_ctx = spec.max_context_length
+        seq_ids_dim = torch.export.Dim("seq_ids", max=max_ctx - 2)
+        seq_pos_dim = torch.export.Dim("seq_pos", min=spec.query_len, max=max_ctx - 1)
         shapes: dict[str, Any] = {
-            "input_ids": {1: torch.export.Dim("seq_ids", max=max_ctx - 2)},
-            "position_ids": {1: torch.export.Dim("seq_pos", min=spec.query_len, max=max_ctx - 1)},
+            "input_ids": {1: seq_ids_dim},
+            "position_ids": {1: seq_pos_dim},
         }
         seq_dim = KVCache.seq_len_dim()
         if spec.caches_are_static:
@@ -494,6 +568,29 @@ class BaseForCausalLM(torch.nn.Module):
             shapes["v_cache"] = {
                 seq_dim: torch.export.Dim("v_seq_len", min=spec.cache_seq_len, max=max_ctx)
             }
+        if self.use_attention_mask:
+            # Mask query axis == input_ids; key axis == the attention key length,
+            # which is the fetched cache prefix tied to position_ids (always
+            # dynamic, even when the cache tensor dims are pinned).
+            shapes["attn_mask"] = {2: seq_ids_dim, 3: seq_pos_dim}
+        if spec.max_batch_size is None:
+            # No dynamic batch requested: dim0 (ids/pos/mask) and cache dim1 stay PINNED to
+            # spec.batch_size (the single-batch / static-batch contract).
+            return {MAIN_GRAPH_NAME: shapes}
+        # One shared ``batch`` Dim across every batch axis so torch.export ties them together:
+        # dim0 of ids/pos/mask and dim1 of the caches. Traced at spec.batch_size (>= 2, strictly
+        # below max), so the batch axis is not specialized to the trace size.
+        batch_dim = torch.export.Dim("batch", min=1, max=spec.max_batch_size)
+        shapes["input_ids"][0] = batch_dim
+        shapes["position_ids"][0] = batch_dim
+        if "attn_mask" in shapes:
+            shapes["attn_mask"][0] = batch_dim
+        # Caches carry the batch Dim on dim1 even when the seq dim is pinned (static cache):
+        # replace the None pin with a batch-only shape dict.
+        for cache_name in ("k_cache", "v_cache"):
+            cache_shape = shapes[cache_name] or {}
+            cache_shape[1] = batch_dim
+            shapes[cache_name] = cache_shape
         return {MAIN_GRAPH_NAME: shapes}
 
     def validate_export_contract(
@@ -568,6 +665,30 @@ class BaseForCausalLM(torch.nn.Module):
             )
         return tuple(reference_inputs.values())
 
+    def new_eager_state(
+        self, *, dtype: torch.dtype, device: torch.device | str, max_seq_len: int | None = None
+    ) -> EagerState:
+        """Empty caches for one sequence of at most ``max_seq_len`` tokens (default: the
+        context)."""
+        with torch.device(device):
+            k_cache, v_cache = KVCache.create_cache_tensors(
+                self.config, dtype=dtype, seq_len=max_seq_len
+            )
+        return EagerState((k_cache, v_cache))
+
+    def eager_forward_args(self, input_ids: torch.Tensor, state: EagerState) -> tuple[Any, ...]:
+        """``forward``'s arguments for ``input_ids`` written at ``state.offset``."""
+        position_ids = torch.arange(
+            state.offset + input_ids.shape[1], dtype=torch.int32, device=input_ids.device
+        ).unsqueeze(0)
+        return (input_ids, position_ids, *state.tensors)
+
+    def eager_step(self, input_ids: torch.Tensor, state: EagerState) -> torch.Tensor:
+        """Logits ``[1, query_len, vocab]`` for ``input_ids``, advancing ``state`` past them."""
+        logits = self(*self.eager_forward_args(input_ids, state))
+        state.offset += input_ids.shape[1]
+        return logits.reshape(1, input_ids.shape[1], -1)
+
     @classmethod
     def _get_reauthored_config(
         cls,
@@ -592,6 +713,10 @@ class BaseForCausalLM(torch.nn.Module):
         if max_context_length is not None and hasattr(hf_config, "max_position_embeddings"):
             hf_config.max_position_embeddings = max_context_length
         if num_layers is not None:
+            if not cls.supports_num_layers:
+                raise ValueError(
+                    f"num_layers is not currently supported for hybrid models ({cls.__name__})"
+                )
             if not hasattr(hf_config, "num_hidden_layers"):
                 raise ValueError(
                     f"num_layers={num_layers} was specified but hf_config has no "
@@ -609,6 +734,7 @@ class BaseForCausalLM(torch.nn.Module):
         mmap_path: str | None = None,
         num_layers: int | None = None,
         disable_embedding_quantization: bool = False,
+        use_attention_mask: bool = False,
     ) -> T:
         """Load model from HuggingFace model hub.
 
@@ -625,6 +751,9 @@ class BaseForCausalLM(torch.nn.Module):
             disable_embedding_quantization: iOS only. When True, the
                 embedding table is not quantized to int8.
                 Ignored for macOS model classes.
+            use_attention_mask: macOS only. When True, build the model with an
+                explicit additive ``attn_mask`` input (``is_causal`` off).
+                Ignored for iOS model classes.
 
         Returns:
             Instance of the model class loaded with HuggingFace weights
@@ -643,10 +772,13 @@ class BaseForCausalLM(torch.nn.Module):
         )
 
         # Create our model instance and load the state dict.
-        # disable_embedding_quantization is only accepted by the iOS base class.
+        # disable_embedding_quantization is only accepted by the iOS base class;
+        # use_attention_mask only by the macOS base class.
         init_kwargs: dict = {"config": config, "model_device": "meta"}
         if issubclass(cls, BaseForCausalLMForiOS):
             init_kwargs["disable_embedding_quantization"] = disable_embedding_quantization
+        else:
+            init_kwargs["use_attention_mask"] = use_attention_mask
         model = cls(**init_kwargs)
         model.to(dtype=target_dtype)
         state_dict = hf_model.state_dict()
@@ -691,6 +823,7 @@ class BaseForCausalLM(torch.nn.Module):
         hf_config_attr: str | None = None,
         hf_state_dict_prefix: str = "",
         disable_embedding_quantization: bool = False,
+        use_attention_mask: bool = False,
     ) -> T:
         """Load model from HuggingFace with layer-by-layer memory offloading.
 
@@ -719,6 +852,9 @@ class BaseForCausalLM(torch.nn.Module):
             disable_embedding_quantization: iOS only. When True, the
                 embedding table is not quantized to int8.
                 Ignored for non-iOS model classes.
+            use_attention_mask: macOS only. When True, build the model with an
+                explicit additive ``attn_mask`` input (``is_causal`` off).
+                Ignored for iOS model classes.
         """
         model_dir = snapshot_download(
             huggingface_model_id,
@@ -730,10 +866,13 @@ class BaseForCausalLM(torch.nn.Module):
 
         config = cls._get_reauthored_config(hf_config, max_context_length, num_layers=num_layers)
 
-        # disable_embedding_quantization is only accepted by the iOS base class.
+        # disable_embedding_quantization is only accepted by the iOS base class;
+        # use_attention_mask only by the macOS base class.
         init_kwargs: dict = {"config": config, "model_device": "meta"}
         if issubclass(cls, BaseForCausalLMForiOS):
             init_kwargs["disable_embedding_quantization"] = disable_embedding_quantization
+        else:
+            init_kwargs["use_attention_mask"] = use_attention_mask
         model = cls(**init_kwargs)
         model.to(dtype=target_dtype)
 
@@ -742,6 +881,7 @@ class BaseForCausalLM(torch.nn.Module):
             safetensors_files,
             num_layers=num_layers,
             hf_state_dict_prefix=hf_state_dict_prefix,
+            extra_shared_keys=cls._extra_hf_shared_keys,
         )
 
         # Shared params first (embeddings, norm, lm_head, ...).
@@ -876,6 +1016,36 @@ class BaseForCausalLMForiOS(BaseForCausalLM):
         # iOS composes the transformer as a submodule, so the flag lives there rather
         # than on the top-level module.
         self.extend.prefill_mode = prefill_mode
+
+    @override
+    def new_eager_state(
+        self, *, dtype: torch.dtype, device: torch.device | str, max_seq_len: int | None = None
+    ) -> EagerState:
+        """iOS graphs index the cache and the mask over the whole context, so ``max_seq_len``
+        is ignored."""
+        with torch.device(device):
+            key_cache, value_cache = KVCacheHandler.get_kv_cache_from_hf(self.config, dtype=dtype)
+        return EagerState((key_cache, value_cache))
+
+    @override
+    def eager_forward_args(self, input_ids: torch.Tensor, state: EagerState) -> tuple[Any, ...]:
+        """iOS takes only the query's positions, the write offset, and an additive mask over
+        the context."""
+        query_len, device = input_ids.shape[1], input_ids.device
+        position_ids = (
+            torch.arange(state.offset, state.offset + query_len, device=device)
+            .to(torch.uint16)
+            .unsqueeze(0)
+        )
+        in_step = torch.tensor([state.offset], dtype=torch.int32, device=device)
+        mask = causal_mask(
+            self.config.max_position_embeddings,
+            query_len,
+            state.offset,
+            dtype=state.tensors[0].dtype,
+            device=device,
+        )
+        return (input_ids, position_ids, in_step, mask, *state.tensors)
 
     # ------------------------------------------------------------------
     # Export contract

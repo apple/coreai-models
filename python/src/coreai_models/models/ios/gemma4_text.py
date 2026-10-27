@@ -519,6 +519,10 @@ class Gemma4Extend(nn.Module):
         self.ple_scale = nn.Parameter(torch.ones([], dtype=torch.float16), requires_grad=False)
         self.ple_zero_point = nn.Parameter(torch.zeros([], dtype=torch.int8), requires_grad=False)
         self.prefill_mode = False
+        # When set, `forward` returns (logits, final_hidden_state) so a speculative
+        # (MTP/EAGLE) drafter can consume the target's post-norm hidden state. Off by
+        # default so the standard single-output export is unchanged.
+        self.emit_hidden_states = False
 
         # E2B/E4B tie word embeddings: the output projection reuses the embedding table.
         if not config.tie_word_embeddings:
@@ -595,14 +599,21 @@ class Gemma4Extend(nn.Module):
         if embedding_table is None:
             raise ValueError("embedding_table is required for the tied output projection")
 
+        # Post-norm final hidden state (batch, seq, hidden). Captured before the
+        # tied-embedding path reshapes `out`, so a speculative drafter can consume it.
+        final_hidden = out.reshape(batch_size, seq_len, hidden_dim)
+
         table = embedding_table
         if table.dtype == torch.int8:
             table = dequantize_per_tensor(table, self.emb_scale, self.emb_zero_point, out.dtype)
 
         table = table.reshape(table.shape[1], table.shape[0], table.shape[2])
-        out = out.transpose(-3, -1).reshape(batch_size, 1, hidden_dim, seq_len)
+        proj = out.transpose(-3, -1).reshape(batch_size, 1, hidden_dim, seq_len)
+        logits = (table @ proj).transpose(-1, -2)
 
-        return (table @ out).transpose(-1, -2)
+        if self.emit_hidden_states:
+            return logits, final_hidden
+        return logits
 
 
 class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):

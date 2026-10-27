@@ -17,3 +17,23 @@ public func sigmoid(_ x: Float) -> Float {
     let e = Foundation.exp(x)
     return e / (1 + e)
 }
+
+/// Cosine similarity of two equal-length vectors, accumulated in `Double` and returned as `Float`.
+///
+/// Length-mismatched inputs score `0`. For zero-norm inputs the convention matches the parity
+/// harnesses: two zero-norm (or empty) vectors are identical and score `1`, while a single
+/// zero-norm vector has no direction to compare and scores `0`.
+public func cosineSimilarity(_ a: [Float], _ b: [Float]) -> Float {
+    guard a.count == b.count else { return 0 }
+    var dot = 0.0
+    var normA = 0.0
+    var normB = 0.0
+    for i in a.indices {
+        dot += Double(a[i]) * Double(b[i])
+        normA += Double(a[i]) * Double(a[i])
+        normB += Double(b[i]) * Double(b[i])
+    }
+    let denom = (normA * normB).squareRoot()
+    guard denom > 0 else { return normA == normB ? 1 : 0 }
+    return Float(dot / denom)
+}

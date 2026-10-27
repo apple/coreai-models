@@ -20,7 +20,7 @@ from coreai_models.diffusion.presets import (
 from coreai_models.diffusion.presets import (
     PRESETS as DIFFUSION_PRESETS,
 )
-from coreai_models.export.pipeline import ExportConfig, export_model
+from coreai_models.export.pipeline import AttentionMaskMode, ExportConfig, export_model
 from coreai_models.export.presets import ALL_PRESET_NAMES, IOS_PRESETS, MACOS_PRESETS, list_presets
 from coreai_models.export.presets import (
     DEFAULT_IOS_COMPRESSION_PRESET as IOS_DEFAULT,
@@ -182,6 +182,28 @@ def build_parser() -> argparse.ArgumentParser:
             "The drafter is looked up from the model registry; not all models have one."
         ),
     )
+    parser.add_argument(
+        "--attention-mask",
+        choices=["default", "batched", "paged"],
+        default="default",
+        help=(
+            "Experimental, macOS only. Attention-mask / KV-write mode of the exported graph. "
+            "'default' keeps the implicit causal mask (shipping contract); 'batched' emits an "
+            "explicit additive attn_mask input (is_causal off) for the dense batched/ragged "
+            "decoder; 'paged' is reserved for the hardware paged backend (not yet supported). "
+            "Default: default. Non-default is rejected when --platform is iOS."
+        ),
+    )
+    parser.add_argument(
+        "--dynamic-batch-size",
+        type=int,
+        default=None,
+        help=(
+            "Experimental, macOS only. Declare a DYNAMIC batch dim up to this max (traced at 2) "
+            "across input_ids/position_ids/attn_mask and the KV cache. Must be >= 2. Pairs with "
+            "--attention-mask batched."
+        ),
+    )
     return parser
 
 
@@ -289,6 +311,40 @@ def _resolve_registry_compression_config(relpath: str, variant: str) -> tuple[ob
     return _load_compression_config_object(yaml_path, variant), yaml_path.stem
 
 
+def resolve_compression(
+    variant: str,
+    *,
+    compression: str | None = None,
+    compression_config: Path | None = None,
+    registry_compression_config: str | None = None,
+) -> tuple[str, object]:
+    """The compression name and coreai-opt config object an export of ``variant`` uses."""
+    compression_config_object = None
+    if compression_config is not None:
+        if not compression_config.is_file():
+            raise SystemExit(f"--compression-config: file not found: {compression_config}")
+        compression_config_object = _load_compression_config_object(compression_config, variant)
+        compression = compression_config.stem
+    elif registry_compression_config is not None:
+        compression_config_object, compression = _resolve_registry_compression_config(
+            registry_compression_config, variant
+        )
+    elif compression == "none":
+        pass
+    elif not compression:
+        compression = MACOS_DEFAULT if variant == "macOS" else IOS_DEFAULT
+    elif compression in MACOS_PRESETS and variant == "iOS":
+        raise RuntimeError("macOS quantization preset provided, but platform is iOS.")
+    elif compression in IOS_PRESETS and variant == "macOS":
+        raise RuntimeError("iOS palettization preset provided, but platform is macOS.")
+    elif compression not in ALL_PRESET_NAMES and compression != "none":
+        raise RuntimeError(
+            f"Compression preset {compression} is not a valid compression "
+            f"preset. Available: {list_presets()}"
+        )
+    return compression, compression_config_object
+
+
 def _resolve_export_config(args: argparse.Namespace) -> ExportConfig:
     """Resolve CLI args + registry preset into a final ExportConfig."""
     hf_model_id = args.model
@@ -297,7 +353,6 @@ def _resolve_export_config(args: argparse.Namespace) -> ExportConfig:
     compute_precision = args.compute_precision
     max_context_length = args.max_context_length
     output_dir = args.output_dir or _default_output_dir()
-    compression_config_object = None
     registry_compression_config: str | None = None  # repo-root-relative path, e.g. models/qwen3/...
 
     preset = None
@@ -360,30 +415,14 @@ def _resolve_export_config(args: argparse.Namespace) -> ExportConfig:
     if args.quantization_mode == "graph" and variant != "macOS":
         raise SystemExit(f"--quantization-mode graph requires --platform macOS (got '{variant}').")
 
-    if args.compression_config is not None:
-        if not args.compression_config.is_file():
-            raise SystemExit(f"--compression-config: file not found: {args.compression_config}")
-        compression_config_object = _load_compression_config_object(
-            args.compression_config, variant
-        )
-        compression = args.compression_config.stem
-    elif registry_compression_config is not None:
-        compression_config_object, compression = _resolve_registry_compression_config(
-            registry_compression_config, variant
-        )
-    elif compression == "none":
-        pass
-    elif not compression:
-        compression = MACOS_DEFAULT if variant == "macOS" else IOS_DEFAULT
-    elif compression in MACOS_PRESETS and variant == "iOS":
-        raise RuntimeError("macOS quantization preset provided, but platform is iOS.")
-    elif compression in IOS_PRESETS and variant == "macOS":
-        raise RuntimeError("iOS palettization preset provided, but platform is macOS.")
-    elif compression not in ALL_PRESET_NAMES and compression != "none":
-        raise RuntimeError(
-            f"Compression preset {compression} is not a valid compression "
-            f"preset. Available: {list_presets()}"
-        )
+    compression, compression_config_object = resolve_compression(
+        variant,
+        compression=compression,
+        compression_config=args.compression_config,
+        registry_compression_config=registry_compression_config,
+    )
+
+    attention_mask_mode = AttentionMaskMode(args.attention_mask)
 
     return ExportConfig(
         hf_model_id=hf_model_id,
@@ -401,6 +440,8 @@ def _resolve_export_config(args: argparse.Namespace) -> ExportConfig:
         include_debug_info=args.include_debug_info,
         model_type_override=getattr(preset, "_model_type_override", None) if preset else None,
         with_drafter=args.with_drafter,
+        attention_mask_mode=attention_mask_mode,
+        dynamic_max_batch_size=args.dynamic_batch_size,
     )
 
 

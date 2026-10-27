@@ -196,6 +196,30 @@ struct ServerAPITypesTests {
         #expect(cache?["utilization"] as? Double == 0.03125)
     }
 
+    @Test("ReadyResponse encodes estimated memory and batching, and omits them when absent")
+    func readyResponseEstimatedMemoryAndBatching() throws {
+        let cache = ReadyResponse.CacheStatus(usedTokens: 0, maxTokens: 4096, utilization: 0)
+        let full = ReadyResponse(
+            status: "ready", model: "m", maxContextLength: 4096, busy: true, cache: cache, toolCalling: false,
+            estimatedMemory: .init(kvCacheMB: 112, batchKVCacheMB: 896, logitsScratchMB: 4.5),
+            batching: .init(concurrentRequests: 4, active: 2, queued: 1))
+        let obj = try JSONSerialization.jsonObject(with: JSONEncoder().encode(full)) as! [String: Any]
+        let memory = obj["estimated_memory"] as? [String: Any]
+        #expect(memory?["kv_cache_mb"] as? Double == 112)
+        #expect(memory?["batch_kv_cache_mb"] as? Double == 896)
+        #expect(memory?["logits_scratch_mb"] as? Double == 4.5)
+        let batching = obj["batching"] as? [String: Any]
+        #expect(batching?["concurrent_requests"] as? Int == 4)
+        #expect(batching?["active"] as? Int == 2)
+        #expect(batching?["queued"] as? Int == 1)
+
+        let bare = ReadyResponse(
+            status: "ready", model: "m", maxContextLength: 4096, busy: false, cache: cache, toolCalling: false)
+        let bareObj = try JSONSerialization.jsonObject(with: JSONEncoder().encode(bare)) as! [String: Any]
+        #expect(bareObj["estimated_memory"] == nil)
+        #expect(bareObj["batching"] == nil)
+    }
+
     @Test("ReadyResponse round-trips through JSON")
     func readyResponseRoundTrip() throws {
         let ready = ReadyResponse(

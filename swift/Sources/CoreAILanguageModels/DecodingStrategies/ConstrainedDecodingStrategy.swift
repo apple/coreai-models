@@ -23,14 +23,23 @@ public struct ConstrainedDecodingStrategy: DecodingStrategy {
     /// Vocabulary size override. If nil, derived from tokenizer at generation time.
     private let vocabSizeOverride: Int?
 
+    /// Most whitespace characters allowed between two JSON tokens; nil when unlimited.
+    private let maxWhitespaceCount: Int?
+
     /// Initialize with a JSON schema string.
     ///
     /// - Parameters:
     ///   - jsonSchema: A valid JSON schema string that constrains output structure
     ///   - vocabSize: Optional vocabulary size override. If nil, derived from tokenizer.
-    public init(jsonSchema: String, vocabSize: Int? = nil) {
+    ///   - maxWhitespaceCount: Most whitespace characters allowed between two JSON tokens (default:
+    ///     ``ConstrainedGenerationSession/defaultMaxWhitespaceCount``), or `nil` for no limit.
+    public init(
+        jsonSchema: String, vocabSize: Int? = nil,
+        maxWhitespaceCount: Int? = ConstrainedGenerationSession.defaultMaxWhitespaceCount
+    ) {
         self.jsonSchema = jsonSchema
         self.vocabSizeOverride = vocabSize
+        self.maxWhitespaceCount = maxWhitespaceCount
     }
 
     // MARK: - DecodingStrategy conformance
@@ -53,7 +62,8 @@ public struct ConstrainedDecodingStrategy: DecodingStrategy {
             jsonSchema: jsonSchema,
             vocabSizeOverride: vocabSizeOverride,
             tokenizer: tokenizer,
-            stopSequences: stopSequences
+            stopSequences: stopSequences,
+            maxWhitespaceCount: maxWhitespaceCount
         )
         let inputTokens =
             try PromptUtils
@@ -83,7 +93,8 @@ public struct ConstrainedDecodingStrategy: DecodingStrategy {
         jsonSchema: String,
         vocabSizeOverride: Int?,
         tokenizer: any Tokenizer,
-        stopSequences: StopSequences
+        stopSequences: StopSequences,
+        maxWhitespaceCount: Int?
     ) throws -> ConstrainedGenerationSession {
         guard let vocabSize = vocabSizeOverride ?? Self.deriveVocabSize(from: tokenizer) else {
             throw InferenceRuntimeError.invalidArgument(
@@ -104,7 +115,8 @@ public struct ConstrainedDecodingStrategy: DecodingStrategy {
             jsonSchema: jsonSchema,
             tokenizer: tokenizer,
             vocabSize: vocabSize,
-            stopTokenIds: stopTokenIds
+            stopTokenIds: stopTokenIds,
+            maxWhitespaceCount: maxWhitespaceCount
         )
         CLILogger.log(
             "Constrained session created (vocabSize=\(vocabSize), stopTokenIds=\(stopTokenIds ?? []))",

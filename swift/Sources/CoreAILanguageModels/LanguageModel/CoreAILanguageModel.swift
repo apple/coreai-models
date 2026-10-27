@@ -51,8 +51,12 @@ public struct CoreAILanguageModel: LanguageModel {
     fileprivate let supportsReasoning: Bool
     fileprivate let resources: ModelResources
     /// All EOS-like token IDs beyond the tokenizer's main `eosTokenId` — e.g.
-    /// Gemma's `<end_of_turn>`, read from tokenizer_config.json at init.
-    fileprivate let additionalEosTokenIds: [Int32]
+    /// Gemma's `<end_of_turn>`, read from tokenizer_config.json at init, plus a
+    /// base-vocab `<|im_end|>` and this model's agentic `<|eot|>` when present.
+    fileprivate let additionalEosTokenIds: Set<Int32>
+    /// Most whitespace characters allowed between two JSON tokens in schema-guided generation from
+    /// this model; nil when unlimited.
+    fileprivate let maxWhitespaceCount: Int?
 
     // MARK: - Protocol Requirements
 
@@ -100,6 +104,11 @@ public struct CoreAILanguageModel: LanguageModel {
     ///   to use the model metadata or engine default.
     /// - Parameter prefillChunkThreshold: Minimum prompt tokens to trigger
     ///   chunking, or `nil` to use the model metadata or engine default.
+    /// - Parameter maxWhitespaceCount: Most whitespace characters the grammar allows between
+    ///   two JSON tokens during schema-guided generation. Defaults to
+    ///   ``ConstrainedGenerationSession/defaultMaxWhitespaceCount``; `nil` for no limit. The limit
+    ///   ends a model that keeps choosing whitespace after the last value, and does not change
+    ///   output that stays within it.
     /// - Throws: If the asset bundle is invalid or the tokenizer fails to load.
     ///   With `.eager`, also throws on engine-creation failure.
     public init(
@@ -108,7 +117,8 @@ public struct CoreAILanguageModel: LanguageModel {
         variant: String? = nil,
         kvCacheStrategy: KVCacheStrategy = .auto,
         prefillChunkSize: Int? = nil,
-        prefillChunkThreshold: Int? = nil
+        prefillChunkThreshold: Int? = nil,
+        maxWhitespaceCount: Int? = ConstrainedGenerationSession.defaultMaxWhitespaceCount
     ) async throws {
         let bundle = try LanguageModelBundle(at: url)
         let configuration = CoreAIExecutor.Configuration(
@@ -134,14 +144,15 @@ public struct CoreAILanguageModel: LanguageModel {
         try await engineLoad
         self.init(
             configuration: configuration, bundle: bundle, tokenizer: tokenizer,
-            resources: resources)
+            resources: resources, maxWhitespaceCount: maxWhitespaceCount)
     }
 
     private init(
         configuration: CoreAIExecutor.Configuration,
         bundle: LanguageModelBundle,
         tokenizer: any Tokenizer,
-        resources: ModelResources
+        resources: ModelResources,
+        maxWhitespaceCount: Int?
     ) {
         let toolCallDetection = detectToolCallFormat(using: tokenizer)
         let thinkingFormat = detectThinkingFormat(using: tokenizer)
@@ -163,23 +174,20 @@ public struct CoreAILanguageModel: LanguageModel {
             }
         }()
         self.resources = resources
-        // Read additional stop token IDs from tokenizer_config.json (e.g. Gemma's
-        // <end_of_turn>). Empty when the bundle has no tokenizer directory.
-        var extraEos: [Int32] = []
-        if let tokenizerDir = bundle.tokenizerPath {
-            extraEos = LanguageConfig.additionalStopTokenIds(
-                from: tokenizerDir, tokenizer: tokenizer)
+        // Config-derived turn-end IDs. The base-vocab <|im_end|> baseline is
+        // folded in at runtime by runtimeStopTokens.
+        var additional: Set<Int32> =
+            bundle.tokenizerPath.map {
+                LanguageConfig.additionalStopTokenIds(from: $0, tokenizer: tokenizer)
+            } ?? []
+        // Agentic models stop on <|eot|> so the runner doesn't loop self->user
+        // turns. This is text-adapter-specific, so it is folded in here rather
+        // than in the shared resolver.
+        if let id = agenticEndOfTurnTokenId(thinkingFormat: thinkingFormat, tokenizer: tokenizer) {
+            additional.insert(id)
         }
-        // Agentic models: stop on <|eot|> (end of user-facing turn) so the
-        // runner doesn't loop through repeated self→user cycles.
-        if case .agentic(_, _, _, let eot) = thinkingFormat,
-            let eotId = tokenizer.vocabContains(eot) ? tokenizer.convertTokenToId(eot) : nil
-        {
-            if !extraEos.contains(Int32(eotId)) {
-                extraEos.append(Int32(eotId))
-            }
-        }
-        self.additionalEosTokenIds = extraEos
+        self.additionalEosTokenIds = additional
+        self.maxWhitespaceCount = maxWhitespaceCount
     }
 
     // MARK: - Resource control
@@ -334,11 +342,7 @@ public struct CoreAILanguageModel: LanguageModel {
                 inferenceOptions: InferenceOptions(maxTokens: maxTokens)
             )
 
-            // All EOS-like tokens: the tokenizer's main EOS plus any additional
-            // stop tokens from tokenizer_config.json (e.g. Gemma's <end_of_turn>).
-            var eosTokens = Set<Int32>()
-            if let id = tokenizer.eosTokenId { eosTokens.insert(Int32(id)) }
-            eosTokens.formUnion(model.additionalEosTokenIds)
+            let eosTokens = tokenizer.runtimeStopTokens(additional: model.additionalEosTokenIds)
             // Incremental-decode buffer. After a clean emit, one token is
             // retained as context for the next step (see below). During a
             // multi-byte sequence that hasn't decoded cleanly yet, multiple
@@ -534,10 +538,12 @@ public struct CoreAILanguageModel: LanguageModel {
             let strategy: any DecodingStrategy
             if engine is any ConstrainedGenerationCapable {
                 strategy = PipelinedConstrainedDecodingStrategy(
-                    jsonSchema: jsonSchema, vocabSize: model.bundle.vocabSize)
+                    jsonSchema: jsonSchema, vocabSize: model.bundle.vocabSize,
+                    maxWhitespaceCount: model.maxWhitespaceCount)
             } else {
                 strategy = ConstrainedDecodingStrategy(
-                    jsonSchema: jsonSchema, vocabSize: model.bundle.vocabSize)
+                    jsonSchema: jsonSchema, vocabSize: model.bundle.vocabSize,
+                    maxWhitespaceCount: model.maxWhitespaceCount)
             }
             let stopSequences = StopSequences(
                 for: model.tokenizer,

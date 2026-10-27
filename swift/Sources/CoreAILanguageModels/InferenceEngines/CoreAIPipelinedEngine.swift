@@ -203,6 +203,17 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
                         resolvedNewTokens = input[...]
                         commonPrefix = 0
                     }
+                } else if !StateHandlerFactory.ringRewindIsSafe(
+                    from: self.engine.processedTokenCount, to: commonPrefix,
+                    ringCapacity: self.engine.slidingRingCapacity)
+                {
+                    // The ring has overwritten slots the rewound position reads: replay.
+                    await self.engine.computeStream.currentWorkCompleted()
+                    self.engine.reset()
+                    self.history.clear()
+                    resolvedNewTokens = input[...]
+                    commonPrefix = 0
+                    self.lastPrefixHitCount = 0
                 } else if commonPrefix < self.engine.processedTokenCount {
                     // Pure extension — partial rewind (buffer phase preserved)
                     await self.engine.computeStream.currentWorkCompleted()
@@ -382,6 +393,15 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
             await engine.computeStream.currentWorkCompleted()
             guard tryAcquireEngine() else { return }
             defer { releaseEngine() }
+            guard
+                StateHandlerFactory.ringRewindIsSafe(
+                    from: engine.processedTokenCount, to: tokenIndex,
+                    ringCapacity: engine.slidingRingCapacity)
+            else {
+                throw InferenceRuntimeError.invalidState(
+                    "Partial reset past a wrapped sliding-window ring is not supported. "
+                        + "Use reset(to: 0) and replay the prefix.")
+            }
             engine.processedTokenCount = tokenIndex
             engine.step = tokenIndex
             history.truncate(to: tokenIndex)
@@ -434,10 +454,11 @@ extension CoreAIPipelinedEngine {
         jsonSchema: String,
         tokenizer: any Tokenizer,
         vocabSize: Int,
-        stopTokenIds: [Int32]?
+        stopTokenIds: [Int32]?,
+        maxWhitespaceCount: Int?
     ) throws -> ConstrainedSessionHandle {
         if let cached: ConstrainedSessionHandle = _constrainedSessionCache.withLock({ cache in
-            guard let box = cache, box.schema == jsonSchema else {
+            guard let box = cache, box.matches(schema: jsonSchema, maxWhitespaceCount: maxWhitespaceCount) else {
                 cache = nil
                 return nil
             }
@@ -451,7 +472,8 @@ extension CoreAIPipelinedEngine {
             jsonSchema: jsonSchema,
             tokenizer: tokenizer,
             vocabSize: vocabSize,
-            stopTokenIds: stopTokenIds
+            stopTokenIds: stopTokenIds,
+            maxWhitespaceCount: maxWhitespaceCount
         )
         return ConstrainedSessionHandle(session: session, tokenizer: tokenizer)
     }
@@ -598,6 +620,10 @@ private struct EngineImpl: ~Copyable {
     var additionalStates: FixedMTLBufferState?
     var hasNonTruncatableStates: Bool
 
+    // Slots in the sliding ring, if any. Guards write-first `main` steps, and prefill chunks
+    // break at ring boundaries.
+    let slidingRingCapacity: Int?
+
     // Logits — reuses GrowingLogitsBuffer from TensorStorage+CoreAI.swift
     var logits: GrowingLogitsBuffer
 
@@ -650,7 +676,8 @@ private struct EngineImpl: ~Copyable {
 
         // Classify states using the shared factory logic
         let classified = StateHandlerFactory.classifyStates(
-            descriptor: descriptor, stateKinds: nil, verbose: descriptor.stateNames.count > 2)
+            descriptor: descriptor, stateKinds: config.states, verbose: descriptor.stateNames.count > 2)
+        try StateHandlerFactory.validateKinds(classified, descriptor: descriptor)
 
         // Find the growing KV pair (first two states with .kvCache kind)
         let growingNames = classified.filter { $0.kind == .kvCache }.map(\.name)
@@ -853,6 +880,8 @@ private struct EngineImpl: ~Copyable {
         self.kvCache = kvCacheLocal
         self.additionalStates = additionalStatesLocal
         self.hasNonTruncatableStates = classified.contains(where: { $0.kind == .fixed })
+        self.slidingRingCapacity = StateHandlerFactory.slidingRingCapacity(
+            classified: classified, descriptor: descriptor)
         self.logits = logitsRef
         self.cachedSampler = nil
         self.cachedSamplerTemperature = nil
@@ -928,6 +957,10 @@ private struct EngineImpl: ~Copyable {
 
         let actualTokenCount = tokens.isEmpty ? 1 : tokens.count
         let queryLength = actualTokenCount
+
+        try StateHandlerFactory.checkWriteFirstStep(
+            offset: processedTokenCount, queryLength: queryLength,
+            ringCapacity: slidingRingCapacity)
 
         defer {
             processedTokenCount += actualTokenCount
@@ -1299,7 +1332,11 @@ private struct EngineImpl: ~Copyable {
 
         // Prefill prompt (unconstrained -- grammar doesn't constrain the prompt)
         let prefillTokens: [Int32]
-        if case .chunk(let threshold, _) = inputLayout.prefillPolicy,
+        if slidingRingCapacity != nil {
+            // Ring models take the plain prefill path, which never runs a multi-token
+            // write-first step past the ring.
+            prefillTokens = Array(try await prefill(prompt: prompt))
+        } else if case .chunk(let threshold, _) = inputLayout.prefillPolicy,
             prompt.count > threshold
         {
             let remaining = try await processChunkedInput(tokens: prompt)
@@ -1374,10 +1411,20 @@ private struct EngineImpl: ~Copyable {
                 if case .terminated = postJumpMask { break }
                 let applyMaskAfterJump = postJumpMask == .constrained
 
+                // Only the last token's logits are sampled, so a step that would evict ring
+                // history can prefill the rest first.
+                var jumpStep = [lastToken] + jumpTokens
+                if let ring = slidingRingCapacity,
+                    StateHandlerFactory.writeFirstStepEvicts(
+                        offset: processedTokenCount, queryLength: jumpStep.count, ringCapacity: ring)
+                {
+                    jumpStep = Array(try await prefill(prompt: jumpStep))
+                }
+
                 lastToken = try await withCheckedThrowingContinuation { cont in
                     do {
                         try _encodeStepForConstrainedGeneration(
-                            tokens: [lastToken] + jumpTokens,
+                            tokens: jumpStep,
                             gpuSampler: gpuSampler,
                             applyBitmask: applyMaskAfterJump
                         ) { token, error in
@@ -1502,6 +1549,10 @@ private struct EngineImpl: ~Copyable {
         let actualTokenCount = tokens.isEmpty ? 1 : tokens.count
         let queryLength = actualTokenCount
 
+        try StateHandlerFactory.checkWriteFirstStep(
+            offset: processedTokenCount, queryLength: queryLength,
+            ringCapacity: slidingRingCapacity)
+
         defer {
             processedTokenCount += actualTokenCount
             step += 1
@@ -1562,6 +1613,9 @@ private struct EngineImpl: ~Copyable {
         var asyncStates = InferenceFunction.AsyncMutableViews()
         asyncStates.insert(&keyState, for: keyCacheName)
         asyncStates.insert(&valState, for: valueCacheName)
+        // Non-growing states (e.g. sliding-ring caches) are bound here too, like
+        // the plain-decode and prefill paths; nil for standard two-state bundles.
+        additionalStates?.bind(into: &asyncStates)
 
         // Safe: constrained loop awaits each token before encoding the next step, so logits are consumed before overwrite.
         let logitsBuffer = logits.metalBuffer
@@ -1632,12 +1686,27 @@ private struct EngineImpl: ~Copyable {
             var head = prompt.dropLast()
             for chunk in prefillChunkSizes(
                 tokenCount: prompt.count, chunkSize: prefillMaxQueryLength,
-                heldBack: prefillHeldBackTokens(hasPrefillGraph: true))
+                heldBack: prefillHeldBackTokens(hasPrefillGraph: true),
+                startOffset: processedTokenCount, ringCapacity: slidingRingCapacity)
             {
                 try await _encodeChunk(tokens: Array(head.prefix(chunk)))
                 head = head.dropFirst(chunk)
             }
             return prompt.suffix(1)
+        }
+
+        if let ring = slidingRingCapacity {
+            // `function` writes the ring before attending: no multi-token step past the ring.
+            let plan = mainGraphStepSizes(
+                tokenCount: prompt.count, chunkSize: prefillChunkSize,
+                startOffset: processedTokenCount, ringCapacity: ring)
+            try logits.ensureCapacity(forContextLength: plan.max() ?? 1)
+            var remaining = prompt[...]
+            for size in plan.dropLast() {
+                try await _encodeChunk(tokens: Array(remaining.prefix(size)))
+                remaining = remaining.dropFirst(size)
+            }
+            return remaining
         }
 
         if case .chunk(let threshold, _) = inputLayout.prefillPolicy,
@@ -1656,21 +1725,25 @@ private struct EngineImpl: ~Copyable {
         return prompt[...]
     }
 
+    /// Chunk size for prefill through `function`.
+    private var prefillChunkSize: Int {
+        if case .chunk(_, let cs) = inputLayout.prefillPolicy { return cs }
+        return config.prefillChunkSize
+    }
+
     mutating func processChunkedInput(tokens: [Int32]) async throws -> ArraySlice<Int32> {
-        let chunkSize: Int
-        if case .chunk(_, let cs) = inputLayout.prefillPolicy {
-            chunkSize = cs
-        } else {
-            chunkSize = config.prefillChunkSize
-        }
+        let chunkSize = prefillChunkSize
         var remainingTokens = tokens[...]
 
         try logits.ensureCapacity(forContextLength: chunkSize)
 
-        while remainingTokens.count > chunkSize {
-            let chunk = Array(remainingTokens.prefix(chunkSize))
-            try await _encodeChunk(tokens: chunk)
-            remainingTokens = remainingTokens.dropFirst(chunkSize)
+        // Every chunk but the last is encoded here; the last carries the logits.
+        let plan = prefillChunkSizes(
+            tokenCount: tokens.count, chunkSize: chunkSize, heldBack: 0,
+            startOffset: processedTokenCount, ringCapacity: slidingRingCapacity)
+        for size in plan.dropLast() {
+            try await _encodeChunk(tokens: Array(remainingTokens.prefix(size)))
+            remainingTokens = remainingTokens.dropFirst(size)
         }
 
         return remainingTokens
@@ -1740,6 +1813,9 @@ private struct EngineImpl: ~Copyable {
                 additionalStates: additionalStates,
                 computeStream: computeStream)
         } else {
+            try StateHandlerFactory.checkWriteFirstStep(
+                offset: processedTokenCount, queryLength: queryLength,
+                ringCapacity: slidingRingCapacity)
             let logitsShape = [1, queryLength, vocabSize]
             try encodeWithStates(
                 function: function, inputs: asyncInputs,
@@ -1791,6 +1867,10 @@ private struct EngineImpl: ~Copyable {
             // single-token pass.
             shapesToWarm = shapesToWarm.map { $0 > 1 ? min($0, prefillMaxQueryLength) : $0 }
             if !shapesToWarm.contains(1) { shapesToWarm.append(1) }
+        }
+        if let ring = slidingRingCapacity {
+            // A single ring write must not wrap.
+            shapesToWarm = shapesToWarm.map { min($0, ring) }
         }
 
         CLILogger.log("Running warmup for \(shapesToWarm.count) shape(s)")

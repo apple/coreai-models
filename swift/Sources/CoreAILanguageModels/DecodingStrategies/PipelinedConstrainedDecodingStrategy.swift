@@ -30,10 +30,20 @@ private final class SingleUseFlag: Sendable {
 public struct PipelinedConstrainedDecodingStrategy: DecodingStrategy {
     private let jsonSchema: String
     private let vocabSizeOverride: Int?
+    private let maxWhitespaceCount: Int?
 
-    public init(jsonSchema: String, vocabSize: Int? = nil) {
+    /// - Parameters:
+    ///   - jsonSchema: A valid JSON schema string that constrains output structure.
+    ///   - vocabSize: Optional vocabulary size override. If nil, derived from tokenizer.
+    ///   - maxWhitespaceCount: Most whitespace characters allowed between two JSON tokens (default:
+    ///     ``ConstrainedGenerationSession/defaultMaxWhitespaceCount``), or `nil` for no limit.
+    public init(
+        jsonSchema: String, vocabSize: Int? = nil,
+        maxWhitespaceCount: Int? = ConstrainedGenerationSession.defaultMaxWhitespaceCount
+    ) {
         self.jsonSchema = jsonSchema
         self.vocabSizeOverride = vocabSize
+        self.maxWhitespaceCount = maxWhitespaceCount
     }
 
     // MARK: - DecodingStrategy conformance
@@ -66,7 +76,8 @@ public struct PipelinedConstrainedDecodingStrategy: DecodingStrategy {
             jsonSchema: jsonSchema,
             tokenizer: tokenizer,
             vocabSize: vocabSize,
-            stopTokenIds: stopTokenIds
+            stopTokenIds: stopTokenIds,
+            maxWhitespaceCount: maxWhitespaceCount
         )
 
         let inputTokens = try PromptUtils.maybeApplyTokenizerChatTemplate(input, tokenizer: tokenizer)

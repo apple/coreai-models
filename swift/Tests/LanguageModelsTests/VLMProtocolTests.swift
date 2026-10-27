@@ -110,4 +110,42 @@ struct MultimodalTypeTests {
         #expect(config.imageSize == 896)
         #expect(config.imageTokenCount == 256)
     }
+
+    @Test("VisionConfig decodes a Gemma4-style size ladder")
+    func visionConfigWithImageSizes() throws {
+        let json = """
+            {
+                "image_size": 1152,
+                "patch_size": 16,
+                "pooling_kernel_size": 3,
+                "image_token_count": 576,
+                "image_token_id": 258880,
+                "boi_token_id": 255999,
+                "eoi_token_id": 258882,
+                "pad_token_id": 0,
+                "image_sizes": [384, 768, 1152],
+                "token_merge": "decoder_gather"
+            }
+            """
+        let config = try JSONDecoder().decode(VisionConfig.self, from: json.data(using: .utf8)!)
+        #expect(config.poolingKernelSize == 3)
+        #expect(config.padTokenId == 0)
+        #expect(config.imageSizes == [384, 768, 1152])
+        #expect(config.tokenMerge == .decoderGather)
+        #expect(config.blockPixels == 48)
+        #expect(config.pooledGrid(imageSize: 1152) == 24)
+        #expect(config.softTokenCount(imageSize: 384) == 64)
+        #expect(VisionConfig.encoderFunctionName(imageSize: 768) == "encode_image_768")
+    }
+
+    @Test("VisionConfig backwards compatible without a size list (Qwen-style)")
+    func visionConfigWithoutImageSizes() throws {
+        let json = """
+            {"image_size": 896, "patch_size": 14, "image_token_count": 256, "image_token_id": 255999}
+            """
+        let config = try JSONDecoder().decode(VisionConfig.self, from: json.data(using: .utf8)!)
+        #expect(config.imageSizes == nil)
+        #expect(config.tokenMerge == .separateEmbedding)
+        #expect(config.poolingKernelSize == nil)
+    }
 }

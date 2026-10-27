@@ -603,20 +603,6 @@ struct ImageSegmenterCLI: AsyncParsableCommand {
         return Float(10.0 * log10((peak * peak) / mse))
     }
 
-    private func cosineSimilarity(_ a: [Float], _ b: [Float]) -> Float {
-        guard a.count == b.count, !a.isEmpty else { return 0 }
-        var dot: Double = 0
-        var normA: Double = 0
-        var normB: Double = 0
-        for i in 0..<a.count {
-            dot += Double(a[i]) * Double(b[i])
-            normA += Double(a[i]) * Double(a[i])
-            normB += Double(b[i]) * Double(b[i])
-        }
-        let denom = (normA * normB).squareRoot()
-        return denom > 0 ? Float(dot / denom) : 0
-    }
-
     /// Return the leading slice of `ids` up to and including the first EOT
     /// (token id 49407) after position 0. Trailing pad tokens are excluded.
     /// If no EOT is found, returns the full sequence.

@@ -79,6 +79,29 @@ struct PrefixResetPlanTests {
             #expect(plan.prefixHitCount == c.expectedHitCount, "\(c.name): prefixHitCount")
         }
     }
+
+    @Test("a rewind into overwritten sliding-ring slots replays from scratch")
+    func ringRewind() {
+        // Regenerate after a reply: 2,600 processed, the 2,100-token prompt resent, ring of 2,048.
+        let wrapped = CoreAISequentialEngine.prefixResetPlan(
+            commonPrefix: 2100, historyCount: 2600, processedTokenCount: 2600, inputCount: 2100,
+            hasNonTruncatableStates: false, ringCapacity: 2048)
+        #expect(wrapped.resetTo == 0)
+        #expect(wrapped.prefixHitCount == 0)
+
+        // Before the ring wraps, the same rewind is safe.
+        let unwrapped = CoreAISequentialEngine.prefixResetPlan(
+            commonPrefix: 1500, historyCount: 2000, processedTokenCount: 2000, inputCount: 1500,
+            hasNonTruncatableStates: false, ringCapacity: 2048)
+        #expect(unwrapped.resetTo == 1499)
+        #expect(unwrapped.prefixHitCount == 1500)
+
+        // Exact re-submission past the ring rewinds one token, which is safe.
+        let reseed = CoreAISequentialEngine.prefixResetPlan(
+            commonPrefix: 3000, historyCount: 3000, processedTokenCount: 3000, inputCount: 3000,
+            hasNonTruncatableStates: false, ringCapacity: 2048)
+        #expect(reseed.resetTo == 2999)
+    }
 }
 
 // MARK: - Idempotent Capability Routing (model-free)
@@ -142,6 +165,41 @@ struct IdempotentEngineRoutingTests {
         #expect(!reportsIdempotent(CoreAIPipelinedEngine.self))
         #expect(!reportsIdempotent(StaticShapeEngine.self))
         #expect(!reportsIdempotent(CoreAISequentialVLMEngine.self))
+    }
+}
+
+// MARK: - Per-session generation state (model-free)
+
+/// The token box and `lastPrefixHitCount` live on `GenerationSessionState`, so sessions sharing one
+/// engine cannot cancel or overwrite each other.
+@Suite("Per-session generation state")
+struct PerSessionStateTests {
+    private func makeSession() -> GenerationSessionState {
+        GenerationSessionState(
+            kvCache: MockStateHandler(names: ["k"], shape: [1, 1, 1, 1, 1]),
+            additionalStates: nil,
+            hasNonTruncatableStates: false)
+    }
+
+    @Test("each session owns an independent in-flight token box")
+    func independentTokenBoxes() {
+        let a = makeSession()
+        let b = makeSession()
+        let tokenA = GenerationToken()
+        a.tokenBox.install(tokenA)
+        #expect(a.tokenBox.isBusy)
+        #expect(!b.tokenBox.isBusy)  // installing on A must not make B busy
+        b.tokenBox.cancelActive()
+        #expect(a.tokenBox.isBusy)  // cancelling B must not clear A's token
+    }
+
+    @Test("each session tracks its own prefix hit count")
+    func independentPrefixHitCount() {
+        let a = makeSession()
+        let b = makeSession()
+        a.lastPrefixHitCount = 7
+        #expect(a.lastPrefixHitCount == 7)
+        #expect(b.lastPrefixHitCount == 0)
     }
 }
 

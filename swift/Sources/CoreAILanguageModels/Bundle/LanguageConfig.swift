@@ -93,6 +93,9 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
     public let vocabSize: Int
     public let maxContextLength: Int
 
+    /// Largest batch the graph accepts. 1 for single-sequence graphs and for bundles without `max_batch_size`.
+    package let maxBatchSize: Int
+
     /// `true` if the bundle ships its own tokenizer directory; `false` to
     /// load via HuggingFace at runtime. Defaults to `true` when omitted.
     public let embeddedTokenizer: Bool
@@ -140,6 +143,7 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
         self.prefillChunkSize = prefillChunkSize
         self.prefillChunkThreshold = prefillChunkThreshold
         self.overrides = overrides
+        self.maxBatchSize = 1
     }
 
     enum CodingKeys: String, CodingKey {
@@ -153,6 +157,7 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
         case prefillChunkSize = "prefill_chunk_size"
         case prefillChunkThreshold = "prefill_chunk_threshold"
         case overrides
+        case maxBatchSize = "max_batch_size"
     }
 
     public init(from decoder: Swift.Decoder) throws {
@@ -160,6 +165,15 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
         self.tokenizer = try c.decode(String.self, forKey: .tokenizer)
         self.vocabSize = try c.decode(Int.self, forKey: .vocabSize)
         self.maxContextLength = try c.decode(Int.self, forKey: .maxContextLength)
+        guard vocabSize > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .vocabSize, in: c, debugDescription: "vocab_size must be positive, got \(vocabSize)")
+        }
+        guard maxContextLength > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .maxContextLength, in: c,
+                debugDescription: "max_context_length must be positive, got \(maxContextLength)")
+        }
         self.embeddedTokenizer = try c.decodeIfPresent(Bool.self, forKey: .embeddedTokenizer) ?? true
         self.functionMap = try c.decodeIfPresent(FunctionMap.self, forKey: .functionMap)
         self.vision = try c.decodeIfPresent(VisionConfig.self, forKey: .vision)
@@ -167,135 +181,136 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
         self.prefillChunkSize = try c.decodeIfPresent(Int.self, forKey: .prefillChunkSize)
         self.prefillChunkThreshold = try c.decodeIfPresent(Int.self, forKey: .prefillChunkThreshold)
         self.overrides = try c.decodeIfPresent(LanguageOverrides.self, forKey: .overrides)
+        self.maxBatchSize = try c.decodeIfPresent(Int.self, forKey: .maxBatchSize) ?? 1
     }
 
     // MARK: - Additional Stop Tokens
 
-    /// Extract additional stop token IDs from the tokenizer config.
+    /// Resolve the EOS-like token IDs (beyond the tokenizer's main EOS) that
+    /// should terminate generation, as a `Set` for order-independent membership.
+    ///
     /// Reads `additional_special_tokens` from tokenizer_config.json and
     /// cross-references with the tokenizer to get their IDs.
     ///
     /// Also checks for array-valued `eos_token` (some models list multiple).
     ///
-    /// Finally scans `tokenizer.json`'s `added_tokens` for turn-ending
-    /// specials. Fast tokenizers saved via `save_pretrained` (e.g. Gemma)
-    /// keep their added specials there and omit `added_tokens_decoder` from
+    /// Scans `tokenizer.json`'s `added_tokens` for turn-ending specials. Fast
+    /// tokenizers saved via `save_pretrained` (e.g. Gemma) keep their added
+    /// specials there and omit `added_tokens_decoder` from
     /// tokenizer_config.json, so this is where the exported bundle's
     /// `<end_of_turn>` (ID 106) is found.
     ///
-    /// Best-effort: returns empty if the file doesn't exist or can't be parsed.
+    /// Best-effort on the config: if tokenizer_config.json is missing or can't be
+    /// parsed the config-derived IDs are skipped.
     ///
-    /// TODO: Upstream this to swift-transformers as `Tokenizer.additionalEosTokenIds`
-    /// so we don't need to parse tokenizer_config.json ourselves.
+    /// TODO: Upstream the config parsing to swift-transformers as
+    /// `Tokenizer.additionalEosTokenIds` so we don't parse tokenizer_config.json
+    /// ourselves.
     public static func additionalStopTokenIds(
         from tokenizerDir: URL,
         tokenizer: any Tokenizer
-    ) -> [Int32] {
-        let configURL = tokenizerDir.appending(path: "tokenizer_config.json")
-        guard let data = try? Data(contentsOf: configURL),
-            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else {
-            return []
-        }
-
+    ) -> Set<Int32> {
         let mainEos = tokenizer.eosTokenId.map { Int32($0) }
         var result = Set<Int32>()
 
-        // 1. Check additional_special_tokens array
-        if let specials = json["additional_special_tokens"] as? [Any] {
-            for item in specials {
-                // Each item can be a string or a dict with a "content" key
-                let tokenString: String?
-                if let s = item as? String {
-                    tokenString = s
-                } else if let dict = item as? [String: Any],
-                    let content = dict["content"] as? String
-                {
-                    tokenString = content
-                } else {
-                    tokenString = nil
-                }
-                guard let token = tokenString else { continue }
-
-                if let id = tokenizer.vocabContains(token) ? tokenizer.convertTokenToId(token) : nil {
-                    let id32 = Int32(id)
-                    if id32 != mainEos {
-                        result.insert(id32)
-                    }
-                }
-            }
-        }
-
-        // 2. Check if eos_token is an array (some models list multiple)
-        if let eosArray = json["eos_token"] as? [String] {
-            for token in eosArray {
-                if let id = tokenizer.vocabContains(token) ? tokenizer.convertTokenToId(token) : nil {
-                    let id32 = Int32(id)
-                    if id32 != mainEos {
-                        result.insert(id32)
-                    }
-                }
-            }
-        }
-
-        // 3. Check added_tokens_decoder for turn-ending special tokens, matched
-        //    against the shared pattern list below (covers Gemma's <end_of_turn>,
-        //    Qwen's <|im_end|>, Phi's <|end|>, etc., when present here — not every
-        //    model exposes added_tokens_decoder; see step 5 for the fallback).
         let turnEndPatterns = ["end_of_turn", "im_end", "eot_id", "endoftext", "eot_token", "|eot|", "|end|"]
-        if let addedTokens = json["added_tokens_decoder"] as? [String: Any] {
-            for (idString, value) in addedTokens {
-                guard let dict = value as? [String: Any],
-                    let isSpecial = dict["special"] as? Bool, isSpecial,
-                    let content = dict["content"] as? String,
-                    let id = Int32(idString)
-                else { continue }
-                let lower = content.lowercased()
-                if id != mainEos && turnEndPatterns.contains(where: { lower.contains($0) }) {
-                    result.insert(id)
+
+        let configURL = tokenizerDir.appending(path: "tokenizer_config.json")
+        if let data = try? Data(contentsOf: configURL),
+            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        {
+            // 1. Check additional_special_tokens array
+            if let specials = json["additional_special_tokens"] as? [Any] {
+                for item in specials {
+                    // Each item can be a string or a dict with a "content" key
+                    let tokenString: String?
+                    if let s = item as? String {
+                        tokenString = s
+                    } else if let dict = item as? [String: Any],
+                        let content = dict["content"] as? String
+                    {
+                        tokenString = content
+                    } else {
+                        tokenString = nil
+                    }
+                    guard let token = tokenString else { continue }
+
+                    if let id = tokenizer.vocabContains(token) ? tokenizer.convertTokenToId(token) : nil {
+                        let id32 = Int32(id)
+                        if id32 != mainEos {
+                            result.insert(id32)
+                        }
+                    }
                 }
             }
-        }
 
-        // 4. Check for turn-ending tokens in in top level of config
-        for turnEndPattern in turnEndPatterns {
-            if let eotToken = json[turnEndPattern] as? String {
-                if let id = tokenizer.vocabContains(eotToken) ? tokenizer.convertTokenToId(eotToken) : nil {
+            // 2. Check if eos_token is an array (some models list multiple)
+            if let eosArray = json["eos_token"] as? [String] {
+                for token in eosArray {
+                    if let id = tokenizer.vocabContains(token) ? tokenizer.convertTokenToId(token) : nil {
+                        let id32 = Int32(id)
+                        if id32 != mainEos {
+                            result.insert(id32)
+                        }
+                    }
+                }
+            }
+
+            // 3. Check added_tokens_decoder for turn-ending special tokens, matched
+            //    against the shared pattern list above (covers Gemma's <end_of_turn>,
+            //    Qwen's <|im_end|>, Phi's <|end|>, etc., when present here — not every
+            //    model exposes added_tokens_decoder; see step 5 for the fallback).
+            if let addedTokens = json["added_tokens_decoder"] as? [String: Any] {
+                for (idString, value) in addedTokens {
+                    guard let dict = value as? [String: Any],
+                        let isSpecial = dict["special"] as? Bool, isSpecial,
+                        let content = dict["content"] as? String,
+                        let id = Int32(idString)
+                    else { continue }
+                    let lower = content.lowercased()
+                    if id != mainEos && turnEndPatterns.contains(where: { lower.contains($0) }) {
+                        result.insert(id)
+                    }
+                }
+            }
+
+            // 4. Check for turn-ending tokens in in top level of config
+            for turnEndPattern in turnEndPatterns {
+                if let eotToken = json[turnEndPattern] as? String {
+                    if let id = tokenizer.vocabContains(eotToken) ? tokenizer.convertTokenToId(eotToken) : nil {
+                        let id32 = Int32(id)
+                        if id32 != mainEos {
+                            result.insert(id32)
+                        }
+                    }
+                }
+            }
+
+            // 5. Check tokenizer.json's added_tokens for turn-ending specials.
+            //    Fast tokenizers saved via save_pretrained store their added
+            //    specials here and drop added_tokens_decoder from
+            //    tokenizer_config.json, so this recovers Gemma's <end_of_turn>
+            //    (ID 106) and Phi's <|end|> (ID 200020) in exported bundles.
+            let tokenizerURL = tokenizerDir.appending(path: "tokenizer.json")
+            if let tokenizerData = try? Data(contentsOf: tokenizerURL),
+                let tokenizerJSON = try? JSONSerialization.jsonObject(with: tokenizerData) as? [String: Any],
+                let addedTokens = tokenizerJSON["added_tokens"] as? [[String: Any]]
+            {
+                for entry in addedTokens {
+                    guard let isSpecial = entry["special"] as? Bool, isSpecial,
+                        let content = entry["content"] as? String,
+                        let id = entry["id"] as? Int
+                    else { continue }
                     let id32 = Int32(id)
-                    if id32 != mainEos {
+                    let lower = content.lowercased()
+                    if id32 != mainEos && turnEndPatterns.contains(where: { lower.contains($0) }) {
                         result.insert(id32)
                     }
                 }
             }
         }
 
-        // 5. Check tokenizer.json's added_tokens for turn-ending specials.
-        //    Fast tokenizers saved via save_pretrained store their added
-        //    specials here and drop added_tokens_decoder from
-        //    tokenizer_config.json, so this recovers Gemma's <end_of_turn>
-        //    (ID 106) and Phi's <|end|> (ID 200020) in exported bundles.
-        //    Only reached if tokenizer_config.json exists and parses (see the
-        //    guard at the top of this function); save_pretrained always emits
-        //    it alongside tokenizer.json in practice.
-        let tokenizerURL = tokenizerDir.appending(path: "tokenizer.json")
-        if let tokenizerData = try? Data(contentsOf: tokenizerURL),
-            let tokenizerJSON = try? JSONSerialization.jsonObject(with: tokenizerData) as? [String: Any],
-            let addedTokens = tokenizerJSON["added_tokens"] as? [[String: Any]]
-        {
-            for entry in addedTokens {
-                guard let isSpecial = entry["special"] as? Bool, isSpecial,
-                    let content = entry["content"] as? String,
-                    let id = entry["id"] as? Int
-                else { continue }
-                let id32 = Int32(id)
-                let lower = content.lowercased()
-                if id32 != mainEos && turnEndPatterns.contains(where: { lower.contains($0) }) {
-                    result.insert(id32)
-                }
-            }
-        }
-
-        return Array(result)
+        return result
     }
 }
 
@@ -338,6 +353,32 @@ public struct VisionConfig: Codable, Sendable, Equatable {
     /// Visual tokens produced per frame. Nil defaults to `imageTokenCount`.
     public let tokensPerFrame: Int?
 
+    /// Begin-of-image / end-of-image marker token IDs of the model's image region (Gemma4:
+    /// `<|image>` / `<image|>`), as the checkpoint defines them. Nil for models that don't
+    /// delimit the image region (e.g. Qwen). They are recorded for prompt builders; the
+    /// builders that use the tokenizer's chat template do not add them.
+    public let boiTokenId: Int32?
+    public let eoiTokenId: Int32?
+
+    /// Pad token ID. Used to mask image-placeholder positions before the per-layer
+    /// embedding gather (matching HF's `where(image_mask, pad_token_id, input_ids)`),
+    /// so a placeholder's own per-layer embedding isn't spuriously injected. Nil for
+    /// bundles exported before this field existed — callers fall back to `0`.
+    public let padTokenId: Int32?
+
+    /// How the encoder's soft tokens reach the decoder. Absent in bundles that predate the field,
+    /// which read as ``VisionTokenMerge/separateEmbedding``.
+    public let tokenMerge: VisionTokenMerge
+
+    /// Patch count per pooled soft token, along one axis (Gemma4's 3x3 average pool).
+    /// Nil for models with no pooling stage (e.g. Qwen).
+    public let poolingKernelSize: Int?
+
+    /// Square canvas sizes (px) of a variable-input-shape vision encoder (Gemma4), smallest
+    /// first, with one exported function per size (see ``encoderFunctionName(imageSize:)``). Nil
+    /// for a fixed single-size encoder (e.g. Qwen), which uses `imageSize`/`imageTokenCount`.
+    public let imageSizes: [Int]?
+
     /// CLIP normalization (Qwen VL, Pixtral, InternVL, Phi-3.5-vision).
     public static let clipMean = [0.48145466, 0.4578275, 0.40821073]
     public static let clipStd = [0.26862954, 0.26130258, 0.27577711]
@@ -353,7 +394,13 @@ public struct VisionConfig: Codable, Sendable, Equatable {
         imageStrategy: ImageStrategy? = nil,
         includeImageInfo: Bool? = nil,
         maxVideoFrames: Int? = nil,
-        tokensPerFrame: Int? = nil
+        tokensPerFrame: Int? = nil,
+        boiTokenId: Int32? = nil,
+        eoiTokenId: Int32? = nil,
+        padTokenId: Int32? = nil,
+        poolingKernelSize: Int? = nil,
+        imageSizes: [Int]? = nil,
+        tokenMerge: VisionTokenMerge = .separateEmbedding
     ) {
         self.imageSize = imageSize
         self.patchSize = patchSize
@@ -366,6 +413,12 @@ public struct VisionConfig: Codable, Sendable, Equatable {
         self.includeImageInfo = includeImageInfo ?? false
         self.maxVideoFrames = maxVideoFrames
         self.tokensPerFrame = tokensPerFrame
+        self.boiTokenId = boiTokenId
+        self.eoiTokenId = eoiTokenId
+        self.padTokenId = padTokenId
+        self.poolingKernelSize = poolingKernelSize
+        self.imageSizes = imageSizes
+        self.tokenMerge = tokenMerge
     }
 
     enum CodingKeys: String, CodingKey {
@@ -380,6 +433,12 @@ public struct VisionConfig: Codable, Sendable, Equatable {
         case includeImageInfo = "include_image_info"
         case maxVideoFrames = "max_video_frames"
         case tokensPerFrame = "tokens_per_frame"
+        case boiTokenId = "boi_token_id"
+        case eoiTokenId = "eoi_token_id"
+        case padTokenId = "pad_token_id"
+        case poolingKernelSize = "pooling_kernel_size"
+        case imageSizes = "image_sizes"
+        case tokenMerge = "token_merge"
     }
 
     public init(from decoder: Swift.Decoder) throws {
@@ -395,5 +454,72 @@ public struct VisionConfig: Codable, Sendable, Equatable {
         self.includeImageInfo = try c.decodeIfPresent(Bool.self, forKey: .includeImageInfo) ?? false
         self.maxVideoFrames = try c.decodeIfPresent(Int.self, forKey: .maxVideoFrames)
         self.tokensPerFrame = try c.decodeIfPresent(Int.self, forKey: .tokensPerFrame)
+        self.boiTokenId = try c.decodeIfPresent(Int32.self, forKey: .boiTokenId)
+        self.eoiTokenId = try c.decodeIfPresent(Int32.self, forKey: .eoiTokenId)
+        self.padTokenId = try c.decodeIfPresent(Int32.self, forKey: .padTokenId)
+        self.poolingKernelSize = try c.decodeIfPresent(Int.self, forKey: .poolingKernelSize)
+        self.imageSizes = try c.decodeIfPresent([Int].self, forKey: .imageSizes)
+        self.tokenMerge = try c.decodeIfPresent(VisionTokenMerge.self, forKey: .tokenMerge) ?? .separateEmbedding
+        try validate(in: c)
     }
+
+    /// Side in pixels of one pooled soft-token cell: `patchSize * poolingKernelSize`.
+    public var blockPixels: Int { patchSize * (poolingKernelSize ?? 1) }
+
+    /// Side length of the pooled output grid for a canvas of `imageSize` pixels.
+    public func pooledGrid(imageSize: Int) -> Int { imageSize / blockPixels }
+
+    /// Soft tokens a canvas of `imageSize` pixels always produces. The real (non-padding) subset
+    /// is generally fewer; see the pooled-grid math in `CoreAIStaticShapeEngine+Multimodal.swift`.
+    public func softTokenCount(imageSize: Int) -> Int {
+        let grid = pooledGrid(imageSize: imageSize)
+        return grid * grid
+    }
+
+    /// Name of the `vision.aimodel` function for a canvas size, as the exporter names it
+    /// (`export/gemma4_vision.py`: `encode_image_<size>`). The bundle also lists the names under
+    /// `language.function_map.vision`.
+    public static func encoderFunctionName(imageSize: Int) -> String { "encode_image_\(imageSize)" }
+
+    /// The geometry the vision path divides and indexes by. A size ladder must be sorted
+    /// ascending and unique (canvas selection takes the first that fits) and every size a multiple
+    /// of `patchSize * poolingKernelSize` (the letterbox pads in whole pool blocks).
+    private func validate(in c: KeyedDecodingContainer<CodingKeys>) throws {
+        func fail(_ key: CodingKeys, _ message: String) -> DecodingError {
+            DecodingError.dataCorruptedError(forKey: key, in: c, debugDescription: message)
+        }
+        guard imageSize > 0 else { throw fail(.imageSize, "image_size must be positive, got \(imageSize)") }
+        guard patchSize > 0 else { throw fail(.patchSize, "patch_size must be positive, got \(patchSize)") }
+        if let poolingKernelSize, poolingKernelSize <= 0 {
+            throw fail(.poolingKernelSize, "pooling_kernel_size must be positive, got \(poolingKernelSize)")
+        }
+        guard let imageSizes else { return }
+        guard !imageSizes.isEmpty else { throw fail(.imageSizes, "image_sizes must not be empty") }
+        var previous = 0
+        for size in imageSizes {
+            guard size > previous else {
+                throw fail(
+                    .imageSizes,
+                    "image_sizes must be positive, ascending and unique (\(size) follows \(previous))")
+            }
+            previous = size
+            guard size % blockPixels == 0 else {
+                throw fail(
+                    .imageSizes,
+                    "image_sizes entry \(size) is not a multiple of patch_size * pooling_kernel_size "
+                        + "(\(blockPixels))")
+            }
+        }
+    }
+}
+
+/// How a vision encoder's soft tokens are merged into the decoder. The exporter records the choice in
+/// `vision.token_merge`, and ``EngineFactory`` picks the engine from it.
+public enum VisionTokenMerge: String, Codable, Sendable {
+    /// Text embeddings come from a separate `embedding` asset. The soft tokens are scattered into
+    /// them before the decoder, which consumes embeddings (Qwen-style, `CoreAISequentialVLMEngine`).
+    case separateEmbedding = "separate_embedding"
+    /// The decoder graph embeds its own tokens. The soft tokens overwrite the placeholder rows
+    /// after that gather (Gemma 4, `StaticShapeEngine`).
+    case decoderGather = "decoder_gather"
 }

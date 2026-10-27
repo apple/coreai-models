@@ -8,7 +8,8 @@ import CoreAI
 /// Shared chunked-prefill loop for the sequential engines.
 ///
 /// Splits `tokens` into chunks of `chunkSize`, holding back the final `heldBack` tokens
-/// (see `prefillHeldBackTokens`) for the logits-producing pass. Each chunk is handed to
+/// (see `prefillHeldBackTokens`) for the logits-producing pass. With `ringCapacity`, chunks
+/// also break at sliding-ring boundaries counted from `startOffset`. Each chunk is handed to
 /// `processChunk`, which returns that chunk's logit buffer — or `[]` when the chunk produces
 /// no logits (e.g. a KV-only prefill-graph chunk). Returns the last-token logits.
 ///
@@ -22,9 +23,13 @@ func runChunkedPrefill(
     chunkSize: Int,
     heldBack: Int,
     vocabSize: Int,
+    startOffset: Int = 0,
+    ringCapacity: Int? = nil,
     processChunk: (_ chunk: ArraySlice<Int32>, _ isHeldBack: Bool) async throws -> [LogitsScalarType]
 ) async throws -> [LogitsScalarType] {
-    let plan = prefillChunkSizes(tokenCount: tokens.count, chunkSize: chunkSize, heldBack: heldBack)
+    let plan = prefillChunkSizes(
+        tokenCount: tokens.count, chunkSize: chunkSize, heldBack: heldBack,
+        startOffset: startOffset, ringCapacity: ringCapacity)
     let trailing = tokens.count - plan.reduce(0, +)
     let total = plan.count + (trailing > 0 ? 1 : 0)
 

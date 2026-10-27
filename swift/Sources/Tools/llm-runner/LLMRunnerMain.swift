@@ -130,6 +130,16 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     )
     var jsonSchema: String?
 
+    @Option(
+        name: .customLong("json-max-whitespace"),
+        help:
+            "With --json-schema: most whitespace characters allowed between two JSON tokens (default: 32; 0 for no limit). Ends a model that keeps emitting whitespace after the last value; output that stays within the limit is unchanged."
+    )
+    var jsonMaxWhitespace: Int = ConstrainedGenerationSession.defaultMaxWhitespaceCount
+
+    /// The whitespace limit named by `--json-max-whitespace`; nil for no limit.
+    private var maxWhitespaceCount: Int? { jsonMaxWhitespace > 0 ? jsonMaxWhitespace : nil }
+
     @Option(help: "Model inference engine variant. Defaults to 'default'")
     var inferenceEngineVariant: String = "default"
 
@@ -250,7 +260,20 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     @Option(name: .customLong("verbose-level"), help: "Verbosity level (default: 1, implies --verbose)")
     var verboseLevel: Int?
 
+    @Option(
+        name: .customLong("batch-prototype"),
+        help:
+            "Diagnostic: run the prompt as a batch of N identical rows through lockstep batched decode. Row 0 is greedy and the other rows sample with temperature. Needs a model exported with --attention-mask batched --dynamic-batch-size N or more."
+    )
+    var batchPrototypeRows: Int?
+
     func validate() throws {
+        if let rows = batchPrototypeRows {
+            if rows < 1 { throw ValidationError("--batch-prototype must be >= 1") }
+            if !["default", "auto", "coreai-sequential"].contains(inferenceEngineVariant) {
+                throw ValidationError("--batch-prototype runs on the coreai-sequential engine")
+            }
+        }
         if warmup == .exact && warmupLength == nil {
             throw ValidationError("--warmup exact requires --warmup-length N")
         }
@@ -282,6 +305,9 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             throw ValidationError(
                 "--repetition-penalty cannot be used with --json-schema"
                     + " (constrained generation does not support penalty on the pipelined engine)")
+        }
+        if jsonMaxWhitespace < 0 {
+            throw ValidationError("--json-max-whitespace must be >= 0 (0 for no limit)")
         }
     }
 
@@ -414,12 +440,14 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         let modelVocabSize = bundle.vocabSize
 
         // Resolve component model URLs once; reused for the cache check and model loading below.
-        // An LLM bundle has only `main`; VLM bundles also have `vision` and `embedding`.
+        // An LLM bundle has only `main`; VLM bundles also have `vision`, plus `embedding` unless the
+        // decoder gathers its own token embeddings (`vision.token_merge` is `decoder_gather`).
         let isVLM = bundle.modelBundle.kind == .vlm
         let languageModelURL = try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.main)
         let visionModelURL = isVLM ? try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.vision) : nil
         let embeddingModelURL =
-            isVLM ? try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.embedding) : nil
+            isVLM && bundle.visionConfig?.tokenMerge != .decoderGather
+            ? try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.embedding) : nil
 
         if clearCoreAICache {
             let cleared = try PreparedModel.clearCache(at: bundle.bundlePath)
@@ -428,13 +456,16 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
 
         // Detect an existing cached specialization before loading so we can annotate the load
         // time below. This only inspects the cache; it never triggers specialization. For VLM
-        // bundles, all three components must be cached to count as a hit.
+        // bundles, every component the bundle actually declares must be cached to count as a hit.
         let cacheHit: Bool
         if let visionModelURL, let embeddingModelURL {
             cacheHit =
                 PreparedModel.isCached(at: visionModelURL)
                 && PreparedModel.isCached(at: embeddingModelURL)
                 && PreparedModel.isCached(at: languageModelURL)
+        } else if let visionModelURL {
+            cacheHit =
+                PreparedModel.isCached(at: visionModelURL) && PreparedModel.isCached(at: languageModelURL)
         } else {
             cacheHit = PreparedModel.isCached(at: languageModelURL)
         }
@@ -483,17 +514,26 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             component: "Main")
 
         // Read additional stop token IDs from tokenizer_config.json (e.g. <end_of_turn> for Gemma)
-        let additionalEosTokenIds: [Int32]
+        var additionalEosTokenIds: Set<Int32>
         if let tokenizerDir = bundle.tokenizerPath {
             additionalEosTokenIds = LanguageConfig.additionalStopTokenIds(
                 from: tokenizerDir, tokenizer: tokenizer)
             if !additionalEosTokenIds.isEmpty {
                 CLILogger.log(
-                    "Found \(additionalEosTokenIds.count) additional stop token(s) from tokenizer config: \(additionalEosTokenIds)",
+                    "Found \(additionalEosTokenIds.count) additional stop token(s) from tokenizer config: \(additionalEosTokenIds.sorted())",
                     component: "Main")
             }
         } else {
             additionalEosTokenIds = []
+        }
+
+        // Agentic models use <|eot|> as a turn boundary. It may not appear in
+        // tokenizer_config.json, so add it explicitly (skipping the main EOS).
+        let thinkingFormat = detectThinkingFormat(using: tokenizer)
+        if let eotId = agenticEndOfTurnTokenId(thinkingFormat: thinkingFormat, tokenizer: tokenizer),
+            eotId != tokenizer.eosTokenId.map({ Int32($0) })
+        {
+            additionalEosTokenIds.insert(eotId)
         }
 
         CLILogger.log("Model loaded successfully:", component: "Main")
@@ -556,6 +596,17 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         CLILogger.log("   Max generation tokens: \(maxTokens)", component: "Main")
         CLILogger.log("   Required context length: \(requiredContextLength)", component: "Main")
         // Engines will validate context length during inference
+
+        if let rows = batchPrototypeRows {
+            try await runBatchPrototype(
+                rows: rows,
+                inferenceEngine: inferenceEngine,
+                bundle: bundle,
+                tokenizer: tokenizer,
+                promptTokens: promptTokens,
+                additionalEosTokenIds: additionalEosTokenIds)
+            return
+        }
 
         // VLM path: if --image is provided and engine supports multimodal
         if let imagePath = imagePath {
@@ -781,7 +832,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         maxTokens: Int,
         actualInputTokens: Int,
         modelVocabSize: Int?,
-        additionalEosTokenIds: [Int32] = []
+        additionalEosTokenIds: Set<Int32> = []
     ) async throws {
         let schema: String
         if FileManager.default.fileExists(atPath: schemaInput) {
@@ -809,12 +860,14 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         if inferenceEngine is any ConstrainedGenerationCapable {
             constrainedStrategy = PipelinedConstrainedDecodingStrategy(
                 jsonSchema: schema,
-                vocabSize: vocabSize
+                vocabSize: vocabSize,
+                maxWhitespaceCount: maxWhitespaceCount
             )
         } else {
             constrainedStrategy = ConstrainedDecodingStrategy(
                 jsonSchema: schema,
-                vocabSize: vocabSize
+                vocabSize: vocabSize,
+                maxWhitespaceCount: maxWhitespaceCount
             )
         }
 
@@ -905,7 +958,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     func validateAndEncodeStopTokens(
         stopTokens: [String],
         tokenizer: any Tokenizer,
-        additionalEosTokenIds: [Int32] = []
+        additionalEosTokenIds: Set<Int32> = []
     ) throws -> StopSequences {
         var sequences: [[Int32]] = []
 
@@ -947,6 +1000,50 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
 
     // MARK: - VLM Inference
 
+    /// Runs `rows` copies of `promptTokens` through `lockstepBatchedGenerate`, up to `--max-tokens`
+    /// new tokens per row, and prints each row's decoded text.
+    ///
+    /// Row 0 is greedy. Rows 1 and up sample at `--temperature` (0.8 when it is 0 or less) with
+    /// seed `1234 + row`. A row stops on the tokenizer's EOS or an `additionalEosTokenIds` token.
+    /// Throws `ValidationError` when the engine is not a `CoreAISequentialEngine` or `rows` exceeds
+    /// `bundle.maxBatchSize`.
+    private func runBatchPrototype(
+        rows: Int,
+        inferenceEngine: any InferenceEngine,
+        bundle: LanguageModelBundle,
+        tokenizer: any Tokenizer,
+        promptTokens: [Int],
+        additionalEosTokenIds: Set<Int32>
+    ) async throws {
+        guard let engine = inferenceEngine as? CoreAISequentialEngine else {
+            throw ValidationError(
+                "--batch-prototype needs a model with an attn_mask input, or --inference-engine-variant coreai-sequential"
+            )
+        }
+        guard rows <= bundle.maxBatchSize else {
+            throw ValidationError(
+                "--batch-prototype \(rows) exceeds the model's max batch size \(bundle.maxBatchSize). "
+                    + "Re-export with --dynamic-batch-size \(rows) or more.")
+        }
+        var eosTokenIds = additionalEosTokenIds
+        if let eos = tokenizer.eosTokenId { eosTokenIds.insert(Int32(eos)) }
+        let rowTemperature = temperature > 0 ? temperature : 0.8
+        let configs: [SamplingConfiguration] =
+            [.greedy]
+            + (1..<rows).map { SamplingConfiguration(temperature: rowTemperature, seed: UInt64(1234 + $0)) }
+
+        print("Batched prototype: \(rows) rows, prompt \(promptTokens.count) tokens")
+        let result = try await engine.lockstepBatchedGenerate(
+            promptRows: Array(repeating: promptTokens.map { Int32($0) }, count: rows),
+            configs: configs,
+            maxNewTokens: maxTokens,
+            eosTokenIds: eosTokenIds)
+        for (i, row) in result.tokens.enumerated() {
+            let label = i == 0 ? "greedy" : "temperature \(rowTemperature)"
+            print("\n=== row \(i) (\(label)) ===\n" + tokenizer.decode(tokens: row.map { Int($0) }))
+        }
+    }
+
     private func runVLMInference(
         imagePath: String,
         inferenceEngine: any InferenceEngine,
@@ -954,7 +1051,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         tokenizer: any Tokenizer,
         samplingConfiguration: SamplingConfiguration,
         maxTokens: Int,
-        additionalEosTokenIds: [Int32],
+        additionalEosTokenIds: Set<Int32>,
         displayPrompt: String
     ) async throws {
         guard let vlmEngine = inferenceEngine as? any MultimodalInferenceEngine else {
@@ -1020,7 +1117,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         tokenizer: any Tokenizer,
         samplingConfiguration: SamplingConfiguration,
         maxTokens: Int,
-        additionalEosTokenIds: [Int32],
+        additionalEosTokenIds: Set<Int32>,
         displayPrompt: String
     ) async throws {
         guard let vlmEngine = inferenceEngine as? any MultimodalInferenceEngine else {
@@ -1074,7 +1171,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         tokenizer: any Tokenizer,
         samplingConfiguration: SamplingConfiguration,
         maxTokens: Int,
-        additionalEosTokenIds: [Int32],
+        additionalEosTokenIds: Set<Int32>,
         displayPrompt: String
     ) async throws {
         let imageTokenCount = embeddedInput.tokenCount

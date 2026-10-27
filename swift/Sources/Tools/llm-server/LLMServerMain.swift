@@ -15,7 +15,30 @@ import Tokenizers
 struct LLMServer: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "llm-server",
-        abstract: "Start an OpenAI-compatible HTTP server for LLM inference"
+        abstract: "Serve a Core AI LLM bundle over the chat-completions and completions HTTP APIs.",
+        discussion: """
+            A prototype LLM server engine, to be used for evaluations and to serve as an example for \
+            integrating Core AI into high-performance agentic workflows. It serves a single exported LLM bundle.
+
+            Build and run:
+              uv run coreai.llm.export qwen3-0.6b
+              swift run -c release llm-server --model exports/qwen3_0_6b_4bit_dynamic
+
+            Several requests at once: export with --attention-mask batched --dynamic-batch-size 8, then start \
+            the server with --concurrent-requests auto. New requests join the batch as rows free up.
+
+            Eval harnesses: point the harness at http://127.0.0.1:8080/v1. Generation uses \
+            /v1/chat/completions; log-likelihood scoring uses /v1/completions with echo and logprobs. \
+            --replay runs a JSONL file of requests without HTTP.
+
+            Endpoints:
+              POST /v1/chat/completions  chat generation: streaming, tools, reasoning_effort
+              POST /v1/completions       prompt scoring: echo, logprobs
+              GET  /v1/models            the served model
+              GET  /ready                readiness, KV-cache memory estimates and batch occupancy
+              GET  /v1/stats             request and token counters
+              GET  /health               liveness
+            """
     )
 
     @Option(name: .customLong("model"), help: "Path to a model bundle directory")
@@ -27,7 +50,7 @@ struct LLMServer: AsyncParsableCommand {
     @Option(name: .customLong("server-model-name"), help: "Model name in API responses (default: from metadata)")
     var serverModelName: String?
 
-    @Option(help: "Maximum tokens to generate per request (default: 512)")
+    @Option(help: "Maximum tokens to generate per request")
     var maxTokens: Int = 512
 
     @Option(help: "Default temperature (0.0 = greedy)")
@@ -52,6 +75,13 @@ struct LLMServer: AsyncParsableCommand {
     @Option(name: .customLong("replay-output"), help: "Write replay results JSONL here (default: stdout)")
     var replayOutput: String?
 
+    @Flag(
+        name: .customLong("replay-concurrent"),
+        help: ArgumentHelp(
+            "Run all --replay requests concurrently instead of one at a time. Use with --concurrent-requests N.")
+    )
+    var replayConcurrent: Bool = false
+
     @Option(name: .customLong("variant"), help: "Engine variant: auto, coreai-pipelined, coreai-sequential")
     var inferenceEngineVariant: String = "default"
 
@@ -75,8 +105,19 @@ struct LLMServer: AsyncParsableCommand {
     )
     var chunkThreshold: Int?
 
-    @Option(name: .customLong("max-queue-depth"), help: "Max requests queued before returning 429 (default: 16)")
+    @Option(
+        name: .customLong("max-queue-depth"),
+        help: "Max requests queued beyond the concurrent ones before returning 429")
     var maxQueueDepth: Int = 16
+
+    @Option(
+        name: .customLong("concurrent-requests"),
+        help: ArgumentHelp(
+            "Max requests decoded together in one batch: a number, or auto for the model's max batch size. "
+                + "Values above 1 enable the batch scheduler when the model supports batching, and are ignored "
+                + "with a warning otherwise.")
+    )
+    var concurrentRequests: String = "1"
 
     @Flag(
         name: .customLong("no-thinking"),
@@ -102,6 +143,9 @@ struct LLMServer: AsyncParsableCommand {
     func validate() throws {
         guard maxQueueDepth >= 0 else {
             throw ValidationError("--max-queue-depth must be >= 0 (got \(maxQueueDepth))")
+        }
+        guard ConcurrentRequests(concurrentRequests) != nil else {
+            throw ValidationError("--concurrent-requests must be auto or a number >= 1 (got \(concurrentRequests))")
         }
         do {
             _ = try ReasoningEffort.resolveDefault(
@@ -163,7 +207,7 @@ struct LLMServer: AsyncParsableCommand {
 
         let tokenizer = try await bundle.loadTokenizer()
 
-        var additionalEosTokenIds: [Int32]
+        var additionalEosTokenIds: Set<Int32>
         if let tokenizerDir = bundle.tokenizerPath {
             additionalEosTokenIds = LanguageConfig.additionalStopTokenIds(
                 from: tokenizerDir, tokenizer: tokenizer)
@@ -171,17 +215,13 @@ struct LLMServer: AsyncParsableCommand {
             additionalEosTokenIds = []
         }
 
-        // Agentic models use <|eot|> / <|eom|> as turn boundaries.
-        // These may not appear in tokenizer_config.json, so add them explicitly.
+        // Agentic models use <|eot|> as a turn boundary. It may not appear in
+        // tokenizer_config.json, so add it explicitly (skipping the main EOS).
         let thinkingFormat = detectThinkingFormat(using: tokenizer)
-        if case .agentic(_, _, _, let eot) = thinkingFormat {
-            let mainEos = tokenizer.eosTokenId.map { Int32($0) }
-            if let id = tokenizer.convertTokenToId(eot) {
-                let id32 = Int32(id)
-                if id32 != mainEos && !additionalEosTokenIds.contains(id32) {
-                    additionalEosTokenIds.append(id32)
-                }
-            }
+        if let eotId = agenticEndOfTurnTokenId(thinkingFormat: thinkingFormat, tokenizer: tokenizer),
+            eotId != tokenizer.eosTokenId.map({ Int32($0) })
+        {
+            additionalEosTokenIds.insert(eotId)
         }
 
         let samplingConfig = SamplingConfiguration(
@@ -222,14 +262,44 @@ struct LLMServer: AsyncParsableCommand {
             maxQueueDepth: maxQueueDepth
         )
 
+        // The scheduler holds up to --concurrent-requests plus --max-queue-depth requests, then rejects.
+        var batchScheduler: BatchScheduler? = nil
+        let requested = ConcurrentRequests(concurrentRequests) ?? .count(1)
+        let sequentialEngine = engine as? CoreAISequentialEngine
+        let supportsBatching = sequentialEngine?.supportsBatching ?? false
+        let rows: Int
+        do {
+            rows = try requested.resolve(supportsBatching: supportsBatching, maxBatchSize: bundle.maxBatchSize)
+        } catch {
+            switch error {
+            case .exceedsMaxBatchSize(let count, let maxBatchSize):
+                throw ValidationError(
+                    "--concurrent-requests \(count) exceeds the asset's max batch size \(maxBatchSize). "
+                        + "Re-export with --dynamic-batch-size \(count) or higher, or lower --concurrent-requests."
+                )
+            }
+        }
+        if rows > 1, let sequentialEngine {
+            batchScheduler = try BatchScheduler(
+                engine: sequentialEngine, maxConcurrent: rows, maxQueued: maxQueueDepth)
+            print("Batched serving: \(rows) concurrent requests (asset max batch \(bundle.maxBatchSize))")
+        } else if requested != .count(1), !supportsBatching {
+            print(
+                "⚠️  --concurrent-requests \(concurrentRequests): serving one request at a time. Batched serving needs "
+                    + "the coreai-sequential engine and an asset exported with --attention-mask batched.")
+        }
+
         let state = ServerState(
             engine: engine,
             tokenizer: tokenizer,
-            config: config
+            config: config,
+            batchServing: batchScheduler.map { (scheduler: $0, modelConfig: engineConfig) }
         )
 
         if let replayPath {
-            try await ReplayRunner.run(inputPath: replayPath, outputPath: replayOutput, state: state)
+            try await ReplayRunner.run(
+                inputPath: replayPath, outputPath: replayOutput, state: state,
+                concurrent: replayConcurrent)
             return
         }
 

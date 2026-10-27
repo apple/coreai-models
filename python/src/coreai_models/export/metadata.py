@@ -94,6 +94,109 @@ _METADATA: dict[str, AIModelMetadataFields] = {
             "Source: https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct"
         ),
     ),
+    "Qwen/Qwen3.5-0.8B": AIModelMetadataFields(
+        author="Qwen Team",
+        license="Apache-2.0",
+        model_description=(
+            "Qwen3.5-0.8B is a 0.8B-parameter causal language model from the "
+            "Qwen3.5 family, using a hybrid decoder that interleaves full "
+            "attention with gated delta-net layers. "
+            "Source: https://huggingface.co/Qwen/Qwen3.5-0.8B"
+        ),
+    ),
+    "Qwen/Qwen3.5-2B": AIModelMetadataFields(
+        author="Qwen Team",
+        license="Apache-2.0",
+        model_description=(
+            "Qwen3.5-2B is a 2B-parameter causal language model from the Qwen3.5 "
+            "family, using a hybrid decoder that interleaves full attention with "
+            "gated delta-net layers. "
+            "Source: https://huggingface.co/Qwen/Qwen3.5-2B"
+        ),
+    ),
+    "Qwen/Qwen3.5-4B": AIModelMetadataFields(
+        author="Qwen Team",
+        license="Apache-2.0",
+        model_description=(
+            "Qwen3.5-4B is a 4B-parameter causal language model from the Qwen3.5 "
+            "family, using a hybrid decoder that interleaves full attention with "
+            "gated delta-net layers. "
+            "Source: https://huggingface.co/Qwen/Qwen3.5-4B"
+        ),
+    ),
+    "Qwen/Qwen3.5-9B": AIModelMetadataFields(
+        author="Qwen Team",
+        license="Apache-2.0",
+        model_description=(
+            "Qwen3.5-9B is a 9B-parameter causal language model from the Qwen3.5 "
+            "family, using a hybrid decoder that interleaves full attention with "
+            "gated delta-net layers. "
+            "Source: https://huggingface.co/Qwen/Qwen3.5-9B"
+        ),
+    ),
+    "Qwen/Qwen3.5-27B": AIModelMetadataFields(
+        author="Qwen Team",
+        license="Apache-2.0",
+        model_description=(
+            "Qwen3.5-27B is a 27B-parameter causal language model from the Qwen3.5 "
+            "family, using a hybrid decoder that interleaves full attention with "
+            "gated delta-net layers. "
+            "Source: https://huggingface.co/Qwen/Qwen3.5-27B"
+        ),
+    ),
+    "Qwen/Qwen3.5-35B-A3B": AIModelMetadataFields(
+        author="Qwen Team",
+        license="Apache-2.0",
+        model_description=(
+            "Qwen3.5-35B-A3B is a 35B-parameter mixture-of-experts causal language "
+            "model from the Qwen3.5 family with 3B active parameters per token, "
+            "using a hybrid decoder that interleaves full attention with gated "
+            "delta-net layers. "
+            "Source: https://huggingface.co/Qwen/Qwen3.5-35B-A3B"
+        ),
+    ),
+    "Qwen/Qwen3.5-122B-A10B": AIModelMetadataFields(
+        author="Qwen Team",
+        license="Apache-2.0",
+        model_description=(
+            "Qwen3.5-122B-A10B is a 122B-parameter mixture-of-experts causal "
+            "language model from the Qwen3.5 family with 10B active parameters per "
+            "token, using a hybrid decoder that interleaves full attention with "
+            "gated delta-net layers. "
+            "Source: https://huggingface.co/Qwen/Qwen3.5-122B-A10B"
+        ),
+    ),
+    "Qwen/Qwen3.6-27B": AIModelMetadataFields(
+        author="Qwen Team",
+        license="Apache-2.0",
+        model_description=(
+            "Qwen3.6-27B is a 27B-parameter causal language model from the Qwen3.6 "
+            "family, using a hybrid decoder that interleaves full attention with "
+            "gated delta-net layers. "
+            "Source: https://huggingface.co/Qwen/Qwen3.6-27B"
+        ),
+    ),
+    "Qwen/Qwen3.6-35B-A3B": AIModelMetadataFields(
+        author="Qwen Team",
+        license="Apache-2.0",
+        model_description=(
+            "Qwen3.6-35B-A3B is a 35B-parameter mixture-of-experts causal language "
+            "model from the Qwen3.6 family with 3B active parameters per token, "
+            "using a hybrid decoder that interleaves full attention with gated "
+            "delta-net layers. "
+            "Source: https://huggingface.co/Qwen/Qwen3.6-35B-A3B"
+        ),
+    ),
+    "Qwen/Qwen3.8-27B": AIModelMetadataFields(
+        author="Qwen Team",
+        license="Apache-2.0",
+        model_description=(
+            "Qwen3.8-27B is a 27B-parameter causal language model from the Qwen3.8 "
+            "family, using a hybrid decoder that interleaves full attention with "
+            "gated delta-net layers. "
+            "Source: https://huggingface.co/Qwen/Qwen3.8-27B"
+        ),
+    ),
     "google/gemma-3-4b-it": AIModelMetadataFields(
         author="Gemma Team",
         license="Gemma Terms of Use",

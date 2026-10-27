@@ -58,16 +58,24 @@ public struct CoreAIVisionLanguageModel: LanguageModel {
                 prefillChunkThreshold: bundle.language.prefillChunkThreshold
             )
         )
-        guard let vlmEngine = engine as? CoreAISequentialVLMEngine else {
+        guard let vlmEngine = engine as? any MultimodalInferenceEngine else {
             throw InferenceRuntimeError.invalidArgument(
                 "Expected a vision-language engine for a VLM bundle, got \(type(of: engine))")
         }
 
+        let tokenizer = try await tokenizerResult
+
+        let additionalStopTokenIds: Set<Int32> =
+            bundle.tokenizerPath.map {
+                LanguageConfig.additionalStopTokenIds(from: $0, tokenizer: tokenizer)
+            } ?? []
+
         self.executorConfiguration = CoreAIVLMExecutor.Configuration(
             bundleURL: url,
             engine: vlmEngine,
-            tokenizer: try await tokenizerResult,
-            visionConfig: visionConfig
+            tokenizer: tokenizer,
+            visionConfig: visionConfig,
+            additionalStopTokenIds: additionalStopTokenIds
         )
     }
 }
@@ -79,9 +87,10 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
 
     public struct Configuration: Hashable, Sendable {
         let bundleURL: URL
-        let engine: CoreAISequentialVLMEngine
+        let engine: any MultimodalInferenceEngine
         let tokenizer: any Tokenizer
         let visionConfig: VisionConfig
+        let additionalStopTokenIds: Set<Int32>
 
         public static func == (lhs: Configuration, rhs: Configuration) -> Bool {
             lhs.bundleURL == rhs.bundleURL
@@ -91,14 +100,16 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
         }
     }
 
-    private let engine: CoreAISequentialVLMEngine
+    private let engine: any MultimodalInferenceEngine
     private let tokenizer: any Tokenizer
     private let visionConfig: VisionConfig
+    private let additionalStopTokenIds: Set<Int32>
 
     public init(configuration: Configuration) throws {
         self.engine = configuration.engine
         self.tokenizer = configuration.tokenizer
         self.visionConfig = configuration.visionConfig
+        self.additionalStopTokenIds = configuration.additionalStopTokenIds
     }
 
     public nonisolated(nonsending) func respond(
@@ -144,11 +155,7 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
         )
 
         let maxTokens = request.generationOptions.maximumResponseTokens ?? 512
-        var stopTokens = Set<Int32>()
-        if let eos = tokenizer.eosTokenId { stopTokens.insert(Int32(eos)) }
-        if let imEnd = tokenizer.vocabContains("<|im_end|>") ? tokenizer.convertTokenToId("<|im_end|>") : nil {
-            stopTokens.insert(Int32(imEnd))
-        }
+        let stopTokens = tokenizer.runtimeStopTokens(additional: additionalStopTokenIds)
 
         let stream = try await engine.generate(
             with: embeddedInput,

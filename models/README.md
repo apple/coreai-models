@@ -212,6 +212,7 @@ uv run models/<name>/export.py --include-debug-info   # embed debug information 
 - [Qwen2.5](qwen2)
 - [Qwen3](qwen3)
 - [Qwen3 MoE](qwen3_moe)
+- [Qwen3.5](qwen3_5)
 
 ### Diffusion Models
 
@@ -254,6 +255,23 @@ For models with bespoke export logic that doesn't fit the standard `coreai.llm.e
 - `README.md` — Model introduction, export recipe and example Swift code to make app integration easier.
 
 For models that fit the standard `coreai.llm.export` or `coreai.diffusion.export` pipeline, add a `ModelPreset` entry to [`model_registry.py`](../python/src/coreai_models/model_registry.py) instead.
+
+### Declaring State Kinds
+
+The Swift runtime infers each language-model state's kind from its shape and name: a state with a dynamic dimension is a KV cache (`kv_cache`); a fixed-shape state whose name contains `sliding` is a sliding-window ring cache (`sliding_cache`); any other fixed-shape state whose name contains `cache` or `kv` is a KV cache with a fixed capacity, such as one exported at its full context; and any other state is `fixed`, such as a convolution or recurrent state. A `fixed` state cannot be partially rewound with `reset(to:)`. When the inference is wrong, for example for a ring cache whose name doesn't contain `sliding`, set the kinds in the `language` section of the bundle's `metadata.json`:
+
+```json
+"language": {
+  "states": {
+    "keyCache": "kv_cache",
+    "valueCache": "kv_cache",
+    "convStates": "fixed",
+    "recurrentStates": "fixed"
+  }
+}
+```
+
+States the map leaves out keep their inferred kind. Only `kv_cache` states may have a dynamic dimension; a bundle that gives a dynamic-shaped state another kind fails to load.
 
 ## Compiling models
 
