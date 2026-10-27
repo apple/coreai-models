@@ -7,9 +7,14 @@
 
 import math
 
+import pytest
 import torch
 
-from coreai_models.models.ios.embedding_gemma2 import MASK_NEG, text_encoder_from_state_dict
+from coreai_models.models.ios.embedding_gemma2 import (
+    MASK_NEG,
+    ScaledRMSNorm,
+    text_encoder_from_state_dict,
+)
 from coreai_models.models.macos.embedding_gemma2 import (
     EmbeddingGemma2TextConfig,
     EmbeddingGemma2TextEncoder,
@@ -101,3 +106,16 @@ def test_float16_stays_finite_with_large_activations() -> None:
         got = ios16(**_host_inputs(ids, mask, table, cfg.sliding_window, torch.float16))
     assert torch.isfinite(got.float()).all()
     assert float(_cos(got.float(), want)) >= 0.99
+
+
+@pytest.mark.parametrize("peak", [0.0, 1e-7, 1e-5, 1e-3, 3.9e-3, 4e-3, 1.0, 1e2, 1e4, 6e4])
+def test_float16_scaled_rms_norm_matches_float32_across_magnitudes(peak: float) -> None:
+    eps = 1e-6
+    x = torch.randn(8, 256, generator=torch.Generator().manual_seed(0))
+    x = x / x.abs().amax(1, keepdim=True) * peak
+    x16 = x.half()
+    want = x16.float() * torch.rsqrt((x16.float() ** 2).mean(1, keepdim=True) + eps)
+    with torch.no_grad():
+        got = ScaledRMSNorm(256, eps, with_scale=False).half()(x16).float()
+    assert torch.isfinite(got).all()
+    torch.testing.assert_close(got, want, rtol=2e-3, atol=2e-3)

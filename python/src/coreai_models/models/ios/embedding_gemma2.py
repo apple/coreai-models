@@ -51,7 +51,10 @@ class ScaledRMSNorm(nn.Module):
         m = x.abs().amax(d, keepdim=True).clamp(min=_FP16_TINY)
         r = torch.reciprocal(m)
         xs = x * r
-        y = xs * torch.rsqrt((xs * xs).mean(d, keepdim=True) + self.eps * (r * r))
+        # eps * r^2 as (sqrt(eps) * r)^2. r goes up to 1 / _FP16_TINY, and r * r overflows
+        # float16 once r > 256, which zeroes the row.
+        e = self.eps**0.5 * r
+        y = xs * torch.rsqrt((xs * xs).mean(d, keepdim=True) + e * e)
         if self.with_scale:
             shape = [1] * x.dim()
             shape[d] = self.channels
