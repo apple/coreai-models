@@ -150,6 +150,9 @@ public struct CoreAISegmentationEngine {
         // Text-based inputs (SAM3-style baseline).
         let textInputName: String?
         let embeddingsInputName: String?
+        /// Text-padding mask, present on full SAM3 exports with a padded prompt. Nil for older
+        /// exports (a 3-token prompt with no padding) and for point models.
+        let textAttentionMaskInput: TextAttentionMaskInput?
 
         // Point-based inputs (EfficientSAM).
         let pointsInputName: String?
@@ -176,6 +179,9 @@ public struct CoreAISegmentationEngine {
 
             let textInputName = findTextInputName(in: descriptor.inputNames)
             let embeddingsInputName = findEmbeddingsInputName(in: descriptor.inputNames)
+            let textAttentionMaskInput =
+                textInputName == nil
+                ? nil : try resolveTextAttentionMaskInput(in: descriptor, functionName: GraphNames.main)
             let pointsInputName = findPointsInputName(in: descriptor.inputNames)
             let pointLabelsInputName = findPointLabelsInputName(in: descriptor.inputNames)
 
@@ -239,6 +245,7 @@ public struct CoreAISegmentationEngine {
             self.imageInputName = imageInputName
             self.textInputName = textInputName
             self.embeddingsInputName = embeddingsInputName
+            self.textAttentionMaskInput = textAttentionMaskInput
             self.pointsInputName = pointsInputName
             self.pointLabelsInputName = pointLabelsInputName
             self.masksOutputName = masksOutputName
@@ -273,7 +280,7 @@ public struct CoreAISegmentationEngine {
         let textFeaturesInputName: String
         /// Text-padding mask (1 = prompt token, 0 = padding). Nil for bundles exported before
         /// `detect` took one; those still run, but attend to the padding slots.
-        let textAttentionMaskInput: (name: String, descriptor: NDArrayDescriptor)?
+        let textAttentionMaskInput: TextAttentionMaskInput?
         let masksOutputName: String
         let boxesOutputName: String
         let logitsOutputName: String
@@ -332,15 +339,8 @@ public struct CoreAISegmentationEngine {
                     "Cannot find text-features input in 'detect'. Inputs: \(detectDescriptor.inputNames)"
                 )
             }
-            var textAttentionMaskInput: (name: String, descriptor: NDArrayDescriptor)?
-            if let name = findTextAttentionMaskName(in: detectDescriptor.inputNames) {
-                guard case .ndArray(let descriptor) = detectDescriptor.inputDescriptor(of: name) else {
-                    throw SegmentationRuntimeError.invalidConfiguration(
-                        "No array descriptor for '\(name)' input of 'detect'."
-                    )
-                }
-                textAttentionMaskInput = (name, descriptor)
-            }
+            let textAttentionMaskInput = try resolveTextAttentionMaskInput(
+                in: detectDescriptor, functionName: GraphNames.detect)
             guard let masksOutputName = findMasksOutputName(in: detectDescriptor.outputNames) else {
                 throw SegmentationRuntimeError.invalidConfiguration(
                     "Cannot find masks output in 'detect'. Outputs: \(detectDescriptor.outputNames)"
@@ -430,10 +430,13 @@ public struct CoreAISegmentationEngine {
         fillNDArray(&textArray, as: Int32.self, count: textDescriptor.shape.reduce(1, *)) { _ in
             CLIPTokenizer.eotTokenId
         }
-        try await runSingleFunctionTextInference(
-            state: state,
-            inputs: [state.imageInputName: imageArray, textInputName: textArray]
-        )
+        var inputs = [state.imageInputName: imageArray, textInputName: textArray]
+        if let input = state.textAttentionMaskInput,
+            let mask = Self.buildTextAttentionMaskNDArray(input: input, tokensBatch: [])
+        {
+            inputs[input.name] = mask
+        }
+        try await runSingleFunctionTextInference(state: state, inputs: inputs)
     }
 
     private func warmupSingleFunctionPointModel(state: SingleFunctionContext) async throws {
@@ -501,6 +504,11 @@ public struct CoreAISegmentationEngine {
             inputs[textInputName] = Self.buildTextTokensNDArray(
                 tokensBatch: textTokensBatch, descriptor: textDescriptor
             )
+            if let input = state.textAttentionMaskInput,
+                let mask = Self.buildTextAttentionMaskNDArray(input: input, tokensBatch: textTokensBatch)
+            {
+                inputs[input.name] = mask
+            }
 
         case .embeddings(let embeddingsBatch):
             guard let embInputName = state.embeddingsInputName else {
@@ -524,6 +532,11 @@ public struct CoreAISegmentationEngine {
                     at: idx, sequenceLength: sequenceLength, hiddenSize: hiddenSize, batch: embeddingsBatch)
             }
             inputs[embInputName] = embeddingsArray
+            if let input = state.textAttentionMaskInput,
+                let mask = Self.buildTextAttentionMaskNDArray(input: input, tokensBatch: nil)
+            {
+                inputs[input.name] = mask
+            }
         }
 
         return try await runSingleFunctionTextInference(state: state, inputs: inputs)
@@ -828,7 +841,8 @@ public struct CoreAISegmentationEngine {
             state: state,
             imageArray: imageArray,
             textArray: textArray,
-            textAttentionMask: Self.buildTextAttentionMaskNDArray(state: state, tokensBatch: [])
+            textAttentionMask: Self.buildTextAttentionMaskNDArray(
+                input: state.textAttentionMaskInput, tokensBatch: [])
         )
     }
 
@@ -882,7 +896,7 @@ public struct CoreAISegmentationEngine {
             imageArray: imageArray,
             textArray: textArray,
             textAttentionMask: Self.buildTextAttentionMaskNDArray(
-                state: state, tokensBatch: textTokensBatch)
+                input: state.textAttentionMaskInput, tokensBatch: textTokensBatch)
         )
     }
 
@@ -997,26 +1011,49 @@ public struct CoreAISegmentationEngine {
         return array
     }
 
-    /// The `detect` text-padding mask for `tokensBatch`, or nil when the asset has no such
-    /// input. Its last dimension is the prompt length; rows are padded as in
-    /// `buildTextTokensNDArray`.
-    fileprivate static func buildTextAttentionMaskNDArray(
-        state: MultiFunctionContext,
-        tokensBatch: [[Int32]]
+    /// An optional text-padding mask input: SAM3 lite `detect` and full SAM3 `main` exports take
+    /// one (1 = prompt token, 0 = padding); older exports and other models don't.
+    typealias TextAttentionMaskInput = (name: String, descriptor: NDArrayDescriptor)
+
+    /// The function's `attention_mask` input, or nil when it has none.
+    static func resolveTextAttentionMaskInput(
+        in descriptor: InferenceFunctionDescriptor, functionName: String
+    ) throws -> TextAttentionMaskInput? {
+        guard let name = findTextAttentionMaskName(in: descriptor.inputNames) else { return nil }
+        guard case .ndArray(let arrayDescriptor) = descriptor.inputDescriptor(of: name) else {
+            throw SegmentationRuntimeError.invalidConfiguration(
+                "No array descriptor for '\(name)' input of '\(functionName)'."
+            )
+        }
+        return (name, arrayDescriptor)
+    }
+
+    /// The text-padding mask for `tokensBatch`, or nil when the asset has no such input. Its last
+    /// dimension is the prompt length; rows are padded as in `buildTextTokensNDArray`. A nil
+    /// `tokensBatch` (embedding prompts, which carry no ids) marks every slot as a real token.
+    static func buildTextAttentionMaskNDArray(
+        input: TextAttentionMaskInput?,
+        tokensBatch: [[Int32]]?
     ) -> NDArray? {
-        guard let input = state.textAttentionMaskInput else { return nil }
+        guard let input else { return nil }
         var array = NDArray(descriptor: input.descriptor)
         fillTextAttentionMask(&array, tokensBatch: tokensBatch)
         return array
     }
 
-    /// Fill a `[batch, ..., sequenceLength]` mask array via `textAttentionMask`, row by row.
-    static func fillTextAttentionMask(_ array: inout NDArray, tokensBatch: [[Int32]]) {
+    /// Fill a `[batch, ..., sequenceLength]` mask array via `textAttentionMask`, row by row. A nil
+    /// `tokensBatch` fills every slot with 1.
+    static func fillTextAttentionMask(_ array: inout NDArray, tokensBatch: [[Int32]]?) {
         let batchSize = array.shape[0]
         let sequenceLength = array.shape[array.shape.count - 1]
-        let values = (0..<batchSize).flatMap { b in
-            textAttentionMask(
-                tokens: b < tokensBatch.count ? tokensBatch[b] : [], sequenceLength: sequenceLength)
+        let values: [Float]
+        if let tokensBatch {
+            values = (0..<batchSize).flatMap { b in
+                textAttentionMask(
+                    tokens: b < tokensBatch.count ? tokensBatch[b] : [], sequenceLength: sequenceLength)
+            }
+        } else {
+            values = [Float](repeating: 1, count: batchSize * sequenceLength)
         }
         if array.scalarType == .int32 {
             fillNDArray(&array, as: Int32.self, count: values.count) { Int32(values[$0]) }

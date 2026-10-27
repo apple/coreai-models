@@ -72,6 +72,8 @@ uv run models/sam3/export.py --full --dtype float16
 
 Full bundles land at `<repo-root>/exports/<model>_<dtype>/` (e.g. `exports/sam3_float32/`), so they sit next to the lite `sam3_lite_336_w4_static/` without colliding.
 
+`main` takes `pixel_values`, `input_ids` `[1, 32]` and `attention_mask` `[1, 32]` (int32, 1 for real prompt tokens and 0 for padding); `ImageSegmenter` fills the mask from the token ids.
+
 ## Running
 
 ### In your iOS and macOS applications

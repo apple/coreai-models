@@ -371,32 +371,56 @@ def _write_bundle_metadata(bundle_dir: Path, asset_filename: str) -> None:
 class FullExportConfig:
     """Configuration for the plain ``transformers.Sam3Model`` export.
 
-    Mirrors what the original ``models/sam3/export.py`` produced before the
-    ANE-targeted lite variant landed: a single-entrypoint ``main`` asset
-    that takes ``(pixel_values, input_ids)`` and returns the five raw
-    ``Sam3Model`` outputs.
+    A single-entrypoint ``main`` asset that takes ``(pixel_values, input_ids,
+    attention_mask)`` and returns the five raw ``Sam3Model`` outputs.
+
+    ``max_text_seq_len`` is the static prompt length. 32 matches HF's
+    ``Sam3Processor`` padding and CLIP's 32 position embeddings.
     """
 
     hf_model_id: str = "facebook/sam3"
     image_size: int = 1008
     dtype: str = "float32"  # "float16" | "float32"
+    max_text_seq_len: int = 32
     output_dir: str = "exports"
     output_name: str | None = None
     overwrite: bool = False
     include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO
 
 
-class _Sam3FullModule(nn.Module):
-    """Wrap ``transformers.Sam3Model`` and return the five detection tensors."""
+#: ``(input_names, output_names)`` of the full ``main`` entrypoint, in ``_Sam3FullModule`` order.
+_FULL_IO: tuple[list[str], list[str]] = (
+    ["pixel_values", "input_ids", "attention_mask"],
+    ["pred_masks", "pred_boxes", "pred_logits", "presence_logits", "semantic_seg"],
+)
 
-    def __init__(self, model_id: str) -> None:
+
+class _Sam3FullModule(nn.Module):
+    """Wrap ``transformers.Sam3Model`` and return the five detection tensors.
+
+    ``attention_mask`` is the tokenizer's ``(1, seq)`` mask, 1 for prompt tokens and 0 for
+    padding; ``Sam3Model`` masks the padding out of every attention over the prompt.
+    """
+
+    def __init__(self, model: nn.Module) -> None:
         super().__init__()
+        self._model = model
+
+    @classmethod
+    def from_pretrained(cls, model_id: str) -> _Sam3FullModule:
         import transformers
 
-        self._model = transformers.Sam3Model.from_pretrained(model_id)
+        return cls(transformers.Sam3Model.from_pretrained(model_id))
 
-    def forward(self, pixel_values: torch.Tensor, input_ids: torch.Tensor):
-        outputs = self._model(pixel_values=pixel_values, input_ids=input_ids)
+    def forward(
+        self,
+        pixel_values: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ):
+        outputs = self._model(
+            pixel_values=pixel_values, input_ids=input_ids, attention_mask=attention_mask
+        )
         return (
             outputs.pred_masks,
             outputs.pred_boxes,
@@ -450,15 +474,23 @@ async def _async_export_full(config: FullExportConfig) -> str:
         config.image_size,
         config.dtype,
     )
-    model = _Sam3FullModule(model_id=config.hf_model_id)
+    model = _Sam3FullModule.from_pretrained(config.hf_model_id)
     model.eval()
     model.to(torch_dtype)
 
+    # Pad the example prompt so the traced graph has a static, padded prompt length and sees a
+    # mask with real padding in it.
     processor = transformers.Sam3Processor.from_pretrained(config.hf_model_id)
-    text_inputs = processor.tokenizer(["dummy"], return_tensors="pt")
+    text_inputs = processor.tokenizer(
+        ["dummy"],
+        padding="max_length",
+        max_length=config.max_text_seq_len,
+        return_tensors="pt",
+    )
     example_inputs = {
         "pixel_values": torch.randn(1, 3, config.image_size, config.image_size).to(torch_dtype),
         "input_ids": text_inputs["input_ids"].to(torch.int32),
+        "attention_mask": text_inputs["attention_mask"].to(torch.int32),
     }
 
     logger.info("Running torch.export...")
@@ -475,14 +507,8 @@ async def _async_export_full(config: FullExportConfig) -> str:
         )
     ).add_exported_program(
         exported_program=exported,
-        input_names=["pixel_values", "input_ids"],
-        output_names=[
-            "pred_masks",
-            "pred_boxes",
-            "pred_logits",
-            "presence_logits",
-            "semantic_seg",
-        ],
+        input_names=_FULL_IO[0],
+        output_names=_FULL_IO[1],
     )
     coreai_program = converter.to_coreai()
 

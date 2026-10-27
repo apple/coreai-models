@@ -284,6 +284,27 @@ struct CoreAISegmentationEngineTests {
         #expect(flattenAsFloat(array) == [1, 1, 1, 1, 1, 0, 0, 0])
     }
 
+    @Test("fillTextAttentionMask: fills a [B, S] int32 array (full SAM3 `main` layout)")
+    func fillTextAttentionMaskInt32() {
+        let eot = CLIPTokenizer.eotTokenId
+        var array = NDArray(shape: [1, 6], scalarType: .int32)
+        CoreAISegmentationEngine.fillTextAttentionMask(&array, tokensBatch: [[49406, 320, eot]])
+        #expect(readNDArray(array, as: Int32.self, count: 6) == [1, 1, 1, 0, 0, 0])
+    }
+
+    @Test("buildTextAttentionMaskNDArray: nil when the asset has no mask input")
+    func buildTextAttentionMaskWithoutInput() {
+        #expect(CoreAISegmentationEngine.buildTextAttentionMaskNDArray(input: nil, tokensBatch: [[49406]]) == nil)
+        #expect(CoreAISegmentationEngine.buildTextAttentionMaskNDArray(input: nil, tokensBatch: nil) == nil)
+    }
+
+    @Test("fillTextAttentionMask: embedding prompts (nil tokens) mark every slot real")
+    func fillTextAttentionMaskForEmbeddings() {
+        var array = NDArray(shape: [1, 4], scalarType: .float32)
+        CoreAISegmentationEngine.fillTextAttentionMask(&array, tokensBatch: nil)
+        #expect(flattenAsFloat(array) == [1, 1, 1, 1])
+    }
+
     // MARK: - Embedding value indexing
 
     @Test("embeddingValue: reads [batch, seq, hidden] flat in C-order, zero-pads out-of-range")
