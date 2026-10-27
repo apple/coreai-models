@@ -64,6 +64,42 @@ struct InferenceOptionsTests {
         #expect(InferenceOptions().tokens == .sample)
         #expect(InferenceOptions().logits == .none)
     }
+
+    @Test("returnsLogits is false only for logits .none")
+    func returnsLogits() {
+        #expect(InferenceOptions(logits: .none).returnsLogits == false)
+        #expect(InferenceOptions(logits: .lastPosition).returnsLogits == true)
+        #expect(InferenceOptions(logits: .allPositions).returnsLogits == true)
+    }
+
+    @available(*, deprecated)
+    @Test("Legacy includeLogits initializer maps to sample + lastPosition or none")
+    func legacyInitializer() {
+        let forced: [Int32] = [4, 5]
+        let on = InferenceOptions(maxTokens: 3, includeLogits: true, forcedContinuation: forced)
+        #expect(on.maxTokens == 3)
+        #expect(on.tokens == .sample)
+        #expect(on.logits == .lastPosition)
+        #expect(on.forcedContinuation == forced)
+
+        let off = InferenceOptions(includeLogits: false)
+        #expect(off.tokens == .sample)
+        #expect(off.logits == .none)
+    }
+
+    @available(*, deprecated)
+    @Test("Legacy includeLogits accessor reads returnsLogits and writes the logits axis")
+    func legacyAccessor() {
+        var opts = InferenceOptions.eval()
+        #expect(opts.includeLogits == true)
+
+        opts.includeLogits = false
+        #expect(opts.logits == .none)
+        #expect(opts.tokens == .none)
+
+        opts.includeLogits = true
+        #expect(opts.logits == .lastPosition)
+    }
 }
 
 // MARK: - generate() Default Extension Tests

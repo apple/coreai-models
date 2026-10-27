@@ -32,13 +32,19 @@ public struct InferenceOutput: Sendable {
 
 // MARK: - Inference Options
 
-/// Whether to sample a token this step.
+/// Whether the engine samples a token each step.
+///
+/// Engines currently sample under both cases. `.none` marks requests whose caller does not
+/// read `InferenceOutput.tokenId`.
 public enum TokenRequest: Sendable, Equatable {
     case none
     case sample
 }
 
-/// Which positions' logits to return.
+/// Which positions' logits the engine returns.
+///
+/// Engines currently return one `[vocabSize]` row per output step for both `.lastPosition` and
+/// `.allPositions`. The pipelined engine rejects any value other than `.none`.
 public enum LogitsRequest: Sendable, Equatable {
     case none
     case lastPosition
@@ -49,21 +55,15 @@ public enum LogitsRequest: Sendable, Equatable {
 public struct InferenceOptions: Sendable {
     /// Max tokens to generate. Nil = until EOS or context limit.
     public var maxTokens: Int?
+    /// Whether to sample a token each step. Default `.sample`.
     public var tokens: TokenRequest
+    /// Which positions' logits to return. Default `.none`.
     public var logits: LogitsRequest
     /// Force these token IDs instead of sampling (MMLU-style scoring).
     public var forcedContinuation: [Int32]?
 
-    /// Raw initializer over the full `(tokens, logits)` space.
-    ///
-    /// The two axes are intentionally orthogonal and this initializer is
-    /// deliberately permissive: every `(tokens, logits)` pair is representable
-    /// and there are no invalid combinations to reject. The `prefill`, `extend`,
-    /// `eval`, `guided`, and `sampleWithLogits` presets below cover all the
-    /// meaningful pairings; prefer them to constructing options by hand. The
-    /// only representable pair without a dedicated preset is
-    /// `(tokens: .sample, logits: .allPositions)` — sampling a token while also
-    /// returning logits at every position — which is odd but harmless.
+    /// Creates options from explicit `tokens` and `logits` values. Every pair is valid; prefer the
+    /// presets below.
     public init(
         maxTokens: Int? = nil,
         tokens: TokenRequest = .sample,
@@ -76,9 +76,8 @@ public struct InferenceOptions: Sendable {
         self.forcedContinuation = forcedContinuation
     }
 
-    /// Legacy initializer bridging the old `includeLogits` boolean to the
-    /// `(tokens, logits)` axes: `true` maps to `logits: .lastPosition`, `false` to
-    /// `logits: .none`. Tokens are sampled, as they always were under this API.
+    /// Creates options from the legacy `includeLogits` flag: `true` maps to `logits: .lastPosition`,
+    /// `false` to `logits: .none`. `tokens` is `.sample`.
     @available(
         *, deprecated,
         message: "Use the tokens:/logits: initializer; includeLogits: true == logits: .lastPosition."
@@ -95,14 +94,11 @@ public struct InferenceOptions: Sendable {
             forcedContinuation: forcedContinuation)
     }
 
-    /// Whether this request asks the engine to return logits at any position.
-    ///
-    /// Equivalent to `logits != .none`; use this instead of open-coding the
-    /// comparison so the intent reads clearly at the call site.
+    /// Whether `logits` is anything other than `.none`.
     public var returnsLogits: Bool { logits != .none }
 
-    /// Legacy accessor for the old `includeLogits` boolean. Reads as `returnsLogits`;
-    /// setting `true` requests last-position logits, `false` requests none.
+    /// Legacy flag. Reads `returnsLogits`; writing `true` sets `logits` to `.lastPosition`, `false`
+    /// to `.none`.
     @available(*, deprecated, message: "Use `logits` / `returnsLogits` instead.")
     public var includeLogits: Bool {
         get { returnsLogits }
@@ -112,11 +108,11 @@ public struct InferenceOptions: Sendable {
 
 /// Presets for the common (tokens, logits) pairs.
 extension InferenceOptions {
-    /// Warm the KV cache; does not need token or logits
+    /// No token, no logits. For prefill and warmup chunks.
     public static func prefill(maxTokens: Int? = nil) -> InferenceOptions {
         InferenceOptions(maxTokens: maxTokens, tokens: .none, logits: .none)
     }
-    /// Decode one token.
+    /// Sampled tokens, no logits. The default for decode.
     public static func extend(maxTokens: Int? = nil) -> InferenceOptions {
         InferenceOptions(maxTokens: maxTokens, tokens: .sample, logits: .none)
     }
@@ -124,16 +120,16 @@ extension InferenceOptions {
     public static func `default`(maxTokens: Int? = nil) -> InferenceOptions {
         .extend(maxTokens: maxTokens)
     }
-    /// Logits at every position, for eval / PPL.
+    /// No token, logits at every position. For perplexity and scoring with `forcedContinuation`.
     public static func eval(maxTokens: Int? = nil, forcedContinuation: [Int32]? = nil) -> InferenceOptions {
         InferenceOptions(
             maxTokens: maxTokens, tokens: .none, logits: .allPositions, forcedContinuation: forcedContinuation)
     }
-    /// Last-row logits for constrained decoding.
+    /// No token, last-position logits. For constrained decoding, where the caller masks and samples.
     public static func guided(maxTokens: Int? = nil) -> InferenceOptions {
         InferenceOptions(maxTokens: maxTokens, tokens: .none, logits: .lastPosition)
     }
-    /// Decode, and also return the last-row logits.
+    /// Sampled tokens plus last-position logits. For inspecting logits during decode.
     public static func sampleWithLogits(maxTokens: Int? = nil) -> InferenceOptions {
         InferenceOptions(maxTokens: maxTokens, tokens: .sample, logits: .lastPosition)
     }
