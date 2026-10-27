@@ -295,8 +295,20 @@ struct SlidingRing: Equatable {
     /// after the rewind point overwrite the slots of earlier ones; the next query at
     /// `target` still needs the `window - 1` keys before it, which survive only while
     /// at most `depth - window + 1` positions have been written past it.
-    func allowsRewind(processed: Int, to target: Int) -> Bool {
-        target == 0 || processed - target <= depth - window + 1
+    ///
+    /// The next forward restarts at the batch boundary at or below `target`, so
+    /// `alignment` (the batch width that forward runs in) moves the position whose keys
+    /// are needed back by up to `alignment - 1`. A rewind to 0 is always allowed.
+    func allowsRewind(processed: Int, to target: Int, alignment: Int = 1) -> Bool {
+        let restart = alignment > 1 ? target / alignment * alignment : target
+        return target == 0 || processed - restart <= depth - window + 1
+    }
+
+    /// Longest verify block (anchor plus proposal) that can be rolled back to its anchor at
+    /// any position under `allowsRewind`. Rejecting every draft rewinds `n - 1` positions
+    /// from the block's end, and the restart can sit `alignment - 1` below the anchor.
+    func maxVerifyBlockLength(alignment: Int) -> Int {
+        max(1, depth - window + 3 - max(1, alignment))
     }
 }
 
@@ -317,8 +329,8 @@ struct StaticStateSet {
     /// Whether the states can be truncated from `processed` back to `target`
     /// positions. Flat caches always can; a sliding-window ring only while it still
     /// holds the keys the next query needs.
-    func canTruncate(processed: Int, to target: Int) -> Bool {
-        slidingRing?.allowsRewind(processed: processed, to: target) ?? true
+    func canTruncate(processed: Int, to target: Int, alignment: Int = 1) -> Bool {
+        slidingRing?.allowsRewind(processed: processed, to: target, alignment: alignment) ?? true
     }
 
     /// Lay out the bucketed states for the bucket about to run. Fixed states
