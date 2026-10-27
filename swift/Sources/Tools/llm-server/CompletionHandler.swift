@@ -23,8 +23,7 @@ func handleCompletionsFromBody(body: ByteBuffer, state: ServerState) async throw
     guard state.config.supportsLogprobs else {
         let err = ErrorResponse(
             error: .init(
-                message: "Logprobs not supported. Use --variant coreai-sequential", type: "server_error",
-                code: "unsupported"))
+                message: logprobsUnsupportedMessage, type: "server_error", code: "unsupported"))
         let data = try JSONEncoder().encode(err)
         return Response(
             status: .notImplemented, headers: [.contentType: "application/json"],
@@ -68,7 +67,29 @@ func handleCompletionsFromBody(body: ByteBuffer, state: ServerState) async throw
 
 // MARK: - Loglikelihood Implementation
 
+let logprobsUnsupportedMessage = "Logprobs not supported. Use --variant coreai-sequential"
+
 private func handleLoglikelihood(req: CompletionRequest, state: ServerState) async throws -> Response {
+    let outcome = try await runLoglikelihood(req: req, state: state)
+    let data = try JSONEncoder().encode(outcome.response)
+    return Response(
+        status: .ok,
+        headers: [.contentType: "application/json"],
+        body: .init(byteBuffer: ByteBuffer(data: data))
+    )
+}
+
+/// A scoring response with its token count and timing.
+struct LoglikelihoodOutcome {
+    let response: CompletionResponse
+    /// Tokens over all prompts.
+    let promptTokenCount: Int
+    let totalSeconds: Double
+}
+
+/// Scores the prompts in `req`, for `/v1/completions` and `--replay`. Call it while holding the
+/// scoring access, on an engine with `supportsLogprobs`.
+func runLoglikelihood(req: CompletionRequest, state: ServerState) async throws -> LoglikelihoodOutcome {
     let requestID = RequestID.next()
     let created = Int(Date().timeIntervalSince1970)
     let wantsEcho = req.echo ?? false
@@ -120,13 +141,7 @@ private func handleLoglikelihood(req: CompletionRequest, state: ServerState) asy
         id: requestID, object: "text_completion", created: created,
         model: state.config.modelName, choices: choices
     )
-
-    let data = try JSONEncoder().encode(response)
-    return Response(
-        status: .ok,
-        headers: [.contentType: "application/json"],
-        body: .init(byteBuffer: ByteBuffer(data: data))
-    )
+    return LoglikelihoodOutcome(response: response, promptTokenCount: totalTokens, totalSeconds: seconds)
 }
 
 /// Tokenized prompt to score, with the target token each position predicts.
