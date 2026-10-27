@@ -243,10 +243,12 @@ public struct EngineFactory: Sendable {
     // MARK: - Variant Resolution
 
     /// Resolves the engine variant based on override or auto-detection.
-    // Internal for EngineSupportTests.
     ///
-    /// A dynamic graph with an `attn_mask` input resolves to the sequential engine, which is the
-    /// only engine that fills the mask.
+    /// `takesAttentionMask` is true when the graph has an `attn_mask` input. Auto-detection picks
+    /// `.sequential` for a dynamic graph with one. Throws `unsupportedEngineVariant` for an unknown
+    /// or incompatible override, including `coreai-pipelined` on a dynamic graph with an `attn_mask`
+    /// input.
+    // Internal for EngineSupportTests.
     static func resolveVariant(
         override: String?,
         detectedStructure: ModelStructure,
