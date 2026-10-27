@@ -267,6 +267,53 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     )
     var batchPrototypeRows: Int?
 
+    @Option(
+        name: .customLong("draft-model"),
+        help:
+            "Path to a draft model bundle to enable speculative decoding. Must share the tokenizer/vocabulary with --model. The static-shape engine verifies and drafts."
+    )
+    var draftModel: String?
+
+    @Option(
+        name: .customLong("num-draft-tokens"),
+        help:
+            "Tokens the draft proposes per speculative step, 1 to \(SpeculativeDefaults.maxDraftTokens) (default: \(SpeculativeDefaults.numDraftTokens))."
+    )
+    var numDraftTokens: Int?
+
+    @Option(
+        name: .customLong("seed"),
+        help:
+            "Speculative decoding with temperature sampling: seed the random number generator so a run is reproducible (default: the system generator)."
+    )
+    var seed: UInt64?
+
+    @Flag(
+        name: .customLong("adaptive-draft-count"),
+        help: "Speculative decoding: adapt the draft count to acceptance.")
+    var adaptiveDraftCount: Bool = false
+
+    @Flag(
+        name: .customLong("no-align-proposals"),
+        help:
+            "Speculative decoding: do not shorten proposals to fit the target's single-forward window (a verify block that crosses a batch boundary then costs a second forward)."
+    )
+    var noAlignProposals: Bool = false
+
+    @Flag(
+        name: .customLong("prompt-lookup"),
+        help:
+            "Speculative decoding from the running context: a block whose recent tokens recur earlier proposes what followed. Alone it needs no draft model; with --draft-model, a recurring block is proposed from the context and any other from the draft model. Greedy only."
+    )
+    var promptLookup: Bool = false
+
+    @Option(
+        name: .customLong("prompt-lookup-min-ngram"),
+        help:
+            "With --prompt-lookup: shortest recurring suffix that proposes by lookup (default: \(SpeculativeDefaults.lookupMinNgram))."
+    )
+    var promptLookupMinNgram: Int = SpeculativeDefaults.lookupMinNgram
+
     func validate() throws {
         if let rows = batchPrototypeRows {
             if rows < 1 { throw ValidationError("--batch-prototype must be >= 1") }
@@ -308,6 +355,25 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         }
         if jsonMaxWhitespace < 0 {
             throw ValidationError("--json-max-whitespace must be >= 0 (0 for no limit)")
+        }
+        if let problem = SpeculativeOptions.draftCountProblem(numDraftTokens) {
+            throw ValidationError(problem)
+        }
+        if promptLookupMinNgram < 1 {
+            throw ValidationError("--prompt-lookup-min-ngram must be >= 1")
+        }
+        let speculating = draftModel != nil || promptLookup
+        if seed != nil && !speculating {
+            throw ValidationError("--seed applies to speculative decoding (--draft-model or --prompt-lookup)")
+        }
+        if speculating && jsonSchema != nil {
+            throw ValidationError("--json-schema cannot be used with speculative decoding")
+        }
+        let greedy = samplingStrategy.lowercased() == "greedy" || temperature == 0
+        if let problem = SpeculativeOptions.samplingProblem(greedy: greedy, promptLookup: promptLookup)
+            ?? SpeculativeOptions.imageProblem(hasImage: imagePath != nil, hasRawTokens: rawTokens != nil)
+        {
+            throw ValidationError(problem)
         }
     }
 
@@ -371,7 +437,254 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         }
     }
 
+    /// Speculative decoding: a draft + target pair, or the prompt-lookup drafter alone. Each engine is
+    /// created via `EngineFactory` (static-shape) and driven by ``SpeculativeDecoder``.
+    /// Greedy output is token-for-token identical to the target alone.
+    private func runSpeculativeDecoding(
+        targetPath: String, draftPath rawDraftPath: String?, resolver: ModelPaths
+    ) async throws {
+        func loadSpeculativeEngine(from path: String, label: String) async throws
+            -> (engine: any SpeculativeEngine, bundle: LanguageModelBundle)
+        {
+            let bundle = try LanguageModelBundle(from: path)
+            try bundle.modelBundle.validateModelAssets()
+            let options = EngineOptions(
+                variant: inferenceEngineVariant,
+                kvCacheStrategy: kvCacheStrategy,
+                kvCacheSize: kvCacheInitialCapacity,
+                tensorData: bundle.tensorData
+            )
+            // The factory builds the vision-wired static-shape engine for a VLM bundle whose decoder
+            // gathers its own token embeddings, so the target can encode and scatter an image.
+            let engine = try await EngineFactory.createEngine(bundle: bundle, options: options)
+            guard let spec = engine as? any SpeculativeEngine else {
+                print(
+                    "Error: engine for \(bundle.name) (\(type(of: engine))) does not support "
+                        + "speculative decoding (needs the static-shape engine).")
+                throw ExitCode.failure
+            }
+            print("Loaded \(label): \(bundle.name)  engine=\(type(of: engine))")
+            return (spec, bundle)
+        }
+
+        print("\n⏳ Loading target for speculative decoding...")
+        let (targetEngine, targetBundle) = try await loadSpeculativeEngine(from: targetPath, label: "target")
+
+        // Draft: either a loaded draft model, or the free prompt-lookup drafter.
+        var draftEngine: (any SpeculativeEngine)?
+        if let rawDraftPath {
+            guard let draftURL = resolver.resolve(rawDraftPath) else {
+                print("Error: \(resolver.notFoundError(for: rawDraftPath))")
+                throw ExitCode.failure
+            }
+            let (draft, draftBundle) = try await loadSpeculativeEngine(from: draftURL.path, label: "draft")
+            guard targetBundle.vocabSize == draftBundle.vocabSize else {
+                print("Error: draft/target vocab mismatch (\(draftBundle.vocabSize) vs \(targetBundle.vocabSize)).")
+                throw ExitCode.failure
+            }
+            draftEngine = draft
+        }
+
+        // Warm up the engine(s) so their graphs are specialized before the loop.
+        let warmupSampling = try parseSamplingStrategy()
+        var warmEngines: [(any SpeculativeEngine, String)] = [(targetEngine, "target")]
+        if let draftEngine { warmEngines.append((draftEngine, "draft")) }
+        for (engine, label) in warmEngines {
+            if let inferenceEngine = engine as? any InferenceEngine {
+                print("Warming up \(label)...")
+                try await performWarmup(
+                    mode: warmup, warmupLength: warmupLength, engine: inferenceEngine,
+                    samplingConfiguration: warmupSampling)
+                try await engine.reset(to: 0)
+            }
+        }
+
+        let tokenizer = try await targetBundle.loadTokenizer()
+        let stopTokenIds = RunnerPrompting.stopTokenIds(
+            tokenizer: tokenizer,
+            additional: RunnerPrompting.additionalStopTokenIds(
+                tokenizerDirectory: targetBundle.tokenizerPath, tokenizer: tokenizer))
+
+        let promptInput = try resolvePromptInput()
+        let promptTokens: [Int32]
+        switch promptInput {
+        case .text(let text):
+            let input: Input = applyChatTemplate ? .prompt(text) : .rawText(text)
+            promptTokens = try PromptUtils.maybeApplyTokenizerChatTemplate(input, tokenizer: tokenizer)
+                .map { Int32($0) }
+        case .rawTokens(let container):
+            promptTokens = container.tokens.map { Int32($0) }
+        }
+
+        // Vision: when an image is provided and the target is a multimodal static-shape
+        // engine, encode it, rebuild the prompt with image-placeholder tokens, and stage
+        // the image on the target via the decoder's `onPrefillReady` hook so the
+        // speculative prefill scatters it into the KV (the drafter then attends over the
+        // image-inclusive shared KV). Without this the spec path prefills text-only and
+        // the model never sees the image.
+        var promptTokensForGen = promptTokens
+        var onPrefillReady: (() async throws -> Void)?
+        if let imagePath {
+            guard let mmTarget = targetEngine as? StaticShapeEngine else {
+                print(
+                    "Error: --image with speculative decoding requires the static-shape target engine "
+                        + "(got \(type(of: targetEngine))).")
+                throw ExitCode.failure
+            }
+            guard let visionConfig = targetBundle.visionConfig else {
+                print("Error: --image given but target bundle has no 'vision' config in metadata.json")
+                throw ExitCode.failure
+            }
+            let imageURL = URL(fileURLWithPath: imagePath)
+            guard FileManager.default.fileExists(atPath: imageURL.path) else {
+                print("Error: image not found at \(imagePath)")
+                throw ExitCode.failure
+            }
+            let embedded = try await mmTarget.encodeImage(at: imageURL)
+            let displayText: String = {
+                if case .text(let t) = promptInput { return t } else { return "" }
+            }()
+            guard
+                let vlmTokens = try? buildVLMPromptFromChatTemplate(
+                    prompt: displayText, imageTokenCount: embedded.tokenCount,
+                    imageTokenId: visionConfig.imageTokenId, tokenizer: tokenizer)
+            else {
+                print("Error: the tokenizer has no chat template that places an image, which --image needs here.")
+                throw ExitCode.failure
+            }
+            promptTokensForGen = vlmTokens
+            onPrefillReady = { try mmTarget.setPendingImage(embedded, tokens: vlmTokens) }
+            print("🖼️  image: \(embedded.tokenCount) soft tokens, VLM prompt \(vlmTokens.count) tokens")
+        }
+
+        let contextLength = min(
+            targetEngine.config.maxContextLength, draftEngine?.config.maxContextLength ?? .max)
+        if let problem = SpeculativeOptions.promptLengthProblem(
+            promptTokens: promptTokensForGen.count, contextLength: contextLength)
+        {
+            throw ValidationError(problem)
+        }
+
+        let useGreedy = samplingStrategy.lowercased() == "greedy" || temperature == 0
+
+        // The speculative path samples with temperature only (or takes the argmax).
+        var ignoredOptions: [String] = []
+        if topK != nil { ignoredOptions.append("--top-k") }
+        if topP != nil { ignoredOptions.append("--top-p") }
+        if minP != nil { ignoredOptions.append("--min-p") }
+        if repetitionPenalty != nil { ignoredOptions.append("--repetition-penalty") }
+        if repetitionPenaltyWindow != nil { ignoredOptions.append("--repetition-penalty-window") }
+        if !stopTokens.isEmpty { ignoredOptions.append("--stop-tokens") }
+        if !ignoredOptions.isEmpty {
+            print(
+                "Warning: speculative decoding ignores \(ignoredOptions.joined(separator: ", ")); "
+                    + "generation stops only at the tokenizer's end-of-sequence tokens and "
+                    + "samples with --temperature alone.")
+        }
+
+        let decoder: SpeculativeDecoder
+        let drafterLabel: String
+        let adaptive = adaptiveDraftCount
+        if let draftEngine {
+            decoder = SpeculativeDecoder(
+                draft: draftEngine, target: targetEngine,
+                numDraftTokens: self.numDraftTokens ?? SpeculativeDefaults.numDraftTokens,
+                adaptiveDraftCount: adaptive)
+            if promptLookup {
+                decoder.promptLookup = PromptLookup(
+                    maxNgram: max(SpeculativeDefaults.lookupMaxNgram, promptLookupMinNgram),
+                    minNgram: promptLookupMinNgram)
+            }
+            drafterLabel = promptLookup ? "draft-model + prompt-lookup" : "draft-model"
+        } else {
+            let lookup = PromptLookupDrafter(
+                maxNgram: max(SpeculativeDefaults.lookupMaxNgram, promptLookupMinNgram), minNgram: promptLookupMinNgram,
+                maxContextLength: targetBundle.maxContextLength)
+            decoder = SpeculativeDecoder(
+                drafter: lookup, target: targetEngine,
+                numDraftTokens: self.numDraftTokens ?? SpeculativeDefaults.numDraftTokens,
+                adaptiveDraftCount: adaptive)
+            drafterLabel = "prompt-lookup (free n-gram)"
+        }
+        let numDraftTokens = decoder.numDraftTokens
+        let widestProposal = targetEngine.maxVerifyBlockLength - 1
+        if numDraftTokens > widestProposal {
+            print(
+                "Note: the target verifies at most \(widestProposal + 1) tokens per pass, so each step "
+                    + "drafts at most \(widestProposal) (--num-draft-tokens \(numDraftTokens)).")
+        }
+        decoder.alignProposalsToForward = !noAlignProposals
+        print(
+            "\nGenerating (speculative, drafter=\(drafterLabel), k=\(numDraftTokens)\(adaptive ? " adaptive" : ""), \(useGreedy ? "greedy" : "sampling T=\(temperature)"))...\n"
+        )
+
+        var generatedIds: [Int] = []
+        var previousText = ""
+        let onToken: (Int32) -> Void = { token in
+            if !stopTokenIds.contains(token) {
+                generatedIds.append(Int(token))
+                let full = tokenizer.decode(tokens: generatedIds)
+                let delta = String(full.dropFirst(previousText.count))
+                previousText = full
+                print(delta, terminator: "")
+                fflush(stdout)
+            }
+        }
+
+        let clock = SuspendingClock()
+        let start = clock.now
+        let stats: SpeculativeDecoder.Stats
+        do {
+            if useGreedy {
+                stats = try await decoder.generateGreedy(
+                    promptTokens: promptTokensForGen, maxNewTokens: maxTokens,
+                    stopTokenIds: stopTokenIds,
+                    onPrefillReady: onPrefillReady, onToken: onToken)
+            } else {
+                stats = try await decoder.generateSampling(
+                    promptTokens: promptTokensForGen, maxNewTokens: maxTokens,
+                    stopTokenIds: stopTokenIds, temperature: temperature, seed: seed,
+                    onPrefillReady: onPrefillReady, onToken: onToken)
+            }
+        } catch {
+            print("\n[spec-decode] error: \(error)  |  reflected: \(String(reflecting: error))")
+            throw error
+        }
+        let seconds = (clock.now - start).inSeconds
+        let tokPerSec = seconds > 0 ? Double(stats.generatedTokens) / seconds : 0
+
+        print("\n\n── Speculative decoding summary ──")
+        print(
+            "  target=\(targetBundle.name)  drafter=\(drafterLabel)  k=\(numDraftTokens)\(adaptive ? " adaptive" : "")")
+        print("  generated tokens:      \(stats.generatedTokens)")
+        print("  target forward passes: \(stats.iterations)")
+        print(
+            "  draft accepted:        \(stats.draftTokensAccepted)/\(stats.draftTokensProposed) "
+                + "(\(String(format: "%.1f", stats.acceptanceRate * 100))%)")
+        print("  tokens / target pass:  \(String(format: "%.2f", stats.meanTokensPerTargetPass))")
+        print(
+            "  throughput:            \(String(format: "%.1f", tokPerSec)) tok/s (\(String(format: "%.2f", seconds))s, incl. prompt/specialization)"
+        )
+        let genTokPerSec =
+            stats.generationSeconds > 0 ? Double(stats.generatedTokens) / stats.generationSeconds : 0
+        print(
+            "  generation-only:       \(String(format: "%.1f", genTokPerSec)) tok/s "
+                + "(\(String(format: "%.2f", stats.generationSeconds))s) — compare to base 'Generation:'")
+        if stats.lookupProposals > 0 {
+            print(
+                "  lookup proposals:      \(stats.lookupProposals) blocks, "
+                    + "\(stats.lookupTokensAccepted)/\(stats.lookupTokensProposed) tokens accepted")
+        }
+    }
+
     func runModel(path modelFile: String, resolver: ModelPaths) async throws {
+        // Speculative decoding: a draft model, prompt lookup, or both.
+        if draftModel != nil || promptLookup {
+            try await runSpeculativeDecoding(
+                targetPath: modelFile, draftPath: draftModel, resolver: resolver)
+            return
+        }
+
         // Validate continuation mode requirements
         if let continuation = continuation {
             guard !applyChatTemplate else {
@@ -514,26 +827,13 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             component: "Main")
 
         // Read additional stop token IDs from tokenizer_config.json (e.g. <end_of_turn> for Gemma)
-        var additionalEosTokenIds: Set<Int32>
-        if let tokenizerDir = bundle.tokenizerPath {
-            additionalEosTokenIds = LanguageConfig.additionalStopTokenIds(
-                from: tokenizerDir, tokenizer: tokenizer)
-            if !additionalEosTokenIds.isEmpty {
-                CLILogger.log(
-                    "Found \(additionalEosTokenIds.count) additional stop token(s) from tokenizer config: \(additionalEosTokenIds.sorted())",
-                    component: "Main")
-            }
-        } else {
-            additionalEosTokenIds = []
-        }
-
-        // Agentic models use <|eot|> as a turn boundary. It may not appear in
-        // tokenizer_config.json, so add it explicitly (skipping the main EOS).
-        let thinkingFormat = detectThinkingFormat(using: tokenizer)
-        if let eotId = agenticEndOfTurnTokenId(thinkingFormat: thinkingFormat, tokenizer: tokenizer),
-            eotId != tokenizer.eosTokenId.map({ Int32($0) })
-        {
-            additionalEosTokenIds.insert(eotId)
+        // and, for agentic models, the end-of-turn token.
+        let additionalEosTokenIds = RunnerPrompting.additionalStopTokenIds(
+            tokenizerDirectory: bundle.tokenizerPath, tokenizer: tokenizer)
+        if !additionalEosTokenIds.isEmpty {
+            CLILogger.log(
+                "Found \(additionalEosTokenIds.count) additional stop token(s): \(additionalEosTokenIds.sorted())",
+                component: "Main")
         }
 
         CLILogger.log("Model loaded successfully:", component: "Main")
