@@ -59,13 +59,13 @@ package final class AutoregressiveDrafter: DrafterEngine, @unchecked Sendable {
     }
 
     package func reset(to tokenIndex: Int) async throws {
-        try await engine.reset(to: tokenIndex)
+        try await engine.rewindAndConfirm(to: tokenIndex)
     }
 
     package func commit(confirmedLength: Int, features: DrafterFeatures?) async throws {
         // Keep the accepted drafts the engine already holds; the correction (the
         // new anchor) is re-prefilled from `confirmedPrefix` on the next draft.
-        try await engine.reset(to: min(confirmedLength, engine.processedTokenCount))
+        try await engine.rewindAndConfirm(to: min(confirmedLength, engine.processedTokenCount))
     }
 
     package func draftAll(

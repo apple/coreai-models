@@ -77,9 +77,12 @@ class RowEngine: SpeculativeEngine, @unchecked Sendable {
     let verifyTileWidth: Int?
     let maxVerifyBlockLength: Int
     private(set) var committedTokens: [Int32] = []
-    /// When set, a rewind throws and leaves the cache untouched, like a sliding-window ring that no
-    /// longer holds the keys a rewind needs.
-    var refusesResets = false
+    /// Simulates an engine with recurrent state: a rewind to part of the committed tokens clears the
+    /// cache and leaves the cursor at zero, silently.
+    var rewindsOnlyToZero = false
+    /// What ``hasRecurrentState`` reports.
+    var reportsRecurrentState = false
+    var hasRecurrentState: Bool { reportsRecurrentState }
 
     init(maxContextLength: Int, block: Int?, tile: Int?, maxVerifyBlockLength: Int) {
         self.config = Config(maxContextLength: maxContextLength)
@@ -92,7 +95,6 @@ class RowEngine: SpeculativeEngine, @unchecked Sendable {
     func truncate(to count: Int) { fatalError("subclass") }
 
     var processedTokenCount: Int { committedTokens.count }
-    var currentContextSize: Int { committedTokens.count }
 
     // The rest of ``InferenceEngine`` is defaulted: this double only drives the speculative primitives.
     func generate(
@@ -109,9 +111,9 @@ class RowEngine: SpeculativeEngine, @unchecked Sendable {
         }
         // Nothing to roll back; a reset to zero of an empty cache still clears the state.
         guard tokenIndex < committedTokens.count || tokenIndex == 0 else { return }
-        if refusesResets { throw InferenceRuntimeError.invalidState("rewind refused") }
-        truncate(to: tokenIndex)
-        committedTokens.removeLast(committedTokens.count - tokenIndex)
+        let kept = rewindsOnlyToZero ? 0 : tokenIndex
+        truncate(to: kept)
+        committedTokens.removeLast(committedTokens.count - kept)
     }
 
     /// Feeds `tokens` and returns the rows of the last `logitsCount` positions.
@@ -160,22 +162,11 @@ class RowEngine: SpeculativeEngine, @unchecked Sendable {
         return (try run(tokens, logitsCount: tokens.count).map { $0.map { LogitsScalarType($0) } }, nil)
     }
 
-    func forwardProposalTopK(
-        anchor: Int32, proposal: DraftProposal, k: Int
-    ) async throws -> (topK: [[Int32]], features: DrafterFeatures?) {
-        let tokens = [anchor] + proposal.tokens
-        let k = max(1, k)
-        let rows = try run(tokens, logitsCount: tokens.count)
-        return (rows.map { row in Array(rankedIndices(row).prefix(k)).map { Int32($0) } }, nil)
-    }
-
     /// Room left in the aligned block after the anchor at the next position.
     var oneForwardDraftBudget: Int {
         guard let block = alignedBlockSize, block > 0 else { return Int.max }
         return block - 1 - (committedTokens.count % block)
     }
-
-    private func rank(_ x: Float) -> Float { x.isNaN ? -.infinity : x }
 
     private func argmax(_ row: [Float]) -> Int32 {
         var best = 0
@@ -185,10 +176,6 @@ class RowEngine: SpeculativeEngine, @unchecked Sendable {
             best = i
         }
         return Int32(best)
-    }
-
-    private func rankedIndices(_ row: [Float]) -> [Int] {
-        row.indices.sorted { rank(row[$0]) != rank(row[$1]) ? rank(row[$0]) > rank(row[$1]) : $0 < $1 }
     }
 }
 

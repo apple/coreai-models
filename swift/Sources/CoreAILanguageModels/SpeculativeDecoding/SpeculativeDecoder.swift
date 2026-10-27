@@ -221,6 +221,11 @@ package final class SpeculativeDecoder: @unchecked Sendable {
         }
         guard maxNewTokens > 0, !promptTokens.isEmpty else { return stats }
 
+        guard !target.hasRecurrentState else {
+            throw InferenceRuntimeError.invalidArgument(
+                "speculative decoding rewinds the target after a rejection, which an engine with "
+                    + "recurrent state cannot do")
+        }
         let maxContext = min(drafter.maxContextLength, target.config.maxContextLength)
         guard promptTokens.count <= maxContext else {
             throw InferenceRuntimeError.invalidArgument(
@@ -231,7 +236,7 @@ package final class SpeculativeDecoder: @unchecked Sendable {
         var tokens = promptTokens
 
         // Start both engines clean.
-        try await target.reset(to: 0)
+        try await target.rewindAndConfirm(to: 0)
         try await drafter.reset(to: 0)
 
         // After the reset (which clears any per-run state the target holds) and before the
@@ -258,7 +263,13 @@ package final class SpeculativeDecoder: @unchecked Sendable {
             try Task.checkCancellation()
             let prefixLen = tokens.count
             let anchor = tokens[prefixLen - 1]
-            let baseProcessed = target.processedTokenCount  // == prefixLen - 1
+            // Every token but the anchor is in the target's cache; the rest of the round counts from
+            // here, so a target that holds anything else would verify at the wrong positions.
+            let baseProcessed = target.processedTokenCount
+            guard baseProcessed == prefixLen - 1 else {
+                throw InferenceRuntimeError.invalidState(
+                    "the target holds \(baseProcessed) tokens, but \(prefixLen - 1) precede the anchor")
+            }
             // The drafter's count this round. A block that crosses the verify tile costs a second
             // target forward -- as much as the whole round -- so a tile-aligned run drafts only what
             // fits, and nothing when only the anchor does.
@@ -332,7 +343,7 @@ package final class SpeculativeDecoder: @unchecked Sendable {
             // 4. Roll the target KV to [confirmed prefix + accepted drafts]: the verify order
             //    matches the proposal's, so truncation suffices.
             let confirmedLength = baseProcessed + 1 + acceptedTokens.count
-            try await target.reset(to: confirmedLength)
+            try await target.rewindAndConfirm(to: confirmedLength)
 
             // 5. Bring the drafter into step (token drafter rolls back; attached-head
             //    drafter injects the committed feature rows).

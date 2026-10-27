@@ -223,6 +223,73 @@ extension SpeculativeSafetyTests {
     }
 }
 
+extension SpeculativeSafetyTests {
+    @Test("A target with recurrent state is refused before anything is prefilled")
+    func recurrentTargetIsRefused() async throws {
+        let model = HashModel(vocab: 30, levels: 1000, salt: 8)
+        let target = HashEngine(model: model)
+        target.reportsRecurrentState = true
+        let decoder = SpeculativeDecoder(
+            drafter: FuzzDrafter(model: model, seed: 1), target: target, numDraftTokens: 3)
+        await #expect(throws: InferenceRuntimeError.self) {
+            _ = try await decoder.generateGreedy(
+                promptTokens: [1, 2, 3], maxNewTokens: 5, stopTokenIds: [], onToken: { _ in })
+        }
+        #expect(target.processedTokenCount == 0)
+    }
+
+    @Test("A target whose rewind silently lands elsewhere stops the run instead of continuing from it")
+    func rewindThatLandsElsewhere() async throws {
+        let model = HashModel(vocab: 30, levels: 1000, salt: 9)
+        let target = HashEngine(model: model)
+        target.rewindsOnlyToZero = true  // does not report it: the cursor is the only evidence
+        // Random proposals are rejected within a few rounds, which forces a rewind.
+        let decoder = SpeculativeDecoder(
+            drafter: FuzzDrafter(model: model, seed: 5), target: target, numDraftTokens: 4)
+        await #expect(throws: InferenceRuntimeError.self) {
+            for _ in 0..<20 {
+                _ = try await decoder.generateGreedy(
+                    promptTokens: [1, 2, 3], maxNewTokens: 40, stopTokenIds: [], onToken: { _ in })
+            }
+        }
+    }
+
+    @Test("A target holding the wrong number of tokens is reported before it is verified against")
+    func targetOutOfStep() async throws {
+        let model = HashModel(vocab: 30, levels: 1000, salt: 10)
+        // The target's prefill drops a token, so the cache is one short of the confirmed prefix.
+        let target = ShortPrefillEngine(inner: HashEngine(model: model))
+        let decoder = SpeculativeDecoder(
+            drafter: FuzzDrafter(model: model, seed: 2), target: target, numDraftTokens: 3)
+        await #expect(throws: InferenceRuntimeError.self) {
+            _ = try await decoder.generateGreedy(
+                promptTokens: [1, 2, 3, 4], maxNewTokens: 5, stopTokenIds: [], onToken: { _ in })
+        }
+    }
+}
+
+/// Prefills one token fewer than asked, as an engine that lost track of its cache would.
+private final class ShortPrefillEngine: SpeculativeEngine, @unchecked Sendable {
+    let inner: HashEngine
+    init(inner: HashEngine) { self.inner = inner }
+    var config: RowEngine.Config { inner.config }
+    var processedTokenCount: Int { inner.processedTokenCount }
+    func reset(to tokenIndex: Int) async throws { try await inner.reset(to: tokenIndex) }
+    func advance(_ tokens: [Int32]) async throws { try await inner.advance(Array(tokens.dropLast())) }
+    func forwardPerPositionArgmax(_ tokens: [Int32]) async throws -> [Int32] {
+        try await inner.forwardPerPositionArgmax(tokens)
+    }
+    func forwardWithPerPositionLogits(_ tokens: [Int32]) async throws -> [[LogitsScalarType]] {
+        try await inner.forwardWithPerPositionLogits(tokens)
+    }
+    func generate(
+        with input: [TokenId], samplingConfiguration: SamplingConfiguration,
+        inferenceOptions: InferenceOptions
+    ) async throws -> EmptyOutputSequence {
+        throw InferenceRuntimeError.invalidState("ShortPrefillEngine implements only the speculative primitives")
+    }
+}
+
 /// Wraps an engine and drops the first row of every per-position argmax, as an engine would that
 /// scores fewer positions than a verify block holds.
 private final class ShortRowsEngine: SpeculativeEngine, @unchecked Sendable {

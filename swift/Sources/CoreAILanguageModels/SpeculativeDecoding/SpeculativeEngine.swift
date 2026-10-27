@@ -94,3 +94,20 @@ extension SpeculativeEngine {
 
     package var oneForwardDraftBudget: Int { Int.max }
 }
+
+extension SpeculativeEngine {
+    /// Roll the cache back to `tokenIndex` and confirm the engine is there.
+    ///
+    /// An engine with recurrent state cannot truncate its cache, so a rewind to part of the
+    /// committed tokens full-resets it instead (see ``InferenceEngine/hasRecurrentState``). The
+    /// decoder reasons from the cursor, so a cursor that did not land on `tokenIndex` is an error,
+    /// not something to continue from.
+    package func rewindAndConfirm(to tokenIndex: Int) async throws {
+        try await reset(to: tokenIndex)
+        guard processedTokenCount == tokenIndex else {
+            throw InferenceRuntimeError.invalidState(
+                "the engine holds \(processedTokenCount) tokens after a rewind to \(tokenIndex); "
+                    + "an engine that cannot rewind part way cannot be speculated on")
+        }
+    }
+}

@@ -46,6 +46,18 @@ struct AutoregressiveDrafterGuardTests {
         #expect(later.tokens.count == 2)
     }
 
+    @Test("A draft engine whose rewind lands elsewhere is reported, not drafted from")
+    func draftEngineThatCannotRewind() async throws {
+        let engine = HashEngine(model: HashModel(vocab: 8, levels: 5, salt: 1))
+        engine.rewindsOnlyToZero = true
+        let drafter = AutoregressiveDrafter(engine: engine)
+        var rng = SystemRandomNumberGenerator()
+        _ = try await drafter.draftAll(
+            confirmedPrefix: [1, 2, 3, 4], count: 2, policy: .greedy, using: &rng)
+        // The draft holds 5 tokens; rewinding to 3 clears the whole cache.
+        await #expect(throws: InferenceRuntimeError.self) { try await drafter.reset(to: 3) }
+    }
+
     @Test("Greedy drafting reads each step's argmax and never copies a logits row")
     func greedyDraftsAvoidTheLogitsCopy() async throws {
         let model = HashModel(vocab: 30, levels: 1000, salt: 2)
