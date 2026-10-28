@@ -119,3 +119,15 @@ def test_float16_scaled_rms_norm_matches_float32_across_magnitudes(peak: float) 
         got = ScaledRMSNorm(256, eps, with_scale=False).half()(x16).float()
     assert torch.isfinite(got).all()
     torch.testing.assert_close(got, want, rtol=2e-3, atol=2e-3)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_all_zero_pool_weights_give_a_zero_vector(dtype: torch.dtype) -> None:
+    cfg, _, state = _reference_and_state_dict()
+    ios, table = text_encoder_from_state_dict(cfg, state, dtype=dtype)
+    ids, mask = _ragged_batch([6], seq_len=6, vocab=cfg.vocab_size)
+    inputs = _host_inputs(ids, mask, table, cfg.sliding_window, dtype)
+    inputs["pool_weights"] = torch.zeros_like(inputs["pool_weights"])
+    with torch.no_grad():
+        got = ios(**inputs)
+    assert torch.equal(got, torch.zeros_like(got))

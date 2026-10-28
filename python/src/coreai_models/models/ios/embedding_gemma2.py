@@ -27,7 +27,8 @@ from coreai_models.models.macos.embedding_gemma2 import (
 )
 from coreai_models.primitives.ios.sdpa import SDPA
 
-# Smallest positive normal float16; floors the row max-abs so all-zero rows stay finite.
+# Smallest positive normal float16; floors the row max-abs and the squared norm so all-zero rows
+# stay finite.
 _FP16_TINY = 6.103515625e-05
 MASK_NEG = -30000.0
 
@@ -210,7 +211,7 @@ class EmbeddingGemma2TextEncoder(nn.Module):
         y = self.embedding_projection(pooled.unsqueeze(-1)).reshape(b, -1)  # (B, E)
         m = y.abs().amax(-1, keepdim=True).clamp(min=_FP16_TINY)
         ys = y * torch.reciprocal(m)
-        return ys * torch.rsqrt((ys * ys).sum(-1, keepdim=True))
+        return ys * torch.rsqrt((ys * ys).sum(-1, keepdim=True).clamp(min=_FP16_TINY))
 
 
 def text_encoder_from_state_dict(
