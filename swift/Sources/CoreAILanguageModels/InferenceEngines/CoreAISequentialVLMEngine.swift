@@ -265,9 +265,12 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
             throw InferenceRuntimeError.invalidOutputType(
                 "Cannot get descriptor for '\(logitsName)'")
         }
-        guard logitsDesc.scalarType == .float16 || logitsDesc.scalarType == .bfloat16 else {
+        // Logits are read back as `LogitsScalarType` (Float16) without conversion. Exports cast
+        // logits to float16 with `cast_logits_bfloat16_to_float16`.
+        guard logitsDesc.scalarType == .float16 else {
             throw InferenceRuntimeError.unsupportedLogitsType(
-                "Only float16/bfloat16 logits supported, got \(logitsDesc.scalarType)")
+                "Only float16 logits supported, got \(logitsDesc.scalarType). "
+                    + "Re-export with logits cast to float16.")
         }
         self.logitsDescriptor = logitsDesc
 
