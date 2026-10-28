@@ -106,9 +106,11 @@ public struct InferenceOptions: Sendable {
     }
 }
 
-/// Presets for the common (tokens, logits) pairs.
+/// Presets for the common (tokens, logits) pairs. Engines currently sample a token under every
+/// preset; see `TokenRequest`.
 extension InferenceOptions {
-    /// No token, no logits. For prefill and warmup chunks.
+    /// Requests no token and no logits, for prefill and warmup chunks. Pass `maxTokens`; nil runs
+    /// until EOS.
     public static func prefill(maxTokens: Int? = nil) -> InferenceOptions {
         InferenceOptions(maxTokens: maxTokens, tokens: .none, logits: .none)
     }
@@ -120,12 +122,14 @@ extension InferenceOptions {
     public static func `default`(maxTokens: Int? = nil) -> InferenceOptions {
         .extend(maxTokens: maxTokens)
     }
-    /// No token, logits at every position. For perplexity and scoring with `forcedContinuation`.
+    /// Requests logits at every position and no token. For perplexity and scoring with
+    /// `forcedContinuation`.
     public static func eval(maxTokens: Int? = nil, forcedContinuation: [Int32]? = nil) -> InferenceOptions {
         InferenceOptions(
             maxTokens: maxTokens, tokens: .none, logits: .allPositions, forcedContinuation: forcedContinuation)
     }
-    /// No token, last-position logits. For constrained decoding, where the caller masks and samples.
+    /// Requests last-position logits and no token. For constrained decoding, where the caller masks
+    /// and samples.
     public static func guided(maxTokens: Int? = nil) -> InferenceOptions {
         InferenceOptions(maxTokens: maxTokens, tokens: .none, logits: .lastPosition)
     }
