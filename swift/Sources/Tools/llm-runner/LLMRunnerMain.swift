@@ -501,7 +501,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         let tokenizerLoadSpan = InstrumentsProfiler.beginTokenizerLoad(id: modelFile)
         async let tokenizerResult = bundle.loadTokenizer()
 
-        // The factory routes by bundle kind: VLM bundles build the sequential VLM engine from
+        // The factory routes by bundle kind: VLM bundles build a vision-language engine from
         // their vision/embedding/main components; everything else takes the single-asset path.
         let inferenceEngine = try await EngineFactory.createEngine(
             bundle: bundle, options: engineOptions)

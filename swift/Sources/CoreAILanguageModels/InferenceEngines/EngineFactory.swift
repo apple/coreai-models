@@ -78,9 +78,10 @@ public struct EngineFactory: Sendable {
     ///
     /// Handles bundles that ship more than one asset. A vision-language bundle (`kind == .vlm`)
     /// carries a vision component and a `main` decoder, plus an embedding component when
-    /// `vision.token_merge` is `separate_embedding`. That field decides the engine: the sequential
-    /// VLM engine for `separate_embedding` (and bundles that predate the field), the static-shape
-    /// engine for `decoder_gather`. Every other kind resolves its `main` asset and hands off to
+    /// `vision.token_merge` is `separate_embedding`. That field decides the engine:
+    /// `CoreAISequentialEngine` for `separate_embedding` (and bundles that predate the field), the
+    /// static-shape engine for `decoder_gather`. A `separate_embedding` bundle accepts only the
+    /// `coreai-sequential` variant override. Every other kind resolves its `main` asset and hands off to
     /// ``createEngine(config:modelURL:options:)``.
     ///
     /// - Parameters:
@@ -181,14 +182,15 @@ public struct EngineFactory: Sendable {
         )
     }
 
-    /// Build the sequential VLM engine: assemble the config, prepare the three components, and
-    /// construct the engine. Components are prepared one at a time to keep Core AI specialization
-    /// stable.
+    /// Build `CoreAISequentialEngine` for a separate-embedding VLM: check the variant override,
+    /// assemble the config, prepare the three components, and construct the engine with its vision
+    /// components. Components are prepared one at a time to keep Core AI specialization stable.
     private static func makeVLMEngine(
         bundle: LanguageModelBundle,
         languageModelURL: URL,
         options: EngineOptions
     ) async throws -> any InferenceEngine {
+        _ = try resolveVLMVariant(override: options.variant)
         let vlmConfig = try makeVLMConfig(
             bundle: bundle, languageModelURL: languageModelURL, options: options)
 
@@ -202,36 +204,6 @@ public struct EngineFactory: Sendable {
         let embedModel = try await PreparedModel.prepare(at: embeddingModelURL)
         let llmModel = try await PreparedModel.prepare(at: languageModelURL)
 
-        return try await CoreAISequentialVLMEngine(
-            config: vlmConfig,
-            visionModel: visionModel,
-            embedModel: embedModel,
-            llmModel: llmModel,
-            options: options
-        )
-    }
-
-    /// Build `CoreAISequentialEngine` for a separate-embedding vision-language bundle: prepare
-    /// the three components one at a time and construct the engine with its vision components.
-    static func makeSequentialVLMEngine(
-        bundle: LanguageModelBundle,
-        options: EngineOptions = EngineOptions()
-    ) async throws -> CoreAISequentialEngine {
-        try bundle.modelBundle.validateModelAssets()
-        let languageModelURL = try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.main)
-        let vlmConfig = try makeVLMConfig(
-            bundle: bundle, languageModelURL: languageModelURL, options: options)
-
-        let visionModelURL = try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.vision)
-        let embeddingModelURL = try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.embedding)
-
-        CLILogger.log("EngineFactory: Creating sequential vision-language engine for \(bundle.name)")
-
-        // Prepare one at a time to keep Core AI specialization stable.
-        let visionModel = try await PreparedModel.prepare(at: visionModelURL)
-        let embedModel = try await PreparedModel.prepare(at: embeddingModelURL)
-        let llmModel = try await PreparedModel.prepare(at: languageModelURL)
-
         return try await CoreAISequentialEngine(
             config: vlmConfig.base,
             preparedModel: llmModel,
@@ -239,6 +211,25 @@ public struct EngineFactory: Sendable {
             vision: CoreAISequentialEngine.VisionComponents(
                 visionModel: visionModel, embedModel: embedModel, visionConfig: vlmConfig.visionConfig)
         )
+    }
+
+    /// Resolves the variant override for a separate-embedding VLM. Auto-detection and
+    /// `coreai-sequential` select the sequential engine; any other variant throws
+    /// `unsupportedEngineVariant`.
+    static func resolveVLMVariant(override: String?) throws -> Variant {
+        guard let override, override != "auto", override != "default" else {
+            return .sequential
+        }
+        guard let variant = Variant(rawValue: override) else {
+            throw InferenceRuntimeError.unsupportedEngineVariant(
+                "Unknown variant '\(override)'. Valid: auto, coreai-sequential, coreai-pipelined, static-shape")
+        }
+        guard variant == .sequential else {
+            throw InferenceRuntimeError.unsupportedEngineVariant(
+                "Variant '\(override)' does not run separate-embedding vision-language models; "
+                    + "use coreai-sequential")
+        }
+        return variant
     }
 
     // MARK: - Config Parsing

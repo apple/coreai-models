@@ -54,7 +54,9 @@ struct VLMSessionParityTests {
     private func makeFixture() async throws -> Fixture {
         let bundle = try LanguageModelBundle(at: URL(fileURLWithPath: VLMParityFixture.bundlePath!))
         let visionConfig = try #require(bundle.visionConfig, "Fixture must be a VLM bundle")
-        let engine = try await EngineFactory.makeSequentialVLMEngine(bundle: bundle)
+        let engine = try #require(
+            try await EngineFactory.createEngine(bundle: bundle) as? CoreAISequentialEngine,
+            "Fixture must resolve to CoreAISequentialEngine")
         #expect(engine.acceptsMultimodalInput)
         let tokenizer = try await bundle.loadTokenizer()
         let image = try await engine.encodeImage(at: URL(fileURLWithPath: VLMParityFixture.imagePath!))
