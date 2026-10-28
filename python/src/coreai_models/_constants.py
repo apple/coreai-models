@@ -84,3 +84,7 @@ DEFAULT_DYNAMIC_MAX_BATCH_SIZE = 8
 METADATA_VERSION = "0.2"
 # Batched LLM bundles use 0.3 (adds the max_batch_size field).
 METADATA_VERSION_BATCHED = "0.3"
+
+# Core AI GPU gathers from a single constant return wrong/zero rows for rows
+# starting at or past this element (apple/coreai-models#313). Tables this large are split.
+MAX_GATHER_CONSTANT_ELEMENTS = 2**31
