@@ -975,17 +975,9 @@ extension CoreAISequentialEngine.GenerationSequence {
 
         private let engine: CoreAISequentialEngine
         private let sessionState: GenerationSessionState
-        private let samplingConfiguration: SamplingConfiguration
-        private let returnsLogits: Bool
-        private let forcedContinuation: [CoreAISequentialEngine.TokenId]?
-        private let maxTokens: Int
-        private let stopReasonStore: StopReasonStore
         private let generationToken: GenerationToken
+        private var loop: SequentialDecodeLoop
 
-        private var inputTokens: [CoreAISequentialEngine.TokenId]
-        private let generationStartOffset: Int
-        private var step: Int = 0
-        private var finished: Bool = false
         // Pre-computed logits for batched forcedContinuation evaluation.
         // When non-nil, next() yields from this buffer instead of running inference.
         private var batchedLogitsBuffer: [[LogitsScalarType]]?
@@ -1001,18 +993,15 @@ extension CoreAISequentialEngine.GenerationSequence {
         ) {
             self.engine = engine
             self.sessionState = sessionState
-            self.samplingConfiguration = samplingConfiguration.normalized()
-            self.returnsLogits = inferenceOptions.returnsLogits
-            self.forcedContinuation = inferenceOptions.forcedContinuation
-            self.stopReasonStore = stopReasonStore
             self.generationToken = generationToken
-            self.inputTokens = input
-            self.generationStartOffset = input.count
-            self.maxTokens = SequentialIterator.clampMaxTokens(
-                requested: inferenceOptions.maxTokens,
-                forcedCount: inferenceOptions.forcedContinuation?.count,
-                inputCount: input.count,
-                maxContextLength: engine.config.maxContextLength
+            self.loop = SequentialDecodeLoop(
+                input: input,
+                samplingConfiguration: samplingConfiguration,
+                inferenceOptions: inferenceOptions,
+                maxContextLength: engine.config.maxContextLength,
+                stopReasonStore: stopReasonStore,
+                generationToken: generationToken,
+                release: { [sessionState] in sessionState.tokenBox.clearIfActive(generationToken) }
             )
         }
 
@@ -1021,157 +1010,106 @@ extension CoreAISequentialEngine.GenerationSequence {
         }
 
         public func next() async throws -> InferenceOutput? {
-            if finished { return nil }
-
-            if generationToken.isCancelled {
-                stopReasonStore.set(.cancelled)
-                finishAndRelease()
-                return nil
-            }
-
-            guard step < maxTokens else {
-                // Natural exhaustion. Don't clobber a reason a decoder set (e.g. `.eos`).
-                stopReasonStore.setIfUnset(.maxTokens)
-                finishAndRelease()
-                return nil
-            }
+            guard loop.shouldContinue() else { return nil }
 
             // Fast path: batched forcedContinuation with logits.
             // All tokens were processed in one prefill; yield pre-computed logits.
             if let buffer = batchedLogitsBuffer {
-                let logits = buffer[step]
-                let token = forcedContinuation![step]
-                step += 1
-                if step >= maxTokens {
-                    stopReasonStore.setIfUnset(.maxTokens)
-                    finishAndRelease()
+                let logits = buffer[loop.step]
+                let token = loop.forcedContinuation![loop.step]
+                loop.step += 1
+                if loop.step >= loop.maxTokens {
+                    loop.stopReasonStore.setIfUnset(.maxTokens)
+                    loop.finish()
                 }
                 return InferenceOutput(tokenId: token, logits: logits)
             }
 
             // First call with forcedContinuation + logits: batch-process all tokens at once.
-            if let forced = forcedContinuation, returnsLogits, step == 0 {
-                let allTokens = inputTokens + forced.map { $0 }
-                let vocabSize = engine.config.vocabSize
-
-                let allLogits: [LogitsScalarType]
-                let strategy = engine.selectPrefillStrategy(newTokenCount: allTokens.count)
-                switch strategy {
-                case .chunked(let chunkSize):
-                    allLogits = try await engine.processChunkedPromptAllLogits(
-                        tokens: allTokens[...], chunkSize: chunkSize, sessionState: sessionState)
-                case .wholeBatch:
-                    allLogits = try await engine.processChunkedPromptAllLogits(
-                        tokens: allTokens[...], chunkSize: allTokens.count, sessionState: sessionState)
-                case .oneAtATime:
-                    var collected: [LogitsScalarType] = []
-                    for j in allTokens.indices {
-                        collected.append(
-                            contentsOf: try await engine.processTokenBatch(
-                                allTokens[j...j], logits: .allPositions, sessionState: sessionState))
-                    }
-                    allLogits = collected
-                }
-
-                // Split into per-position logit vectors.
-                // Skip the prompt positions (inputTokens.count - 1 positions);
-                // we want logits that predict each forced token.
-                let promptLen = inputTokens.count
-                var buffer: [[LogitsScalarType]] = []
-                for i in 0..<forced.count {
-                    let offset = (promptLen - 1 + i) * vocabSize
-                    let endOffset = offset + vocabSize
-                    guard endOffset <= allLogits.count else {
-                        throw InferenceRuntimeError.invalidState(
-                            "Batched logits underflow at position \(i): need \(endOffset), got \(allLogits.count)")
-                    }
-                    buffer.append(Array(allLogits[offset..<endOffset]))
-                }
-                batchedLogitsBuffer = buffer
-
-                // Update engine state
-                sessionState.history.append(contentsOf: allTokens[...])
-
-                // Yield first result
-                let logits = buffer[step]
-                let token = forced[step]
-                step += 1
-                return InferenceOutput(tokenId: token, logits: logits)
+            if let forced = loop.forcedContinuation, loop.returnsLogits, loop.step == 0 {
+                return try await batchedForcedContinuation(forced)
             }
 
-            do {
-                try Task.checkCancellation()
-
+            return try await loop.decodeStep { inputTokens in
                 guard sessionState.processedTokenCount < inputTokens.count else {
                     throw InferenceRuntimeError.invalidState("No new tokens to process")
                 }
 
                 let oldProcessedCount = sessionState.processedTokenCount
                 let newTokens = inputTokens[sessionState.processedTokenCount...]
-                let strategy = engine.selectPrefillStrategy(newTokenCount: newTokens.count)
-
-                let logitBuffer: [LogitsScalarType]
-                switch strategy {
-                case .chunked(let chunkSize):
-                    logitBuffer = try await engine.processChunkedPrompt(
-                        tokens: newTokens, chunkSize: chunkSize, sessionState: sessionState)
-                case .wholeBatch:
-                    let allLogits = try await engine.runMainSteps(
-                        newTokens, chunkSize: newTokens.count, keepAllLogits: false,
-                        sessionState: sessionState)
-                    logitBuffer = lastTokenLogits(from: allLogits, vocabSize: engine.config.vocabSize)
-                case .oneAtATime:
-                    var lastLogits: [LogitsScalarType] = []
-                    for j in newTokens.indices {
-                        lastLogits = try await engine.processTokenBatch(
-                            newTokens[j...j], logits: .lastPosition, sessionState: sessionState)
+                let logitBuffer = try await SequentialIterator.lastPositionLogits(
+                    for: newTokens,
+                    strategy: engine.selectPrefillStrategy(newTokenCount: newTokens.count),
+                    vocabSize: engine.config.vocabSize,
+                    chunked: { tokens, chunkSize in
+                        try await engine.processChunkedPrompt(
+                            tokens: tokens, chunkSize: chunkSize, sessionState: sessionState)
+                    },
+                    batch: { tokens in
+                        try await engine.runMainSteps(
+                            tokens, chunkSize: tokens.count, keepAllLogits: false, sessionState: sessionState)
                     }
-                    logitBuffer = lastLogits
-                }
+                )
 
                 // Update history with newly processed tokens
                 let processedSlice = inputTokens[oldProcessedCount..<sessionState.processedTokenCount]
                 sessionState.history.append(contentsOf: processedSlice)
-
-                // Check cancellation after inference step
-                if generationToken.isCancelled {
-                    stopReasonStore.set(.cancelled)
-                    finishAndRelease()
-                    return nil
-                }
-
-                let nextToken = SequentialIterator.nextToken(
-                    fromLogits: logitBuffer,
-                    forced: forcedContinuation,
-                    step: step,
-                    sampling: samplingConfiguration,
-                    tokenHistory: inputTokens[generationStartOffset...]
-                )
-
-                inputTokens.append(nextToken)
-                step += 1
-
-                return InferenceOutput(
-                    tokenId: nextToken,
-                    logits: returnsLogits ? logitBuffer : nil
-                )
-            } catch is CancellationError {
-                stopReasonStore.set(.cancelled)
-                finishAndRelease()
-                throw CancellationError()
-            } catch {
-                stopReasonStore.set(.error)
-                finishAndRelease()
-                throw error
+                return logitBuffer
             }
         }
 
-        private func finishAndRelease() {
-            guard !finished else {
-                return
+        /// Process the prompt plus every forced token in one prefill, buffer the logits that
+        /// predict each forced token, and yield the first.
+        private func batchedForcedContinuation(
+            _ forced: [CoreAISequentialEngine.TokenId]
+        ) async throws -> InferenceOutput {
+            let inputTokens = loop.inputTokens
+            let allTokens = inputTokens + forced.map { $0 }
+            let vocabSize = engine.config.vocabSize
+
+            let allLogits: [LogitsScalarType]
+            let strategy = engine.selectPrefillStrategy(newTokenCount: allTokens.count)
+            switch strategy {
+            case .chunked(let chunkSize):
+                allLogits = try await engine.processChunkedPromptAllLogits(
+                    tokens: allTokens[...], chunkSize: chunkSize, sessionState: sessionState)
+            case .wholeBatch:
+                allLogits = try await engine.processChunkedPromptAllLogits(
+                    tokens: allTokens[...], chunkSize: allTokens.count, sessionState: sessionState)
+            case .oneAtATime:
+                var collected: [LogitsScalarType] = []
+                for j in allTokens.indices {
+                    collected.append(
+                        contentsOf: try await engine.processTokenBatch(
+                            allTokens[j...j], logits: .allPositions, sessionState: sessionState))
+                }
+                allLogits = collected
             }
-            finished = true
-            sessionState.tokenBox.clearIfActive(generationToken)
+
+            // Split into per-position logit vectors.
+            // Skip the prompt positions (inputTokens.count - 1 positions);
+            // we want logits that predict each forced token.
+            let promptLen = inputTokens.count
+            var buffer: [[LogitsScalarType]] = []
+            for i in 0..<forced.count {
+                let offset = (promptLen - 1 + i) * vocabSize
+                let endOffset = offset + vocabSize
+                guard endOffset <= allLogits.count else {
+                    throw InferenceRuntimeError.invalidState(
+                        "Batched logits underflow at position \(i): need \(endOffset), got \(allLogits.count)")
+                }
+                buffer.append(Array(allLogits[offset..<endOffset]))
+            }
+            batchedLogitsBuffer = buffer
+
+            // Update engine state
+            sessionState.history.append(contentsOf: allTokens[...])
+
+            // Yield first result
+            let logits = buffer[loop.step]
+            let token = forced[loop.step]
+            loop.step += 1
+            return InferenceOutput(tokenId: token, logits: logits)
         }
     }
 }

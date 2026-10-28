@@ -700,18 +700,10 @@ extension CoreAISequentialVLMEngine.GenerationSequence {
         public typealias Failure = Error
 
         private let engine: CoreAISequentialVLMEngine
-        private let samplingConfiguration: SamplingConfiguration
-        private let returnsLogits: Bool
-        private let forcedContinuation: [CoreAISequentialVLMEngine.TokenId]?
-        private let maxTokens: Int
-        private let stopReasonStore: StopReasonStore
         private let generationToken: GenerationToken
+        private var loop: SequentialDecodeLoop
 
-        private var inputTokens: [CoreAISequentialVLMEngine.TokenId]
-        private let generationStartOffset: Int
         private var embeddedInput: InputEmbeddings?
-        private var step: Int = 0
-        private var finished: Bool = false
         private var prefillDone: Bool = false
 
         init(
@@ -724,19 +716,16 @@ extension CoreAISequentialVLMEngine.GenerationSequence {
             generationToken: GenerationToken
         ) {
             self.engine = engine
-            self.samplingConfiguration = samplingConfiguration.normalized()
-            self.returnsLogits = inferenceOptions.returnsLogits
-            self.forcedContinuation = inferenceOptions.forcedContinuation
-            self.stopReasonStore = stopReasonStore
             self.generationToken = generationToken
-            self.inputTokens = input
-            self.generationStartOffset = input.count
             self.embeddedInput = embeddedInput
-            self.maxTokens = SequentialIterator.clampMaxTokens(
-                requested: inferenceOptions.maxTokens,
-                forcedCount: inferenceOptions.forcedContinuation?.count,
-                inputCount: input.count,
-                maxContextLength: engine.config.maxContextLength
+            self.loop = SequentialDecodeLoop(
+                input: input,
+                samplingConfiguration: samplingConfiguration,
+                inferenceOptions: inferenceOptions,
+                maxContextLength: engine.config.maxContextLength,
+                stopReasonStore: stopReasonStore,
+                generationToken: generationToken,
+                release: { [engine] in engine.clearTokenIfActive(generationToken) }
             )
         }
 
@@ -745,23 +734,9 @@ extension CoreAISequentialVLMEngine.GenerationSequence {
         }
 
         public func next() async throws -> InferenceOutput? {
-            if finished { return nil }
+            guard loop.shouldContinue() else { return nil }
 
-            if generationToken.isCancelled {
-                stopReasonStore.set(.cancelled)
-                finishAndRelease()
-                return nil
-            }
-
-            guard step < maxTokens else {
-                stopReasonStore.setIfUnset(.maxTokens)
-                finishAndRelease()
-                return nil
-            }
-
-            do {
-                try Task.checkCancellation()
-
+            return try await loop.decodeStep { inputTokens in
                 let logitBuffer: [LogitsScalarType]
 
                 if !prefillDone {
@@ -776,23 +751,15 @@ extension CoreAISequentialVLMEngine.GenerationSequence {
                     } else {
                         // Text-only path: standard prefill
                         let newTokens = inputTokens[engine.processedTokenCount...]
-                        let strategy = engine.selectPrefillStrategy(newTokenCount: newTokens.count)
-
-                        switch strategy {
-                        case .chunked(let chunkSize):
-                            logitBuffer = try await engine.processChunkedPrompt(
-                                tokens: newTokens, chunkSize: chunkSize)
-                        case .wholeBatch:
-                            let allLogits = try await engine.processTokenBatch(newTokens)
-                            logitBuffer = lastTokenLogits(
-                                from: allLogits, vocabSize: engine.config.vocabSize)
-                        case .oneAtATime:
-                            var lastLogits: [LogitsScalarType] = []
-                            for j in newTokens.indices {
-                                lastLogits = try await engine.processTokenBatch(newTokens[j...j])
-                            }
-                            logitBuffer = lastLogits
-                        }
+                        logitBuffer = try await SequentialIterator.lastPositionLogits(
+                            for: newTokens,
+                            strategy: engine.selectPrefillStrategy(newTokenCount: newTokens.count),
+                            vocabSize: engine.config.vocabSize,
+                            chunked: { tokens, chunkSize in
+                                try await engine.processChunkedPrompt(tokens: tokens, chunkSize: chunkSize)
+                            },
+                            batch: { tokens in try await engine.processTokenBatch(tokens) }
+                        )
                     }
                     prefillDone = true
                 } else {
@@ -803,45 +770,8 @@ extension CoreAISequentialVLMEngine.GenerationSequence {
                     let newTokens = inputTokens[engine.processedTokenCount...]
                     logitBuffer = try await engine.processTokenBatch(newTokens)
                 }
-
-                // Check cancellation after inference step
-                if generationToken.isCancelled {
-                    stopReasonStore.set(.cancelled)
-                    finishAndRelease()
-                    return nil
-                }
-
-                // Sample next token
-                let nextToken = SequentialIterator.nextToken(
-                    fromLogits: logitBuffer,
-                    forced: forcedContinuation,
-                    step: step,
-                    sampling: samplingConfiguration,
-                    tokenHistory: inputTokens[generationStartOffset...]
-                )
-
-                inputTokens.append(nextToken)
-                step += 1
-
-                return InferenceOutput(
-                    tokenId: nextToken,
-                    logits: returnsLogits ? logitBuffer : nil
-                )
-            } catch is CancellationError {
-                stopReasonStore.set(.cancelled)
-                finishAndRelease()
-                throw CancellationError()
-            } catch {
-                stopReasonStore.set(.error)
-                finishAndRelease()
-                throw error
+                return logitBuffer
             }
-        }
-
-        private func finishAndRelease() {
-            guard !finished else { return }
-            finished = true
-            engine.clearTokenIfActive(generationToken)
         }
     }
 }
