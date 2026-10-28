@@ -179,14 +179,20 @@ class TextEmbeddingExportWrapper(nn.Module):
 
 
 class TokenTableExportWrapper(nn.Module):
-    """``input_ids [B, L] int32 -> inputs_embeds [B, L, H]`` float32 (scaled token embeddings)."""
+    """``input_ids [B, L] int32 -> inputs_embeds [B, L, H]`` as ``dtype`` (scaled embeddings)."""
 
-    def __init__(self, embed_tokens: nn.Module) -> None:
+    def __init__(self, embed_tokens: nn.Module, dtype: torch.dtype = torch.float32) -> None:
         super().__init__()
         self.embed_tokens = embed_tokens
+        self.dtype = dtype
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.embed_tokens(input_ids).to(torch.float32)
+        return self.embed_tokens(input_ids).to(self.dtype)
+
+
+def scaled_token_table(table: torch.Tensor, scale: float, dtype: torch.dtype) -> nn.Embedding:
+    """``table * scale`` stored as ``dtype``. Scaling in float32 first keeps the cast exact."""
+    return nn.Embedding.from_pretrained((table.float() * scale).to(dtype))
 
 
 class InputsEmbedsEncoderWrapper(nn.Module):
@@ -377,6 +383,7 @@ def export_token_table_program(
     embed_tokens: nn.Module,
     max_length: int,
     include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
+    dtype: torch.dtype = torch.float32,
 ) -> AIProgram:
     """``token_table``: function ``main``, ids -> scaled embeddings, dynamic length (batch 1)."""
     from coreai_models.diffusion.gpu import export_stateless
@@ -385,7 +392,7 @@ def export_token_table_program(
     length = torch.export.Dim("length", min=2, max=max_length)
     ids = torch.zeros((1, 64), dtype=torch.int32)
     return export_stateless(
-        TokenTableExportWrapper(embed_tokens),
+        TokenTableExportWrapper(embed_tokens, dtype),
         (ids,),
         TOKEN_TABLE_INPUT_NAMES,
         (TOKEN_TABLE_OUTPUT_NAME,),
@@ -585,20 +592,20 @@ def _export_ane_programs(
         raise NotImplementedError(f"No Neural Engine export for family {family.key!r}")
     from coreai_models.models.ios.embedding_gemma2 import load_embedding_gemma2_text_encoder
 
-    # The token table runs on the GPU in float32; the encoder and image tower use float16.
-    gpu_encoder = _load_text_encoder(family, snapshot, torch.float32)
+    # The token table runs on the GPU and stores the scaled table in float16, the encoder's input
+    # precision.
+    encoder, table = load_embedding_gemma2_text_encoder(snapshot, dtype=torch.float16)
+    token_table = scaled_token_table(table, encoder.config.hidden_size**0.5, torch.float16)
+    del table
     _save(
         export_token_table_program(
-            gpu_encoder.embed_tokens, family.model_max_tokens, include_debug_info
+            token_table, family.model_max_tokens, include_debug_info, dtype=torch.float16
         ),
         out,
         family,
         TOKEN_TABLE_COMPONENT,
     )
-    del gpu_encoder
-
-    encoder, _table = load_embedding_gemma2_text_encoder(snapshot, dtype=torch.float16)
-    del _table
+    del token_table
     _save(
         export_ane_encoder_program(
             encoder,

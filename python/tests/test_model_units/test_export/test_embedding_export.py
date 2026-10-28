@@ -514,6 +514,30 @@ def test_inputs_embeds_path_equals_ids_path():
     assert isinstance(text.embed_tokens, torch.nn.Embedding)  # restored
 
 
+def test_float16_scaled_token_table_equals_the_float32_table_cast():
+    """The float16 token table gives the encoder the same inputs as the float32 one."""
+    text = _tiny_text_encoder()
+    ids = torch.randint(3, 64, (1, 16), dtype=torch.int32)
+    table = embedding_export.scaled_token_table(
+        text.embed_tokens.weight, text.config.hidden_size**0.5, torch.float16
+    )
+    with torch.no_grad():
+        want = embedding_export.TokenTableExportWrapper(text.embed_tokens)(ids).half()
+        got = embedding_export.TokenTableExportWrapper(table, torch.float16)(ids)
+    assert got.dtype == torch.float16
+    assert torch.equal(got, want)
+
+
+def test_tiny_float16_token_table_conversion():
+    pytest.importorskip("coreai_torch")
+    text = _tiny_text_encoder()
+    table = embedding_export.scaled_token_table(
+        text.embed_tokens.weight, text.config.hidden_size**0.5, torch.float16
+    )
+    program = embedding_export.export_token_table_program(table, 64, dtype=torch.float16)
+    assert program is not None
+
+
 def test_image_reference_inputs_are_a_valid_padded_grid():
     pixels, positions = embedding_export.image_reference_inputs(TINY_IMAGE)
     assert pixels.shape == (1, 108, 48) and pixels.dtype == torch.float32
