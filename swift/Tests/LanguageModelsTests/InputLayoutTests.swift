@@ -104,6 +104,25 @@ struct InputLayoutTests {
         #expect(try makeLayout(outputNames: ["out", "aux"]).logitsName == "out")
     }
 
+    @Test("resolveEmbeddingsInputs: known names in either order, positional fallback otherwise")
+    func resolveEmbeddingsInputs() throws {
+        let byName = try InputLayout.resolveEmbeddingsInputs(inputNames: ["inputs_embeds", "position_ids"])
+        #expect(byName.embeddings == "inputs_embeds" && byName.positionIds == "position_ids")
+
+        let swapped = try InputLayout.resolveEmbeddingsInputs(inputNames: ["position_ids", "in_embeddings"])
+        #expect(swapped.embeddings == "in_embeddings" && swapped.positionIds == "position_ids")
+
+        let onlyPositions = try InputLayout.resolveEmbeddingsInputs(inputNames: ["pos_ids", "hidden"])
+        #expect(onlyPositions.embeddings == "hidden" && onlyPositions.positionIds == "pos_ids")
+
+        let positional = try InputLayout.resolveEmbeddingsInputs(inputNames: ["a", "b"])
+        #expect(positional.embeddings == "a" && positional.positionIds == "b")
+
+        #expect(throws: InferenceRuntimeError.self) {
+            _ = try InputLayout.resolveEmbeddingsInputs(inputNames: ["inputs_embeds"])
+        }
+    }
+
     // MARK: - Helpers
 
     private func makeLayout(
