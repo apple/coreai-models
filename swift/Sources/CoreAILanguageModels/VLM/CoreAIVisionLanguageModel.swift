@@ -161,7 +161,7 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
             with: embeddedInput,
             tokens: promptTokens,
             samplingConfiguration: SamplingConfiguration(temperature: 1.0, topK: 1),
-            inferenceOptions: InferenceOptions(maxTokens: maxTokens, includeLogits: false)
+            inferenceOptions: .extend(maxTokens: maxTokens)
         )
 
         var generatedCount = 0

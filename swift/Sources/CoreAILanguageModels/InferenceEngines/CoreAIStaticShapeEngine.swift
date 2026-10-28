@@ -1150,7 +1150,7 @@ extension StaticShapeEngine.GenerationSequence {
         ) {
             self.engine = engine
             self.samplingConfiguration = samplingConfiguration
-            self.returnsLogits = inferenceOptions.includeLogits
+            self.returnsLogits = inferenceOptions.returnsLogits
             self.forcedContinuation = inferenceOptions.forcedContinuation
             self.stopReasonStore = stopReasonStore
             self.generationToken = generationToken

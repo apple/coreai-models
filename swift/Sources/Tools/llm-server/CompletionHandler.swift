@@ -161,9 +161,8 @@ private func preparePrompt(_ prompt: Prompt, state: ServerState) throws -> Prepa
 private func scoreOnEngine(_ prompt: PreparedPrompt, topN: Int, state: ServerState) async throws
     -> LogProbabilities
 {
-    let options = InferenceOptions(
+    let options = InferenceOptions.eval(
         maxTokens: prompt.targets.count,
-        includeLogits: true,
         forcedContinuation: prompt.targets
     )
 

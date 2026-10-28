@@ -5,6 +5,9 @@
 
 """Tests for macOS Gemma 3n model parity with HuggingFace."""
 
+import copy
+
+import pytest
 import torch
 from transformers.models.gemma3n.configuration_gemma3n import Gemma3nTextConfig
 from transformers.models.gemma3n.modeling_gemma3n import (
@@ -100,6 +103,27 @@ class TestGemma3nForCausalLM:
     def test_forward_parity_multi_token(self):
         config = _make_gemma3n_config(num_hidden_layers=5)
         hf_model, our_model = _build_models(config)
+
+        input_ids = torch.randint(0, 200, (1, 6))
+        position_ids = torch.arange(6, dtype=torch.int32).unsqueeze(0)
+        k_cache, v_cache = KVCache.create_cache_tensors(config, dtype=torch.float32)
+
+        with torch.no_grad():
+            our_out = our_model(input_ids, position_ids, k_cache, v_cache)
+            hf_out = hf_model(
+                input_ids=input_ids, position_ids=position_ids.long(), use_cache=False
+            )
+
+        torch.testing.assert_close(our_out, hf_out.logits, atol=1e-4, rtol=1e-4)
+
+    def test_forward_parity_with_chunked_per_layer_table(self, monkeypatch):
+        """A lowered limit splits the [200, 80] per-layer table; the HF checkpoint still loads."""
+        from coreai_models.models.macos import gemma3n
+
+        monkeypatch.setattr(gemma3n, "MAX_GATHER_CONSTANT_ELEMENTS", 200 * 32 + 1)
+        config = _make_gemma3n_config(num_hidden_layers=5)
+        hf_model, our_model = _build_models(config)
+        assert our_model.model.embed_tokens_per_layer.widths == [32, 32, 16]
 
         input_ids = torch.randint(0, 200, (1, 6))
         position_ids = torch.arange(6, dtype=torch.int32).unsqueeze(0)
@@ -239,3 +263,58 @@ class TestGemma3nForCausalLM:
         our_model.load_state_dict(sd, assign=True, strict=True)
 
         assert our_model.lm_head.weight is our_model.model.embed_tokens.weight
+
+
+class TestChunkedEmbedding:
+    """Per-layer table split to stay under the GPU gather element limit (#313)."""
+
+    def test_matches_unsplit_embedding(self):
+        from coreai_models.models.macos.gemma3n import ChunkedEmbedding
+
+        ref = torch.nn.Embedding(50, 21)
+        chunked = ChunkedEmbedding(50, 21, max_elements=400, align=1)
+        assert len(chunked.chunks) > 1
+        assert all(c.weight.numel() < 400 for c in chunked.chunks)
+        chunked.load_state_dict({"weight": ref.weight.detach()})
+        ids = torch.randint(0, 50, (2, 7))
+        assert torch.equal(chunked(ids), ref(ids))
+
+    def test_chunks_stay_under_limit_when_width_rounds_up(self):
+        """Splitting by element count alone gives 4-column chunks of 400 >= 351 here."""
+        from coreai_models.models.macos.gemma3n import ChunkedEmbedding
+
+        chunked = ChunkedEmbedding(100, 10, max_elements=351, align=1)
+        assert sum(chunked.widths) == 10
+        assert all(c.weight.numel() < 351 for c in chunked.chunks)
+
+    def test_single_chunk_below_limit(self):
+        from coreai_models.models.macos.gemma3n import ChunkedEmbedding
+
+        assert len(ChunkedEmbedding(50, 21, max_elements=2**31).chunks) == 1
+
+    def test_e4b_per_layer_table_is_split(self):
+        from coreai_models.models.macos.gemma3n import ChunkedEmbedding, _per_layer_embedding
+
+        with torch.device("meta"):
+            e4b = _per_layer_embedding(262144, 35 * 256)
+            e2b = _per_layer_embedding(262144, 30 * 256)
+        assert isinstance(e4b, ChunkedEmbedding)
+        assert e4b.widths == [4480, 4480]
+        assert all(c.weight.numel() < 2**31 for c in e4b.chunks)
+        assert isinstance(e2b, torch.nn.Embedding)
+
+    def test_4bit_preset_quantizes_every_chunk(self):
+        """Unaligned, this splits into two 48-wide chunks the 32-block int4 preset skips."""
+        quantization = pytest.importorskip("coreai_opt.quantization")
+        from coreai_models.export.presets import MACOS_PRESETS
+        from coreai_models.models.macos.gemma3n import ChunkedEmbedding
+
+        model = ChunkedEmbedding(64, 96, max_elements=64 * 48 + 1)
+        assert model.widths == [32, 32, 32]
+        qcfg = copy.deepcopy(MACOS_PRESETS["4bit"]["torch_quantization_config"])
+        quantizer = quantization.Quantizer(
+            model, quantization.QuantizerConfig.from_dict({"quantization_config": qcfg})
+        )
+        ids = torch.randint(0, 64, (1, 5), dtype=torch.int32)
+        prepared = quantizer.prepare(example_inputs=(ids,), dynamic_shapes=None)
+        assert all(hasattr(c, "parametrizations") for c in prepared.chunks)

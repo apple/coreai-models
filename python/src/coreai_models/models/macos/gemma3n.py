@@ -25,6 +25,7 @@ from transformers.models.gemma3n.modeling_gemma3n import (
 )
 from typing_extensions import Self, override
 
+from coreai_models._constants import MAX_GATHER_CONSTANT_ELEMENTS
 from coreai_models.models.base import BaseForCausalLM
 from coreai_models.primitives.macos.cache import KVCache
 from coreai_models.primitives.macos.rms_norm import RMSNorm
@@ -297,6 +298,55 @@ class TransformerBlock(nn.Module):
         return corrected
 
 
+class ChunkedEmbedding(nn.Module):
+    """Embedding whose table is split along the feature axis into ``nn.Embedding``
+    chunks below ``max_elements``, since GPU gathers from larger constants return
+    wrong rows (apple/coreai-models#313). Chunks stay ``nn.Embedding`` so compression
+    configs match them like the unsplit table.
+
+    Checkpoints still store one ``weight``; it is split into ``chunks.{i}.weight`` on load.
+    """
+
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        max_elements: int = MAX_GATHER_CONSTANT_ELEMENTS,
+        align: int = 32,
+    ) -> None:
+        super().__init__()
+        # Widths are multiples of ``align`` because the int4 presets quantize in 32-column
+        # blocks and silently skip tables whose width is not a multiple of the block.
+        max_width = (max_elements - 1) // num_embeddings // align * align
+        if max_width < 1:
+            raise ValueError(
+                f"{align} columns of {num_embeddings} rows already reach {max_elements} "
+                "elements; the table cannot be split along the feature axis."
+            )
+        width = math.ceil(embedding_dim / math.ceil(embedding_dim / max_width))
+        width = math.ceil(width / align) * align
+        self.widths = [min(width, embedding_dim - i) for i in range(0, embedding_dim, width)]
+        self.chunks = nn.ModuleList([nn.Embedding(num_embeddings, w) for w in self.widths])
+        self._register_load_state_dict_pre_hook(self._split_weight)
+
+    def _split_weight(self, state_dict, prefix, *args) -> None:
+        full = state_dict.pop(prefix + "weight", None)
+        if full is None:
+            return
+        # Column slices are strided, so contiguous() already copies each one.
+        for i, chunk in enumerate(full.split(self.widths, dim=-1)):
+            state_dict[f"{prefix}chunks.{i}.weight"] = chunk.contiguous()
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return torch.cat([chunk(input_ids) for chunk in self.chunks], dim=-1)
+
+
+def _per_layer_embedding(num_embeddings: int, embedding_dim: int) -> nn.Module:
+    if num_embeddings * embedding_dim >= MAX_GATHER_CONSTANT_ELEMENTS:
+        return ChunkedEmbedding(num_embeddings, embedding_dim, MAX_GATHER_CONSTANT_ELEMENTS)
+    return nn.Embedding(num_embeddings, embedding_dim)
+
+
 class Gemma3nModel(nn.Module):
     def __init__(self, config: Gemma3nTextConfig) -> None:
         super().__init__()
@@ -306,7 +356,7 @@ class Gemma3nModel(nn.Module):
         self.per_layer_input_scale = 2.0**-0.5
 
         self.embed_tokens = nn.Embedding(config.vocab_size, hidden)
-        self.embed_tokens_per_layer = nn.Embedding(
+        self.embed_tokens_per_layer = _per_layer_embedding(
             config.vocab_size_per_layer_input,
             config.num_hidden_layers * config.hidden_size_per_layer_input,
         )

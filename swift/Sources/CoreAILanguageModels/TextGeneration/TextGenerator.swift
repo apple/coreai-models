@@ -83,7 +83,7 @@ public class TextGenerator {
             tokenizer: tokenizer,
             inferenceEngine: inferenceEngine,
             samplingConfiguration: samplingConfiguration,
-            options: InferenceOptions(maxTokens: maxTokens, includeLogits: true),
+            options: .sampleWithLogits(maxTokens: maxTokens),
             stopSequences: effectiveStopSequences
         )
 
@@ -134,9 +134,8 @@ public class TextGenerator {
         let continuationTokens = Array(
             encoding.tokens[encoding.continuationStartIndex..<encoding.tokens.count])
 
-        let options = InferenceOptions(
+        let options = InferenceOptions.eval(
             maxTokens: continuationTokens.count,
-            includeLogits: true,
             forcedContinuation: continuationTokens
         )
 
@@ -193,9 +192,8 @@ public class TextGenerator {
 
         try await inferenceEngine.reset()
 
-        let options = InferenceOptions(
+        let options = InferenceOptions.eval(
             maxTokens: continuationTokens.count,
-            includeLogits: true,
             forcedContinuation: continuationTokens
         )
 
