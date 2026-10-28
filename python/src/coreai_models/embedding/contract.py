@@ -91,6 +91,8 @@ class EmbeddingFamily:
     renormalize_after_truncation: bool = True
     pooling_mode: str = "mean"
     include_prompt: bool = True
+    # Precision of the GPU encoder, which runs the reference math. The Neural Engine encoder
+    # rescales its norms to compute in float16.
     default_compute_precision: str = "float32"
     precision_floor: str | None = None
     forbidden_precisions: tuple[str, ...] = ()
@@ -398,6 +400,7 @@ def embedding_block(
         "metric": family.metric,
         "precision": {
             "compute": precision,
+            # The Neural Engine graphs compute in float16.
             "forbidden": [] if ios else list(family.forbidden_precisions),
             "compute_units": ["neural_engine", "gpu"] if ios else ["gpu"],
         },
