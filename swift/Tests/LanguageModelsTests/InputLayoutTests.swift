@@ -97,6 +97,13 @@ struct InputLayoutTests {
         #expect(layout.prefillPolicy == .chunk(threshold: 1, chunkSize: 1))
     }
 
+    @Test("Logits output resolves by name, else falls back to the first output")
+    func logitsNameResolution() throws {
+        #expect(try makeLayout(outputNames: ["hidden_states", "logits"]).logitsName == "logits")
+        #expect(try makeLayout(outputNames: ["logits", "drafter_features"]).logitsName == "logits")
+        #expect(try makeLayout(outputNames: ["out", "aux"]).logitsName == "out")
+    }
+
     // MARK: - Helpers
 
     private func makeLayout(

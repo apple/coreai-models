@@ -60,7 +60,7 @@ extension InputLayout {
             from: descriptor.inputNames,
             candidates: knownInputIdNames,
             label: "input_ids")
-        let logitsName = descriptor.outputNames[0]
+        let logitsName = resolveLogitsName(from: descriptor.outputNames)
 
         let inputIdsSeqLen: Int?
         if case .ndArray(let desc) = descriptor.inputDescriptor(of: inputIdsName),
@@ -112,7 +112,7 @@ extension InputLayout {
             from: inputNames, candidates: knownInputIdNames, label: "input_ids")
         let positionIdsName = try resolveRequired(
             from: inputNames, candidates: knownPositionIdNames, label: "position_ids")
-        let logitsName = outputNames[0]
+        let logitsName = resolveLogitsName(from: outputNames)
 
         let attnMaskName = knownAttnMaskNames.first(where: inputNames.contains)
 
@@ -147,6 +147,12 @@ extension InputLayout {
     static let knownInputIdNames = ["input_ids", "in_new_token_ids"]
     static let knownPositionIdNames = ["position_ids", "pos_ids"]
     static let knownAttnMaskNames = ["attn_mask"]
+    static let knownLogitsNames = ["logits"]
+
+    /// Logits output name: the first of `knownLogitsNames` present in `outputNames`, else `outputNames[0]`.
+    static func resolveLogitsName(from outputNames: [String]) -> String {
+        knownLogitsNames.first(where: outputNames.contains) ?? outputNames[0]
+    }
 
     static func resolveRequired(
         from names: [String], candidates: [String], label: String
