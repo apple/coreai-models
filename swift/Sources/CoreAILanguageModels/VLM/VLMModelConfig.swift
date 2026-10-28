@@ -27,3 +27,11 @@ public struct VLMModelConfig: InferenceConfiguration, Codable, Sendable {
         self.visionConfig = visionConfig
     }
 }
+
+// MARK: - Compatibility
+
+/// Vision-language models run on `CoreAISequentialEngine`, built from a `kind=vlm` bundle by
+/// `EngineFactory.createEngine(bundle:options:)`. `is CoreAISequentialVLMEngine` matches every
+/// sequential engine; check `acceptsMultimodalInput` instead.
+@available(*, deprecated, renamed: "CoreAISequentialEngine")
+public typealias CoreAISequentialVLMEngine = CoreAISequentialEngine

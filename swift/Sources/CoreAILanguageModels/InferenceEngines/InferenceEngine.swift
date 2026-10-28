@@ -412,6 +412,8 @@ public enum InferenceRuntimeError: Error, LocalizedError {
 
 // MARK: - Multimodal
 
+// TODO: Multimodal support in `CoreAIPipelinedEngine`.
+
 /// Engine that supports vision/audio input in addition to text tokens.
 ///
 /// The typical flow:

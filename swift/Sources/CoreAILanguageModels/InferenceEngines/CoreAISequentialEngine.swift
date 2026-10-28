@@ -349,6 +349,32 @@ public final class CoreAISequentialEngine: MultimodalInferenceEngine, Idempotent
         self.session.inputHandler = try makeInputHandler()
     }
 
+    /// Vision-language initializer from separate prepared assets for the vision encoder, the token
+    /// embedding, and the embeddings-input decoder.
+    ///
+    /// - Parameters:
+    ///   - config: VLM model configuration (decoder config + vision config)
+    ///   - visionModel: Prepared model containing `encode_image` and `project` (or a fused `main`)
+    ///   - embedModel: Prepared model containing `embed_tokens` (or `main`)
+    ///   - llmModel: Prepared model containing the embeddings-input decoder
+    ///   - options: Engine options including KV cache strategy
+    @available(*, deprecated, message: "Use EngineFactory.createEngine(bundle:options:) with a kind=vlm bundle")
+    public convenience init(
+        config: VLMModelConfig,
+        visionModel: PreparedModel,
+        embedModel: PreparedModel,
+        llmModel: PreparedModel,
+        options: EngineOptions = EngineOptions()
+    ) async throws {
+        try await self.init(
+            config: config.base,
+            preparedModel: llmModel,
+            options: options,
+            vision: VisionComponents(
+                visionModel: visionModel, embedModel: embedModel, visionConfig: config.visionConfig)
+        )
+    }
+
     /// Convenience initializer with direct model URL.
     public convenience init(
         config: ModelConfig,
