@@ -217,8 +217,8 @@ class FunctionSpec:
         return {"function": self.name, "batch": self.batch, "length": self.length}
 
 
-def function_name(length: int, batch: int) -> str:
-    return f"len{length}_b{batch}"
+def function_name(length: int, batch: int, prefix: str = "") -> str:
+    return f"{prefix}len{length}_b{batch}"
 
 
 def bucket_plan(
@@ -253,14 +253,14 @@ def text_functions(family: EmbeddingFamily, platform: str) -> list[FunctionSpec]
 
 
 def encoder_functions(family: EmbeddingFamily, platform: str) -> list[FunctionSpec]:
-    """Batch-1 ``inputs_embeds`` functions of the ``encoder`` component."""
+    """Batch-1 ``inputs_embeds`` functions of the ``encoder`` component, named ``embeds_len*``."""
     if platform == "iOS":
         lengths = sorted(set(family.ane_length_buckets))
     else:
         assert family.image is not None
         first = -(-family.image.sequence_length() // 32) * 32
         lengths = sorted({first} | {n for n in family.length_buckets if n > first})
-    return [FunctionSpec(function_name(n, 1), 1, n) for n in lengths]
+    return [FunctionSpec(function_name(n, 1, "embeds_"), 1, n) for n in lengths]
 
 
 def bundle_name(family: EmbeddingFamily, platform: str, with_image: bool) -> str:
@@ -268,16 +268,25 @@ def bundle_name(family: EmbeddingFamily, platform: str, with_image: bool) -> str
 
 
 def bundle_assets(platform: str, with_image: bool) -> dict[str, str]:
-    """Component name -> asset file for the bundle."""
+    """Component name -> asset file for the bundle.
+
+    In the macOS image bundle, ``token_table`` and ``encoder`` are functions of
+    ``text_encoder.aimodel``, so the table and the transformer are stored once.
+    """
     if platform == "iOS":
         components = [TOKEN_TABLE_COMPONENT, ENCODER_COMPONENT]
         if with_image:
             components.append(IMAGE_COMPONENT)
-    elif with_image:
-        components = [TEXT_COMPONENT, IMAGE_COMPONENT, TOKEN_TABLE_COMPONENT, ENCODER_COMPONENT]
-    else:
-        components = [TEXT_COMPONENT]
-    return {name: f"{name}.aimodel" for name in components}
+        return {name: f"{name}.aimodel" for name in components}
+    text = f"{TEXT_COMPONENT}.aimodel"
+    if not with_image:
+        return {TEXT_COMPONENT: text}
+    return {
+        TEXT_COMPONENT: text,
+        IMAGE_COMPONENT: f"{IMAGE_COMPONENT}.aimodel",
+        TOKEN_TABLE_COMPONENT: text,
+        ENCODER_COMPONENT: text,
+    }
 
 
 def embedding_block(
@@ -292,7 +301,8 @@ def embedding_block(
     """Build the ``embedding`` block of ``metadata.json``.
 
     macOS: a ``text_encoder`` graph (ids in, vector out), plus the image tower
-    ``image_encoder -> token_table -> encoder`` when ``with_image``. iOS: the text tower runs
+    ``image_encoder -> token_table -> encoder`` when ``with_image``; ``token_table`` and
+    ``encoder`` are functions of ``text_encoder.aimodel``. iOS: the text tower runs
     ``token_table -> encoder`` on the Neural Engine. The host merges soft tokens into the table
     output at the placeholder rows before the encoder.
     """

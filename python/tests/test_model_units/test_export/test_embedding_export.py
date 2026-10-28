@@ -551,17 +551,25 @@ def test_image_reference_inputs_are_a_valid_padded_grid():
     assert torch.all(soft[0, n:] == 0) and torch.all(soft[0, :n].abs().sum(-1) > 0)
 
 
-def test_tiny_image_components_conversion():
+def test_tiny_shared_text_program_conversion():
     pytest.importorskip("coreai_torch")
-    programs = embedding_export.export_image_programs(
+    program = embedding_export.export_shared_text_program(
         _tiny_text_encoder(),
-        _tiny_image_encoder(),
-        TINY_IMAGE,
-        [FunctionSpec("len32_b1", 1, 32)],
+        [FunctionSpec("len16_b1", 1, 16), FunctionSpec("len32_b1", 1, 32)],
+        [FunctionSpec("embeds_len32_b1", 1, 32)],
         max_length=64,
     )
-    assert set(programs) == {"image_encoder", "token_table", "encoder"}
-    assert all(p is not None for p in programs.values())
+    assert program is not None
+    image = embedding_export.export_image_encoder_program(_tiny_image_encoder(), TINY_IMAGE)
+    assert image is not None
+
+
+def test_macos_image_bundle_shares_the_text_encoder_asset():
+    assets = bundle_assets("macOS", True)
+    assert assets["token_table"] == assets["encoder"] == assets["text_encoder"]
+    assert assets["image_encoder"] == "image_encoder.aimodel"
+    names = [f.name for f in text_functions(EG2, "macOS") + encoder_functions(EG2, "macOS")]
+    assert len(names) == len(set(names)) and "main" not in names
 
 
 def test_ane_reference_inputs_shapes():

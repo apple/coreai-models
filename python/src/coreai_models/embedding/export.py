@@ -267,6 +267,13 @@ def reference_inputs(spec: FunctionSpec, vocab_size: int) -> tuple[torch.Tensor,
     return ids.to(torch.int32), mask
 
 
+def embeds_reference_inputs(spec: FunctionSpec, hidden: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Trace inputs for one ``inputs_embeds`` function (values do not matter)."""
+    generator = torch.Generator().manual_seed(spec.length)
+    embeds = torch.randn((spec.batch, spec.length, hidden), generator=generator)
+    return embeds, torch.ones((spec.batch, spec.length), dtype=torch.int32)
+
+
 def image_reference_inputs(image: ImageTowerFacts) -> tuple[torch.Tensor, torch.Tensor]:
     """Image-encoder trace inputs: a full block grid padded to the budget (int32 positions)."""
     k = image.pooling_kernel_size
@@ -311,41 +318,33 @@ def ane_image_reference_inputs(image: ImageTowerFacts) -> tuple[torch.Tensor, to
 
 @dataclass
 class TraceSpec:
-    """One function of a Neural Engine program: example args + IO names."""
+    """One function of a multi-function program: example args, IO names, dynamic dims."""
 
     name: str
     args: tuple[torch.Tensor, ...]
     input_names: tuple[str, ...]
     output_names: tuple[str, ...]
+    dynamic_shapes: tuple[dict[int, Any] | None, ...] | None = None
 
 
-def convert_ane_functions(
-    traces: list[tuple[nn.Module, TraceSpec]],
-    *,
-    include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
-) -> AIProgram:
-    """``torch.export`` every ``(module, trace)``; convert them into one multi-function program.
-
-    Uses the default decompositions plus the repo's custom lowerings, as ``export/ios.py`` does.
-    """
+def _converter(include_debug_info: bool) -> Any:
     import coreai_torch
 
-    from coreai_models.export.mlir_ops import register_custom_torch_lowering
+    mode = coreai_torch.TorchConverter.Mode
+    return coreai_torch.TorchConverter(mode=mode.DEBUG if include_debug_info else mode.RELEASE)
 
-    converter = coreai_torch.TorchConverter(
-        mode=(
-            coreai_torch.TorchConverter.Mode.DEBUG
-            if include_debug_info
-            else coreai_torch.TorchConverter.Mode.RELEASE
-        )
-    )
-    register_custom_torch_lowering(converter)
-    decomp = torch.export.default_decompositions()
+
+def _add_functions(
+    converter: Any, traces: list[tuple[nn.Module, TraceSpec]], decomp: dict[Any, Any]
+) -> None:
+    """``torch.export`` every ``(module, trace)`` and add it to ``converter`` as one function."""
     for module, trace in traces:
         module.eval()
         start = time.time()
         with torch.no_grad():
-            exported = torch.export.export(module, args=trace.args)
+            exported = torch.export.export(
+                module, args=trace.args, dynamic_shapes=trace.dynamic_shapes
+            )
         converter.add_exported_program(
             exported.run_decompositions(decomp),
             input_names=list(trace.input_names),
@@ -358,6 +357,22 @@ def convert_ane_functions(
             [tuple(a.shape) for a in trace.args],
             time.time() - start,
         )
+
+
+def convert_ane_functions(
+    traces: list[tuple[nn.Module, TraceSpec]],
+    *,
+    include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
+) -> AIProgram:
+    """Convert every ``(module, trace)`` into one multi-function Neural Engine program.
+
+    Uses the default decompositions plus the repo's custom lowerings, as ``export/ios.py`` does.
+    """
+    from coreai_models.export.mlir_ops import register_custom_torch_lowering
+
+    converter = _converter(include_debug_info)
+    register_custom_torch_lowering(converter)
+    _add_functions(converter, traces, torch.export.default_decompositions())
     return converter.to_coreai()
 
 
@@ -401,46 +416,85 @@ def export_token_table_program(
     )
 
 
-def export_image_programs(
-    text_encoder: nn.Module,
-    image_encoder: nn.Module,
-    image: ImageTowerFacts,
-    functions: list[FunctionSpec],
+def export_shared_text_program(
+    encoder: nn.Module,
+    text_fns: list[FunctionSpec],
+    encoder_fns: list[FunctionSpec],
     max_length: int,
     include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
-) -> dict[str, AIProgram]:
-    """GPU image tower: ``{image_encoder, token_table, encoder}`` programs.
+) -> AIProgram:
+    """GPU ``text_encoder`` that also holds the ``token_table`` and ``encoder`` functions.
 
-    ``max_length`` bounds the token table's dynamic sequence dimension.
+    Text functions take ids; ``main`` maps ids to ``inputs_embeds`` (dynamic length up to
+    ``max_length``); ``embeds_*`` functions take ``inputs_embeds``. The functions share one copy
+    of the table and the transformer.
     """
-    from coreai_models.diffusion.gpu import export_multifunction, export_stateless
+    import coreai_torch
 
-    programs: dict[str, AIProgram] = {
-        TOKEN_TABLE_COMPONENT: export_token_table_program(
-            text_encoder.embed_tokens, max_length, include_debug_info
+    vocab_size = int(encoder.config.vocab_size)
+    hidden = int(encoder.config.hidden_size)
+    length = torch.export.Dim("length", min=2, max=max_length)
+    text = TextEmbeddingExportWrapper(encoder)
+    traces = [
+        (
+            text,
+            TraceSpec(
+                spec.name, reference_inputs(spec, vocab_size), TEXT_INPUT_NAMES, (OUTPUT_NAME,)
+            ),
         )
-    }
-    with without_token_table(text_encoder) as encoder:
-        wrapper = InputsEmbedsEncoderWrapper(encoder)
-        traces = []
-        for spec in functions:
-            generator = torch.Generator().manual_seed(spec.length)
-            embeds = torch.randn(
-                (spec.batch, spec.length, image.soft_token_dim), generator=generator
-            )
-            mask = torch.ones((spec.batch, spec.length), dtype=torch.int32)
-            traces.append((spec.name, wrapper, (embeds, mask)))
-        programs[ENCODER_COMPONENT] = export_multifunction(
-            traces, ENCODER_INPUT_NAMES, (OUTPUT_NAME,), include_debug_info
+        for spec in text_fns
+    ]
+    traces.append(
+        (
+            TokenTableExportWrapper(encoder.embed_tokens),
+            TraceSpec(
+                "main",
+                (torch.zeros((1, 64), dtype=torch.int32),),
+                TOKEN_TABLE_INPUT_NAMES,
+                (TOKEN_TABLE_OUTPUT_NAME,),
+                ({1: length},),
+            ),
         )
-    programs[IMAGE_COMPONENT] = export_stateless(
+    )
+    converter = _converter(include_debug_info)
+    decomp = coreai_torch.get_decomp_table()
+    _add_functions(converter, traces, decomp)
+    with without_token_table(encoder) as inner:
+        embeds = InputsEmbedsEncoderWrapper(inner)
+        _add_functions(
+            converter,
+            [
+                (
+                    embeds,
+                    TraceSpec(
+                        spec.name,
+                        embeds_reference_inputs(spec, hidden),
+                        ENCODER_INPUT_NAMES,
+                        (OUTPUT_NAME,),
+                    ),
+                )
+                for spec in encoder_fns
+            ],
+            decomp,
+        )
+    return converter.to_coreai()
+
+
+def export_image_encoder_program(
+    image_encoder: nn.Module,
+    image: ImageTowerFacts,
+    include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
+) -> AIProgram:
+    """GPU ``image_encoder``: function ``main``, pixels and positions -> soft tokens."""
+    from coreai_models.diffusion.gpu import export_stateless
+
+    return export_stateless(
         ImageEncoderExportWrapper(image_encoder),
         image_reference_inputs(image),
         IMAGE_INPUT_NAMES,
         (IMAGE_OUTPUT_NAME,),
         include_debug_info=include_debug_info,
     )
-    return programs
 
 
 def export_ane_encoder_program(
@@ -556,28 +610,33 @@ def _export_gpu_programs(
 ) -> None:
     dtype = _DTYPES[compute_precision]
     encoder = _load_text_encoder(family, snapshot, dtype)
-    program = export_text_encoder_program(
-        TextEmbeddingExportWrapper(encoder),
-        text_functions(family, "macOS"),
-        int(encoder.config.vocab_size),
-        include_debug_info,
-    )
+    if with_image:
+        program = export_shared_text_program(
+            encoder,
+            text_functions(family, "macOS"),
+            encoder_functions(family, "macOS"),
+            family.model_max_tokens,
+            include_debug_info,
+        )
+    else:
+        program = export_text_encoder_program(
+            TextEmbeddingExportWrapper(encoder),
+            text_functions(family, "macOS"),
+            int(encoder.config.vocab_size),
+            include_debug_info,
+        )
     _save(program, out, family, TEXT_COMPONENT)
-    del program
+    del program, encoder
     if not with_image:
         return
     assert family.image is not None
     image_encoder = _load_image_encoder(family, snapshot, dtype, family.image.budget)
-    programs = export_image_programs(
-        encoder,
-        image_encoder,
-        family.image,
-        encoder_functions(family, "macOS"),
-        max_length=family.model_max_tokens,
-        include_debug_info=include_debug_info,
+    _save(
+        export_image_encoder_program(image_encoder, family.image, include_debug_info),
+        out,
+        family,
+        IMAGE_COMPONENT,
     )
-    for component, component_program in programs.items():
-        _save(component_program, out, family, component)
 
 
 def _export_ane_programs(
@@ -799,7 +858,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"platform:  {platform}")
         print(f"precision: {precision}")
         print(f"towers:    {towers}")
-        print(f"assets:    {', '.join(assets.values())}")
+        print(f"assets:    {', '.join(dict.fromkeys(assets.values()))}")
         if platform == "macOS":
             print(f"text functions:    {[f.name for f in text_functions(family, platform)]}")
         if with_image or platform == "iOS":
