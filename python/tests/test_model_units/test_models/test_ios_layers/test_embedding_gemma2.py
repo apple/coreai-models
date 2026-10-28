@@ -13,11 +13,15 @@ import torch
 from coreai_models.models.ios.embedding_gemma2 import (
     MASK_NEG,
     ScaledRMSNorm,
+    load_embedding_gemma2_text_encoder,
     text_encoder_from_state_dict,
 )
 from coreai_models.models.macos.embedding_gemma2 import (
     EmbeddingGemma2TextConfig,
     EmbeddingGemma2TextEncoder,
+)
+from coreai_models.models.macos.embedding_gemma2 import (
+    load_embedding_gemma2_text_encoder as load_macos_text_encoder,
 )
 from tests.test_model_units.test_models._embedding_gemma2_common import (
     TINY_TEXT_CONFIG,
@@ -131,3 +135,18 @@ def test_all_zero_pool_weights_give_a_zero_vector(dtype: torch.dtype) -> None:
     with torch.no_grad():
         got = ios(**inputs)
     assert torch.equal(got, torch.zeros_like(got))
+
+
+@pytest.mark.parametrize(("length", "valid"), [(8, 8), (64, 40), (128, 128)])
+def test_real_weight_float16_matches_float32(embeddinggemma2_snapshot, length, valid) -> None:
+    reference = load_macos_text_encoder(embeddinggemma2_snapshot, dtype=torch.float32).eval()
+    ios16, table = load_embedding_gemma2_text_encoder(embeddinggemma2_snapshot, torch.float16)
+    gen = torch.Generator().manual_seed(length)
+    ids = torch.randint(3, table.shape[0], (1, length), generator=gen, dtype=torch.int32)
+    ids[0, 0], ids[0, valid - 1] = 2, 1  # BOS ... EOS
+    mask = (torch.arange(length) < valid).to(torch.int32)[None]
+    with torch.no_grad():
+        want = reference(input_ids=ids, attention_mask=mask)
+        got = ios16(**_host_inputs(ids, mask, table, ios16.config.sliding_window, torch.float16))
+    assert torch.isfinite(got).all()
+    assert float(_cos(got.float(), want)) >= 0.9999
