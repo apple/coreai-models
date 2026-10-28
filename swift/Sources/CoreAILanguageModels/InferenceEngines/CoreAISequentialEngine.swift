@@ -289,9 +289,10 @@ public final class CoreAISequentialEngine: InferenceEngine, IdempotentEngine, Ba
 
     // MARK: - Token Batch Processing
 
-    /// Process a batch of tokens in a single forward pass.
+    /// Process a batch of tokens in a single forward pass. Returns `[]` for `.none`, `[vocabSize]` for
+    /// `.lastPosition`, and `[tokens.count × vocabSize]` for `.allPositions`.
     private func processTokenBatch(
-        _ tokens: ArraySlice<Int32>, sessionState: GenerationSessionState
+        _ tokens: ArraySlice<Int32>, logits: LogitsRequest, sessionState: GenerationSessionState
     ) async throws -> [LogitsScalarType] {
         let batchSize = tokens.count
         guard batchSize > 0 else {
@@ -337,9 +338,18 @@ public final class CoreAISequentialEngine: InferenceEngine, IdempotentEngine, Ba
         )
         sessionState.logitsScratch = logitsArray  // Store the handle back so the next step reuses it.
 
-        // Read logits from NDArray
-        let totalLogits = batchSize * config.vocabSize
-        let logitBuffer = readNDArray(logitsArray, as: LogitsScalarType.self, count: totalLogits)
+        let vocab = config.vocabSize
+        let logitBuffer: [LogitsScalarType]
+        switch logits {
+        case .none:
+            logitBuffer = []
+        case .lastPosition:
+            let lastRow = Self.logitsRows(
+                logitsArray, count: 1, rowLength: vocab, firstOffset: (batchSize - 1) * vocab, rowStride: 0)
+            logitBuffer = lastRow[0]
+        case .allPositions:
+            logitBuffer = readNDArray(logitsArray, as: LogitsScalarType.self, count: batchSize * vocab)
+        }
 
         sessionState.processedTokenCount += batchSize
 
@@ -588,12 +598,11 @@ public final class CoreAISequentialEngine: InferenceEngine, IdempotentEngine, Ba
             logits = try await processChunkedPrompt(
                 tokens: promptSlice, chunkSize: chunkSize, sessionState: scratch)
         case .wholeBatch:
-            let allLogits = try await processTokenBatch(promptSlice, sessionState: scratch)
-            logits = lastTokenLogits(from: allLogits, vocabSize: config.vocabSize)
+            logits = try await processTokenBatch(promptSlice, logits: .lastPosition, sessionState: scratch)
         case .oneAtATime:
             var last: [LogitsScalarType] = []
             for j in promptSlice.indices {
-                last = try await processTokenBatch(promptSlice[j...j], sessionState: scratch)
+                last = try await processTokenBatch(promptSlice[j...j], logits: .lastPosition, sessionState: scratch)
             }
             logits = last
         }
@@ -676,7 +685,7 @@ public final class CoreAISequentialEngine: InferenceEngine, IdempotentEngine, Ba
                 try await self.encodePrefillChunk(chunk, using: prefillFn, sessionState: sessionState)
                 return []
             }
-            return try await self.processTokenBatch(chunk, sessionState: sessionState)
+            return try await self.processTokenBatch(chunk, logits: .lastPosition, sessionState: sessionState)
         }
     }
 
@@ -716,7 +725,8 @@ public final class CoreAISequentialEngine: InferenceEngine, IdempotentEngine, Ba
         {
             let end = remaining.startIndex + size
             let stepLogits = try await processTokenBatch(
-                remaining[remaining.startIndex..<end], sessionState: sessionState)
+                remaining[remaining.startIndex..<end], logits: keepAllLogits ? .allPositions : .lastPosition,
+                sessionState: sessionState)
             if keepAllLogits {
                 logits.append(contentsOf: stepLogits)
             } else {
@@ -1058,7 +1068,7 @@ extension CoreAISequentialEngine.GenerationSequence {
                     for j in allTokens.indices {
                         collected.append(
                             contentsOf: try await engine.processTokenBatch(
-                                allTokens[j...j], sessionState: sessionState))
+                                allTokens[j...j], logits: .allPositions, sessionState: sessionState))
                     }
                     allLogits = collected
                 }
@@ -1114,7 +1124,7 @@ extension CoreAISequentialEngine.GenerationSequence {
                     var lastLogits: [LogitsScalarType] = []
                     for j in newTokens.indices {
                         lastLogits = try await engine.processTokenBatch(
-                            newTokens[j...j], sessionState: sessionState)
+                            newTokens[j...j], logits: .lastPosition, sessionState: sessionState)
                     }
                     logitBuffer = lastLogits
                 }
