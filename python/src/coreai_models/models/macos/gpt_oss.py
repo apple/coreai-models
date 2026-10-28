@@ -15,6 +15,7 @@ from transformers.models.gpt_oss.modeling_gpt_oss import (
 )
 from typing_extensions import Self, override
 
+from coreai_models._download import resolve_model_path
 from coreai_models._hf import load_named_tensors_from_weight_files, resolve_rope_theta
 from coreai_models.models.base import BaseForCausalLM, _is_layer_key_beyond, move_model_to_disk
 from coreai_models.primitives.macos.cache import KVCache
@@ -319,7 +320,9 @@ class GptOssForCausalLM(BaseForCausalLM):
         Returns:
             Instance of the model class loaded with HuggingFace weights
         """
-        config = GptOssConfig.from_pretrained(huggingface_model_id)
+        config = GptOssConfig.from_pretrained(
+            resolve_model_path(huggingface_model_id, allow_patterns=["config.json"])
+        )
         if cls._HF_MODEL_CLASS is None:
             raise ValueError(f"{cls.__name__} must define _HF_MODEL_CLASS class attribute")
         msg = "All HuggingFace model should have architectures field populated"

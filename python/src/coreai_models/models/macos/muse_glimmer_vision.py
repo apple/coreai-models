@@ -51,9 +51,9 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from huggingface_hub import snapshot_download
 from safetensors import safe_open
 
+from coreai_models._download import download_snapshot
 from coreai_models.models.base import (
     _load_tensors_for_keys,
     _resolve_safetensors_files,
@@ -679,7 +679,7 @@ class MuseGlimmerVisionModel(nn.Module):
         if os.path.isdir(model_id_or_path):
             model_dir = model_id_or_path
         else:
-            model_dir = snapshot_download(
+            model_dir = download_snapshot(
                 model_id_or_path,
                 allow_patterns=[
                     "*.safetensors",

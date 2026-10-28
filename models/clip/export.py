@@ -17,6 +17,7 @@
 # ///
 import argparse
 import shutil
+import sys
 import time
 from pathlib import Path
 
@@ -24,6 +25,9 @@ import torch
 import transformers
 from coreai.runtime import AIModelAssetMetadata
 from coreai_torch import TorchConverter, get_decomp_table
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from _download_shim import resolve_model_path  # noqa: E402
 
 
 class ClipModule(torch.nn.Module):
@@ -141,12 +145,13 @@ def create_clip(
     include_debug_info: bool,
 ):
     print("[INFO] Sourcing model...")
-    model = ClipModule(model_name)
+    local_path = resolve_model_path(model_name)
+    model = ClipModule(local_path)
     model.eval()
     model.to(dtype)
     print("[INFO] Model sourced. Running torch export with decompositions...")
 
-    example_inputs = reference_inputs(model_name, dtype, dynamic)
+    example_inputs = reference_inputs(local_path, dtype, dynamic)
     ds = dynamic_shapes() if dynamic else None
 
     with torch.autocast(device_type="cpu", dtype=dtype):
@@ -177,7 +182,12 @@ def main():
     parser = argparse.ArgumentParser(description="Create and save a Core AI AIProgram for CLIP.")
     parser.add_argument(
         "--model",
-        choices=["openai/clip-vit-base-patch32"],
+        choices=[
+            "openai/clip-vit-base-patch32",
+            # ModelScope id: also set COREAI_DOWNLOAD_BACKEND=modelscope
+            # (plus `uv run --with modelscope`).
+            "openai-mirror/clip-vit-base-patch32",
+        ],
         default="openai/clip-vit-base-patch32",
         help="Model variant to convert.",
     )

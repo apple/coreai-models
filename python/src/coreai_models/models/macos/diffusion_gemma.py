@@ -819,15 +819,14 @@ def _mutate_diffusion_gemma_state_dict(
 def _load_state_dict_from_hub(
     hf_model_id: str, target_dtype: torch.dtype, num_layers: int | None
 ) -> dict[str, torch.Tensor]:
-    from huggingface_hub import snapshot_download
-
+    from coreai_models._download import download_snapshot
     from coreai_models.models.base import (
         _build_safetensors_key_index,
         _load_tensors_for_keys,
         _resolve_safetensors_files,
     )
 
-    model_dir = snapshot_download(
+    model_dir = download_snapshot(
         hf_model_id, allow_patterns=["*.safetensors", "*.safetensors.index.json"]
     )
     sf_files = _resolve_safetensors_files(model_dir)
@@ -865,7 +864,12 @@ def load_diffusion_gemma_encoder(
     mmap_path: str | None = None,
 ) -> DiffusionGemmaEncoder:
     """Load the encoder model with HF checkpoint weights."""
-    cfg = DiffusionGemmaConfig.from_pretrained(hf_model_id).text_config
+    from coreai_models._download import resolve_model_path
+
+    local_path = resolve_model_path(
+        hf_model_id, allow_patterns=["config.json", "generation_config.json"]
+    )
+    cfg = DiffusionGemmaConfig.from_pretrained(local_path).text_config
     if max_context_length is not None:
         cfg.max_position_embeddings = max_context_length
     if num_layers is not None:
@@ -895,7 +899,12 @@ def load_diffusion_gemma_decoder(
     num_layers: int | None = None,
 ) -> DiffusionGemmaDecoder:
     """Load the canvas denoiser model with HF checkpoint weights."""
-    cfg = DiffusionGemmaConfig.from_pretrained(hf_model_id).text_config
+    from coreai_models._download import resolve_model_path
+
+    local_path = resolve_model_path(
+        hf_model_id, allow_patterns=["config.json", "generation_config.json"]
+    )
+    cfg = DiffusionGemmaConfig.from_pretrained(local_path).text_config
     if num_layers is not None:
         cfg.num_hidden_layers = num_layers
 

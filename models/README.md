@@ -31,6 +31,123 @@ uv run coreai.llm.export Qwen/Qwen3-0.6B --platform iOS  # iOS
 
 The export tool resolves compression, precision, and context length automatically for known models.
 
+#### Downloading from ModelScope
+
+By default models are downloaded from the HuggingFace Hub. You can switch the
+download backend to [ModelScope](https://modelscope.cn) (useful where HF access
+is slow or blocked, and for Qwen models which are mirrored on ModelScope):
+
+```bash
+# 1. Install the optional ModelScope backend (into the uv workspace env)
+uv pip install modelscope
+
+# 2a. Per-command: pass --backend modelscope (Qwen/Qwen3-0.6B exists
+#     under the same name on both hubs, so the HF id works as-is)
+uv run coreai.llm.export Qwen/Qwen3-0.6B --backend modelscope
+
+# 2b. Or via environment variable
+export COREAI_DOWNLOAD_BACKEND=modelscope
+uv run coreai.llm.export Qwen/Qwen3-0.6B
+```
+
+Backend resolution precedence: `--backend` flag > `COREAI_DOWNLOAD_BACKEND`
+(`huggingface` | `modelscope`) > HuggingFace (default). The `modelscope`
+package is only imported when the ModelScope backend is active, so the
+default path needs no extra dependency. Version 1.37 or newer is required —
+older releases lack the `allow_patterns` support the download path relies on.
+
+**Model ids belong to the selected hub's namespace.** Use a HuggingFace id
+(`org/name`) with the default backend, or a ModelScope id together with the
+ModelScope backend. The example above works both ways: `Qwen/Qwen3-0.6B`
+exists under the same name on both hubs, so either id downloads fine with
+the ModelScope backend selected. If the model lives under a *different*
+namespace on ModelScope (see the table below), pass the ModelScope id
+explicitly — passing the HF id to the ModelScope backend will 404 for those
+repos.
+
+> **Python API users:** The `--backend` flag only exists on the CLI. If you
+> call `export_model(...)` directly from Python, set the backend via the
+> environment variable instead — `export COREAI_DOWNLOAD_BACKEND=modelscope`
+> (or `os.environ["COREAI_DOWNLOAD_BACKEND"]="modelscope"` before the call).
+
+> **Standalone-script users:** `uv run models/<name>/export.py` runs in its own
+> PEP 723 environment, which does not include `modelscope` — add it with
+> `--with`:
+>
+> ```bash
+> COREAI_DOWNLOAD_BACKEND=modelscope \
+>   uv run --with modelscope models/whisper/export.py --model AI-ModelScope/whisper-large-v3
+> ```
+
+> **Scope note:** ModelScope download is supported across all export paths:
+> LLM (`coreai.llm.export`), VLM (`coreai.vlm.export`), Diffusion
+> (`coreai.diffusion.export`), Segmentation (`coreai.segmentation.export`),
+> Muse-Glimmer, and standalone
+> `models/<name>/export.py` scripts that load weights from a model hub
+> (CLIP, CLAP, Whisper, T5, RoBERTa, YOLOS, Parakeet, EfficientSAM,
+> Depth-Anything). Three scripts — Wav2Vec2, EDSR, PVT — let their
+> respective libraries fetch weights themselves, outside this repo's
+> download abstraction (`torchaudio` from download.pytorch.org, `torchSR`
+> from GitHub Releases, `timm` from the HuggingFace Hub), so the backend
+> switch does not apply to them. Note in particular that PVT downloads via
+> HF regardless of the backend setting.
+>
+> Some models live under a different namespace on ModelScope than on
+> HuggingFace (e.g. `openai/whisper-large-v3` exists only as
+> `AI-ModelScope/whisper-large-v3` there). When using the ModelScope
+> backend, pass the ModelScope id from the table below (standalone-script
+> `--model` choices include them). Most models share the same `org/name` on
+> both hubs, so the HF id works as-is with `--backend modelscope`.
+
+> **ModelScope availability (verified):** The table below lists the
+> ModelScope id to use per model (LLM registry presets + standalone scripts).
+>
+> | Model | HF ID | ModelScope id / status |
+> |-------|-------|------------------------|
+> | Whisper large-v3 / v3-turbo | `openai/whisper-*` | ✅ `AI-ModelScope/whisper-*` |
+> | T5 small / base | `google-t5/t5-small` / `t5-base` | ✅ `AI-ModelScope/t5-small` / `t5-base` |
+> | RoBERTa | `roberta-base` | ✅ `AI-ModelScope/roberta-base` |
+> | CLIP | `openai/clip-vit-base-patch32` | ✅ `openai-mirror/clip-vit-base-patch32` |
+> | GPT-OSS | `openai/gpt-oss-20b` | ⚠️ `openai-mirror/gpt-oss-20b` (see preset caveat below) |
+> | Parakeet | `nvidia/parakeet-tdt-0.6b-v3` | ✅ `nv-community/parakeet-tdt-0.6b-v3` |
+> | Qwen3-VL | `Qwen/Qwen3-VL-2B-Instruct` | ✅ same name |
+> | YOLOS | `hustvl/yolos-*` | ✅ same name |
+> | CLAP | `laion/clap-htsat-unfused` | ✅ same name |
+> | Depth-Anything | `depth-anything/da3-small` | ✅ same name |
+> | EfficientSAM | `merve/EfficientSAM` | ✅ same name (URL direct link) |
+> | SAM3 (Segmentation / Video) | `facebook/sam3` | ✅ same name |
+> | Qwen3 / Gemma3 / Phi / Mistral / FLUX.2 / SD3.5 | various | ✅ same name |
+> | Qwen3.5 (0.8B / 2B / 4B / 9B / 27B) | `Qwen/Qwen3.5-*` | ✅ same name |
+> | Gemma 3n (E2B / E4B) | `google/gemma-3n-*` | ✅ same name |
+> | SmolLM2 (1.7B / 360M / 135M) | `HuggingFaceTB/SmolLM2-*-Instruct` | ✅ same name |
+> | Wan 2.1 T2V | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` | ✅ same name |
+> | Sana Sprint 0.6B | `Efficient-Large-Model/Sana_Sprint_0.6B_1024px_diffusers` | ✅ same name |
+> | DiffusionGemma 26B A4B | `google/diffusiongemma-26b-a4b-it` | ✅ same name |
+> | OLMo 2 (1B) | `allenai/OLMo-2-0425-1B-Instruct` | ✅ same name |
+> | Muse Glimmer 30B / drafter / VLM | `meta-models/Muse-Glimmer-30B` / `-assistant` / `-vision` | ✅ same name |
+> | T5-large | `google-t5/t5-large` | ❌ not on ModelScope |
+>
+> Only T5-large is not available on ModelScope. It will fail with a 404 when
+> `--backend modelscope` is used; fall back to the default HuggingFace backend
+> for that model. (Note: `google/flan-t5-large` — the instruction-tuned variant
+> — does exist on ModelScope, but it is a different model with different
+> weights; `google-t5/t5-large` cannot be substituted with it.)
+
+> **GPT-OSS preset caveat:** `gpt-oss-20b` is the only preset whose ModelScope
+> repo lives under a different namespace. Its short name resolves to the HF id
+> (`openai/gpt-oss-20b`), which 404s on ModelScope — export it from ModelScope
+> by passing the ModelScope id with `--experimental` and this preset's defaults:
+>
+> ```bash
+> uv run coreai.llm.export openai-mirror/gpt-oss-20b --backend modelscope \
+>     --experimental --compute-precision bfloat16 \
+>     --compression none --max-context-length 32768
+> ```
+>
+> `--compression none` matters: without it the experimental path defaults to
+> 4bit, but gpt-oss ships natively MXFP4 weights. All other presets are
+> same-name on ModelScope and work as-is.
+
 To try exporting a model that has Python source but no registry preset, use `--experimental`:
 
 ```bash
