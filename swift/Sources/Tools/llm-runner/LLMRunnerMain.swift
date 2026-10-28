@@ -1054,7 +1054,8 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         additionalEosTokenIds: Set<Int32>,
         displayPrompt: String
     ) async throws {
-        guard let vlmEngine = inferenceEngine as? any MultimodalInferenceEngine else {
+        guard let vlmEngine = inferenceEngine as? any MultimodalInferenceEngine, vlmEngine.acceptsMultimodalInput
+        else {
             print("Error: --image requires a vision-language model (engine does not support multimodal)")
             throw ExitCode.failure
         }
@@ -1120,7 +1121,8 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         additionalEosTokenIds: Set<Int32>,
         displayPrompt: String
     ) async throws {
-        guard let vlmEngine = inferenceEngine as? any MultimodalInferenceEngine else {
+        guard let vlmEngine = inferenceEngine as? any MultimodalInferenceEngine, vlmEngine.acceptsMultimodalInput
+        else {
             print("Error: --video requires a vision-language model (engine does not support multimodal)")
             throw ExitCode.failure
         }

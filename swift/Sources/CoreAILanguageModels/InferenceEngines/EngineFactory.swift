@@ -211,6 +211,36 @@ public struct EngineFactory: Sendable {
         )
     }
 
+    /// Build `CoreAISequentialEngine` for a separate-embedding vision-language bundle: prepare
+    /// the three components one at a time and construct the engine with its vision components.
+    static func makeSequentialVLMEngine(
+        bundle: LanguageModelBundle,
+        options: EngineOptions = EngineOptions()
+    ) async throws -> CoreAISequentialEngine {
+        try bundle.modelBundle.validateModelAssets()
+        let languageModelURL = try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.main)
+        let vlmConfig = try makeVLMConfig(
+            bundle: bundle, languageModelURL: languageModelURL, options: options)
+
+        let visionModelURL = try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.vision)
+        let embeddingModelURL = try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.embedding)
+
+        CLILogger.log("EngineFactory: Creating sequential vision-language engine for \(bundle.name)")
+
+        // Prepare one at a time to keep Core AI specialization stable.
+        let visionModel = try await PreparedModel.prepare(at: visionModelURL)
+        let embedModel = try await PreparedModel.prepare(at: embeddingModelURL)
+        let llmModel = try await PreparedModel.prepare(at: languageModelURL)
+
+        return try await CoreAISequentialEngine(
+            config: vlmConfig.base,
+            preparedModel: llmModel,
+            options: options,
+            vision: CoreAISequentialEngine.VisionComponents(
+                visionModel: visionModel, embedModel: embedModel, visionConfig: vlmConfig.visionConfig)
+        )
+    }
+
     // MARK: - Config Parsing
 
     /// Parsed config container for engine selection.

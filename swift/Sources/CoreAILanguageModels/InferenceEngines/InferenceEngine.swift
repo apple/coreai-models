@@ -421,6 +421,10 @@ public enum InferenceRuntimeError: Error, LocalizedError {
 ///
 /// The caller owns the embeddings and decides caching strategy.
 public protocol MultimodalInferenceEngine: InferenceEngine {
+    /// Whether this engine instance accepts image and video input. A conforming engine built from
+    /// a text bundle (such as `CoreAISequentialEngine`) reports `false`.
+    var acceptsMultimodalInput: Bool { get }
+
     /// Encode an image into embeddings suitable for injection into the VLM.
     /// Returns the embedded representation — caller decides whether to cache.
     func encodeImage(at url: URL) async throws -> InputEmbeddings
@@ -443,6 +447,10 @@ public protocol MultimodalInferenceEngine: InferenceEngine {
         samplingConfiguration: SamplingConfiguration,
         inferenceOptions: InferenceOptions
     ) async throws -> OutputSequence
+}
+
+extension MultimodalInferenceEngine {
+    public var acceptsMultimodalInput: Bool { true }
 }
 
 // TODO: Multi-turn — caller can cache InputEmbeddings across turns and pass it
