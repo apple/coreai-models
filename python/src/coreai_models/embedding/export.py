@@ -274,8 +274,16 @@ def embeds_reference_inputs(spec: FunctionSpec, hidden: int) -> tuple[torch.Tens
     return embeds, torch.ones((spec.batch, spec.length), dtype=torch.int32)
 
 
-def image_reference_inputs(image: ImageTowerFacts) -> tuple[torch.Tensor, torch.Tensor]:
-    """Image-encoder trace inputs: a full block grid padded to the budget (int32 positions)."""
+def image_reference_inputs(
+    image: ImageTowerFacts,
+    dtype: torch.dtype = torch.float32,
+    position_dtype: torch.dtype = torch.int32,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Image-encoder trace inputs: a block grid padded to the budget (-1 positions, zero pixels).
+
+    The GPU program takes float32 pixels and int32 positions; the Neural Engine takes float16 for
+    both.
+    """
     k = image.pooling_kernel_size
     n = image.budget
     # Square-ish grid of n soft tokens (blocks) -> (bw*k) x (bh*k) patches, row-major.
@@ -283,13 +291,13 @@ def image_reference_inputs(image: ImageTowerFacts) -> tuple[torch.Tensor, torch.
     bh = max(1, n // bw)
     pw, ph = bw * k, bh * k
     ys, xs = torch.meshgrid(torch.arange(ph), torch.arange(pw), indexing="ij")
-    real = torch.stack([xs.reshape(-1), ys.reshape(-1)], dim=-1).to(torch.int32)
+    real = torch.stack([xs.reshape(-1), ys.reshape(-1)], dim=-1)
     positions = torch.full((1, image.max_patches, 2), -1, dtype=torch.int32)
-    positions[0, : real.shape[0]] = real
+    positions[0, : real.shape[0]] = real.to(torch.int32)
     generator = torch.Generator().manual_seed(image.budget)
     pixels = torch.rand((1, image.max_patches, image.patch_dim), generator=generator)
     pixels[0, real.shape[0] :] = 0.0
-    return pixels, positions
+    return pixels.to(dtype), positions.to(position_dtype)
 
 
 def ane_text_reference_inputs(
@@ -301,19 +309,6 @@ def ane_text_reference_inputs(
     bias = torch.zeros((1, length, 1, length), dtype=torch.float16)
     pool = torch.full((1, length), 1.0 / length, dtype=torch.float16)
     return embeds, bias, pool
-
-
-def ane_image_reference_inputs(image: ImageTowerFacts) -> tuple[torch.Tensor, torch.Tensor]:
-    """Neural Engine image trace inputs (float16): a block grid padded to the budget (-1 pad)."""
-    k = image.pooling_kernel_size
-    a = int(image.budget**0.5)
-    gh, gw = k * a, k * (image.budget // a)
-    generator = torch.Generator().manual_seed(image.budget)
-    pixels = torch.rand((1, image.max_patches, image.patch_dim), generator=generator)
-    ys, xs = torch.meshgrid(torch.arange(gh), torch.arange(gw), indexing="ij")
-    positions = torch.full((1, image.max_patches, 2), -1.0)
-    positions[0, : gh * gw] = torch.stack([xs.reshape(-1), ys.reshape(-1)], -1).float()
-    return pixels.to(torch.float16), positions.to(torch.float16)
 
 
 @dataclass
@@ -522,7 +517,10 @@ def export_ane_image_encoder_program(
 ) -> AIProgram:
     """Neural Engine ``image_encoder``: function ``main`` at the static budget."""
     trace = TraceSpec(
-        "main", ane_image_reference_inputs(image), IMAGE_INPUT_NAMES, (IMAGE_OUTPUT_NAME,)
+        "main",
+        image_reference_inputs(image, torch.float16, torch.float16),
+        IMAGE_INPUT_NAMES,
+        (IMAGE_OUTPUT_NAME,),
     )
     return convert_ane_functions([(image_encoder, trace)], include_debug_info=include_debug_info)
 

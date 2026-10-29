@@ -633,7 +633,7 @@ def test_ane_reference_inputs_shapes():
     embeds, bias, pool = embedding_export.ane_text_reference_inputs(128, 512)
     assert embeds.shape == (1, 128, 512) and bias.shape == (1, 128, 1, 128)
     assert pool.shape == (1, 128) and {t.dtype for t in (embeds, bias, pool)} == {torch.float16}
-    pixels, positions = embedding_export.ane_image_reference_inputs(IMAGE)
+    pixels, positions = embedding_export.image_reference_inputs(IMAGE, torch.float16, torch.float16)
     assert pixels.shape == (1, 2520, 768) and positions.shape == (1, 2520, 2)
     assert pixels.dtype == positions.dtype == torch.float16
     real = positions[0, :, 0] >= 0
