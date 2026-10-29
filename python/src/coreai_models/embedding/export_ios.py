@@ -151,6 +151,9 @@ def export_ane_programs(
 
     # The token table runs on the GPU and stores the scaled table in float16, the encoder's input
     # precision.
+    # TODO: write the table as a safetensors sidecar that the host gathers from, as the Gemma 4
+    # per-layer embeddings do (SafeTensorsReader), instead of a GPU program; lands with the Swift
+    # embedding runtime.
     encoder, table = load_embedding_gemma2_text_encoder(snapshot, dtype=torch.float16)
     token_table = scaled_token_table(table, encoder.config.hidden_size**0.5, torch.float16)
     del table
