@@ -370,6 +370,23 @@ def test_export_writes_the_requested_precision_to_metadata(tmp_path, monkeypatch
     assert written["embedding"]["precision"]["compute"] == "bfloat16"
 
 
+def test_failed_export_removes_the_bundle_dir(tmp_path, monkeypatch):
+    def fail(*args, **kwargs):
+        raise RuntimeError("conversion failed")
+
+    monkeypatch.setattr(
+        embedding_export, "resolve_snapshot", lambda *a: (tmp_path, "0123456789abcdef0123")
+    )
+    monkeypatch.setattr(embedding_export, "verify_pooling_config", lambda *a: None)
+    monkeypatch.setattr(embedding_export, "read_prompts", lambda *a: (PROMPTS, None))
+    monkeypatch.setattr(embedding_export, "consolidate_prompts", lambda family, prompts: prompts)
+    monkeypatch.setattr(embedding_export, "copy_tokenizer", lambda *a: ["tokenizer.json"])
+    monkeypatch.setattr(embedding_export, "_export_gpu_programs", fail)
+    with pytest.raises(RuntimeError, match="conversion failed"):
+        embedding_export.export_embedding_bundle(EG2, tmp_path / "out", with_image=False)
+    assert not (tmp_path / "out").exists()
+
+
 def test_forbidden_precision_message_lists_the_allowed_ones():
     with pytest.raises(EmbeddingPrecisionError, match=r"Use float32 \(default\) or bfloat16\."):
         check_compute_precision(EG2, "float16")
@@ -725,7 +742,7 @@ def test_cli_dry_run_never_exports(no_export, capsys):
     assert embedding_export.main(["embeddinggemma-2", "--platform", "iOS", "--dry-run"]) == 0
     out = capsys.readouterr().out
     assert "iOS" in out and "float16" in out and "encoder.aimodel" in out
-    assert "len128_b1" in out and "embeddinggemma-2-ios" in out
+    assert "embeds_len128_b1" in out and "embeddinggemma-2-ios" in out
 
 
 def test_cli_list_models(capsys):

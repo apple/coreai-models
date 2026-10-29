@@ -327,13 +327,6 @@ class TraceSpec:
     dynamic_shapes: tuple[dict[int, Any] | None, ...] | None = None
 
 
-def _converter(include_debug_info: bool) -> Any:
-    import coreai_torch
-
-    mode = coreai_torch.TorchConverter.Mode
-    return coreai_torch.TorchConverter(mode=mode.DEBUG if include_debug_info else mode.RELEASE)
-
-
 def _add_functions(
     converter: Any, traces: list[tuple[nn.Module, TraceSpec]], decomp: dict[Any, Any]
 ) -> None:
@@ -368,9 +361,12 @@ def convert_ane_functions(
 
     Uses the default decompositions plus the repo's custom lowerings, as ``export/ios.py`` does.
     """
+    import coreai_torch
+
     from coreai_models.export.mlir_ops import register_custom_torch_lowering
 
-    converter = _converter(include_debug_info)
+    mode = coreai_torch.TorchConverter.Mode
+    converter = coreai_torch.TorchConverter(mode=mode.DEBUG if include_debug_info else mode.RELEASE)
     register_custom_torch_lowering(converter)
     _add_functions(converter, traces, torch.export.default_decompositions())
     return converter.to_coreai()
@@ -456,7 +452,8 @@ def export_shared_text_program(
             ),
         )
     )
-    converter = _converter(include_debug_info)
+    mode = coreai_torch.TorchConverter.Mode
+    converter = coreai_torch.TorchConverter(mode=mode.DEBUG if include_debug_info else mode.RELEASE)
     decomp = coreai_torch.get_decomp_table()
     _add_functions(converter, traces, decomp)
     with without_token_table(encoder) as inner:
@@ -722,52 +719,59 @@ def export_embedding_bundle(
             raise FileExistsError(f"{out} exists (pass --overwrite)")
         shutil.rmtree(out)
     out.mkdir(parents=True)
+    try:
+        snapshot, sha = resolve_snapshot(family.hf_model_id, model_dir)
+        if not sha:
+            raise ValueError(
+                f"Could not read the snapshot revision from {snapshot}; pass a Hugging Face "
+                "cache snapshot directory (.../snapshots/<sha>), whose name is the revision the "
+                "bundle records"
+            )
+        verify_pooling_config(snapshot, family)
+        if with_image:
+            verify_image_config(snapshot, family)
+        snapshot_prompts, default_prompt = read_prompts(snapshot)
+        prompts = consolidate_prompts(family, snapshot_prompts)
+        copy_tokenizer(snapshot, out / "tokenizer")
 
-    snapshot, sha = resolve_snapshot(family.hf_model_id, model_dir)
-    if not sha:
-        raise ValueError(f"Could not infer the snapshot SHA from {snapshot}")
-    verify_pooling_config(snapshot, family)
-    if with_image:
-        verify_image_config(snapshot, family)
-    snapshot_prompts, default_prompt = read_prompts(snapshot)
-    prompts = consolidate_prompts(family, snapshot_prompts)
-    copy_tokenizer(snapshot, out / "tokenizer")
+        if platform == "iOS":
+            _export_ane_programs(
+                family,
+                snapshot,
+                out,
+                with_image=with_image,
+                include_debug_info=include_debug_info,
+            )
+        else:
+            _export_gpu_programs(
+                family,
+                snapshot,
+                out,
+                with_image=with_image,
+                compute_precision=precision,
+                include_debug_info=include_debug_info,
+            )
 
-    if platform == "iOS":
-        _export_ane_programs(
+        block = embedding_block(
             family,
-            snapshot,
-            out,
+            platform=platform,
             with_image=with_image,
-            include_debug_info=include_debug_info,
-        )
-    else:
-        _export_gpu_programs(
-            family,
-            snapshot,
-            out,
-            with_image=with_image,
+            revision=sha[:16],
+            prompts=prompts,
+            default_prompt_name=default_prompt,
             compute_precision=precision,
-            include_debug_info=include_debug_info,
         )
-
-    block = embedding_block(
-        family,
-        platform=platform,
-        with_image=with_image,
-        revision=sha[:16],
-        prompts=prompts,
-        default_prompt_name=default_prompt,
-        compute_precision=precision,
-    )
-    metadata = build_bundle_metadata(
-        family,
-        block,
-        name=bundle_name(family, platform, with_image),
-        assets=bundle_assets(platform, with_image),
-        hf_revision=sha,
-    )
-    (out / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
+        metadata = build_bundle_metadata(
+            family,
+            block,
+            name=bundle_name(family, platform, with_image),
+            assets=bundle_assets(platform, with_image),
+            hf_revision=sha,
+        )
+        (out / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
+    except BaseException:
+        shutil.rmtree(out, ignore_errors=True)  # a failed export leaves no partial bundle
+        raise
     logger.info("wrote %s", out)
     return metadata
 
@@ -785,9 +789,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--platform",
         choices=list(PLATFORMS),
-        default=None,
-        help="Target platform. macOS: GPU bundle (float32). iOS: Neural Engine bundle "
-        "(float16); also runs on a Mac.",
+        default="macOS",
+        help="Target platform. macOS: GPU bundle (float32 or bfloat16). iOS: Neural Engine "
+        "bundle (float16); also runs on a Mac.",
     )
     parser.add_argument(
         "--skip-vision",
@@ -804,7 +808,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-dir",
         type=Path,
         default=None,
-        help="Parent directory for the bundle (default: <repo>/exports).",
+        help="Parent directory for the bundle (default: <repo_root>/exports).",
     )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--dry-run", action="store_true", help="Print the export plan and exit.")
@@ -842,7 +846,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(
             f"unknown model {args.model!r}. Run `uv run coreai.embedding.export --list-models`."
         )
-    platform = args.platform or "macOS"
+    platform = args.platform
     with_image = not args.skip_vision
     try:
         precision = check_compute_precision(
