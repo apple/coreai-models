@@ -256,7 +256,10 @@ def load_embedding_gemma2_text_encoder(
     model_dir = _resolve_model_dir(model_dir_or_id)
     config = EmbeddingGemma2TextConfig.from_pretrained(model_dir)
     sd: dict[str, torch.Tensor] = {}
-    for file in sorted(model_dir.glob("*.safetensors")):
+    files = sorted(model_dir.glob("*.safetensors"))
+    if not files:
+        raise FileNotFoundError(f"No .safetensors in {model_dir}")
+    for file in files:
         with safe_open(str(file), framework="pt") as handle:
             for key in handle.keys():  # noqa: SIM118
                 if key.startswith(HF_TEXT_PREFIX):

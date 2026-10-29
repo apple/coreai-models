@@ -8,7 +8,7 @@
 Bidirectional encoder with per-layer inputs and a sentence-embedding head: masked mean over the
 valid tokens (prompt included), bias-free projection to 768, then L2 normalization. Masks derive
 from the static sequence length and ``attention_mask``, so the graph has no data-dependent control
-flow. The GPU path runs in float32; the float16 variant lives in the iOS modules.
+flow. The GPU path runs in float32 or bfloat16; the float16 variant lives in the iOS modules.
 """
 
 from __future__ import annotations
@@ -39,7 +39,11 @@ HF_TEXT_PREFIX = "language_model."
 
 @dataclass
 class EmbeddingGemma2TextConfig:
-    """Text-tower config parsed from the HF ``text_config`` block (needs no transformers>=5.19)."""
+    """Text-tower config parsed from the HF ``text_config`` block.
+
+    Reads ``config.json`` directly, so export runs on the repo's pinned transformers; the HF
+    EmbeddingGemma 2 classes need transformers>=5.19.
+    """
 
     vocab_size: int = 262_144
     hidden_size: int = 512

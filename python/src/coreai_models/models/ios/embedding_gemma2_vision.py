@@ -162,7 +162,7 @@ class EmbeddingGemma2ImageEncoder(nn.Module):
         cos = torch.cat((cx, cx, cy, cy), -1).transpose(1, 2).unsqueeze(1)
         sin = torch.cat((sx, sx, sy, sy), -1).transpose(1, 2).unsqueeze(1)
 
-        # Additive key-padding bias (1, Pk, 1, 1), broadcast over heads and queries.
+        # Additive key-padding bias (B, Pk, 1, 1), broadcast over heads and queries.
         bias = ((valid - 1.0) * -MASK_NEG).reshape(b, p, 1, 1)
         for layer in self.layers:
             x = layer(x, cos, sin, bias)
@@ -191,7 +191,10 @@ def load_image_encoder(
         cfg = EmbeddingGemma2VisionConfig.from_hf_config(json.load(f), max_soft_tokens)
     model = EmbeddingGemma2ImageEncoder(cfg)
     sd: dict[str, torch.Tensor] = {}
-    for fn in sorted(x for x in os.listdir(model_dir) if x.endswith(".safetensors")):
+    files = sorted(x for x in os.listdir(model_dir) if x.endswith(".safetensors"))
+    if not files:
+        raise FileNotFoundError(f"No .safetensors in {model_dir}")
+    for fn in files:
         with safe_open(os.path.join(model_dir, fn), framework="pt") as h:
             for key in h.keys():  # noqa: SIM118
                 if key.startswith(("vision_tower.", "embed_vision.")):

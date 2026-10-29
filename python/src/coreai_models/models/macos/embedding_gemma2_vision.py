@@ -7,8 +7,8 @@
 
 Host-prepared patches ``[B, P, 768]`` and ``position_ids [B, P, 2]`` (-1 for padding) become soft
 tokens ``[B, L, 512]`` with P and L static. Padding and the 3x3 pooling slots are derived in-graph
-from ``position_ids``, with no data-dependent control flow. The GPU path runs in float32; the
-float16 variant lives in the iOS modules.
+from ``position_ids``, with no data-dependent control flow. The GPU path runs in float32 or
+bfloat16; the float16 variant lives in the iOS modules.
 """
 
 from __future__ import annotations
@@ -320,6 +320,8 @@ class EmbeddingGemma2ImageEncoder(nn.Module):
         model = cls(config)
         state: dict[str, torch.Tensor] = {}
         files = sorted(fn for fn in os.listdir(model_dir) if fn.endswith(".safetensors"))
+        if not files:
+            raise FileNotFoundError(f"No .safetensors in {model_dir}")
         for fn in files:
             with safe_open(os.path.join(model_dir, fn), framework="pt", device="cpu") as f:
                 for key in f.keys():  # noqa: SIM118
