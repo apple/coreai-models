@@ -12,6 +12,8 @@ it, and compares both with a mask that leaves most of the 32 slots as padding. T
 checks that ``DetectorModule`` ignores whatever sits in the padded slots.
 """
 
+import copy
+
 import pytest
 import torch
 import transformers
@@ -210,3 +212,21 @@ def test_detector_ignores_padded_text_slots(detector, config):
     logits_clean = detector(backbone, text, ones)[2]
     logits_noisy = detector(backbone, noisy, ones)[2]
     assert (logits_clean - logits_noisy).abs().max() > 1e-2
+
+
+@torch.no_grad()
+def test_detector_masks_padding_in_fp16(detector, config):
+    """``detect`` ships fp16: the ``-40000`` bias must stay finite and still zero out padding."""
+    half = copy.deepcopy(detector).half()
+    torch.manual_seed(1)
+    backbone = torch.randn(1, config.vision_config.backbone_config.hidden_size, 1, _GRID * _GRID)
+    text = torch.randn(1, _C, 1, _SEQ)
+    noisy = text.clone()
+    noisy[..., _NUM_VALID:] = torch.randn_like(noisy[..., _NUM_VALID:]) * 10
+    mask = _mask().float().reshape(1, 1, 1, _SEQ)
+
+    clean_out = half(backbone.half(), text.half(), mask.half())
+    noisy_out = half(backbone.half(), noisy.half(), mask.half())
+    for a, b in zip(clean_out, noisy_out, strict=True):
+        assert torch.isfinite(a).all()
+        torch.testing.assert_close(a, b, atol=0, rtol=0)

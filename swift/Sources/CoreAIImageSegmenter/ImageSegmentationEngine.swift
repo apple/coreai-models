@@ -1015,11 +1015,21 @@ public struct CoreAISegmentationEngine {
     /// one (1 = prompt token, 0 = padding); older exports and other models don't.
     typealias TextAttentionMaskInput = (name: String, descriptor: NDArrayDescriptor)
 
-    /// The function's `attention_mask` input, or nil when it has none.
+    /// The function's `attention_mask` input, or nil when it has none. A nil result still loads
+    /// (older bundles keep working) but warns: those exports attend to prompt padding (#381).
     static func resolveTextAttentionMaskInput(
         in descriptor: InferenceFunctionDescriptor, functionName: String
     ) throws -> TextAttentionMaskInput? {
-        guard let name = findTextAttentionMaskName(in: descriptor.inputNames) else { return nil }
+        guard let name = findTextAttentionMaskName(in: descriptor.inputNames) else {
+            CLILogger.log(
+                "Warning: '\(functionName)' has no 'attention_mask' input, so this SAM3 bundle predates "
+                    + "the text-padding fix and its scores and masks can differ from Sam3Model. "
+                    + "Re-export it with the current models/sam3/export.py.",
+                component: "ImageSegmenter",
+                level: 0
+            )
+            return nil
+        }
         guard case .ndArray(let arrayDescriptor) = descriptor.inputDescriptor(of: name) else {
             throw SegmentationRuntimeError.invalidConfiguration(
                 "No array descriptor for '\(name)' input of '\(functionName)'."
