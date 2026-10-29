@@ -289,7 +289,8 @@ def test_torch_export_default_budget_static_shape(monkeypatch) -> None:
     torch.testing.assert_close(exported, eager, rtol=1e-5, atol=1e-5)
     # No dynamic dims and no data-dependent ops (nonzero / masked_select / item) in the graph.
     targets = {str(node.target) for node in ep.graph.nodes if node.op == "call_function"}
-    assert not any(t for t in targets if "nonzero" in t or "masked_select" in t or "item" in t)
+    data_dependent = ("aten.nonzero", "aten.masked_select", "aten.item", "aten._local_scalar_dense")
+    assert not any(op in t for t in targets for op in data_dependent), sorted(targets)
 
 
 # --- Real weights (transformers >= 5.19 + local snapshot) ---

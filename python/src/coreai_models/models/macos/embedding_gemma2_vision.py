@@ -26,7 +26,7 @@ from safetensors import safe_open
 
 from coreai_models.models.macos.diffusion_gemma import DiffusionGemmaDenseMLP
 from coreai_models.models.macos.diffusion_gemma import DiffusionGemmaRMSNorm as RMSNorm
-from coreai_models.primitives.macos.rope import rotate_half
+from coreai_models.primitives.ios.rope import apply_rope
 from coreai_models.primitives.macos.sdpa import SDPA
 
 # Special token ids from the EG2 tokenizer / config.json.
@@ -104,23 +104,6 @@ def axial_inv_freq(cfg: EmbeddingGemma2VisionConfig) -> torch.Tensor:
     )
 
 
-def apply_axial_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """Axial 2-D RoPE: the first half of ``head_dim`` rotates by x, the second half by y.
-
-    Args:
-        x: ``[B, L, H, D]``.
-        cos, sin: ``[B, L, D]`` laid out ``[fx, fx, fy, fy]`` (see ``axial_rope_cos_sin``).
-    """
-    half = x.shape[-1] // 2
-    cos = cos.unsqueeze(2)
-    sin = sin.unsqueeze(2)
-    parts = []
-    for lo, hi in ((0, half), (half, 2 * half)):
-        xp, cp, sp = x[..., lo:hi], cos[..., lo:hi], sin[..., lo:hi]
-        parts.append(xp * cp + rotate_half(xp) * sp)
-    return torch.cat(parts, dim=-1)
-
-
 class VisionAttention(nn.Module):
     """Bidirectional MHA with q/k RMSNorm, scale-free v RMSNorm and axial RoPE; scale 1.0."""
 
@@ -150,8 +133,10 @@ class VisionAttention(nn.Module):
         q = self.q_norm(self.q_proj(x).view(b, n, self.num_heads, self.head_dim))
         k = self.k_norm(self.k_proj(x).view(b, n, self.num_kv_heads, self.head_dim))
         v = self.v_norm(self.v_proj(x).view(b, n, self.num_kv_heads, self.head_dim))
-        q = apply_axial_rope(q, cos, sin).transpose(1, 2)
-        k = apply_axial_rope(k, cos, sin).transpose(1, 2)
+        # Axial 2-D RoPE: half of head_dim rotates by x, half by y (cos/sin from
+        # axial_rope_cos_sin, laid out [fx, fx, fy, fy]).
+        q = apply_rope(q, cos, sin, head_axis=2, ndim=2).transpose(1, 2)
+        k = apply_rope(k, cos, sin, head_axis=2, ndim=2).transpose(1, 2)
         v = v.transpose(1, 2)
         if self.num_kv_heads != self.num_heads:
             rep = self.num_heads // self.num_kv_heads
