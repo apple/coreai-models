@@ -99,6 +99,42 @@ def export_stateless(
     return program
 
 
+def new_converter(
+    include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
+) -> coreai_torch.TorchConverter:
+    """A converter in ``DEBUG`` mode (full debug info) or ``RELEASE`` mode (smaller asset)."""
+    mode = coreai_torch.TorchConverter.Mode
+    return coreai_torch.TorchConverter(mode=mode.DEBUG if include_debug_info else mode.RELEASE)
+
+
+def add_function(
+    converter: coreai_torch.TorchConverter,
+    name: str,
+    module: torch.nn.Module,
+    args: tuple[torch.Tensor, ...],
+    input_names: tuple[str, ...] | list[str],
+    output_names: tuple[str, ...] | list[str],
+    *,
+    dynamic_shapes: tuple[dict[int, torch.export.Dim] | None, ...] | None = None,
+    decompositions: dict | None = None,
+) -> None:
+    """Trace ``module`` on ``args`` and add it to ``converter`` as function ``name``.
+
+    Functions added to one converter share their weights. ``decompositions`` defaults to Core AI's
+    table.
+    """
+    module.eval()
+    with torch.no_grad():
+        exported = torch.export.export(module, args=args, dynamic_shapes=dynamic_shapes)
+    table = coreai_torch.get_decomp_table() if decompositions is None else decompositions
+    converter.add_exported_program(
+        exported.run_decompositions(table),
+        input_names=input_names,
+        output_names=output_names,
+        entrypoint_name=name,
+    )
+
+
 def export_multifunction(
     functions: list[tuple[str, torch.nn.Module, tuple[torch.Tensor, ...]]],
     input_names: tuple[str, ...],
@@ -122,29 +158,8 @@ def export_multifunction(
     Returns:
         An optimized AIProgram with multiple named functions.
     """
-    converter = coreai_torch.TorchConverter(
-        mode=(
-            coreai_torch.TorchConverter.Mode.DEBUG
-            if include_debug_info
-            else coreai_torch.TorchConverter.Mode.RELEASE
-        )
-    )
-    coreai_decomp_table = coreai_torch.get_decomp_table()
-
+    converter = new_converter(include_debug_info)
     for name, wrapper, dummy_inputs in functions:
-        wrapper.eval()
         logger.info(f"Tracing function '{name}' (seq dims: {[t.shape for t in dummy_inputs[:2]]})")
-
-        with torch.no_grad():
-            exported = torch.export.export(wrapper, args=dummy_inputs)
-        decomposed = exported.run_decompositions(coreai_decomp_table)
-
-        converter.add_exported_program(
-            decomposed,
-            input_names=input_names,
-            output_names=output_names,
-            entrypoint_name=name,
-        )
-
-    program = converter.to_coreai()
-    return program
+        add_function(converter, name, wrapper, dummy_inputs, input_names, output_names)
+    return converter.to_coreai()

@@ -327,22 +327,25 @@ class TraceSpec:
     dynamic_shapes: tuple[dict[int, Any] | None, ...] | None = None
 
 
-def _add_functions(
-    converter: Any, traces: list[tuple[nn.Module, TraceSpec]], decomp: dict[Any, Any]
+def add_traces(
+    converter: Any,
+    traces: list[tuple[nn.Module, TraceSpec]],
+    decompositions: dict[Any, Any] | None = None,
 ) -> None:
-    """``torch.export`` every ``(module, trace)`` and add it to ``converter`` as one function."""
+    """Add each ``(module, trace)`` to ``converter`` as a function (Core AI's table by default)."""
+    from coreai_models.diffusion.gpu import add_function
+
     for module, trace in traces:
-        module.eval()
         start = time.time()
-        with torch.no_grad():
-            exported = torch.export.export(
-                module, args=trace.args, dynamic_shapes=trace.dynamic_shapes
-            )
-        converter.add_exported_program(
-            exported.run_decompositions(decomp),
-            input_names=list(trace.input_names),
-            output_names=list(trace.output_names),
-            entrypoint_name=trace.name,
+        add_function(
+            converter,
+            trace.name,
+            module,
+            trace.args,
+            list(trace.input_names),
+            list(trace.output_names),
+            dynamic_shapes=trace.dynamic_shapes,
+            decompositions=decompositions,
         )
         logger.info(
             "traced %s %s in %.1fs",
@@ -361,14 +364,12 @@ def convert_ane_functions(
 
     Uses the default decompositions plus the repo's custom lowerings, as ``export/ios.py`` does.
     """
-    import coreai_torch
-
+    from coreai_models.diffusion.gpu import new_converter
     from coreai_models.export.mlir_ops import register_custom_torch_lowering
 
-    mode = coreai_torch.TorchConverter.Mode
-    converter = coreai_torch.TorchConverter(mode=mode.DEBUG if include_debug_info else mode.RELEASE)
+    converter = new_converter(include_debug_info)
     register_custom_torch_lowering(converter)
-    _add_functions(converter, traces, torch.export.default_decompositions())
+    add_traces(converter, traces, torch.export.default_decompositions())
     return converter.to_coreai()
 
 
@@ -425,7 +426,7 @@ def export_shared_text_program(
     ``max_length``); ``embeds_*`` functions take ``inputs_embeds``. The functions share one copy
     of the table and the transformer.
     """
-    import coreai_torch
+    from coreai_models.diffusion.gpu import new_converter
 
     vocab_size = int(encoder.config.vocab_size)
     hidden = int(encoder.config.hidden_size)
@@ -452,13 +453,11 @@ def export_shared_text_program(
             ),
         )
     )
-    mode = coreai_torch.TorchConverter.Mode
-    converter = coreai_torch.TorchConverter(mode=mode.DEBUG if include_debug_info else mode.RELEASE)
-    decomp = coreai_torch.get_decomp_table()
-    _add_functions(converter, traces, decomp)
+    converter = new_converter(include_debug_info)
+    add_traces(converter, traces)
     with without_token_table(encoder) as inner:
         embeds = InputsEmbedsEncoderWrapper(inner)
-        _add_functions(
+        add_traces(
             converter,
             [
                 (
@@ -472,7 +471,6 @@ def export_shared_text_program(
                 )
                 for spec in encoder_fns
             ],
-            decomp,
         )
     return converter.to_coreai()
 
