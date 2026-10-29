@@ -758,6 +758,7 @@ def export_embedding_bundle(
         revision=sha[:16],
         prompts=prompts,
         default_prompt_name=default_prompt,
+        compute_precision=precision,
     )
     metadata = build_bundle_metadata(
         family,

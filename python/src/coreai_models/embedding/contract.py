@@ -297,6 +297,7 @@ def embedding_block(
     revision: str,
     prompts: dict[str, str],
     default_prompt_name: str | None = None,
+    compute_precision: str | None = None,
 ) -> dict[str, Any]:
     """Build the ``embedding`` block of ``metadata.json``.
 
@@ -304,13 +305,14 @@ def embedding_block(
     ``image_encoder -> token_table -> encoder`` when ``with_image``; ``token_table`` and
     ``encoder`` are functions of ``text_encoder.aimodel``. iOS: the text tower runs
     ``token_table -> encoder`` on the Neural Engine. The host merges soft tokens into the table
-    output at the placeholder rows before the encoder.
+    output at the placeholder rows before the encoder. ``compute_precision`` defaults to the
+    platform's precision.
     """
     ios = platform == "iOS"
     if platform not in PLATFORMS:
         raise ValueError(f"platform must be one of {list(PLATFORMS)}, got {platform!r}")
     precision = check_compute_precision(
-        family, default_precision(family, platform), platform=platform
+        family, compute_precision or default_precision(family, platform), platform=platform
     )
     if not revision:
         raise ValueError("revision (snapshot SHA) is required to stamp the embedding space")

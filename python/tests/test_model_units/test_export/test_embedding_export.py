@@ -343,6 +343,33 @@ def test_embedding_block_validation():
         embedding_block(no_image, platform="macOS", with_image=True, revision="x", prompts=PROMPTS)
 
 
+def test_embedding_block_records_the_compute_precision():
+    assert _block()["precision"]["compute"] == "float32"
+    assert _block(compute_precision="bfloat16")["precision"]["compute"] == "bfloat16"
+    assert _block("iOS")["precision"]["compute"] == "float16"
+    with pytest.raises(EmbeddingPrecisionError, match="forbids float16"):
+        _block(compute_precision="float16")
+
+
+def test_export_writes_the_requested_precision_to_metadata(tmp_path, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(
+        embedding_export, "resolve_snapshot", lambda *a: (tmp_path, "0123456789abcdef0123")
+    )
+    monkeypatch.setattr(embedding_export, "verify_pooling_config", lambda *a: None)
+    monkeypatch.setattr(embedding_export, "read_prompts", lambda *a: (PROMPTS, None))
+    monkeypatch.setattr(embedding_export, "consolidate_prompts", lambda family, prompts: prompts)
+    monkeypatch.setattr(embedding_export, "copy_tokenizer", lambda *a: ["tokenizer.json"])
+    monkeypatch.setattr(embedding_export, "_export_gpu_programs", lambda *a, **kw: seen.update(kw))
+    meta = embedding_export.export_embedding_bundle(
+        EG2, tmp_path / "out", with_image=False, compute_precision="bfloat16"
+    )
+    assert seen["compute_precision"] == "bfloat16"
+    assert meta["embedding"]["precision"]["compute"] == "bfloat16"
+    written = json.loads((tmp_path / "out" / "metadata.json").read_text())
+    assert written["embedding"]["precision"]["compute"] == "bfloat16"
+
+
 def test_bundle_metadata_envelope():
     meta = build_bundle_metadata(
         EG2,
