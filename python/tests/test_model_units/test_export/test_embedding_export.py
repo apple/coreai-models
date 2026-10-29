@@ -471,6 +471,11 @@ TINY_CONFIG = {
     "head_dim": 16,
     "sliding_window": 3,
     "layer_types": ["sliding_attention", "full_attention"],
+    "per_layer_config": {"01": {"head_dim": 32, "num_key_value_heads": 1}},
+    "rope_parameters": {
+        "full_attention": {"rope_theta": 1_000_000.0, "rope_type": "default"},
+        "sliding_attention": {"rope_theta": 10_000.0, "rope_type": "default"},
+    },
     "hidden_size_per_layer_input": 8,
     "embedding_dim": 24,
 }

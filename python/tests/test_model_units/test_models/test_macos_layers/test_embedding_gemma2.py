@@ -76,6 +76,19 @@ def test_config_from_dict_resolves_per_layer_overrides():
     assert (cfg.rope_theta_sliding, cfg.rope_theta_full) == (10_000.0, 1_000_000.0)
 
 
+@pytest.mark.parametrize("key", ["layer_types", "per_layer_config", "rope_parameters"])
+def test_config_requires_the_layer_layout(key):
+    config = {k: v for k, v in TINY_TEXT_CONFIG.items() if k != key}
+    with pytest.raises(ValueError, match=key):
+        EmbeddingGemma2TextConfig.from_dict(config)
+
+
+def test_config_requires_both_rope_thetas():
+    rope = {"sliding_attention": {"rope_theta": 10_000.0}, "full_attention": {}}
+    with pytest.raises(ValueError, match="full_attention"):
+        EmbeddingGemma2TextConfig.from_dict({**TINY_TEXT_CONFIG, "rope_parameters": rope})
+
+
 def test_config_from_snapshot_matches_published_layout(embeddinggemma2_snapshot):
     cfg = EmbeddingGemma2TextConfig.from_pretrained(embeddinggemma2_snapshot)
     full = [i for i in range(cfg.num_hidden_layers) if not cfg.is_sliding(i)]

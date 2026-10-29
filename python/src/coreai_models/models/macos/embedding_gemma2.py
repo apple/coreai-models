@@ -62,11 +62,6 @@ class EmbeddingGemma2TextConfig:
     per_layer_config: dict[int, dict[str, int]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if not self.layer_types:
-            self.layer_types = [
-                "sliding_attention" if (i + 1) % 6 else "full_attention"
-                for i in range(self.num_hidden_layers)
-            ]
         if len(self.layer_types) != self.num_hidden_layers:
             raise ValueError(
                 f"layer_types has {len(self.layer_types)} entries, "
@@ -88,30 +83,33 @@ class EmbeddingGemma2TextConfig:
 
     @classmethod
     def from_dict(cls, text_config: dict[str, Any]) -> EmbeddingGemma2TextConfig:
-        """Build from an HF ``text_config`` dict (``config.json["text_config"]``)."""
-        rope = text_config.get("rope_parameters") or {}
-        sliding_theta = (rope.get("sliding_attention") or {}).get("rope_theta", 10_000.0)
-        full_theta = (rope.get("full_attention") or {}).get("rope_theta", 1_000_000.0)
+        """Build from an HF ``text_config`` dict (``config.json["text_config"]``).
+
+        ``layer_types``, ``per_layer_config`` and both ``rope_parameters`` entries define the layer
+        layout, so they are required; the other fields default to EmbeddingGemma 2's values.
+        """
+        missing = [
+            key
+            for key in ("layer_types", "per_layer_config", "rope_parameters")
+            if not text_config.get(key)
+        ]
+        if missing:
+            raise ValueError(f"text_config is missing {missing}")
+        rope = text_config["rope_parameters"]
+        thetas = {}
         for kind in ("sliding_attention", "full_attention"):
-            rope_type = (rope.get(kind) or {}).get("rope_type", "default")
+            params = rope.get(kind) or {}
+            if "rope_theta" not in params:
+                raise ValueError(f"rope_parameters[{kind!r}] has no rope_theta")
+            rope_type = params.get("rope_type", "default")
             if rope_type != "default":
                 raise ValueError(f"Unsupported rope_type {rope_type!r} for {kind}")
+            thetas[kind] = float(params["rope_theta"])
         names = {f.name for f in cls.__dataclass_fields__.values()}
         kwargs = {k: v for k, v in text_config.items() if k in names and v is not None}
-        kwargs["rope_theta_sliding"] = float(sliding_theta)
-        kwargs["rope_theta_full"] = float(full_theta)
-        per_layer = text_config.get("per_layer_config")
-        if per_layer is None:
-            # HF default: full layers get head_dim 512 / 1 KV head.
-            types = kwargs.get("layer_types") or []
-            per_layer = {
-                i: {
-                    "head_dim": text_config.get("global_head_dim", 512),
-                    "num_key_value_heads": text_config.get("num_global_key_value_heads", 1),
-                }
-                for i, t in enumerate(types)
-                if t == "full_attention"
-            }
+        kwargs["rope_theta_sliding"] = thetas["sliding_attention"]
+        kwargs["rope_theta_full"] = thetas["full_attention"]
+        per_layer = text_config["per_layer_config"]
         kwargs["per_layer_config"] = {
             int(k): {kk: int(vv) for kk, vv in dict(v).items() if vv is not None}
             for k, v in per_layer.items()
