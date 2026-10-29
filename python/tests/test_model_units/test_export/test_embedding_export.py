@@ -20,6 +20,7 @@ import tomllib
 import torch
 
 from coreai_models.embedding import export as embedding_export
+from coreai_models.embedding import export_ios, export_macos, export_utils
 from coreai_models.embedding.contract import (
     EMBEDDING_FAMILIES,
     EmbeddingPrecisionError,
@@ -360,7 +361,7 @@ def test_export_writes_the_requested_precision_to_metadata(tmp_path, monkeypatch
     monkeypatch.setattr(embedding_export, "read_prompts", lambda *a: (PROMPTS, None))
     monkeypatch.setattr(embedding_export, "consolidate_prompts", lambda family, prompts: prompts)
     monkeypatch.setattr(embedding_export, "copy_tokenizer", lambda *a: ["tokenizer.json"])
-    monkeypatch.setattr(embedding_export, "_export_gpu_programs", lambda *a, **kw: seen.update(kw))
+    monkeypatch.setattr(embedding_export, "export_gpu_programs", lambda *a, **kw: seen.update(kw))
     meta = embedding_export.export_embedding_bundle(
         EG2, tmp_path / "out", with_image=False, compute_precision="bfloat16"
     )
@@ -381,7 +382,7 @@ def test_failed_export_removes_the_bundle_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(embedding_export, "read_prompts", lambda *a: (PROMPTS, None))
     monkeypatch.setattr(embedding_export, "consolidate_prompts", lambda family, prompts: prompts)
     monkeypatch.setattr(embedding_export, "copy_tokenizer", lambda *a: ["tokenizer.json"])
-    monkeypatch.setattr(embedding_export, "_export_gpu_programs", fail)
+    monkeypatch.setattr(embedding_export, "export_gpu_programs", fail)
     with pytest.raises(RuntimeError, match="conversion failed"):
         embedding_export.export_embedding_bundle(EG2, tmp_path / "out", with_image=False)
     assert not (tmp_path / "out").exists()
@@ -437,11 +438,11 @@ def test_snapshot_helpers(tmp_path):
     snap = _fake_snapshot(
         tmp_path, {"embedding_dimension": 768, "pooling_mode": "mean", "include_prompt": True}
     )
-    path, sha = embedding_export.resolve_snapshot("google/embeddinggemma-2", str(snap))
+    path, sha = export_utils.resolve_snapshot("google/embeddinggemma-2", str(snap))
     assert sha == "a" * 40 and path == snap.resolve()
-    assert embedding_export.read_prompts(snap) == (SNAPSHOT_PROMPTS, None)
-    embedding_export.verify_pooling_config(snap, EG2)
-    copied = embedding_export.copy_tokenizer(snap, tmp_path / "bundle" / "tokenizer")
+    assert export_utils.read_prompts(snap) == (SNAPSHOT_PROMPTS, None)
+    export_utils.verify_pooling_config(snap, EG2)
+    copied = export_utils.copy_tokenizer(snap, tmp_path / "bundle" / "tokenizer")
     assert copied == ["tokenizer.json", "tokenizer_config.json"]
 
 
@@ -450,7 +451,7 @@ def test_verify_pooling_config_fails_closed(tmp_path):
         tmp_path, {"embedding_dimension": 768, "pooling_mode": "mean", "include_prompt": False}
     )
     with pytest.raises(ValueError, match="include_prompt"):
-        embedding_export.verify_pooling_config(snap, EG2)
+        export_utils.verify_pooling_config(snap, EG2)
 
 
 def _image_snapshot(root: Path, **config_overrides) -> Path:
@@ -479,9 +480,9 @@ def _image_snapshot(root: Path, **config_overrides) -> Path:
 
 
 def test_verify_image_config(tmp_path):
-    embedding_export.verify_image_config(_image_snapshot(tmp_path / "ok"), EG2)
+    export_utils.verify_image_config(_image_snapshot(tmp_path / "ok"), EG2)
     with pytest.raises(ValueError, match="boi_token_id"):
-        embedding_export.verify_image_config(_image_snapshot(tmp_path / "bad", boi_token_id=1), EG2)
+        export_utils.verify_image_config(_image_snapshot(tmp_path / "bad", boi_token_id=1), EG2)
 
 
 # --- Conversion (tiny random config) ---
@@ -508,14 +509,14 @@ TINY_CONFIG = {
 
 def test_tiny_multifunction_conversion():
     pytest.importorskip("coreai_torch")
-    wrapper = embedding_export.TextEmbeddingExportWrapper(_tiny_text_encoder())
+    wrapper = export_macos.TextEmbeddingExportWrapper(_tiny_text_encoder())
     plan = bucket_plan([16], [1, 4], 1024)
-    ids, mask = embedding_export.reference_inputs(plan[1], 64)
+    ids, mask = export_macos.reference_inputs(plan[1], 64)
     assert ids.dtype == torch.int32 and mask.dtype == torch.int32 and ids.shape == (4, 16)
     out = wrapper(ids, mask)
     assert out.dtype == torch.float32 and out.shape == (4, 24)
     torch.testing.assert_close(out.norm(dim=-1), torch.ones(4))
-    assert embedding_export.export_text_encoder_program(wrapper, plan, 64) is not None
+    assert export_macos.export_text_encoder_program(wrapper, plan, 64) is not None
 
 
 def _tiny_text_encoder():
@@ -562,10 +563,10 @@ def test_inputs_embeds_path_equals_ids_path():
     mask = torch.ones(1, 16, dtype=torch.int32)
     mask[0, 11:] = 0
     with torch.no_grad():
-        direct = embedding_export.TextEmbeddingExportWrapper(text)(ids, mask)
-        embeds = embedding_export.TokenTableExportWrapper(text.embed_tokens)(ids)
-        with embedding_export.without_token_table(text) as encoder:
-            merged = embedding_export.InputsEmbedsEncoderWrapper(encoder)(embeds, mask)
+        direct = export_macos.TextEmbeddingExportWrapper(text)(ids, mask)
+        embeds = export_utils.TokenTableExportWrapper(text.embed_tokens)(ids)
+        with export_macos.without_token_table(text) as encoder:
+            merged = export_macos.InputsEmbedsEncoderWrapper(encoder)(embeds, mask)
     assert embeds.dtype == torch.float32 and embeds.shape == (1, 16, 32)
     torch.testing.assert_close(merged, direct, atol=1e-6, rtol=0)
     assert isinstance(text.embed_tokens, torch.nn.Embedding)  # restored
@@ -575,12 +576,12 @@ def test_float16_scaled_token_table_equals_the_float32_table_cast():
     """The float16 token table gives the encoder the same inputs as the float32 one."""
     text = _tiny_text_encoder()
     ids = torch.randint(3, 64, (1, 16), dtype=torch.int32)
-    table = embedding_export.scaled_token_table(
+    table = export_utils.scaled_token_table(
         text.embed_tokens.weight, text.config.hidden_size**0.5, torch.float16
     )
     with torch.no_grad():
-        want = embedding_export.TokenTableExportWrapper(text.embed_tokens)(ids).half()
-        got = embedding_export.TokenTableExportWrapper(table, torch.float16)(ids)
+        want = export_utils.TokenTableExportWrapper(text.embed_tokens)(ids).half()
+        got = export_utils.TokenTableExportWrapper(table, torch.float16)(ids)
     assert got.dtype == torch.float16
     assert torch.equal(got, want)
 
@@ -588,21 +589,21 @@ def test_float16_scaled_token_table_equals_the_float32_table_cast():
 def test_tiny_float16_token_table_conversion():
     pytest.importorskip("coreai_torch")
     text = _tiny_text_encoder()
-    table = embedding_export.scaled_token_table(
+    table = export_utils.scaled_token_table(
         text.embed_tokens.weight, text.config.hidden_size**0.5, torch.float16
     )
-    program = embedding_export.export_token_table_program(table, 64, dtype=torch.float16)
+    program = export_utils.export_token_table_program(table, 64, dtype=torch.float16)
     assert program is not None
 
 
 def test_image_reference_inputs_are_a_valid_padded_grid():
-    pixels, positions = embedding_export.image_reference_inputs(TINY_IMAGE)
+    pixels, positions = export_utils.image_reference_inputs(TINY_IMAGE)
     assert pixels.shape == (1, 108, 48) and pixels.dtype == torch.float32
     assert positions.shape == (1, 108, 2) and positions.dtype == torch.int32
     real = positions[0, :, 0] >= 0
     assert int(real.sum()) % 9 == 0
     assert torch.all(pixels[0, ~real] == 0)
-    soft = embedding_export.ImageEncoderExportWrapper(_tiny_image_encoder())(pixels, positions)
+    soft = export_macos.ImageEncoderExportWrapper(_tiny_image_encoder())(pixels, positions)
     n = int(real.sum()) // 9
     assert soft.shape == (1, 12, 32) and soft.dtype == torch.float32
     assert torch.all(soft[0, n:] == 0) and torch.all(soft[0, :n].abs().sum(-1) > 0)
@@ -610,14 +611,14 @@ def test_image_reference_inputs_are_a_valid_padded_grid():
 
 def test_tiny_shared_text_program_conversion():
     pytest.importorskip("coreai_torch")
-    program = embedding_export.export_shared_text_program(
+    program = export_macos.export_shared_text_program(
         _tiny_text_encoder(),
         [FunctionSpec("len16_b1", 1, 16), FunctionSpec("len32_b1", 1, 32)],
         [FunctionSpec("embeds_len32_b1", 1, 32)],
         max_length=64,
     )
     assert program is not None
-    image = embedding_export.export_image_encoder_program(_tiny_image_encoder(), TINY_IMAGE)
+    image = export_macos.export_image_encoder_program(_tiny_image_encoder(), TINY_IMAGE)
     assert image is not None
 
 
@@ -630,10 +631,10 @@ def test_macos_image_bundle_shares_the_text_encoder_asset():
 
 
 def test_ane_reference_inputs_shapes():
-    embeds, bias, pool = embedding_export.ane_text_reference_inputs(128, 512)
+    embeds, bias, pool = export_ios.ane_text_reference_inputs(128, 512)
     assert embeds.shape == (1, 128, 512) and bias.shape == (1, 128, 1, 128)
     assert pool.shape == (1, 128) and {t.dtype for t in (embeds, bias, pool)} == {torch.float16}
-    pixels, positions = embedding_export.image_reference_inputs(IMAGE, torch.float16, torch.float16)
+    pixels, positions = export_utils.image_reference_inputs(IMAGE, torch.float16, torch.float16)
     assert pixels.shape == (1, 2520, 768) and positions.shape == (1, 2520, 2)
     assert pixels.dtype == positions.dtype == torch.float16
     real = positions[0, :, 0] >= 0
@@ -657,12 +658,12 @@ def test_ane_band_wrapper_matches_explicit_sliding_bias():
     bias, sliding = (t.reshape(1, length, 1, length) for t in (bias, sliding))
     embeds = torch.randn(1, length, 32)
     pool = (pos < valid).float().reshape(1, length) / valid
-    wrapper = embedding_export.EncoderBandWrapper(model, length, 3)
+    wrapper = export_ios.EncoderBandWrapper(model, length, 3)
     with torch.no_grad():
         want = model(embeds, bias, pool, sliding)
         got = wrapper(embeds, bias, pool)
     torch.testing.assert_close(got, want)
-    assert not embedding_export.EncoderBandWrapper(model, 4, 3).banded
+    assert not export_ios.EncoderBandWrapper(model, 4, 3).banded
 
 
 # --- CLI ---
