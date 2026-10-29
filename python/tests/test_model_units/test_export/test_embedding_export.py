@@ -370,6 +370,14 @@ def test_export_writes_the_requested_precision_to_metadata(tmp_path, monkeypatch
     assert written["embedding"]["precision"]["compute"] == "bfloat16"
 
 
+def test_forbidden_precision_message_lists_the_allowed_ones():
+    with pytest.raises(EmbeddingPrecisionError, match=r"Use float32 \(default\) or bfloat16\."):
+        check_compute_precision(EG2, "float16")
+    no_floor = dataclasses.replace(EG2, precision_floor=None)
+    with pytest.raises(EmbeddingPrecisionError, match=r"Use float32 \(default\)\.$"):
+        check_compute_precision(no_floor, "float16")
+
+
 def test_bundle_metadata_envelope():
     meta = build_bundle_metadata(
         EG2,

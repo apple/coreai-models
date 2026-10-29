@@ -41,7 +41,7 @@ class EmbeddingPrecisionError(ValueError):
 
 @dataclass(frozen=True)
 class ImageTowerFacts:
-    """Facts the image tower needs on the host (merge ids, preprocessing, soft-token budget).
+    """One family's image-tower facts for the host (merge ids, preprocessing, soft-token budget).
 
     The exporter checks them against the snapshot ``config.json`` / ``processor_config.json``
     and fails closed on a mismatch.
@@ -50,14 +50,14 @@ class ImageTowerFacts:
     placeholder_id: int
     boi_token_id: int
     eoi_token_id: int
-    patch_size: int = 16
-    pooling_kernel_size: int = 3
-    rescale_factor: float = 1.0 / 255.0
-    normalize: bool = False
-    image_mean: tuple[float, ...] = (0.0, 0.0, 0.0)
-    image_std: tuple[float, ...] = (1.0, 1.0, 1.0)
-    budget: int = 280
-    soft_token_dim: int = 512
+    patch_size: int
+    pooling_kernel_size: int
+    rescale_factor: float
+    normalize: bool
+    image_mean: tuple[float, ...]
+    image_std: tuple[float, ...]
+    budget: int
+    soft_token_dim: int
 
     @property
     def max_patches(self) -> int:
@@ -137,7 +137,19 @@ EMBEDDINGGEMMA2 = EmbeddingFamily(
     pad_token_id=0,
     document_template="title: {title} | text: {text}",
     # config.json image/boi/eoi token ids; processor_config.json image_processor.
-    image=ImageTowerFacts(placeholder_id=258880, boi_token_id=255999, eoi_token_id=258882),
+    image=ImageTowerFacts(
+        placeholder_id=258880,
+        boi_token_id=255999,
+        eoi_token_id=258882,
+        patch_size=16,
+        pooling_kernel_size=3,
+        rescale_factor=1.0 / 255.0,
+        normalize=False,
+        image_mean=(0.0, 0.0, 0.0),
+        image_std=(1.0, 1.0, 1.0),
+        budget=280,
+        soft_token_dim=512,
+    ),
 )
 
 EMBEDDING_FAMILIES: dict[str, EmbeddingFamily] = {EMBEDDINGGEMMA2.key: EMBEDDINGGEMMA2}
@@ -177,10 +189,13 @@ def check_compute_precision(
             )
         return precision
     if precision in family.forbidden_precisions:
+        floor = family.precision_floor
+        alternatives = "float32 (default)" + (
+            f" or {floor}" if floor and floor != "float32" else ""
+        )
         raise EmbeddingPrecisionError(
             f"{family.hf_model_id} forbids {precision} compute on macOS (it overflows: NaN or "
-            f"silently degraded vectors). Use float32 (default) or "
-            f"{family.precision_floor or 'float32'}."
+            f"silently degraded vectors). Use {alternatives}."
         )
     return precision
 
