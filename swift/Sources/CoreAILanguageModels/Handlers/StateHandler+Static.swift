@@ -305,10 +305,17 @@ struct SlidingRing: Equatable {
     }
 
     /// Longest verify block (anchor plus proposal) that can be rolled back to its anchor at
-    /// any position under `allowsRewind`. Rejecting every draft rewinds `n - 1` positions
-    /// from the block's end, and the restart can sit `alignment - 1` below the anchor.
+    /// any position under `allowsRewind`.
+    ///
+    /// `allowsRewind` lets `depth - window + 1` positions be written past the restart. Rejecting
+    /// every draft of an `n`-token block rewinds from the block's end to just after the anchor,
+    /// `n - 1` positions, and the restart can sit `alignment - 1` below that target. So the block
+    /// is safe when `(n - 1) + (alignment - 1) <= depth - window + 1`, that is
+    /// `n <= depth - window + 3 - alignment`.
     func maxVerifyBlockLength(alignment: Int) -> Int {
-        max(1, depth - window + 3 - max(1, alignment))
+        let slack = depth - window + 1
+        let restartBelowTarget = max(1, alignment) - 1
+        return max(1, slack - restartBelowTarget + 1)
     }
 }
 

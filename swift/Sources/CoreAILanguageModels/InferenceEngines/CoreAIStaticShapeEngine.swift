@@ -670,17 +670,13 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
 
     // MARK: - Speculative decoding support (per-position results for verification)
 
-    /// Full token sequence seen by the speculative primitives, so batch inputs can be
-    /// sliced at batch-aligned boundaries the way `inference` does.
-    private var specSequence: [Int32] = []
-
-    /// The speculative buffer holds exactly the tokens the cache has processed. A mismatch means
-    /// tokens were processed or rewound outside the speculative primitives, and slicing batches
-    /// from the buffer would skip or replay positions.
+    /// The token history holds exactly the tokens the cache has processed. A mismatch means
+    /// tokens were processed or rewound outside the history's bookkeeping, and slicing batches
+    /// from it would skip or replay positions.
     static func validateSpeculativeSequence(count: Int, processed: Int) throws {
         guard count == processed else {
             throw InferenceRuntimeError.invalidState(
-                "speculative sequence holds \(count) tokens but \(processed) are processed; "
+                "the token history holds \(count) tokens but \(processed) are processed; "
                     + "reset(to: 0) and replay the prefix before speculative decoding")
         }
     }
@@ -700,12 +696,10 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
 
     /// Forward `tokens` in one pass; per-position argmax (greedy) token.
     ///
-    /// Computes the argmax directly from the contiguous logits buffer instead of
-    /// materializing a `[vocabSize]` row per position: with a 262K vocab, that row copy
-    /// (times every position times the softcap pass) dominated the verify cost. The result is
-    /// the token plain decoding picks, softcap included: the cap rounds near-equal logits to the
-    /// same value, and a tie goes to the lowest index. Only entries that can reach the maximum
-    /// after capping are capped.
+    /// Computes the argmax directly from the logits buffer instead of materializing a
+    /// `[vocabSize]` row per position. The result is the token plain decoding picks, softcap
+    /// included: the cap rounds near-equal logits to the same value, and a tie goes to the lowest
+    /// index. Only entries that can reach the maximum after capping are capped.
     package func forwardPerPositionArgmax(_ tokens: [Int32]) async throws -> [Int32] {
         try await processSpeculativeBlock(tokens, capture: .argmax).argmax
     }
@@ -753,41 +747,48 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     ) async throws -> SpecCaptureResult {
         guard !tokens.isEmpty else { return SpecCaptureResult() }
         // A block longer than the widest graph starts in a prefill graph, which returns no logits,
-        // so it would yield fewer rows than tokens with the first rows missing.
+        // so it would yield fewer rows than tokens with the first rows missing. This is the caller
+        // breaking the contract of `maxVerifyBlockLength`, hence an invalid argument.
         if capture != .none, tokens.count > maxQueryLength {
             throw InferenceRuntimeError.invalidArgument(
                 "a verify block of \(tokens.count) tokens exceeds the widest graph "
-                    + "(\(maxQueryLength) tokens)")
+                    + "(\(maxQueryLength) tokens); keep blocks within maxVerifyBlockLength")
         }
-        try Self.validateSpeculativeSequence(count: specSequence.count, processed: processedTokenCount)
+        try Self.validateSpeculativeSequence(count: history.count, processed: processedTokenCount)
         let captureFrom = processedTokenCount
-        specSequence.append(contentsOf: tokens)
-        let total = specSequence.count
+        let total = captureFrom + tokens.count
         var result = SpecCaptureResult()
-        var currentPosition = processedTokenCount
 
-        while currentPosition < total {
-            let remaining = total - currentPosition
+        // Fixed for the whole call: the row width, the cap, and the scratch row the argmax widens into.
+        let vocab = config.vocabSize
+        let softcap = config.overrides?.finalLogitSoftcapping.map { Float($0) }
+        var scratch: [Float] = capture == .argmax ? [Float](repeating: 0, count: vocab) : []
+
+        while processedTokenCount < total {
+            let remaining = total - processedTokenCount
             let usePrefill = remaining > maxQueryLength
             let graphName = try forwardGraph(
-                numInputTokens: remaining, currentPosition: currentPosition, isPrefill: usePrefill)
+                numInputTokens: remaining, currentPosition: processedTokenCount, isPrefill: usePrefill)
             let contextBucket = try contextLength(of: graphName)
             try states.prepare(contextBucket: contextBucket, writtenTokenCount: processedTokenCount)
 
             let batchSize = try queryLength(of: graphName)
-            // Batches must start on a batchSize boundary: the static graph's KV write
-            // is compiled for a batchSize-aligned write offset, and a non-aligned
-            // offset is rejected by the palettized (int4) program at runtime
-            // ("Request cancelled"). So a verify block may span two batches (a second
-            // forward) when it straddles a boundary: correct, and the dominant verify
-            // cost is the forward, not the re-scanned committed positions.
-            let batchStartToken = (currentPosition / batchSize) * batchSize
+            // Batches start on a batchSize boundary, as in `inference`: the graph takes the aligned
+            // step as its write offset, and the palettized (int4) Gemma 4 program rejected a
+            // non-aligned offset at runtime ("Request cancelled"); other assets were not tried. A
+            // verify block that straddles a boundary therefore takes a second forward.
+            let batchStartToken = (processedTokenCount / batchSize) * batchSize
             let batchEndToken = min(batchStartToken + batchSize - 1, total - 1)
             let tokensInBatch = batchEndToken - batchStartToken + 1
 
+            // The batch's tokens by absolute position: those below the cursor are already in the
+            // history, the rest come from `tokens`.
+            let newInBatch = tokens[(processedTokenCount - captureFrom)...(batchEndToken - captureFrom)]
+            let batchTokens = history.tokens[batchStartToken..<processedTokenCount] + newInBatch
+
             let inputs = try await buildInputs(
                 graphName: graphName,
-                batchTokens: specSequence[batchStartToken...batchEndToken],
+                batchTokens: batchTokens,
                 batchSize: batchSize,
                 alignedStep: batchStartToken,
                 contextBucket: contextBucket)
@@ -798,45 +799,56 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
                 function: fn, descriptor: desc, inputs: inputs, states: states)
             let logitsArray = outputs.remove(Self.logitsOutputName)?.ndArray
 
-            if case .none = capture {
-                // advance only: nothing to read back
-            } else if !usePrefill, let logitsArray {
-                let vocab = config.vocabSize
-                // Read via the raw pointer: `contiguousElements` materializes an Array copy of the
-                // whole batch (batchSize x vocab), which for a 262K vocab dominates verify cost.
-                // The pointer path scans only the rows we keep. The argmax is vectorized through
-                // Accelerate: a scalar Swift loop over 262K Float16 was ~15 ms per position and, at
-                // k+1 positions per verify, cancelled the acceptance speedup.
-                var scratch: [Float] = capture == .argmax ? [Float](repeating: 0, count: vocab) : []
-                let softcap = config.overrides?.finalLogitSoftcapping.map { Float($0) }
-                logitsArray.view(as: LogitsScalarType.self).withUnsafePointer { ptr, _, _ in
-                    for local in 0..<tokensInBatch {
-                        let absolutePosition = batchStartToken + local
-                        guard absolutePosition >= captureFrom else { continue }
-                        let offset = local * vocab
-                        switch capture {
-                        case .none:
-                            break
-                        case .argmax:
+            if capture != .none, !usePrefill, let logitsArray {
+                // Only the positions from `captureFrom` on are results; earlier rows of the batch
+                // are committed positions that were re-run to reach the batch boundary.
+                let firstRow = max(0, captureFrom - batchStartToken)
+                try Self.withLogitRows(logitsArray) { rows in
+                    switch capture {
+                    case .none:
+                        break
+                    case .argmax:
+                        for local in firstRow..<tokensInBatch {
                             let top = Self.scanRow(
-                                ptr + offset, vocab: vocab, count: 1, softcap: softcap, scratch: &scratch)
+                                rows + local * vocab, vocab: vocab, count: 1, softcap: softcap,
+                                scratch: &scratch)
                             result.argmax.append(top.indices.first ?? 0)
-                        case .fullLogits:
-                            var row = [LogitsScalarType](repeating: 0, count: vocab)
-                            for i in 0..<vocab { row[i] = ptr[offset + i] }
-                            if let cap = config.overrides?.finalLogitSoftcapping {
-                                LogitSoftcapProcessor.apply(to: &row, cap: Float(cap))
-                            }
+                        }
+                    case .fullLogits:
+                        for local in firstRow..<tokensInBatch {
+                            var row = Array(UnsafeBufferPointer(start: rows + local * vocab, count: vocab))
+                            if let softcap { LogitSoftcapProcessor.apply(to: &row, cap: softcap) }
                             result.logits.append(row)
                         }
                     }
                 }
             }
 
-            currentPosition = batchEndToken + 1
-            processedTokenCount = currentPosition
+            history.append(contentsOf: newInBatch)
+            processedTokenCount = batchEndToken + 1
         }
         return result
+    }
+
+    /// Calls `body` with the start of a `[rows, vocab]` logits array read in place, so no row is
+    /// copied until a caller keeps it. The array must be Float16 and contiguous row-major, as the
+    /// graphs produce; anything else is reported, not read through a mismatched pointer.
+    static func withLogitRows(
+        _ array: NDArray, _ body: (UnsafePointer<LogitsScalarType>) -> Void
+    ) throws {
+        guard array.scalarType == .float16 else {
+            throw InferenceRuntimeError.unsupportedLogitsType(
+                "speculative decoding reads Float16 logits, got \(array.scalarType)")
+        }
+        let view = array.view(as: LogitsScalarType.self)
+        let contiguous = view.withUnsafePointer { _, shape, strides in
+            isContiguousRowMajor(shape: shape, strides: strides)
+        }
+        guard contiguous else {
+            throw InferenceRuntimeError.invalidState(
+                "Logits array has non-contiguous (interleaved) layout — cannot extract values safely")
+        }
+        view.withUnsafePointer { ptr, _, _ in body(ptr) }
     }
 
     /// Longest block the per-position forwards accept and the decoder can roll back from. The
@@ -856,20 +868,12 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
             .compactMap { Self.parseFunctionDimensions($0)?.queryLength }.max()
     }
 
-    /// Query length of the decode graph that runs a block starting at the current position,
-    /// which is the batch window a verify block must fit to take one forward. This is not the
-    /// largest query length across all graphs, which includes the prefill graphs.
-    package var decodeBlockSize: Int? {
-        try? queryLength(
-            of: forwardGraph(numInputTokens: 1, currentPosition: processedTokenCount, isPrefill: false))
-    }
-
     /// Proposal tokens that fit with the anchor in one forward of the decode graph: the
-    /// anchor sits at the current position, and a block that crosses the next batch-size
-    /// boundary needs a second forward.
+    /// anchor sits at the current position, and a block that crosses the next tile boundary
+    /// needs a second forward.
     package var oneForwardDraftBudget: Int {
         Self.batchAlignedDraftBudget(
-            batchSize: decodeBlockSize ?? maxQueryLength, anchorPosition: processedTokenCount)
+            batchSize: verifyTileWidth ?? maxQueryLength, anchorPosition: processedTokenCount)
     }
 
     /// `batchSize - 1 - (anchorPosition mod batchSize)`: the slots left in the anchor's batch
@@ -1070,9 +1074,6 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         } else {
             processedTokenCount = position
             history.truncate(to: position)
-        }
-        if specSequence.count > position {
-            specSequence.removeLast(specSequence.count - position)
         }
     }
 

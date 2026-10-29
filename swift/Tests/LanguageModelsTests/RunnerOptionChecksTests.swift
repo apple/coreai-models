@@ -11,40 +11,40 @@ import Testing
 struct RunnerOptionChecksTests {
     @Test("Greedy speculative decoding is accepted with prompt lookup")
     func greedyAccepted() {
-        #expect(SpeculativeOptions.samplingProblem(greedy: true, promptLookup: true) == nil)
+        #expect(SpeculativeDecodingOptions.samplingProblem(greedy: true, promptLookup: true) == nil)
     }
 
     @Test("Sampling is accepted when prompt lookup is off")
     func samplingWithoutPromptLookup() {
-        #expect(SpeculativeOptions.samplingProblem(greedy: false, promptLookup: false) == nil)
+        #expect(SpeculativeDecodingOptions.samplingProblem(greedy: false, promptLookup: false) == nil)
     }
 
     @Test("Prompt lookup with sampling is rejected, naming --prompt-lookup")
     func promptLookupWithSampling() throws {
-        let message = try #require(SpeculativeOptions.samplingProblem(greedy: false, promptLookup: true))
+        let message = try #require(SpeculativeDecodingOptions.samplingProblem(greedy: false, promptLookup: true))
         #expect(message.contains("--prompt-lookup"))
     }
 
     @Test("An image with raw tokens is rejected")
     func imageWithRawTokens() throws {
-        let message = try #require(SpeculativeOptions.imageProblem(hasImage: true, hasRawTokens: true))
+        let message = try #require(SpeculativeDecodingOptions.imageProblem(hasImage: true, hasRawTokens: true))
         #expect(message.contains("--image"))
         #expect(message.contains("--raw-tokens"))
-        #expect(SpeculativeOptions.imageProblem(hasImage: true, hasRawTokens: false) == nil)
-        #expect(SpeculativeOptions.imageProblem(hasImage: false, hasRawTokens: true) == nil)
+        #expect(SpeculativeDecodingOptions.imageProblem(hasImage: true, hasRawTokens: false) == nil)
+        #expect(SpeculativeDecodingOptions.imageProblem(hasImage: false, hasRawTokens: true) == nil)
     }
 
     @Test("A prompt shorter than the context is accepted")
     func shortPrompt() {
-        #expect(SpeculativeOptions.promptLengthProblem(promptTokens: 16383, contextLength: 16384) == nil)
-        #expect(SpeculativeOptions.promptLengthProblem(promptTokens: 0, contextLength: 16384) == nil)
+        #expect(SpeculativeDecodingOptions.promptLengthProblem(promptTokens: 16383, contextLength: 16384) == nil)
+        #expect(SpeculativeDecodingOptions.promptLengthProblem(promptTokens: 0, contextLength: 16384) == nil)
     }
 
     @Test("A prompt at or over the context length is rejected with both sizes")
     func longPrompt() throws {
         for n in [16384, 16390] {
             let message = try #require(
-                SpeculativeOptions.promptLengthProblem(promptTokens: n, contextLength: 16384))
+                SpeculativeDecodingOptions.promptLengthProblem(promptTokens: n, contextLength: 16384))
             #expect(message.contains("\(n)"))
             #expect(message.contains("16384"))
         }

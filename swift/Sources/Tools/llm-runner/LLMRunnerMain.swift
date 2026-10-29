@@ -356,7 +356,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         if jsonMaxWhitespace < 0 {
             throw ValidationError("--json-max-whitespace must be >= 0 (0 for no limit)")
         }
-        if let problem = SpeculativeOptions.draftCountProblem(numDraftTokens) {
+        if let problem = SpeculativeDecodingOptions.draftCountProblem(numDraftTokens) {
             throw ValidationError(problem)
         }
         if promptLookupMinNgram < 1 {
@@ -366,14 +366,22 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         if seed != nil && !speculating {
             throw ValidationError("--seed applies to speculative decoding (--draft-model or --prompt-lookup)")
         }
-        if speculating && jsonSchema != nil {
-            throw ValidationError("--json-schema cannot be used with speculative decoding")
-        }
-        let greedy = samplingStrategy.lowercased() == "greedy" || temperature == 0
-        if let problem = SpeculativeOptions.samplingProblem(greedy: greedy, promptLookup: promptLookup)
-            ?? SpeculativeOptions.imageProblem(hasImage: imagePath != nil, hasRawTokens: rawTokens != nil)
-        {
-            throw ValidationError(problem)
+        if speculating {
+            let unsupported = [
+                jsonSchema != nil ? "--json-schema" : nil,
+                videoPath != nil ? "--video" : nil,
+                continuation != nil ? "--continuation" : nil,
+                batchPrototypeRows != nil ? "--batch-prototype" : nil,
+            ].compactMap { $0 }
+            if let problem = SpeculativeDecodingOptions.unsupportedProblem(used: unsupported) {
+                throw ValidationError(problem)
+            }
+            let greedy = samplingStrategy.lowercased() == "greedy" || temperature == 0
+            if let problem = SpeculativeDecodingOptions.samplingProblem(greedy: greedy, promptLookup: promptLookup)
+                ?? SpeculativeDecodingOptions.imageProblem(hasImage: imagePath != nil, hasRawTokens: rawTokens != nil)
+            {
+                throw ValidationError(problem)
+            }
         }
     }
 
@@ -544,14 +552,10 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             let displayText: String = {
                 if case .text(let t) = promptInput { return t } else { return "" }
             }()
-            guard
-                let vlmTokens = try? buildVLMPromptFromChatTemplate(
-                    prompt: displayText, imageTokenCount: embedded.tokenCount,
-                    imageTokenId: visionConfig.imageTokenId, tokenizer: tokenizer)
-            else {
-                print("Error: the tokenizer has no chat template that places an image, which --image needs here.")
-                throw ExitCode.failure
-            }
+            let vlmTokens = imagePromptTokens(
+                imagePromptText(displayText, imagePath: imagePath, visionConfig: visionConfig),
+                imageTokenCount: embedded.tokenCount, imageTokenId: visionConfig.imageTokenId,
+                tokenizer: tokenizer)
             promptTokensForGen = vlmTokens
             onPrefillReady = { try mmTarget.setPendingImage(embedded, tokens: vlmTokens) }
             print("🖼️  image: \(embedded.tokenCount) soft tokens, VLM prompt \(vlmTokens.count) tokens")
@@ -559,7 +563,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
 
         let contextLength = min(
             targetEngine.config.maxContextLength, draftEngine?.config.maxContextLength ?? .max)
-        if let problem = SpeculativeOptions.promptLengthProblem(
+        if let problem = SpeculativeDecodingOptions.promptLengthProblem(
             promptTokens: promptTokensForGen.count, contextLength: contextLength)
         {
             throw ValidationError(problem)
@@ -568,18 +572,23 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         let useGreedy = samplingStrategy.lowercased() == "greedy" || temperature == 0
 
         // The speculative path samples with temperature only (or takes the argmax).
-        var ignoredOptions: [String] = []
-        if topK != nil { ignoredOptions.append("--top-k") }
-        if topP != nil { ignoredOptions.append("--top-p") }
-        if minP != nil { ignoredOptions.append("--min-p") }
-        if repetitionPenalty != nil { ignoredOptions.append("--repetition-penalty") }
-        if repetitionPenaltyWindow != nil { ignoredOptions.append("--repetition-penalty-window") }
-        if !stopTokens.isEmpty { ignoredOptions.append("--stop-tokens") }
-        if !ignoredOptions.isEmpty {
-            print(
-                "Warning: speculative decoding ignores \(ignoredOptions.joined(separator: ", ")); "
-                    + "generation stops only at the tokenizer's end-of-sequence tokens and "
-                    + "samples with --temperature alone.")
+        let ignoredOptions = [
+            topK != nil ? "--top-k" : nil,
+            topP != nil ? "--top-p" : nil,
+            minP != nil ? "--min-p" : nil,
+            repetitionPenalty != nil ? "--repetition-penalty" : nil,
+            repetitionPenaltyWindow != nil ? "--repetition-penalty-window" : nil,
+            stopTokens.isEmpty ? nil : "--stop-tokens",
+            synchronousSampling ? "--synchronous-sampling" : nil,
+            saveLogits != nil ? "--save-logits" : nil,
+            printLogits ? "--print-logits" : nil,
+            bucketSize != nil ? "--bucket-size" : nil,
+            chunkSize != nil ? "--chunk-size" : nil,
+            chunkThreshold != nil ? "--chunk-threshold" : nil,
+            imageStrategy != nil ? "--image-strategy" : nil,
+        ].compactMap { $0 }
+        if let warning = SpeculativeDecodingOptions.ignoredWarning(ignored: ignoredOptions) {
+            print(warning)
         }
 
         let decoder: SpeculativeDecoder
@@ -1378,23 +1387,8 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         let embeddedInput = try await vlmEngine.encodeImage(at: imageURL)
         CLILogger.log("Image encoded: \(embeddedInput.tokenCount) visual tokens", component: "VLM")
 
-        let shouldIncludeInfo =
-            switch imageInfo {
-            case .on: true
-            case .off: false
-            case .auto: visionConfig.includeImageInfo
-            }
-
-        var effectivePrompt = displayPrompt
-        if shouldIncludeInfo {
-            let imageURL = URL(fileURLWithPath: imagePath)
-            if let ciImage = CIImage(contentsOf: imageURL) {
-                let w = Int(ciImage.extent.width)
-                let h = Int(ciImage.extent.height)
-                effectivePrompt = "Image: \(w)x\(h)\n\(displayPrompt)"
-                CLILogger.log("Injected image info: \(w)x\(h)", component: "VLM")
-            }
-        }
+        let effectivePrompt = imagePromptText(
+            displayPrompt, imagePath: imagePath, visionConfig: visionConfig)
 
         try await runVLMGeneration(
             vlmEngine: vlmEngine,
@@ -1474,32 +1468,12 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         additionalEosTokenIds: Set<Int32>,
         displayPrompt: String
     ) async throws {
-        let imageTokenCount = embeddedInput.tokenCount
-        let imageTokenId = visionConfig.imageTokenId
-        let vlmTokens: [Int32]
-
-        if let chatTemplateTokens = try? buildVLMPromptFromChatTemplate(
-            prompt: displayPrompt,
-            imageTokenCount: imageTokenCount,
-            imageTokenId: imageTokenId,
-            tokenizer: tokenizer
-        ) {
-            vlmTokens = chatTemplateTokens
-            CLILogger.log("VLM prompt: used tokenizer chat template", component: "VLM")
-        } else {
-            CLILogger.log(
-                "VLM prompt: no chat template found, using fallback USER/ASSISTANT format",
-                component: "VLM")
-            var tokens = tokenizer.encode(text: "USER: ", addSpecialTokens: true).map { Int32($0) }
-            tokens.append(contentsOf: [Int32](repeating: imageTokenId, count: imageTokenCount))
-            let suffix = "\n" + displayPrompt + "\nASSISTANT:"
-            tokens.append(
-                contentsOf: tokenizer.encode(text: suffix, addSpecialTokens: false).map { Int32($0) })
-            vlmTokens = tokens
-        }
+        let vlmTokens = imagePromptTokens(
+            displayPrompt, imageTokenCount: embeddedInput.tokenCount,
+            imageTokenId: visionConfig.imageTokenId, tokenizer: tokenizer)
 
         CLILogger.log(
-            "VLM prompt: \(vlmTokens.count) tokens (\(imageTokenCount) visual placeholders)",
+            "VLM prompt: \(vlmTokens.count) tokens (\(embeddedInput.tokenCount) visual placeholders)",
             component: "VLM")
 
         var eosTokenIds = Set<Int32>()
@@ -1595,6 +1569,49 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     /// Build a VLM prompt using the tokenizer's chat template.
     /// Returns nil if the tokenizer doesn't support multimodal chat templates
     /// or if the template doesn't produce the expected image placeholder tokens.
+    /// The prompt text sent with an image: `displayPrompt`, preceded by the image's resolution when
+    /// `--image-info` asks for it (`auto` follows the model's metadata). Used by plain and speculative
+    /// runs so both put the same text in front of the model.
+    private func imagePromptText(
+        _ displayPrompt: String, imagePath: String, visionConfig: VisionConfig
+    ) -> String {
+        let shouldIncludeInfo =
+            switch imageInfo {
+            case .on: true
+            case .off: false
+            case .auto: visionConfig.includeImageInfo
+            }
+        guard shouldIncludeInfo,
+            let ciImage = CIImage(contentsOf: URL(fileURLWithPath: imagePath))
+        else { return displayPrompt }
+        let w = Int(ciImage.extent.width)
+        let h = Int(ciImage.extent.height)
+        CLILogger.log("Injected image info: \(w)x\(h)", component: "VLM")
+        return "Image: \(w)x\(h)\n\(displayPrompt)"
+    }
+
+    /// Prompt tokens for an image prompt: the tokenizer's chat template with the image placeholder
+    /// expanded to `imageTokenCount` tokens, else a plain USER/ASSISTANT format. Used by plain and
+    /// speculative runs.
+    private func imagePromptTokens(
+        _ prompt: String, imageTokenCount: Int, imageTokenId: Int32, tokenizer: any Tokenizer
+    ) -> [Int32] {
+        if let chatTemplateTokens = try? buildVLMPromptFromChatTemplate(
+            prompt: prompt, imageTokenCount: imageTokenCount, imageTokenId: imageTokenId,
+            tokenizer: tokenizer)
+        {
+            CLILogger.log("VLM prompt: used tokenizer chat template", component: "VLM")
+            return chatTemplateTokens
+        }
+        CLILogger.log(
+            "VLM prompt: no chat template found, using fallback USER/ASSISTANT format", component: "VLM")
+        var tokens = tokenizer.encode(text: "USER: ", addSpecialTokens: true).map { Int32($0) }
+        tokens.append(contentsOf: [Int32](repeating: imageTokenId, count: imageTokenCount))
+        let suffix = "\n" + prompt + "\nASSISTANT:"
+        tokens.append(contentsOf: tokenizer.encode(text: suffix, addSpecialTokens: false).map { Int32($0) })
+        return tokens
+    }
+
     private func buildVLMPromptFromChatTemplate(
         prompt: String,
         imageTokenCount: Int,

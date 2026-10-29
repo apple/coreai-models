@@ -198,3 +198,25 @@ struct SpeculativeSequenceTests {
         }
     }
 }
+
+@Suite("Reading verify logits in place")
+struct LogitRowReadTests {
+    @Test("Contiguous Float16 logits are read in place, row after row")
+    func readsContiguousRows() throws {
+        var array = NDArray(shape: [1, 3, 4], scalarType: .float16)
+        fillNDArray(&array, as: Float16.self, with: (0..<12).map { Float16($0) })
+        var seen: [Float16] = []
+        try StaticShapeEngine.withLogitRows(array) { rows in
+            seen = Array(UnsafeBufferPointer(start: rows, count: 12))
+        }
+        #expect(seen == (0..<12).map { Float16($0) })
+    }
+
+    @Test("Logits that are not Float16 are reported, not read through a Float16 pointer")
+    func rejectsOtherLogitTypes() {
+        let array = NDArray(shape: [1, 3, 4], scalarType: .float32)
+        #expect(throws: InferenceRuntimeError.self) {
+            try StaticShapeEngine.withLogitRows(array) { _ in }
+        }
+    }
+}
