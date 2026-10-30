@@ -36,9 +36,12 @@ uv run export.py --help
 
 **Supported models:**
 
-| Model                         | Parameters |
-| ----------------------------- | ---------- |
-| nvidia/parakeet-tdt-0.6b-v3   | 0.6B       |
+| Model                             | Parameters |
+| --------------------------------- | ---------- |
+| nvidia/parakeet-tdt-0.6b-v3       | 0.6B       |
+| rahulrachuri/parakeet-tdt-0.6b-v2 | 0.6B       |
+
+v2 is English only. NVIDIA publishes [parakeet-tdt-0.6b-v2](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) as a `.nemo` file, which `transformers` cannot load directly, so this recipe sources it from a [conversion to the Hugging Face format](https://huggingface.co/rahulrachuri/parakeet-tdt-0.6b-v2).
 
 ## Running
 
