@@ -167,10 +167,7 @@ class EmbeddingGemma2TextEncoder(nn.Module):
         self.layers = nn.ModuleList([EmbeddingGemma2EncoderLayer(config, i) for i in range(L)])
         self.norm = ScaledRMSNorm(dim, eps)
         self.embedding_projection = conv1x1(dim, config.embedding_dim)
-        self._rope_hd = {
-            "sliding": config.layer_head_dim(next(i for i in range(L) if config.is_sliding(i))),
-            "full": config.layer_head_dim(next(i for i in range(L) if not config.is_sliding(i))),
-        }
+        self._rope_hd = {"sliding": config.rope_head_dim(True), "full": config.rope_head_dim(False)}
 
     def rope(
         self, length: int, dtype: torch.dtype, device

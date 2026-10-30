@@ -90,6 +90,17 @@ class EmbeddingGemma2TextConfig:
     def is_sliding(self, layer_idx: int) -> bool:
         return self.layer_types[layer_idx] == "sliding_attention"
 
+    def rope_head_dim(self, sliding: bool) -> int:
+        """Head dim of the sliding (or full) layers; ``head_dim`` when there are none."""
+        dims = {
+            self.layer_head_dim(i)
+            for i in range(self.num_hidden_layers)
+            if self.is_sliding(i) == sliding
+        }
+        if len(dims) > 1:
+            raise ValueError("RoPE tables assume one head_dim per layer type")
+        return next(iter(dims), self.head_dim)
+
     @classmethod
     def from_dict(cls, text_config: dict[str, Any]) -> EmbeddingGemma2TextConfig:
         """Build from an HF ``text_config`` dict (``config.json["text_config"]``).
@@ -287,23 +298,15 @@ class EmbeddingGemma2TextEncoder(nn.Module):
         self.norm = EmbeddingGemma2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.embedding_projection = nn.Linear(config.hidden_size, config.embedding_dim, bias=False)
 
-        sliding_dims = {
-            config.layer_head_dim(i) for i in range(len(self.layers)) if config.is_sliding(i)
-        }
-        full_dims = {
-            config.layer_head_dim(i) for i in range(len(self.layers)) if not config.is_sliding(i)
-        }
-        if len(sliding_dims) > 1 or len(full_dims) > 1:
-            raise ValueError("RoPE tables assume one head_dim per layer type")
-        sliding_hd = next(iter(sliding_dims), config.head_dim)
-        full_hd = next(iter(full_dims), config.head_dim)
         self.register_buffer(
             "sliding_inv_freq",
-            rope_inv_freq(sliding_hd, config.rope_theta_sliding),
+            rope_inv_freq(config.rope_head_dim(True), config.rope_theta_sliding),
             persistent=False,
         )
         self.register_buffer(
-            "full_inv_freq", rope_inv_freq(full_hd, config.rope_theta_full), persistent=False
+            "full_inv_freq",
+            rope_inv_freq(config.rope_head_dim(False), config.rope_theta_full),
+            persistent=False,
         )
 
     @staticmethod

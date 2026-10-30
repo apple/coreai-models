@@ -21,7 +21,7 @@ import logging
 import shutil
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from coreai_models._constants import DEFAULT_INCLUDE_DEBUG_INFO
 from coreai_models.embedding.contract import (
@@ -53,9 +53,6 @@ from coreai_models.embedding.export_utils import (
     verify_image_config,
     verify_pooling_config,
 )
-
-if TYPE_CHECKING:
-    pass
 
 logger = logging.getLogger(__name__)
 
