@@ -53,6 +53,31 @@ DECODER_STEP_GRAPH = "decoder_step"
 JOINT_GRAPH = "joint"
 
 
+@dataclasses.dataclass(frozen=True)
+class ModelAttribution:
+    """What an exported asset's metadata credits, per supported checkpoint."""
+
+    version: str
+    author: str
+    source_url: str
+
+
+# NVIDIA publishes v2 only as a .nemo file, which `from_pretrained` cannot load, so v2 is sourced
+# from a conversion to the Hugging Face format. The asset still credits NVIDIA's original.
+SUPPORTED_MODELS = {
+    "nvidia/parakeet-tdt-0.6b-v3": ModelAttribution(
+        version="v3",
+        author="M. Sekoyan et al.",
+        source_url="https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3",
+    ),
+    "rahulrachuri/parakeet-tdt-0.6b-v2": ModelAttribution(
+        version="v2",
+        author="NVIDIA",
+        source_url="https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2",
+    ),
+}
+
+
 class ParakeetEncoderModule(torch.nn.Module):
     """FastConformer encoder + encoder_projector linear."""
 
@@ -354,23 +379,24 @@ def _bundle_paths(
     return bundle_dir, assets
 
 
-def _build_aimodel_metadata(graph: str) -> AIModelAssetMetadata:
+def _build_aimodel_metadata(graph: str, model_name: str) -> AIModelAssetMetadata:
+    attribution = SUPPORTED_MODELS[model_name]
     metadata = AIModelAssetMetadata()
-    metadata.author = "M. Sekoyan et al."
+    metadata.author = attribution.author
     metadata.license = "CC-BY-4.0"
     metadata.model_description = (
-        f"Parakeet-TDT v3 ASR ({graph} subgraph). Parakeet is a FastConformer "
+        f"Parakeet-TDT {attribution.version} ASR ({graph} subgraph). Parakeet is a FastConformer "
         f"encoder paired with a Token-and-Duration Transducer decoder that "
         f"predicts (token, duration) pairs for blank-skipping greedy decoding. "
-        f"Source: https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3"
+        f"Source: {attribution.source_url}"
     )
     metadata.creation_date = int(time.time())
     return metadata
 
 
-def _save_program(program, model_path: Path, graph: str) -> None:
+def _save_program(program, model_path: Path, graph: str, model_name: str) -> None:
     model_path.parent.mkdir(parents=True, exist_ok=True)
-    program.save_asset(model_path, _build_aimodel_metadata(graph))
+    program.save_asset(model_path, _build_aimodel_metadata(graph, model_name))
     print(f"[INFO] Saved {graph} graph to {model_path}.")
 
 
@@ -530,7 +556,7 @@ def create_parakeet(
         include_debug_info=include_debug_info,
         dynamic_shapes=_encoder_dynamic_shapes() if dynamic else None,
     )
-    _save_program(encoder_program, assets[ENCODER_GRAPH], ENCODER_GRAPH)
+    _save_program(encoder_program, assets[ENCODER_GRAPH], ENCODER_GRAPH, model_name)
 
     print(f"[INFO] Exporting {DECODER_STEP_GRAPH} graph...")
     decoder_program = _convert(
@@ -541,7 +567,7 @@ def create_parakeet(
         dtype=dtype,
         include_debug_info=include_debug_info,
     )
-    _save_program(decoder_program, assets[DECODER_STEP_GRAPH], DECODER_STEP_GRAPH)
+    _save_program(decoder_program, assets[DECODER_STEP_GRAPH], DECODER_STEP_GRAPH, model_name)
 
     print(f"[INFO] Exporting {JOINT_GRAPH} graph...")
     joint_program = _convert(
@@ -552,7 +578,7 @@ def create_parakeet(
         dtype=dtype,
         include_debug_info=include_debug_info,
     )
-    _save_program(joint_program, assets[JOINT_GRAPH], JOINT_GRAPH)
+    _save_program(joint_program, assets[JOINT_GRAPH], JOINT_GRAPH, model_name)
 
     _write_processor(bundle_dir / "processor", processor, model_name)
     _write_bundle_metadata(
@@ -605,7 +631,7 @@ def main():
     )
     parser.add_argument(
         "--model",
-        choices=["nvidia/parakeet-tdt-0.6b-v3"],
+        choices=list(SUPPORTED_MODELS),
         default="nvidia/parakeet-tdt-0.6b-v3",
         help="Model variant to convert.",
     )
