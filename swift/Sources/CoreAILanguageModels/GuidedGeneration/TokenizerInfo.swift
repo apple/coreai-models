@@ -12,16 +12,25 @@ public final class TokenizerInfo {
     public let vocabularySize: Int
     public let vocabType: VocabularyType
     public let addPrefixSpace: Bool
+    /// Ids a grammar allows only once its JSON is complete, or nil (or empty) when xgrammar detects them from
+    /// the vocabulary.
+    public let stopTokenIds: [Int32]?
 
     /// Extract vocabulary from any tokenizer with a vocabulary property
+    ///
+    /// - Parameter stopTokenIds: Ids to treat as stop tokens (e.g. EOS), which a grammar allows
+    ///   only once its JSON is complete. Nil or empty lets xgrammar detect them from the vocabulary, which
+    ///   can miss a model's real end of turn.
     public init(
         vocabulary: [String],
         vocabType: VocabularyType = .raw,
+        stopTokenIds: [Int32]? = nil,
         addPrefixSpace: Bool = false
     ) {
         self.vocabulary = vocabulary
         self.vocabType = vocabType
         self.addPrefixSpace = addPrefixSpace
+        self.stopTokenIds = stopTokenIds
 
         // Convert Swift strings to C string array
         let cStrings = vocabulary.map { strdup($0) }
@@ -39,14 +48,14 @@ public final class TokenizerInfo {
         }
 
         // Call C bridge — NULL indicates a programming error (corrupt vocabulary)
-        guard
-            let handle = xgrammar_tokenizer_info_create(
-                cStringArray,
-                Int32(vocabulary.count),
-                vocabType.cValue,
-                addPrefixSpace
-            )
-        else {
+        let created = { (stops: UnsafePointer<Int32>?, count: Int) in
+            xgrammar_tokenizer_info_create(
+                cStringArray, Int32(vocabulary.count), vocabType.cValue, stops, Int32(count), addPrefixSpace)
+        }
+        let handle =
+            stopTokenIds.map { ids in ids.withUnsafeBufferPointer { created($0.baseAddress, ids.count) } }
+            ?? created(nil, 0)
+        guard let handle else {
             preconditionFailure(
                 "Failed to create xgrammar TokenizerInfo: invalid vocabulary (\(vocabulary.count) tokens)")
         }

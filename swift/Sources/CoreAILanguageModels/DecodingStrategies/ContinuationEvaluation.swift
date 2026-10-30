@@ -65,6 +65,12 @@ public struct ContinuationEvaluationResult: Sendable {
     /// Logits for each continuation position [num_continuation_tokens, vocab_size]
     public let logits: [[LogitsScalarType]]
 
+    public init(contextTokens: [Int32], continuationTokens: [Int32], logits: [[LogitsScalarType]]) {
+        self.contextTokens = contextTokens
+        self.continuationTokens = continuationTokens
+        self.logits = logits
+    }
+
     /// Calculate log probability of the continuation
     public func logProbability() -> Double {
         LogProbabilities.compute(logits: logits, targets: continuationTokens).sum
@@ -90,11 +96,17 @@ public struct ContinuationEvaluationResult: Sendable {
 
 // MARK: - Errors
 
+/// Why `TextGenerator.evaluateRawTokens(context:continuation:)` cannot score.
 public enum ContinuationEvaluationError: Error, LocalizedError {
+    @available(*, deprecated, message: "No longer thrown; llm-runner reports its own option errors.")
     case requiresDisabledChatTemplate
+    @available(*, deprecated, message: "No longer thrown; llm-runner reports its own option errors.")
     case requiresLogitsOutput
+    @available(*, deprecated, message: "No longer thrown; llm-runner reports its own option errors.")
     case engineDoesNotSupportLogits
+    @available(*, deprecated, message: "No longer thrown; llm-runner reports its own option errors.")
     case emptyContinuation
+    @available(*, deprecated, message: "No longer thrown; llm-runner reports its own option errors.")
     case rawTokensNotSupported
     case emptyInput
 
@@ -111,7 +123,7 @@ public enum ContinuationEvaluationError: Error, LocalizedError {
         case .rawTokensNotSupported:
             return "--continuation requires text prompt (--prompt or --prompt-file), not --raw-tokens"
         case .emptyInput:
-            return "Raw token evaluation requires at least 2 tokens"
+            return "Raw token scoring requires at least one context id and one continuation id"
         }
     }
 }

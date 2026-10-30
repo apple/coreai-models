@@ -39,11 +39,14 @@ typedef enum {
     XGRAMMAR_VOCAB_BYTE_LEVEL = 2
 } XGrammarVocabType;
 
-// Create tokenizer info
+// Create tokenizer info. A grammar allows `stop_token_ids` only once its JSON is complete; pass
+// NULL to let xgrammar detect them from the vocabulary.
 XGrammarTokenizerInfo* xgrammar_tokenizer_info_create(
     const char** encoded_vocab,
     int vocab_size,
     XGrammarVocabType vocab_type,
+    const int32_t* stop_token_ids,
+    int stop_token_count,
     bool add_prefix_space
 );
 

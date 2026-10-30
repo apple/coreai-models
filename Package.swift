@@ -316,6 +316,14 @@ let package = Package(
             ]
         ),
         .testTarget(
+            name: "LLMRunnerTests",
+            dependencies: [
+                "llm-runner",
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+            ],
+            path: "swift/Tests/LLMRunnerTests"
+        ),
+        .testTarget(
             name: "ImageSegmenterTests",
             dependencies: [
                 "CoreAIImageSegmenter",
