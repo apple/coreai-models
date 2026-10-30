@@ -10,6 +10,7 @@ The static-length encoder, the float16 token table, and the image encoder.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -31,8 +32,6 @@ from coreai_models.embedding.contract import (
     encoder_functions,
 )
 from coreai_models.embedding.export_utils import (
-    TraceSpec,
-    add_traces,
     export_token_table_program,
     image_reference_inputs,
     save_program,
@@ -82,20 +81,27 @@ def ane_text_reference_inputs(
 
 
 def convert_ane_functions(
-    traces: list[tuple[nn.Module, TraceSpec]],
+    functions: Sequence[
+        tuple[str, nn.Module, tuple[torch.Tensor, ...], tuple[str, ...], tuple[str, ...]]
+    ],
     *,
     include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
 ) -> AIProgram:
-    """Convert every ``(module, trace)`` into one multi-function Neural Engine program.
+    """Convert each ``(name, module, args, input_names, output_names)`` into one Neural Engine
+    program.
 
     Uses the default decompositions plus the repo's custom lowerings, as ``export/ios.py`` does.
     """
-    from coreai_models.diffusion.gpu import new_converter
+    from coreai_models.diffusion.gpu import add_function, new_converter
     from coreai_models.export.mlir_ops import register_custom_torch_lowering
 
     converter = new_converter(include_debug_info)
     register_custom_torch_lowering(converter)
-    add_traces(converter, traces, torch.export.default_decompositions())
+    decompositions = torch.export.default_decompositions()
+    for name, module, args, input_names, output_names in functions:
+        add_function(
+            converter, name, module, args, input_names, output_names, decompositions=decompositions
+        )
     return converter.to_coreai()
 
 
@@ -109,13 +115,11 @@ def export_ane_encoder_program(
     hidden = int(encoder.config.hidden_size)
     traces = [
         (
+            spec.name,
             EncoderBandWrapper(encoder, spec.length, sliding_window),
-            TraceSpec(
-                spec.name,
-                ane_text_reference_inputs(spec.length, hidden),
-                ANE_ENCODER_INPUT_NAMES,
-                (OUTPUT_NAME,),
-            ),
+            ane_text_reference_inputs(spec.length, hidden),
+            ANE_ENCODER_INPUT_NAMES,
+            (OUTPUT_NAME,),
         )
         for spec in functions
     ]
@@ -128,13 +132,11 @@ def export_ane_image_encoder_program(
     include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
 ) -> AIProgram:
     """Neural Engine ``image_encoder``: function ``main`` at the static budget."""
-    trace = TraceSpec(
-        "main",
-        image_reference_inputs(image, torch.float16, torch.float16),
-        IMAGE_INPUT_NAMES,
-        (IMAGE_OUTPUT_NAME,),
+    args = image_reference_inputs(image, torch.float16, torch.float16)
+    return convert_ane_functions(
+        [("main", image_encoder, args, IMAGE_INPUT_NAMES, (IMAGE_OUTPUT_NAME,))],
+        include_debug_info=include_debug_info,
     )
-    return convert_ane_functions([(image_encoder, trace)], include_debug_info=include_debug_info)
 
 
 def export_ane_programs(

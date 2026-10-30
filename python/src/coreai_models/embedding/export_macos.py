@@ -37,10 +37,9 @@ from coreai_models.embedding.contract import (
 )
 from coreai_models.embedding.export_utils import (
     TokenTableExportWrapper,
-    TraceSpec,
-    add_traces,
     image_reference_inputs,
     save_program,
+    token_table_trace,
 )
 
 if TYPE_CHECKING:
@@ -116,24 +115,6 @@ def embeds_reference_inputs(spec: FunctionSpec, hidden: int) -> tuple[torch.Tens
     return embeds, torch.ones((spec.batch, spec.length), dtype=torch.int32)
 
 
-def export_text_encoder_program(
-    wrapper: nn.Module,
-    functions: list[FunctionSpec],
-    vocab_size: int,
-    include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
-) -> AIProgram:
-    """GPU ``text_encoder``: one static (batch, length) function per spec, weights shared."""
-    from coreai_models.diffusion.gpu import export_multifunction
-
-    # Static (batch, length) traces; the host pads to the next listed batch.
-    return export_multifunction(
-        [(spec.name, wrapper, reference_inputs(spec, vocab_size)) for spec in functions],
-        TEXT_INPUT_NAMES,
-        (OUTPUT_NAME,),
-        include_debug_info,
-    )
-
-
 def export_shared_text_program(
     encoder: nn.Module,
     text_fns: list[FunctionSpec],
@@ -141,58 +122,37 @@ def export_shared_text_program(
     max_length: int,
     include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
 ) -> AIProgram:
-    """GPU ``text_encoder`` that also holds the ``token_table`` and ``encoder`` functions.
+    """GPU ``text_encoder``; with ``encoder_fns`` it also holds the ``token_table`` and ``encoder``.
 
-    Text functions take ids; ``main`` maps ids to ``inputs_embeds`` (dynamic length up to
-    ``max_length``); ``embeds_*`` functions take ``inputs_embeds``. The functions share one copy
-    of the table and the transformer.
+    Text functions take ids at a static (batch, length); the host pads to the next listed batch.
+    ``main`` maps ids to ``inputs_embeds`` (dynamic length up to ``max_length``); ``embeds_*``
+    functions take ``inputs_embeds``. The functions share one copy of the table and the transformer.
     """
-    from coreai_models.diffusion.gpu import new_converter
+    from coreai_models.diffusion.gpu import add_function, new_converter
 
-    vocab_size = int(encoder.config.vocab_size)
-    hidden = int(encoder.config.hidden_size)
-    length = torch.export.Dim("length", min=2, max=max_length)
-    text = TextEmbeddingExportWrapper(encoder)
-    traces = [
-        (
-            text,
-            TraceSpec(
-                spec.name, reference_inputs(spec, vocab_size), TEXT_INPUT_NAMES, (OUTPUT_NAME,)
-            ),
-        )
-        for spec in text_fns
-    ]
-    traces.append(
-        (
-            TokenTableExportWrapper(encoder.embed_tokens),
-            TraceSpec(
-                "main",
-                (torch.zeros((1, 64), dtype=torch.int32),),
-                TOKEN_TABLE_INPUT_NAMES,
-                (TOKEN_TABLE_OUTPUT_NAME,),
-                ({1: length},),
-            ),
-        )
-    )
     converter = new_converter(include_debug_info)
-    add_traces(converter, traces)
-    with without_token_table(encoder) as inner:
-        embeds = InputsEmbedsEncoderWrapper(inner)
-        add_traces(
+    text = TextEmbeddingExportWrapper(encoder)
+    for spec in text_fns:
+        args = reference_inputs(spec, int(encoder.config.vocab_size))
+        add_function(converter, spec.name, text, args, TEXT_INPUT_NAMES, (OUTPUT_NAME,))
+    if encoder_fns:
+        ids, dynamic_shapes = token_table_trace(max_length)
+        add_function(
             converter,
-            [
-                (
-                    embeds,
-                    TraceSpec(
-                        spec.name,
-                        embeds_reference_inputs(spec, hidden),
-                        ENCODER_INPUT_NAMES,
-                        (OUTPUT_NAME,),
-                    ),
-                )
-                for spec in encoder_fns
-            ],
+            "main",
+            TokenTableExportWrapper(encoder.embed_tokens),
+            ids,
+            TOKEN_TABLE_INPUT_NAMES,
+            (TOKEN_TABLE_OUTPUT_NAME,),
+            dynamic_shapes=dynamic_shapes,
         )
+        with without_token_table(encoder) as inner:
+            embeds = InputsEmbedsEncoderWrapper(inner)
+            for spec in encoder_fns:
+                args = embeds_reference_inputs(spec, int(encoder.config.hidden_size))
+                add_function(
+                    converter, spec.name, embeds, args, ENCODER_INPUT_NAMES, (OUTPUT_NAME,)
+                )
     return converter.to_coreai()
 
 
@@ -213,26 +173,6 @@ def export_image_encoder_program(
     )
 
 
-def load_text_encoder(family: EmbeddingFamily, snapshot: Path, dtype: torch.dtype) -> nn.Module:
-    if family.key == "embeddinggemma-2":
-        from coreai_models.models.macos.embedding_gemma2 import load_embedding_gemma2_text_encoder
-
-        return load_embedding_gemma2_text_encoder(snapshot, dtype=dtype)
-    raise NotImplementedError(f"No text-encoder loader for family {family.key!r}")
-
-
-def load_image_encoder(
-    family: EmbeddingFamily, snapshot: Path, dtype: torch.dtype, max_soft_tokens: int
-) -> nn.Module:
-    if family.key == "embeddinggemma-2":
-        from coreai_models.models.macos.embedding_gemma2_vision import EmbeddingGemma2ImageEncoder
-
-        return EmbeddingGemma2ImageEncoder.from_pretrained(
-            str(snapshot), dtype=dtype, max_soft_tokens=max_soft_tokens
-        )
-    raise NotImplementedError(f"No image-encoder loader for family {family.key!r}")
-
-
 def export_gpu_programs(
     family: EmbeddingFamily,
     snapshot: Path,
@@ -242,29 +182,28 @@ def export_gpu_programs(
     compute_precision: str,
     include_debug_info: bool,
 ) -> None:
+    if family.key != "embeddinggemma-2":
+        raise NotImplementedError(f"No GPU export for family {family.key!r}")
+    from coreai_models.models.macos.embedding_gemma2 import load_embedding_gemma2_text_encoder
+    from coreai_models.models.macos.embedding_gemma2_vision import EmbeddingGemma2ImageEncoder
+
     dtype = _DTYPES[compute_precision]
-    encoder = load_text_encoder(family, snapshot, dtype)
-    if with_image:
-        program = export_shared_text_program(
-            encoder,
-            text_functions(family, "macOS"),
-            encoder_functions(family, "macOS"),
-            family.model_max_tokens,
-            include_debug_info,
-        )
-    else:
-        program = export_text_encoder_program(
-            TextEmbeddingExportWrapper(encoder),
-            text_functions(family, "macOS"),
-            int(encoder.config.vocab_size),
-            include_debug_info,
-        )
+    encoder = load_embedding_gemma2_text_encoder(snapshot, dtype=dtype)
+    program = export_shared_text_program(
+        encoder,
+        text_functions(family, "macOS"),
+        encoder_functions(family, "macOS") if with_image else [],
+        family.model_max_tokens,
+        include_debug_info,
+    )
     save_program(program, out, family, TEXT_COMPONENT)
     del program, encoder
     if not with_image:
         return
     assert family.image is not None
-    image_encoder = load_image_encoder(family, snapshot, dtype, family.image.budget)
+    image_encoder = EmbeddingGemma2ImageEncoder.from_pretrained(
+        str(snapshot), dtype=dtype, max_soft_tokens=family.image.budget
+    )
     save_program(
         export_image_encoder_program(image_encoder, family.image, include_debug_info),
         out,

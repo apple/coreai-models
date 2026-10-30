@@ -516,7 +516,7 @@ def test_tiny_multifunction_conversion():
     out = wrapper(ids, mask)
     assert out.dtype == torch.float32 and out.shape == (4, 24)
     torch.testing.assert_close(out.norm(dim=-1), torch.ones(4))
-    assert export_macos.export_text_encoder_program(wrapper, plan, 64) is not None
+    assert export_macos.export_shared_text_program(wrapper.encoder, plan, [], 64) is not None
 
 
 def _tiny_text_encoder():

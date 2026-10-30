@@ -13,8 +13,6 @@ from __future__ import annotations
 import json
 import logging
 import shutil
-import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -146,59 +144,24 @@ def image_reference_inputs(
     The GPU program takes float32 pixels and int32 positions; the Neural Engine takes float16 for
     both.
     """
+    from coreai_models.models.macos.embedding_gemma2_vision import pad_to_budget, patch_position_ids
+
     k = image.pooling_kernel_size
-    n = image.budget
-    # Square-ish grid of n soft tokens (blocks) -> (bw*k) x (bh*k) patches, row-major.
-    bw = max(1, int(n**0.5))
-    bh = max(1, n // bw)
-    pw, ph = bw * k, bh * k
-    ys, xs = torch.meshgrid(torch.arange(ph), torch.arange(pw), indexing="ij")
-    real = torch.stack([xs.reshape(-1), ys.reshape(-1)], dim=-1)
-    positions = torch.full((1, image.max_patches, 2), -1, dtype=torch.int32)
-    positions[0, : real.shape[0]] = real.to(torch.int32)
+    # Square-ish grid of budget soft tokens (blocks) -> (bh*k) x (bw*k) patches, row-major.
+    bw = max(1, int(image.budget**0.5))
+    bh = max(1, image.budget // bw)
     generator = torch.Generator().manual_seed(image.budget)
-    pixels = torch.rand((1, image.max_patches, image.patch_dim), generator=generator)
-    pixels[0, real.shape[0] :] = 0.0
-    return pixels.to(dtype), positions.to(position_dtype)
+    pixels = torch.rand((image.max_patches, image.patch_dim), generator=generator)
+    pixels, positions = pad_to_budget(
+        pixels[: bh * k * bw * k], patch_position_ids(bh * k, bw * k), image.max_patches
+    )
+    return pixels[None].to(dtype), positions[None].to(position_dtype)
 
 
-@dataclass
-class TraceSpec:
-    """One function of a multi-function program: example args, IO names, dynamic dims."""
-
-    name: str
-    args: tuple[torch.Tensor, ...]
-    input_names: tuple[str, ...]
-    output_names: tuple[str, ...]
-    dynamic_shapes: tuple[dict[int, Any] | None, ...] | None = None
-
-
-def add_traces(
-    converter: Any,
-    traces: list[tuple[nn.Module, TraceSpec]],
-    decompositions: dict[Any, Any] | None = None,
-) -> None:
-    """Add each ``(module, trace)`` to ``converter`` as a function (Core AI's table by default)."""
-    from coreai_models.diffusion.gpu import add_function
-
-    for module, trace in traces:
-        start = time.time()
-        add_function(
-            converter,
-            trace.name,
-            module,
-            trace.args,
-            list(trace.input_names),
-            list(trace.output_names),
-            dynamic_shapes=trace.dynamic_shapes,
-            decompositions=decompositions,
-        )
-        logger.info(
-            "traced %s %s in %.1fs",
-            trace.name,
-            [tuple(a.shape) for a in trace.args],
-            time.time() - start,
-        )
+def token_table_trace(max_length: int) -> tuple[tuple[torch.Tensor], tuple[dict[int, Any]]]:
+    """Token-table trace args and dynamic shapes: batch-1 ids, length 2..``max_length``."""
+    length = torch.export.Dim("length", min=2, max=max_length)
+    return (torch.zeros((1, 64), dtype=torch.int32),), ({1: length},)
 
 
 def export_token_table_program(
@@ -211,14 +174,13 @@ def export_token_table_program(
     from coreai_models.diffusion.gpu import export_stateless
 
     # Placeholder ids look up like any id; the host overwrites those rows with soft tokens.
-    length = torch.export.Dim("length", min=2, max=max_length)
-    ids = torch.zeros((1, 64), dtype=torch.int32)
+    args, dynamic_shapes = token_table_trace(max_length)
     return export_stateless(
         TokenTableExportWrapper(embed_tokens, dtype),
-        (ids,),
+        args,
         TOKEN_TABLE_INPUT_NAMES,
         (TOKEN_TABLE_OUTPUT_NAME,),
-        dynamic_shapes=({1: length},),
+        dynamic_shapes=dynamic_shapes,
         include_debug_info=include_debug_info,
     )
 

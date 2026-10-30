@@ -82,13 +82,7 @@ def export_stateless(
         decomposed: torch.export.ExportedProgram = exported.run_decompositions(coreai_decomp_table)
         return decomposed
 
-    converter = coreai_torch.TorchConverter(
-        mode=(
-            coreai_torch.TorchConverter.Mode.DEBUG
-            if include_debug_info
-            else coreai_torch.TorchConverter.Mode.RELEASE
-        )
-    )
+    converter = new_converter(include_debug_info)
     converter.add_pytorch_module(
         wrapper,
         export_fn=export_fn,
