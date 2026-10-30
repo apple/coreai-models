@@ -167,26 +167,37 @@ def build_attention_masks(
 
 
 class EmbeddingGemma2Attention(nn.Module):
-    """Bidirectional attention; q/k RMSNorm + RoPE, scale-free v_norm, scaling 1.0."""
+    """Bidirectional attention; q/k RMSNorm + RoPE, scale-free v_norm, scaling 1.0.
 
-    def __init__(self, config: EmbeddingGemma2TextConfig, layer_idx: int) -> None:
+    ``_rope`` applies the rotary embedding to ``[B, L, heads, head_dim]``; subclasses override it.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        n_heads: int,
+        n_kv_heads: int,
+        head_dim: int,
+        eps: float,
+        bias: bool = False,
+    ) -> None:
         super().__init__()
-        self.n_heads = config.num_attention_heads
-        self.n_kv_heads = config.layer_num_key_value_heads(layer_idx)
-        self.head_dim = config.layer_head_dim(layer_idx)
-        dim, hd = config.hidden_size, self.head_dim
-        bias = config.attention_bias
+        self.n_heads, self.n_kv_heads, self.head_dim = n_heads, n_kv_heads, head_dim
+        hd = head_dim
 
         self.q_proj = nn.Linear(dim, self.n_heads * hd, bias=bias)
         self.k_proj = nn.Linear(dim, self.n_kv_heads * hd, bias=bias)
         self.v_proj = nn.Linear(dim, self.n_kv_heads * hd, bias=bias)
         self.o_proj = nn.Linear(self.n_heads * hd, dim, bias=bias)
-        self.q_norm = EmbeddingGemma2RMSNorm(hd, eps=config.rms_norm_eps)
-        self.k_norm = EmbeddingGemma2RMSNorm(hd, eps=config.rms_norm_eps)
-        self.v_norm = EmbeddingGemma2RMSNorm(hd, eps=config.rms_norm_eps, with_scale=False)
+        self.q_norm = EmbeddingGemma2RMSNorm(hd, eps=eps)
+        self.k_norm = EmbeddingGemma2RMSNorm(hd, eps=eps)
+        self.v_norm = EmbeddingGemma2RMSNorm(hd, eps=eps, with_scale=False)
         # The mask carries both the window and the key padding; the composite itself stays
         # windowless and non-causal.
         self.sdpa = SDPA(scale=1.0, window_size=0, is_causal=False)
+
+    def _rope(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        return apply_rotary_pos_emb(x, cos, sin, unsqueeze_dim=2)
 
     def forward(
         self,
@@ -199,9 +210,9 @@ class EmbeddingGemma2Attention(nn.Module):
         n_h, n_kv, hd = self.n_heads, self.n_kv_heads, self.head_dim
 
         query = self.q_norm(self.q_proj(x).reshape(batch, seq_len, n_h, hd))
-        query = apply_rotary_pos_emb(query, cos, sin, unsqueeze_dim=2).transpose(1, 2)
+        query = self._rope(query, cos, sin).transpose(1, 2)
         key = self.k_norm(self.k_proj(x).reshape(batch, seq_len, n_kv, hd))
-        key = apply_rotary_pos_emb(key, cos, sin, unsqueeze_dim=2).transpose(1, 2)
+        key = self._rope(key, cos, sin).transpose(1, 2)
         value = self.v_norm(self.v_proj(x).reshape(batch, seq_len, n_kv, hd)).transpose(1, 2)
 
         out = self.sdpa(query=query, key=key, value=value, attn_mask=attn_mask)
@@ -248,24 +259,25 @@ class EmbeddingGemma2PLEBlock(nn.Module):
         return x + self.post_per_layer_input_norm(self.per_layer_projection(h))
 
 
-class EmbeddingGemma2EncoderLayer(nn.Module):
-    def __init__(self, config: EmbeddingGemma2TextConfig, layer_idx: int) -> None:
+class EmbeddingGemma2SandwichLayer(nn.Module):
+    """Sandwich-norm block: ``x + post_norm(attn(pre_norm(x)))``, same for the MLP.
+
+    ``config`` needs ``hidden_size``, ``intermediate_size`` and ``rms_norm_eps``.
+    """
+
+    def __init__(self, config: Any, self_attn: EmbeddingGemma2Attention) -> None:
         super().__init__()
-        eps = config.rms_norm_eps
-        self.is_sliding = config.is_sliding(layer_idx)
-        self.self_attn = EmbeddingGemma2Attention(config, layer_idx)
+        h, eps = config.hidden_size, config.rms_norm_eps
+        self.self_attn = self_attn
         self.mlp = EmbeddingGemma2MLP(config)
-        self.input_layernorm = EmbeddingGemma2RMSNorm(config.hidden_size, eps=eps)
-        self.post_attention_layernorm = EmbeddingGemma2RMSNorm(config.hidden_size, eps=eps)
-        self.pre_feedforward_layernorm = EmbeddingGemma2RMSNorm(config.hidden_size, eps=eps)
-        self.post_feedforward_layernorm = EmbeddingGemma2RMSNorm(config.hidden_size, eps=eps)
-        self.ple_block = EmbeddingGemma2PLEBlock(config)
-        self.register_buffer("layer_scalar", torch.ones(1))
+        self.input_layernorm = EmbeddingGemma2RMSNorm(h, eps=eps)
+        self.post_attention_layernorm = EmbeddingGemma2RMSNorm(h, eps=eps)
+        self.pre_feedforward_layernorm = EmbeddingGemma2RMSNorm(h, eps=eps)
+        self.post_feedforward_layernorm = EmbeddingGemma2RMSNorm(h, eps=eps)
 
     def forward(
         self,
         x: torch.Tensor,
-        per_layer_input: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
         attn_mask: torch.Tensor,
@@ -273,7 +285,35 @@ class EmbeddingGemma2EncoderLayer(nn.Module):
         h = self.self_attn(self.input_layernorm(x), cos, sin, attn_mask)
         x = x + self.post_attention_layernorm(h)
         h = self.mlp(self.pre_feedforward_layernorm(x))
-        x = x + self.post_feedforward_layernorm(h)
+        return x + self.post_feedforward_layernorm(h)
+
+
+class EmbeddingGemma2EncoderLayer(EmbeddingGemma2SandwichLayer):
+    """Sandwich-norm block followed by the per-layer-input block and ``layer_scalar``."""
+
+    def __init__(self, config: EmbeddingGemma2TextConfig, layer_idx: int) -> None:
+        attn = EmbeddingGemma2Attention(
+            config.hidden_size,
+            config.num_attention_heads,
+            config.layer_num_key_value_heads(layer_idx),
+            config.layer_head_dim(layer_idx),
+            config.rms_norm_eps,
+            config.attention_bias,
+        )
+        super().__init__(config, attn)
+        self.is_sliding = config.is_sliding(layer_idx)
+        self.ple_block = EmbeddingGemma2PLEBlock(config)
+        self.register_buffer("layer_scalar", torch.ones(1))
+
+    def forward(  # type: ignore[override]
+        self,
+        x: torch.Tensor,
+        per_layer_input: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        attn_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        x = super().forward(x, cos, sin, attn_mask)
         x = self.ple_block(x, per_layer_input)
         return x * self.layer_scalar
 

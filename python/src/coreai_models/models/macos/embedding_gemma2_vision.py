@@ -23,11 +23,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from coreai_models.models.macos.diffusion_gemma import DiffusionGemmaDenseMLP
 from coreai_models.models.macos.diffusion_gemma import DiffusionGemmaRMSNorm as RMSNorm
-from coreai_models.models.macos.embedding_gemma2 import read_checkpoint_tensors, rope_inv_freq
+from coreai_models.models.macos.embedding_gemma2 import (
+    EmbeddingGemma2Attention,
+    EmbeddingGemma2SandwichLayer,
+    read_checkpoint_tensors,
+    rope_inv_freq,
+)
 from coreai_models.primitives.ios.rope import apply_rope
-from coreai_models.primitives.macos.sdpa import SDPA
 
 # Special token ids from the EG2 tokenizer / config.json.
 EG2_BOS_TOKEN_ID = 2
@@ -96,72 +99,17 @@ class EmbeddingGemma2VisionConfig:
         )
 
 
-class VisionAttention(nn.Module):
-    """Bidirectional MHA with q/k RMSNorm, scale-free v RMSNorm and axial RoPE; scale 1.0."""
+class VisionAttention(EmbeddingGemma2Attention):
+    """Text attention with axial 2-D RoPE: half of head_dim rotates by x, half by y (cos/sin from
+    ``axial_rope_cos_sin``, laid out ``[fx, fx, fy, fy]``)."""
 
     def __init__(self, config: EmbeddingGemma2VisionConfig) -> None:
-        super().__init__()
-        self.num_heads = config.num_attention_heads
-        self.num_kv_heads = config.num_key_value_heads
-        self.head_dim = config.head_dim
-        h = config.hidden_size
-        self.q_proj = nn.Linear(h, self.num_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(h, self.num_kv_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(h, self.num_kv_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, h, bias=False)
-        self.q_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
-        self.k_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
-        self.v_norm = RMSNorm(self.head_dim, config.rms_norm_eps, with_scale=False)
-        self.sdpa = SDPA(scale=1.0, is_causal=False)
+        c = config
+        heads, kv_heads = c.num_attention_heads, c.num_key_value_heads
+        super().__init__(c.hidden_size, heads, kv_heads, c.head_dim, c.rms_norm_eps)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-        attn_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        b, n, _ = x.shape
-        q = self.q_norm(self.q_proj(x).view(b, n, self.num_heads, self.head_dim))
-        k = self.k_norm(self.k_proj(x).view(b, n, self.num_kv_heads, self.head_dim))
-        v = self.v_norm(self.v_proj(x).view(b, n, self.num_kv_heads, self.head_dim))
-        # Axial 2-D RoPE: half of head_dim rotates by x, half by y (cos/sin from
-        # axial_rope_cos_sin, laid out [fx, fx, fy, fy]).
-        q = apply_rope(q, cos, sin, head_axis=2, ndim=2).transpose(1, 2)
-        k = apply_rope(k, cos, sin, head_axis=2, ndim=2).transpose(1, 2)
-        v = v.transpose(1, 2)
-        if self.num_kv_heads != self.num_heads:
-            rep = self.num_heads // self.num_kv_heads
-            k = k.repeat_interleave(rep, dim=1)
-            v = v.repeat_interleave(rep, dim=1)
-        out = self.sdpa(q, k, v, attn_mask=attn_mask)
-        return self.o_proj(out.transpose(1, 2).reshape(b, n, self.num_heads * self.head_dim))
-
-
-class VisionEncoderLayer(nn.Module):
-    """Sandwich-norm block: ``x + post_norm(attn(pre_norm(x)))``, same for the MLP."""
-
-    def __init__(self, config: EmbeddingGemma2VisionConfig) -> None:
-        super().__init__()
-        h, eps = config.hidden_size, config.rms_norm_eps
-        self.self_attn = VisionAttention(config)
-        self.mlp = DiffusionGemmaDenseMLP(config)
-        self.input_layernorm = RMSNorm(h, eps)
-        self.post_attention_layernorm = RMSNorm(h, eps)
-        self.pre_feedforward_layernorm = RMSNorm(h, eps)
-        self.post_feedforward_layernorm = RMSNorm(h, eps)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-        attn_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        h = self.self_attn(self.input_layernorm(x), cos, sin, attn_mask)
-        x = x + self.post_attention_layernorm(h)
-        h = self.mlp(self.pre_feedforward_layernorm(x))
-        return x + self.post_feedforward_layernorm(h)
+    def _rope(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        return apply_rope(x, cos, sin, head_axis=2, ndim=2)
 
 
 class VisionPatchEmbedder(nn.Module):
@@ -193,7 +141,10 @@ class VisionEncoder(nn.Module):
     def __init__(self, config: EmbeddingGemma2VisionConfig) -> None:
         super().__init__()
         self.layers = nn.ModuleList(
-            [VisionEncoderLayer(config) for _ in range(config.num_hidden_layers)]
+            [
+                EmbeddingGemma2SandwichLayer(config, VisionAttention(config))
+                for _ in range(config.num_hidden_layers)
+            ]
         )
 
 
