@@ -15,12 +15,6 @@ from typing_extensions import Self
 logger = logging.getLogger(__name__)
 
 
-def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    """Rotate second half of the last dimension: ``cat(-x2, x1)``."""
-    mid = x.shape[-1] // 2
-    return torch.cat((-x[..., mid:], x[..., :mid]), dim=-1)
-
-
 class RoPE(coreai_torch.composite_ops.RoPE):
     """Apply rotary positional embedding to input tensors."""
 
