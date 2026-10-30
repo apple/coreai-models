@@ -4,11 +4,13 @@ SAM 3 (Segment Anything Model 3) is a unified vision model from Meta for prompta
 
 This export targets **iOS** by restructuring the model in a BC1S layout (channels-first, `Conv2d(1x1)` projections, fp16-safe primitives, rank-4 window attention) and splitting it into three independently optimizable functions:
 
-| Function       | Compression                                | Inputs                               | Outputs                                                      |
-|----------------|--------------------------------------------|--------------------------------------|--------------------------------------------------------------|
-| `image_encode` | 4-bit k-means palettization (gs=32) + fp16 | `pixel_values`                       | `backbone_features`                                          |
-| `text_encode`  | 6-bit k-means palettization (gs=8) + fp16  | `input_ids`                          | `text_features`                                              |
-| `detect`       | fp16 (no weight compression)               | `backbone_features`, `text_features` | `pred_masks`, `pred_boxes`, `pred_logits`, `presence_logits` |
+| Function       | Compression                                | Inputs                                                 | Outputs                                                                      |
+|----------------|--------------------------------------------|--------------------------------------------------------|------------------------------------------------------------------------------|
+| `image_encode` | 4-bit k-means palettization (gs=32) + fp16 | `pixel_values`                                         | `backbone_features`                                                          |
+| `text_encode`  | 6-bit k-means palettization (gs=8) + fp16  | `input_ids`                                            | `text_features`                                                              |
+| `detect`       | fp16 (no weight compression)               | `backbone_features`, `text_features`, `attention_mask` | `pred_masks`, `pred_boxes`, `pred_logits`, `presence_logits`, `semantic_seg` |
+
+`attention_mask` is `[1, 1, 1, S]` (`S` = `--max-text-seq-len`, default 32), 1 for real prompt tokens and 0 for padding, so `detect` ignores the padding the way HF `Sam3Model` does. `ImageSegmenter` fills it from the token ids.
 
 ## Setup
 
@@ -69,6 +71,8 @@ uv run models/sam3/export.py --full --dtype float16
 ```
 
 Full bundles land at `<repo-root>/exports/<model>_<dtype>/` (e.g. `exports/sam3_float32/`), so they sit next to the lite `sam3_lite_336_w4_static/` without colliding.
+
+`main` takes `pixel_values`, `input_ids` `[1, 32]` and `attention_mask` `[1, 32]` (int32, 1 for real prompt tokens and 0 for padding); `ImageSegmenter` fills the mask from the token ids.
 
 ## Running
 

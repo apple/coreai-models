@@ -81,7 +81,8 @@ public struct ConstrainedGenerationSession: ~Copyable {
         try Self.validateMaxWhitespaceCount(maxWhitespaceCount)
         let tokenizerInfo = TokenizerInfo(
             vocabulary: vocabulary,
-            vocabType: vocabType
+            vocabType: vocabType,
+            stopTokenIds: stopTokenIds
         )
         try self.init(
             jsonSchema: jsonSchema, tokenizerInfo: tokenizerInfo, maxWhitespaceCount: maxWhitespaceCount,

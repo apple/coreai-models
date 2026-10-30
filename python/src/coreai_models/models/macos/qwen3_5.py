@@ -215,10 +215,12 @@ class GatedDeltaNet(nn.Module):
         conv_input = torch.cat([conv_state, mixed_qkv], dim=1)
 
         if cache is not None:
-            # Trailing conv_kernel_size tokens, already in the cache's layout.
+            # Trailing conv_kernel_size tokens, already in the cache's layout. Indexed
+            # from the end: an explicit `S - 1` gets attributed to the `torch.cat` above,
+            # which breaks graph-mode quantization.
             cache.update_conv_state(
                 self.cache_layer_idx,
-                conv_input.narrow(1, S - 1, conv_kernel_size),
+                conv_input.narrow(1, -conv_kernel_size, conv_kernel_size),
             )
 
         # The depthwise causal conv as conv_kernel_size scaled shifts, channels-last
@@ -361,8 +363,6 @@ class Qwen3_5ForCausalLM(BaseForCausalLM):
     _extra_hf_shared_keys = ["lm_head.weight"]
     # Hybrid: states are sized per layer type, so a plain layer-count cut isn't supported.
     supports_num_layers = False
-    # coreai-opt's graph-mode prepare rejects the GatedDeltaNet source partition.
-    supports_graph_quantization = False
 
     # Emit a second, prefill-only ``prefill`` entrypoint beside ``main``. Every state this
     # model carries is written by an in-place update, so all four survive the trim that

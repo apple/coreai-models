@@ -85,8 +85,19 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     @Option(name: .customLong("prompt-file"), help: "Read prompt text from file (UTF-8 text file)")
     var promptFile: String?
 
-    @Option(name: .customLong("raw-tokens"), help: "JSON file with pre-tokenized tokens: {\"tokens\": [...]}")
+    @Option(
+        name: .customLong("raw-tokens"),
+        help:
+            "JSON file with pre-tokenized tokens to use as the context: {\"tokens\": [...]}. Generates from them; to score a forced continuation instead, add --raw-continuation"
+    )
     var rawTokens: String?
+
+    @Option(
+        name: .customLong("raw-continuation"),
+        help:
+            "JSON file with token ids to score as a forced continuation of --raw-tokens: {\"tokens\": [...]} (requires --print-logits or --save-logits)"
+    )
+    var rawContinuation: String?
 
     @Option(help: "Maximum number of tokens to generate (default: 50)")
     var maxTokens: Int = 50
@@ -372,22 +383,44 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     }
 
     func runModel(path modelFile: String, resolver: ModelPaths) async throws {
+        // Decide whether this run scores a forced continuation, refusing options that would skip
+        // the scoring. Done before the model loads, so a bad combination fails fast.
+        let rawScoring = try RawTokenScoring.request(
+            rawContinuationPath: rawContinuation,
+            rawTokensPath: rawTokens,
+            textContinuationGiven: continuation != nil,
+            logitsRequested: saveLogits != nil || printLogits,
+            conflictingFlags: [
+                batchPrototypeRows.map { _ in "--batch-prototype" },
+                imagePath.map { _ in "--image" },
+                videoPath.map { _ in "--video" },
+            ].compactMap { $0 }
+        )
+        if let notice = RawTokenScoring.generationNotice(
+            rawTokensGiven: rawTokens != nil,
+            rawContinuationGiven: rawContinuation != nil,
+            textContinuationGiven: continuation != nil,
+            logitsRequested: saveLogits != nil || printLogits
+        ) {
+            FileHandle.standardError.write(Data((notice + "\n").utf8))
+        }
+
         // Validate continuation mode requirements
         if let continuation = continuation {
             guard !applyChatTemplate else {
                 CLILogger.log(
                     "Validation failed: chat template must be disabled for continuation mode", component: "Main")
-                throw ContinuationEvaluationError.requiresDisabledChatTemplate
+                throw ContinuationOptionError.requiresDisabledChatTemplate
             }
 
             guard saveLogits != nil || printLogits else {
                 CLILogger.log("Validation failed: logits output required for continuation mode", component: "Main")
-                throw ContinuationEvaluationError.requiresLogitsOutput
+                throw ContinuationOptionError.requiresLogitsOutput
             }
 
             guard !continuation.isEmpty else {
                 CLILogger.log("Validation failed: continuation string is empty", component: "Main")
-                throw ContinuationEvaluationError.emptyContinuation
+                throw ContinuationOptionError.emptyContinuation
             }
 
             CLILogger.log("Continuation evaluation mode enabled", component: "Main")
@@ -438,6 +471,10 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         try bundle.modelBundle.validateModelAssets()
         let modelName = bundle.name
         let modelVocabSize = bundle.vocabSize
+        if let rawScoring {
+            try RawTokenScoring.checkFits(
+                rawScoring, vocabSize: bundle.vocabSize, maxContextLength: bundle.maxContextLength)
+        }
 
         // Resolve component model URLs once; reused for the cache check and model loading below.
         // An LLM bundle has only `main`; VLM bundles also have `vision`, plus `embedding` unless the
@@ -661,19 +698,31 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             print("Generating...")
         }
 
-        // Raw token evaluation: feed pre-tokenized IDs and save per-position logits
-        if case .rawTokens(let container) = promptInput, saveLogits != nil || printLogits {
+        // Raw token scoring (--raw-continuation): score those ids as a forced continuation of
+        // the whole --raw-tokens context, under --json-schema when it is given.
+        if let rawScoring {
             guard inferenceEngine.supportsLogits else {
-                throw ContinuationEvaluationError.engineDoesNotSupportLogits
+                throw ContinuationOptionError.engineDoesNotSupportLogits
             }
-            let result = try await generator.evaluateRawTokens(container.tokens.map { Int32($0) })
+            var result = try await generator.evaluateRawTokens(
+                context: rawScoring.context, continuation: rawScoring.continuation)
+            if let schemaInput = jsonSchema {
+                // The grammar generation would use: the same stop tokens, allowed once the JSON is
+                // complete, and the same whitespace limit.
+                let stopSequences = try validateAndEncodeStopTokens(
+                    stopTokens: stopTokens, tokenizer: tokenizer, additionalEosTokenIds: additionalEosTokenIds)
+                var grammar = try ConstrainedGenerationSession(
+                    jsonSchema: try loadJSONSchema(schemaInput), tokenizer: tokenizer, vocabSize: bundle.vocabSize,
+                    stopTokenIds: stopSequences.singleTokenStopIds, maxWhitespaceCount: maxWhitespaceCount)
+                result = try RawTokenScoring.maskedByGrammar(result, session: &grammar)
+            }
 
             await PerformanceMetrics.shared.endOverallTiming()
 
             try LogitsWriter.handleEvaluationOutput(
                 result: result,
-                context: "(raw tokens: \(container.tokens.count) ids)",
-                continuation: "(forced: \(container.tokens.count - 1) ids)",
+                context: "(raw tokens: \(rawScoring.context.count) ids)",
+                continuation: "(raw continuation: \(rawScoring.continuation.count) ids)",
                 tokenizer: tokenizer,
                 saveLogitsLength: saveLogitsLength,
                 saveJsonPath: saveLogits,
@@ -691,7 +740,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             case .text(let text):
                 contextString = text
             case .rawTokens:
-                throw ContinuationEvaluationError.rawTokensNotSupported
+                throw ContinuationOptionError.rawTokensNotSupported
             }
 
             let signpostID = InstrumentsProfiler.beginInference(promptTokens: actualInputTokens, maxTokens: 0)
@@ -823,6 +872,12 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
 
     // MARK: - Constrained Generation Helper
 
+    /// The `--json-schema` value: a file's contents when it names a file, otherwise the schema itself.
+    private func loadJSONSchema(_ schemaInput: String) throws -> String {
+        guard FileManager.default.fileExists(atPath: schemaInput) else { return schemaInput }
+        return try String(contentsOfFile: schemaInput, encoding: .utf8)
+    }
+
     private func runConstrainedGeneration(
         schemaInput: String,
         input: Input,
@@ -834,12 +889,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         modelVocabSize: Int?,
         additionalEosTokenIds: Set<Int32> = []
     ) async throws {
-        let schema: String
-        if FileManager.default.fileExists(atPath: schemaInput) {
-            schema = try String(contentsOfFile: schemaInput, encoding: .utf8)
-        } else {
-            schema = schemaInput
-        }
+        let schema = try loadJSONSchema(schemaInput)
 
         CLILogger.log("Constrained generation with JSON schema", component: "Main")
 

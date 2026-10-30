@@ -69,8 +69,7 @@ public struct PipelinedConstrainedDecodingStrategy: DecodingStrategy {
             )
         }
 
-        let singleTokenStops = stopSequences.sequences.filter { $0.count == 1 }.map { $0[0] }
-        let stopTokenIds: [Int32]? = singleTokenStops.isEmpty ? nil : singleTokenStops
+        let stopTokenIds = stopSequences.singleTokenStopIds
 
         let session = try constrainedEngine.getOrCreateConstrainedSession(
             jsonSchema: jsonSchema,

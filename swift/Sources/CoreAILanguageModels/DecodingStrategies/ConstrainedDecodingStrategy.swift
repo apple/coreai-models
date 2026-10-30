@@ -103,13 +103,12 @@ public struct ConstrainedDecodingStrategy: DecodingStrategy {
             )
         }
 
-        let singleTokenStops = stopSequences.sequences.filter { $0.count == 1 }.map { $0[0] }
         if stopSequences.sequences.contains(where: { $0.count > 1 }) {
             CLILogger.log(
                 "Warning: Multi-token stop sequences not supported by xgrammar, using single-token stops only",
                 component: "ConstrainedDecodingStrategy")
         }
-        let stopTokenIds: [Int32]? = singleTokenStops.isEmpty ? nil : singleTokenStops
+        let stopTokenIds = stopSequences.singleTokenStopIds
 
         let session = try ConstrainedGenerationSession(
             jsonSchema: jsonSchema,
