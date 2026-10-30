@@ -186,7 +186,7 @@ class EmbeddingGemma2ImageEncoder(nn.Module):
             "pool_slots", torch.arange(cfg.max_soft_tokens, dtype=torch.int64), persistent=False
         )
 
-    # -- pieces (public so tests / activation probes can hook them) ---------------------
+    # -- pieces -------------------------------------------------------------------------
 
     def axial_rope_cos_sin(
         self, position_ids: torch.Tensor, dtype: torch.dtype
