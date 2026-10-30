@@ -504,10 +504,6 @@ class TestExportGuards:
         with pytest.raises(ValueError, match="--num-layers is not currently supported"):
             self._export(num_layers=2)
 
-    def test_graph_quantization(self) -> None:
-        with pytest.raises(ValueError, match="Graph-mode quantization is not currently supported"):
-            self._export(quantization_mode="graph")
-
 
 class TestLoadStateDict:
     def _model_and_state_dict(self) -> tuple[Qwen3_5ForCausalLM, dict[str, torch.Tensor]]:

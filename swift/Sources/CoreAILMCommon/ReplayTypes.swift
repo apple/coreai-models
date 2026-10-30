@@ -7,44 +7,92 @@ import Foundation
 
 // MARK: - Replay format
 
-/// One replayed chat request. Wraps the exact `ChatCompletionRequest` the HTTP server
-/// decodes, plus a session id and an arrival timestamp, so a JSONL file can drive the real
-/// generation stack without an HTTP surface. One JSON object per line:
+/// One line of a `--replay` file: a request body, a session id, and an arrival time.
+///
+/// A line has either a `request` (a `/v1/chat/completions` body) or a `completion` (a
+/// `/v1/completions` body, to score prompt logprobs):
 ///
 ///     {"id":"r1","session":"A","t":0.0,"request":{"messages":[{"role":"user","content":"hi"}],"seed":7,"max_tokens":64}}
+///     {"id":"d0","completion":{"prompt":[[1,2,3],[3,4,5]],"logprobs":0}}
 public struct ReplayRequest: Decodable, Sendable {
+    public enum Body: Sendable {
+        case chat(ChatCompletionRequest)
+        case completion(CompletionRequest)
+    }
+
     /// Caller-supplied id, echoed on the result. Optional.
     public let id: String?
     /// Session identity — maps to `X-Session-ID`. Defaults to "default" when absent.
     public let session: String?
     /// Arrival timestamp in seconds. Used to order requests; optional.
     public let t: Double?
-    /// The chat request body, identical to what the HTTP endpoint accepts.
-    public let request: ChatCompletionRequest
+    public let body: Body
 
     public init(id: String?, session: String?, t: Double?, request: ChatCompletionRequest) {
+        self.init(id: id, session: session, t: t, body: .chat(request))
+    }
+
+    public init(id: String?, session: String?, t: Double?, body: Body) {
         self.id = id
         self.session = session
         self.t = t
-        self.request = request
+        self.body = body
     }
 
-    /// Whether this request asks for the streaming path.
-    public var isStreaming: Bool { request.stream == true }
+    enum CodingKeys: String, CodingKey {
+        case id, session, t, request, completion
+    }
+
+    public init(from decoder: any Swift.Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(String.self, forKey: .id)
+        session = try container.decodeIfPresent(String.self, forKey: .session)
+        t = try container.decodeIfPresent(Double.self, forKey: .t)
+        let chat = try container.decodeIfPresent(ChatCompletionRequest.self, forKey: .request)
+        let completion = try container.decodeIfPresent(CompletionRequest.self, forKey: .completion)
+        switch (chat, completion) {
+        case (let chat?, nil):
+            body = .chat(chat)
+        case (nil, let completion?):
+            body = .completion(completion)
+        default:
+            throw DecodingError.dataCorrupted(
+                .init(
+                    codingPath: [],
+                    debugDescription: "A replay line needs exactly one of 'request' or 'completion'"))
+        }
+    }
+
+    /// True for a chat body with `stream: true`.
+    public var isStreaming: Bool {
+        if case .chat(let request) = body { return request.stream == true }
+        return false
+    }
 }
 
-/// Per-request result with instrumentation, emitted as one JSON object per line. The generated
-/// output reuses the response's `choices` shape (`ChatCompletionResponse.Choice`), so content,
-/// reasoning, tool calls, and finish reason round-trip per message; the surrounding fields are
-/// per-request instrumentation. `choices` is nil on the error path. One JSON object per line:
+/// The `choices` of a replay result, in the shape of the matching HTTP response.
+public enum ReplayChoices: Encodable, Sendable {
+    case chat([ChatCompletionResponse.Choice])
+    case completion([CompletionResponse.CompletionChoice])
+
+    public func encode(to encoder: any Swift.Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .chat(let choices): try container.encode(choices)
+        case .completion(let choices): try container.encode(choices)
+        }
+    }
+}
+
+/// One line of `--replay` output: the response `choices`, plus token counts and timing. On error,
+/// `choices` is nil and `error` is set.
 ///
 ///     {"id":"r1","session":"A","t":0.0,"choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"prompt_tokens":3,"completion_tokens":1,"ttft_ms":12.5}
 public struct ReplayResult: Encodable, Sendable {
     public let id: String?
     public let session: String?
     public let t: Double?
-    /// Response choices, mirroring `ChatCompletionResponse.choices`. Nil on error.
-    public let choices: [ChatCompletionResponse.Choice]?
+    public let choices: ReplayChoices?
     public let systemFingerprint: String?
     public let promptTokens: Int
     public let completionTokens: Int
@@ -66,7 +114,7 @@ public struct ReplayResult: Encodable, Sendable {
         self.id = id
         self.session = session
         self.t = t
-        self.choices = choices
+        self.choices = choices.map { .chat($0) }
         self.systemFingerprint = systemFingerprint
         self.promptTokens = promptTokens
         self.completionTokens = completionTokens
@@ -76,6 +124,26 @@ public struct ReplayResult: Encodable, Sendable {
         self.decodeTps = decodeTps
         self.streamed = streamed
         self.error = error
+    }
+
+    /// Result of a `completion` line. `promptTokens` counts the scored tokens; `ttftMs` is `totalMs`.
+    public init(
+        id: String?, session: String?, t: Double?,
+        completionChoices: [CompletionResponse.CompletionChoice], promptTokens: Int, totalMs: Double
+    ) {
+        self.id = id
+        self.session = session
+        self.t = t
+        self.choices = .completion(completionChoices)
+        self.systemFingerprint = nil
+        self.promptTokens = promptTokens
+        self.completionTokens = 0
+        self.prefixReuseTokens = 0
+        self.ttftMs = totalMs
+        self.totalMs = totalMs
+        self.decodeTps = 0
+        self.streamed = false
+        self.error = nil
     }
 
     enum CodingKeys: String, CodingKey {

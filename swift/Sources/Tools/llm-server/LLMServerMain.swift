@@ -29,7 +29,7 @@ struct LLMServer: AsyncParsableCommand {
 
             Eval harnesses: point the harness at http://127.0.0.1:8080/v1. Generation uses \
             /v1/chat/completions; log-likelihood scoring uses /v1/completions with echo and logprobs. \
-            --replay runs a JSONL file of requests without HTTP.
+            --replay runs a JSONL file of chat ("request") and scoring ("completion") lines without HTTP.
 
             Endpoints:
               POST /v1/chat/completions  chat generation: streaming, tools, reasoning_effort
