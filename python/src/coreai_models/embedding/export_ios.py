@@ -92,10 +92,10 @@ def convert_ane_functions(
 
     Uses the default decompositions plus the repo's custom lowerings, as ``export/ios.py`` does.
     """
-    from coreai_models.diffusion.gpu import add_function, new_converter
+    from coreai_models.diffusion.gpu import add_function, make_converter
     from coreai_models.export.mlir_ops import register_custom_torch_lowering
 
-    converter = new_converter(include_debug_info)
+    converter = make_converter(include_debug_info)
     register_custom_torch_lowering(converter)
     decompositions = torch.export.default_decompositions()
     for name, module, args, input_names, output_names in functions:

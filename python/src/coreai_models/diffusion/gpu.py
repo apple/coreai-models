@@ -82,7 +82,7 @@ def export_stateless(
         decomposed: torch.export.ExportedProgram = exported.run_decompositions(coreai_decomp_table)
         return decomposed
 
-    converter = new_converter(include_debug_info)
+    converter = make_converter(include_debug_info)
     converter.add_pytorch_module(
         wrapper,
         export_fn=export_fn,
@@ -93,10 +93,10 @@ def export_stateless(
     return program
 
 
-def new_converter(
+def make_converter(
     include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
 ) -> coreai_torch.TorchConverter:
-    """A converter in ``DEBUG`` mode (full debug info) or ``RELEASE`` mode (smaller asset)."""
+    """Return a ``TorchConverter``; ``include_debug_info`` keeps debug info in the asset."""
     mode = coreai_torch.TorchConverter.Mode
     return coreai_torch.TorchConverter(mode=mode.DEBUG if include_debug_info else mode.RELEASE)
 
@@ -152,7 +152,7 @@ def export_multifunction(
     Returns:
         An optimized AIProgram with multiple named functions.
     """
-    converter = new_converter(include_debug_info)
+    converter = make_converter(include_debug_info)
     for name, wrapper, dummy_inputs in functions:
         logger.info(f"Tracing function '{name}' (seq dims: {[t.shape for t in dummy_inputs[:2]]})")
         add_function(converter, name, wrapper, dummy_inputs, input_names, output_names)

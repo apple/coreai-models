@@ -29,12 +29,12 @@ from coreai_models.embedding.contract import (
     build_bundle_metadata,
     bundle_assets,
     bundle_name,
-    check_compute_precision,
     consolidate_prompts,
     embedding_block,
     encoder_functions,
     family_for_model,
     text_functions,
+    validate_compute_precision,
 )
 from tests.test_model_units.test_models._embedding_gemma2_common import (
     TINY_TEXT_CONFIG,
@@ -83,22 +83,22 @@ def _block(platform="macOS", with_image=False, **overrides):
 
 
 def test_ios_requires_float16():
-    assert check_compute_precision(EG2, "float16", platform="iOS") == "float16"
+    assert validate_compute_precision(EG2, "float16", platform="iOS") == "float16"
     for precision in ("float32", "bfloat16"):
         with pytest.raises(EmbeddingPrecisionError, match="float16"):
-            check_compute_precision(EG2, precision, platform="iOS")
+            validate_compute_precision(EG2, precision, platform="iOS")
 
 
 def test_macos_refuses_float16_and_allows_bfloat16():
     with pytest.raises(EmbeddingPrecisionError, match="forbids float16"):
-        check_compute_precision(EG2, "float16")
-    assert check_compute_precision(EG2, "bfloat16") == "bfloat16"
-    assert check_compute_precision(EG2, "float32") == "float32"
+        validate_compute_precision(EG2, "float16")
+    assert validate_compute_precision(EG2, "bfloat16") == "bfloat16"
+    assert validate_compute_precision(EG2, "float32") == "float32"
 
 
 def test_unknown_precision_is_refused():
     with pytest.raises(EmbeddingPrecisionError, match="Unknown compute precision"):
-        check_compute_precision(EG2, "int8")
+        validate_compute_precision(EG2, "int8")
 
 
 def test_export_bundle_refuses_float16_before_touching_out(tmp_path):
@@ -359,10 +359,10 @@ def test_failed_export_removes_the_bundle_dir(tmp_path, monkeypatch, stub_snapsh
 
 def test_forbidden_precision_message_lists_the_allowed_ones():
     with pytest.raises(EmbeddingPrecisionError, match=r"Use float32 \(default\) or bfloat16\."):
-        check_compute_precision(EG2, "float16")
+        validate_compute_precision(EG2, "float16")
     no_floor = dataclasses.replace(EG2, precision_floor=None)
     with pytest.raises(EmbeddingPrecisionError, match=r"Use float32 \(default\)\.$"):
-        check_compute_precision(no_floor, "float16")
+        validate_compute_precision(no_floor, "float16")
 
 
 def test_family_registry():

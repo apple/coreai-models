@@ -32,13 +32,13 @@ from coreai_models.embedding.contract import (
     build_bundle_metadata,
     bundle_assets,
     bundle_name,
-    check_compute_precision,
     consolidate_prompts,
     default_precision,
     embedding_block,
     encoder_functions,
     family_for_model,
     text_functions,
+    validate_compute_precision,
 )
 from coreai_models.embedding.export_ios import (
     export_ane_programs,
@@ -90,7 +90,7 @@ def export_embedding_bundle(
     """
     if platform not in PLATFORMS:
         raise ValueError(f"platform must be one of {list(PLATFORMS)}, got {platform!r}")
-    precision = check_compute_precision(
+    precision = validate_compute_precision(
         family, compute_precision or default_precision(family, platform), platform=platform
     )  # before touching disk
     if with_image and family.image is None:
@@ -231,7 +231,7 @@ def main(argv: list[str] | None = None) -> int:
     platform = args.platform
     with_image = not args.skip_vision
     try:
-        precision = check_compute_precision(
+        precision = validate_compute_precision(
             family,
             args.compute_precision or default_precision(family, platform),
             platform=platform,

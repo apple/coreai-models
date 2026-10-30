@@ -118,22 +118,16 @@ class EmbeddingGemma2TextEncoder(nn.Module):
         self.layers = nn.ModuleList([EmbeddingGemma2EncoderLayer(config, i) for i in range(L)])
         self.norm = MaxAbsRMSNorm(dim, eps, axis=-3)
         self.embedding_projection = conv1x1(dim, config.embedding_dim)
-        self._rope_hd = {"sliding": config.rope_head_dim(True), "full": config.rope_head_dim(False)}
 
-    def rope(
-        self, length: int, dtype: torch.dtype, device
-    ) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
-        out = {}
-        for kind, theta in (
-            ("sliding", self.config.rope_theta_sliding),
-            ("full", self.config.rope_theta_full),
-        ):
-            hd = self._rope_hd[kind]
-            inv = rope_inv_freq(hd, theta, device)
-            fr = inv[:, None] * torch.arange(length, dtype=torch.float32, device=device)[None, :]
-            e = torch.cat([fr, fr], 0).reshape(1, 1, hd, length)
-            out[kind] = (e.cos().to(dtype), e.sin().to(dtype))
-        return out
+    def _cos_sin(self, sliding: bool, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """cos/sin ``[1, 1, head_dim, L]`` in ``x``'s dtype for the sliding or full layers."""
+        head_dim = self.config.rope_head_dim(sliding)
+        theta = self.config.rope_theta_sliding if sliding else self.config.rope_theta_full
+        length = x.shape[-1]
+        inv_freq = rope_inv_freq(head_dim, theta, x.device)[:, None]
+        freqs = inv_freq * torch.arange(length, dtype=torch.float32, device=x.device)[None, :]
+        emb = torch.cat([freqs, freqs], 0).reshape(1, 1, head_dim, length)
+        return emb.cos().to(x.dtype), emb.sin().to(x.dtype)
 
     def forward(
         self,
@@ -148,10 +142,10 @@ class EmbeddingGemma2TextEncoder(nn.Module):
         ple = self.per_layer_model_projection(x) * (dim**-0.5)
         ple = self.per_layer_projection_norm(ple.reshape(b, nl, self.ple_dim, length))
         ple = ple.reshape(b, nl * self.ple_dim, 1, length)
-        ropes = self.rope(length, x.dtype, x.device)
+        ropes = {sliding: self._cos_sin(sliding, x) for sliding in (True, False)}
         sb = bias if sliding_bias is None else sliding_bias
         for i, layer in enumerate(self.layers):
-            cos, sin = ropes["sliding" if layer.is_sliding else "full"]
+            cos, sin = ropes[layer.is_sliding]
             ple_i = ple[:, i * self.ple_dim : (i + 1) * self.ple_dim]
             x = layer(x, ple_i, cos, sin, sb if layer.is_sliding else bias)
         x = self.norm(x)  # (B, H, 1, L)

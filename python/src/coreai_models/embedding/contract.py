@@ -41,10 +41,10 @@ class EmbeddingPrecisionError(ValueError):
 
 @dataclass(frozen=True)
 class ImageTowerFacts:
-    """One family's image-tower facts for the host (merge ids, preprocessing, soft-token budget).
+    """Image-tower facts the host needs: merge ids, preprocessing and the soft-token budget.
 
     The exporter checks them against the snapshot ``config.json`` / ``processor_config.json``
-    and fails closed on a mismatch.
+    and raises on a mismatch.
     """
 
     placeholder_id: int
@@ -168,7 +168,7 @@ def default_precision(family: EmbeddingFamily, platform: str) -> str:
     return "float16" if platform == "iOS" else family.default_compute_precision
 
 
-def check_compute_precision(
+def validate_compute_precision(
     family: EmbeddingFamily, precision: str, *, platform: str = "macOS"
 ) -> str:
     """Validate ``precision`` for ``family`` on ``platform`` and return it.
@@ -282,25 +282,24 @@ def bundle_name(family: EmbeddingFamily, platform: str, with_image: bool) -> str
     return family.key + ("-ios" if platform == "iOS" else "") + ("" if with_image else "-text")
 
 
-def bundle_assets(platform: str, with_image: bool) -> dict[str, str]:
-    """Component name -> asset file for the bundle.
+IMAGE_PIPELINE = (IMAGE_COMPONENT, TOKEN_TABLE_COMPONENT, ENCODER_COMPONENT)
 
-    In the macOS image bundle, ``token_table`` and ``encoder`` are functions of
-    ``text_encoder.aimodel``, so the table and the transformer are stored once.
+
+def text_pipeline(platform: str) -> tuple[str, ...]:
+    """Components the text tower runs, in order."""
+    return (TOKEN_TABLE_COMPONENT, ENCODER_COMPONENT) if platform == "iOS" else (TEXT_COMPONENT,)
+
+
+def bundle_assets(platform: str, with_image: bool) -> dict[str, str]:
+    """Component name -> asset file for every component of the bundle's pipelines.
+
+    On macOS, ``token_table`` and ``encoder`` are functions of ``text_encoder.aimodel``.
     """
-    if platform == "iOS":
-        components = [TOKEN_TABLE_COMPONENT, ENCODER_COMPONENT]
-        if with_image:
-            components.append(IMAGE_COMPONENT)
-        return {name: f"{name}.aimodel" for name in components}
-    text = f"{TEXT_COMPONENT}.aimodel"
-    if not with_image:
-        return {TEXT_COMPONENT: text}
+    components = text_pipeline(platform) + (IMAGE_PIPELINE if with_image else ())
+    shared = () if platform == "iOS" else (TOKEN_TABLE_COMPONENT, ENCODER_COMPONENT)
     return {
-        TEXT_COMPONENT: text,
-        IMAGE_COMPONENT: f"{IMAGE_COMPONENT}.aimodel",
-        TOKEN_TABLE_COMPONENT: text,
-        ENCODER_COMPONENT: text,
+        name: f"{TEXT_COMPONENT if name in shared else name}.aimodel"
+        for name in dict.fromkeys(components)
     }
 
 
@@ -316,17 +315,21 @@ def embedding_block(
 ) -> dict[str, Any]:
     """Build the ``embedding`` block of ``metadata.json``.
 
-    macOS: a ``text_encoder`` graph (ids in, vector out), plus the image tower
-    ``image_encoder -> token_table -> encoder`` when ``with_image``; ``token_table`` and
-    ``encoder`` are functions of ``text_encoder.aimodel``. iOS: the text tower runs
-    ``token_table -> encoder`` on the Neural Engine. The host merges soft tokens into the table
-    output at the placeholder rows before the encoder. ``compute_precision`` defaults to the
-    platform's precision.
+    Text runs ``text_encoder`` on macOS and ``token_table -> encoder`` on iOS. With
+    ``with_image``, images run ``image_encoder -> token_table -> encoder``, and the host writes
+    the soft tokens into the ``token_table`` output at the placeholder rows. ``token_table`` runs
+    on the GPU; on iOS the encoders run on the Neural Engine. ``compute_precision`` defaults to
+    the platform's precision.
+
+    Raises:
+        ValueError: on an unknown platform, a missing revision or prompts, an unknown
+            ``default_prompt_name``, or family facts that do not fit the function plan.
+        EmbeddingPrecisionError: if ``compute_precision`` is not allowed on ``platform``.
     """
     ios = platform == "iOS"
     if platform not in PLATFORMS:
         raise ValueError(f"platform must be one of {list(PLATFORMS)}, got {platform!r}")
-    precision = check_compute_precision(
+    precision = validate_compute_precision(
         family, compute_precision or default_precision(family, platform), platform=platform
     )
     if not revision:
@@ -383,7 +386,7 @@ def embedding_block(
 
     text_tower: dict[str, Any] = {
         "modality": "text",
-        "pipeline": [TOKEN_TABLE_COMPONENT, ENCODER_COMPONENT] if ios else [TEXT_COMPONENT],
+        "pipeline": list(text_pipeline(platform)),
         "inputs": {"input_ids": "int32[B,L]", "attention_mask": "int32[B,L]"},
         "output": OUTPUT_NAME,
         "batch_sizes": sorted({f.batch for f in text_fns}),
@@ -402,7 +405,7 @@ def embedding_block(
         towers.append(
             {
                 "modality": "image",
-                "pipeline": [IMAGE_COMPONENT, TOKEN_TABLE_COMPONENT, ENCODER_COMPONENT],
+                "pipeline": list(IMAGE_PIPELINE),
                 "output": OUTPUT_NAME,
                 "batch_sizes": [1],
                 "length_buckets": image_lengths,

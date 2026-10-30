@@ -128,9 +128,9 @@ def export_shared_text_program(
     ``main`` maps ids to ``inputs_embeds`` (dynamic length up to ``max_length``); ``embeds_*``
     functions take ``inputs_embeds``. The functions share one copy of the table and the transformer.
     """
-    from coreai_models.diffusion.gpu import add_function, new_converter
+    from coreai_models.diffusion.gpu import add_function, make_converter
 
-    converter = new_converter(include_debug_info)
+    converter = make_converter(include_debug_info)
     text = TextEmbeddingExportWrapper(encoder)
     for spec in text_fns:
         args = reference_inputs(spec, int(encoder.config.vocab_size))
