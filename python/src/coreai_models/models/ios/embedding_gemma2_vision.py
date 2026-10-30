@@ -5,8 +5,8 @@
 
 """Neural Engine float16 EmbeddingGemma 2 image encoder, channels-first (BC1S) conv layout.
 
-What: the vision tower as 1x1 Conv2d projections with a static patch budget and in-graph lookups.
-Why: ScaledRMSNorm divides by the row max-abs before squaring, keeping float16 in range.
+The vision tower as 1x1 Conv2d projections with max-abs RMSNorms, a static patch budget and
+in-graph lookups.
 """
 
 from __future__ import annotations
@@ -15,17 +15,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from coreai_models.models.ios.embedding_gemma2 import (
-    MASK_NEG,
-    ScaledRMSNorm,
-    conv1x1,
-    load_conv_weights,
-)
+from coreai_models.models.ios.embedding_gemma2 import MASK_NEG, conv1x1, load_conv_weights
 from coreai_models.models.macos.embedding_gemma2 import rope_inv_freq
 from coreai_models.models.macos.embedding_gemma2_vision import (
     EmbeddingGemma2ImageEncoder as MacEmbeddingGemma2ImageEncoder,
 )
 from coreai_models.models.macos.embedding_gemma2_vision import EmbeddingGemma2VisionConfig
+from coreai_models.primitives.ios.rms_norm import MaxAbsRMSNorm, MaxAbsRMSNormNoScale
 
 
 def one_hot_f16(coord: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
@@ -52,9 +48,9 @@ class VisionAttention(nn.Module):
         self.k_proj = conv1x1(dim, self.n_heads * hd)
         self.v_proj = conv1x1(dim, self.n_heads * hd)
         self.o_proj = conv1x1(self.n_heads * hd, dim)
-        self.q_norm = ScaledRMSNorm(hd, eps, dim=2)
-        self.k_norm = ScaledRMSNorm(hd, eps, dim=2)
-        self.v_norm = ScaledRMSNorm(hd, eps, with_scale=False, dim=2)
+        self.q_norm = MaxAbsRMSNorm(hd, eps, axis=-2)
+        self.k_norm = MaxAbsRMSNorm(hd, eps, axis=-2)
+        self.v_norm = MaxAbsRMSNormNoScale(eps, axis=-2)
 
     def _heads(self, x: torch.Tensor) -> torch.Tensor:
         b, _, _, p = x.shape
@@ -88,10 +84,10 @@ class VisionEncoderLayer(nn.Module):
         self.gate_proj = conv1x1(dim, cfg.intermediate_size)
         self.up_proj = conv1x1(dim, cfg.intermediate_size)
         self.down_proj = conv1x1(cfg.intermediate_size, dim)
-        self.input_layernorm = ScaledRMSNorm(dim, eps)
-        self.post_attention_layernorm = ScaledRMSNorm(dim, eps)
-        self.pre_feedforward_layernorm = ScaledRMSNorm(dim, eps)
-        self.post_feedforward_layernorm = ScaledRMSNorm(dim, eps)
+        self.input_layernorm = MaxAbsRMSNorm(dim, eps, axis=-3)
+        self.post_attention_layernorm = MaxAbsRMSNorm(dim, eps, axis=-3)
+        self.pre_feedforward_layernorm = MaxAbsRMSNorm(dim, eps, axis=-3)
+        self.post_feedforward_layernorm = MaxAbsRMSNorm(dim, eps, axis=-3)
 
     def forward(self, x, cos, sin, bias):
         x = x + self.post_attention_layernorm(
@@ -113,7 +109,7 @@ class EmbeddingGemma2ImageEncoder(nn.Module):
         dim = cfg.hidden_size
         self.input_proj = conv1x1(cfg.patch_dim, dim)
         self.layers = nn.ModuleList([VisionEncoderLayer(cfg) for _ in range(cfg.num_hidden_layers)])
-        self.embedding_pre_projection_norm = ScaledRMSNorm(dim, cfg.rms_norm_eps, with_scale=False)
+        self.embedding_pre_projection_norm = MaxAbsRMSNormNoScale(cfg.rms_norm_eps, axis=-3)
         self.embedding_projection = conv1x1(dim, cfg.text_hidden_size)
         # Per-axis lookup tables, filled by ``bake_tables`` (fp32 math, stored in model dtype):
         # [G, hidden] position embedding | [G, hd/4] cos | [G, hd/4] sin.

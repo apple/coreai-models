@@ -5,8 +5,7 @@
 
 """Neural Engine float16 EmbeddingGemma 2 text encoder, channels-first (BC1S) conv layout.
 
-What: the macOS encoder math as 1x1 Conv2d projections with static shapes.
-Why: ScaledRMSNorm divides by the row max-abs before squaring, keeping float16 in range.
+The macOS encoder math as 1x1 Conv2d projections with static shapes and max-abs RMSNorms.
 """
 
 from __future__ import annotations
@@ -24,42 +23,13 @@ from coreai_models.models.macos.embedding_gemma2 import (
 from coreai_models.models.macos.embedding_gemma2 import (
     load_embedding_gemma2_text_encoder as load_macos_text_encoder,
 )
+from coreai_models.primitives.ios.rms_norm import MaxAbsRMSNorm, MaxAbsRMSNormNoScale
 from coreai_models.primitives.ios.sdpa import SDPA
 
-# Smallest positive normal float16; floors the row max-abs and the squared norm so all-zero rows
-# stay finite.
+# Smallest positive normal float16; floors the output L2's row max-abs and squared norm so an
+# all-zero row stays finite.
 _FP16_TINY = 6.103515625e-05
 MASK_NEG = -30000.0
-
-
-class ScaledRMSNorm(nn.Module):
-    """RMSNorm over ``dim`` that normalizes by the row max-abs first, so squares stay at most 1."""
-
-    def __init__(
-        self, channels: int, eps: float = 1e-6, with_scale: bool = True, dim: int = 1
-    ) -> None:
-        super().__init__()
-        self.eps = eps
-        self.channels = channels
-        self.dim = dim
-        self.with_scale = with_scale
-        if with_scale:
-            self.weight = nn.Parameter(torch.ones(channels))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        d = self.dim
-        m = x.abs().amax(d, keepdim=True).clamp(min=_FP16_TINY)
-        r = torch.reciprocal(m)
-        xs = x * r
-        # eps * r^2 as (sqrt(eps) * r)^2. r goes up to 1 / _FP16_TINY, and r * r overflows
-        # float16 once r > 256, which zeroes the row.
-        e = self.eps**0.5 * r
-        y = xs * torch.rsqrt((xs * xs).mean(d, keepdim=True) + e * e)
-        if self.with_scale:
-            shape = [1] * x.dim()
-            shape[d] = self.channels
-            y = y * self.weight.to(y.dtype).reshape(shape)
-        return y
 
 
 def rotate_half_channels(x: torch.Tensor, head_dim: int) -> torch.Tensor:
@@ -99,9 +69,9 @@ class EmbeddingGemma2Attention(nn.Module):
         self.k_proj = conv1x1(dim, self.n_kv * hd)
         self.v_proj = conv1x1(dim, self.n_kv * hd)
         self.o_proj = conv1x1(self.n_heads * hd, dim)
-        self.q_norm = ScaledRMSNorm(hd, eps, dim=2)
-        self.k_norm = ScaledRMSNorm(hd, eps, dim=2)
-        self.v_norm = ScaledRMSNorm(hd, eps, with_scale=False, dim=2)
+        self.q_norm = MaxAbsRMSNorm(hd, eps, axis=-2)
+        self.k_norm = MaxAbsRMSNorm(hd, eps, axis=-2)
+        self.v_norm = MaxAbsRMSNormNoScale(eps, axis=-2)
         self.sdpa = SDPA(head_dim=hd, scale=1.0)
 
     def _per_head(self, x: torch.Tensor, n: int, norm: nn.Module) -> torch.Tensor:
@@ -131,11 +101,11 @@ class EmbeddingGemma2EncoderLayer(nn.Module):
         self.down_proj = conv1x1(config.intermediate_size, dim)
         self.per_layer_input_gate = conv1x1(dim, ple)
         self.per_layer_projection = conv1x1(ple, dim)
-        self.input_layernorm = ScaledRMSNorm(dim, eps)
-        self.post_attention_layernorm = ScaledRMSNorm(dim, eps)
-        self.pre_feedforward_layernorm = ScaledRMSNorm(dim, eps)
-        self.post_feedforward_layernorm = ScaledRMSNorm(dim, eps)
-        self.post_per_layer_input_norm = ScaledRMSNorm(dim, eps)
+        self.input_layernorm = MaxAbsRMSNorm(dim, eps, axis=-3)
+        self.post_attention_layernorm = MaxAbsRMSNorm(dim, eps, axis=-3)
+        self.pre_feedforward_layernorm = MaxAbsRMSNorm(dim, eps, axis=-3)
+        self.post_feedforward_layernorm = MaxAbsRMSNorm(dim, eps, axis=-3)
+        self.post_per_layer_input_norm = MaxAbsRMSNorm(dim, eps, axis=-3)
         self.register_buffer("layer_scalar", torch.ones(1))
 
     def forward(self, x, ple_i, cos, sin, bias):
@@ -163,9 +133,9 @@ class EmbeddingGemma2TextEncoder(nn.Module):
         dim, eps, L = config.hidden_size, config.rms_norm_eps, config.num_hidden_layers
         self.ple_dim = config.hidden_size_per_layer_input
         self.per_layer_model_projection = conv1x1(dim, L * self.ple_dim)
-        self.per_layer_projection_norm = ScaledRMSNorm(self.ple_dim, eps, dim=2)
+        self.per_layer_projection_norm = MaxAbsRMSNorm(self.ple_dim, eps, axis=-2)
         self.layers = nn.ModuleList([EmbeddingGemma2EncoderLayer(config, i) for i in range(L)])
-        self.norm = ScaledRMSNorm(dim, eps)
+        self.norm = MaxAbsRMSNorm(dim, eps, axis=-3)
         self.embedding_projection = conv1x1(dim, config.embedding_dim)
         self._rope_hd = {"sliding": config.rope_head_dim(True), "full": config.rope_head_dim(False)}
 
@@ -252,7 +222,6 @@ def load_embedding_gemma2_text_encoder(
 
 __all__ = [
     "MASK_NEG",
-    "ScaledRMSNorm",
     "EmbeddingGemma2TextEncoder",
     "conv1x1",
     "load_conv_weights",
