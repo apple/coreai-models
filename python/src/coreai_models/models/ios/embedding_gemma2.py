@@ -32,25 +32,6 @@ _FP16_TINY = 6.103515625e-05
 MASK_NEG = -30000.0
 
 
-def rotate_half_channels(x: torch.Tensor, head_dim: int) -> torch.Tensor:
-    """NeoX rotate-half over the per-head channel axis of ``(B, H*hd, 1, L)``."""
-    b, c, one, length = x.shape
-    x = x.reshape(b, c // head_dim, head_dim, length)
-    x1, x2 = x[:, :, : head_dim // 2], x[:, :, head_dim // 2 :]
-    return torch.cat((-x2, x1), dim=2).reshape(b, c, one, length)
-
-
-def apply_rope_bc1s(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, head_dim: int):
-    """Apply rotary embedding; ``cos``/``sin``: ``(1, 1, hd, L)``; ``x``: ``(B, H*hd, 1, L)``."""
-    b, c, one, length = x.shape
-    xr = x.reshape(b, c // head_dim, head_dim, length)
-    out = (
-        xr * cos
-        + rotate_half_channels(x, head_dim).reshape(b, c // head_dim, head_dim, length) * sin
-    )
-    return out.reshape(b, c, one, length)
-
-
 def conv1x1(cin: int, cout: int) -> nn.Conv2d:
     """Bias-free 1x1 ``Conv2d``, the BC1S form of a bias-free ``Linear``."""
     return nn.Conv2d(cin, cout, kernel_size=1, bias=False)
@@ -74,17 +55,17 @@ class EmbeddingGemma2Attention(nn.Module):
         self.v_norm = MaxAbsRMSNormNoScale(eps, axis=-2)
         self.sdpa = SDPA(head_dim=hd, scale=1.0)
 
-    def _per_head(self, x: torch.Tensor, n: int, norm: nn.Module) -> torch.Tensor:
-        b, c, one, length = x.shape
-        return norm(x.reshape(b, n, self.head_dim, length)).reshape(b, c, one, length)
-
     def forward(self, x, cos, sin, bias):
-        hd = self.head_dim
-        q = self._per_head(self.q_proj(x), self.n_heads, self.q_norm)
-        k = self._per_head(self.k_proj(x), self.n_kv, self.k_norm)
-        v = self._per_head(self.v_proj(x), self.n_kv, self.v_norm)
-        q = apply_rope_bc1s(q, cos, sin, hd)
-        k = apply_rope_bc1s(k, cos, sin, hd)
+        """``x``: ``(B, C, 1, L)``; ``cos``/``sin``: ``(1, 1, hd, L)``; norms and RoPE run per head
+        on ``(B, n, hd, L)``."""
+        b, _, _, length = x.shape
+        hd, half = self.head_dim, self.head_dim // 2
+        q = self.q_norm(self.q_proj(x).reshape(b, self.n_heads, hd, length))
+        k = self.k_norm(self.k_proj(x).reshape(b, self.n_kv, hd, length))
+        v = self.v_norm(self.v_proj(x).reshape(b, self.n_kv, hd, length))
+        q = q * cos + torch.cat((-q[:, :, half:], q[:, :, :half]), dim=2) * sin
+        k = k * cos + torch.cat((-k[:, :, half:], k[:, :, :half]), dim=2) * sin
+        q, k, v = (t.reshape(b, -1, 1, length) for t in (q, k, v))
         return self.o_proj(self.sdpa(q, k, v, bias))
 
 
