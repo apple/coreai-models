@@ -21,9 +21,7 @@ from coreai_models.models.macos.embedding_gemma2 import (
     HF_TEXT_PREFIX,
     EmbeddingGemma2TextConfig,
     _resolve_model_dir,
-)
-from coreai_models.models.macos.embedding_gemma2 import (
-    EmbeddingGemma2TextEncoder as MacEmbeddingGemma2TextEncoder,
+    rope_inv_freq,
 )
 from coreai_models.primitives.ios.sdpa import SDPA
 
@@ -82,7 +80,8 @@ def apply_rope_bc1s(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, head_
     return out.reshape(b, c, one, length)
 
 
-def _conv(cin: int, cout: int) -> nn.Conv2d:
+def conv1x1(cin: int, cout: int) -> nn.Conv2d:
+    """Bias-free 1x1 ``Conv2d``, the BC1S form of a bias-free ``Linear``."""
     return nn.Conv2d(cin, cout, kernel_size=1, bias=False)
 
 
@@ -95,10 +94,10 @@ class EmbeddingGemma2Attention(nn.Module):
         self.n_kv = config.layer_num_key_value_heads(layer_idx)
         self.head_dim = hd = config.layer_head_dim(layer_idx)
         dim, eps = config.hidden_size, config.rms_norm_eps
-        self.q_proj = _conv(dim, self.n_heads * hd)
-        self.k_proj = _conv(dim, self.n_kv * hd)
-        self.v_proj = _conv(dim, self.n_kv * hd)
-        self.o_proj = _conv(self.n_heads * hd, dim)
+        self.q_proj = conv1x1(dim, self.n_heads * hd)
+        self.k_proj = conv1x1(dim, self.n_kv * hd)
+        self.v_proj = conv1x1(dim, self.n_kv * hd)
+        self.o_proj = conv1x1(self.n_heads * hd, dim)
         self.q_norm = ScaledRMSNorm(hd, eps, dim=2)
         self.k_norm = ScaledRMSNorm(hd, eps, dim=2)
         self.v_norm = ScaledRMSNorm(hd, eps, with_scale=False, dim=2)
@@ -126,11 +125,11 @@ class EmbeddingGemma2EncoderLayer(nn.Module):
         dim, eps, ple = config.hidden_size, config.rms_norm_eps, config.hidden_size_per_layer_input
         self.is_sliding = config.is_sliding(i)
         self.self_attn = EmbeddingGemma2Attention(config, i)
-        self.gate_proj = _conv(dim, config.intermediate_size)
-        self.up_proj = _conv(dim, config.intermediate_size)
-        self.down_proj = _conv(config.intermediate_size, dim)
-        self.per_layer_input_gate = _conv(dim, ple)
-        self.per_layer_projection = _conv(ple, dim)
+        self.gate_proj = conv1x1(dim, config.intermediate_size)
+        self.up_proj = conv1x1(dim, config.intermediate_size)
+        self.down_proj = conv1x1(config.intermediate_size, dim)
+        self.per_layer_input_gate = conv1x1(dim, ple)
+        self.per_layer_projection = conv1x1(ple, dim)
         self.input_layernorm = ScaledRMSNorm(dim, eps)
         self.post_attention_layernorm = ScaledRMSNorm(dim, eps)
         self.pre_feedforward_layernorm = ScaledRMSNorm(dim, eps)
@@ -162,11 +161,11 @@ class EmbeddingGemma2TextEncoder(nn.Module):
         self.config = config
         dim, eps, L = config.hidden_size, config.rms_norm_eps, config.num_hidden_layers
         self.ple_dim = config.hidden_size_per_layer_input
-        self.per_layer_model_projection = _conv(dim, L * self.ple_dim)
+        self.per_layer_model_projection = conv1x1(dim, L * self.ple_dim)
         self.per_layer_projection_norm = ScaledRMSNorm(self.ple_dim, eps, dim=2)
         self.layers = nn.ModuleList([EmbeddingGemma2EncoderLayer(config, i) for i in range(L)])
         self.norm = ScaledRMSNorm(dim, eps)
-        self.embedding_projection = _conv(dim, config.embedding_dim)
+        self.embedding_projection = conv1x1(dim, config.embedding_dim)
         self._rope_hd = {
             "sliding": config.layer_head_dim(next(i for i in range(L) if config.is_sliding(i))),
             "full": config.layer_head_dim(next(i for i in range(L) if not config.is_sliding(i))),
@@ -181,7 +180,7 @@ class EmbeddingGemma2TextEncoder(nn.Module):
             ("full", self.config.rope_theta_full),
         ):
             hd = self._rope_hd[kind]
-            inv = MacEmbeddingGemma2TextEncoder._inv_freq(hd, theta, device)
+            inv = rope_inv_freq(hd, theta, device)
             fr = inv[:, None] * torch.arange(length, dtype=torch.float32, device=device)[None, :]
             e = torch.cat([fr, fr], 0).reshape(1, 1, hd, length)
             out[kind] = (e.cos().to(dtype), e.sin().to(dtype))
@@ -271,6 +270,7 @@ __all__ = [
     "MASK_NEG",
     "ScaledRMSNorm",
     "EmbeddingGemma2TextEncoder",
+    "conv1x1",
     "load_embedding_gemma2_text_encoder",
     "text_encoder_from_state_dict",
 ]

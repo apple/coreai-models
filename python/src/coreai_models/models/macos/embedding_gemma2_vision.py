@@ -26,6 +26,7 @@ from safetensors import safe_open
 
 from coreai_models.models.macos.diffusion_gemma import DiffusionGemmaDenseMLP
 from coreai_models.models.macos.diffusion_gemma import DiffusionGemmaRMSNorm as RMSNorm
+from coreai_models.models.macos.embedding_gemma2 import rope_inv_freq
 from coreai_models.primitives.ios.rope import apply_rope
 from coreai_models.primitives.macos.sdpa import SDPA
 
@@ -94,14 +95,6 @@ class EmbeddingGemma2VisionConfig:
             text_hidden_size=config["text_config"]["hidden_size"],
             max_soft_tokens=max_soft_tokens or config.get("vision_soft_tokens_per_image", 280),
         )
-
-
-def axial_inv_freq(cfg: EmbeddingGemma2VisionConfig) -> torch.Tensor:
-    """Per-axis RoPE inverse frequencies (``head_dim // 2`` rotary dims per spatial axis)."""
-    spatial_dim = cfg.head_dim // 2
-    return 1.0 / (
-        cfg.rope_theta ** (torch.arange(0, spatial_dim, 2, dtype=torch.float32) / spatial_dim)
-    )
 
 
 class VisionAttention(nn.Module):
@@ -235,7 +228,10 @@ class EmbeddingGemma2ImageEncoder(nn.Module):
         self.patch_embedder = VisionPatchEmbedder(cfg)
         self.encoder = VisionEncoder(cfg)
         self.embed_vision = MultimodalEmbedder(cfg)
-        self.register_buffer("rope_inv_freq", axial_inv_freq(cfg), persistent=False)
+        # Axial RoPE: head_dim // 2 rotary dims per spatial axis.
+        self.register_buffer(
+            "rope_inv_freq", rope_inv_freq(cfg.head_dim // 2, cfg.rope_theta), persistent=False
+        )
         self.register_buffer(
             "pool_slots", torch.arange(cfg.max_soft_tokens, dtype=torch.int64), persistent=False
         )

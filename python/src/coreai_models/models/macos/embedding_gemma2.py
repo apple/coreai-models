@@ -37,6 +37,11 @@ from coreai_models.primitives.macos.sdpa import SDPA
 HF_TEXT_PREFIX = "language_model."
 
 
+def rope_inv_freq(dim: int, base: float, device: torch.device | None = None) -> torch.Tensor:
+    """RoPE inverse frequencies ``base ** (-arange(0, dim, 2) / dim)`` in float32."""
+    return 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim))
+
+
 @dataclass
 class EmbeddingGemma2TextConfig:
     """Text-tower config parsed from the HF ``text_config`` block.
@@ -294,17 +299,11 @@ class EmbeddingGemma2TextEncoder(nn.Module):
         full_hd = next(iter(full_dims), config.head_dim)
         self.register_buffer(
             "sliding_inv_freq",
-            self._inv_freq(sliding_hd, config.rope_theta_sliding),
+            rope_inv_freq(sliding_hd, config.rope_theta_sliding),
             persistent=False,
         )
         self.register_buffer(
-            "full_inv_freq", self._inv_freq(full_hd, config.rope_theta_full), persistent=False
-        )
-
-    @staticmethod
-    def _inv_freq(head_dim: int, base: float, device: torch.device | None = None) -> torch.Tensor:
-        return 1.0 / (
-            base ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device=device) / head_dim)
+            "full_inv_freq", rope_inv_freq(full_hd, config.rope_theta_full), persistent=False
         )
 
     @staticmethod
@@ -446,4 +445,5 @@ __all__ = [
     "extract_text_state_dict",
     "load_embedding_gemma2_text_encoder",
     "load_text_state_dict",
+    "rope_inv_freq",
 ]

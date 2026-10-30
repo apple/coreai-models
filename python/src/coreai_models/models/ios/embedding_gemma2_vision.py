@@ -19,11 +19,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from safetensors import safe_open
 
-from coreai_models.models.ios.embedding_gemma2 import MASK_NEG, ScaledRMSNorm, _conv
-from coreai_models.models.macos.embedding_gemma2_vision import (
-    EmbeddingGemma2VisionConfig,
-    axial_inv_freq,
-)
+from coreai_models.models.ios.embedding_gemma2 import MASK_NEG, ScaledRMSNorm, conv1x1
+from coreai_models.models.macos.embedding_gemma2 import rope_inv_freq
+from coreai_models.models.macos.embedding_gemma2_vision import EmbeddingGemma2VisionConfig
 
 
 def one_hot_f16(coord: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
@@ -46,10 +44,10 @@ class VisionAttention(nn.Module):
         self.q_chunk = q_chunk
         self.n_heads, self.head_dim = cfg.num_attention_heads, cfg.head_dim
         dim, hd, eps = cfg.hidden_size, cfg.head_dim, cfg.rms_norm_eps
-        self.q_proj = _conv(dim, self.n_heads * hd)
-        self.k_proj = _conv(dim, self.n_heads * hd)
-        self.v_proj = _conv(dim, self.n_heads * hd)
-        self.o_proj = _conv(self.n_heads * hd, dim)
+        self.q_proj = conv1x1(dim, self.n_heads * hd)
+        self.k_proj = conv1x1(dim, self.n_heads * hd)
+        self.v_proj = conv1x1(dim, self.n_heads * hd)
+        self.o_proj = conv1x1(self.n_heads * hd, dim)
         self.q_norm = ScaledRMSNorm(hd, eps, dim=2)
         self.k_norm = ScaledRMSNorm(hd, eps, dim=2)
         self.v_norm = ScaledRMSNorm(hd, eps, with_scale=False, dim=2)
@@ -83,9 +81,9 @@ class VisionEncoderLayer(nn.Module):
         super().__init__()
         dim, eps = cfg.hidden_size, cfg.rms_norm_eps
         self.self_attn = VisionAttention(cfg)
-        self.gate_proj = _conv(dim, cfg.intermediate_size)
-        self.up_proj = _conv(dim, cfg.intermediate_size)
-        self.down_proj = _conv(cfg.intermediate_size, dim)
+        self.gate_proj = conv1x1(dim, cfg.intermediate_size)
+        self.up_proj = conv1x1(dim, cfg.intermediate_size)
+        self.down_proj = conv1x1(cfg.intermediate_size, dim)
         self.input_layernorm = ScaledRMSNorm(dim, eps)
         self.post_attention_layernorm = ScaledRMSNorm(dim, eps)
         self.pre_feedforward_layernorm = ScaledRMSNorm(dim, eps)
@@ -109,10 +107,10 @@ class EmbeddingGemma2ImageEncoder(nn.Module):
         k = cfg.pooling_kernel_size
         self.grid = g = cfg.max_soft_tokens * k  # largest reachable patch coordinate + 1
         dim = cfg.hidden_size
-        self.input_proj = _conv(cfg.patch_dim, dim)
+        self.input_proj = conv1x1(cfg.patch_dim, dim)
         self.layers = nn.ModuleList([VisionEncoderLayer(cfg) for _ in range(cfg.num_hidden_layers)])
         self.embedding_pre_projection_norm = ScaledRMSNorm(dim, cfg.rms_norm_eps, with_scale=False)
-        self.embedding_projection = _conv(dim, cfg.text_hidden_size)
+        self.embedding_projection = conv1x1(dim, cfg.text_hidden_size)
         # Per-axis lookup tables, filled by ``bake_tables`` (fp32 math, stored in model dtype):
         # [G, hidden] position embedding | [G, hd/4] cos | [G, hd/4] sin.
         self.register_buffer("pos_x", torch.zeros(g, dim), persistent=False)
@@ -137,7 +135,7 @@ class EmbeddingGemma2ImageEncoder(nn.Module):
             raise ValueError(f"position table has {table.shape[1]} rows; budget needs {g}")
         self.pos_x.copy_(table[0, :g])
         self.pos_y.copy_(table[1, :g])
-        inv = axial_inv_freq(cfg)
+        inv = rope_inv_freq(cfg.head_dim // 2, cfg.rope_theta)
         ang = torch.arange(g, dtype=torch.float32)[:, None] * inv[None, :]
         self.cos_tab.copy_(ang.cos())
         self.sin_tab.copy_(ang.sin())
