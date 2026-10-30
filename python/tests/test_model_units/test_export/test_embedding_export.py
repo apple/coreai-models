@@ -6,13 +6,16 @@
 """Tests for the ``kind: "embedding"`` bundle contract and exporter (``coreai_models.embedding``).
 
 Metadata, precision and CLI tests need no hardware or weights. The conversion tests use tiny random
-EmbeddingGemma 2 configs.
+EmbeddingGemma 2 configs; the Neural Engine programs also run on the Core AI runtime (CPU and GPU)
+when it is available.
 """
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -589,6 +592,136 @@ def test_ane_reference_inputs_shapes():
     assert pixels.dtype == positions.dtype == torch.float16
     real = positions[0, :, 0] >= 0
     assert int(real.sum()) % 9 == 0 and torch.all(positions[0, ~real] == -1)
+
+
+# --- Neural Engine conversion (tiny random config) ---
+
+# Encoder lengths 4 (unbanded) and 16 (banded: > sliding_window + 1); 16 also fits the image
+# sequence (budget 12 + 4).
+TINY_ANE_FAMILY = dataclasses.replace(
+    EG2, image=TINY_IMAGE, ane_length_buckets=(4, 16), model_max_tokens=64
+)
+
+
+@pytest.fixture(scope="module")
+def tiny_ane_programs():
+    """Component name -> (PyTorch module, program converted through ``export_ios``)."""
+    from coreai_models.models.ios import embedding_gemma2_vision as ios_vision
+    from coreai_models.models.ios.embedding_gemma2 import text_encoder_from_state_dict
+
+    text = _tiny_text_encoder()
+    encoder, table = text_encoder_from_state_dict(
+        text.config, dict(text.state_dict()), torch.float16
+    )
+    encoder.eval()
+    token_table = export_utils.scaled_token_table(
+        table, text.config.hidden_size**0.5, torch.float16
+    )
+    torch.manual_seed(1)
+    image_encoder = ios_vision.EmbeddingGemma2ImageEncoder(TINY_VISION_CONFIG).half().eval()
+    functions = encoder_functions(TINY_ANE_FAMILY, "iOS")
+    window = int(text.config.sliding_window)
+    return {
+        "encoder": (
+            encoder,
+            export_ios.export_ane_encoder_program(encoder, functions, window),
+        ),
+        "token_table": (
+            token_table,
+            export_utils.export_token_table_program(token_table, 64, dtype=torch.float16),
+        ),
+        "image_encoder": (
+            image_encoder,
+            export_ios.export_ane_image_encoder_program(image_encoder, TINY_IMAGE),
+        ),
+    }
+
+
+def _function_names(program) -> list[str]:
+    with tempfile.TemporaryDirectory() as tmp:
+        asset = program.save_asset(Path(tmp) / "program.aimodel")
+        return sorted(asset.summary(include_statistics=False).function_names)
+
+
+async def _run_function(program, name: str, inputs: dict, options) -> dict:
+    """Outputs of function ``name`` of ``program`` on ``inputs``, run by the Core AI runtime."""
+    import coreai.runtime as rt
+
+    with tempfile.TemporaryDirectory() as tmp:
+        asset = program.save_asset(Path(tmp) / "program.aimodel")
+        async with asset.executable(options) as model:
+            outputs = await model.load_function(name)(
+                {key: rt.NDArray(data=value.contiguous()) for key, value in inputs.items()}
+            )
+            return {key: torch.from_numpy(value.numpy().copy()) for key, value in outputs.items()}
+
+
+def test_tiny_ane_programs_have_the_contract_functions(tiny_ane_programs):
+    block = embedding_block(
+        TINY_ANE_FAMILY, platform="iOS", with_image=True, revision=REVISION, prompts=PROMPTS
+    )
+    encoder = block["components"]["encoder"]
+    assert [f["function"] for f in encoder["functions"]] == ["embeds_len4_b1", "embeds_len16_b1"]
+    for name, spec in block["components"].items():
+        if "functions" in spec:
+            functions = [f["function"] for f in spec["functions"]]
+        else:
+            functions = [spec["function"]]
+        assert _function_names(tiny_ane_programs[name][1]) == sorted(functions), name
+
+
+@pytest.mark.parametrize("compute_unit", ["cpu", "gpu"])
+def test_tiny_ane_programs_match_pytorch(tiny_ane_programs, compute_unit):
+    """Each converted program, run by the Core AI runtime, matches its float16 module.
+
+    The tolerance is the float16 one of ``test_macos_prefill_graph.py`` (atol = rtol = 1e-2).
+    """
+    import coreai.runtime as rt
+
+    from coreai_models.models.ios.embedding_gemma2 import MASK_NEG
+    from coreai_models.models.macos.embedding_gemma2_vision import pad_to_budget, patch_position_ids
+
+    if not rt.SpecializationOptions.is_supported():
+        pytest.skip("the Core AI runtime cannot run programs here")
+    options = (
+        rt.SpecializationOptions.cpu_only()
+        if compute_unit == "cpu"
+        else rt.SpecializationOptions.from_preferred_compute_unit_kind(rt.ComputeUnitKind.gpu())
+    )
+
+    encoder, program = tiny_ane_programs["encoder"]
+    for spec in encoder_functions(TINY_ANE_FAMILY, "iOS"):
+        n = spec.length
+        valid = torch.arange(n) < n - 1
+        embeds, _, _ = export_ios.ane_text_reference_inputs(n, 64)
+        bias = torch.where(valid.reshape(1, n, 1, 1), 0.0, MASK_NEG).expand(1, n, 1, n)
+        pool = (valid.float() / valid.sum()).reshape(1, n)
+        inputs = {"inputs_embeds": embeds, "bias": bias.half(), "pool_weights": pool.half()}
+        with torch.no_grad():
+            wrapper = export_ios.EncoderBandWrapper(encoder, n, encoder.config.sliding_window)
+            want = wrapper(*inputs.values())
+        got = asyncio.run(_run_function(program, spec.name, inputs, options))["embedding"]
+        assert got.dtype == torch.float16 and got.shape == want.shape == (1, 48)
+        torch.testing.assert_close(got, want, atol=1e-2, rtol=1e-2)
+
+    table, program = tiny_ane_programs["token_table"]
+    ids = torch.randint(3, 128, (1, 9), dtype=torch.int32)
+    got = asyncio.run(_run_function(program, "main", {"input_ids": ids}, options))
+    assert got["inputs_embeds"].dtype == torch.float16
+    assert torch.equal(
+        got["inputs_embeds"], export_utils.TokenTableExportWrapper(table, torch.float16)(ids)
+    )
+
+    image_encoder, program = tiny_ane_programs["image_encoder"]
+    pixels = torch.rand((54, TINY_IMAGE.patch_dim), generator=torch.Generator().manual_seed(2))
+    pixels, positions = pad_to_budget(pixels, patch_position_ids(6, 9), TINY_IMAGE.max_patches)
+    inputs = {"pixel_values": pixels[None].half(), "position_ids": positions[None].half()}
+    with torch.no_grad():
+        want = image_encoder(*inputs.values())
+    got = asyncio.run(_run_function(program, "main", inputs, options))["soft_tokens"]
+    assert got.dtype == torch.float16 and got.shape == want.shape == (1, 12, 32)
+    torch.testing.assert_close(got, want, atol=1e-2, rtol=1e-2)
+    assert torch.all(got[0, 6:] == 0)
 
 
 # --- CLI ---
