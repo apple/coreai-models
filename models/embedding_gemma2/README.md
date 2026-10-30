@@ -39,4 +39,17 @@ uv run coreai.embedding.export --help
 | ---------------- | ----------------------- | ---------------------------- |
 | embeddinggemma-2 | google/embeddinggemma-2 | 439M (text 271M, image 168M) |
 
+## Bundle
+
+`metadata.json` lists each `.aimodel` file once under `assets`. Each entry of `embedding.components` names the asset it lives in (`asset`), its functions and its `output_dtype`:
+
+| Component       | macOS asset (GPU)            | iOS asset                       | Functions          | Output dtype                   |
+| --------------- | ---------------------------- | ------------------------------- | ------------------ | ------------------------------ |
+| `text_encoder`  | `text_encoder`               | —                               | `len{L}_b{B}`      | `float32`                      |
+| `token_table`   | `text_encoder` (images only) | `token_table` (GPU)             | `main`             | `float32` macOS, `float16` iOS |
+| `encoder`       | `text_encoder` (images only) | `encoder` (Neural Engine)       | `embeds_len{L}_b1` | `float32` macOS, `float16` iOS |
+| `image_encoder` | `image_encoder`              | `image_encoder` (Neural Engine) | `main`             | `float32` macOS, `float16` iOS |
+
+The encoder functions are named `embeds_len{L}_b1` on both platforms; read the names from `components.encoder.functions`.
+
 [^1]: [Documentation](https://ai.google.dev/gemma/docs/embeddinggemma) · [HuggingFace](https://huggingface.co/google/embeddinggemma-2)

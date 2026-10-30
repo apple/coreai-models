@@ -84,9 +84,10 @@ def export_embedding_bundle(
 ) -> dict[str, Any]:
     """Export one bundle to ``output_dir`` and return its ``metadata.json`` content.
 
-    macOS writes a GPU bundle (``text_encoder``, plus ``image_encoder`` / ``token_table`` /
-    ``encoder`` with images); iOS writes the Neural Engine bundle (``token_table``, ``encoder``,
-    plus ``image_encoder``). Both carry the tokenizer and a ``metadata.json``.
+    macOS writes a GPU bundle: ``text_encoder.aimodel``; with images also
+    ``image_encoder.aimodel``, and ``text_encoder`` then holds the ``token_table`` and ``encoder``
+    functions. iOS writes the Neural Engine bundle: ``token_table.aimodel``, ``encoder.aimodel``,
+    plus ``image_encoder.aimodel``. Both carry the tokenizer and a ``metadata.json``.
     """
     if platform not in PLATFORMS:
         raise ValueError(f"platform must be one of {list(PLATFORMS)}, got {platform!r}")
@@ -245,7 +246,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"platform:  {platform}")
         print(f"precision: {precision}")
         print(f"towers:    {towers}")
-        print(f"assets:    {', '.join(dict.fromkeys(assets.values()))}")
+        print(f"assets:    {', '.join(assets.values())}")
         if platform == "macOS":
             print(f"text functions:    {[f.name for f in text_functions(family, platform)]}")
         if with_image or platform == "iOS":

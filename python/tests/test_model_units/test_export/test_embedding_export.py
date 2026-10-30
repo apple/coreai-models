@@ -252,17 +252,21 @@ def test_embedding_block_platform_matrix(platform, with_image, components, pipel
     assert [t["pipeline"] for t in block["towers"]] == pipelines
     assert {k: v["compute_units"] for k, v in block["components"].items()} == units
     assert ("merge" in block) == with_image and ("preprocessing" in block) == with_image
-    assert set(bundle_assets(platform, with_image)) == set(components)
+    assets = bundle_assets(platform, with_image)
+    assert {spec["asset"] for spec in block["components"].values()} == set(assets)
+    assert len(set(assets.values())) == len(assets)
+    want_dtype = "float16" if platform == "iOS" else "float32"
+    assert {spec["output_dtype"] for spec in block["components"].values()} == {want_dtype}
     assert not REMOVED_KEYS & set(_keys(block)), REMOVED_KEYS & set(_keys(block))
     meta = build_bundle_metadata(
         EG2,
         block,
         name=bundle_name(EG2, platform, with_image),
-        assets=bundle_assets(platform, with_image),
+        assets=assets,
         hf_revision="914f7f89142e33e77833254d9c9b90c3cef7303b",
     )
     assert meta["metadata_version"] == "0.2" and meta["kind"] == "embedding"
-    assert {c for t in meta["embedding"]["towers"] for c in t["pipeline"]} == set(meta["assets"])
+    assert {c for t in meta["embedding"]["towers"] for c in t["pipeline"]} == set(components)
     assert meta["source"]["hf_model_id"] == "google/embeddinggemma-2"
 
 
@@ -284,6 +288,16 @@ def test_embedding_block_ios_details():
     assert image_tower["batch_sizes"] == [1]
     assert block["text"]["truncation"]["max_tokens"] == 1024
     assert block["space"] == _block("macOS")["space"]
+    assert bundle_assets("iOS", True) == {
+        "token_table": "token_table.aimodel",
+        "encoder": "encoder.aimodel",
+        "image_encoder": "image_encoder.aimodel",
+    }
+    assert {k: v["asset"] for k, v in block["components"].items()} == {
+        "token_table": "token_table",
+        "encoder": "encoder",
+        "image_encoder": "image_encoder",
+    }
 
 
 def test_embedding_block_macos_image_details():
@@ -326,9 +340,16 @@ def test_embedding_block_macos_image_details():
         "pad_token_id": 0,
     }
     assert text["prompts"] == PROMPTS and text["default_prompt_name"] is None
-    assets = bundle_assets("macOS", True)
-    assert assets["token_table"] == assets["encoder"] == assets["text_encoder"]
-    assert assets["image_encoder"] == "image_encoder.aimodel"
+    assert bundle_assets("macOS", True) == {
+        "text_encoder": "text_encoder.aimodel",
+        "image_encoder": "image_encoder.aimodel",
+    }
+    assert {k: v["asset"] for k, v in block["components"].items()} == {
+        "text_encoder": "text_encoder",
+        "image_encoder": "image_encoder",
+        "token_table": "text_encoder",
+        "encoder": "text_encoder",
+    }
     names = [f.name for f in text_functions(EG2, "macOS") + encoder_functions(EG2, "macOS")]
     assert len(names) == len(set(names)) and "main" not in names
     enc = block["components"]["encoder"]
@@ -362,7 +383,9 @@ def test_embedding_block_validation():
 
 def test_embedding_block_records_the_compute_precision():
     assert _block()["precision"]["compute"] == "float32"
-    assert _block(compute_precision="bfloat16")["precision"]["compute"] == "bfloat16"
+    bf16 = _block(with_image=True, compute_precision="bfloat16")
+    assert bf16["precision"]["compute"] == "bfloat16"
+    assert {spec["output_dtype"] for spec in bf16["components"].values()} == {"float32"}
     assert _block("iOS")["precision"]["compute"] == "float16"
     with pytest.raises(EmbeddingPrecisionError, match="forbids float16"):
         _block(compute_precision="float16")
@@ -571,6 +594,12 @@ def test_image_reference_inputs_are_a_valid_padded_grid():
     assert torch.all(soft[0, n:] == 0) and torch.all(soft[0, :n].abs().sum(-1) > 0)
 
 
+def _function_names(program) -> list[str]:
+    with tempfile.TemporaryDirectory() as tmp:
+        asset = program.save_asset(Path(tmp) / "program.aimodel")
+        return sorted(asset.summary(include_statistics=False).function_names)
+
+
 def test_tiny_shared_text_program_conversion():
     program = export_macos.export_shared_text_program(
         _tiny_text_encoder(),
@@ -578,7 +607,7 @@ def test_tiny_shared_text_program_conversion():
         [FunctionSpec("embeds_len32_b1", 1, 32)],
         max_length=64,
     )
-    assert program is not None
+    assert _function_names(program) == ["embeds_len32_b1", "len16_b1", "len32_b1", "main"]
     image = export_macos.export_image_encoder_program(_tiny_image_encoder(), TINY_IMAGE)
     assert image is not None
 
@@ -637,12 +666,6 @@ def tiny_ane_programs():
     }
 
 
-def _function_names(program) -> list[str]:
-    with tempfile.TemporaryDirectory() as tmp:
-        asset = program.save_asset(Path(tmp) / "program.aimodel")
-        return sorted(asset.summary(include_statistics=False).function_names)
-
-
 async def _run_function(program, name: str, inputs: dict, options) -> dict:
     """Outputs of function ``name`` of ``program`` on ``inputs``, run by the Core AI runtime."""
     import coreai.runtime as rt
@@ -672,7 +695,8 @@ def test_tiny_ane_programs_have_the_contract_functions(tiny_ane_programs):
 
 @pytest.mark.parametrize("compute_unit", ["cpu", "gpu"])
 def test_tiny_ane_programs_match_pytorch(tiny_ane_programs, compute_unit):
-    """Each converted program, run by the Core AI runtime, matches its float16 module.
+    """Each converted program, run by the Core AI runtime, matches its float16 module and
+    outputs the metadata's ``output_dtype``.
 
     The tolerance is the float16 one of ``test_macos_prefill_graph.py`` (atol = rtol = 1e-2).
     """
@@ -689,6 +713,10 @@ def test_tiny_ane_programs_match_pytorch(tiny_ane_programs, compute_unit):
         else rt.SpecializationOptions.from_preferred_compute_unit_kind(rt.ComputeUnitKind.gpu())
     )
 
+    dtypes = {
+        name: getattr(torch, spec["output_dtype"])
+        for name, spec in _block("iOS", True)["components"].items()
+    }
     encoder, program = tiny_ane_programs["encoder"]
     for spec in encoder_functions(TINY_ANE_FAMILY, "iOS"):
         n = spec.length
@@ -701,13 +729,13 @@ def test_tiny_ane_programs_match_pytorch(tiny_ane_programs, compute_unit):
             wrapper = export_ios.EncoderBandWrapper(encoder, n, encoder.config.sliding_window)
             want = wrapper(*inputs.values())
         got = asyncio.run(_run_function(program, spec.name, inputs, options))["embedding"]
-        assert got.dtype == torch.float16 and got.shape == want.shape == (1, 48)
+        assert got.dtype == dtypes["encoder"] and got.shape == want.shape == (1, 48)
         torch.testing.assert_close(got, want, atol=1e-2, rtol=1e-2)
 
     table, program = tiny_ane_programs["token_table"]
     ids = torch.randint(3, 128, (1, 9), dtype=torch.int32)
     got = asyncio.run(_run_function(program, "main", {"input_ids": ids}, options))
-    assert got["inputs_embeds"].dtype == torch.float16
+    assert got["inputs_embeds"].dtype == dtypes["token_table"]
     assert torch.equal(
         got["inputs_embeds"], export_utils.TokenTableExportWrapper(table, torch.float16)(ids)
     )
@@ -719,7 +747,7 @@ def test_tiny_ane_programs_match_pytorch(tiny_ane_programs, compute_unit):
     with torch.no_grad():
         want = image_encoder(*inputs.values())
     got = asyncio.run(_run_function(program, "main", inputs, options))["soft_tokens"]
-    assert got.dtype == torch.float16 and got.shape == want.shape == (1, 12, 32)
+    assert got.dtype == dtypes["image_encoder"] and got.shape == want.shape == (1, 12, 32)
     torch.testing.assert_close(got, want, atol=1e-2, rtol=1e-2)
     assert torch.all(got[0, 6:] == 0)
 

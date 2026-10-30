@@ -33,9 +33,11 @@ from coreai_models.embedding.contract import (
     FunctionSpec,
     ImageTowerFacts,
     encoder_functions,
+    output_dtype,
     text_functions,
 )
 from coreai_models.embedding.export_utils import (
+    TORCH_DTYPES,
     TokenTableExportWrapper,
     image_reference_inputs,
     save_program,
@@ -46,11 +48,11 @@ if TYPE_CHECKING:
     from coreai.authoring import AIProgram
 
 
-_DTYPES = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}
+OUTPUT_DTYPE = TORCH_DTYPES[output_dtype("macOS")]
 
 
 class TextEmbeddingExportWrapper(nn.Module):
-    """``(input_ids, attention_mask) -> embedding`` with float32 output.
+    """``(input_ids, attention_mask) -> embedding`` as ``OUTPUT_DTYPE``.
 
     The wrapped encoder owns pooling (masked mean incl. prompt), projection and L2 normalization.
     """
@@ -60,11 +62,14 @@ class TextEmbeddingExportWrapper(nn.Module):
         self.encoder = encoder
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        return self.encoder(input_ids=input_ids, attention_mask=attention_mask).to(torch.float32)
+        return self.encoder(input_ids=input_ids, attention_mask=attention_mask).to(OUTPUT_DTYPE)
 
 
 class InputsEmbedsEncoderWrapper(nn.Module):
-    """``(inputs_embeds, attention_mask) -> embedding`` for merged (e.g. image) inputs."""
+    """``(inputs_embeds, attention_mask) -> embedding`` for merged (e.g. image) inputs.
+
+    Outputs ``OUTPUT_DTYPE``.
+    """
 
     def __init__(self, encoder: nn.Module) -> None:
         super().__init__()
@@ -74,11 +79,14 @@ class InputsEmbedsEncoderWrapper(nn.Module):
         dtype = next(self.encoder.parameters()).dtype
         return self.encoder(
             inputs_embeds=inputs_embeds.to(dtype), attention_mask=attention_mask
-        ).to(torch.float32)
+        ).to(OUTPUT_DTYPE)
 
 
 class ImageEncoderExportWrapper(nn.Module):
-    """``(pixel_values f32, position_ids int32) -> soft_tokens f32`` at the module's dtype."""
+    """``(pixel_values f32, position_ids int32) -> soft_tokens`` as ``OUTPUT_DTYPE``.
+
+    The encoder computes at the module's dtype.
+    """
 
     def __init__(self, image_encoder: nn.Module) -> None:
         super().__init__()
@@ -86,7 +94,7 @@ class ImageEncoderExportWrapper(nn.Module):
 
     def forward(self, pixel_values: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
         dtype = next(self.image_encoder.parameters()).dtype
-        return self.image_encoder(pixel_values.to(dtype), position_ids).to(torch.float32)
+        return self.image_encoder(pixel_values.to(dtype), position_ids).to(OUTPUT_DTYPE)
 
 
 @contextmanager
@@ -140,7 +148,7 @@ def export_shared_text_program(
         add_function(
             converter,
             "main",
-            TokenTableExportWrapper(encoder.embed_tokens),
+            TokenTableExportWrapper(encoder.embed_tokens, OUTPUT_DTYPE),
             ids,
             TOKEN_TABLE_INPUT_NAMES,
             (TOKEN_TABLE_OUTPUT_NAME,),
@@ -187,7 +195,7 @@ def export_gpu_programs(
     from coreai_models.models.macos.embedding_gemma2 import load_embedding_gemma2_text_encoder
     from coreai_models.models.macos.embedding_gemma2_vision import EmbeddingGemma2ImageEncoder
 
-    dtype = _DTYPES[compute_precision]
+    dtype = TORCH_DTYPES[compute_precision]
     encoder = load_embedding_gemma2_text_encoder(snapshot, dtype=dtype)
     program = export_shared_text_program(
         encoder,

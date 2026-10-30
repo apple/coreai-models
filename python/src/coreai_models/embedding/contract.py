@@ -268,7 +268,11 @@ def text_functions(family: EmbeddingFamily, platform: str) -> list[FunctionSpec]
 
 
 def encoder_functions(family: EmbeddingFamily, platform: str) -> list[FunctionSpec]:
-    """Batch-1 ``inputs_embeds`` functions of the ``encoder`` component, named ``embeds_len*``."""
+    """Batch-1 ``inputs_embeds`` functions of the ``encoder`` component.
+
+    Named ``embeds_len{L}_b1`` on both platforms; the host reads the names from
+    ``components.encoder.functions``.
+    """
     if platform == "iOS":
         lengths = sorted(set(family.ane_length_buckets))
     else:
@@ -290,17 +294,29 @@ def text_pipeline(platform: str) -> tuple[str, ...]:
     return (TOKEN_TABLE_COMPONENT, ENCODER_COMPONENT) if platform == "iOS" else (TEXT_COMPONENT,)
 
 
-def bundle_assets(platform: str, with_image: bool) -> dict[str, str]:
-    """Component name -> asset file for every component of the bundle's pipelines.
+def bundle_components(platform: str, with_image: bool) -> tuple[str, ...]:
+    """Components of the bundle's pipelines, text first."""
+    return tuple(dict.fromkeys(text_pipeline(platform) + (IMAGE_PIPELINE if with_image else ())))
 
-    On macOS, ``token_table`` and ``encoder`` are functions of ``text_encoder.aimodel``.
+
+def component_asset(platform: str, component: str) -> str:
+    """Name of the asset holding ``component``.
+
+    On macOS, ``token_table`` and ``encoder`` are functions of the ``text_encoder`` asset.
     """
-    components = text_pipeline(platform) + (IMAGE_PIPELINE if with_image else ())
-    shared = () if platform == "iOS" else (TOKEN_TABLE_COMPONENT, ENCODER_COMPONENT)
-    return {
-        name: f"{TEXT_COMPONENT if name in shared else name}.aimodel"
-        for name in dict.fromkeys(components)
-    }
+    shared = platform != "iOS" and component in (TOKEN_TABLE_COMPONENT, ENCODER_COMPONENT)
+    return TEXT_COMPONENT if shared else component
+
+
+def bundle_assets(platform: str, with_image: bool) -> dict[str, str]:
+    """Asset name -> ``.aimodel`` file, one entry per file; components name theirs in ``asset``."""
+    names = (component_asset(platform, c) for c in bundle_components(platform, with_image))
+    return {name: f"{name}.aimodel" for name in dict.fromkeys(names)}
+
+
+def output_dtype(platform: str) -> str:
+    """Dtype of every component output: float16 on iOS, float32 on macOS."""
+    return "float16" if platform == "iOS" else "float32"
 
 
 def embedding_block(
@@ -318,8 +334,9 @@ def embedding_block(
     Text runs ``text_encoder`` on macOS and ``token_table -> encoder`` on iOS. With
     ``with_image``, images run ``image_encoder -> token_table -> encoder``, and the host writes
     the soft tokens into the ``token_table`` output at the placeholder rows. ``token_table`` runs
-    on the GPU; on iOS the encoders run on the Neural Engine. ``compute_precision`` defaults to
-    the platform's precision.
+    on the GPU; on iOS the encoders run on the Neural Engine. Each component names its
+    ``bundle_assets`` entry (``asset``), its functions and its ``output_dtype``.
+    ``compute_precision`` defaults to the platform's precision.
 
     Raises:
         ValueError: on an unknown platform, a missing revision or prompts, an unknown
@@ -354,35 +371,43 @@ def embedding_block(
     if with_image or ios:
         enc_fns = encoder_functions(family, platform)
     functions_json = [f.as_dict() for f in enc_fns]
+    out_dtype = output_dtype(platform)
 
     specs: dict[str, Any] = {
         TEXT_COMPONENT: {
             "functions": [f.as_dict() for f in text_fns],
             "inputs": list(TEXT_INPUT_NAMES),
             "output": OUTPUT_NAME,
+            "output_dtype": out_dtype,
             "compute_units": ["gpu"],
         },
         IMAGE_COMPONENT: {
             "function": "main",
             "inputs": list(IMAGE_INPUT_NAMES),
             "output": IMAGE_OUTPUT_NAME,
+            "output_dtype": out_dtype,
             "compute_units": ["neural_engine"] if ios else ["gpu"],
         },
         TOKEN_TABLE_COMPONENT: {
             "function": "main",
             "inputs": list(TOKEN_TABLE_INPUT_NAMES),
             "output": TOKEN_TABLE_OUTPUT_NAME,
+            "output_dtype": out_dtype,
             "compute_units": ["gpu"],
         },
         ENCODER_COMPONENT: {
             "functions": functions_json,
             "inputs": list(ANE_ENCODER_INPUT_NAMES if ios else ENCODER_INPUT_NAMES),
             "output": OUTPUT_NAME,
+            "output_dtype": out_dtype,
             "mask_encoding": "additive_bias" if ios else "attention_mask",
             "compute_units": ["neural_engine"] if ios else ["gpu"],
         },
     }
-    components = {name: specs[name] for name in bundle_assets(platform, with_image)}
+    components = {
+        name: {"asset": component_asset(platform, name), **specs[name]}
+        for name in bundle_components(platform, with_image)
+    }
 
     text_tower: dict[str, Any] = {
         "modality": "text",

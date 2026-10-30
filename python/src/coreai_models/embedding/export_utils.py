@@ -33,6 +33,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+TORCH_DTYPES = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}
+
+
 TOKENIZER_FILES = (
     "tokenizer.json",
     "tokenizer_config.json",

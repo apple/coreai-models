@@ -30,8 +30,10 @@ from coreai_models.embedding.contract import (
     FunctionSpec,
     ImageTowerFacts,
     encoder_functions,
+    output_dtype,
 )
 from coreai_models.embedding.export_utils import (
+    TORCH_DTYPES,
     export_token_table_program,
     image_reference_inputs,
     save_program,
@@ -40,6 +42,10 @@ from coreai_models.embedding.export_utils import (
 
 if TYPE_CHECKING:
     from coreai.authoring import AIProgram
+
+
+# The Neural Engine programs compute in this dtype and output it.
+DTYPE = TORCH_DTYPES[output_dtype("iOS")]
 
 
 class EncoderBandWrapper(nn.Module):
@@ -74,9 +80,9 @@ def ane_text_reference_inputs(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Neural Engine encoder trace inputs (all valid tokens): embeds, zero bias, uniform pooling."""
     generator = torch.Generator().manual_seed(length)
-    embeds = torch.randn((1, length, hidden), generator=generator).to(torch.float16)
-    bias = torch.zeros((1, length, 1, length), dtype=torch.float16)
-    pool = torch.full((1, length), 1.0 / length, dtype=torch.float16)
+    embeds = torch.randn((1, length, hidden), generator=generator).to(DTYPE)
+    bias = torch.zeros((1, length, 1, length), dtype=DTYPE)
+    pool = torch.full((1, length), 1.0 / length, dtype=DTYPE)
     return embeds, bias, pool
 
 
@@ -132,7 +138,7 @@ def export_ane_image_encoder_program(
     include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
 ) -> AIProgram:
     """Neural Engine ``image_encoder``: function ``main`` at the static budget."""
-    args = image_reference_inputs(image, torch.float16, torch.float16)
+    args = image_reference_inputs(image, DTYPE, DTYPE)
     return convert_ane_functions(
         [("main", image_encoder, args, IMAGE_INPUT_NAMES, (IMAGE_OUTPUT_NAME,))],
         include_debug_info=include_debug_info,
@@ -156,13 +162,11 @@ def export_ane_programs(
     # TODO: write the table as a safetensors sidecar that the host gathers from, as the Gemma 4
     # per-layer embeddings do (SafeTensorsReader), instead of a GPU program; lands with the Swift
     # embedding runtime.
-    encoder, table = load_embedding_gemma2_text_encoder(snapshot, dtype=torch.float16)
-    token_table = scaled_token_table(table, encoder.config.hidden_size**0.5, torch.float16)
+    encoder, table = load_embedding_gemma2_text_encoder(snapshot, dtype=DTYPE)
+    token_table = scaled_token_table(table, encoder.config.hidden_size**0.5, DTYPE)
     del table
     save_program(
-        export_token_table_program(
-            token_table, family.model_max_tokens, include_debug_info, dtype=torch.float16
-        ),
+        export_token_table_program(token_table, family.model_max_tokens, include_debug_info, DTYPE),
         out,
         family,
         TOKEN_TABLE_COMPONENT,
@@ -185,7 +189,7 @@ def export_ane_programs(
         from coreai_models.models.ios.embedding_gemma2_vision import load_image_encoder
 
         image_encoder = load_image_encoder(
-            str(snapshot), torch.float16, max_soft_tokens=family.image.budget
+            str(snapshot), DTYPE, max_soft_tokens=family.image.budget
         )
         save_program(
             export_ane_image_encoder_program(image_encoder, family.image, include_debug_info),
