@@ -48,7 +48,7 @@ from tests.test_model_units.test_models._embedding_gemma2_common import (
 
 
 def _randomize_(module: torch.nn.Module, seed: int = 0) -> None:
-    """Perturb every parameter/buffer (norm weights, layer_scalar included) so bugs are visible."""
+    """Overwrite every floating-point parameter and buffer with seeded random values."""
     gen = torch.Generator().manual_seed(seed)
     with torch.no_grad():
         for name, tensor in sorted(module.state_dict().items()):
@@ -123,7 +123,7 @@ def test_forward_shapes_and_unit_norm():
 
 
 def test_padding_invariance_tiny():
-    """A sequence embedded alone (no padding) == the same sequence inside a padded batch."""
+    """A sequence embedded alone (no padding) matches its row of a padded batch (atol 2e-5)."""
     model = _tiny_model()
     ids, mask = _ragged_batch([11, 4, 7], seq_len=16, vocab=128)
     with torch.no_grad():
@@ -283,7 +283,9 @@ def real_setup(embeddinggemma2_snapshot):
 
 
 def test_real_weight_parity_and_padding_invariance(real_setup):
-    """Includes a row over 2 * 512 + 1 tokens, so the sliding layers' window bites for real."""
+    """Ours matches HF hidden states mean-pooled and normalized, and each row embedded alone
+    matches its padded-batch row (cosine >= 0.99999). One row exceeds 2 * sliding_window + 1 tokens.
+    """
     ours, hf = real_setup["ours"], real_setup["hf"]
     paragraph = (
         "On-device semantic search embeds documents once and compares vectors at query time. "

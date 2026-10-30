@@ -261,7 +261,7 @@ uv run models/<name>/export.py --include-debug-info   # embed debug information 
 
 ## Adding a Model
 
-To make a new model exportable via short-name, add a `ModelPreset(...)` entry to `LLM_PRESETS` or `DIFFUSION_PRESETS` in [`python/src/coreai_models/model_registry.py`](../python/src/coreai_models/model_registry.py). Set the short name, HuggingFace ID, family, variant, and the export defaults (compression, compute precision, max context length). Embedding models are registered as `embedding` utility models in the registry and as a family in `coreai_models/embedding/contract.py`.
+To make a new model exportable via short-name, add a `ModelPreset(...)` entry to `LLM_PRESETS` or `DIFFUSION_PRESETS` in [`python/src/coreai_models/model_registry.py`](../python/src/coreai_models/model_registry.py). Set the short name, HuggingFace ID, family, variant, and the export defaults (compression, compute precision, max context length). Models exported by `coreai.embedding.export` need an `EmbeddingFamily` in `EMBEDDING_FAMILIES` ([`python/src/coreai_models/embedding/contract.py`](../python/src/coreai_models/embedding/contract.py)) and a `UtilityModel` entry with task `embedding` in `UTILITY_PRESETS`.
 
 For models with bespoke export logic that doesn't fit the standard `coreai.llm.export` / `coreai.diffusion.export` flow, write a standalone recipe under `models/<name>/export.py` — see existing recipes for the [PEP 723](https://peps.python.org/pep-0723/) pattern and `models/README.md` for the contribution checklist.
 

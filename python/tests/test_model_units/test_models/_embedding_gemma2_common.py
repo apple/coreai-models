@@ -3,7 +3,7 @@
 # Use of this source code is governed by a BSD-3-clause license that can
 # be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
-"""Tiny EmbeddingGemma 2 configs and helpers shared by the macOS and iOS test modules."""
+"""Tiny EmbeddingGemma 2 configs and helpers shared by the EmbeddingGemma 2 test modules."""
 
 import torch
 import torch.nn.functional as F

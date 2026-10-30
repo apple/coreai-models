@@ -6,9 +6,9 @@
 """EmbeddingGemma 2 (EG2) text encoder for Core AI export.
 
 Bidirectional encoder with per-layer inputs and a sentence-embedding head: masked mean over the
-valid tokens (prompt included), bias-free projection to 768, then L2 normalization. Masks derive
-from the static sequence length and ``attention_mask``, so the graph has no data-dependent control
-flow. The GPU path runs in float32 or bfloat16; the float16 variant lives in the iOS modules.
+valid tokens (prompt included), bias-free projection to ``embedding_dim``, then L2 normalization.
+Masks are built from the static sequence length and ``attention_mask``. macOS bundles compute in
+float32 or bfloat16; the float16 Neural Engine variant is ``models.ios.embedding_gemma2``.
 """
 
 from __future__ import annotations
@@ -39,16 +39,15 @@ HF_TEXT_PREFIX = "language_model."
 
 
 def rope_inv_freq(dim: int, base: float, device: torch.device | None = None) -> torch.Tensor:
-    """RoPE inverse frequencies ``base ** (-arange(0, dim, 2) / dim)`` in float32."""
+    """Return RoPE inverse frequencies ``base ** (-arange(0, dim, 2) / dim)`` in float32."""
     return 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim))
 
 
 @dataclass
 class EmbeddingGemma2TextConfig:
-    """Text-tower config parsed from the HF ``text_config`` block.
+    """Text-tower config parsed from the ``text_config`` block of an HF ``config.json``.
 
-    Reads ``config.json`` directly, so export runs on the repo's pinned transformers; the HF
-    EmbeddingGemma 2 classes need transformers>=5.19.
+    Parsed without transformers; the HF EmbeddingGemma 2 classes need transformers>=5.19.
     """
 
     vocab_size: int = 262_144
@@ -92,7 +91,11 @@ class EmbeddingGemma2TextConfig:
         return self.layer_types[layer_idx] == "sliding_attention"
 
     def rope_head_dim(self, sliding: bool) -> int:
-        """Head dim of the sliding (or full) layers; ``head_dim`` when there are none."""
+        """Return the head dim of the sliding (or full) layers; ``head_dim`` when there are none.
+
+        Raises:
+            ValueError: if those layers have more than one head dim.
+        """
         dims = {
             self.layer_head_dim(i)
             for i in range(self.num_hidden_layers)
@@ -106,8 +109,14 @@ class EmbeddingGemma2TextConfig:
     def from_dict(cls, text_config: dict[str, Any]) -> EmbeddingGemma2TextConfig:
         """Build from an HF ``text_config`` dict (``config.json["text_config"]``).
 
-        ``layer_types``, ``per_layer_config`` and both ``rope_parameters`` entries define the layer
-        layout, so they are required; the other fields default to EmbeddingGemma 2's values.
+        ``layer_types``, ``per_layer_config`` and ``rope_parameters`` (a ``rope_theta`` for both
+        ``sliding_attention`` and ``full_attention``) are required; other missing or null fields
+        take EmbeddingGemma 2's values.
+
+        Raises:
+            ValueError: if a required field is missing, a ``rope_type`` is not ``"default"``,
+                ``layer_types`` does not have ``num_hidden_layers`` entries, or
+                ``hidden_activation`` is not ``"gelu_pytorch_tanh"``.
         """
         missing = [
             key
@@ -153,9 +162,8 @@ def build_attention_masks(
 
     Matches ``create_bidirectional_mask`` / ``create_bidirectional_sliding_window_mask`` in
     transformers (``masking_utils.sliding_window_bidirectional_overlay`` +
-    ``padding_mask_function``). Rows of padded queries may be fully masked; the SDPA composite
-    converts the boolean mask into a finite additive bias, so those rows stay finite and they are
-    excluded from pooling anyway.
+    ``padding_mask_function``). Rows of padded queries may be fully masked; their outputs stay
+    finite and are excluded from pooling.
     """
     batch, seq_len = attention_mask.shape
     key_valid = (attention_mask != 0).reshape(batch, 1, 1, seq_len)
@@ -366,7 +374,15 @@ class EmbeddingGemma2TextEncoder(nn.Module):
         attention_mask: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Run the tower; returns final-normed hidden states ``[B, L, hidden_size]``."""
+        """Run the tower; returns final-normed hidden states ``[B, L, hidden_size]``.
+
+        Pass exactly one of ``input_ids`` ``[B, L]`` or ``inputs_embeds`` ``[B, L, hidden_size]``
+        (already scaled, as ``embed_tokens`` returns). ``attention_mask`` ``[B, L]`` defaults to
+        all ones.
+
+        Raises:
+            ValueError: if both or neither of ``input_ids`` and ``inputs_embeds`` are given.
+        """
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("Pass exactly one of input_ids or inputs_embeds")
         if inputs_embeds is None:
@@ -411,9 +427,9 @@ class EmbeddingGemma2TextEncoder(nn.Module):
         """Return ``sentence_embedding`` ``[B, embedding_dim]`` (unit L2 norm, fp32).
 
         ``pooling_mask`` defaults to ``attention_mask`` (include_prompt=True); pass a narrower
-        mask to exclude e.g. prompt tokens from the mean. With ``return_token_states`` the
-        per-token projected states ``[B, L, embedding_dim]`` (HF ``last_hidden_state``
-        equivalent) are returned as a second output for parity checks.
+        mask to exclude e.g. prompt tokens from the mean. With ``return_token_states``, also
+        returns the per-token projected states ``[B, L, embedding_dim]`` (HF ``last_hidden_state``)
+        as a second output, unnormalized and in the model dtype.
         """
         hidden = self.encode_tokens(input_ids, attention_mask, inputs_embeds)
         if attention_mask is None:
@@ -429,14 +445,16 @@ class EmbeddingGemma2TextEncoder(nn.Module):
 def read_checkpoint_tensors(
     model_dir: str | Path, prefixes: tuple[str, ...], dtype: torch.dtype
 ) -> dict[str, torch.Tensor]:
-    """Tensors of the ``model_dir`` checkpoint whose names start with one of ``prefixes``.
+    """Load the tensors of the ``model_dir`` checkpoint whose names start with one of ``prefixes``.
 
-    Reads ``model.safetensors`` or the shards listed in ``model.safetensors.index.json``. Names
-    are kept as in the checkpoint; tensors are cast to ``dtype`` except embedding tables and
-    quantization zero-points, as in ``load_tensors_for_keys``.
+    Reads the shards listed in ``model.safetensors.index.json``, else ``model.safetensors``. Names
+    are kept as in the checkpoint; tensors are cast to ``dtype`` except those whose names contain
+    ``embedding_table`` or ``zero_point``, as in ``load_tensors_for_keys``.
 
     Raises:
-        FileNotFoundError: if ``model_dir`` has no safetensors weights.
+        FileNotFoundError: if ``model_dir`` has no safetensors weights or an indexed shard is
+            missing.
+        RuntimeError: if ``model.safetensors.index.json`` has no ``weight_map``.
     """
     from safetensors import safe_open
 

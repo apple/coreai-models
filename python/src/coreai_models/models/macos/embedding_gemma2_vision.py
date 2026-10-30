@@ -5,10 +5,10 @@
 
 """EmbeddingGemma 2 image encoder for Core AI export (vision tower + ``embed_vision``).
 
-Host-prepared patches ``[B, P, 768]`` and ``position_ids [B, P, 2]`` (-1 for padding) become soft
-tokens ``[B, L, 512]`` with P and L static. Padding and the 3x3 pooling slots are derived in-graph
-from ``position_ids``, with no data-dependent control flow. The GPU path runs in float32 or
-bfloat16; the float16 variant lives in the iOS modules.
+Host-prepared patches ``[B, P, patch_dim]`` and ``position_ids [B, P, 2]`` (-1 for padding) become
+soft tokens ``[B, L, text_hidden_size]``, with P and L static. Padding and the ``k x k`` pooling
+slots come from ``position_ids`` inside the graph. Runs in float32 or bfloat16; the float16
+variant is in ``models/ios/embedding_gemma2_vision.py``.
 """
 
 from __future__ import annotations
@@ -43,7 +43,7 @@ EG2_IMAGE_TOKEN_ID = 258880
 
 @dataclass
 class EmbeddingGemma2VisionConfig:
-    """Vision tower + ``embed_vision`` hyper-parameters (defaults = google/embeddinggemma-2)."""
+    """Vision tower and ``embed_vision`` hyper-parameters (defaults: google/embeddinggemma-2)."""
 
     hidden_size: int = 768
     intermediate_size: int = 3072
@@ -71,7 +71,11 @@ class EmbeddingGemma2VisionConfig:
     def from_hf_config(
         cls, config: dict, max_soft_tokens: int | None = None
     ) -> EmbeddingGemma2VisionConfig:
-        """Build from an EG2 ``config.json`` dict (top level, with ``vision_config``)."""
+        """Build from an EG2 ``config.json`` dict (top level, with ``vision_config``).
+
+        ``max_soft_tokens`` overrides the snapshot's ``vision_soft_tokens_per_image``. Raises
+        ``NotImplementedError`` for clipped linears, standardization or a non-axial RoPE.
+        """
         vc = config["vision_config"]
         if vc.get("use_clipped_linears", False):
             raise NotImplementedError("clipped vision linears are not supported")
@@ -100,8 +104,11 @@ class EmbeddingGemma2VisionConfig:
 
 
 class VisionAttention(EmbeddingGemma2Attention):
-    """Text attention with axial 2-D RoPE: half of head_dim rotates by x, half by y (cos/sin from
-    ``axial_rope_cos_sin``, laid out ``[fx, fx, fy, fy]``)."""
+    """``EmbeddingGemma2Attention`` with axial 2-D RoPE.
+
+    Half of ``head_dim`` rotates by x and half by y, with cos/sin from ``axial_rope_cos_sin``
+    laid out ``[fx, fx, fy, fy]``.
+    """
 
     def __init__(self, config: EmbeddingGemma2VisionConfig) -> None:
         c = config
@@ -113,7 +120,10 @@ class VisionAttention(EmbeddingGemma2Attention):
 
 
 class VisionPatchEmbedder(nn.Module):
-    """``Linear(2*(p-0.5))`` plus separable learned x/y position embeddings."""
+    """Projection of ``2 * (pixels - 0.5)`` plus learned x and y position embeddings.
+
+    Padding rows get no position embedding.
+    """
 
     def __init__(self, config: EmbeddingGemma2VisionConfig) -> None:
         super().__init__()
@@ -136,7 +146,7 @@ class VisionPatchEmbedder(nn.Module):
 
 
 class VisionEncoder(nn.Module):
-    """Holds the layer stack (module path ``encoder.layers.N`` mirrors the checkpoint)."""
+    """Layer stack at module path ``encoder.layers.N``, matching the checkpoint keys."""
 
     def __init__(self, config: EmbeddingGemma2VisionConfig) -> None:
         super().__init__()
@@ -167,7 +177,7 @@ class MultimodalEmbedder(nn.Module):
 
 
 class EmbeddingGemma2ImageEncoder(nn.Module):
-    """gemma4_vision tower + ``embed_vision``: patches -> soft tokens ``[B, L, text_hidden]``."""
+    """Gemma 4 vision tower and ``embed_vision``: patches -> soft tokens ``[B, L, text_hidden]``."""
 
     def __init__(self, config: EmbeddingGemma2VisionConfig | None = None) -> None:
         super().__init__()
@@ -193,20 +203,23 @@ class EmbeddingGemma2ImageEncoder(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """``[B, P, 2]`` positions -> cos/sin ``[B, P, head_dim]`` laid out ``[fx, fx, fy, fy]``.
 
-        Padding rows keep their raw ``-1`` coordinates, as in HF; they are masked as keys
-        and dropped by the pooler, so their values never reach a real soft token.
+        Padding rows keep their raw ``-1`` coordinates, as in HF; attention masks them and the
+        pooler drops them.
         """
         freqs = position_ids.unsqueeze(-1).float() * self.rope_inv_freq  # [B, P, 2, D/4]
         fx, fy = freqs[..., 0, :], freqs[..., 1, :]
         angles = torch.cat([fx, fx, fy, fy], dim=-1)
         return angles.cos().to(dtype), angles.sin().to(dtype)
 
-    def pool(self, hidden: torch.Tensor, position_ids: torch.Tensor, padding: torch.Tensor):
-        """Mean over each ``k x k`` patch block, then ``x sqrt(hidden)``; fp32 output.
+    def pool(
+        self, hidden: torch.Tensor, position_ids: torch.Tensor, padding: torch.Tensor
+    ) -> torch.Tensor:
+        """Mean over each ``k x k`` patch block, scaled by ``sqrt(hidden_size)``.
 
-        Block index = ``x//k + (max_x+1)//k * (y//k)``. With the host contract (a full
-        ``(W/k) x (H/k)`` block grid, row-major, padded at the end) the real soft tokens are
-        exactly the first ``num_soft_tokens`` slots.
+        Returns ``[B, L, hidden]`` in fp32. Block ``(x, y)`` lands in slot
+        ``x//k + (W//k) * (y//k)``, where ``W`` is the patch-grid width. For a full
+        ``(W/k) x (H/k)`` block grid, row-major and padded at the end, the real soft tokens are
+        the first ``num_soft_tokens`` slots.
         """
         k = self.config.pooling_kernel_size
         h = hidden.float().masked_fill(padding.unsqueeze(-1), 0.0)
@@ -229,9 +242,8 @@ class EmbeddingGemma2ImageEncoder(nn.Module):
         padding = position_ids[..., 0] < 0
         x = self.patch_embedder(pixel_values, position_ids, padding)
         cos, sin = self.axial_rope_cos_sin(position_ids, x.dtype)
-        # Boolean key mask (True = attend), the convention of the repo SDPA primitive: its
-        # Core AI lowering turns ``~mask`` into a -1e4 additive bias. Do not pass an additive
-        # float mask here; that path would read it as a bool and invert it.
+        # Boolean key mask, True = attend. The SDPA primitive reads any mask as boolean; do not
+        # pass an additive float mask.
         attn_mask = torch.logical_not(padding)[:, None, None, :]
         for layer in self.encoder.layers:
             x = layer(x, cos, sin, attn_mask)
@@ -260,7 +272,7 @@ class EmbeddingGemma2ImageEncoder(nn.Module):
         dtype: torch.dtype = torch.float32,
         max_soft_tokens: int | None = None,
     ) -> EmbeddingGemma2ImageEncoder:
-        """Load from a local EG2 snapshot directory (``config.json`` + ``model.safetensors``)."""
+        """Load from a local EG2 snapshot directory: ``config.json`` and its safetensors weights."""
         config = json.loads((Path(model_dir) / "config.json").read_text())
         model = cls(EmbeddingGemma2VisionConfig.from_hf_config(config, max_soft_tokens))
         tensors = read_checkpoint_tensors(model_dir, ("vision_tower.", "embed_vision."), dtype)
@@ -277,8 +289,11 @@ def aspect_ratio_preserving_size(
     max_soft_tokens: int = 280,
     pooling_kernel_size: int = 3,
 ) -> tuple[int, int]:
-    """Target ``(height, width)``: the largest size with sides divisible by ``k*patch`` and at
-    most ``max_soft_tokens * k^2`` patches, preserving aspect ratio (Gemma4ImageProcessor)."""
+    """Aspect-preserving resize target ``(height, width)``, as Gemma4ImageProcessor computes it.
+
+    It is the largest size with sides divisible by ``pooling_kernel_size * patch_size`` and at
+    most ``max_soft_tokens * pooling_kernel_size**2`` patches.
+    """
     max_patches = max_soft_tokens * pooling_kernel_size**2
     target_px = max_patches * patch_size**2
     factor = math.sqrt(target_px / (height * width))
@@ -336,8 +351,7 @@ def preprocess_resized_image(
     """Already-resized ``[3, H, W]`` RGB (uint8 or 0..255 float) -> model inputs.
 
     Returns ``(pixel_values [1, P, patch_dim] fp32, position_ids [1, P, 2] int64,
-    num_soft_tokens)``. Rescale only (no mean/std normalization: the tower does
-    ``2*(x-0.5)`` itself).
+    num_soft_tokens)``. Applies ``rescale_factor`` only; the tower applies ``2 * (x - 0.5)``.
     """
     _, h, w = image.shape
     side = patch_size * pooling_kernel_size
@@ -360,8 +374,10 @@ def build_image_input_ids(
     eoi_token_id: int = EG2_EOI_TOKEN_ID,
     image_token_id: int = EG2_IMAGE_TOKEN_ID,
 ) -> list[int]:
-    """Ids for an image-only input, as the HF processor emits them:
-    ``<bos> <boi> <image> * num_soft_tokens <eoi> <eos>``."""
+    """Ids for an image-only input, as the HF processor emits them.
+
+    ``<bos> <boi> <image> * num_soft_tokens <eoi> <eos>``; ``None`` drops ``<bos>`` or ``<eos>``.
+    """
     ids = [boi_token_id] + [image_token_id] * num_soft_tokens + [eoi_token_id]
     if bos_token_id is not None:
         ids = [bos_token_id] + ids
@@ -375,9 +391,8 @@ def scatter_soft_tokens(
 ) -> torch.Tensor:
     """Replace placeholder rows with soft tokens, in order (``masked_scatter`` semantics).
 
-    Gather-based so it exports at a static length: the ``j``-th placeholder in row ``b``
-    takes ``soft_tokens[b, j]``. ``soft_tokens`` may carry extra trailing rows (e.g. the
-    zero padding slots of a fixed budget); they are never read.
+    Exports at a static length. The ``j``-th placeholder in row ``b`` takes ``soft_tokens[b, j]``;
+    extra trailing rows of ``soft_tokens``, such as budget padding, are ignored.
 
     Args:
         inputs_embeds: ``[B, S, D]`` text embeddings.
@@ -403,9 +418,9 @@ def build_image_inputs_embeds(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Full text-encoder input for one image per row.
 
-    ``embed_tokens`` maps ids -> *scaled* text embeddings (EG2 multiplies the table by
-    ``sqrt(hidden)``; HF ``language_model.embed_tokens`` already does). Placeholders are
-    looked up as ``<pad>`` (like HF) and then overwritten by the soft tokens.
+    ``embed_tokens`` maps ids to text embeddings already scaled by ``sqrt(hidden_size)``, as HF
+    ``language_model.embed_tokens`` does. Placeholders are looked up as ``<pad>``, as in HF, then
+    replaced by the soft tokens.
 
     Returns ``(inputs_embeds [B, S, D], attention_mask [B, S] int64, input_ids [B, S])``,
     right-padded to the longest row.

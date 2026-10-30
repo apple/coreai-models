@@ -232,7 +232,15 @@ def _save_and_mmap_safetensors(
 
 
 def resolve_safetensors_files(model_dir: str) -> list[str]:
-    """Resolve the safetensors file paths in a local HuggingFace model directory."""
+    """Return the safetensors paths of a local HuggingFace model directory.
+
+    Returns the shards listed in ``model.safetensors.index.json`` if present, else
+    ``model.safetensors``.
+
+    Raises:
+        FileNotFoundError: if neither file exists or an indexed shard is missing.
+        RuntimeError: if the index has no ``weight_map``.
+    """
     single_path = os.path.join(model_dir, "model.safetensors")
     index_path = os.path.join(model_dir, "model.safetensors.index.json")
 
@@ -310,10 +318,10 @@ def load_tensors_for_keys(
     key_to_file: dict[str, str],
     target_dtype: torch.dtype,
 ) -> dict[str, torch.Tensor]:
-    """Load specific tensors from safetensors files by key.
+    """Load the tensors in ``key_to_file`` (tensor name -> safetensors path), keyed by name.
 
-    Each safetensors file is opened at most once. Tensors are cast to
-    ``target_dtype`` except embedding tables and quantization zero-points.
+    Tensors are cast to ``target_dtype`` except those whose names contain ``embedding_table`` or
+    ``zero_point``.
     """
     file_to_keys: dict[str, list[str]] = {}
     for key, path in key_to_file.items():

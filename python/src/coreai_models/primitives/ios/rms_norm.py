@@ -53,49 +53,32 @@ class RMSNorm(nn.Module):
         return x_2normalized * self.weight
 
 
-# fp16-overflow-safe RMSNorm. RMSNorm is scale-invariant, so we normalize each row
-# by its own max magnitude *before* squaring: ``m = amax(|x|)`` (a data-dependent,
-# per-row reduction), ``xn = x/m``. Since ``|xn| <= 1``, ``xn^2`` can never overflow
-# fp16 (whereas raw ``x^2`` overflows once ``|x|>~256``: ``256^2~=65504``, the fp16 max
-# -- the tower's residual stream peaks at ``|x|~=500`` on real images, so raw ``x^2``
-# overflows to ``inf`` -> ``rsqrt(inf)=0`` -> zeroed features -> garbage soft tokens).
+# Max-abs RMSNorm: a float16-overflow-safe RMSNorm. The input is divided by its max magnitude
+# along ``axis``, ``m = amax(|x|)``, before squaring, and ``eps`` is rescaled to match; the
+# result equals plain RMSNorm::
 #
-# The result is the *exact* RMSNorm because ``eps`` is folded back at the right scale::
+#     xn = x / m
+#     xn * rsqrt(mean(xn^2) + (sqrt(eps) / m)^2) * w  ==  x * rsqrt(mean(x^2) + eps) * w
 #
-#     xn*rsqrt(mean(xn^2) + (sqrt(eps)/m)^2) * w
-#       = (x/m)*rsqrt(mean(x^2)/m^2 + eps/m^2) * w
-#       = (x/m)*m*rsqrt(mean(x^2) + eps) * w
-#       = x*rsqrt(mean(x^2) + eps) * w
-#
-# ``(sqrt(eps)/m)^2`` computes ``eps/m^2`` without ever forming ``m^2`` (which would
-# itself overflow fp16 for ``m~=500``). Crucially this survives the ANE graph
-# optimizer: a constant prescale (``x*0.125``) gets reassociated back into ``x^2*c^2``
-# (recomputing the overflowing ``x^2``) or stripped as scale-invariant, but
-# ``x/amax(|x|)`` is data-dependent and cannot be folded away. All ops
-# (``abs``/``amax``/``div``/``mean``/``rsqrt``) are fp16 and ANE-resident -- no fp32
-# upcast.
+# Plain RMSNorm overflows float16 once ``|x| > ~256`` (``x^2 > 65504``). ``eps / m^2`` is computed
+# as ``(sqrt(eps) / m)^2`` to avoid forming ``m^2``. A constant prescale does not work instead:
+# the Neural Engine compiler folds it back into ``x^2``. All ops run in the input dtype.
 
 
 class MaxAbsRMSNormNoScale(nn.Module):
     """RMSNorm without a learnable scale, reducing over ``axis`` (counted from the end).
 
-    fp16-overflow-safe via per-row max-normalization before squaring (see the comment
-    directly above, and :class:`MaxAbsRMSNorm`, which adds the scale). Exact and ANE-resident (no
-    fp32 upcast).
+    Float16-overflow-safe and exact; see the comment above. :class:`MaxAbsRMSNorm` adds the scale.
     """
 
     def __init__(self, eps: float = 1e-6, axis: int = -1) -> None:
         super().__init__()
         self._eps = eps
         self.axis = axis
-        # Registered as a buffer (not a plain attribute) so it follows the module's
-        # device on `.to(device)` -- a plain `torch.tensor(...)` created in forward()
-        # defaults to CPU and raises on a GPU/MPS input (e.g. during parity tests).
         self.register_buffer("_eps_sqrt", torch.tensor(eps**0.5), persistent=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Per-row max magnitude; clamp floor avoids 0/0 on an all-zero row (real rows
-        # have m >> floor, so this is a no-op for them).
+        # Max magnitude along ``axis``; the floor keeps an all-zero row at zero instead of NaN.
         m = torch.clamp(x.abs().amax(self.axis, keepdim=True), min=1e-4)
         xn = x / m
         eps_sqrt = self._eps_sqrt.to(dtype=x.dtype)
@@ -107,7 +90,8 @@ class MaxAbsRMSNormNoScale(nn.Module):
 class MaxAbsRMSNorm(MaxAbsRMSNormNoScale):
     """:class:`MaxAbsRMSNormNoScale` followed by a learnable per-channel scale.
 
-    The scale has shape ``(dim, 1, ..., 1)``, broadcasting over the dims after ``axis``.
+    ``axis`` must be negative. The scale has shape ``(dim, 1, ..., 1)``, broadcasting over the dims
+    after ``axis``.
     """
 
     def __init__(self, dim: int, eps: float = 1e-6, axis: int = -1) -> None:

@@ -58,7 +58,8 @@ def resolve_snapshot(hf_model_id: str, model_dir: str | None = None) -> tuple[Pa
     """Return ``(snapshot_dir, revision_sha)`` for a local dir or a hub download.
 
     The SHA is the HF cache snapshot directory name (``.../snapshots/<sha>``); a plain directory
-    outside the cache yields ``""``.
+    outside the cache yields ``""``. Raises ``FileNotFoundError`` if ``model_dir`` is not a
+    directory.
     """
     if model_dir is not None:
         path = Path(model_dir).expanduser().resolve()
@@ -82,7 +83,12 @@ def read_prompts(snapshot: Path) -> tuple[dict[str, str], str | None]:
 
 
 def verify_pooling_config(snapshot: Path, family: EmbeddingFamily) -> None:
-    """Fail closed if the snapshot's sentence-transformers pooling disagrees with the family."""
+    """Raise ``ValueError`` if the snapshot's pooling config disagrees with the family.
+
+    Checks the pooling mode, ``include_prompt``, the embedding dimension and, for a normalized
+    family, the ``2_Normalize`` module; a snapshot without ``1_Pooling/config.json`` only logs a
+    warning.
+    """
     pooling = snapshot / "1_Pooling" / "config.json"
     if not pooling.exists():
         logger.warning("No 1_Pooling/config.json in %s; trusting the family defaults", snapshot)
@@ -107,7 +113,10 @@ def verify_pooling_config(snapshot: Path, family: EmbeddingFamily) -> None:
 
 
 def copy_tokenizer(snapshot: Path, dest: Path) -> list[str]:
-    """Copy the tokenizer files verbatim (no re-serialization through a tokenizer class)."""
+    """Copy the snapshot's tokenizer files verbatim into ``dest`` and return the copied names.
+
+    Raises ``FileNotFoundError`` if the snapshot has no ``tokenizer.json``.
+    """
     dest.mkdir(parents=True, exist_ok=True)
     copied = []
     for name in TOKENIZER_FILES:
@@ -133,7 +142,7 @@ class TokenTableExportWrapper(nn.Module):
 
 
 def scaled_token_table(table: torch.Tensor, scale: float, dtype: torch.dtype) -> nn.Embedding:
-    """``table * scale`` stored as ``dtype``. Scaling in float32 first keeps the cast exact."""
+    """Return an ``nn.Embedding`` of ``table * scale`` (computed in float32) as ``dtype``."""
     return nn.Embedding.from_pretrained((table.float() * scale).to(dtype))
 
 
@@ -150,7 +159,7 @@ def image_reference_inputs(
     from coreai_models.models.macos.embedding_gemma2_vision import pad_to_budget, patch_position_ids
 
     k = image.pooling_kernel_size
-    # Square-ish grid of budget soft tokens (blocks) -> (bh*k) x (bw*k) patches, row-major.
+    # Square-ish grid of at most budget blocks (soft tokens) -> (bh*k) x (bw*k) patches, row-major.
     bw = max(1, int(image.budget**0.5))
     bh = max(1, image.budget // bw)
     generator = torch.Generator().manual_seed(image.budget)
@@ -189,7 +198,12 @@ def export_token_table_program(
 
 
 def verify_image_config(snapshot: Path, family: EmbeddingFamily) -> None:
-    """Fail closed if the snapshot's merge ids / image processor disagree with the family facts."""
+    """Raise ``ValueError`` if the snapshot's image config disagrees with ``family.image``.
+
+    Checks the placeholder, begin-image and end-image token ids and the text hidden size in
+    ``config.json``, and the image processor settings in ``processor_config.json``. Also raises
+    if the family has no image tower.
+    """
     image = family.image
     if image is None:
         raise ValueError(f"{family.hf_model_id} has no image tower")

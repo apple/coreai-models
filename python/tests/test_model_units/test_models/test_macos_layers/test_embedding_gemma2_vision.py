@@ -3,7 +3,7 @@
 # Use of this source code is governed by a BSD-3-clause license that can
 # be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
-"""Parity tests for the EmbeddingGemma 2 image path (``embedding_gemma2_vision.py``).
+"""Parity tests for the EmbeddingGemma 2 image path (``models/macos/embedding_gemma2_vision.py``).
 
 * Tiny-config parity against HF ``Gemma4VisionModel`` + ``Gemma4MultimodalEmbedder``
   (present in the repo's transformers; no checkpoint needed).
@@ -78,7 +78,7 @@ def _hf_tiny_vision(cfg: EmbeddingGemma2VisionConfig):
     hf_cfg._attn_implementation = "eager"
     torch.manual_seed(0)
     model = gemma4_modeling.Gemma4VisionModel(hf_cfg).eval()
-    # HF init leaves norms at 1 / zeros; randomize every float tensor so the test bites.
+    # HF init leaves norms at 1 and biases at 0; overwrite every parameter with random values.
     with torch.no_grad():
         for name, p in model.named_parameters():
             if "norm" in name:
@@ -100,7 +100,10 @@ def _load_from_hf_vision(ours: EmbeddingGemma2ImageEncoder, hf_vision, hf_embedd
 
 
 def _random_inputs(cfg: EmbeddingGemma2VisionConfig, grids: list[tuple[int, int]], seed: int = 0):
-    """Random patches for images whose block grid is ``(bh, bw)`` blocks, padded to budget."""
+    """Random patches, positions and soft-token counts for images of ``(bh, bw)`` pooling blocks.
+
+    Patches and positions are padded to ``cfg.max_patches``.
+    """
     g = torch.Generator().manual_seed(seed)
     k = cfg.pooling_kernel_size
     pv, pos, counts = [], [], []
@@ -179,7 +182,9 @@ def test_aspect_ratio_size_matches_hf(budget: int) -> None:
 
 
 def test_preprocess_matches_hf_processor_without_resize() -> None:
-    """At the target size HF skips the resize, so patching/positions/padding must be exact."""
+    """At sizes the resize policy keeps, ``preprocess_resized_image`` matches the HF processor:
+    pixels within atol 1e-7, positions and soft-token count exactly.
+    """
     np = pytest.importorskip("numpy")
     try:
         from transformers.models.gemma4.image_processing_pil_gemma4 import (
@@ -265,7 +270,7 @@ def test_torch_export_default_budget_static_shape(monkeypatch) -> None:
         exported = ep.module()(pixel_values, position_ids)
     assert exported.shape == (1, 280, 512)
     torch.testing.assert_close(exported, eager, rtol=1e-5, atol=1e-5)
-    # No dynamic dims and no data-dependent ops (nonzero / masked_select / item) in the graph.
+    # No data-dependent ops (nonzero / masked_select / item) in the graph.
     targets = {str(node.target) for node in ep.graph.nodes if node.op == "call_function"}
     data_dependent = ("aten.nonzero", "aten.masked_select", "aten.item", "aten._local_scalar_dense")
     assert not any(op in t for t in targets for op in data_dependent), sorted(targets)

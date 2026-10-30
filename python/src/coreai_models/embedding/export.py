@@ -84,10 +84,23 @@ def export_embedding_bundle(
 ) -> dict[str, Any]:
     """Export one bundle to ``output_dir`` and return its ``metadata.json`` content.
 
-    macOS writes a GPU bundle: ``text_encoder.aimodel``; with images also
+    macOS writes a GPU bundle: ``text_encoder.aimodel``; if ``with_image``, also
     ``image_encoder.aimodel``, and ``text_encoder`` then holds the ``token_table`` and ``encoder``
-    functions. iOS writes the Neural Engine bundle: ``token_table.aimodel``, ``encoder.aimodel``,
-    plus ``image_encoder.aimodel``. Both carry the tokenizer and a ``metadata.json``.
+    functions. iOS writes a Neural Engine bundle: ``token_table.aimodel`` and ``encoder.aimodel``;
+    if ``with_image``, also ``image_encoder.aimodel``. Both carry the tokenizer and a
+    ``metadata.json``. ``compute_precision`` defaults to the family's default on macOS and
+    float16 on iOS. ``model_dir`` is a local HF cache snapshot (``.../snapshots/<sha>``); without
+    it the snapshot is downloaded. A failed export removes ``output_dir``.
+
+    Raises:
+        ValueError: on an unknown platform, ``with_image`` for a family without an image tower,
+            a ``model_dir`` outside the HF cache, or snapshot configs or prompts that disagree
+            with the family.
+        EmbeddingPrecisionError: if ``compute_precision`` is unknown or not allowed for the
+            family on ``platform``.
+        FileExistsError: if ``output_dir`` exists and ``overwrite`` is False.
+        FileNotFoundError: if ``model_dir`` is not a directory or the snapshot has no
+            ``tokenizer.json``.
     """
     if platform not in PLATFORMS:
         raise ValueError(f"platform must be one of {list(PLATFORMS)}, got {platform!r}")

@@ -3,9 +3,9 @@
 # Use of this source code is governed by a BSD-3-clause license that can
 # be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
-"""Neural Engine (iOS) programs of an embedding bundle.
+"""iOS programs of an embedding bundle.
 
-The static-length encoder, the float16 token table, and the image encoder.
+The float16 token table (GPU), the static-length encoder and the image encoder (Neural Engine).
 """
 
 from __future__ import annotations
@@ -44,15 +44,15 @@ if TYPE_CHECKING:
     from coreai.authoring import AIProgram
 
 
-# The Neural Engine programs compute in this dtype and output it.
+# The iOS programs compute in this dtype and output it.
 DTYPE = TORCH_DTYPES[output_dtype("iOS")]
 
 
 class EncoderBandWrapper(nn.Module):
     """``(inputs_embeds, bias, pool_weights) -> embedding`` at one static length (Neural Engine).
 
-    When ``length > sliding_window + 1`` the sliding layers also need the ``|i - j| <= window``
-    band; it is a per-length constant folded in here (``min(bias, band)``), so every length keeps
+    When ``length > sliding_window + 1``, the sliding-window layers use ``min(bias, band)``, with
+    ``band`` a constant ``|i - j| <= sliding_window`` mask for that length. Every length takes
     the same three inputs.
     """
 
@@ -93,8 +93,8 @@ def convert_ane_functions(
     *,
     include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
 ) -> AIProgram:
-    """Convert each ``(name, module, args, input_names, output_names)`` into one Neural Engine
-    program.
+    """Convert ``(name, module, args, input_names, output_names)`` entries into one Neural Engine
+    program with one function per entry.
 
     Uses the default decompositions plus the repo's custom lowerings, as ``export/ios.py`` does.
     """
@@ -153,6 +153,11 @@ def export_ane_programs(
     with_image: bool,
     include_debug_info: bool,
 ) -> None:
+    """Write the ``token_table``, ``encoder`` and, if ``with_image``, ``image_encoder`` assets to
+    ``out``.
+
+    Raises ``NotImplementedError`` for a family other than ``embeddinggemma-2``.
+    """
     if family.key != "embeddinggemma-2":
         raise NotImplementedError(f"No Neural Engine export for family {family.key!r}")
     from coreai_models.models.ios.embedding_gemma2 import load_embedding_gemma2_text_encoder

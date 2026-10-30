@@ -99,7 +99,11 @@ class VisionEncoderLayer(nn.Module):
 
 
 class EmbeddingGemma2ImageEncoder(nn.Module):
-    """``pixel_values [1, P, 768]`` + ``position_ids [1, P, 2]`` (float16) -> ``[1, L, 512]``."""
+    """``(pixel_values [B, P, patch_dim], position_ids [B, P, 2]) -> [B, L, text_hidden_size]``.
+
+    Padding patches have position ``-1``. ``L`` is ``max_soft_tokens``; the image's soft tokens
+    fill the first slots and the rest are zero. Inputs are cast to the model dtype.
+    """
 
     def __init__(self, config: EmbeddingGemma2VisionConfig | None = None):
         super().__init__()
@@ -128,6 +132,12 @@ class EmbeddingGemma2ImageEncoder(nn.Module):
 
     @torch.no_grad()
     def bake_tables(self, position_embedding_table: torch.Tensor) -> None:
+        """Fill the position tables from ``position_embedding_table [2, N, hidden_size]`` and the
+        RoPE tables from the config.
+
+        Raises:
+            ValueError: if ``N`` is smaller than ``self.grid``.
+        """
         cfg = self.config
         g = self.grid
         table = position_embedding_table.float()
@@ -165,8 +175,8 @@ class EmbeddingGemma2ImageEncoder(nn.Module):
         for layer in self.layers:
             x = layer(x, cos, sin, bias)
 
-        # 3x3 pooling as one matmul with exact one-hot slot weights (sum; the scale cancels in
-        # the scale-free norm below, like the dropped x sqrt(hidden)).
+        # ``k``-by-``k`` block pooling as one matmul with exact one-hot slot weights. It sums where
+        # HF takes the mean times ``sqrt(hidden_size)``; the scale-free norm below cancels this.
         bx = ox @ self.block_tab.to(dt)  # [B, P, 1]
         by = oy @ self.block_tab.to(dt)
         max_x = pos[..., 0:1].amax(1, keepdim=True)  # [B, 1, 1]
@@ -175,8 +185,8 @@ class EmbeddingGemma2ImageEncoder(nn.Module):
         w = one_hot_f16(slot, self.slot_ar.to(dt)) * valid  # [B, P, L]
         pooled = torch.matmul(x.squeeze(2), w)  # (B, C, L)
         y = self.embedding_pre_projection_norm(pooled.unsqueeze(2))  # (B, C, 1, L)
-        y = self.embedding_projection(y)  # (B, 512, 1, L)
-        return y.squeeze(2).transpose(1, 2).contiguous()  # [B, L, 512]
+        y = self.embedding_projection(y)  # (B, text_hidden_size, 1, L)
+        return y.squeeze(2).transpose(1, 2).contiguous()  # [B, L, text_hidden_size]
 
 
 def load_image_encoder(
@@ -184,7 +194,7 @@ def load_image_encoder(
     dtype: torch.dtype = torch.float16,
     max_soft_tokens: int | None = None,
 ) -> EmbeddingGemma2ImageEncoder:
-    """Load from a local EG2 snapshot directory (``config.json`` + ``model.safetensors``)."""
+    """Load from a local EG2 snapshot directory (``config.json`` and its safetensors weights)."""
     mac = MacEmbeddingGemma2ImageEncoder.from_pretrained(model_dir, torch.float32, max_soft_tokens)
     model = load_hf_state_dict(EmbeddingGemma2ImageEncoder(mac.config), mac.state_dict())
     return model.to(dtype).eval()
@@ -194,7 +204,13 @@ def load_hf_state_dict(
     model: EmbeddingGemma2ImageEncoder, sd: dict[str, torch.Tensor]
 ) -> EmbeddingGemma2ImageEncoder:
     """Load checkpoint-named (``vision_tower.*`` / ``embed_vision.*``) or macOS-encoder-named
-    tensors (fail closed)."""
+    tensors into ``model``, bake its lookup tables, and return it.
+
+    Raises:
+        RuntimeError: on missing, unexpected, or mis-shaped tensors.
+        KeyError: if ``patch_embedder.position_embedding_table`` is absent.
+        ValueError: if the position table is shorter than ``model.grid``.
+    """
     mapped: dict[str, torch.Tensor] = {}
     for key, v in sd.items():
         k2 = key.replace(".linear.weight", ".weight")

@@ -37,7 +37,7 @@ def _host_inputs(
     embed_table: torch.Tensor,
     dtype: torch.dtype = torch.float16,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Graph inputs for one sequence (``ids [1, L]``): token-table embeddings, bias, pooling."""
+    """Encoder inputs for ``ids [1, L]``: scaled embeddings, bias ``[1, L, 1, L]``, pool weights."""
     length = ids.shape[1]
     table = scaled_token_table(embed_table, math.sqrt(embed_table.shape[1]), dtype)
     key_ok = attention_mask[0].bool().reshape(length, 1, 1).expand(length, 1, length)
@@ -51,7 +51,7 @@ def _banded(ios: torch.nn.Module, length: int) -> EncoderBandWrapper:
 
 
 def _perturb(model: torch.nn.Module, seed: int) -> None:
-    """Randomize norm weights and layer scalars so the comparison exercises them."""
+    """Randomize the norm weights and layer scalars of ``model``."""
     gen = torch.Generator().manual_seed(seed)
     with torch.no_grad():
         for name, tensor in sorted(model.state_dict().items()):
@@ -91,7 +91,7 @@ def test_float16_stays_finite_with_large_activations() -> None:
     cfg, _, state = _reference_and_state_dict()
     _, table = text_encoder_from_state_dict(cfg, state, dtype=torch.float32)
     ids, mask = _ragged_batch([12], seq_len=12, vocab=cfg.vocab_size)
-    # Scale the token embeddings so the hidden stream reaches about 3e3, past sqrt(fp16 max).
+    # Scale the token table to a peak scaled embedding of 3000, past sqrt(float16 max).
     peak = table[ids.long()].abs().max().item() * math.sqrt(cfg.hidden_size)
     table = table * (3000.0 / peak)
     ios32, _ = text_encoder_from_state_dict(cfg, state, dtype=torch.float32)

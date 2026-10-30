@@ -5,9 +5,9 @@
 
 """Builds the ``embedding`` block and ``metadata.json`` for ``kind: "embedding"`` bundles.
 
-Also holds the per-family export facts the exporter and the Swift runtime both read.
-EmbeddingGemma 2 overflows in float16 on the GPU, so macOS bundles compute in float32 or
-bfloat16, while Neural Engine (iOS) bundles use float16 with scale-invariant norms.
+Also defines the per-family export facts (``EmbeddingFamily``). iOS (Neural Engine) bundles
+compute in float16 with scale-invariant norms. EmbeddingGemma 2 macOS bundles compute in float32
+or bfloat16; float16 overflows on the GPU.
 """
 
 from __future__ import annotations
@@ -74,11 +74,7 @@ class ImageTowerFacts:
 
 @dataclass(frozen=True)
 class EmbeddingFamily:
-    """Facts about one retrieval-embedding family that the bundle must carry.
-
-    Values come from the HF snapshot files and model card; the space *revision* is the snapshot
-    SHA of the weights actually exported.
-    """
+    """Facts about one retrieval-embedding family that the bundle must carry."""
 
     key: str
     hf_model_id: str
@@ -91,8 +87,7 @@ class EmbeddingFamily:
     renormalize_after_truncation: bool = True
     pooling_mode: str = "mean"
     include_prompt: bool = True
-    # Precision of the GPU encoder, which runs the reference math. The Neural Engine encoder
-    # rescales its norms to compute in float16.
+    # Default macOS (GPU) compute precision; iOS bundles always compute in float16.
     default_compute_precision: str = "float32"
     precision_floor: str | None = None
     forbidden_precisions: tuple[str, ...] = ()
@@ -205,8 +200,9 @@ def consolidate_prompts(
 ) -> dict[str, str]:
     """Collapse the snapshot's prompt table to canonical name -> prefix, in family order.
 
-    Fails closed: a mapped snapshot key that is missing, or a snapshot prefix that no canonical
-    prompt carries (a new upstream task), raises instead of being dropped.
+    Raises:
+        ValueError: if a snapshot key mapped in ``family.prompt_names`` is missing, or a
+            snapshot prompt uses a prefix that no canonical prompt carries.
     """
     missing = [key for key in family.prompt_names.values() if key not in snapshot_prompts]
     if missing:
@@ -243,8 +239,11 @@ def bucket_plan(
 ) -> list[FunctionSpec]:
     """Cross length buckets with batch sizes, dropping pairs above ``max_batch_tokens``.
 
-    Batch 1 is always kept for every length (the unbatched path). Attention cost is O(B * L^2), so
-    the token cap is what keeps the large buckets small.
+    Batch 1 is always kept for every length. Functions are named ``len{L}_b{B}``.
+
+    Raises:
+        ValueError: if ``length_buckets`` is empty or holds a length below 2, or a batch size is
+            below 1.
     """
     lengths = sorted(set(int(x) for x in length_buckets))
     batches = sorted(set(int(x) for x in batch_sizes) | {1})
@@ -268,10 +267,11 @@ def text_functions(family: EmbeddingFamily, platform: str) -> list[FunctionSpec]
 
 
 def encoder_functions(family: EmbeddingFamily, platform: str) -> list[FunctionSpec]:
-    """Batch-1 ``inputs_embeds`` functions of the ``encoder`` component.
+    """Batch-1 ``inputs_embeds`` functions ``embeds_len{L}_b1`` of the ``encoder`` component.
 
-    Named ``embeds_len{L}_b1`` on both platforms; the host reads the names from
-    ``components.encoder.functions``.
+    Lengths are ``ane_length_buckets`` on iOS. On macOS (image tower required) they are the
+    longest image sequence rounded up to a multiple of 32, plus every longer ``length_buckets``
+    entry. The host reads the names from ``components.encoder.functions``.
     """
     if platform == "iOS":
         lengths = sorted(set(family.ane_length_buckets))
@@ -340,7 +340,8 @@ def embedding_block(
 
     Raises:
         ValueError: on an unknown platform, a missing revision or prompts, an unknown
-            ``default_prompt_name``, or family facts that do not fit the function plan.
+            ``default_prompt_name``, ``with_image`` on a family without an image tower, or family
+            facts that do not fit the function plan.
         EmbeddingPrecisionError: if ``compute_precision`` is not allowed on ``platform``.
     """
     ios = platform == "iOS"
@@ -500,7 +501,7 @@ def build_bundle_metadata(
     assets: dict[str, str],
     hf_revision: str | None,
 ) -> dict[str, Any]:
-    """Wrap an :func:`embedding_block` in the 0.2 ``metadata.json`` envelope."""
+    """Wrap an :func:`embedding_block` in the ``metadata.json`` envelope."""
     return {
         "metadata_version": METADATA_VERSION,
         "kind": BUNDLE_KIND,

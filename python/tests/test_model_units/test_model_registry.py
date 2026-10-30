@@ -239,7 +239,7 @@ def test_embedding_export_args_use_the_console_script() -> None:
     assert _utility_to_export_args(model, "macOS")[-1] == "embeddinggemma-2"
 
 
-def test_script_utility_export_args_are_unchanged() -> None:
+def test_script_utility_export_args_run_the_script() -> None:
     model = lookup_utility_model("clip-vit-b32")
     assert model is not None
     assert _utility_to_export_args(model) == [

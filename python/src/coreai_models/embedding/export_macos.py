@@ -5,7 +5,8 @@
 
 """GPU (macOS) programs of an embedding bundle.
 
-The text encoder, the shared text / token-table / encoder program, and the image encoder.
+The ``text_encoder`` program (with images it also holds the ``token_table`` and ``encoder``
+functions) and the ``image_encoder`` program.
 """
 
 from __future__ import annotations
@@ -99,7 +100,7 @@ class ImageEncoderExportWrapper(nn.Module):
 
 @contextmanager
 def without_token_table(encoder: nn.Module) -> Iterator[nn.Module]:
-    """Temporarily drop ``encoder.embed_tokens`` so an ``inputs_embeds`` trace carries no table."""
+    """Swap ``encoder.embed_tokens`` for ``nn.Identity`` inside the block; restore it on exit."""
     table = encoder.embed_tokens
     encoder.embed_tokens = nn.Identity()
     try:
@@ -190,6 +191,10 @@ def export_gpu_programs(
     compute_precision: str,
     include_debug_info: bool,
 ) -> None:
+    """Write the ``text_encoder`` and, if ``with_image``, ``image_encoder`` assets to ``out``.
+
+    Raises ``NotImplementedError`` for a family other than ``embeddinggemma-2``.
+    """
     if family.key != "embeddinggemma-2":
         raise NotImplementedError(f"No GPU export for family {family.key!r}")
     from coreai_models.models.macos.embedding_gemma2 import load_embedding_gemma2_text_encoder

@@ -162,7 +162,7 @@ def test_consolidate_prompts_maps_the_snapshot_table_to_eight_names():
     assert list(prompts) == list(EG2.prompt_names)
 
 
-def test_consolidate_prompts_fails_closed():
+def test_consolidate_prompts_rejects_unknown_and_missing_keys():
     with pytest.raises(ValueError, match="canonical"):
         consolidate_prompts(EG2, {**SNAPSHOT_PROMPTS, "Translation": "task: translate | query: "})
     missing = {k: v for k, v in SNAPSHOT_PROMPTS.items() if k != "FactChecking"}
@@ -468,7 +468,7 @@ def test_snapshot_helpers(tmp_path):
     assert copied == ["tokenizer.json", "tokenizer_config.json"]
 
 
-def test_verify_pooling_config_fails_closed(tmp_path):
+def test_verify_pooling_config_rejects_include_prompt_false(tmp_path):
     snap = _fake_snapshot(
         tmp_path, {"embedding_dimension": 768, "pooling_mode": "mean", "include_prompt": False}
     )
@@ -543,7 +543,9 @@ TINY_IMAGE = dataclasses.replace(IMAGE, patch_size=4, budget=12, soft_token_dim=
 
 
 def test_inputs_embeds_path_equals_ids_path():
-    """token_table(ids) -> encoder(inputs_embeds) == text_encoder(ids) (the merge is lossless)."""
+    """``encoder(token_table(ids))`` matches ``text_encoder(ids)`` within atol 1e-6, and
+    ``without_token_table`` restores ``embed_tokens`` afterwards.
+    """
     text = _tiny_text_encoder()
     ids = torch.randint(3, 128, (1, 16), dtype=torch.int32)
     mask = torch.ones(1, 16, dtype=torch.int32)
@@ -559,7 +561,9 @@ def test_inputs_embeds_path_equals_ids_path():
 
 
 def test_float16_scaled_token_table_equals_the_float32_table_cast():
-    """The float16 token table gives the encoder the same inputs as the float32 one."""
+    """Lookups in the float16 ``scaled_token_table`` equal the float32 ``embed_tokens`` lookups
+    cast to float16.
+    """
     text = _tiny_text_encoder()
     ids = torch.randint(3, 128, (1, 16), dtype=torch.int32)
     table = export_utils.scaled_token_table(
@@ -634,7 +638,7 @@ TINY_ANE_FAMILY = dataclasses.replace(
 
 @pytest.fixture(scope="module")
 def tiny_ane_programs():
-    """Component name -> (PyTorch module, program converted through ``export_ios``)."""
+    """Component name -> (float16 PyTorch module, its converted program) for the tiny iOS bundle."""
     from coreai_models.models.ios import embedding_gemma2_vision as ios_vision
     from coreai_models.models.ios.embedding_gemma2 import text_encoder_from_state_dict
 
@@ -695,10 +699,8 @@ def test_tiny_ane_programs_have_the_contract_functions(tiny_ane_programs):
 
 @pytest.mark.parametrize("compute_unit", ["cpu", "gpu"])
 def test_tiny_ane_programs_match_pytorch(tiny_ane_programs, compute_unit):
-    """Each converted program, run by the Core AI runtime, matches its float16 module and
-    outputs the metadata's ``output_dtype``.
-
-    The tolerance is the float16 one of ``test_macos_prefill_graph.py`` (atol = rtol = 1e-2).
+    """Each converted program, run by the Core AI runtime, outputs the metadata's ``output_dtype``
+    and matches its float16 module: the token table exactly, the encoders within atol = rtol = 1e-2.
     """
     import coreai.runtime as rt
 

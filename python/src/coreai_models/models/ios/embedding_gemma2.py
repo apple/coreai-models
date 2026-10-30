@@ -26,8 +26,8 @@ from coreai_models.models.macos.embedding_gemma2 import (
 from coreai_models.primitives.ios.rms_norm import MaxAbsRMSNorm, MaxAbsRMSNormNoScale
 from coreai_models.primitives.ios.sdpa import SDPA
 
-# Smallest positive normal float16; floors the output L2's row max-abs and squared norm so an
-# all-zero row stays finite.
+# Smallest positive normal float16; floor for the row max-abs and squared norm in the output L2
+# normalization.
 _FP16_TINY = 6.103515625e-05
 MASK_NEG = -30000.0
 
@@ -56,8 +56,8 @@ class EmbeddingGemma2Attention(nn.Module):
         self.sdpa = SDPA(head_dim=hd, scale=1.0)
 
     def forward(self, x, cos, sin, bias):
-        """``x``: ``(B, C, 1, L)``; ``cos``/``sin``: ``(1, 1, hd, L)``; norms and RoPE run per head
-        on ``(B, n, hd, L)``."""
+        """``x``: ``(B, C, 1, L)``; ``cos``/``sin``: ``(1, 1, hd, L)``; ``bias``: additive
+        ``(1, L, 1, L)``. Returns ``(B, C, 1, L)``."""
         b, _, _, length = x.shape
         hd, half = self.head_dim, self.head_dim // 2
         q = self.q_norm(self.q_proj(x).reshape(b, self.n_heads, hd, length))
@@ -102,10 +102,12 @@ class EmbeddingGemma2EncoderLayer(nn.Module):
 
 
 class EmbeddingGemma2TextEncoder(nn.Module):
-    """``(inputs_embeds [B,L,H], bias [1,L,1,L], pool_weights [B,L]) -> embedding [B, E]``.
+    """``(inputs_embeds [B, L, H], bias [1, L, 1, L], pool_weights [B, L]) -> embedding [B, E]``.
 
-    ``sliding_bias`` optionally replaces ``bias`` on sliding layers. ``pool_weights`` is the
-    attention mask divided by its row sum, so pooling is a masked mean.
+    ``H`` is ``hidden_size`` and ``E`` is ``embedding_dim``. ``inputs_embeds`` are token
+    embeddings scaled by ``sqrt(hidden_size)``. ``bias`` is additive (0 or ``MASK_NEG``);
+    ``sliding_bias`` optionally replaces it on sliding layers. ``pool_weights`` is the attention
+    mask divided by its row sum, so pooling is a masked mean. The output has unit L2 norm.
     """
 
     def __init__(self, config: EmbeddingGemma2TextConfig) -> None:
@@ -171,7 +173,8 @@ def text_encoder_from_state_dict(
 ) -> tuple[EmbeddingGemma2TextEncoder, torch.Tensor]:
     """Build the encoder from HF text weights (``language_model.`` prefix stripped).
 
-    Returns ``(encoder, embed_table_fp32)``; the embedding table stays on the host.
+    Returns ``(encoder, embed_table_fp32)``. The table is the unscaled ``[vocab, hidden_size]``
+    token embedding, not part of the encoder.
     """
     sd = {k: v.float() for k, v in state_dict.items()}
     table = sd.pop("embed_tokens.weight")
