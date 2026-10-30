@@ -72,11 +72,52 @@ SNAPSHOT_PROMPTS = {
     **dict.fromkeys(["CodeRetrieval", "InstructionRetrieval"], PROMPTS["code_retrieval"]),
 }
 
+# Keys of earlier contract drafts that must not come back.
+REMOVED_KEYS = {
+    "pooling",
+    "attention",
+    "granularity",
+    "budgets",
+    "max_sequence_length",
+    "prompt_applies_to",
+    "side",
+    "strategy",
+    "wrap",
+    "soft_tokens_scaled",
+    "floor",
+    "norm",
+    "dynamic_batch",
+    "dynamic_length",
+    "hidden_size",
+    "note",
+    "max_patches",
+    "soft_token_dim",
+    "convert_rgb",
+    "exif_transpose",
+    "resize",
+    "resize_policy",
+    "patch_pixel_order",
+    "position_order",
+    "padding_position",
+    "prompt",
+    "truncation_side",
+}
+
 
 def _block(platform="macOS", with_image=False, **overrides):
     kwargs = dict(revision=REVISION, prompts=PROMPTS)
     kwargs.update(overrides)
     return embedding_block(EG2, platform=platform, with_image=with_image, **kwargs)
+
+
+def _keys(node):
+    if isinstance(node, dict):
+        for key, value in node.items():
+            yield key
+            yield from _keys(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _keys(value)
 
 
 # --- Precision guard ---
@@ -209,6 +250,7 @@ def test_embedding_block_platform_matrix(platform, with_image, components, pipel
     assert {k: v["compute_units"] for k, v in block["components"].items()} == units
     assert ("merge" in block) == with_image and ("preprocessing" in block) == with_image
     assert set(bundle_assets(platform, with_image)) == set(components)
+    assert not REMOVED_KEYS & set(_keys(block)), REMOVED_KEYS & set(_keys(block))
     meta = build_bundle_metadata(
         EG2,
         block,

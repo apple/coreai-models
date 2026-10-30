@@ -7,8 +7,8 @@
 
 Tiers
 -----
-1. Self-contained (always run): config parsing, padding invariance, pooling mask negative test,
-   inputs_embeds path.
+1. Self-contained (always run): config parsing, mask semantics, padding invariance, pooling
+   mask negative test, inputs_embeds path.
 2. HF reference (tiny random config): needs ``transformers>=5.19`` (``models/embedding_gemma2``).
    The repo pins an older transformers, so run in an overlay::
 
@@ -18,7 +18,8 @@ Tiers
 3. Real weights (CPU fp32): additionally needs the ``google/embeddinggemma-2`` snapshot in the
    local HF cache (the ``embeddinggemma2_snapshot`` fixture skips otherwise). Compared against HF
    ``EmbeddingGemma2Model`` + the sentence-transformers mean-pool + L2-normalize
-   re-implementation in ``_st_mean_pool_normalize``.
+   re-implementation in ``_st_mean_pool_normalize``, and against sentence-transformers>=6.1
+   when it is installed (``--with "sentence-transformers>=6.1"``).
 
 Tiers 2/3 skip cleanly when their dependencies are unavailable.
 """
@@ -34,6 +35,7 @@ import torch.nn.functional as F
 from coreai_models.models.macos.embedding_gemma2 import (
     EmbeddingGemma2TextConfig,
     EmbeddingGemma2TextEncoder,
+    build_attention_masks,
     load_embedding_gemma2_text_encoder,
     read_checkpoint_tensors,
 )
@@ -87,6 +89,28 @@ def test_config_requires_both_rope_thetas():
     rope = {"sliding_attention": {"rope_theta": 10_000.0}, "full_attention": {}}
     with pytest.raises(ValueError, match="full_attention"):
         EmbeddingGemma2TextConfig.from_dict({**TINY_TEXT_CONFIG, "rope_parameters": rope})
+
+
+def test_config_from_snapshot_matches_published_layout(embeddinggemma2_snapshot):
+    cfg = EmbeddingGemma2TextConfig.from_pretrained(embeddinggemma2_snapshot)
+    full = [i for i in range(cfg.num_hidden_layers) if not cfg.is_sliding(i)]
+    assert full == [5, 11, 17, 23]
+    assert all(cfg.layer_head_dim(i) == 512 and cfg.layer_num_key_value_heads(i) == 1 for i in full)
+    assert cfg.layer_head_dim(0) == 256 and cfg.layer_num_key_value_heads(0) == 2
+    assert (cfg.hidden_size, cfg.embedding_dim, cfg.sliding_window) == (512, 768, 512)
+
+
+def test_masks_bidirectional_window_and_key_padding():
+    attention_mask = torch.tensor([[1, 1, 1, 1, 1, 0, 0]], dtype=torch.int32)
+    full, sliding = build_attention_masks(attention_mask, sliding_window=2)
+    assert full.shape == sliding.shape == (1, 1, 7, 7)
+    i, j = torch.meshgrid(torch.arange(7), torch.arange(7), indexing="ij")
+    key_valid = (j < 5).unsqueeze(0).unsqueeze(0)
+    assert torch.equal(full, key_valid.expand_as(full))
+    assert torch.equal(sliding, ((i - j).abs() <= 2).unsqueeze(0).unsqueeze(0) & key_valid)
+    # Symmetric (bidirectional) on valid positions.
+    valid = sliding[0, 0, :5, :5]
+    assert torch.equal(valid, valid.T)
 
 
 def test_forward_shapes_and_unit_norm():
@@ -175,8 +199,8 @@ def _hf_modeling():
     )
 
 
-def _tiny_hf():
-    """Tiny random HF ``EmbeddingGemma2TextModel`` (eager attention) with perturbed weights."""
+def _tiny_hf(attn_impl: str = "eager"):
+    """Tiny random HF ``EmbeddingGemma2TextModel`` with perturbed weights."""
     modeling = _hf_modeling()
     from transformers.models.embedding_gemma2.configuration_embedding_gemma2 import (
         EmbeddingGemma2Config,
@@ -184,14 +208,15 @@ def _tiny_hf():
 
     torch.manual_seed(0)
     hf_cfg = EmbeddingGemma2Config(text_config=dict(TINY_TEXT_CONFIG)).text_config
-    hf_cfg._attn_implementation = "eager"
+    hf_cfg._attn_implementation = attn_impl
     hf = modeling.EmbeddingGemma2TextModel(hf_cfg).eval()
     _randomize_(hf, seed=3)
     return hf
 
 
-def test_tiny_parity_vs_hf():
-    hf = _tiny_hf()
+@pytest.mark.parametrize("attn_impl", ["eager", "sdpa"])
+def test_tiny_parity_vs_hf(attn_impl):
+    hf = _tiny_hf(attn_impl)
 
     ours = EmbeddingGemma2TextEncoder(EmbeddingGemma2TextConfig.from_dict(TINY_TEXT_CONFIG)).eval()
     ours.load_state_dict(hf.state_dict())
@@ -207,6 +232,21 @@ def test_tiny_parity_vs_hf():
     torch.testing.assert_close(tokens[valid], hf_tokens[valid], atol=1e-4, rtol=1e-4)
     assert _cos(emb, hf_emb).min().item() > 1 - 1e-6
     torch.testing.assert_close(emb, hf_emb, atol=1e-5, rtol=0)
+
+
+def test_tiny_sliding_window_matters_vs_hf():
+    """With the window widened from 3 to 1000, ours no longer matches HF."""
+    hf = _tiny_hf()
+    wide = dict(TINY_TEXT_CONFIG, sliding_window=1000)
+    ours = EmbeddingGemma2TextEncoder(EmbeddingGemma2TextConfig.from_dict(wide)).eval()
+    ours.load_state_dict(hf.state_dict())
+    ids, mask = _ragged_batch([24], seq_len=24, vocab=128, seed=7)
+    with torch.no_grad():
+        hf_emb = _st_mean_pool_normalize(
+            hf(input_ids=ids.long(), attention_mask=mask.long()).last_hidden_state, mask
+        )
+        emb = ours(input_ids=ids, attention_mask=mask)
+    assert (emb - hf_emb).abs().max().item() > 1e-3
 
 
 # --- Tier 3: real weights (CPU fp32) ---
@@ -272,6 +312,23 @@ def test_real_weight_parity_and_padding_invariance(real_setup):
 
     assert _cos(emb, ref).min().item() >= 0.99999
     assert _cos(alone, emb).min().item() >= 0.99999
+
+
+def test_real_weight_matches_sentence_transformers(real_setup, embeddinggemma2_snapshot):
+    """The pooling re-implementation and the prompt handling agree with sentence-transformers."""
+    st = pytest.importorskip("sentence_transformers", minversion="6.1")
+    model = st.SentenceTransformer(
+        str(embeddinggemma2_snapshot), device="cpu", model_kwargs={"dtype": torch.float32}
+    )
+    texts = real_setup["texts"]
+    features = real_setup["tokenize"](texts)
+    with torch.inference_mode():
+        st_emb = model.encode(texts, batch_size=len(texts), convert_to_tensor=True)
+        emb = real_setup["ours"](
+            input_ids=features["input_ids"].to(torch.int32),
+            attention_mask=features["attention_mask"].to(torch.int32),
+        )
+    assert _cos(emb, st_emb).min().item() >= 0.99999
 
 
 def test_real_weight_excluding_prompt_changes_embedding(real_setup):

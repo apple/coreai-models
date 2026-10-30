@@ -119,10 +119,11 @@ def _random_inputs(cfg: EmbeddingGemma2VisionConfig, grids: list[tuple[int, int]
 # --- Tiny-config parity vs HF ---
 
 
-def test_tiny_soft_tokens_match_hf(monkeypatch) -> None:
-    # The directory conftest forces USE_HF_IMPL=true; run the Core AI lowering path of the SDPA
-    # primitive (bool-mask -> -1e4 bias), which is what gets exported.
-    monkeypatch.setenv("USE_HF_IMPL", "false")
+@pytest.mark.parametrize("use_hf_impl", ["true", "false"])
+def test_tiny_soft_tokens_match_hf(use_hf_impl, monkeypatch) -> None:
+    # "false" runs the Core AI lowering path of the SDPA primitive (bool-mask -> -1e4 bias),
+    # which is what gets exported; "true" is the directory conftest's default.
+    monkeypatch.setenv("USE_HF_IMPL", use_hf_impl)
     hf_cfg, hf = _hf_tiny_vision(TINY)
     text_cfg = gemma4_config.Gemma4TextConfig(hidden_size=TINY.text_hidden_size)
     torch.manual_seed(1)
