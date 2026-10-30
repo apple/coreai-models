@@ -35,6 +35,7 @@ from coreai_models.models.macos.embedding_gemma2 import (
     EmbeddingGemma2TextConfig,
     EmbeddingGemma2TextEncoder,
     load_embedding_gemma2_text_encoder,
+    read_checkpoint_tensors,
 )
 from tests.test_model_units.test_models._embedding_gemma2_common import (
     TINY_TEXT_CONFIG,
@@ -139,6 +140,29 @@ def test_inputs_embeds_path_matches_input_ids():
     torch.testing.assert_close(a, b, atol=0, rtol=0)
     with pytest.raises(ValueError):
         model(input_ids=ids, inputs_embeds=model.embed_tokens(ids))
+
+
+def test_read_checkpoint_tensors_reads_index_shards(tmp_path):
+    from safetensors.torch import save_file
+
+    with pytest.raises(FileNotFoundError):
+        read_checkpoint_tensors(tmp_path, ("language_model.",), torch.float32)
+    shards = {
+        "model-00001-of-00002.safetensors": {
+            "language_model.a": torch.ones(2, dtype=torch.bfloat16)
+        },
+        "model-00002-of-00002.safetensors": {
+            "language_model.b": torch.zeros(3),
+            "vision_tower.c": torch.ones(1),
+        },
+    }
+    for name, tensors in shards.items():
+        save_file(tensors, str(tmp_path / name))
+    weight_map = {key: name for name, tensors in shards.items() for key in tensors}
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}))
+    tensors = read_checkpoint_tensors(tmp_path, ("language_model.",), torch.float32)
+    assert sorted(tensors) == ["language_model.a", "language_model.b"]
+    assert {t.dtype for t in tensors.values()} == {torch.float32}
 
 
 # --- Tier 2: tiny random config vs HF EmbeddingGemma2TextModel ---

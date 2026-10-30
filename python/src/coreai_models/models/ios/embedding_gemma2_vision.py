@@ -184,7 +184,7 @@ def load_image_encoder(
     dtype: torch.dtype = torch.float16,
     max_soft_tokens: int | None = None,
 ) -> EmbeddingGemma2ImageEncoder:
-    """Load from a local EG2 snapshot directory (``config.json`` + ``*.safetensors``)."""
+    """Load from a local EG2 snapshot directory (``config.json`` + ``model.safetensors``)."""
     mac = MacEmbeddingGemma2ImageEncoder.from_pretrained(model_dir, torch.float32, max_soft_tokens)
     model = load_hf_state_dict(EmbeddingGemma2ImageEncoder(mac.config), mac.state_dict())
     return model.to(dtype).eval()

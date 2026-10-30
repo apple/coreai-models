@@ -22,6 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from coreai_models.models.base import load_tensors_for_keys, resolve_safetensors_files
 from coreai_models.models.macos.diffusion_gemma import (
     DiffusionGemmaDenseMLP as EmbeddingGemma2MLP,
 )
@@ -426,25 +427,26 @@ class EmbeddingGemma2TextEncoder(nn.Module):
 
 
 def read_checkpoint_tensors(
-    model_dir: str | Path, prefixes: tuple[str, ...], dtype: torch.dtype | None = None
+    model_dir: str | Path, prefixes: tuple[str, ...], dtype: torch.dtype
 ) -> dict[str, torch.Tensor]:
-    """Tensors from ``model_dir/*.safetensors`` whose names start with one of ``prefixes``.
+    """Tensors of the ``model_dir`` checkpoint whose names start with one of ``prefixes``.
 
-    Names are kept as in the checkpoint; each tensor is cast to ``dtype`` when given.
+    Reads ``model.safetensors`` or the shards listed in ``model.safetensors.index.json``. Names
+    are kept as in the checkpoint; tensors are cast to ``dtype`` except embedding tables and
+    quantization zero-points, as in ``load_tensors_for_keys``.
+
+    Raises:
+        FileNotFoundError: if ``model_dir`` has no safetensors weights.
     """
     from safetensors import safe_open
 
-    files = sorted(Path(model_dir).glob("*.safetensors"))
-    if not files:
-        raise FileNotFoundError(f"No .safetensors in {model_dir}")
-    tensors: dict[str, torch.Tensor] = {}
-    for file in files:
-        with safe_open(str(file), framework="pt") as handle:
+    key_to_file: dict[str, str] = {}
+    for file in resolve_safetensors_files(str(model_dir)):
+        with safe_open(file, framework="pt") as handle:
             for key in handle.keys():  # noqa: SIM118 - safe_open is not a Mapping
                 if key.startswith(prefixes):
-                    tensor = handle.get_tensor(key)
-                    tensors[key] = tensor if dtype is None else tensor.to(dtype)
-    return tensors
+                    key_to_file[key] = file
+    return load_tensors_for_keys(key_to_file, dtype)
 
 
 def _resolve_model_dir(model_dir_or_id: str | Path) -> Path:

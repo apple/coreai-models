@@ -260,7 +260,7 @@ class EmbeddingGemma2ImageEncoder(nn.Module):
         dtype: torch.dtype = torch.float32,
         max_soft_tokens: int | None = None,
     ) -> EmbeddingGemma2ImageEncoder:
-        """Load from a local EG2 snapshot directory (``config.json`` + ``*.safetensors``)."""
+        """Load from a local EG2 snapshot directory (``config.json`` + ``model.safetensors``)."""
         config = json.loads((Path(model_dir) / "config.json").read_text())
         model = cls(EmbeddingGemma2VisionConfig.from_hf_config(config, max_soft_tokens))
         tensors = read_checkpoint_tensors(model_dir, ("vision_tower.", "embed_vision."), dtype)
