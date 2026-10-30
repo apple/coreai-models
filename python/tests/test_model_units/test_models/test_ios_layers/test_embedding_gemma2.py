@@ -10,6 +10,8 @@ import math
 import pytest
 import torch
 
+from coreai_models.embedding.export_ios import EncoderBandWrapper
+from coreai_models.embedding.export_utils import TokenTableExportWrapper, scaled_token_table
 from coreai_models.models.ios.embedding_gemma2 import (
     MASK_NEG,
     load_embedding_gemma2_text_encoder,
@@ -33,28 +35,19 @@ def _host_inputs(
     ids: torch.Tensor,
     attention_mask: torch.Tensor,
     embed_table: torch.Tensor,
-    sliding_window: int,
     dtype: torch.dtype = torch.float16,
-) -> dict[str, torch.Tensor]:
-    """Graph inputs for one sequence (``ids [1, L]``): scaled embeddings, bias, pooling weights."""
-    b, length = ids.shape
-    emb = embed_table[ids.long()].float() * math.sqrt(embed_table.shape[1])
-    valid = attention_mask.bool()
-    key_ok = valid[0].reshape(length, 1, 1).expand(length, 1, length)  # (Lk, 1, Lq)
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Graph inputs for one sequence (``ids [1, L]``): token-table embeddings, bias, pooling."""
+    length = ids.shape[1]
+    table = scaled_token_table(embed_table, math.sqrt(embed_table.shape[1]), dtype)
+    key_ok = attention_mask[0].bool().reshape(length, 1, 1).expand(length, 1, length)
     bias = torch.where(key_ok, 0.0, MASK_NEG).reshape(1, length, 1, length)
-    out = {
-        "inputs_embeds": emb.to(dtype),
-        "bias": bias.to(dtype),
-        "pool_weights": (attention_mask.float() / attention_mask.float().sum(-1, keepdim=True)).to(
-            dtype
-        ),
-    }
-    if length > sliding_window + 1:
-        pos = torch.arange(length)
-        band = (pos[:, None] - pos[None, :]).abs() <= sliding_window  # (Lk, Lq) symmetric
-        sb = torch.where(key_ok & band.reshape(length, 1, length), 0.0, MASK_NEG)
-        out["sliding_bias"] = sb.reshape(1, length, 1, length).to(dtype)
-    return out
+    pool = attention_mask.float() / attention_mask.float().sum(-1, keepdim=True)
+    return TokenTableExportWrapper(table, dtype)(ids), bias.to(dtype), pool.to(dtype)
+
+
+def _banded(ios: torch.nn.Module, length: int) -> EncoderBandWrapper:
+    return EncoderBandWrapper(ios, length, ios.config.sliding_window)
 
 
 def _perturb(model: torch.nn.Module, seed: int) -> None:
@@ -84,15 +77,14 @@ def test_float32_matches_macos_reference_per_row() -> None:
     ids, mask = _ragged_batch([12, 7, 4], seq_len=12, vocab=cfg.vocab_size)
     with torch.no_grad():
         want = ref(input_ids=ids, attention_mask=mask)
-        for row in range(ids.shape[0]):
-            n = int(mask[row].sum())
-            inputs = _host_inputs(
-                ids[row : row + 1], mask[row : row + 1], table, cfg.sliding_window, torch.float32
-            )
-            got = ios(**inputs)
+        # Length 12 takes the banded path (> sliding_window + 1); length 4 the unbanded one.
+        for row, length in ((0, 12), (1, 12), (2, 12), (2, 4)):
+            r = slice(row, row + 1)
+            inputs = _host_inputs(ids[r, :length], mask[r, :length], table, torch.float32)
+            got = _banded(ios, length)(*inputs)
             assert got.shape == (1, cfg.embedding_dim)
-            cos = _cos(got, want[row : row + 1])
-            assert float(cos) >= 0.9999, (row, n, float(cos))
+            cos = _cos(got, want[r])
+            assert float(cos) >= 0.9999, (row, length, float(cos))
 
 
 def test_float16_stays_finite_with_large_activations() -> None:
@@ -105,8 +97,8 @@ def test_float16_stays_finite_with_large_activations() -> None:
     ios32, _ = text_encoder_from_state_dict(cfg, state, dtype=torch.float32)
     ios16, _ = text_encoder_from_state_dict(cfg, state, dtype=torch.float16)
     with torch.no_grad():
-        want = ios32(**_host_inputs(ids, mask, table, cfg.sliding_window, torch.float32))
-        got = ios16(**_host_inputs(ids, mask, table, cfg.sliding_window, torch.float16))
+        want = _banded(ios32, 12)(*_host_inputs(ids, mask, table, torch.float32))
+        got = _banded(ios16, 12)(*_host_inputs(ids, mask, table, torch.float16))
     assert torch.isfinite(got.float()).all()
     assert float(_cos(got.float(), want)) >= 0.99
 
@@ -116,14 +108,13 @@ def test_all_zero_pool_weights_give_a_zero_vector(dtype: torch.dtype) -> None:
     cfg, _, state = _reference_and_state_dict()
     ios, table = text_encoder_from_state_dict(cfg, state, dtype=dtype)
     ids, mask = _ragged_batch([6], seq_len=6, vocab=cfg.vocab_size)
-    inputs = _host_inputs(ids, mask, table, cfg.sliding_window, dtype)
-    inputs["pool_weights"] = torch.zeros_like(inputs["pool_weights"])
+    embeds, bias, pool = _host_inputs(ids, mask, table, dtype)
     with torch.no_grad():
-        got = ios(**inputs)
+        got = _banded(ios, 6)(embeds, bias, torch.zeros_like(pool))
     assert torch.equal(got, torch.zeros_like(got))
 
 
-@pytest.mark.parametrize(("length", "valid"), [(8, 8), (64, 40), (128, 128)])
+@pytest.mark.parametrize(("length", "valid"), [(64, 40), (1024, 700)])
 def test_real_weight_float16_matches_float32(embeddinggemma2_snapshot, length, valid) -> None:
     reference = load_macos_text_encoder(embeddinggemma2_snapshot, dtype=torch.float32).eval()
     ios16, table = load_embedding_gemma2_text_encoder(embeddinggemma2_snapshot, torch.float16)
@@ -133,6 +124,6 @@ def test_real_weight_float16_matches_float32(embeddinggemma2_snapshot, length, v
     mask = (torch.arange(length) < valid).to(torch.int32)[None]
     with torch.no_grad():
         want = reference(input_ids=ids, attention_mask=mask)
-        got = ios16(**_host_inputs(ids, mask, table, ios16.config.sliding_window, torch.float16))
+        got = _banded(ios16, length)(*_host_inputs(ids, mask, table, torch.float16))
     assert torch.isfinite(got).all()
     assert float(_cos(got.float(), want)) >= 0.9999

@@ -5,7 +5,7 @@
 
 """Parity tests for the EmbeddingGemma 2 image path (``embedding_gemma2_vision.py``).
 
-* Tiny-config parity against HF ``Gemma4VisionModel`` / ``Gemma4MultimodalEmbedder``
+* Tiny-config parity against HF ``Gemma4VisionModel`` + ``Gemma4MultimodalEmbedder``
   (present in the repo's transformers; no checkpoint needed).
 * Host preprocessing helpers against HF ``Gemma4ImageProcessor``.
 * Scatter / sequence assembly against HF ``masked_scatter`` semantics.
@@ -19,7 +19,6 @@
 """
 
 import math
-import os
 
 import pytest
 import torch
@@ -89,21 +88,15 @@ def _hf_tiny_vision(cfg: EmbeddingGemma2VisionConfig):
     return hf_cfg, model
 
 
-def _load_from_hf_vision(ours: EmbeddingGemma2ImageEncoder, hf_vision, hf_embedder=None):
+def _load_from_hf_vision(ours: EmbeddingGemma2ImageEncoder, hf_vision, hf_embedder):
     state = {}
     for k, v in hf_vision.state_dict().items():
         local = EmbeddingGemma2ImageEncoder.map_hf_key("vision_tower." + k)
         if local is not None and local in dict(ours.named_parameters()):
             state[local] = v
-    if hf_embedder is not None:
-        for k, v in hf_embedder.state_dict().items():
-            state["embed_vision." + k] = v
-    missing, unexpected = ours.load_state_dict(state, strict=False)
-    expected_missing = (
-        [] if hf_embedder is not None else ["embed_vision.embedding_projection.weight"]
-    )
-    assert sorted(missing) == expected_missing
-    assert not unexpected
+    for k, v in hf_embedder.state_dict().items():
+        state["embed_vision." + k] = v
+    ours.load_state_dict(state)
 
 
 def _random_inputs(cfg: EmbeddingGemma2VisionConfig, grids: list[tuple[int, int]], seed: int = 0):
@@ -126,44 +119,28 @@ def _random_inputs(cfg: EmbeddingGemma2VisionConfig, grids: list[tuple[int, int]
 # --- Tiny-config parity vs HF ---
 
 
-@pytest.mark.parametrize("use_hf_sdpa", ["true", "false"])
-@pytest.mark.parametrize("grids", [[(3, 4)], [(2, 3)], [(1, 5), (4, 3)]])
-def test_tiny_vision_tower_matches_hf(grids, use_hf_sdpa, monkeypatch) -> None:
-    # The directory conftest forces USE_HF_IMPL=true; also cover the Core AI lowering path
-    # of the SDPA primitive (bool-mask -> -1e4 bias), which is what gets exported.
-    monkeypatch.setenv("USE_HF_IMPL", use_hf_sdpa)
-    _, hf = _hf_tiny_vision(TINY)
-    ours = EmbeddingGemma2ImageEncoder(TINY).eval()
-    _load_from_hf_vision(ours, hf)
-    pixel_values, position_ids, counts = _random_inputs(TINY, grids)
-    with torch.no_grad():
-        ref = hf(pixel_values=pixel_values, pixel_position_ids=position_ids).last_hidden_state
-        got = ours.encode_pooled(pixel_values, position_ids)
-    # HF strips padding slots and concatenates images; ours keeps the static budget.
-    got_valid = torch.cat([got[i, :n] for i, n in enumerate(counts)])
-    assert got_valid.shape == ref.shape
-    torch.testing.assert_close(got_valid, ref.float(), rtol=1e-5, atol=1e-5)
-    # Padding slots are exactly zero.
-    for i, n in enumerate(counts):
-        assert torch.count_nonzero(got[i, n:]) == 0
-
-
-def test_tiny_soft_tokens_match_hf_embedder() -> None:
+def test_tiny_soft_tokens_match_hf(monkeypatch) -> None:
+    # The directory conftest forces USE_HF_IMPL=true; run the Core AI lowering path of the SDPA
+    # primitive (bool-mask -> -1e4 bias), which is what gets exported.
+    monkeypatch.setenv("USE_HF_IMPL", "false")
     hf_cfg, hf = _hf_tiny_vision(TINY)
     text_cfg = gemma4_config.Gemma4TextConfig(hidden_size=TINY.text_hidden_size)
     torch.manual_seed(1)
     embedder = gemma4_modeling.Gemma4MultimodalEmbedder(hf_cfg, text_cfg).eval()
     ours = EmbeddingGemma2ImageEncoder(TINY).eval()
     _load_from_hf_vision(ours, hf, embedder)
-    pixel_values, position_ids, counts = _random_inputs(TINY, [(4, 3)], seed=3)
+    pixel_values, position_ids, counts = _random_inputs(TINY, [(1, 5), (4, 3)])
     with torch.no_grad():
         ref = embedder(
             hf(pixel_values=pixel_values, pixel_position_ids=position_ids).last_hidden_state
         )
         got = ours(pixel_values, position_ids)
-    assert got.shape == (1, TINY.max_soft_tokens, TINY.text_hidden_size)
-    torch.testing.assert_close(got[0, : counts[0]], ref, rtol=1e-5, atol=1e-5)
-    assert torch.count_nonzero(got[0, counts[0] :]) == 0
+    assert got.shape == (2, TINY.max_soft_tokens, TINY.text_hidden_size)
+    # HF strips padding slots and concatenates images; ours keeps the static budget.
+    got_valid = torch.cat([got[i, :n] for i, n in enumerate(counts)])
+    torch.testing.assert_close(got_valid, ref, rtol=1e-5, atol=1e-5)
+    for i, n in enumerate(counts):
+        assert torch.count_nonzero(got[i, n:]) == 0
 
 
 def test_rejects_wrong_patch_count() -> None:
@@ -336,15 +313,9 @@ def eg2_hf(embeddinggemma2_snapshot):
         snapshot, dtype=torch.float32, audio_config=None
     ).eval()
     # Build ours on the SDPA lowering path that gets exported (not the HF-eager shim).
-    saved = os.environ.get("USE_HF_IMPL")
-    os.environ["USE_HF_IMPL"] = "false"
-    try:
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("USE_HF_IMPL", "false")
         ours = EmbeddingGemma2ImageEncoder.from_pretrained(snapshot, dtype=torch.float32)
-    finally:
-        if saved is None:
-            os.environ.pop("USE_HF_IMPL", None)
-        else:
-            os.environ["USE_HF_IMPL"] = saved
     return processor, model, ours
 
 

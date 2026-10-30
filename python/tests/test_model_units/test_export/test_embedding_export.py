@@ -549,31 +549,6 @@ def test_ane_reference_inputs_shapes():
     assert int(real.sum()) % 9 == 0 and torch.all(positions[0, ~real] == -1)
 
 
-def test_ane_band_wrapper_matches_explicit_sliding_bias():
-    """The in-graph band equals an explicit sliding-window bias built on the host."""
-    from coreai_models.models.ios.embedding_gemma2 import MASK_NEG, EmbeddingGemma2TextEncoder
-    from coreai_models.models.macos.embedding_gemma2 import EmbeddingGemma2TextConfig
-
-    config = EmbeddingGemma2TextConfig.from_dict(TINY_TEXT_CONFIG)
-    torch.manual_seed(0)
-    model = EmbeddingGemma2TextEncoder(config).eval()
-    length, valid = 16, 12
-    pos = torch.arange(length)
-    key_ok = (pos < valid)[:, None]  # (key, query)
-    bias = torch.where(key_ok, 0.0, MASK_NEG).expand(length, length)
-    band = (pos[:, None] - pos[None, :]).abs() <= 3
-    sliding = torch.where(key_ok & band, 0.0, MASK_NEG)
-    bias, sliding = (t.reshape(1, length, 1, length) for t in (bias, sliding))
-    embeds = torch.randn(1, length, 64)
-    pool = (pos < valid).float().reshape(1, length) / valid
-    wrapper = export_ios.EncoderBandWrapper(model, length, 3)
-    with torch.no_grad():
-        want = model(embeds, bias, pool, sliding)
-        got = wrapper(embeds, bias, pool)
-    torch.testing.assert_close(got, want)
-    assert not export_ios.EncoderBandWrapper(model, 4, 3).banded
-
-
 # --- CLI ---
 
 

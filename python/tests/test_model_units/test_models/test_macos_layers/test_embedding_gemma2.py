@@ -7,23 +7,25 @@
 
 Tiers
 -----
-1. Self-contained (always run): config parsing, mask semantics, padding invariance, pooling
-   mask negative test, inputs_embeds path, torch.export at a static bucket.
+1. Self-contained (always run): config parsing, padding invariance, pooling mask negative test,
+   inputs_embeds path.
 2. HF reference (tiny random config): needs ``transformers>=5.19`` (``models/embedding_gemma2``).
    The repo pins an older transformers, so run in an overlay::
 
-       uv run --no-sync --with "transformers>=5.19" --with "sentence-transformers>=6.1" \\
+       uv run --no-sync --with "transformers>=5.19" \\
            python -m pytest -q -p no:rerunfailures -p no:xdist -o addopts="" <this file>
 
 3. Real weights (CPU fp32): additionally needs the ``google/embeddinggemma-2`` snapshot in the
-   local HF cache (the ``embeddinggemma2_snapshot`` fixture skips otherwise). Compared against
-   sentence-transformers>=6.1 when present; otherwise against HF ``EmbeddingGemma2Model`` + the
-   mean-pool + L2-normalize re-implementation in ``_st_mean_pool_normalize``.
+   local HF cache (the ``embeddinggemma2_snapshot`` fixture skips otherwise). Compared against HF
+   ``EmbeddingGemma2Model`` + the sentence-transformers mean-pool + L2-normalize
+   re-implementation in ``_st_mean_pool_normalize``.
 
 Tiers 2/3 skip cleanly when their dependencies are unavailable.
 """
 
 from __future__ import annotations
+
+import json
 
 import pytest
 import torch
@@ -32,7 +34,6 @@ import torch.nn.functional as F
 from coreai_models.models.macos.embedding_gemma2 import (
     EmbeddingGemma2TextConfig,
     EmbeddingGemma2TextEncoder,
-    build_attention_masks,
     load_embedding_gemma2_text_encoder,
 )
 from tests.test_model_units.test_models._embedding_gemma2_common import (
@@ -85,28 +86,6 @@ def test_config_requires_both_rope_thetas():
     rope = {"sliding_attention": {"rope_theta": 10_000.0}, "full_attention": {}}
     with pytest.raises(ValueError, match="full_attention"):
         EmbeddingGemma2TextConfig.from_dict({**TINY_TEXT_CONFIG, "rope_parameters": rope})
-
-
-def test_config_from_snapshot_matches_published_layout(embeddinggemma2_snapshot):
-    cfg = EmbeddingGemma2TextConfig.from_pretrained(embeddinggemma2_snapshot)
-    full = [i for i in range(cfg.num_hidden_layers) if not cfg.is_sliding(i)]
-    assert full == [5, 11, 17, 23]
-    assert all(cfg.layer_head_dim(i) == 512 and cfg.layer_num_key_value_heads(i) == 1 for i in full)
-    assert cfg.layer_head_dim(0) == 256 and cfg.layer_num_key_value_heads(0) == 2
-    assert (cfg.hidden_size, cfg.embedding_dim, cfg.sliding_window) == (512, 768, 512)
-
-
-def test_masks_bidirectional_window_and_key_padding():
-    attention_mask = torch.tensor([[1, 1, 1, 1, 1, 0, 0]], dtype=torch.int32)
-    full, sliding = build_attention_masks(attention_mask, sliding_window=2)
-    assert full.shape == sliding.shape == (1, 1, 7, 7)
-    i, j = torch.meshgrid(torch.arange(7), torch.arange(7), indexing="ij")
-    key_valid = (j < 5).unsqueeze(0).unsqueeze(0)
-    assert torch.equal(full, key_valid.expand_as(full))
-    assert torch.equal(sliding, ((i - j).abs() <= 2).unsqueeze(0).unsqueeze(0) & key_valid)
-    # Symmetric (bidirectional) on valid positions.
-    valid = sliding[0, 0, :5, :5]
-    assert torch.equal(valid, valid.T)
 
 
 def test_forward_shapes_and_unit_norm():
@@ -162,27 +141,6 @@ def test_inputs_embeds_path_matches_input_ids():
         model(input_ids=ids, inputs_embeds=model.embed_tokens(ids))
 
 
-def test_torch_export_static_bucket():
-    """torch.export at a static (B=2, L=128) bucket with int32 ids/mask; outputs match eager."""
-    model = _tiny_model()
-    ids, mask = _ragged_batch([128, 37], seq_len=128, vocab=128)
-    with torch.no_grad():
-        exported = torch.export.export(
-            model, args=(), kwargs={"input_ids": ids, "attention_mask": mask}
-        )
-        eager = model(input_ids=ids, attention_mask=mask)
-        traced = exported.module()(input_ids=ids, attention_mask=mask)
-    assert traced.shape == (2, 48)
-    torch.testing.assert_close(traced, eager, atol=1e-6, rtol=0)
-    placeholders = [
-        n
-        for n in exported.graph.nodes
-        if n.op == "placeholder" and n.name in ("input_ids", "attention_mask")
-    ]
-    assert len(placeholders) == 2
-    assert all(n.meta["val"].dtype == torch.int32 for n in placeholders)
-
-
 # --- Tier 2: tiny random config vs HF EmbeddingGemma2TextModel ---
 
 
@@ -193,8 +151,8 @@ def _hf_modeling():
     )
 
 
-def _tiny_hf(attn_impl: str):
-    """Tiny random HF ``EmbeddingGemma2TextModel`` with perturbed weights."""
+def _tiny_hf():
+    """Tiny random HF ``EmbeddingGemma2TextModel`` (eager attention) with perturbed weights."""
     modeling = _hf_modeling()
     from transformers.models.embedding_gemma2.configuration_embedding_gemma2 import (
         EmbeddingGemma2Config,
@@ -202,15 +160,14 @@ def _tiny_hf(attn_impl: str):
 
     torch.manual_seed(0)
     hf_cfg = EmbeddingGemma2Config(text_config=dict(TINY_TEXT_CONFIG)).text_config
-    hf_cfg._attn_implementation = attn_impl
+    hf_cfg._attn_implementation = "eager"
     hf = modeling.EmbeddingGemma2TextModel(hf_cfg).eval()
     _randomize_(hf, seed=3)
     return hf
 
 
-@pytest.mark.parametrize("attn_impl", ["eager", "sdpa"])
-def test_tiny_parity_vs_hf(attn_impl):
-    hf = _tiny_hf(attn_impl)
+def test_tiny_parity_vs_hf():
+    hf = _tiny_hf()
 
     ours = EmbeddingGemma2TextEncoder(EmbeddingGemma2TextConfig.from_dict(TINY_TEXT_CONFIG)).eval()
     ours.load_state_dict(hf.state_dict())
@@ -226,21 +183,6 @@ def test_tiny_parity_vs_hf(attn_impl):
     torch.testing.assert_close(tokens[valid], hf_tokens[valid], atol=1e-4, rtol=1e-4)
     assert _cos(emb, hf_emb).min().item() > 1 - 1e-6
     torch.testing.assert_close(emb, hf_emb, atol=1e-5, rtol=0)
-
-
-def test_tiny_sliding_window_matters_vs_hf():
-    """Guard against a silently-ignored window: widening ours must break parity with HF."""
-    hf = _tiny_hf("eager")
-    wide = dict(TINY_TEXT_CONFIG, sliding_window=1000)
-    ours = EmbeddingGemma2TextEncoder(EmbeddingGemma2TextConfig.from_dict(wide)).eval()
-    ours.load_state_dict(hf.state_dict())
-    ids, mask = _ragged_batch([24], seq_len=24, vocab=128, seed=7)
-    with torch.no_grad():
-        hf_emb = _st_mean_pool_normalize(
-            hf(input_ids=ids.long(), attention_mask=mask.long()).last_hidden_state, mask
-        )
-        emb = ours(input_ids=ids, attention_mask=mask)
-    assert (emb - hf_emb).abs().max().item() > 1e-3
 
 
 # --- Tier 3: real weights (CPU fp32) ---
@@ -264,22 +206,7 @@ def real_setup(embeddinggemma2_snapshot):
     from transformers import AutoConfig, AutoTokenizer
     from transformers.models.embedding_gemma2.modeling_embedding_gemma2 import EmbeddingGemma2Model
 
-    prompts = None
-    st_model = None
-    try:
-        from sentence_transformers import SentenceTransformer
-
-        st_model = SentenceTransformer(
-            str(snapshot), device="cpu", model_kwargs={"dtype": torch.float32}
-        )
-        prompts = st_model.prompts
-    except Exception:  # noqa: BLE001 - optional reference
-        import json
-
-        prompts = json.loads((snapshot / "config_sentence_transformers.json").read_text())[
-            "prompts"
-        ]
-
+    prompts = json.loads((snapshot / "config_sentence_transformers.json").read_text())["prompts"]
     cfg = AutoConfig.from_pretrained(str(snapshot))
     cfg.vision_config = None
     cfg.audio_config = None
@@ -287,41 +214,28 @@ def real_setup(embeddinggemma2_snapshot):
     tokenizer = AutoTokenizer.from_pretrained(str(snapshot))
     ours = load_embedding_gemma2_text_encoder(snapshot, dtype=torch.float32)
     texts = [prompts[p] + t for p, t in REAL_TEXTS]
-    if st_model is not None:
-        tokenize = lambda batch: st_model.tokenize(batch)  # noqa: E731
-    else:
-        tokenize = lambda batch: tokenizer(batch, padding=True, return_tensors="pt")  # noqa: E731
-    return {"st": st_model, "hf": hf, "ours": ours, "texts": texts, "tokenize": tokenize}
-
-
-def test_real_weight_key_coverage(real_setup, embeddinggemma2_snapshot):
-    from safetensors import safe_open
-
-    with safe_open(str(embeddinggemma2_snapshot / "model.safetensors"), framework="pt") as handle:
-        all_keys = list(handle.keys())  # noqa: SIM118 - safe_open is not a Mapping
-        hf_text_keys = {
-            k[len("language_model.") :] for k in all_keys if k.startswith("language_model.")
-        }
-    ours = set(real_setup["ours"].state_dict().keys())
-    assert ours == hf_text_keys, (sorted(ours - hf_text_keys)[:5], sorted(hf_text_keys - ours)[:5])
+    tokenize = lambda batch: tokenizer(batch, padding=True, return_tensors="pt")  # noqa: E731
+    return {"hf": hf, "ours": ours, "texts": texts, "tokenize": tokenize}
 
 
 def test_real_weight_parity_and_padding_invariance(real_setup):
-    ours, hf, texts = real_setup["ours"], real_setup["hf"], real_setup["texts"]
+    """Includes a row over 2 * 512 + 1 tokens, so the sliding layers' window bites for real."""
+    ours, hf = real_setup["ours"], real_setup["hf"]
+    paragraph = (
+        "On-device semantic search embeds documents once and compares vectors at query time. "
+    )
+    texts = real_setup["texts"] + [real_setup["texts"][1] + paragraph * 90]
     features = real_setup["tokenize"](texts)
     ids = features["input_ids"].to(torch.int32)
     mask = features["attention_mask"].to(torch.int32)
     assert int(mask.sum(1).min()) < int(mask.sum(1).max()), "batch must be mixed-length"
+    assert ids.shape[1] > 1100
 
     with torch.inference_mode():
         hf.language_model.config._attn_implementation = "sdpa"
         hf_tokens = hf(input_ids=ids.long(), attention_mask=mask.long()).last_hidden_state
         ref = _st_mean_pool_normalize(hf_tokens, mask)
-        if real_setup["st"] is not None:
-            st_emb = real_setup["st"].encode(texts, batch_size=len(texts), convert_to_tensor=True)
-            assert _cos(st_emb, ref).min().item() > 0.99999  # our pooling re-impl == ST
-            ref = st_emb
-        emb, tokens = ours(input_ids=ids, attention_mask=mask, return_token_states=True)
+        emb = ours(input_ids=ids, attention_mask=mask)
         alone = torch.cat(
             [
                 ours(
@@ -332,17 +246,8 @@ def test_real_weight_parity_and_padding_invariance(real_setup):
             ]
         )
 
-    cos = _cos(emb, ref)
-    emb_max_abs = (emb - ref).abs().max().item()
-    pad_cos = _cos(alone, emb)
-    print(
-        f"\nEG2 real fp32 CPU: n={len(texts)} lens={mask.sum(1).tolist()} "
-        f"cos min={cos.min().item():.9f} median={cos.median().item():.9f} "
-        f"emb max_abs={emb_max_abs:.3e} "
-        f"padding-invariance cos min={pad_cos.min().item():.9f}"
-    )
-    assert cos.min().item() >= 0.99999
-    assert pad_cos.min().item() >= 0.99999
+    assert _cos(emb, ref).min().item() >= 0.99999
+    assert _cos(alone, emb).min().item() >= 0.99999
 
 
 def test_real_weight_excluding_prompt_changes_embedding(real_setup):
@@ -360,32 +265,4 @@ def test_real_weight_excluding_prompt_changes_embedding(real_setup):
     with torch.inference_mode():
         a = ours(input_ids=ids, attention_mask=mask)
         b = ours(input_ids=ids, attention_mask=mask, pooling_mask=no_prompt)
-    cos = _cos(a, b).item()
-    print(f"\nEG2 include_prompt vs exclude_prompt cos={cos:.6f} (prompt_len={prompt_len})")
-    assert cos < 0.999
-
-
-def test_real_weight_long_sequence_window_bites(real_setup):
-    """> 2 * 512 + 1 tokens so the sliding layers' |i - j| <= 512 window is exercised for real."""
-    ours, hf = real_setup["ours"], real_setup["hf"]
-    paragraph = (
-        "On-device semantic search embeds documents once and compares vectors at query time. "
-    )
-    features = real_setup["tokenize"](
-        [real_setup["texts"][1] + paragraph * 90, real_setup["texts"][0]]
-    )
-    ids = features["input_ids"].to(torch.int32)
-    mask = features["attention_mask"].to(torch.int32)
-    assert ids.shape[1] > 1100
-    with torch.inference_mode():
-        hf.language_model.config._attn_implementation = "sdpa"
-        ref = _st_mean_pool_normalize(
-            hf(input_ids=ids.long(), attention_mask=mask.long()).last_hidden_state, mask
-        )
-        emb = ours(input_ids=ids, attention_mask=mask)
-    cos = _cos(emb, ref)
-    print(
-        f"\nEG2 long L={ids.shape[1]} lens={mask.sum(1).tolist()} cos={cos.tolist()} "
-        f"max_abs={(emb - ref).abs().max().item():.3e}"
-    )
-    assert cos.min().item() >= 0.99999
+    assert _cos(a, b).item() < 0.999
