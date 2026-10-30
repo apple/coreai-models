@@ -80,6 +80,9 @@ class RowEngine: SpeculativeEngine, @unchecked Sendable {
     /// Simulates an engine with recurrent state: a rewind to part of the committed tokens clears the
     /// cache and leaves the cursor at zero, silently.
     var rewindsOnlyToZero = false
+    /// When set, a rewind throws and leaves the cache untouched, like a sliding-window ring that no
+    /// longer holds the keys a rewind needs.
+    var refusesResets = false
     /// What ``hasRecurrentState`` reports.
     var reportsRecurrentState = false
     var hasRecurrentState: Bool { reportsRecurrentState }
@@ -111,6 +114,7 @@ class RowEngine: SpeculativeEngine, @unchecked Sendable {
         }
         // Nothing to roll back; a reset to zero of an empty cache still clears the state.
         guard tokenIndex < committedTokens.count || tokenIndex == 0 else { return }
+        if refusesResets { throw InferenceRuntimeError.invalidState("rewind refused") }
         let kept = rewindsOnlyToZero ? 0 : tokenIndex
         truncate(to: kept)
         committedTokens.removeLast(committedTokens.count - kept)
