@@ -823,20 +823,20 @@ def _load_state_dict_from_hub(
 
     from coreai_models.models.base import (
         _build_safetensors_key_index,
-        _load_tensors_for_keys,
-        _resolve_safetensors_files,
+        load_tensors_for_keys,
+        resolve_safetensors_files,
     )
 
     model_dir = snapshot_download(
         hf_model_id, allow_patterns=["*.safetensors", "*.safetensors.index.json"]
     )
-    sf_files = _resolve_safetensors_files(model_dir)
+    sf_files = resolve_safetensors_files(model_dir)
     per_layer, shared = _build_safetensors_key_index(
         sf_files, num_layers=num_layers, hf_state_dict_prefix=""
     )
-    sd: dict[str, torch.Tensor] = _load_tensors_for_keys(shared, target_dtype)
+    sd: dict[str, torch.Tensor] = load_tensors_for_keys(shared, target_dtype)
     for layer_idx in sorted(per_layer.keys()):
-        sd.update(_load_tensors_for_keys(per_layer[layer_idx], target_dtype))
+        sd.update(load_tensors_for_keys(per_layer[layer_idx], target_dtype))
     return sd
 
 

@@ -495,7 +495,7 @@ class Gemma3nForCausalLM(BaseForCausalLM):
         from huggingface_hub import snapshot_download
         from safetensors import safe_open
 
-        from coreai_models.models.base import _load_tensors_for_keys, _resolve_safetensors_files
+        from coreai_models.models.base import load_tensors_for_keys, resolve_safetensors_files
 
         model_dir = snapshot_download(
             huggingface_model_id,
@@ -511,7 +511,7 @@ class Gemma3nForCausalLM(BaseForCausalLM):
         model = cls(config=config, model_device="meta")
         model.to(dtype=target_dtype)
 
-        safetensors_files = _resolve_safetensors_files(model_dir)
+        safetensors_files = resolve_safetensors_files(model_dir)
 
         prefix = hf_state_dict_prefix
         layer_pattern = re.compile(re.escape(prefix) + r"layers\.(\d+)\.")
@@ -532,7 +532,7 @@ class Gemma3nForCausalLM(BaseForCausalLM):
                     else:
                         shared[key] = path
 
-        shared_dict = _load_tensors_for_keys(shared, target_dtype)
+        shared_dict = load_tensors_for_keys(shared, target_dtype)
         normalized: dict[str, torch.Tensor] = {}
         for k, v in shared_dict.items():
             if k.startswith(prefix):
@@ -547,7 +547,7 @@ class Gemma3nForCausalLM(BaseForCausalLM):
 
         for layer_idx in sorted(per_layer.keys()):
             layer_key_to_file = per_layer.pop(layer_idx)
-            layer_sd = _load_tensors_for_keys(layer_key_to_file, target_dtype)
+            layer_sd = load_tensors_for_keys(layer_key_to_file, target_dtype)
             del layer_key_to_file
             remapped: dict[str, torch.Tensor] = {}
             for k, v in layer_sd.items():
