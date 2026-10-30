@@ -18,10 +18,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from coreai_models.models.macos.embedding_gemma2 import (
-    HF_TEXT_PREFIX,
     EmbeddingGemma2TextConfig,
-    _resolve_model_dir,
     rope_inv_freq,
+)
+from coreai_models.models.macos.embedding_gemma2 import (
+    load_embedding_gemma2_text_encoder as load_macos_text_encoder,
 )
 from coreai_models.primitives.ios.sdpa import SDPA
 
@@ -213,6 +214,14 @@ class EmbeddingGemma2TextEncoder(nn.Module):
         return ys * torch.rsqrt((ys * ys).sum(-1, keepdim=True).clamp(min=_FP16_TINY))
 
 
+def load_conv_weights(model: nn.Module, state_dict: dict[str, torch.Tensor]) -> None:
+    """Strict ``load_state_dict`` with each tensor reshaped to the module's shape (e.g. conv)."""
+    own = model.state_dict()
+    model.load_state_dict(
+        {k: v.reshape(own[k].shape) if k in own else v for k, v in state_dict.items()}
+    )
+
+
 def text_encoder_from_state_dict(
     config: EmbeddingGemma2TextConfig,
     state_dict: dict[str, torch.Tensor],
@@ -231,17 +240,7 @@ def text_encoder_from_state_dict(
         k2 = k2.replace("mlp.", "").replace("ple_block.", "")
         mapped[k2] = v
     model = EmbeddingGemma2TextEncoder(config)
-    own = model.state_dict()
-    for k, v in mapped.items():
-        if k not in own:
-            raise RuntimeError(f"unexpected key {k}")
-        if own[k].dim() == 4 and v.dim() == 2:
-            v = v[:, :, None, None]
-        mapped[k] = v.reshape(own[k].shape)
-    missing = set(own) - set(mapped)
-    if missing:
-        raise RuntimeError(f"missing keys {sorted(missing)[:10]}")
-    model.load_state_dict(mapped, strict=True)
+    load_conv_weights(model, mapped)
     return model.to(dtype).eval(), table
 
 
@@ -250,20 +249,8 @@ def load_embedding_gemma2_text_encoder(
     dtype: torch.dtype = torch.float16,
 ) -> tuple[EmbeddingGemma2TextEncoder, torch.Tensor]:
     """Load from a local snapshot dir or HF id; returns ``(encoder, embed_table_fp32)``."""
-    from safetensors import safe_open
-
-    model_dir = _resolve_model_dir(model_dir_or_id)
-    config = EmbeddingGemma2TextConfig.from_pretrained(model_dir)
-    sd: dict[str, torch.Tensor] = {}
-    files = sorted(model_dir.glob("*.safetensors"))
-    if not files:
-        raise FileNotFoundError(f"No .safetensors in {model_dir}")
-    for file in files:
-        with safe_open(str(file), framework="pt") as handle:
-            for key in handle.keys():  # noqa: SIM118
-                if key.startswith(HF_TEXT_PREFIX):
-                    sd[key[len(HF_TEXT_PREFIX) :]] = handle.get_tensor(key)
-    return text_encoder_from_state_dict(config, sd, dtype)
+    mac = load_macos_text_encoder(model_dir_or_id, torch.float32)
+    return text_encoder_from_state_dict(mac.config, mac.state_dict(), dtype)
 
 
 __all__ = [
@@ -271,6 +258,7 @@ __all__ = [
     "ScaledRMSNorm",
     "EmbeddingGemma2TextEncoder",
     "conv1x1",
+    "load_conv_weights",
     "load_embedding_gemma2_text_encoder",
     "text_encoder_from_state_dict",
 ]

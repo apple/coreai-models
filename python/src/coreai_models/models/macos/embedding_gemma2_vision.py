@@ -15,18 +15,17 @@ from __future__ import annotations
 
 import json
 import math
-import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from safetensors import safe_open
 
 from coreai_models.models.macos.diffusion_gemma import DiffusionGemmaDenseMLP
 from coreai_models.models.macos.diffusion_gemma import DiffusionGemmaRMSNorm as RMSNorm
-from coreai_models.models.macos.embedding_gemma2 import rope_inv_freq
+from coreai_models.models.macos.embedding_gemma2 import read_checkpoint_tensors, rope_inv_freq
 from coreai_models.primitives.ios.rope import apply_rope
 from coreai_models.primitives.macos.sdpa import SDPA
 
@@ -310,23 +309,13 @@ class EmbeddingGemma2ImageEncoder(nn.Module):
         dtype: torch.dtype = torch.float32,
         max_soft_tokens: int | None = None,
     ) -> EmbeddingGemma2ImageEncoder:
-        """Load from a local EG2 snapshot directory (``config.json`` + ``model.safetensors``)."""
-        with open(os.path.join(model_dir, "config.json")) as f:
-            config = EmbeddingGemma2VisionConfig.from_hf_config(json.load(f), max_soft_tokens)
-        model = cls(config)
-        state: dict[str, torch.Tensor] = {}
-        files = sorted(fn for fn in os.listdir(model_dir) if fn.endswith(".safetensors"))
-        if not files:
-            raise FileNotFoundError(f"No .safetensors in {model_dir}")
-        for fn in files:
-            with safe_open(os.path.join(model_dir, fn), framework="pt", device="cpu") as f:
-                for key in f.keys():  # noqa: SIM118
-                    local = cls.map_hf_key(key)
-                    if local is not None:
-                        state[local] = f.get_tensor(key).to(dtype)
-        missing, unexpected = model.load_state_dict(state, strict=False)
-        if missing or unexpected:
-            raise RuntimeError(f"weight mismatch: missing={missing} unexpected={unexpected}")
+        """Load from a local EG2 snapshot directory (``config.json`` + ``*.safetensors``)."""
+        config = json.loads((Path(model_dir) / "config.json").read_text())
+        model = cls(EmbeddingGemma2VisionConfig.from_hf_config(config, max_soft_tokens))
+        tensors = read_checkpoint_tensors(model_dir, ("vision_tower.", "embed_vision."), dtype)
+        model.load_state_dict(
+            {local: v for k, v in tensors.items() if (local := cls.map_hf_key(k)) is not None}
+        )
         return model.to(dtype).eval()
 
 

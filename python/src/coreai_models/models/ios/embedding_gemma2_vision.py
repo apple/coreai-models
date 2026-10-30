@@ -11,16 +11,20 @@ Why: ScaledRMSNorm divides by the row max-abs before squaring, keeping float16 i
 
 from __future__ import annotations
 
-import json
-import os
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from safetensors import safe_open
 
-from coreai_models.models.ios.embedding_gemma2 import MASK_NEG, ScaledRMSNorm, conv1x1
+from coreai_models.models.ios.embedding_gemma2 import (
+    MASK_NEG,
+    ScaledRMSNorm,
+    conv1x1,
+    load_conv_weights,
+)
 from coreai_models.models.macos.embedding_gemma2 import rope_inv_freq
+from coreai_models.models.macos.embedding_gemma2_vision import (
+    EmbeddingGemma2ImageEncoder as MacEmbeddingGemma2ImageEncoder,
+)
 from coreai_models.models.macos.embedding_gemma2_vision import EmbeddingGemma2VisionConfig
 
 
@@ -185,43 +189,25 @@ def load_image_encoder(
     max_soft_tokens: int | None = None,
 ) -> EmbeddingGemma2ImageEncoder:
     """Load from a local EG2 snapshot directory (``config.json`` + ``*.safetensors``)."""
-    with open(os.path.join(model_dir, "config.json")) as f:
-        cfg = EmbeddingGemma2VisionConfig.from_hf_config(json.load(f), max_soft_tokens)
-    model = EmbeddingGemma2ImageEncoder(cfg)
-    sd: dict[str, torch.Tensor] = {}
-    files = sorted(x for x in os.listdir(model_dir) if x.endswith(".safetensors"))
-    if not files:
-        raise FileNotFoundError(f"No .safetensors in {model_dir}")
-    for fn in files:
-        with safe_open(os.path.join(model_dir, fn), framework="pt") as h:
-            for key in h.keys():  # noqa: SIM118
-                if key.startswith(("vision_tower.", "embed_vision.")):
-                    sd[key] = h.get_tensor(key).float()
-    load_hf_state_dict(model, sd)
+    mac = MacEmbeddingGemma2ImageEncoder.from_pretrained(model_dir, torch.float32, max_soft_tokens)
+    model = load_hf_state_dict(EmbeddingGemma2ImageEncoder(mac.config), mac.state_dict())
     return model.to(dtype).eval()
 
 
 def load_hf_state_dict(
     model: EmbeddingGemma2ImageEncoder, sd: dict[str, torch.Tensor]
 ) -> EmbeddingGemma2ImageEncoder:
-    """Load checkpoint-named ``vision_tower.*`` / ``embed_vision.*`` tensors (fail closed)."""
+    """Load checkpoint-named (``vision_tower.*`` / ``embed_vision.*``) or macOS-encoder-named
+    tensors (fail closed)."""
     mapped: dict[str, torch.Tensor] = {}
     for key, v in sd.items():
         k2 = key.replace(".linear.weight", ".weight")
         k2 = k2.removeprefix("vision_tower.").removeprefix("embed_vision.")
         k2 = k2.replace("patch_embedder.input_proj", "input_proj")
         k2 = k2.replace("encoder.layers.", "layers.").replace("mlp.", "")
-        mapped[k2] = v.float()
+        mapped[k2] = v
     pos_table = mapped.pop("patch_embedder.position_embedding_table")
-    own = model.state_dict()
-    for key, v in list(mapped.items()):
-        if key not in own:
-            raise RuntimeError(f"unexpected key {key}")
-        mapped[key] = v.reshape(own[key].shape)
-    missing = set(own) - set(mapped)
-    if missing:
-        raise RuntimeError(f"missing keys {sorted(missing)[:10]}")
-    model.load_state_dict(mapped, strict=True)
+    load_conv_weights(model, mapped)
     model.bake_tables(pos_table)
     return model
 

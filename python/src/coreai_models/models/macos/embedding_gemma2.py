@@ -382,23 +382,26 @@ class EmbeddingGemma2TextEncoder(nn.Module):
         return sentence_embedding
 
 
-def extract_text_state_dict(
-    state_dict: dict[str, torch.Tensor], prefix: str = HF_TEXT_PREFIX
+def read_checkpoint_tensors(
+    model_dir: str | Path, prefixes: tuple[str, ...], dtype: torch.dtype | None = None
 ) -> dict[str, torch.Tensor]:
-    """Keep only ``prefix*`` keys (vision/audio dropped) and strip the prefix."""
-    return {k[len(prefix) :]: v for k, v in state_dict.items() if k.startswith(prefix)}
+    """Tensors from ``model_dir/*.safetensors`` whose names start with one of ``prefixes``.
 
+    Names are kept as in the checkpoint; each tensor is cast to ``dtype`` when given.
+    """
+    from safetensors import safe_open
 
-def load_text_state_dict(
-    model: EmbeddingGemma2TextEncoder, state_dict: dict[str, torch.Tensor]
-) -> None:
-    """Load an (already prefix-stripped) text state dict; fail closed on any missing/extra key."""
-    info = model.load_state_dict(state_dict, strict=False)
-    if info.missing_keys or info.unexpected_keys:
-        raise RuntimeError(
-            f"EG2 text load mismatch: missing={info.missing_keys[:10]} "
-            f"unexpected={info.unexpected_keys[:10]}"
-        )
+    files = sorted(Path(model_dir).glob("*.safetensors"))
+    if not files:
+        raise FileNotFoundError(f"No .safetensors in {model_dir}")
+    tensors: dict[str, torch.Tensor] = {}
+    for file in files:
+        with safe_open(str(file), framework="pt") as handle:
+            for key in handle.keys():  # noqa: SIM118 - safe_open is not a Mapping
+                if key.startswith(prefixes):
+                    tensor = handle.get_tensor(key)
+                    tensors[key] = tensor if dtype is None else tensor.to(dtype)
+    return tensors
 
 
 def _resolve_model_dir(model_dir_or_id: str | Path) -> Path:
@@ -419,22 +422,10 @@ def load_embedding_gemma2_text_encoder(
     dtype: torch.dtype = torch.float32,
 ) -> EmbeddingGemma2TextEncoder:
     """Build the text encoder from a local snapshot dir or HF id, loading ``language_model.*``."""
-    from safetensors import safe_open
-
     model_dir = _resolve_model_dir(model_dir_or_id)
-    config = EmbeddingGemma2TextConfig.from_pretrained(model_dir)
-    model = EmbeddingGemma2TextEncoder(config)
-
-    state_dict: dict[str, torch.Tensor] = {}
-    files = sorted(model_dir.glob("*.safetensors"))
-    if not files:
-        raise FileNotFoundError(f"No .safetensors in {model_dir}")
-    for file in files:
-        with safe_open(str(file), framework="pt") as handle:
-            for key in handle.keys():  # noqa: SIM118 - safe_open is not a Mapping
-                if key.startswith(HF_TEXT_PREFIX):
-                    state_dict[key[len(HF_TEXT_PREFIX) :]] = handle.get_tensor(key).to(dtype)
-    load_text_state_dict(model, state_dict)
+    model = EmbeddingGemma2TextEncoder(EmbeddingGemma2TextConfig.from_pretrained(model_dir))
+    tensors = read_checkpoint_tensors(model_dir, (HF_TEXT_PREFIX,), dtype)
+    model.load_state_dict({k.removeprefix(HF_TEXT_PREFIX): v for k, v in tensors.items()})
     return model.to(dtype).eval()
 
 
@@ -442,8 +433,7 @@ __all__ = [
     "EmbeddingGemma2TextConfig",
     "EmbeddingGemma2TextEncoder",
     "build_attention_masks",
-    "extract_text_state_dict",
     "load_embedding_gemma2_text_encoder",
-    "load_text_state_dict",
+    "read_checkpoint_tensors",
     "rope_inv_freq",
 ]

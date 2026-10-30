@@ -33,9 +33,7 @@ from coreai_models.models.macos.embedding_gemma2 import (
     EmbeddingGemma2TextConfig,
     EmbeddingGemma2TextEncoder,
     build_attention_masks,
-    extract_text_state_dict,
     load_embedding_gemma2_text_encoder,
-    load_text_state_dict,
 )
 from tests.test_model_units.test_models._embedding_gemma2_common import (
     TINY_TEXT_CONFIG,
@@ -164,19 +162,6 @@ def test_inputs_embeds_path_matches_input_ids():
         model(input_ids=ids, inputs_embeds=model.embed_tokens(ids))
 
 
-def test_load_text_state_dict_fails_closed():
-    model = _tiny_model()
-    prefixed = {f"language_model.{k}": v for k, v in model.state_dict().items()}
-    prefixed["vision_tower.encoder.foo"] = torch.zeros(1)
-    stripped = extract_text_state_dict(prefixed)
-    assert "encoder.foo" not in stripped and len(stripped) == len(model.state_dict())
-    fresh = EmbeddingGemma2TextEncoder(model.config)
-    load_text_state_dict(fresh, stripped)
-    stripped.pop("layers.0.layer_scalar")
-    with pytest.raises(RuntimeError, match="missing"):
-        load_text_state_dict(EmbeddingGemma2TextEncoder(model.config), stripped)
-
-
 def test_torch_export_static_bucket():
     """torch.export at a static (B=2, L=128) bucket with int32 ids/mask; outputs match eager."""
     model = _tiny_model()
@@ -228,7 +213,7 @@ def test_tiny_parity_vs_hf(attn_impl):
     hf = _tiny_hf(attn_impl)
 
     ours = EmbeddingGemma2TextEncoder(EmbeddingGemma2TextConfig.from_dict(TINY_TEXT_CONFIG)).eval()
-    load_text_state_dict(ours, dict(hf.state_dict()))
+    ours.load_state_dict(hf.state_dict())
 
     # Long enough (L=24 > 2*window+1) that the sliding window actually bites, with padding.
     ids, mask = _ragged_batch([24, 13, 5], seq_len=24, vocab=128, seed=7)
@@ -248,7 +233,7 @@ def test_tiny_sliding_window_matters_vs_hf():
     hf = _tiny_hf("eager")
     wide = dict(TINY_TEXT_CONFIG, sliding_window=1000)
     ours = EmbeddingGemma2TextEncoder(EmbeddingGemma2TextConfig.from_dict(wide)).eval()
-    load_text_state_dict(ours, dict(hf.state_dict()))
+    ours.load_state_dict(hf.state_dict())
     ids, mask = _ragged_batch([24], seq_len=24, vocab=128, seed=7)
     with torch.no_grad():
         hf_emb = _st_mean_pool_normalize(
