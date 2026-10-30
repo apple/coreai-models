@@ -151,6 +151,13 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     /// The whitespace limit named by `--json-max-whitespace`; nil for no limit.
     private var maxWhitespaceCount: Int? { jsonMaxWhitespace > 0 ? jsonMaxWhitespace : nil }
 
+    @Option(
+        name: .customLong("grammar-proposal-max"),
+        help:
+            "With --json-schema and speculative decoding: most tokens the grammar may propose in one verify block when it fully determines the next span (0 disables; default \(GrammarConstraint.defaultForcedRunLimit), at most \(GrammarConstraint.maxForcedRunLimit), the grammar's rollback budget less the anchor)."
+    )
+    var grammarProposalMax: Int?
+
     @Option(help: "Model inference engine variant. Defaults to 'default'")
     var inferenceEngineVariant: String = "default"
 
@@ -377,9 +384,13 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         if seed != nil && !speculating {
             throw ValidationError("--seed applies to speculative decoding (--draft-model or --prompt-lookup)")
         }
+        if let problem = SpeculativeDecodingOptions.grammarProposalProblem(
+            grammarProposalMax, speculating: speculating, hasSchema: jsonSchema != nil)
+        {
+            throw ValidationError(problem)
+        }
         if speculating {
             let unsupported = [
-                jsonSchema != nil ? "--json-schema" : nil,
                 videoPath != nil ? "--video" : nil,
                 continuation != nil ? "--continuation" : nil,
                 rawContinuation != nil ? "--raw-continuation" : nil,
@@ -390,6 +401,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             }
             let greedy = samplingStrategy.lowercased() == "greedy" || temperature == 0
             if let problem = SpeculativeDecodingOptions.samplingProblem(greedy: greedy, promptLookup: promptLookup)
+                ?? SpeculativeDecodingOptions.grammarSamplingProblem(greedy: greedy, hasSchema: jsonSchema != nil)
                 ?? SpeculativeDecodingOptions.imageProblem(hasImage: imagePath != nil, hasRawTokens: rawTokens != nil)
             {
                 throw ValidationError(problem)
@@ -603,6 +615,20 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             print(warning)
         }
 
+        // Grammar: with --json-schema (greedy only) acceptance follows the grammar, so the output is
+        // schema-valid while the target still verifies several tokens per pass. A span the grammar
+        // fully determines is proposed in place of drafted tokens.
+        var constraint: GrammarConstraint?
+        if let schemaInput = jsonSchema {
+            let session = try ConstrainedGenerationSession(
+                jsonSchema: try loadJSONSchema(schemaInput), tokenizer: tokenizer,
+                vocabSize: targetBundle.vocabSize, stopTokenIds: stopTokenIds.sorted(),
+                maxWhitespaceCount: maxWhitespaceCount)
+            let proposalMax = grammarProposalMax ?? GrammarConstraint.defaultForcedRunLimit
+            constraint = GrammarConstraint(session, tokenizer: tokenizer, forcedRunLimit: proposalMax)
+            print("Guided speculative decode: grammar proposals up to \(proposalMax) tokens")
+        }
+
         let decoder: SpeculativeDecoder
         let drafterLabel: String
         let adaptive = adaptiveDraftCount
@@ -659,7 +685,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             if useGreedy {
                 stats = try await decoder.generateGreedy(
                     promptTokens: promptTokensForGen, maxNewTokens: maxTokens,
-                    stopTokenIds: stopTokenIds,
+                    stopTokenIds: stopTokenIds, constraint: constraint,
                     onPrefillReady: onPrefillReady, onToken: onToken)
             } else {
                 stats = try await decoder.generateSampling(
@@ -695,6 +721,11 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             print(
                 "  lookup proposals:      \(stats.lookupProposals) blocks, "
                     + "\(stats.lookupTokensAccepted)/\(stats.lookupTokensProposed) tokens accepted")
+        }
+        if constraint != nil {
+            print(
+                "  grammar proposals:     \(stats.grammarProposals) blocks, "
+                    + "\(stats.grammarTokensAccepted)/\(stats.grammarTokensProposed) tokens accepted")
         }
     }
 
