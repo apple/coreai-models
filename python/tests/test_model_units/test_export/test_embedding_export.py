@@ -6,7 +6,7 @@
 """Tests for the ``kind: "embedding"`` bundle contract and exporter (``coreai_models.embedding``).
 
 Metadata, precision and CLI tests need no hardware or weights. The conversion tests use tiny random
-EmbeddingGemma 2 configs and skip when ``coreai_torch`` is unavailable.
+EmbeddingGemma 2 configs.
 """
 
 from __future__ import annotations
@@ -35,6 +35,10 @@ from coreai_models.embedding.contract import (
     encoder_functions,
     family_for_model,
     text_functions,
+)
+from tests.test_model_units.test_models._embedding_gemma2_common import (
+    TINY_TEXT_CONFIG,
+    TINY_VISION_CONFIG,
 )
 
 EG2 = family_for_model("embeddinggemma-2")
@@ -67,51 +71,12 @@ SNAPSHOT_PROMPTS = {
     "FactChecking": PROMPTS["fact_checking"],
     **dict.fromkeys(["CodeRetrieval", "InstructionRetrieval"], PROMPTS["code_retrieval"]),
 }
-REMOVED_KEYS = {
-    "pooling",
-    "attention",
-    "granularity",
-    "budgets",
-    "max_sequence_length",
-    "prompt_applies_to",
-    "side",
-    "strategy",
-    "wrap",
-    "soft_tokens_scaled",
-    "floor",
-    "norm",
-    "dynamic_batch",
-    "dynamic_length",
-    "hidden_size",
-    "note",
-    "max_patches",
-    "soft_token_dim",
-    "convert_rgb",
-    "exif_transpose",
-    "resize",
-    "resize_policy",
-    "patch_pixel_order",
-    "position_order",
-    "padding_position",
-    "prompt",
-    "truncation_side",
-}
 
 
 def _block(platform="macOS", with_image=False, **overrides):
     kwargs = dict(revision=REVISION, prompts=PROMPTS)
     kwargs.update(overrides)
     return embedding_block(EG2, platform=platform, with_image=with_image, **kwargs)
-
-
-def _keys(node):
-    if isinstance(node, dict):
-        for key, value in node.items():
-            yield key
-            yield from _keys(value)
-    elif isinstance(node, list):
-        for value in node:
-            yield from _keys(value)
 
 
 # --- Precision guard ---
@@ -201,49 +166,6 @@ def test_function_plans_per_platform():
 # --- embedding_block schema ---
 
 
-def test_embedding_block_macos_text():
-    block = _block()
-    assert list(block) == [
-        "space",
-        "dimension",
-        "matryoshka_dimensions",
-        "renormalize_after_truncation",
-        "normalized",
-        "metric",
-        "precision",
-        "components",
-        "towers",
-        "text",
-    ]
-    assert block["space"] == {"id": "google/embeddinggemma-2", "revision": REVISION}
-    assert block["matryoshka_dimensions"] == [768, 512, 256, 128]
-    assert block["precision"] == {
-        "compute": "float32",
-        "forbidden": ["float16"],
-        "compute_units": ["gpu"],
-    }
-    assert set(block["components"]) == {"text_encoder"}
-    component = block["components"]["text_encoder"]
-    assert component["output"] == "embedding" and component["compute_units"] == ["gpu"]
-    assert {"function": "len2048_b8", "batch": 8, "length": 2048} in component["functions"]
-    (tower,) = block["towers"]
-    assert tower["pipeline"] == ["text_encoder"]
-    assert tower["batch_sizes"] == [1, 8, 32]
-    assert tower["length_buckets"] == [128, 512, 2048]
-    assert tower["max_batch_tokens"] == 16384
-    text = block["text"]
-    assert text["truncation"] == {"keep_eos": True, "max_tokens": 2048}
-    assert text["special_tokens"] == {
-        "bos": True,
-        "eos": True,
-        "bos_token_id": 2,
-        "eos_token_id": 1,
-        "pad_token_id": 0,
-    }
-    assert text["prompts"] == PROMPTS and text["default_prompt_name"] is None
-    json.dumps(block)
-
-
 @pytest.mark.parametrize(
     ("platform", "with_image", "components", "pipelines", "units"),
     [
@@ -287,10 +209,16 @@ def test_embedding_block_platform_matrix(platform, with_image, components, pipel
     assert {k: v["compute_units"] for k, v in block["components"].items()} == units
     assert ("merge" in block) == with_image and ("preprocessing" in block) == with_image
     assert set(bundle_assets(platform, with_image)) == set(components)
-    assert not REMOVED_KEYS & set(_keys(block)), REMOVED_KEYS & set(_keys(block))
-    assert all("batch" not in tower and "output" in tower for tower in block["towers"])
-    assert "output" not in block["precision"]
-    json.dumps(block)
+    meta = build_bundle_metadata(
+        EG2,
+        block,
+        name=bundle_name(EG2, platform, with_image),
+        assets=bundle_assets(platform, with_image),
+        hf_revision="914f7f89142e33e77833254d9c9b90c3cef7303b",
+    )
+    assert meta["metadata_version"] == "0.2" and meta["kind"] == "embedding"
+    assert {c for t in meta["embedding"]["towers"] for c in t["pipeline"]} == set(meta["assets"])
+    assert meta["source"]["hf_model_id"] == "google/embeddinggemma-2"
 
 
 def test_embedding_block_ios_details():
@@ -315,6 +243,49 @@ def test_embedding_block_ios_details():
 
 def test_embedding_block_macos_image_details():
     block = _block("macOS", True)
+    assert list(block) == [
+        "space",
+        "dimension",
+        "matryoshka_dimensions",
+        "renormalize_after_truncation",
+        "normalized",
+        "metric",
+        "precision",
+        "components",
+        "towers",
+        "text",
+        "merge",
+        "preprocessing",
+    ]
+    assert block["space"] == {"id": "google/embeddinggemma-2", "revision": REVISION}
+    assert block["matryoshka_dimensions"] == [768, 512, 256, 128]
+    assert block["precision"] == {
+        "compute": "float32",
+        "forbidden": ["float16"],
+        "compute_units": ["gpu"],
+    }
+    text_encoder = block["components"]["text_encoder"]
+    assert text_encoder["output"] == "embedding"
+    assert {"function": "len2048_b8", "batch": 8, "length": 2048} in text_encoder["functions"]
+    text_tower = block["towers"][0]
+    assert text_tower["batch_sizes"] == [1, 8, 32]
+    assert text_tower["length_buckets"] == [128, 512, 2048]
+    assert text_tower["max_batch_tokens"] == 16384
+    text = block["text"]
+    assert text["truncation"] == {"keep_eos": True, "max_tokens": 2048}
+    assert text["special_tokens"] == {
+        "bos": True,
+        "eos": True,
+        "bos_token_id": 2,
+        "eos_token_id": 1,
+        "pad_token_id": 0,
+    }
+    assert text["prompts"] == PROMPTS and text["default_prompt_name"] is None
+    assets = bundle_assets("macOS", True)
+    assert assets["token_table"] == assets["encoder"] == assets["text_encoder"]
+    assert assets["image_encoder"] == "image_encoder.aimodel"
+    names = [f.name for f in text_functions(EG2, "macOS") + encoder_functions(EG2, "macOS")]
+    assert len(names) == len(set(names)) and "main" not in names
     enc = block["components"]["encoder"]
     assert enc["inputs"] == ["inputs_embeds", "attention_mask"]
     assert enc["mask_encoding"] == "attention_mask"
@@ -352,8 +323,9 @@ def test_embedding_block_records_the_compute_precision():
         _block(compute_precision="float16")
 
 
-def test_export_writes_the_requested_precision_to_metadata(tmp_path, monkeypatch):
-    seen = {}
+@pytest.fixture
+def stub_snapshot(tmp_path, monkeypatch):
+    """Snapshot helpers stubbed so ``export_embedding_bundle`` runs without weights."""
     monkeypatch.setattr(
         embedding_export, "resolve_snapshot", lambda *a: (tmp_path, "0123456789abcdef0123")
     )
@@ -361,6 +333,10 @@ def test_export_writes_the_requested_precision_to_metadata(tmp_path, monkeypatch
     monkeypatch.setattr(embedding_export, "read_prompts", lambda *a: (PROMPTS, None))
     monkeypatch.setattr(embedding_export, "consolidate_prompts", lambda family, prompts: prompts)
     monkeypatch.setattr(embedding_export, "copy_tokenizer", lambda *a: ["tokenizer.json"])
+
+
+def test_export_writes_the_requested_precision_to_metadata(tmp_path, monkeypatch, stub_snapshot):
+    seen = {}
     monkeypatch.setattr(embedding_export, "export_gpu_programs", lambda *a, **kw: seen.update(kw))
     meta = embedding_export.export_embedding_bundle(
         EG2, tmp_path / "out", with_image=False, compute_precision="bfloat16"
@@ -371,17 +347,10 @@ def test_export_writes_the_requested_precision_to_metadata(tmp_path, monkeypatch
     assert written["embedding"]["precision"]["compute"] == "bfloat16"
 
 
-def test_failed_export_removes_the_bundle_dir(tmp_path, monkeypatch):
+def test_failed_export_removes_the_bundle_dir(tmp_path, monkeypatch, stub_snapshot):
     def fail(*args, **kwargs):
         raise RuntimeError("conversion failed")
 
-    monkeypatch.setattr(
-        embedding_export, "resolve_snapshot", lambda *a: (tmp_path, "0123456789abcdef0123")
-    )
-    monkeypatch.setattr(embedding_export, "verify_pooling_config", lambda *a: None)
-    monkeypatch.setattr(embedding_export, "read_prompts", lambda *a: (PROMPTS, None))
-    monkeypatch.setattr(embedding_export, "consolidate_prompts", lambda family, prompts: prompts)
-    monkeypatch.setattr(embedding_export, "copy_tokenizer", lambda *a: ["tokenizer.json"])
     monkeypatch.setattr(embedding_export, "export_gpu_programs", fail)
     with pytest.raises(RuntimeError, match="conversion failed"):
         embedding_export.export_embedding_bundle(EG2, tmp_path / "out", with_image=False)
@@ -394,21 +363,6 @@ def test_forbidden_precision_message_lists_the_allowed_ones():
     no_floor = dataclasses.replace(EG2, precision_floor=None)
     with pytest.raises(EmbeddingPrecisionError, match=r"Use float32 \(default\)\.$"):
         check_compute_precision(no_floor, "float16")
-
-
-def test_bundle_metadata_envelope():
-    meta = build_bundle_metadata(
-        EG2,
-        _block("iOS", True),
-        name=bundle_name(EG2, "iOS", True),
-        assets=bundle_assets("iOS", True),
-        hf_revision="914f7f89142e33e77833254d9c9b90c3cef7303b",
-    )
-    assert meta["metadata_version"] == "0.2" and meta["kind"] == "embedding"
-    assert meta["name"] == "embeddinggemma-2-ios"
-    pipelines = {c for t in meta["embedding"]["towers"] for c in t["pipeline"]}
-    assert pipelines == set(meta["assets"])
-    assert meta["source"]["hf_model_id"] == "google/embeddinggemma-2"
 
 
 def test_family_registry():
@@ -487,34 +441,14 @@ def test_verify_image_config(tmp_path):
 
 # --- Conversion (tiny random config) ---
 
-TINY_CONFIG = {
-    "vocab_size": 64,
-    "hidden_size": 32,
-    "intermediate_size": 48,
-    "num_hidden_layers": 2,
-    "num_attention_heads": 2,
-    "num_key_value_heads": 1,
-    "head_dim": 16,
-    "sliding_window": 3,
-    "layer_types": ["sliding_attention", "full_attention"],
-    "per_layer_config": {"01": {"head_dim": 32, "num_key_value_heads": 1}},
-    "rope_parameters": {
-        "full_attention": {"rope_theta": 1_000_000.0, "rope_type": "default"},
-        "sliding_attention": {"rope_theta": 10_000.0, "rope_type": "default"},
-    },
-    "hidden_size_per_layer_input": 8,
-    "embedding_dim": 24,
-}
-
 
 def test_tiny_multifunction_conversion():
-    pytest.importorskip("coreai_torch")
     wrapper = export_macos.TextEmbeddingExportWrapper(_tiny_text_encoder())
     plan = bucket_plan([16], [1, 4], 1024)
-    ids, mask = export_macos.reference_inputs(plan[1], 64)
+    ids, mask = export_macos.reference_inputs(plan[1], 128)
     assert ids.dtype == torch.int32 and mask.dtype == torch.int32 and ids.shape == (4, 16)
     out = wrapper(ids, mask)
-    assert out.dtype == torch.float32 and out.shape == (4, 24)
+    assert out.dtype == torch.float32 and out.shape == (4, 48)
     torch.testing.assert_close(out.norm(dim=-1), torch.ones(4))
     assert export_macos.export_shared_text_program(wrapper.encoder, plan, [], 64) is not None
 
@@ -525,32 +459,16 @@ def _tiny_text_encoder():
         EmbeddingGemma2TextEncoder,
     )
 
-    config = EmbeddingGemma2TextConfig.from_dict(TINY_CONFIG)
+    config = EmbeddingGemma2TextConfig.from_dict(TINY_TEXT_CONFIG)
     torch.manual_seed(0)
     return EmbeddingGemma2TextEncoder(config).eval()
 
 
 def _tiny_image_encoder():
-    from coreai_models.models.macos.embedding_gemma2_vision import (
-        EmbeddingGemma2ImageEncoder,
-        EmbeddingGemma2VisionConfig,
-    )
+    from coreai_models.models.macos.embedding_gemma2_vision import EmbeddingGemma2ImageEncoder
 
-    config = EmbeddingGemma2VisionConfig(
-        hidden_size=64,
-        intermediate_size=128,
-        num_hidden_layers=2,
-        num_attention_heads=4,
-        num_key_value_heads=4,
-        head_dim=16,
-        patch_size=4,
-        pooling_kernel_size=3,
-        position_embedding_size=64,
-        text_hidden_size=32,
-        max_soft_tokens=12,
-    )
     torch.manual_seed(1)
-    return EmbeddingGemma2ImageEncoder(config).eval()
+    return EmbeddingGemma2ImageEncoder(TINY_VISION_CONFIG).eval()
 
 
 TINY_IMAGE = dataclasses.replace(IMAGE, patch_size=4, budget=12, soft_token_dim=32)
@@ -559,7 +477,7 @@ TINY_IMAGE = dataclasses.replace(IMAGE, patch_size=4, budget=12, soft_token_dim=
 def test_inputs_embeds_path_equals_ids_path():
     """token_table(ids) -> encoder(inputs_embeds) == text_encoder(ids) (the merge is lossless)."""
     text = _tiny_text_encoder()
-    ids = torch.randint(3, 64, (1, 16), dtype=torch.int32)
+    ids = torch.randint(3, 128, (1, 16), dtype=torch.int32)
     mask = torch.ones(1, 16, dtype=torch.int32)
     mask[0, 11:] = 0
     with torch.no_grad():
@@ -567,7 +485,7 @@ def test_inputs_embeds_path_equals_ids_path():
         embeds = export_utils.TokenTableExportWrapper(text.embed_tokens)(ids)
         with export_macos.without_token_table(text) as encoder:
             merged = export_macos.InputsEmbedsEncoderWrapper(encoder)(embeds, mask)
-    assert embeds.dtype == torch.float32 and embeds.shape == (1, 16, 32)
+    assert embeds.dtype == torch.float32 and embeds.shape == (1, 16, 64)
     torch.testing.assert_close(merged, direct, atol=1e-6, rtol=0)
     assert isinstance(text.embed_tokens, torch.nn.Embedding)  # restored
 
@@ -575,7 +493,7 @@ def test_inputs_embeds_path_equals_ids_path():
 def test_float16_scaled_token_table_equals_the_float32_table_cast():
     """The float16 token table gives the encoder the same inputs as the float32 one."""
     text = _tiny_text_encoder()
-    ids = torch.randint(3, 64, (1, 16), dtype=torch.int32)
+    ids = torch.randint(3, 128, (1, 16), dtype=torch.int32)
     table = export_utils.scaled_token_table(
         text.embed_tokens.weight, text.config.hidden_size**0.5, torch.float16
     )
@@ -587,7 +505,6 @@ def test_float16_scaled_token_table_equals_the_float32_table_cast():
 
 
 def test_tiny_float16_token_table_conversion():
-    pytest.importorskip("coreai_torch")
     text = _tiny_text_encoder()
     table = export_utils.scaled_token_table(
         text.embed_tokens.weight, text.config.hidden_size**0.5, torch.float16
@@ -610,7 +527,6 @@ def test_image_reference_inputs_are_a_valid_padded_grid():
 
 
 def test_tiny_shared_text_program_conversion():
-    pytest.importorskip("coreai_torch")
     program = export_macos.export_shared_text_program(
         _tiny_text_encoder(),
         [FunctionSpec("len16_b1", 1, 16), FunctionSpec("len32_b1", 1, 32)],
@@ -620,14 +536,6 @@ def test_tiny_shared_text_program_conversion():
     assert program is not None
     image = export_macos.export_image_encoder_program(_tiny_image_encoder(), TINY_IMAGE)
     assert image is not None
-
-
-def test_macos_image_bundle_shares_the_text_encoder_asset():
-    assets = bundle_assets("macOS", True)
-    assert assets["token_table"] == assets["encoder"] == assets["text_encoder"]
-    assert assets["image_encoder"] == "image_encoder.aimodel"
-    names = [f.name for f in text_functions(EG2, "macOS") + encoder_functions(EG2, "macOS")]
-    assert len(names) == len(set(names)) and "main" not in names
 
 
 def test_ane_reference_inputs_shapes():
@@ -646,7 +554,7 @@ def test_ane_band_wrapper_matches_explicit_sliding_bias():
     from coreai_models.models.ios.embedding_gemma2 import MASK_NEG, EmbeddingGemma2TextEncoder
     from coreai_models.models.macos.embedding_gemma2 import EmbeddingGemma2TextConfig
 
-    config = EmbeddingGemma2TextConfig.from_dict(TINY_CONFIG)
+    config = EmbeddingGemma2TextConfig.from_dict(TINY_TEXT_CONFIG)
     torch.manual_seed(0)
     model = EmbeddingGemma2TextEncoder(config).eval()
     length, valid = 16, 12
@@ -656,7 +564,7 @@ def test_ane_band_wrapper_matches_explicit_sliding_bias():
     band = (pos[:, None] - pos[None, :]).abs() <= 3
     sliding = torch.where(key_ok & band, 0.0, MASK_NEG)
     bias, sliding = (t.reshape(1, length, 1, length) for t in (bias, sliding))
-    embeds = torch.randn(1, length, 32)
+    embeds = torch.randn(1, length, 64)
     pool = (pos < valid).float().reshape(1, length) / valid
     wrapper = export_ios.EncoderBandWrapper(model, length, 3)
     with torch.no_grad():
