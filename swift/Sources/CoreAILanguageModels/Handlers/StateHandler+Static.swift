@@ -295,8 +295,27 @@ struct SlidingRing: Equatable {
     /// after the rewind point overwrite the slots of earlier ones; the next query at
     /// `target` still needs the `window - 1` keys before it, which survive only while
     /// at most `depth - window + 1` positions have been written past it.
-    func allowsRewind(processed: Int, to target: Int) -> Bool {
-        target == 0 || processed - target <= depth - window + 1
+    ///
+    /// The next forward restarts at the batch boundary at or below `target`, so
+    /// `alignment` (the batch width that forward runs in) moves the position whose keys
+    /// are needed back by up to `alignment - 1`. A rewind to 0 is always allowed.
+    func allowsRewind(processed: Int, to target: Int, alignment: Int = 1) -> Bool {
+        let restart = alignment > 1 ? target / alignment * alignment : target
+        return target == 0 || processed - restart <= depth - window + 1
+    }
+
+    /// Longest verify block (anchor plus proposal) that can be rolled back to its anchor at
+    /// any position under `allowsRewind`.
+    ///
+    /// `allowsRewind` lets `depth - window + 1` positions be written past the restart. Rejecting
+    /// every draft of an `n`-token block rewinds from the block's end to just after the anchor,
+    /// `n - 1` positions, and the restart can sit `alignment - 1` below that target. So the block
+    /// is safe when `(n - 1) + (alignment - 1) <= depth - window + 1`, that is
+    /// `n <= depth - window + 3 - alignment`.
+    func maxVerifyBlockLength(alignment: Int) -> Int {
+        let slack = depth - window + 1
+        let restartBelowTarget = max(1, alignment) - 1
+        return max(1, slack - restartBelowTarget + 1)
     }
 }
 
@@ -317,8 +336,8 @@ struct StaticStateSet {
     /// Whether the states can be truncated from `processed` back to `target`
     /// positions. Flat caches always can; a sliding-window ring only while it still
     /// holds the keys the next query needs.
-    func canTruncate(processed: Int, to target: Int) -> Bool {
-        slidingRing?.allowsRewind(processed: processed, to: target) ?? true
+    func canTruncate(processed: Int, to target: Int, alignment: Int = 1) -> Bool {
+        slidingRing?.allowsRewind(processed: processed, to: target, alignment: alignment) ?? true
     }
 
     /// Lay out the bucketed states for the bucket about to run. Fixed states
