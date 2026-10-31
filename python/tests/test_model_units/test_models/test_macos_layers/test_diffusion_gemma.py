@@ -373,9 +373,9 @@ def test_load_state_dict_from_hub_mocked() -> None:
 
     with (
         mock.patch("huggingface_hub.snapshot_download", return_value="/tmp/x"),
-        mock.patch.object(base, "_resolve_safetensors_files", return_value=[]),
+        mock.patch.object(base, "resolve_safetensors_files", return_value=[]),
         mock.patch.object(base, "_build_safetensors_key_index", return_value=({}, {})),
-        mock.patch.object(base, "_load_tensors_for_keys", return_value={}),
+        mock.patch.object(base, "load_tensors_for_keys", return_value={}),
     ):
         sd = dgm._load_state_dict_from_hub("some/model", torch.float32, num_layers=2)
     assert sd == {}

@@ -15,9 +15,11 @@ from coreai_models.model_registry import (
     ModelPreset,
     _preset_to_export_args,
     _preset_to_output_name,
+    _utility_to_export_args,
     filter_presets,
     filter_utility_models,
     lookup_preset,
+    lookup_utility_model,
     presets_for_type,
     try_lookup_preset,
 )
@@ -210,3 +212,40 @@ def test_utility_platform_filter_excludes_macos_only() -> None:
     names = [u.short_name for u in ios_models]
     assert "depth-anything-3-small" not in names
     assert "clip-vit-b32" in names
+
+
+def test_embedding_utility_models_have_a_matching_family() -> None:
+    from coreai_models.embedding.contract import EMBEDDING_FAMILIES
+    from coreai_models.model_registry import UTILITY_PRESETS
+
+    rows = [u for u in UTILITY_PRESETS if u.export_script == "coreai.embedding.export"]
+    assert rows
+    for row in rows:
+        assert row.short_name in EMBEDDING_FAMILIES
+        assert EMBEDDING_FAMILIES[row.short_name].hf_model_id == row.hf_id
+
+
+def test_embedding_export_args_use_the_console_script() -> None:
+    model = lookup_utility_model("embeddinggemma-2")
+    assert model is not None
+    assert _utility_to_export_args(model, "iOS") == [
+        "uv",
+        "run",
+        "coreai.embedding.export",
+        "embeddinggemma-2",
+        "--platform",
+        "iOS",
+    ]
+    assert _utility_to_export_args(model, "macOS")[-1] == "embeddinggemma-2"
+
+
+def test_script_utility_export_args_run_the_script() -> None:
+    model = lookup_utility_model("clip-vit-b32")
+    assert model is not None
+    assert _utility_to_export_args(model) == [
+        "uv",
+        "run",
+        "models/clip/export.py",
+        "--model",
+        "openai/clip-vit-base-patch32",
+    ]

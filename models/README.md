@@ -133,7 +133,7 @@ Pass `--include-debug-info` to switch the converter to `DEBUG` mode, which embed
 uv run coreai.llm.export Qwen/Qwen3-0.6B --include-debug-info
 ```
 
-The flag is available on `coreai.llm.export`, `coreai.vlm.export`, `coreai.diffusion.export`, `coreai.segmentation.export`, and every standalone `models/<name>/export.py` recipe, so all export paths produce assets carrying the same debug information by default.
+The flag is available on `coreai.llm.export`, `coreai.vlm.export`, `coreai.diffusion.export`, `coreai.segmentation.export`, `coreai.embedding.export`, and every standalone `models/<name>/export.py` recipe, so all export paths produce assets carrying the same debug information by default.
 
 **Note:** `--include-debug-info` is independent of `--verbose`/`-v`. `--verbose` only raises the console log level; it does not change what goes into the asset.
 
@@ -188,6 +188,16 @@ This produces a single `<name>/` bundle (`kind=vlm`) holding the text
 decoder (`main`), token-embedding lookup (`embedding`), vision encoder
 (`vision`), tokenizer, and `metadata.json`. Pass `--skip-vision` to export the
 text portion only.
+
+### Embedding Models
+
+```bash
+uv run coreai.embedding.export --list-models
+uv run coreai.embedding.export embeddinggemma-2                 # text + image (macOS)
+uv run coreai.embedding.export embeddinggemma-2 --platform iOS  # Neural Engine
+```
+
+See the [EmbeddingGemma 2](embedding_gemma2) model card.
 
 ### Standalone Export Scripts
 
@@ -245,9 +255,13 @@ uv run models/<name>/export.py --include-debug-info   # embed debug information 
 - [RoBERTa](roberta)
 - [T5](t5)
 
+### Embedding Models
+
+- [EmbeddingGemma 2](embedding_gemma2)
+
 ## Adding a Model
 
-To make a new model exportable via short-name, add a `ModelPreset(...)` entry to `LLM_PRESETS` or `DIFFUSION_PRESETS` in [`python/src/coreai_models/model_registry.py`](../python/src/coreai_models/model_registry.py). Set the short name, HuggingFace ID, family, variant, and the export defaults (compression, compute precision, max context length).
+To make a new model exportable via short-name, add a `ModelPreset(...)` entry to `LLM_PRESETS` or `DIFFUSION_PRESETS` in [`python/src/coreai_models/model_registry.py`](../python/src/coreai_models/model_registry.py). Set the short name, HuggingFace ID, family, variant, and the export defaults (compression, compute precision, max context length). Models exported by `coreai.embedding.export` need an `EmbeddingFamily` in `EMBEDDING_FAMILIES` ([`python/src/coreai_models/embedding/contract.py`](../python/src/coreai_models/embedding/contract.py)) and a `UtilityModel` entry with task `embedding` in `UTILITY_PRESETS`.
 
 For models with bespoke export logic that doesn't fit the standard `coreai.llm.export` / `coreai.diffusion.export` flow, write a standalone recipe under `models/<name>/export.py` — see existing recipes for the [PEP 723](https://peps.python.org/pep-0723/) pattern and `models/README.md` for the contribution checklist.
 

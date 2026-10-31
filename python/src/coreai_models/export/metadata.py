@@ -362,6 +362,17 @@ _METADATA: dict[str, AIModelMetadataFields] = {
             "Source: https://huggingface.co/Efficient-Large-Model/Sana_Sprint_0.6B_1024px_diffusers"
         ),
     ),
+    # ---- Embedding ----
+    "google/embeddinggemma-2": AIModelMetadataFields(
+        author="Google DeepMind",
+        license="Apache-2.0",
+        model_description=(
+            "EmbeddingGemma 2 is a multimodal retrieval embedding model from Google DeepMind "
+            "producing 768-d L2-normalized vectors (Matryoshka prefixes 512/256/128) for text "
+            "and images in one space. "
+            "Source: https://huggingface.co/google/embeddinggemma-2"
+        ),
+    ),
     # ---- Segmentation ----
     "facebook/sam3": AIModelMetadataFields(
         author="N. Carion et al.",

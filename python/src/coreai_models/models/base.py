@@ -231,8 +231,16 @@ def _save_and_mmap_safetensors(
     module.load_state_dict(new_sd, assign=True, strict=False)
 
 
-def _resolve_safetensors_files(model_dir: str) -> list[str]:
-    """Resolve the safetensors file paths in a local HuggingFace model directory."""
+def resolve_safetensors_files(model_dir: str) -> list[str]:
+    """Return the safetensors paths of a local HuggingFace model directory.
+
+    Returns the shards listed in ``model.safetensors.index.json`` if present, else
+    ``model.safetensors``.
+
+    Raises:
+        FileNotFoundError: if neither file exists or an indexed shard is missing.
+        RuntimeError: if the index has no ``weight_map``.
+    """
     single_path = os.path.join(model_dir, "model.safetensors")
     index_path = os.path.join(model_dir, "model.safetensors.index.json")
 
@@ -306,14 +314,14 @@ def _build_safetensors_key_index(
     return per_layer, shared
 
 
-def _load_tensors_for_keys(
+def load_tensors_for_keys(
     key_to_file: dict[str, str],
     target_dtype: torch.dtype,
 ) -> dict[str, torch.Tensor]:
-    """Load specific tensors from safetensors files by key.
+    """Load the tensors in ``key_to_file`` (tensor name -> safetensors path), keyed by name.
 
-    Each safetensors file is opened at most once. Tensors are cast to
-    ``target_dtype`` except embedding tables and quantization zero-points.
+    Tensors are cast to ``target_dtype`` except those whose names contain ``embedding_table`` or
+    ``zero_point``.
     """
     file_to_keys: dict[str, list[str]] = {}
     for key, path in key_to_file.items():
@@ -876,7 +884,7 @@ class BaseForCausalLM(torch.nn.Module):
         model = cls(**init_kwargs)
         model.to(dtype=target_dtype)
 
-        safetensors_files = _resolve_safetensors_files(model_dir)
+        safetensors_files = resolve_safetensors_files(model_dir)
         per_layer_index, shared_index = _build_safetensors_key_index(
             safetensors_files,
             num_layers=num_layers,
@@ -885,7 +893,7 @@ class BaseForCausalLM(torch.nn.Module):
         )
 
         # Shared params first (embeddings, norm, lm_head, ...).
-        shared_dict = _load_tensors_for_keys(shared_index, target_dtype)
+        shared_dict = load_tensors_for_keys(shared_index, target_dtype)
         shared_dict = {k.removeprefix(hf_state_dict_prefix): v for k, v in shared_dict.items()}
         del shared_index
 
@@ -903,7 +911,7 @@ class BaseForCausalLM(torch.nn.Module):
         exclude_buffers = {KVCache.HF_K_BUFFER_NAME, KVCache.HF_V_BUFFER_NAME}
         for layer_idx in sorted(per_layer_index.keys()):
             layer_key_to_file = per_layer_index.pop(layer_idx)
-            layer_sd = _load_tensors_for_keys(layer_key_to_file, target_dtype)
+            layer_sd = load_tensors_for_keys(layer_key_to_file, target_dtype)
             layer_sd = {k.removeprefix(hf_state_dict_prefix): v for k, v in layer_sd.items()}
             del layer_key_to_file
 
