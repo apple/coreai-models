@@ -517,7 +517,7 @@ public struct VisionConfig: Codable, Sendable, Equatable {
 /// `vision.token_merge`, and ``EngineFactory`` picks the engine from it.
 public enum VisionTokenMerge: String, Codable, Sendable {
     /// Text embeddings come from a separate `embedding` asset. The soft tokens are scattered into
-    /// them before the decoder, which consumes embeddings (Qwen-style, `CoreAISequentialVLMEngine`).
+    /// them before the decoder, which consumes embeddings (Qwen-style, `CoreAISequentialEngine`).
     case separateEmbedding = "separate_embedding"
     /// The decoder graph embeds its own tokens. The soft tokens overwrite the placeholder rows
     /// after that gather (Gemma 4, `StaticShapeEngine`).

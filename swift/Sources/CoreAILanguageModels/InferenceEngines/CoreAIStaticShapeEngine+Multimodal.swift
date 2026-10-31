@@ -15,8 +15,8 @@ import Foundation
 /// the image with the separate `vision.aimodel`, scatter the soft tokens into the
 /// gathered embeddings at placeholder positions, and everything else (decoder graph,
 /// PLE, masks, KV cache) is unchanged — image tokens ride the ordinary causal prefill
-/// path. Unlike `CoreAISequentialVLMEngine` (separate `embed_tokens`+`project`, a
-/// growing single cache), this reuses the ladder's dual-cache/PLE engine and only
+/// path. Unlike the separate-embedding path of `CoreAISequentialEngine` (separate
+/// `embed_tokens`+`project`, a growing single cache), this reuses the ladder's dual-cache/PLE engine and only
 /// adds the encode + scatter steps.
 ///
 /// `vision.aimodel` is itself a ladder of canvas sizes
