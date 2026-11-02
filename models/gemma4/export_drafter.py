@@ -108,6 +108,18 @@ TOP_LEVEL_TENSORS = (
 # Sidecar format version. A consumer reads a missing version as 1 and rejects one newer than it
 # understands, so bump it when a field is removed or changes meaning; adding a field needs no bump.
 SIDECAR_VERSION = 1
+# What the head expects of the target, written to `draft_step.json` so the runtime can check it
+# instead of assuming it. A runtime rejects a value it does not implement.
+#   hidden_states_output: the name of the decode graphs' final post-norm hidden state output.
+#   token_embedding: "unscaled" -- the head takes `embed_tokens(token)` before the sqrt(hidden)
+#     scale the backbone applies.
+#   kv_source: "last_storing_layer" -- the shared K/V are those of the target's last layer that
+#     stores K/V, for the full-attention and the sliding cache each.
+CONTRACT = {
+    "hidden_states_output": "hidden_states",
+    "token_embedding": "unscaled",
+    "kv_source": "last_storing_layer",
+}
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -427,6 +439,7 @@ def export(model_id: str, drafter: Path, window: int, max_context: int, out_dir:
         json.dumps(
             {
                 "version": SIDECAR_VERSION,
+                "contract": CONTRACT,
                 "full_windows": sizes,
                 "sliding_theta": rope["sliding_attention"]["rope_theta"],
                 "full_theta": rope["full_attention"]["rope_theta"],

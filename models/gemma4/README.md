@@ -143,7 +143,10 @@ The token-embedding lookup and the candidate scan stay outside the program, over
 component: the program under `assets.drafter`, and `drafter_config`, `drafter_scan` and
 `drafter_scan_index` under `auxiliary_assets`. It also sets `speculative.drafter_kind` to `mtp`,
 because other drafters use the same `drafter` asset key with different semantics; `--bundle`
-refuses a bundle that already declares one. The head attends to the target's K/V in the most
+refuses a bundle that already declares one. `draft_step.json` also records what the head expects of
+the target (the hidden-state output name, an unscaled token embedding, and K/V from the target's
+last storing layer) under `contract`, and the runner refuses a head whose expectations it does
+not implement. The head attends to the target's K/V in the most
 recent 512 positions in its sliding layers and to the whole context in its full-attention layer.
 
 ### Runner side

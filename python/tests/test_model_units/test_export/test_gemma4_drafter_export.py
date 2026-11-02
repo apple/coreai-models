@@ -409,6 +409,16 @@ def test_sidecars_carry_a_format_version(tmp_path):
     assert json.loads((tmp_path / "draft_scan.json").read_text())["version"] == 1
 
 
+def test_the_sidecar_contract_names_what_the_head_expects_of_the_target():
+    # The runtime checks these values by name; changing one is a change of meaning for a consumer.
+    assert export_drafter.CONTRACT == {
+        "hidden_states_output": "hidden_states",
+        "token_embedding": "unscaled",
+        "kv_source": "last_storing_layer",
+    }
+    assert export_drafter.CONTRACT["hidden_states_output"] == export_g4.HIDDEN_STATES_OUTPUT_NAME
+
+
 def test_scaled_rms_norm_matches_the_textbook_form_without_overflowing_fp16():
     g = torch.Generator().manual_seed(0)
     weight = torch.randn(64, generator=g)

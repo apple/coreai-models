@@ -288,6 +288,7 @@ struct SlidingRing: Equatable {
 
     /// Name of the state whose sequence extent is the ring depth.
     static let keyCacheName = "sliding_key_cache"
+    static let valueCacheName = "sliding_value_cache"
 
     /// Whether the written prefix can be rewound from `processed` to `target` positions.
     ///
@@ -338,6 +339,12 @@ struct StaticStateSet {
     /// holds the keys the next query needs.
     func canTruncate(processed: Int, to target: Int, alignment: Int = 1) -> Bool {
         slidingRing?.allowsRewind(processed: processed, to: target, alignment: alignment) ?? true
+    }
+
+    /// A state's backing array, from whichever handler owns it; nil when none does. Lets a draft
+    /// head read the target's shared K/V in place.
+    func stateArray(named name: String) -> NDArray? {
+        bucketed?.arrays[name] ?? fixed?.arrays[name]
     }
 
     /// Lay out the bucketed states for the bucket about to run. Fixed states
