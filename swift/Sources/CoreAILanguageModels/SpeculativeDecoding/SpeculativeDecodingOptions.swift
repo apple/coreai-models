@@ -34,6 +34,28 @@ package enum SpeculativeDecodingOptions {
             "--prompt-lookup does not support sampling (it supplies no draft logits); use --sampling-strategy greedy"
     }
 
+    /// Grammar-masked acceptance is defined for the argmax only, so a schema needs greedy decoding.
+    package static func grammarSamplingProblem(greedy: Bool, hasSchema: Bool) -> String? {
+        guard hasSchema, !greedy else { return nil }
+        return "--json-schema with speculative decoding requires greedy decoding; "
+            + "use --sampling-strategy greedy"
+    }
+
+    /// A message when `--grammar-proposal-max` is outside 0 to ``GrammarConstraint/maxForcedRunLimit``,
+    /// or is given without both speculative decoding and `--json-schema`, which are what it applies to.
+    package static func grammarProposalProblem(_ limit: Int?, speculating: Bool, hasSchema: Bool) -> String? {
+        guard let limit else { return nil }
+        guard speculating, hasSchema else {
+            return "--grammar-proposal-max applies to speculative decoding with --json-schema"
+        }
+        guard (0...GrammarConstraint.maxForcedRunLimit).contains(limit) else {
+            return "--grammar-proposal-max must be between 0 and \(GrammarConstraint.maxForcedRunLimit) "
+                + "(the grammar session rolls back at most \(ConstrainedGenerationSession.maxRollbackTokens) "
+                + "tokens, one of them the anchor); got \(limit)"
+        }
+        return nil
+    }
+
     /// A message naming the first of `used`, command-line options that have no meaning with
     /// speculative decoding (they need a generation mode it does not provide), or `nil`.
     package static func unsupportedProblem(used: [String]) -> String? {

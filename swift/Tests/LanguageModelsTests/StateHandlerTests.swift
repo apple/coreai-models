@@ -153,6 +153,11 @@ struct InferKindTests {
             ("valueCache", [28, 1, 8, 1024, 128], .kvCache),
             ("slidingKeyCache", [20, 1, 8, 512, 128], .slidingCache),
             ("convState", [24, 1, 4, 2048], .fixed),
+            // A hybrid vision-language decoder (MiniCPM-V 4.6) exported without `language.states`.
+            ("k_cache", [6, 1, 2, -1, 256], .kvCache),
+            ("v_cache", [6, 1, 2, -1, 256], .kvCache),
+            ("conv_states", [18, 1, 6144, 3], .fixed),
+            ("recurrent_states", [18, 1, 16, 128, 128], .fixed),
         ])
     func classify(state: (String, [Int], StateKind)) {
         #expect(StateHandlerFactory.inferKind(name: state.0, shape: state.1) == state.2)
