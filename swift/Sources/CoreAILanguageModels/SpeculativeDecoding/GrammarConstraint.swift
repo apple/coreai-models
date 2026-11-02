@@ -81,8 +81,10 @@ package final class GrammarConstraint {
         return Int32(index)
     }
 
-    /// Advance the grammar by a committed token.
+    /// Advance the grammar by a committed token. A terminated grammar takes no more tokens: the
+    /// slots a verify block scores past the stop token are never emitted, so they leave it as it is.
     func accept(_ token: Int32) {
+        guard !session.isTerminated else { return }
         if session.acceptToken(token) { acceptedCount += 1 }
     }
 
