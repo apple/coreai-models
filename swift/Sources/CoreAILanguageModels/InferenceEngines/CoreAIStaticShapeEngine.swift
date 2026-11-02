@@ -29,6 +29,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     private static let keyCacheName = "key_cache"
     private static let valueCacheName = "value_cache"
     private static let embeddingTableName = "embedding_table"
+    private static let hiddenStatesOutputName = "hidden_states"
     private static let tokenIDsInputName = "in_new_token_ids"
     private static let gatheredOutputName = "out_transformer_input"
 
@@ -735,6 +736,10 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     private struct SpecCaptureResult {
         var logits: [[LogitsScalarType]] = []
         var argmax: [Int32] = []
+        /// The post-norm final hidden state of each captured position, flattened row by row, when the
+        /// decode graphs emit `hidden_states`; `hiddenDim` is a row's width.
+        var hidden: [Float] = []
+        var hiddenDim = 0
     }
 
     /// Runs the delta `tokens` through the static-shape graph at the current position and
@@ -798,6 +803,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
             var outputs = try await runStaticStep(
                 function: fn, descriptor: desc, inputs: inputs, states: states)
             let logitsArray = outputs.remove(Self.logitsOutputName)?.ndArray
+            let hiddenArray = outputs.remove(Self.hiddenStatesOutputName)?.ndArray
 
             if capture != .none, !usePrefill, let logitsArray {
                 // Only the positions from `captureFrom` on are results; earlier rows of the batch
@@ -821,6 +827,21 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
                             result.logits.append(row)
                         }
                     }
+                }
+            }
+
+            // The hidden states of the captured positions, in the order the rows above were taken.
+            if capture != .none, !usePrefill, let hiddenArray {
+                let firstRow = max(0, captureFrom - batchStartToken)
+                let view = hiddenArray.view(as: LogitsScalarType.self)
+                guard let hidden = view.contiguousElements else {
+                    throw InferenceRuntimeError.invalidState(
+                        "hidden_states has a non-contiguous layout — cannot extract values safely")
+                }
+                let width = hidden.count / batchSize
+                result.hiddenDim = width
+                for local in firstRow..<tokensInBatch {
+                    for i in 0..<width { result.hidden.append(Float(hidden[local * width + i])) }
                 }
             }
 
@@ -881,6 +902,114 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     static func batchAlignedDraftBudget(batchSize: Int, anchorPosition: Int) -> Int {
         guard batchSize > 0 else { return 0 }
         return batchSize - 1 - (anchorPosition % batchSize)
+    }
+
+    // MARK: - Draft head support
+
+    /// Greedy verify of a block, with the hidden states a draft head seeds from when the decode
+    /// graphs emit them.
+    package func forwardProposalGreedy(
+        anchor: Int32, proposal: DraftProposal
+    ) async throws -> (argmax: [Int32], features: DrafterFeatures?) {
+        let start = processedTokenCount
+        let result = try await processSpeculativeBlock([anchor] + proposal.tokens, capture: .argmax)
+        return (result.argmax, Self.features(from: result, startPosition: start))
+    }
+
+    /// Full-logits verify of a block, with the hidden states a draft head seeds from when the decode
+    /// graphs emit them.
+    package func forwardProposal(
+        anchor: Int32, proposal: DraftProposal
+    ) async throws -> (logits: [[LogitsScalarType]], features: DrafterFeatures?) {
+        let start = processedTokenCount
+        let result = try await processSpeculativeBlock([anchor] + proposal.tokens, capture: .fullLogits)
+        return (result.logits, Self.features(from: result, startPosition: start))
+    }
+
+    private static func features(from result: SpecCaptureResult, startPosition: Int) -> DrafterFeatures? {
+        guard result.hiddenDim > 0, !result.hidden.isEmpty else { return nil }
+        return DrafterFeatures(
+            values: result.hidden, positionCount: result.hidden.count / result.hiddenDim,
+            hiddenDim: result.hiddenDim, startPosition: startPosition)
+    }
+
+    /// Width of the backbone's hidden state, which a draft head's inputs are sized from.
+    package var backboneHiddenSize: Int { embeddingTable.shape.last ?? 0 }
+
+    /// Whether the decode graphs emit `hidden_states`, the final hidden state a draft head seeds from
+    /// (an export with `--emit-hidden-states`).
+    package var emitsHiddenStates: Bool {
+        guard let decode = extendFunctionNames.first(where: { $0.hasPrefix(Self.decodeFunctionPrefix + "_") }),
+            let descriptor = try? functionDescriptor(for: decode)
+        else { return false }
+        return descriptor.outputNames.contains(Self.hiddenStatesOutputName)
+    }
+
+    /// The raw token embedding a draft head fuses with the hidden state, read through the asset's
+    /// narrowest gather graph.
+    ///
+    /// `gather_embeddings` returns `embed_tokens(token)` scaled down by the square root of the hidden
+    /// width, which the extend graph applies separately; the draft head wants the unscaled row, so
+    /// the factor is multiplied back in.
+    package func drafterEmbedding(_ token: Int32) async throws -> [Float] {
+        let prefix = "gather_embeddings_"
+        guard
+            let batchSize = gatherFunctionNames.compactMap({ name in
+                name.hasPrefix(prefix) ? Int(name.dropFirst(prefix.count)) : nil
+            }).min()
+        else {
+            throw InferenceRuntimeError.invalidState("the asset has no gather_embeddings graph")
+        }
+        let hidden = backboneHiddenSize
+        guard let gathered = try await runGather(tokenIDs: [token], batchSize: batchSize) else {
+            throw InferenceRuntimeError.invalidState("gather_embeddings returned no output")
+        }
+        let normalizer = Float(Double(hidden).squareRoot())
+        var out = [Float](repeating: 0, count: hidden)
+        gathered.view(as: LogitsScalarType.self).withUnsafePointer { ptr, _, _ in
+            for i in 0..<hidden { out[i] = Float(ptr[i]) * normalizer }  // row 0 holds the requested token
+        }
+        return out
+    }
+
+    /// One shared K/V cache of the last storing layer, read in place: no copy and no layout change.
+    ///
+    /// Element (position slot `r`, channel `d`) is at
+    /// `base[(d / factor) * ctx * factor + r * factor + d % factor]`. The sliding cache is a ring, so
+    /// position `p` lives in slot `p % ctx`; the full-attention cache is addressed by position.
+    package struct SharedKVCache {
+        package let base: UnsafePointer<LogitsScalarType>
+        package let channels: Int
+        package let ctx: Int
+        package let factor: Int
+    }
+
+    package enum SharedKVCacheKind: CaseIterable, Sendable { case fullK, fullV, slidingK, slidingV }
+
+    /// Runs `body` over one shared cache. The pointer is valid only inside `body`.
+    package func withSharedKVCache(
+        _ kind: SharedKVCacheKind, _ body: (SharedKVCache) -> Void
+    ) throws {
+        let name: String
+        switch kind {
+        case .fullK: name = Self.keyCacheName
+        case .fullV: name = Self.valueCacheName
+        case .slidingK: name = SlidingRing.keyCacheName
+        case .slidingV: name = SlidingRing.valueCacheName
+        }
+        guard let array = states.stateArray(named: name) else {
+            throw InferenceRuntimeError.invalidState("no state '\(name)' for shared KV")
+        }
+        let shape = array.shape
+        let channels = shape[2]
+        let ctx = shape[shape.count - 1]
+        let factor = array.interleaveLayout?.factor ?? 1
+        array.view(as: LogitsScalarType.self).withUnsafePointer { ptr, _, _ in
+            body(
+                SharedKVCache(
+                    base: ptr + (shape[0] - 1) * channels * ctx,
+                    channels: channels, ctx: ctx, factor: factor))
+        }
     }
 
     // MARK: - Inference Helpers

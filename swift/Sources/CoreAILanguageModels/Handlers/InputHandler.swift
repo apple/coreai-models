@@ -134,6 +134,13 @@ public struct InputBuffers {
         }
     }
 
+    /// Free `name`'s active buffer and every pooled one, for a caller whose old shapes are not
+    /// worth holding for reuse.
+    public mutating func removeBuffer(name: String) {
+        buffers.removeValue(forKey: name)
+        pool.removeValue(forKey: name)
+    }
+
     /// Access a buffer by name.
     ///
     /// - Warning: The `get` accessor returns a *copy* of the NDArray reference.
