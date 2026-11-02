@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from coreai_models._constants import DEFAULT_INCLUDE_DEBUG_INFO
+from coreai_models.embedding.clip_clap import CLAP_EXPORTER, CLIP_EXPORTER
 from coreai_models.embedding.contract import (
     PLATFORMS,
     SUPPORTED_COMPUTE_PRECISIONS,
@@ -40,7 +41,13 @@ from coreai_models.embedding.export_utils import (
 
 logger = logging.getLogger(__name__)
 
-EXPORTERS: dict[str, EmbeddingExporter] = {}
+EXPORTERS: dict[str, EmbeddingExporter] = {
+    exporter.family.key: exporter
+    for exporter in (
+        CLAP_EXPORTER,
+        CLIP_EXPORTER,
+    )
+}
 
 
 def exporter_for_model(name: str) -> EmbeddingExporter:
