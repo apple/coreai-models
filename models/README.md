@@ -175,6 +175,7 @@ AIModelAsset.load("outputModel.aimodel").update_metadata(
 ```bash
 uv run coreai.diffusion.export black-forest-labs/FLUX.2-klein-4B
 uv run coreai.diffusion.export sana-sprint-0.6b
+uv run coreai.diffusion.export sana-sprint-1.6b
 ```
 
 ### Vision-Language Models (VLMs)

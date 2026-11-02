@@ -7,6 +7,7 @@ NVIDIA's Sana Sprint few-step text-to-image model for on-device image generation
 | Model            | Parameters                    | Resolution | Steps | macOS | iOS |
 | ---------------- | ----------------------------- | ---------- | ----- | ----- | --- |
 | Sana Sprint 0.6B | 0.6B DiT + 2.6B Gemma-2 + VAE | 1024x1024  | 1-4   | Yes   | No  |
+| Sana Sprint 1.6B | 1.6B DiT + 2.6B Gemma-2 + VAE | 1024x1024  | 1-4   | Yes   | No  |
 
 ## Setup
 
@@ -20,18 +21,21 @@ brew install uv
 
 ```bash
 uv run coreai.diffusion.export sana-sprint-0.6b
+uv run coreai.diffusion.export sana-sprint-1.6b
 ```
 
-This loads `Efficient-Large-Model/Sana_Sprint_0.6B_1024px_diffusers` with diffusers'
-`SanaSprintPipeline` and exports in `bfloat16`. Other dtypes may be added in the future.
+These load `Efficient-Large-Model/Sana_Sprint_{0.6B,1.6B}_1024px_diffusers` with diffusers'
+`SanaSprintPipeline` and export in `bfloat16`. Other dtypes may be added in the future.
 
 ## Components
 
-| Component      | Asset                 | Size   | Description                                                   |
-| -------------- | --------------------- | ------ | ------------------------------------------------------------- |
-| `transformer`  | `Transformer.aimodel` | 1.1 GB | Linear-attention DiT (28 blocks) on a 32x32x32 latent          |
-| `text_encoder` | `TextEncoder.aimodel` | 4.9 GB | Gemma-2-2B; returns the 300 tokens the transformer attends to |
-| `vae_decoder`  | `VAEDecoder.aimodel`  | 304 MB | DC-AE, 32x32 latent to 1024x1024 image                        |
+| Component      | Asset                 | Size                          | Description                                                   |
+| -------------- | --------------------- | ----------------------------- | ------------------------------------------------------------- |
+| `transformer`  | `Transformer.aimodel` | 1.1 GB (0.6B) / 3.0 GB (1.6B) | Linear-attention DiT (28 / 20 blocks) on a 32x32x32 latent    |
+| `text_encoder` | `TextEncoder.aimodel` | 4.9 GB                        | Gemma-2-2B; returns the 300 tokens the transformer attends to |
+| `vae_decoder`  | `VAEDecoder.aimodel`  | 304 MB                        | DC-AE, 32x32 latent to 1024x1024 image                        |
+
+Both variants share the text encoder, VAE, tokenizer, and sampler settings; only the transformer differs.
 
 The bundle also has `tokenizer/` and `metadata.json`. The metadata carries the instruction prefix that
 diffusers prepends to every prompt, and the timestep schedule.
@@ -65,6 +69,8 @@ let image = try await pipeline.generateImages(configuration: config).images.firs
 swift run -c release diffusion-runner --model exports/Sana_Sprint_0.6B_1024px_diffusers \
     --prompt "a cyberpunk cat with a neon sign that says \"Sana\"" --seed 42
 ```
+
+For 1.6B, pass `--model exports/Sana_Sprint_1.6B_1024px_diffusers`.
 
 The defaults (2 steps, guidance 4.5) come from `metadata.json`. `--guidance-scale` feeds the
 transformer's guidance embedding; there is no classifier-free guidance pass. `--seed` matches
