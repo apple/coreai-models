@@ -25,13 +25,29 @@ package enum SpeculativeDecodingOptions {
         return nil
     }
 
-    /// Sampling needs the draft distribution, which only a draft model supplies. Prompt lookup
-    /// proposes tokens without one, so it requires greedy decoding, also when a draft model is
-    /// given as well.
-    package static func samplingProblem(greedy: Bool, promptLookup: Bool) -> String? {
-        guard !greedy, promptLookup else { return nil }
-        return
-            "--prompt-lookup does not support sampling (it supplies no draft logits); use --sampling-strategy greedy"
+    /// Sampling needs the draft distribution, which only a draft model supplies. Prompt lookup and
+    /// the draft head propose tokens without one, so they require greedy decoding, also when a draft
+    /// model is given as well.
+    package static func samplingProblem(greedy: Bool, promptLookup: Bool, draftHead: Bool = false) -> String? {
+        guard !greedy else { return nil }
+        if promptLookup {
+            return
+                "--prompt-lookup does not support sampling (it supplies no draft logits); use --sampling-strategy greedy"
+        }
+        if draftHead {
+            return
+                "--speculative does not support sampling (the draft head supplies no draft logits); use --sampling-strategy greedy"
+        }
+        return nil
+    }
+
+    /// `--speculative` drafts with the bundle's draft head, so it excludes a separate `--draft-model`,
+    /// and `--drafter-top-k`, which configures the head's scan, needs it and a positive count.
+    package static func draftHeadProblem(draftHead: Bool, draftModel: Bool, drafterTopK: Int?) -> String? {
+        if draftHead && draftModel { return "--speculative and --draft-model cannot be used together" }
+        guard let drafterTopK else { return nil }
+        guard draftHead else { return "--drafter-top-k applies to --speculative" }
+        return drafterTopK >= 1 ? nil : "--drafter-top-k must be >= 1 (got \(drafterTopK))"
     }
 
     /// Grammar-masked acceptance is defined for the argmax only, so a schema needs greedy decoding.

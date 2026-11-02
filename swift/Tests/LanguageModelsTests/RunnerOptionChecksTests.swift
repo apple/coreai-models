@@ -25,6 +25,39 @@ struct RunnerOptionChecksTests {
         #expect(message.contains("--prompt-lookup"))
     }
 
+    @Test("The draft head, like prompt lookup, needs greedy decoding")
+    func draftHeadWithSampling() throws {
+        let message = try #require(
+            SpeculativeDecodingOptions.samplingProblem(greedy: false, promptLookup: false, draftHead: true))
+        #expect(message.contains("--speculative"))
+        #expect(SpeculativeDecodingOptions.samplingProblem(greedy: true, promptLookup: false, draftHead: true) == nil)
+        // With both, the message names the one the user is more likely to have meant to drop.
+        let both = try #require(
+            SpeculativeDecodingOptions.samplingProblem(greedy: false, promptLookup: true, draftHead: true))
+        #expect(both.contains("--prompt-lookup"))
+    }
+
+    @Test("--speculative excludes --draft-model, and --drafter-top-k needs it and a positive count")
+    func draftHeadOptions() throws {
+        #expect(
+            SpeculativeDecodingOptions.draftHeadProblem(draftHead: true, draftModel: false, drafterTopK: nil) == nil)
+        #expect(
+            SpeculativeDecodingOptions.draftHeadProblem(draftHead: false, draftModel: true, drafterTopK: nil) == nil)
+        let both = try #require(
+            SpeculativeDecodingOptions.draftHeadProblem(draftHead: true, draftModel: true, drafterTopK: nil))
+        #expect(both.contains("--speculative") && both.contains("--draft-model"))
+
+        #expect(SpeculativeDecodingOptions.draftHeadProblem(draftHead: true, draftModel: false, drafterTopK: 16) == nil)
+        let alone = try #require(
+            SpeculativeDecodingOptions.draftHeadProblem(draftHead: false, draftModel: false, drafterTopK: 16))
+        #expect(alone.contains("--drafter-top-k") && alone.contains("--speculative"))
+        for bad in [0, -3] {
+            let message = try #require(
+                SpeculativeDecodingOptions.draftHeadProblem(draftHead: true, draftModel: false, drafterTopK: bad))
+            #expect(message.contains("--drafter-top-k must be >= 1"))
+        }
+    }
+
     @Test("An image with raw tokens is rejected")
     func imageWithRawTokens() throws {
         let message = try #require(SpeculativeDecodingOptions.imageProblem(hasImage: true, hasRawTokens: true))
