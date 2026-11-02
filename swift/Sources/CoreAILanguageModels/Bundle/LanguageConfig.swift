@@ -61,16 +61,25 @@ public struct LanguageOverrides: Codable, Sendable, Equatable {
     /// when the model has no cap, or when the graph already applies it.
     public let finalLogitSoftcapping: Double?
 
-    public init(slidingWindow: Int? = nil, rope: RoPEConfig? = nil, finalLogitSoftcapping: Double? = nil) {
+    /// Whether the decode graphs also output `hidden_states`, the post-norm final hidden state a
+    /// speculative-decoding draft head seeds from (an export with `--emit-hidden-states`).
+    public let emitsHiddenStates: Bool
+
+    public init(
+        slidingWindow: Int? = nil, rope: RoPEConfig? = nil, finalLogitSoftcapping: Double? = nil,
+        emitsHiddenStates: Bool = false
+    ) {
         self.slidingWindow = slidingWindow
         self.rope = rope
         self.finalLogitSoftcapping = finalLogitSoftcapping
+        self.emitsHiddenStates = emitsHiddenStates
     }
 
     enum CodingKeys: String, CodingKey {
         case slidingWindow = "sliding_window"
         case rope
         case finalLogitSoftcapping = "final_logit_softcapping"
+        case emitsHiddenStates = "emits_hidden_states"
     }
 
     public init(from decoder: Swift.Decoder) throws {
@@ -78,6 +87,7 @@ public struct LanguageOverrides: Codable, Sendable, Equatable {
         self.slidingWindow = try c.decodeIfPresent(Int.self, forKey: .slidingWindow)
         self.rope = try c.decodeIfPresent(RoPEConfig.self, forKey: .rope)
         self.finalLogitSoftcapping = try c.decodeIfPresent(Double.self, forKey: .finalLogitSoftcapping)
+        self.emitsHiddenStates = try c.decodeIfPresent(Bool.self, forKey: .emitsHiddenStates) ?? false
         // The runner divides by the cap.
         if let finalLogitSoftcapping, finalLogitSoftcapping <= 0 {
             throw DecodingError.dataCorruptedError(

@@ -50,6 +50,7 @@ public struct ModelBundle: Sendable {
         public static let main = "main"
         public static let vision = "vision"
         public static let embedding = "embedding"
+        public static let drafter = "drafter"
     }
 
     /// All component keys declared in this bundle's `assets` map, sorted.
