@@ -55,4 +55,31 @@ struct SpeculativeDecodingOptionsTests {
         #expect(warning.contains("--top-k, --chunk-size"))
         #expect(warning.hasPrefix("Warning: speculative decoding ignores"))
     }
+
+    @Test("A schema with speculative decoding needs greedy decoding")
+    func grammarNeedsGreedy() throws {
+        #expect(SpeculativeDecodingOptions.grammarSamplingProblem(greedy: true, hasSchema: true) == nil)
+        #expect(SpeculativeDecodingOptions.grammarSamplingProblem(greedy: false, hasSchema: false) == nil)
+        let message = try #require(
+            SpeculativeDecodingOptions.grammarSamplingProblem(greedy: false, hasSchema: true))
+        #expect(message.contains("--json-schema"))
+        #expect(message.contains("greedy"))
+    }
+
+    @Test("The grammar proposal limit is checked against its range and where it applies")
+    func grammarProposalLimit() throws {
+        let top = GrammarConstraint.maxForcedRunLimit
+        #expect(SpeculativeDecodingOptions.grammarProposalProblem(nil, speculating: false, hasSchema: false) == nil)
+        for limit in [0, 7, top] {
+            #expect(
+                SpeculativeDecodingOptions.grammarProposalProblem(limit, speculating: true, hasSchema: true) == nil)
+        }
+        for limit in [-1, top + 1] {
+            let message = try #require(
+                SpeculativeDecodingOptions.grammarProposalProblem(limit, speculating: true, hasSchema: true))
+            #expect(message.contains("--grammar-proposal-max must be between 0 and \(top)"))
+        }
+        #expect(SpeculativeDecodingOptions.grammarProposalProblem(7, speculating: false, hasSchema: true) != nil)
+        #expect(SpeculativeDecodingOptions.grammarProposalProblem(7, speculating: true, hasSchema: false) != nil)
+    }
 }
