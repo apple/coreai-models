@@ -108,6 +108,35 @@ struct DraftPackValidationTests {
         #expect(message { _ = try DraftPack(blob: blob) }.contains("empty geometry"))
     }
 
+    @Test("A geometry whose row count overflows is reported, not trapped on")
+    func overflowingGeometry() throws {
+        let blob = try write(tensors: [], vocab: 8, centroids: Int.max, perCentroid: 2)
+        #expect(message { _ = try DraftPack(blob: blob) }.contains("more rows than fit"))
+
+        // `require` is also safe on its own, given an index that skipped `validate`.
+        let index = try JSONDecoder().decode(
+            DraftPack.Index.self,
+            from: Data(
+                """
+                {"vocab": 8, "centroids": \(Int.max), "per_centroid": 2, "layers": 1, "tensors": {}}
+                """.utf8))
+        #expect(
+            message { try DraftPack.require(.scan, index: index, name: "pack.json") }.contains("more rows than fit"))
+    }
+
+    @Test("The scan's dot product of an empty vector is zero, and of a vector is the sum of products")
+    func dotProduct() {
+        let weights: [Float16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        weights.withUnsafeBufferPointer { w in
+            #expect(DraftScan.dot([], w.baseAddress!, n: 0) == 0)
+            #expect(DraftScan.dot([1, 1, 1], w.baseAddress!, n: 3) == 6)
+            let x = [Float](repeating: 2, count: 10)
+            #expect(DraftScan.dot(x, w.baseAddress!, n: 10) == 110)
+            // Only the first `n` entries are read.
+            #expect(DraftScan.dot(x, w.baseAddress!, n: 4) == 20)
+        }
+    }
+
     @Test("A missing scan tensor is rejected for the scan role, naming the tensor")
     func missingScanTensor() throws {
         let blob = try write(tensors: [scanTensors[0]])

@@ -155,6 +155,7 @@ final class DraftPack: @unchecked Sendable {
                 "\(name) declares an empty geometry (vocab \(index.vocab), centroids \(index.centroids), "
                     + "per_centroid \(index.perCentroid), layers \(index.layers)); \(repack)")
         }
+        _ = try candidateRows(index: index, name: name)
         for (tensor, entry) in index.tensors.sorted(by: { $0.key < $1.key }) {
             guard let size = elementSize[entry.dtype] else {
                 throw DraftPackError.message(
@@ -189,9 +190,21 @@ final class DraftPack: @unchecked Sendable {
         }
     }
 
+    /// The number of candidate rows, `centroids * per_centroid`. The index is read from a file, so
+    /// a product that does not fit an `Int` is reported, not trapped on.
+    static func candidateRows(index: Index, name: String) throws -> Int {
+        let (rows, overflow) = index.centroids.multipliedReportingOverflow(by: index.perCentroid)
+        guard !overflow else {
+            throw DraftPackError.message(
+                "\(name) declares \(index.centroids) centroids of \(index.perCentroid) candidates, "
+                    + "which is more rows than fit in an Int; re-export it with models/gemma4/export_drafter.py")
+        }
+        return rows
+    }
+
     /// Checks the tensors `role` reads are present with the right dtype and shape.
     static func require(_ role: Role, index: Index, name: String) throws {
-        let rows = index.centroids * index.perCentroid
+        let rows = try candidateRows(index: index, name: name)
         func tensor(_ tensorName: String, _ dtype: String, shape: [Int?]) throws {
             guard let entry = index.tensors[tensorName] else {
                 throw DraftPackError.message(
@@ -228,9 +241,12 @@ enum DraftScan {
         return min(requested, centroids)
     }
 
-    /// dot(x, weights) with weights fp16 contiguous: the masked embedder's per-candidate score.
+    /// dot(x, weights) with weights fp16 contiguous: the masked embedder's per-candidate score. Reads
+    /// the first `n` entries of `x` and of `weights`, so `x` must hold at least `n`.
     static func dot(_ x: [Float], _ weights: UnsafePointer<Float16>, n: Int) -> Float {
-        x.withUnsafeBufferPointer { xp -> Float in
+        guard n > 0 else { return 0 }
+        precondition(x.count >= n, "dot reads \(n) values from a vector of \(x.count)")
+        return x.withUnsafeBufferPointer { xp -> Float in
             let xb = xp.baseAddress!
             let row = UnsafeRawPointer(weights)
             var a0 = SIMD8<Float>()
