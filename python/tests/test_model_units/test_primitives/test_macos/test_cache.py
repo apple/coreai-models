@@ -13,6 +13,7 @@ from coreai_models.primitives.macos.cache import DeltaNetCache, KVCache, SSMStat
 from tests._runner_infra.testing_utils import (
     assert_close,
     run_compare_coreai_explicit_kv_cache,
+    uses_os_coreai,
 )
 
 
@@ -265,6 +266,8 @@ class TestKVCache:
         This verifies the pattern used by macOS models (e.g., Qwen2ForCausalLM) where
         forward(input_ids, position_ids, k_cache, v_cache) -> (logits, k_cache, v_cache).
         """
+        if uses_os_coreai():
+            pytest.skip("known issue on macOS 27")
         N_KV_HEADS = 2
         HEAD_DIM = 4
         MAX_SEQ = 32

@@ -13,7 +13,7 @@ concurrency:
 jobs:
   lint:
     if: github.repository == 'apple/coreai-models'
-    runs-on: [self-hosted, macos, tahoe, ARM64]
+    runs-on: [self-hosted, macos, goldengate]
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -28,7 +28,7 @@ jobs:
 
   swift-format:
     if: github.repository == 'apple/coreai-models'
-    runs-on: [self-hosted, macos, tahoe, ARM64]
+    runs-on: [self-hosted, macos, goldengate]
     timeout-minutes: 15
     env:
       DEVELOPER_DIR: /Applications/Xcode-latest.app/Contents/Developer
@@ -36,10 +36,31 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       - run: swift format lint --strict --recursive swift/Sources/ swift/Tests/
 
+  # Core AI on the runtime bundled with coreai-core.
   python-test:
     if: github.repository == 'apple/coreai-models'
-    runs-on: [self-hosted, macos, tahoe, ARM64]
+    runs-on: [self-hosted, macos, goldengate]
     timeout-minutes: 60
+    # torch.compile builds C++ guards with clang++; without an Xcode here it uses the
+    # runner's Command Line Tools, whose linker cannot read the macOS 27 SDK stubs.
+    env:
+      DEVELOPER_DIR: /Applications/Xcode-latest.app/Contents/Developer
+      USE_LOCAL_COREAI: "1"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Ensure uv
+        run: |
+          command -v uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - run: uv run pytest python/tests/test_model_units -x -q
+
+  # Core AI on the macOS framework, the default for wheel installs on macOS 27.
+  python-test-Mac:
+    if: github.repository == 'apple/coreai-models'
+    runs-on: [self-hosted, macos, goldengate]
+    timeout-minutes: 60
+    env:
+      DEVELOPER_DIR: /Applications/Xcode-latest.app/Contents/Developer
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       - name: Ensure uv

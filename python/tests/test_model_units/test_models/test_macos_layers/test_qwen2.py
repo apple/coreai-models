@@ -63,7 +63,11 @@ from coreai_models.models.macos.qwen2 import (
     TransformerBlock as CoreaiTorchTransformerBlock,
 )
 from tests._runner_infra.models.model import Model
-from tests._runner_infra.testing_utils import ForCausalLMTestBase
+from tests._runner_infra.testing_utils import (
+    MACOS_27_0_KNOWN_ISSUE,
+    ForCausalLMTestBase,
+    skip_os_coreai_below_macos,
+)
 
 
 def _make_qwen2_config(
@@ -898,6 +902,8 @@ class TestQwen2Layers:
         """Verify Core AI Torch Qwen2 layers match HuggingFace and MLX."""
         if num_key_value_heads > num_attention_heads:
             pytest.skip("num_key_value_heads > num_attention_heads is invalid")
+        if precision in (Precision.f16, Precision.bf16) and num_attention_heads > 1:
+            skip_os_coreai_below_macos((27, 2), MACOS_27_0_KNOWN_ISSUE)
 
         oss_torch_config = RunConfig(
             author=cast("Author", Author.oss),

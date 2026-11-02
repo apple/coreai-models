@@ -22,6 +22,7 @@ from coreai_models.primitives.ios.rope import apply_rope
 from tests._runner_infra.testing_utils import (
     assert_close,
     run_compare_coreai,
+    uses_os_coreai,
 )
 
 
@@ -275,6 +276,8 @@ class TestiOSStandardRope(BaseRoPETest):
         precision: torch.dtype,
     ) -> None:
         """Test Core AI compilation and execution."""
+        if uses_os_coreai():
+            pytest.skip("known issue on macOS 27")
         self._run_test_coreai(
             precision=precision,
             config_class=config_class,

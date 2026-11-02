@@ -73,7 +73,11 @@ from coreai_models.models.macos.mixtral import (
     TransformerBlock as CoreaiTorchTransformerBlock,
 )
 from tests._runner_infra.models.model import Model
-from tests._runner_infra.testing_utils import ForCausalLMTestBase
+from tests._runner_infra.testing_utils import (
+    MACOS_27_0_KNOWN_ISSUE,
+    ForCausalLMTestBase,
+    skip_os_coreai_below_macos,
+)
 
 
 def _make_mixtral_config(
@@ -1024,6 +1028,8 @@ class TestMixtralLayers:
         """Verify Core AI Torch Mixtral layers match HuggingFace and MLX."""
         if num_key_value_heads > num_attention_heads:
             pytest.skip("num_key_value_heads > num_attention_heads is invalid")
+        if precision in (Precision.f16, Precision.bf16) and num_attention_heads > 1:
+            skip_os_coreai_below_macos((27, 2), MACOS_27_0_KNOWN_ISSUE)
 
         # Disable fused KV for the entire test so Core AI model uses
         # separate projections (matching HF) during both construction
