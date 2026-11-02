@@ -155,7 +155,7 @@ struct IdempotentEngineRoutingTests {
         #expect(engine as? any IdempotentEngine == nil)
     }
 
-    @Test("CoreAISequentialEngine is the idempotent engine")
+    @Test("CoreAISequentialEngine (text and vision-language) is the idempotent engine")
     func sequentialEngineIsIdempotent() {
         #expect(reportsIdempotent(CoreAISequentialEngine.self))
     }
@@ -164,7 +164,6 @@ struct IdempotentEngineRoutingTests {
     func otherEnginesAreNotIdempotent() {
         #expect(!reportsIdempotent(CoreAIPipelinedEngine.self))
         #expect(!reportsIdempotent(StaticShapeEngine.self))
-        #expect(!reportsIdempotent(CoreAISequentialVLMEngine.self))
     }
 }
 

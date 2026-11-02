@@ -51,6 +51,15 @@ package struct DrafterFeatures: Sendable {
         self.hiddenDim = hiddenDim
         self.startPosition = startPosition
     }
+
+    /// The feature row that seeds a drafter's recurrence once `confirmedLength` tokens are
+    /// committed: the row of the last committed token, clamped to the rows present. `nil` when there
+    /// are no rows.
+    package func seedRow(confirmedLength: Int) -> [Float]? {
+        guard hiddenDim > 0, positionCount > 0 else { return nil }
+        let row = Swift.max(0, Swift.min(confirmedLength - startPosition - 1, positionCount - 1))
+        return Array(values[row * hiddenDim..<(row + 1) * hiddenDim])
+    }
 }
 
 /// How the target's verdict is turned into committed tokens.

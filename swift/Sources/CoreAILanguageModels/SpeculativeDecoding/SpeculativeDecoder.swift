@@ -25,6 +25,11 @@ import Tokenizers
 ///   target at that temperature (the accept/reject scheme of Chen et al. 2023,
 ///   https://arxiv.org/abs/2302.01318).
 ///
+/// Greedy decoding can also run under a ``GrammarConstraint``: the target's choice at each position
+/// is then its argmax over the tokens the grammar allows, so the output is token-for-token
+/// identical to grammar-constrained greedy decoding of the target alone. Where the grammar fully
+/// determines the next span, that span is the proposal and no drafting happens for the block.
+///
 /// The decoder names no concrete engine type: draft and target may run on
 /// different backends, and the drafter may be a separate model
 /// (``AutoregressiveDrafter``), a model-free drafter such as ``PromptLookupDrafter``, or a
@@ -66,6 +71,10 @@ package final class SpeculativeDecoder: @unchecked Sendable {
         /// one-time prompt prefill / graph specialization), so it is comparable to the time
         /// plain decoding spends generating the same tokens.
         package var generationSeconds: Double = 0
+        /// Iterations whose proposal came from the grammar, and its proposed/accepted tokens.
+        package var grammarProposals: Int = 0
+        package var grammarTokensProposed: Int = 0
+        package var grammarTokensAccepted: Int = 0
         /// Iterations whose proposal came from prompt lookup, and its proposed/accepted tokens.
         package var lookupProposals: Int = 0
         package var lookupTokensProposed: Int = 0
@@ -136,10 +145,17 @@ package final class SpeculativeDecoder: @unchecked Sendable {
 
     /// Run greedy speculative decoding (lossless; token-for-token identical to the
     /// target alone). See the type overview.
+    ///
+    /// - Parameter constraint: optional grammar. The grammar advances by every emitted token, so
+    ///   the output is schema-valid and identical to grammar-constrained greedy decoding of the
+    ///   target. A proposed token the grammar forbids cannot match the constrained argmax: it ends
+    ///   acceptance early, which costs speed and never emits an invalid token. The caller passes a
+    ///   session at its initial state, and the decoder leaves it at the end of the emitted stream.
     package func generateGreedy(
         promptTokens: [Int32],
         maxNewTokens: Int,
         stopTokenIds: Set<Int32>,
+        constraint: GrammarConstraint? = nil,
         onPrefillReady: (() async throws -> Void)? = nil,
         onToken: (Int32) -> Void
     ) async throws -> Stats {
@@ -147,7 +163,8 @@ package final class SpeculativeDecoder: @unchecked Sendable {
         var rng = SystemRandomNumberGenerator()
         return try await run(
             policy: .greedy, promptTokens: promptTokens, maxNewTokens: maxNewTokens,
-            stopTokenIds: stopTokenIds, onPrefillReady: onPrefillReady, onToken: onToken, rng: &rng)
+            stopTokenIds: stopTokenIds, constraint: constraint, onPrefillReady: onPrefillReady,
+            onToken: onToken, rng: &rng)
     }
 
     /// Run speculative **sampling** at the given temperature (distributionally
@@ -204,6 +221,7 @@ package final class SpeculativeDecoder: @unchecked Sendable {
         promptTokens: [Int32],
         maxNewTokens: Int,
         stopTokenIds: Set<Int32>,
+        constraint: GrammarConstraint? = nil,
         onPrefillReady: (() async throws -> Void)? = nil,
         onToken: (Int32) -> Void,
         rng: inout some RandomNumberGenerator
@@ -283,18 +301,24 @@ package final class SpeculativeDecoder: @unchecked Sendable {
             let k = min(draftCount(anchorPosition: baseProcessed, upTo: draftBudget), proposalCap)
             stats.iterations += 1
 
-            // 1. Propose: prompt lookup when the recent tokens recur in the context, else the
-            //    drafter. Both are verified the same way below, and both are sized to the
-            //    target's one-forward window when alignment is on.
+            // 1. Propose: the grammar when it fully determines the next span, else prompt lookup
+            //    when the recent tokens recur in the context, else the drafter. All are verified
+            //    the same way below, and all are sized to the target's one-forward window when
+            //    alignment is on.
             let budget = target.oneForwardDraftBudget
             let proposalLimit = min(alignProposalsToForward && budget >= 1 ? budget : Int.max, proposalCap)
             let proposal: DraftProposal
+            let grammarTokens = Array((try constraint?.forcedProposal() ?? []).prefix(proposalLimit))
             var lookupTokens: [Int32] = []
-            if let promptLookup {
+            if grammarTokens.isEmpty, let promptLookup {
                 lookupTokens = promptLookup.propose(
                     context: tokens, count: min(promptLookup.maxTokens, proposalLimit))
             }
-            if !lookupTokens.isEmpty {
+            if !grammarTokens.isEmpty {
+                proposal = DraftProposal(tokens: grammarTokens)
+                stats.grammarProposals += 1
+                stats.grammarTokensProposed += grammarTokens.count
+            } else if !lookupTokens.isEmpty {
                 proposal = DraftProposal(tokens: lookupTokens)
                 stats.lookupProposals += 1
                 stats.lookupTokensProposed += lookupTokens.count
@@ -311,15 +335,24 @@ package final class SpeculativeDecoder: @unchecked Sendable {
             // 2-3. Target verifies the whole proposal in one pass, then accept per
             //      policy → the accepted candidate indices + next token. Greedy uses
             //      the argmax-only verify path (no per-slot [vocabSize] copy); only
-            //      sampling needs the full distributions.
+            //      sampling and grammar-masked acceptance need the full distributions.
             let verdict: (path: [Int], next: Int32)
             let features: DrafterFeatures?
+            let grammarAcceptedBefore = constraint?.acceptedCount ?? 0
             switch policy {
             case .greedy:
-                let (targetArgmax, f) = try await target.forwardProposalGreedy(
-                    anchor: anchor, proposal: proposal)
-                features = f
-                verdict = try acceptGreedy(proposal: proposal, targetArgmax: targetArgmax)
+                if let constraint {
+                    let (targetLogits, f) = try await target.forwardProposal(
+                        anchor: anchor, proposal: proposal)
+                    features = f
+                    verdict = try acceptGreedyConstrained(
+                        proposal: proposal, targetLogits: targetLogits, constraint: constraint)
+                } else {
+                    let (targetArgmax, f) = try await target.forwardProposalGreedy(
+                        anchor: anchor, proposal: proposal)
+                    features = f
+                    verdict = try acceptGreedy(proposal: proposal, targetArgmax: targetArgmax)
+                }
             case .sampling:
                 let (targetLogits, f) = try await target.forwardProposal(
                     anchor: anchor, proposal: proposal)
@@ -330,10 +363,11 @@ package final class SpeculativeDecoder: @unchecked Sendable {
             }
             let acceptedTokens = verdict.path.map { proposal.tokens[$0] }
             stats.draftTokensAccepted += acceptedTokens.count
+            if !grammarTokens.isEmpty { stats.grammarTokensAccepted += acceptedTokens.count }
             if !lookupTokens.isEmpty { stats.lookupTokensAccepted += acceptedTokens.count }
             // Only the drafter's own rounds steer its budget: a round with no drafts (anchor on the
-            // tile's last slot), or one prompt lookup proposed, says nothing about it.
-            if adaptiveDraftCount, lookupTokens.isEmpty, !proposal.tokens.isEmpty {
+            // tile's last slot), or one the grammar or prompt lookup proposed, says nothing about it.
+            if adaptiveDraftCount, grammarTokens.isEmpty, lookupTokens.isEmpty, !proposal.tokens.isEmpty {
                 draftBudget =
                     acceptedTokens.count == proposal.tokens.count
                     ? min(draftBudget + SpeculativeDefaults.adaptiveGrowth, maxDraftBudget)
@@ -349,13 +383,21 @@ package final class SpeculativeDecoder: @unchecked Sendable {
             //    drafter injects the committed feature rows).
             try await drafter.commit(confirmedLength: confirmedLength, features: features)
 
-            // 6. Commit accepted drafts + the correction/bonus token.
-            for token in acceptedTokens {
+            // 6. Commit accepted drafts + the correction/bonus token. Constrained acceptance
+            //    advanced the grammar over a prefix of them; when the stream stops early, roll
+            //    back the part of that prefix that was not emitted.
+            for (index, token) in acceptedTokens.enumerated() {
                 tokens.append(token)
                 onToken(token)
                 generated += 1
                 stats.generatedTokens += 1
-                if stopTokenIds.contains(token) || generated >= maxNewTokens { break generate }
+                if stopTokenIds.contains(token) || generated >= maxNewTokens {
+                    if let constraint {
+                        let advanced = constraint.acceptedCount - grammarAcceptedBefore
+                        try constraint.rollback(advanced - (index + 1))
+                    }
+                    break generate
+                }
             }
             let correction = verdict.next
             tokens.append(correction)
@@ -399,6 +441,32 @@ package final class SpeculativeDecoder: @unchecked Sendable {
             currentSlot += 1
         }
         return (path, targetArgmax[currentSlot])
+    }
+
+    /// Grammar-constrained greedy acceptance. Like ``acceptGreedy`` but the target's choice at
+    /// each slot is the argmax over the grammar-legal tokens, and the grammar advances by every
+    /// token the choice yields, so the emitted stream is schema-valid and identical to
+    /// grammar-constrained greedy decoding of the target.
+    ///
+    /// `targetLogits` is aligned to `[anchor] + proposal.tokens`; the slot after the last proposed
+    /// token is the bonus slot used when every proposed token is accepted.
+    private func acceptGreedyConstrained(
+        proposal: DraftProposal,
+        targetLogits: [[LogitsScalarType]],
+        constraint: GrammarConstraint
+    ) throws -> (path: [Int], next: Int32) {
+        try Self.requireRows(targetLogits.count, for: proposal)
+        var currentSlot = 0  // slot 0 = anchor
+        var path: [Int] = []
+        while true {
+            let want = constraint.maskedArgmax(targetLogits[currentSlot])
+            constraint.accept(want)
+            guard currentSlot < proposal.tokens.count, proposal.tokens[currentSlot] == want else {
+                return (path, want)
+            }
+            path.append(currentSlot)
+            currentSlot += 1
+        }
     }
 
     /// Speculative sampling (Chen et al. 2023, https://arxiv.org/abs/2302.01318). Linear proposals only: accept

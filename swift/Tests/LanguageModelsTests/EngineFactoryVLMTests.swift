@@ -86,4 +86,22 @@ struct EngineFactoryVLMTests {
         #expect(config.prefillChunkSize == 128)
         #expect(config.chunkThreshold == 256)
     }
+
+    @Test("a VLM runs on its token-merge engine and rejects other variants")
+    func validatesVLMVariant() throws {
+        let cases: [(VisionTokenMerge, String, [String])] = [
+            (.separateEmbedding, "coreai-sequential", ["coreai-pipelined", "static-shape", "bogus"]),
+            (.decoderGather, "static-shape", ["coreai-sequential", "coreai-pipelined", "bogus"]),
+        ]
+        for (tokenMerge, supported, rejected) in cases {
+            for override in [nil, "auto", "default", supported] {
+                try EngineFactory.validateVLMVariant(override, tokenMerge: tokenMerge)
+            }
+            for override in rejected {
+                #expect(throws: InferenceRuntimeError.self) {
+                    try EngineFactory.validateVLMVariant(override, tokenMerge: tokenMerge)
+                }
+            }
+        }
+    }
 }
