@@ -149,6 +149,24 @@ last storing layer) under `contract`, and the runner refuses a head whose expect
 not implement. The head attends to the target's K/V in the most
 recent 512 positions in its sliding layers and to the whole context in its full-attention layer.
 
+Run the model with its draft head through `llm-runner --speculative`:
+
+```bash
+llm-runner --model <bundle> --sampling-strategy greedy --speculative --prompt "..."
+```
+
+The head and the target live in the same bundle, so `--speculative` takes no separate path. The
+output is token for token what greedy decoding of the target alone produces; the head only changes
+how many tokens one verify pass of the target commits. The runner needs greedy decoding, a bundle
+with a `drafter` of kind `mtp`, and a target exported with `--emit-hidden-states`, and it says which
+of the three is missing. `--speculative` combines with `--prompt-lookup` (a block whose recent
+tokens recur in the context is proposed by lookup, any other by the head) and with `--json-schema`.
+`--num-draft-tokens` sets the drafts per round; by default a round drafts one less than the target's
+verify tile is wide, and `--no-align-proposals` drops that limit. `--drafter-top-k` sets how many
+centroids the head's candidate scan scores.
+
+The run summary reports the share of drafts accepted and the tokens committed per target pass.
+
 ### Runner side
 
 There is no Gemma-specific engine. The generic static-shape engine drives these
