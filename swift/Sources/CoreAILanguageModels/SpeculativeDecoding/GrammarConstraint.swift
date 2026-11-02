@@ -15,8 +15,9 @@ import Tokenizers
 /// rolling it back, and, when a tokenizer and a run limit are supplied, the tokens of the span the
 /// grammar fully determines next, which the decoder verifies as a proposal instead of drafting.
 ///
-/// Single-owner: the session is one sequence's state, driven by one generation at a time.
-package final class GrammarConstraint: @unchecked Sendable {
+/// Single-owner and not `Sendable`: the session is one sequence's mutable state, driven by one
+/// generation at a time, and it owns a C++ matcher that is not safe to share.
+package final class GrammarConstraint {
     private var session: ConstrainedGenerationSession
     private let tokenizer: (any Tokenizer)?
     private let forcedRunLimit: Int
