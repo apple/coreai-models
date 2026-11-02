@@ -151,6 +151,20 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     /// The whitespace limit named by `--json-max-whitespace`; nil for no limit.
     private var maxWhitespaceCount: Int? { jsonMaxWhitespace > 0 ? jsonMaxWhitespace : nil }
 
+    @Flag(
+        name: .customLong("speculative"),
+        help:
+            "Self-speculative decoding with the bundle's draft head (the 'drafter' component of metadata.json, added by models/gemma4/export_drafter.py --bundle). The head drafts from the target's hidden states and shared K/V, so --model must be exported with --emit-hidden-states. Greedy only; combines with --prompt-lookup and --json-schema."
+    )
+    var speculative: Bool = false
+
+    @Option(
+        name: .customLong("drafter-top-k"),
+        help:
+            "With --speculative: centroids whose candidates the draft head's scan scores (default: \(DraftScan.defaultTopK))."
+    )
+    var drafterTopK: Int?
+
     @Option(
         name: .customLong("grammar-proposal-max"),
         help:
@@ -380,7 +394,12 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         if promptLookupMinNgram < 1 {
             throw ValidationError("--prompt-lookup-min-ngram must be >= 1")
         }
-        let speculating = draftModel != nil || promptLookup
+        if let problem = SpeculativeDecodingOptions.draftHeadProblem(
+            draftHead: speculative, draftModel: draftModel != nil, drafterTopK: drafterTopK)
+        {
+            throw ValidationError(problem)
+        }
+        let speculating = draftModel != nil || promptLookup || speculative
         if seed != nil && !speculating {
             throw ValidationError("--seed applies to speculative decoding (--draft-model or --prompt-lookup)")
         }
@@ -400,7 +419,8 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
                 throw ValidationError(problem)
             }
             let greedy = samplingStrategy.lowercased() == "greedy" || temperature == 0
-            if let problem = SpeculativeDecodingOptions.samplingProblem(greedy: greedy, promptLookup: promptLookup)
+            if let problem = SpeculativeDecodingOptions.samplingProblem(
+                greedy: greedy, promptLookup: promptLookup, draftHead: speculative)
                 ?? SpeculativeDecodingOptions.grammarSamplingProblem(greedy: greedy, hasSchema: jsonSchema != nil)
                 ?? SpeculativeDecodingOptions.imageProblem(hasImage: imagePath != nil, hasRawTokens: rawTokens != nil)
             {
@@ -632,7 +652,20 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         let decoder: SpeculativeDecoder
         let drafterLabel: String
         let adaptive = adaptiveDraftCount
-        if let draftEngine {
+        if speculative {
+            guard let staticTarget = targetEngine as? StaticShapeEngine else {
+                print("Error: --speculative needs the static-shape engine (got \(type(of: targetEngine))).")
+                throw ExitCode.failure
+            }
+            decoder = try await EngineFactory.createSpeculativeDecoder(
+                target: staticTarget, bundle: targetBundle,
+                options: EngineFactory.DraftHeadOptions(
+                    draftTokens: numDraftTokens, alignDraftsToVerifyTile: !noAlignProposals,
+                    adaptiveDraftCount: adaptive,
+                    promptLookupMinNgram: promptLookup ? promptLookupMinNgram : nil,
+                    drafterTopK: drafterTopK))
+            drafterLabel = promptLookup ? "draft head + prompt-lookup" : "draft head"
+        } else if let draftEngine {
             decoder = SpeculativeDecoder(
                 draft: draftEngine, target: targetEngine,
                 numDraftTokens: self.numDraftTokens ?? SpeculativeDefaults.numDraftTokens,
@@ -753,7 +786,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         }
 
         // Speculative decoding: a draft model, prompt lookup, or both.
-        if draftModel != nil || promptLookup {
+        if draftModel != nil || promptLookup || speculative {
             try await runSpeculativeDecoding(
                 targetPath: modelFile, draftPath: draftModel, resolver: resolver)
             return

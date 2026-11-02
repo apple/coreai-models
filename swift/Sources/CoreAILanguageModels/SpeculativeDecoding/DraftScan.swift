@@ -228,9 +228,9 @@ final class DraftPack: @unchecked Sendable {
     }
 }
 
-enum DraftScan {
+package enum DraftScan {
     /// Centroids whose candidates the masked embedder scores when no count is requested.
-    static let defaultTopK = 32
+    package static let defaultTopK = 32
 
     /// The centroid count to score: `requested` (or ``defaultTopK``), at most `centroids`.
     static func topK(requested: Int?, centroids: Int) throws -> Int {
