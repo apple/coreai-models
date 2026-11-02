@@ -7,10 +7,9 @@ import Synchronization
 
 /// Thread-safe holder for an engine's in-flight `GenerationToken`.
 ///
-/// Both `CoreAISequentialEngine` and `CoreAISequentialVLMEngine` track a single active
-/// generation so a new `generate()` can cancel the previous one and the iterator can
-/// release the engine when it finishes. This centralizes that `Mutex<GenerationToken?>`
-/// bookkeeping so both engines share one implementation.
+/// Each `CoreAISequentialEngine` session tracks a single active generation: a new
+/// `generate()` cancels the previous one, and the iterator releases the session when it
+/// finishes. This holds that `Mutex<GenerationToken?>` bookkeeping.
 final class GenerationTokenBox: Sendable {
     private let _token = Mutex<GenerationToken?>(nil)
 

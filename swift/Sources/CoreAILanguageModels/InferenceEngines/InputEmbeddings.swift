@@ -31,7 +31,4 @@ public struct InputEmbeddings: Sendable {
 
     /// Number of embedding tokens (seq_len dimension).
     public var tokenCount: Int { embeddings.shape[1] }
-
-    // TODO: Multi-turn support — allow multiple image regions per input,
-    // persistent across generate() calls (keep in KV cache on reset).
 }

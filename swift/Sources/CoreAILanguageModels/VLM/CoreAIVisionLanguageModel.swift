@@ -58,9 +58,9 @@ public struct CoreAIVisionLanguageModel: LanguageModel {
                 prefillChunkThreshold: bundle.language.prefillChunkThreshold
             )
         )
-        guard let vlmEngine = engine as? any MultimodalInferenceEngine else {
+        guard let vlmEngine = engine as? any MultimodalInferenceEngine, vlmEngine.acceptsMultimodalInput else {
             throw InferenceRuntimeError.invalidArgument(
-                "Expected a vision-language engine for a VLM bundle, got \(type(of: engine))")
+                "The \(type(of: engine)) built for this VLM bundle does not accept image input")
         }
 
         let tokenizer = try await tokenizerResult

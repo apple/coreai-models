@@ -78,9 +78,10 @@ public struct EngineFactory: Sendable {
     ///
     /// Handles bundles that ship more than one asset. A vision-language bundle (`kind == .vlm`)
     /// carries a vision component and a `main` decoder, plus an embedding component when
-    /// `vision.token_merge` is `separate_embedding`. That field decides the engine: the sequential
-    /// VLM engine for `separate_embedding` (and bundles that predate the field), the static-shape
-    /// engine for `decoder_gather`. Every other kind resolves its `main` asset and hands off to
+    /// `vision.token_merge` is `separate_embedding`. That field decides the engine:
+    /// `CoreAISequentialEngine` for `separate_embedding` (and bundles that predate the field), the
+    /// static-shape engine for `decoder_gather`. A `separate_embedding` bundle accepts only the
+    /// `coreai-sequential` variant override. Every other kind resolves its `main` asset and hands off to
     /// ``createEngine(config:modelURL:options:)``.
     ///
     /// - Parameters:
@@ -101,6 +102,7 @@ public struct EngineFactory: Sendable {
                 throw InferenceRuntimeError.invalidArgument(
                     "VLM bundle missing 'vision' config in metadata.json")
             }
+            try validateVLMVariant(options.variant, tokenMerge: visionConfig.tokenMerge)
             switch visionConfig.tokenMerge {
             case .decoderGather:
                 return try await makeStaticShapeVLMEngine(
@@ -181,9 +183,8 @@ public struct EngineFactory: Sendable {
         )
     }
 
-    /// Build the sequential VLM engine: assemble the config, prepare the three components, and
-    /// construct the engine. Components are prepared one at a time to keep Core AI specialization
-    /// stable.
+    /// Build `CoreAISequentialEngine` for a separate-embedding VLM: assemble the config, prepare the three components, and construct the engine with its vision
+    /// components. Components are prepared one at a time to keep Core AI specialization stable.
     private static func makeVLMEngine(
         bundle: LanguageModelBundle,
         languageModelURL: URL,
@@ -202,13 +203,33 @@ public struct EngineFactory: Sendable {
         let embedModel = try await PreparedModel.prepare(at: embeddingModelURL)
         let llmModel = try await PreparedModel.prepare(at: languageModelURL)
 
-        return try await CoreAISequentialVLMEngine(
-            config: vlmConfig,
-            visionModel: visionModel,
-            embedModel: embedModel,
-            llmModel: llmModel,
-            options: options
+        return try await CoreAISequentialEngine(
+            config: vlmConfig.base,
+            preparedModel: llmModel,
+            options: options,
+            vision: CoreAISequentialEngine.VisionComponents(
+                visionModel: visionModel, embedModel: embedModel, visionConfig: vlmConfig.visionConfig)
         )
+    }
+
+    /// Checks the variant override for a VLM. Each token-merge mode runs on one engine: a
+    /// separate-embedding VLM on `coreai-sequential`, a decoder-gather VLM on `static-shape`.
+    /// Auto-detection and that engine's variant pass; any other variant throws
+    /// `unsupportedEngineVariant`.
+    static func validateVLMVariant(_ override: String?, tokenMerge: VisionTokenMerge) throws {
+        guard let override, override != "auto", override != "default" else {
+            return
+        }
+        guard let variant = Variant(rawValue: override) else {
+            throw InferenceRuntimeError.unsupportedEngineVariant(
+                "Unknown variant '\(override)'. Valid: auto, coreai-sequential, coreai-pipelined, static-shape")
+        }
+        let supported: Variant = tokenMerge == .separateEmbedding ? .sequential : .staticShape
+        guard variant == supported else {
+            throw InferenceRuntimeError.unsupportedEngineVariant(
+                "Variant '\(override)' does not run \(tokenMerge.rawValue) vision-language models; "
+                    + "use \(supported.rawValue)")
+        }
     }
 
     // MARK: - Config Parsing
