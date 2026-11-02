@@ -23,16 +23,38 @@ package final class StaticShapeDrafter: DrafterEngine, @unchecked Sendable {
     /// The target's token embedding for a token id (`StaticShapeEngine.drafterEmbedding`).
     package var embeddingProvider: ((Int32) async throws -> [Float])?
     /// In-place access to the target's shared caches (`StaticShapeEngine.withSharedKVCache`): K/V
-    /// goes straight from the target's state into the inputs. Without it the drafter proposes the
-    /// anchor repeated, which a target rejects.
+    /// goes straight from the target's state into the inputs. Drafting without it throws.
     package var sharedKVProvider:
         (
             (StaticShapeEngine.SharedKVCacheKind, (StaticShapeEngine.SharedKVCache) -> Void) throws -> Void
         )?
 
+    /// What the head expects of the target, as `export_drafter.py` records it under `contract`.
+    struct Contract: Decodable, Equatable {
+        /// The decode graphs' final post-norm hidden state output.
+        let hiddenStatesOutput: String?
+        /// `unscaled`: `embed_tokens(token)` before the square-root-of-hidden scale the backbone applies.
+        let tokenEmbedding: String?
+        /// `last_storing_layer`: the shared K/V of the target's last layer that stores K/V.
+        let kvSource: String?
+
+        enum CodingKeys: String, CodingKey {
+            case hiddenStatesOutput = "hidden_states_output"
+            case tokenEmbedding = "token_embedding"
+            case kvSource = "kv_source"
+        }
+
+        /// What this runtime provides.
+        static let supported = Contract(
+            hiddenStatesOutput: "hidden_states", tokenEmbedding: "unscaled", kvSource: "last_storing_layer")
+    }
+
     struct Config: Decodable {
         /// Sidecar format version; absent in exports written before it existed, which read as 1.
         let version: Int?
+        /// What the head expects of the target; absent in exports written before it existed, which
+        /// were written for what ``Contract/supported`` provides.
+        let contract: Contract?
         let fullWindows: [Int]?
         /// The one window of an export from before per-window draft steps.
         let window: Int?
@@ -41,7 +63,7 @@ package final class StaticShapeDrafter: DrafterEngine, @unchecked Sendable {
         let fullPartialRotaryFactor: Float
 
         enum CodingKeys: String, CodingKey {
-            case version, window
+            case version, window, contract
             case fullWindows = "full_windows"
             case slidingTheta = "sliding_theta"
             case fullTheta = "full_theta"
@@ -93,6 +115,7 @@ package final class StaticShapeDrafter: DrafterEngine, @unchecked Sendable {
         // The program is static-shape like the target's, so it is specialized the way the engine's are.
         let model = try await AIModel(
             contentsOf: component.step, options: ModelStructure.chunkedStatic(batchSize: 1).specializationOptions)
+        try checkContract(config.contract, name: configURL.lastPathComponent)
         let resolved = try resolveWindows(
             config: config, name: configURL.lastPathComponent, functionNames: Set(model.functionNames))
         for warning in loadWarnings(
@@ -106,6 +129,24 @@ package final class StaticShapeDrafter: DrafterEngine, @unchecked Sendable {
             scan: DraftPack(blob: component.scan, index: component.scanIndex, role: .scan),
             backboneHidden: backboneHiddenSize, maxContextLength: maxContextLength, vocabSize: vocabSize,
             topK: topK)
+    }
+
+    /// Throws unless every expectation the export records is one this runtime provides. A field the
+    /// export omits is not checked.
+    static func checkContract(_ contract: Contract?, name: String) throws {
+        guard let contract else { return }
+        let provided = Contract.supported
+        let remedy = "update the runner or re-export the drafter with a matching models/gemma4/export_drafter.py"
+        func check(_ what: String, expected: String?, provided: String?) throws {
+            guard let expected, expected != provided else { return }
+            throw InferenceRuntimeError.invalidState(
+                "\(name) expects \(what) '\(expected)' from the target, but this runner provides "
+                    + "'\(provided ?? "none")'; \(remedy)")
+        }
+        try check(
+            "the hidden-state output", expected: contract.hiddenStatesOutput, provided: provided.hiddenStatesOutput)
+        try check("a token embedding that is", expected: contract.tokenEmbedding, provided: provided.tokenEmbedding)
+        try check("shared K/V from", expected: contract.kvSource, provided: provided.kvSource)
     }
 
     /// The full-attention windows to serve, ascending, and whether the export is from before
@@ -330,7 +371,13 @@ package final class StaticShapeDrafter: DrafterEngine, @unchecked Sendable {
         confirmedPrefix: [Int32], count: Int, policy: VerificationPolicy,
         using rng: inout some RandomNumberGenerator
     ) async throws -> DraftProposal {
-        guard var lastHidden = seedHidden, let caches = sharedKVProvider else {
+        guard let caches = sharedKVProvider else {
+            throw InferenceRuntimeError.invalidState(
+                "StaticShapeDrafter has no shared K/V provider: connect it to the target before drafting")
+        }
+        // Before the first verify there is no hidden state to seed from, so the round proposes the
+        // anchor, which the target rejects.
+        guard var lastHidden = seedHidden else {
             let anchor = confirmedPrefix.last ?? 0
             return DraftProposal(tokens: Array(repeating: anchor, count: count))
         }

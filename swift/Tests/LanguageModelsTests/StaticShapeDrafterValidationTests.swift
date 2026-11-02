@@ -32,6 +32,46 @@ struct StaticShapeDrafterValidationTests {
 
     private let functions: Set<String> = ["draft_step_512", "draft_step_1024"]
 
+    private func contract(_ json: String) throws -> StaticShapeDrafter.Config {
+        try config("{\"contract\": \(json), \"full_windows\": [512, 1024]}")
+    }
+
+    @Test("The contract this runtime provides is the one the exporter writes")
+    func exporterContract() throws {
+        let written = try contract(
+            """
+            {"hidden_states_output": "hidden_states", "token_embedding": "unscaled",
+             "kv_source": "last_storing_layer"}
+            """)
+        #expect(written.contract == StaticShapeDrafter.Contract.supported)
+        try StaticShapeDrafter.checkContract(written.contract, name: "draft_step.json")
+    }
+
+    @Test("An export from before the contract existed is accepted")
+    func noContract() throws {
+        #expect(try config().contract == nil)
+        try StaticShapeDrafter.checkContract(try config().contract, name: "draft_step.json")
+    }
+
+    @Test(
+        "An expectation the runtime does not implement is rejected, naming it and the remedy",
+        arguments: [
+            ("hidden_states_output", "final_hidden", "hidden-state output"),
+            ("token_embedding", "scaled", "token embedding"),
+            ("kv_source", "first_storing_layer", "shared K/V"),
+        ])
+    func unsupportedExpectation(field: String, value: String, mentions: String) throws {
+        let c = try contract("{\"\(field)\": \"\(value)\"}")
+        let text = message { try StaticShapeDrafter.checkContract(c.contract, name: "draft_step.json") }
+        #expect(text.contains(mentions) && text.contains(value) && text.contains("re-export"))
+    }
+
+    @Test("An expectation the export leaves out is not checked")
+    func partialContract() throws {
+        let c = try contract("{\"kv_source\": \"last_storing_layer\"}")
+        try StaticShapeDrafter.checkContract(c.contract, name: "draft_step.json")
+    }
+
     @Test("Windows resolve to the listed full_windows of a current export")
     func currentExport() throws {
         let r = try StaticShapeDrafter.resolveWindows(
@@ -186,6 +226,17 @@ struct StaticShapeDrafterExportTests {
             Issue.record("expected a mismatch error")
         } catch {
             #expect("\(error)".contains("1536") && "\(error)".contains("2560"))
+        }
+    }
+
+    @Test("A drafter that is not connected to a target refuses to draft")
+    func unconnectedDrafter() async throws {
+        let drafter = try await StaticShapeDrafter.load(
+            component: component, backboneHiddenSize: 1536, maxContextLength: 16384, vocabSize: 262_144)
+        var rng = SystemRandomNumberGenerator()
+        await #expect(throws: InferenceRuntimeError.self) {
+            _ = try await drafter.draftAll(
+                confirmedPrefix: [1, 2, 3], count: 2, policy: .greedy, using: &rng)
         }
     }
 
