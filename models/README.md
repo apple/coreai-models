@@ -133,7 +133,7 @@ Pass `--include-debug-info` to switch the converter to `DEBUG` mode, which embed
 uv run coreai.llm.export Qwen/Qwen3-0.6B --include-debug-info
 ```
 
-The flag is available on `coreai.llm.export`, `coreai.vlm.export`, `coreai.diffusion.export`, `coreai.segmentation.export`, and every standalone `models/<name>/export.py` recipe, so all export paths produce assets carrying the same debug information by default.
+The flag is available on `coreai.llm.export`, `coreai.vlm.export`, `coreai.diffusion.export`, `coreai.segmentation.export`, `coreai.embedding.export`, and every standalone `models/<name>/export.py` recipe, so all export paths produce assets carrying the same debug information by default.
 
 **Note:** `--include-debug-info` is independent of `--verbose`/`-v`. `--verbose` only raises the console log level; it does not change what goes into the asset.
 
@@ -189,6 +189,35 @@ decoder (`main`), token-embedding lookup (`embedding`), vision encoder
 (`vision`), tokenizer, and `metadata.json`. Pass `--skip-vision` to export the
 text portion only.
 
+### Embedding Models
+
+```bash
+uv run coreai.embedding.export --list-models
+uv run coreai.embedding.export clip-vit-b32                 # text + image towers (macOS)
+uv run coreai.embedding.export clap-htsat --platform iOS    # text + audio towers (iOS)
+uv run coreai.embedding.export clip-vit-b32 --fused         # a single fused asset, including a `main`
+```
+
+Each export writes a bundle directory `exports/<name>/` with:
+
+- one `.aimodel` per tower: `text_encoder`, plus `image_encoder` (CLIP) or `audio_encoder` (CLAP)
+- `tokenizer/`
+- `metadata.json`: how a host tokenizes, preprocesses and batches inputs
+  ([contract](../python/src/coreai_models/embedding/contract.py))
+
+Every tower returns L2-normalized vectors in one shared space: the cosine of a
+text vector and an image or audio vector is their similarity.
+
+- `--text-only` exports the text tower alone.
+- `--compute-precision float16` computes in float16.
+- `--compute-precision bfloat16` computes in bfloat16 (CLIP only).
+
+Details are in the [CLIP](clip) and [CLAP](clap) model cards. To add a model,
+register an `EmbeddingExporter` in `EXPORTERS`
+([`embedding/export.py`](../python/src/coreai_models/embedding/export.py)) and
+add a `UtilityModel` row with `export_script="coreai.embedding.export"` to
+`UTILITY_PRESETS`.
+
 ### Standalone Export Scripts
 
 Models with a standalone `export.py` are run directly:
@@ -225,7 +254,6 @@ uv run models/<name>/export.py --include-debug-info   # embed debug information 
 
 ### Vision Models
 
-- [CLIP](clip)
 - [Depth Anything v3](depth-anything)
 - [EDSR](edsr)
 - [EfficientSAM](efficient-sam)
@@ -235,7 +263,6 @@ uv run models/<name>/export.py --include-debug-info   # embed debug information 
 
 ### Audio Models
 
-- [CLAP](clap)
 - [Parakeet TDT](parakeet)
 - [Wav2Vec 2.0](wav2vec2)
 - [Whisper](whisper)
@@ -244,6 +271,11 @@ uv run models/<name>/export.py --include-debug-info   # embed debug information 
 
 - [RoBERTa](roberta)
 - [T5](t5)
+
+### Embedding Models
+
+- [CLAP](clap)
+- [CLIP](clip)
 
 ## Adding a Model
 

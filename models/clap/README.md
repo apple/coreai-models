@@ -13,24 +13,44 @@ brew install uv
 ## Export
 
 ```sh
-uv run export.py
+uv run coreai.embedding.export clap-htsat
 ```
 
-Saves to `<repo-root>/exports/<model>_<dtype>_<static_or_dynamic>.aimodel` (e.g. `<repo-root>/exports/laion_clap-htsat-unfused_float32_static.aimodel`). Pass `--output-dir <path>` to override the destination.
+This writes the bundle `<repo-root>/exports/clap-htsat/`:
+
+- `text_encoder.aimodel`: `input_ids`, `attention_mask` `[B, 77]` → `embedding` `[B, 512]`
+- `audio_encoder.aimodel`: log-mel `input_features` `[B, 1, 1001, 64]` → `embedding` `[B, 512]`
+- `tokenizer/`
+- `metadata.json`: the tokenizer settings, audio front end, batch range and `logit_scale`
+
+`B` is 1 to 64. Embeddings are L2-normalized; `logit_scale * dot(text, audio)` gives Hugging Face's `logits_per_audio`. Pass `--output-dir <path>` to write the bundle somewhere else.
+
+`logit_scale` is 18.66, `exp(logit_scale_a)`. Hugging Face's `logits_per_text` uses `logit_scale_t` instead, which stayed at its initial value (14.29) in training.
 
 ```sh
-uv run export.py --help
+uv run coreai.embedding.export clap-htsat --fused           # a single fused asset, including a `main`
+uv run coreai.embedding.export clap-htsat --platform iOS    # bundle clap-htsat-ios
+uv run coreai.embedding.export clap-htsat --compute-precision float16
+uv run coreai.embedding.export --help
 ```
+
+`--fused` writes a single `model.aimodel` instead. It holds both tower functions and `main`, which runs Hugging Face's `ClapModel` forward:
+
+- inputs: `input_ids`, `attention_mask` (text length 77), `input_features`, `is_longer`
+- outputs: `logits_per_audio`, `logits_per_text`, `text_embeds`, `audio_embeds`
 
 **Options:**
 
-| Flag           | Description                                       | Default                    |
-| -------------- | ------------------------------------------------- | -------------------------- |
-| `--model`      | Model variant                                     | `laion/clap-htsat-unfused` |
-| `--output-dir` | Output directory for `.aimodel`                   | `<repo-root>/exports/`     |
-| `--dtype`      | `float16`, `float32`                              | `float32`                  |
-| `--overwrite`  | Overwrite existing `.aimodel`                     | —                          |
-| `--dynamic`    | Dynamic text batch size (1–64); audio stays fixed | —                          |
+| Flag                   | Description                               | Default                |
+| ---------------------- | ----------------------------------------- | ---------------------- |
+| `clap-htsat`           | Short name, or `laion/clap-htsat-unfused` | —                      |
+| `--compute-precision`  | `float32`, `float16`                      | `float32`              |
+| `--platform`           | `macOS` or `iOS` (same GPU programs)      | `macOS`                |
+| `--fused`              | A single fused asset, including a `main`  | —                      |
+| `--text-only`          | Text tower only                           | —                      |
+| `--output-dir`         | Parent of the bundle directory            | `<repo-root>/exports/` |
+| `--overwrite`          | Replace an existing bundle                | —                      |
+| `--include-debug-info` | Embed debug information in the assets     | —                      |
 
 **Supported models:**
 
