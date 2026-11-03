@@ -136,6 +136,11 @@ script refuses a bundle exported without it.
 second output, `hidden_states`, and records `language.overrides.emits_hidden_states` in the bundle
 metadata. The default export is unchanged.
 
+Pass the same `--max-context-length` to `export.py` and `export_drafter.py`: the head's full-attention
+layer covers up to that length, and a head exported for more than the target needs is a larger program.
+The other speculative decoding options are described under
+[Speculative Decoding](../README.md#speculative-decoding).
+
 `export_drafter.py` exports the head's layer stack as one static-shape program, `draft_step.aimodel`,
 with one function per context bucket of the target export's ladder, up to `--max-context-length`.
 The token-embedding lookup and the candidate scan stay outside the program, over
@@ -165,7 +170,8 @@ tokens recur in the context is proposed by lookup, any other by the head) and wi
 verify tile is wide, and `--no-align-proposals` drops that limit. `--drafter-top-k` sets how many
 centroids the head's candidate scan scores.
 
-The run summary reports the share of drafts accepted and the tokens committed per target pass.
+The run summary reports the share of drafts accepted and the tokens committed per target pass, then
+the same timing summary as a plain run.
 
 ### Runner side
 

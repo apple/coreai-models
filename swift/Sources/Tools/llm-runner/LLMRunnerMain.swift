@@ -495,6 +495,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     private func runSpeculativeDecoding(
         targetPath: String, draftPath rawDraftPath: String?, resolver: ModelPaths
     ) async throws {
+        await PerformanceMetrics.shared.startOverallTiming()
         func loadSpeculativeEngine(from path: String, label: String) async throws
             -> (engine: any SpeculativeEngine, bundle: LanguageModelBundle)
         {
@@ -508,7 +509,9 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             )
             // The factory builds the vision-wired static-shape engine for a VLM bundle whose decoder
             // gathers its own token embeddings, so the target can encode and scatter an image.
-            let engine = try await EngineFactory.createEngine(bundle: bundle, options: options)
+            let engine = try await InstrumentsProfiler.profile(InstrumentsProfiler.beginModelLoad(name: bundle.name)) {
+                try await EngineFactory.createEngine(bundle: bundle, options: options)
+            }
             guard let spec = engine as? any SpeculativeEngine else {
                 print(
                     "Error: engine for \(bundle.name) (\(type(of: engine))) does not support "
@@ -711,8 +714,6 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             }
         }
 
-        let clock = SuspendingClock()
-        let start = clock.now
         let stats: SpeculativeDecoder.Stats
         do {
             if useGreedy {
@@ -730,8 +731,9 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             print("\n[spec-decode] error: \(error)  |  reflected: \(String(reflecting: error))")
             throw error
         }
-        let seconds = (clock.now - start).inSeconds
-        let tokPerSec = seconds > 0 ? Double(stats.generatedTokens) / seconds : 0
+        await PerformanceMetrics.shared.endOverallTiming()
+        await PerformanceMetrics.shared.recordPromptTokens(promptTokensForGen.count)
+        await PerformanceMetrics.shared.recordGeneratedTokens(stats.generatedTokens)
 
         print("\n\n── Speculative decoding summary ──")
         print(
@@ -742,14 +744,6 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             "  draft accepted:        \(stats.draftTokensAccepted)/\(stats.draftTokensProposed) "
                 + "(\(String(format: "%.1f", stats.acceptanceRate * 100))%)")
         print("  tokens / target pass:  \(String(format: "%.2f", stats.meanTokensPerTargetPass))")
-        print(
-            "  throughput:            \(String(format: "%.1f", tokPerSec)) tok/s (\(String(format: "%.2f", seconds))s, incl. prompt/specialization)"
-        )
-        let genTokPerSec =
-            stats.generationSeconds > 0 ? Double(stats.generatedTokens) / stats.generationSeconds : 0
-        print(
-            "  generation-only:       \(String(format: "%.1f", genTokPerSec)) tok/s "
-                + "(\(String(format: "%.2f", stats.generationSeconds))s) — compare to base 'Generation:'")
         if stats.lookupProposals > 0 {
             print(
                 "  lookup proposals:      \(stats.lookupProposals) blocks, "
@@ -759,6 +753,13 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             print(
                 "  grammar proposals:     \(stats.grammarProposals) blocks, "
                     + "\(stats.grammarTokensAccepted)/\(stats.grammarTokensProposed) tokens accepted")
+        }
+
+        // The same timing summary as a plain run: prompt, generation and total, from the profiler's
+        // spans. With --verbose, the statistics table also lists the drafter and verify spans.
+        await PerformanceMetrics.shared.printSummary(verbose: CLILogger.isVerbose)
+        if verbose {
+            await StatsReporter(storage: .shared).printVerboseTable()
         }
     }
 
