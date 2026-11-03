@@ -150,3 +150,128 @@ class TestMutableWeightRoundTrip:
     def test_a_weight_only_read_with_value_is_refused_at_export(self, tmp_path: Path) -> None:
         with pytest.raises(ValueError, match=r"MutableWeight\.read\(\)"):
             self._export(_Projection(read_with_value=True), torch.randn(2, 4), "weight", tmp_path)
+
+
+class _Weighted(nn.Module):
+    """``x @ weight`` for one ``(n, m)`` mutable weight of a given dtype."""
+
+    def __init__(self, n: int, m: int, dtype: torch.dtype) -> None:
+        super().__init__()
+        self.weight = MutableWeight("weight", (n, m), dtype=dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x @ self.weight.read()
+
+
+class _ManyWeights(nn.Module):
+    """Row ``i`` of the output is ``x * w_i``, so a weight bound to the wrong name shows."""
+
+    def __init__(self, count: int) -> None:
+        super().__init__()
+        self.store = MutableWeightStore([MutableWeight(f"w{i:02d}", (4,)) for i in range(count)])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.stack([x * weight.read() for weight in self.store.weights()])
+
+
+_COMPUTE_UNITS = [
+    "cpu",
+    "gpu",
+    pytest.param(
+        "neural_engine",
+        marks=pytest.mark.xfail(reason="mutable weights are not yet verified on the ANE"),
+    ),
+]
+
+
+@pytest.mark.skipif(not _HAS_COREAI, reason=_MSG_COREAI_NOT_FOUND)
+@pytest.mark.parametrize("compute_unit", _COMPUTE_UNITS)
+class TestMutableWeightStress:
+    """Round trips under load, on each preferred compute unit."""
+
+    @staticmethod
+    def _options(compute_unit: str):
+        from coreai.runtime import ComputeUnitKind, SpecializationOptions
+
+        return SpecializationOptions.from_preferred_compute_unit_kind(
+            getattr(ComputeUnitKind, compute_unit)()
+        )
+
+    @staticmethod
+    def _export(module: nn.Module, x: torch.Tensor, names: list[str], tmp_path: Path) -> Path:
+        _, path = export_mutable_weight_module(
+            module,
+            (x,),
+            input_names=["x"],
+            output_names=["y"],
+            weight_names=names,
+            output_path=tmp_path / "model.aimodel",
+        )
+        return path
+
+    def test_a_written_weight_persists_over_many_calls(
+        self, compute_unit: str, tmp_path: Path
+    ) -> None:
+        x = torch.ones(4)
+        path = self._export(_Accumulator(), x, ["total"], tmp_path)
+        with MutableWeightRunner(
+            path, {"total": torch.zeros(4)}, options=self._options(compute_unit)
+        ) as runner:
+            for step in range(1, 101):
+                np.testing.assert_allclose(runner.step({"x": x})["y"], np.full(4, float(step)))
+            np.testing.assert_allclose(runner.weights_snapshot()["total"], np.full(4, 100.0))
+
+    def test_the_host_replaces_a_weight_on_every_call(
+        self, compute_unit: str, tmp_path: Path
+    ) -> None:
+        torch.manual_seed(0)
+        x = torch.randn(2, 16)
+        weights = [torch.randn(16, 8) for _ in range(20)]
+        path = self._export(_Weighted(16, 8, torch.float32), x, ["weight"], tmp_path)
+        with MutableWeightRunner(
+            path, {"weight": weights[0]}, options=self._options(compute_unit)
+        ) as runner:
+            # Every value once, then back to the first: an earlier value is not cached.
+            for weight in [*weights, weights[0]]:
+                runner.set_weight("weight", weight)
+                np.testing.assert_allclose(
+                    runner.step({"x": x})["y"], (x @ weight).numpy(), rtol=1e-3, atol=1e-3
+                )
+
+    def test_many_weights_keep_their_names(self, compute_unit: str, tmp_path: Path) -> None:
+        count = 24
+        module = _ManyWeights(count)
+        x = torch.arange(1.0, 5.0)
+        path = self._export(module, x, list(module.store.weight_names()), tmp_path)
+        names = module.store.weight_names()
+        init = {name: torch.full((4,), float(i)) for i, name in enumerate(names)}
+        with MutableWeightRunner(path, init, options=self._options(compute_unit)) as runner:
+            expected = torch.stack([x * i for i in range(count)]).numpy()
+            np.testing.assert_allclose(runner.step({"x": x})["y"], expected)
+
+    def test_a_large_weight(self, compute_unit: str, tmp_path: Path) -> None:
+        # 2048 x 4096 float32: 32 MiB.
+        torch.manual_seed(0)
+        x, weight = torch.randn(1, 2048), torch.randn(2048, 4096) / 64
+        path = self._export(_Weighted(2048, 4096, torch.float32), x, ["weight"], tmp_path)
+        with MutableWeightRunner(
+            path, {"weight": weight}, options=self._options(compute_unit)
+        ) as runner:
+            np.testing.assert_allclose(
+                runner.step({"x": x})["y"], (x @ weight).numpy(), rtol=1e-2, atol=1e-2
+            )
+
+    def test_a_float16_weight(self, compute_unit: str, tmp_path: Path) -> None:
+        torch.manual_seed(0)
+        x = torch.randn(2, 16, dtype=torch.float16)
+        first, second = (torch.randn(16, 8, dtype=torch.float16) for _ in range(2))
+        path = self._export(_Weighted(16, 8, torch.float16), x, ["weight"], tmp_path)
+        with MutableWeightRunner(
+            path, {"weight": first}, options=self._options(compute_unit)
+        ) as runner:
+            for weight in (first, second):
+                runner.set_weight("weight", weight)
+                expected = (x.float() @ weight.float()).numpy()
+                np.testing.assert_allclose(
+                    runner.step({"x": x})["y"].astype(np.float32), expected, rtol=1e-2, atol=1e-2
+                )

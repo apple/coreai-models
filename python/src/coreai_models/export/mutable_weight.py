@@ -28,7 +28,7 @@ import torch.nn as nn
 
 if TYPE_CHECKING:
     from coreai.authoring import AIProgram
-    from coreai.runtime import InferenceFunction
+    from coreai.runtime import InferenceFunction, SpecializationOptions
 
 
 def export_mutable_weight_module(
@@ -97,37 +97,45 @@ def export_mutable_weight_module(
 class MutableWeightRunner:
     """Runs an exported mutable-weight module, keeping its weights on device.
 
-    Each :meth:`step` runs the ``main`` function once; the mutable weights persist and
-    change between calls, and the host passes only the other inputs. :meth:`set_weight`
-    replaces a weight's value between calls, and :meth:`weights_snapshot` reads the
-    current values.
+    Each :meth:`step` runs one function of the model once; the mutable weights persist
+    and change between calls, and the host passes only the other inputs.
+    :meth:`set_weight` replaces a weight's value between calls, and
+    :meth:`weights_snapshot` reads the current values. Every call runs on one event
+    loop, the one the model was loaded on.
 
     Args:
         aimodel_path: The exported ``.aimodel``.
         weights_init: The initial value of every mutable weight, keyed by name.
+        options: Specialization options for loading, such as the preferred compute
+            unit; the runtime's default when omitted.
+        function_name: The function :meth:`step` runs.
     """
 
     def __init__(
         self,
         aimodel_path: Path | str,
         weights_init: dict[str, np.ndarray | torch.Tensor],
+        *,
+        options: SpecializationOptions | None = None,
+        function_name: str = "main",
     ) -> None:
         from coreai.runtime import NDArray
 
         self._path = Path(aimodel_path)
         self._fn: InferenceFunction
         self._exit_stack = AsyncExitStack()
+        self._loop = asyncio.new_event_loop()
         self._weights: dict[str, NDArray] = {
             name: NDArray(data=_as_tensor(value)) for name, value in weights_init.items()
         }
-        asyncio.run(self._async_init())
+        self._loop.run_until_complete(self._async_init(options, function_name))
 
-    async def _async_init(self) -> None:
+    async def _async_init(self, options: SpecializationOptions | None, function_name: str) -> None:
         from coreai.authoring.asset import AIModelAsset
 
         asset = AIModelAsset.load(self._path)
-        model = await self._exit_stack.enter_async_context(asset.executable())
-        self._fn = model.load_function("main")
+        model = await self._exit_stack.enter_async_context(asset.executable(options))
+        self._fn = model.load_function(function_name)
 
     async def _async_step(
         self, inputs: dict[str, np.ndarray | torch.Tensor]
@@ -141,8 +149,8 @@ class MutableWeightRunner:
         }
 
     def step(self, inputs: dict[str, np.ndarray | torch.Tensor]) -> dict[str, np.ndarray]:
-        """Run ``main`` once on ``inputs`` and return its outputs by name."""
-        return asyncio.run(self._async_step(inputs))
+        """Run the function once on ``inputs`` and return its outputs by name."""
+        return self._loop.run_until_complete(self._async_step(inputs))
 
     def set_weight(self, name: str, value: np.ndarray | torch.Tensor) -> None:
         """Replace the value of the mutable weight ``name`` before the next call.
@@ -161,8 +169,11 @@ class MutableWeightRunner:
         return {name: np.asarray(value.numpy()).copy() for name, value in self._weights.items()}
 
     def close(self) -> None:
-        """Release the loaded model."""
-        asyncio.run(self._exit_stack.aclose())
+        """Release the loaded model and its event loop."""
+        try:
+            self._loop.run_until_complete(self._exit_stack.aclose())
+        finally:
+            self._loop.close()
 
     def __enter__(self) -> MutableWeightRunner:
         return self
