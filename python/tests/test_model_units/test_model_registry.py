@@ -184,6 +184,10 @@ def test_try_lookup_resolves_sana_sprint() -> None:
     assert p is not None
     assert p.hf_id == "Efficient-Large-Model/Sana_Sprint_0.6B_1024px_diffusers"
     assert _preset_to_output_name(p) == "Sana_Sprint_0.6B_1024px_diffusers"
+    p = try_lookup_preset("sana-sprint-1.6b", model_type="diffusion")
+    assert p is not None
+    assert p.hf_id == "Efficient-Large-Model/Sana_Sprint_1.6B_1024px_diffusers"
+    assert _preset_to_output_name(p) == "Sana_Sprint_1.6B_1024px_diffusers"
 
 
 def test_try_lookup_without_type_finds_across_tables() -> None:
