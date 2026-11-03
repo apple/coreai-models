@@ -64,7 +64,7 @@ from coreai_models.models.macos.qwen2 import (
 )
 from tests._runner_infra.models.model import Model
 from tests._runner_infra.testing_utils import (
-    MACOS_27_0_KNOWN_ISSUE,
+    MACOS_27_KNOWN_ISSUE,
     ForCausalLMTestBase,
     skip_os_coreai_below_macos,
 )
@@ -903,7 +903,7 @@ class TestQwen2Layers:
         if num_key_value_heads > num_attention_heads:
             pytest.skip("num_key_value_heads > num_attention_heads is invalid")
         if precision in (Precision.f16, Precision.bf16) and num_attention_heads > 1:
-            skip_os_coreai_below_macos((27, 2), MACOS_27_0_KNOWN_ISSUE)
+            skip_os_coreai_below_macos((27, 2), MACOS_27_KNOWN_ISSUE)
 
         oss_torch_config = RunConfig(
             author=cast("Author", Author.oss),

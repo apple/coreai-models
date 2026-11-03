@@ -1508,7 +1508,7 @@ def skip_os_coreai_below_macos(version: tuple[int, ...], reason: str) -> None:
         pytest.skip(f"macOS {have} < {need}: {reason}")
 
 
-MACOS_27_0_KNOWN_ISSUE = "known issue on macOS 27.0"
+MACOS_27_KNOWN_ISSUE = "known issue on macOS 27.x"
 
 
 # Part of the RuntimeError Core AI raises when the Neural Engine refuses to load a program.
@@ -1542,7 +1542,7 @@ def skip_if_neural_engine_refused(error: BaseException) -> None:
     """Skip the calling test if ``error`` is a Neural Engine load refusal on a machine
     where the probe is refused too; otherwise return so the caller raises."""
     if is_neural_engine_load_error(error) and not neural_engine_available():
-        pytest.skip("known issue on macOS 27")
+        pytest.skip(MACOS_27_KNOWN_ISSUE)
 
 
 def _run_coreai(coroutine: collections.abc.Coroutine[Any, Any, None]) -> None:

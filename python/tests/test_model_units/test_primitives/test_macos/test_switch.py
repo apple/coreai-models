@@ -40,7 +40,7 @@ from tests._runner_infra.common.types.source_types import (
     Source,
     SourceConfig,
 )
-from tests._runner_infra.testing_utils import uses_os_coreai
+from tests._runner_infra.testing_utils import MACOS_27_KNOWN_ISSUE, uses_os_coreai
 from tests.test_model_units.test_primitives.test_macos._random_input_models import (
     RandomInputModel,
     RandomInputWithIndicesModel,
@@ -56,7 +56,7 @@ if _HAS_MLX:
 
 F16_MACOS_27_XFAIL = pytest.param(
     Precision.f16,
-    marks=pytest.mark.xfail(uses_os_coreai(), reason="known issue on macOS 27", strict=False),
+    marks=pytest.mark.xfail(uses_os_coreai(), reason=MACOS_27_KNOWN_ISSUE, strict=False),
 )
 
 

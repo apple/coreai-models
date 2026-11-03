@@ -11,6 +11,7 @@ import torch
 import coreai_models.primitives.macos.cache as cache_module
 from coreai_models.primitives.macos.cache import DeltaNetCache, KVCache, SSMState
 from tests._runner_infra.testing_utils import (
+    MACOS_27_KNOWN_ISSUE,
     assert_close,
     run_compare_coreai_explicit_kv_cache,
     uses_os_coreai,
@@ -267,7 +268,7 @@ class TestKVCache:
         forward(input_ids, position_ids, k_cache, v_cache) -> (logits, k_cache, v_cache).
         """
         if uses_os_coreai():
-            pytest.skip("known issue on macOS 27")
+            pytest.skip(MACOS_27_KNOWN_ISSUE)
         N_KV_HEADS = 2
         HEAD_DIM = 4
         MAX_SEQ = 32
