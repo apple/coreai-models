@@ -171,6 +171,38 @@ struct GrammarSpeculativeDecodingTests {
         }
     }
 
+    /// What `body` writes to standard error, which is where the grammar matcher reports.
+    private func standardError(_ body: () async throws -> Void) async rethrows -> String {
+        let path = FileManager.default.temporaryDirectory.appendingPathComponent("stderr-\(UUID().uuidString)")
+        FileManager.default.createFile(atPath: path.path, contents: nil)
+        let handle = try! FileHandle(forWritingTo: path)
+        fflush(stderr)
+        let saved = dup(STDERR_FILENO)
+        dup2(handle.fileDescriptor, STDERR_FILENO)
+        defer {
+            fflush(stderr)
+            dup2(saved, STDERR_FILENO)
+            close(saved)
+            try? handle.close()
+            try? FileManager.default.removeItem(at: path)
+        }
+        try await body()
+        fflush(stderr)
+        return (try? String(contentsOf: path, encoding: .utf8)) ?? ""
+    }
+
+    @Test("Slots scored past the stop token are not offered to the terminated grammar")
+    func nothingIsAcceptedAfterTermination() async throws {
+        // The drafter proposes the stop token, so the final verify block spans it: the target's
+        // choice at the slots after it is a token the grammar can no longer take.
+        var result: (tokens: [Int32], stats: SpeculativeDecoder.Stats, verifyPasses: Int)?
+        let log = try await standardError {
+            result = try await run(forcedRunLimit: 0, drafterToken: stop)
+        }
+        #expect(result?.tokens == script + [stop])
+        #expect(!log.contains("terminated after accepting the stop token"), "\(log)")
+    }
+
     @Test("Stopping at maxNewTokens leaves the grammar exactly at the emitted stream")
     func grammarMatchesEmittedStreamAfterEarlyStop() async throws {
         for limit in [3, 5, 9, 12] {

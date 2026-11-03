@@ -362,6 +362,15 @@ _METADATA: dict[str, AIModelMetadataFields] = {
             "Source: https://huggingface.co/Efficient-Large-Model/Sana_Sprint_0.6B_1024px_diffusers"
         ),
     ),
+    "Efficient-Large-Model/Sana_Sprint_1.6B_1024px_diffusers": AIModelMetadataFields(
+        author="NVIDIA, Sana",
+        license="Apache-2.0",
+        model_description=(
+            "Sana Sprint 1.6B is a few-step (1-4) text-to-image linear-attention "
+            "diffusion transformer distilled from Sana, generating 1024×1024 images. "
+            "Source: https://huggingface.co/Efficient-Large-Model/Sana_Sprint_1.6B_1024px_diffusers"
+        ),
+    ),
     # ---- Segmentation ----
     "facebook/sam3": AIModelMetadataFields(
         author="N. Carion et al.",

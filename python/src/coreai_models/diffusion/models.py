@@ -15,6 +15,7 @@ SUPPORTED_MODELS: list[tuple[str, str, str]] = [
     ("flux2", "black-forest-labs/FLUX.2-klein-4B", "flux2"),
     ("wan-t2v-1.3b", "Wan-AI/Wan2.1-T2V-1.3B-Diffusers", "wan"),
     ("sana-sprint-0.6b", "Efficient-Large-Model/Sana_Sprint_0.6B_1024px_diffusers", "sana_sprint"),
+    ("sana-sprint-1.6b", "Efficient-Large-Model/Sana_Sprint_1.6B_1024px_diffusers", "sana_sprint"),
 ]
 
 
