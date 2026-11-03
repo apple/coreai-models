@@ -29,7 +29,7 @@ from coreai_models.embedding.contract import (
     EmbeddingFamily,
     EmbeddingPrecisionError,
     ImagePreprocessing,
-    build_bundle_metadata,
+    build_embedding_bundle_metadata,
     bundle_name,
     function_entry,
     media_block,
@@ -212,7 +212,9 @@ def test_bundle_names_and_envelope():
     assert bundle_name(TOY, "macOS", False, False) == "toy-embed"
     assert bundle_name(TOY, "iOS", True, False) == "toy-embed-ios-text"
     assert bundle_name(TOY, "macOS", False, True) == "toy-embed-fused"
-    meta = build_bundle_metadata(TOY, {}, name="toy-embed", assets={}, hf_revision=REVISION)
+    meta = build_embedding_bundle_metadata(
+        TOY, {}, name="toy-embed", assets={}, hf_revision=REVISION
+    )
     assert meta["metadata_version"] == "0.2" and meta["kind"] == "embedding"
     assert meta["source"] == {
         "model_definition": "torch",

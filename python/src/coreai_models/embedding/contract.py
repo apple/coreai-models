@@ -253,7 +253,7 @@ def bundle_name(family: EmbeddingFamily, platform: str, text_only: bool, fused: 
     )
 
 
-def build_bundle_metadata(
+def build_embedding_bundle_metadata(
     family: EmbeddingFamily,
     block: dict[str, Any],
     *,

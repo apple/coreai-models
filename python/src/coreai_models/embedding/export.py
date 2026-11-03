@@ -28,7 +28,7 @@ from coreai_models.embedding.clip_clap import CLAP_EXPORTER, CLIP_EXPORTER
 from coreai_models.embedding.contract import (
     PLATFORMS,
     SUPPORTED_COMPUTE_PRECISIONS,
-    build_bundle_metadata,
+    build_embedding_bundle_metadata,
     bundle_name,
     resolve_compute_precision,
     validate_block,
@@ -140,7 +140,7 @@ def export_embedding_bundle(
             revision=sha,
         )
         validate_block(block, assets)
-        metadata = build_bundle_metadata(
+        metadata = build_embedding_bundle_metadata(
             family,
             block,
             name=bundle_name(family, platform, text_only, fused),

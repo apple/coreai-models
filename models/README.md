@@ -233,7 +233,8 @@ uv run coreai.embedding.export clip-vit-b32 --fused         # a single fused ass
 
 Each export writes a bundle directory `exports/<name>/` with:
 
-- one `.aimodel` per tower: `text_encoder`, plus `image_encoder` (CLIP) or `audio_encoder` (CLAP)
+- one `.aimodel` per tower: `text_encoder`, plus `image_encoder` (CLIP) or `audio_encoder` (CLAP);
+  with `--fused`, a single `model.aimodel` holding every tower
 - `tokenizer/`
 - `metadata.json`: how a host tokenizes, preprocesses and batches inputs
   ([contract](../python/src/coreai_models/embedding/contract.py))
