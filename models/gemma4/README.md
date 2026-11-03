@@ -170,7 +170,8 @@ tokens recur in the context is proposed by lookup, any other by the head) and wi
 verify tile is wide, and `--no-align-proposals` drops that limit. `--drafter-top-k` sets how many
 centroids the head's candidate scan scores.
 
-The run summary reports the share of drafts accepted and the tokens committed per target pass.
+The run summary reports the share of drafts accepted and the tokens committed per target pass, then
+the same timing summary as a plain run.
 
 ### Runner side
 
