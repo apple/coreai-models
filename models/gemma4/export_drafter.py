@@ -128,7 +128,7 @@ class RMSNorm(nn.Module):
 
     ``rsqrt(mean((x / s)^2) + eps / s^2) / s`` equals ``rsqrt(mean(x^2) + eps)`` and moves fp16
     overflow of the square from ``|x| > 256`` to ``|x| > 256 * s``. Computing the square and mean
-    in fp32 instead moves the program off the Neural Engine.
+    in fp32 instead stops the program from running where the target's graphs run.
     """
 
     SCALE = 16.0

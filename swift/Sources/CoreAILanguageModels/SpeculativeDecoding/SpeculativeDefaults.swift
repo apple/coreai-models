@@ -9,7 +9,7 @@ package enum SpeculativeDefaults {
     package static let numDraftTokens = 4
 
     /// Most draft tokens per step. A verify pass scores a block in one forward, and the widest
-    /// tile an engine runs is far narrower than this (the Neural Engine's decode tile is 8), so a
+    /// tile an engine runs is far narrower than this (the static-shape engine's decode tile is 8), so a
     /// larger count only spends draft work on tokens the engine cannot verify together.
     package static let maxDraftTokens = 256
 

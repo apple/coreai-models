@@ -7,7 +7,7 @@
 
 Extracts the bespoke RoPE ViT vision tower + multimodal projector from a
 multimodal Gemma4 checkpoint (``Gemma4ForConditionalGeneration``) and re-authors
-it for the Neural Engine, producing image *soft tokens* in text-decoder space.
+it for static-shape execution, producing image *soft tokens* in text-decoder space.
 
 Bucketed geometry:
   - A ladder of square canvas sizes (patch-count buckets), not one fixed size: for
@@ -386,8 +386,8 @@ class Gemma4VisionEncoderForiOS(nn.Module):
         + col_block -- matching HF ``Gemma4VisionPooler`` for a full (no-padding) grid.
 
         Uses ``avg_pool2d`` (rank-4 NCHW) rather than a grid reshape: a
-        ``(B, pg, k, pg, k, hidden)`` reshape is rank 6 and exceeds the ANE's max
-        tensor rank (5), dropping the op off the Neural Engine.
+        ``(B, pg, k, pg, k, hidden)`` reshape is rank 6 and exceeds the static-shape
+        engine's maximum tensor rank (5), so the op would run elsewhere.
         """
         b, g = x.shape[0], self.grid
         # (B, N, hidden) row-major -> (B, hidden, grid, grid) NCHW (row=H, col=W).
