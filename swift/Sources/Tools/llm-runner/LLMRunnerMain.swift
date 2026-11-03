@@ -750,6 +750,13 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         print(
             "  generation-only:       \(String(format: "%.1f", genTokPerSec)) tok/s "
                 + "(\(String(format: "%.2f", stats.generationSeconds))s) — compare to base 'Generation:'")
+        if stats.iterations > 0 {
+            let rounds = Double(stats.iterations)
+            func ms(_ seconds: Double) -> String { String(format: "%.1f", seconds * 1000 / rounds) }
+            print(
+                "  per round:             drafter \(ms(stats.draftSeconds)) ms, verify \(ms(stats.verifySeconds)) ms, "
+                    + "total \(ms(stats.generationSeconds)) ms")
+        }
         if stats.lookupProposals > 0 {
             print(
                 "  lookup proposals:      \(stats.lookupProposals) blocks, "

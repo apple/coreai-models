@@ -71,6 +71,12 @@ package final class SpeculativeDecoder: @unchecked Sendable {
         /// one-time prompt prefill / graph specialization), so it is comparable to the time
         /// plain decoding spends generating the same tokens.
         package var generationSeconds: Double = 0
+        /// Seconds inside the drafter's `draftAll`, and inside the target's verify pass with its
+        /// acceptance. A round that the grammar or prompt lookup proposed for has no drafter time. The
+        /// rest of ``generationSeconds`` is bookkeeping: rewinding the target, committing to the
+        /// drafter, and emitting tokens.
+        package var draftSeconds: Double = 0
+        package var verifySeconds: Double = 0
         /// Iterations whose proposal came from the grammar, and its proposed/accepted tokens.
         package var grammarProposals: Int = 0
         package var grammarTokensProposed: Int = 0
@@ -324,11 +330,13 @@ package final class SpeculativeDecoder: @unchecked Sendable {
                 stats.lookupTokensProposed += lookupTokens.count
             } else {
                 let count = min(k, proposalLimit)
+                let draftStart = genClock.now
                 proposal =
                     count > 0
                     ? try await drafter.draftAll(
                         confirmedPrefix: tokens, count: count, policy: policy, using: &rng)
                     : DraftProposal(tokens: [])
+                stats.draftSeconds += (genClock.now - draftStart).inSeconds
             }
             stats.draftTokensProposed += proposal.tokens.count
 
@@ -339,6 +347,7 @@ package final class SpeculativeDecoder: @unchecked Sendable {
             let verdict: (path: [Int], next: Int32)
             let features: DrafterFeatures?
             let grammarAcceptedBefore = constraint?.acceptedCount ?? 0
+            let verifyStart = genClock.now
             switch policy {
             case .greedy:
                 if let constraint {
@@ -361,6 +370,7 @@ package final class SpeculativeDecoder: @unchecked Sendable {
                     proposal: proposal, targetLogits: targetLogits,
                     temperature: policy.temperature, rng: &rng)
             }
+            stats.verifySeconds += (genClock.now - verifyStart).inSeconds
             let acceptedTokens = verdict.path.map { proposal.tokens[$0] }
             stats.draftTokensAccepted += acceptedTokens.count
             if !grammarTokens.isEmpty { stats.grammarTokensAccepted += acceptedTokens.count }
