@@ -67,10 +67,6 @@ package final class SpeculativeDecoder: @unchecked Sendable {
         package var draftTokensAccepted: Int = 0
         /// Number of propose/verify iterations (= target forward passes).
         package var iterations: Int = 0
-        /// Wall-clock seconds spent in the generation loop only (excludes the
-        /// one-time prompt prefill / graph specialization), so it is comparable to the time
-        /// plain decoding spends generating the same tokens.
-        package var generationSeconds: Double = 0
         /// Iterations whose proposal came from the grammar, and its proposed/accepted tokens.
         package var grammarProposals: Int = 0
         package var grammarTokensProposed: Int = 0
@@ -267,147 +263,160 @@ package final class SpeculativeDecoder: @unchecked Sendable {
         // the last* (the "anchor"), so verifying [anchor, draft…] yields the
         // target's prediction for the anchor's successor at slot 0. Prefill all but
         // the last prompt token here.
-        if promptTokens.count > 1 {
-            try await target.advance(Array(promptTokens[0..<promptTokens.count - 1]))
+        try await InstrumentsProfiler.profile(
+            InstrumentsProfiler.beginPrompt(tokens: promptTokens.count, engine: "speculative")
+        ) {
+            if promptTokens.count > 1 {
+                try await target.advance(Array(promptTokens[0..<promptTokens.count - 1]))
+            }
         }
 
         var generated = 0
         var draftBudget = numDraftTokens
         let maxDraftBudget = max(numDraftTokens, (target.verifyTileWidth ?? 1) - 1)
-        let genClock = SuspendingClock()
-        let genStart = genClock.now
 
-        generate: while generated < maxNewTokens {
-            try Task.checkCancellation()
-            let prefixLen = tokens.count
-            let anchor = tokens[prefixLen - 1]
-            // Every token but the anchor is in the target's cache; the rest of the round counts from
-            // here, so a target that holds anything else would verify at the wrong positions.
-            let baseProcessed = target.processedTokenCount
-            guard baseProcessed == prefixLen - 1 else {
-                throw InferenceRuntimeError.invalidState(
-                    "the target holds \(baseProcessed) tokens, but \(prefixLen - 1) precede the anchor")
-            }
-            // The drafter's count this round. A block that crosses the verify tile costs a second
-            // target forward -- as much as the whole round -- so a tile-aligned run drafts only what
-            // fits, and nothing when only the anchor does.
-            // Every proposal, whatever its source, is also cut to the context left after the anchor
-            // and to the widest block the target can verify, so a large (adaptive) budget shortens
-            // the last rounds instead of ending generation early, and a block never exceeds what the
-            // target can score position by position.
-            let roomForDrafts = maxContext - prefixLen
-            if roomForDrafts < 0 { break }
-            let proposalCap = min(roomForDrafts, max(1, target.maxVerifyBlockLength) - 1)
-            let k = min(draftCount(anchorPosition: baseProcessed, upTo: draftBudget), proposalCap)
-            stats.iterations += 1
-
-            // 1. Propose: the grammar when it fully determines the next span, else prompt lookup
-            //    when the recent tokens recur in the context, else the drafter. All are verified
-            //    the same way below, and all are sized to the target's one-forward window when
-            //    alignment is on.
-            let budget = target.oneForwardDraftBudget
-            let proposalLimit = min(alignProposalsToForward && budget >= 1 ? budget : Int.max, proposalCap)
-            let proposal: DraftProposal
-            let grammarTokens = Array((try constraint?.forcedProposal() ?? []).prefix(proposalLimit))
-            var lookupTokens: [Int32] = []
-            if grammarTokens.isEmpty, let promptLookup {
-                lookupTokens = promptLookup.propose(
-                    context: tokens, count: min(promptLookup.maxTokens, proposalLimit))
-            }
-            if !grammarTokens.isEmpty {
-                proposal = DraftProposal(tokens: grammarTokens)
-                stats.grammarProposals += 1
-                stats.grammarTokensProposed += grammarTokens.count
-            } else if !lookupTokens.isEmpty {
-                proposal = DraftProposal(tokens: lookupTokens)
-                stats.lookupProposals += 1
-                stats.lookupTokensProposed += lookupTokens.count
-            } else {
-                let count = min(k, proposalLimit)
-                proposal =
-                    count > 0
-                    ? try await drafter.draftAll(
-                        confirmedPrefix: tokens, count: count, policy: policy, using: &rng)
-                    : DraftProposal(tokens: [])
-            }
-            stats.draftTokensProposed += proposal.tokens.count
-
-            // 2-3. Target verifies the whole proposal in one pass, then accept per
-            //      policy → the accepted candidate indices + next token. Greedy uses
-            //      the argmax-only verify path (no per-slot [vocabSize] copy); only
-            //      sampling and grammar-masked acceptance need the full distributions.
-            let verdict: (path: [Int], next: Int32)
-            let features: DrafterFeatures?
-            let grammarAcceptedBefore = constraint?.acceptedCount ?? 0
-            switch policy {
-            case .greedy:
-                if let constraint {
-                    let (targetLogits, f) = try await target.forwardProposal(
-                        anchor: anchor, proposal: proposal)
-                    features = f
-                    verdict = try acceptGreedyConstrained(
-                        proposal: proposal, targetLogits: targetLogits, constraint: constraint)
-                } else {
-                    let (targetArgmax, f) = try await target.forwardProposalGreedy(
-                        anchor: anchor, proposal: proposal)
-                    features = f
-                    verdict = try acceptGreedy(proposal: proposal, targetArgmax: targetArgmax)
+        // One span for the generation loop, so the profiler Extend time is its duration, as for
+        // plain decoding. The drafter call and the verify pass of each round have spans of their own.
+        try await InstrumentsProfiler.profile(InstrumentsProfiler.beginExtend(step: 0)) {
+            generate: while generated < maxNewTokens {
+                try Task.checkCancellation()
+                let prefixLen = tokens.count
+                let anchor = tokens[prefixLen - 1]
+                // Every token but the anchor is in the target's cache; the rest of the round counts from
+                // here, so a target that holds anything else would verify at the wrong positions.
+                let baseProcessed = target.processedTokenCount
+                guard baseProcessed == prefixLen - 1 else {
+                    throw InferenceRuntimeError.invalidState(
+                        "the target holds \(baseProcessed) tokens, but \(prefixLen - 1) precede the anchor")
                 }
-            case .sampling:
-                let (targetLogits, f) = try await target.forwardProposal(
-                    anchor: anchor, proposal: proposal)
-                features = f
-                verdict = try acceptSampling(
-                    proposal: proposal, targetLogits: targetLogits,
-                    temperature: policy.temperature, rng: &rng)
-            }
-            let acceptedTokens = verdict.path.map { proposal.tokens[$0] }
-            stats.draftTokensAccepted += acceptedTokens.count
-            if !grammarTokens.isEmpty { stats.grammarTokensAccepted += acceptedTokens.count }
-            if !lookupTokens.isEmpty { stats.lookupTokensAccepted += acceptedTokens.count }
-            // Only the drafter's own rounds steer its budget: a round with no drafts (anchor on the
-            // tile's last slot), or one the grammar or prompt lookup proposed, says nothing about it.
-            if adaptiveDraftCount, grammarTokens.isEmpty, lookupTokens.isEmpty, !proposal.tokens.isEmpty {
-                draftBudget =
-                    acceptedTokens.count == proposal.tokens.count
-                    ? min(draftBudget + SpeculativeDefaults.adaptiveGrowth, maxDraftBudget)
-                    : max(draftBudget - SpeculativeDefaults.adaptiveShrink, 1)
-            }
+                // The drafter's count this round. A block that crosses the verify tile costs a second
+                // target forward -- as much as the whole round -- so a tile-aligned run drafts only what
+                // fits, and nothing when only the anchor does.
+                // Every proposal, whatever its source, is also cut to the context left after the anchor
+                // and to the widest block the target can verify, so a large (adaptive) budget shortens
+                // the last rounds instead of ending generation early, and a block never exceeds what the
+                // target can score position by position.
+                let roomForDrafts = maxContext - prefixLen
+                if roomForDrafts < 0 { break }
+                let proposalCap = min(roomForDrafts, max(1, target.maxVerifyBlockLength) - 1)
+                let k = min(draftCount(anchorPosition: baseProcessed, upTo: draftBudget), proposalCap)
+                stats.iterations += 1
 
-            // 4. Roll the target KV to [confirmed prefix + accepted drafts]: the verify order
-            //    matches the proposal's, so truncation suffices.
-            let confirmedLength = baseProcessed + 1 + acceptedTokens.count
-            try await target.rewindAndConfirm(to: confirmedLength)
+                // 1. Propose: the grammar when it fully determines the next span, else prompt lookup
+                //    when the recent tokens recur in the context, else the drafter. All are verified
+                //    the same way below, and all are sized to the target's one-forward window when
+                //    alignment is on.
+                let budget = target.oneForwardDraftBudget
+                let proposalLimit = min(alignProposalsToForward && budget >= 1 ? budget : Int.max, proposalCap)
+                let proposal: DraftProposal
+                let grammarTokens = Array((try constraint?.forcedProposal() ?? []).prefix(proposalLimit))
+                var lookupTokens: [Int32] = []
+                if grammarTokens.isEmpty, let promptLookup {
+                    lookupTokens = promptLookup.propose(
+                        context: tokens, count: min(promptLookup.maxTokens, proposalLimit))
+                }
+                if !grammarTokens.isEmpty {
+                    proposal = DraftProposal(tokens: grammarTokens)
+                    stats.grammarProposals += 1
+                    stats.grammarTokensProposed += grammarTokens.count
+                } else if !lookupTokens.isEmpty {
+                    proposal = DraftProposal(tokens: lookupTokens)
+                    stats.lookupProposals += 1
+                    stats.lookupTokensProposed += lookupTokens.count
+                } else {
+                    let count = min(k, proposalLimit)
+                    proposal =
+                        count > 0
+                        ? try await InstrumentsProfiler.profile(
+                            InstrumentsProfiler.beginSpeculativeDraft(tokens: count)
+                        ) {
+                            try await drafter.draftAll(
+                                confirmedPrefix: tokens, count: count, policy: policy, using: &rng)
+                        }
+                        : DraftProposal(tokens: [])
+                }
+                stats.draftTokensProposed += proposal.tokens.count
 
-            // 5. Bring the drafter into step (token drafter rolls back; attached-head
-            //    drafter injects the committed feature rows).
-            try await drafter.commit(confirmedLength: confirmedLength, features: features)
+                // 2-3. Target verifies the whole proposal in one pass, then accept per
+                //      policy → the accepted candidate indices + next token. Greedy uses
+                //      the argmax-only verify path (no per-slot [vocabSize] copy); only
+                //      sampling and grammar-masked acceptance need the full distributions.
+                let verdict: (path: [Int], next: Int32)
+                let features: DrafterFeatures?
+                let grammarAcceptedBefore = constraint?.acceptedCount ?? 0
+                (verdict, features) = try await InstrumentsProfiler.profile(
+                    InstrumentsProfiler.beginSpeculativeVerify(tokens: proposal.tokens.count + 1)
+                ) {
+                    switch policy {
+                    case .greedy:
+                        if let constraint {
+                            let (targetLogits, f) = try await target.forwardProposal(
+                                anchor: anchor, proposal: proposal)
+                            return (
+                                try acceptGreedyConstrained(
+                                    proposal: proposal, targetLogits: targetLogits, constraint: constraint), f
+                            )
+                        }
+                        let (targetArgmax, f) = try await target.forwardProposalGreedy(
+                            anchor: anchor, proposal: proposal)
+                        return (try acceptGreedy(proposal: proposal, targetArgmax: targetArgmax), f)
+                    case .sampling:
+                        let (targetLogits, f) = try await target.forwardProposal(
+                            anchor: anchor, proposal: proposal)
+                        return (
+                            try acceptSampling(
+                                proposal: proposal, targetLogits: targetLogits,
+                                temperature: policy.temperature, rng: &rng), f
+                        )
+                    }
+                }
+                let acceptedTokens = verdict.path.map { proposal.tokens[$0] }
+                stats.draftTokensAccepted += acceptedTokens.count
+                if !grammarTokens.isEmpty { stats.grammarTokensAccepted += acceptedTokens.count }
+                if !lookupTokens.isEmpty { stats.lookupTokensAccepted += acceptedTokens.count }
+                // Only the drafter's own rounds steer its budget: a round with no drafts (anchor on the
+                // tile's last slot), or one the grammar or prompt lookup proposed, says nothing about it.
+                if adaptiveDraftCount, grammarTokens.isEmpty, lookupTokens.isEmpty, !proposal.tokens.isEmpty {
+                    draftBudget =
+                        acceptedTokens.count == proposal.tokens.count
+                        ? min(draftBudget + SpeculativeDefaults.adaptiveGrowth, maxDraftBudget)
+                        : max(draftBudget - SpeculativeDefaults.adaptiveShrink, 1)
+                }
 
-            // 6. Commit accepted drafts + the correction/bonus token. Constrained acceptance
-            //    advanced the grammar over a prefix of them; when the stream stops early, roll
-            //    back the part of that prefix that was not emitted.
-            for (index, token) in acceptedTokens.enumerated() {
-                tokens.append(token)
-                onToken(token)
+                // 4. Roll the target KV to [confirmed prefix + accepted drafts]: the verify order
+                //    matches the proposal's, so truncation suffices.
+                let confirmedLength = baseProcessed + 1 + acceptedTokens.count
+                try await target.rewindAndConfirm(to: confirmedLength)
+
+                // 5. Bring the drafter into step (token drafter rolls back; attached-head
+                //    drafter injects the committed feature rows).
+                try await drafter.commit(confirmedLength: confirmedLength, features: features)
+
+                // 6. Commit accepted drafts + the correction/bonus token. Constrained acceptance
+                //    advanced the grammar over a prefix of them; when the stream stops early, roll
+                //    back the part of that prefix that was not emitted.
+                for (index, token) in acceptedTokens.enumerated() {
+                    tokens.append(token)
+                    onToken(token)
+                    generated += 1
+                    stats.generatedTokens += 1
+                    if stopTokenIds.contains(token) || generated >= maxNewTokens {
+                        if let constraint {
+                            let advanced = constraint.acceptedCount - grammarAcceptedBefore
+                            try constraint.rollback(advanced - (index + 1))
+                        }
+                        break generate
+                    }
+                }
+                let correction = verdict.next
+                tokens.append(correction)
+                onToken(correction)
                 generated += 1
                 stats.generatedTokens += 1
-                if stopTokenIds.contains(token) || generated >= maxNewTokens {
-                    if let constraint {
-                        let advanced = constraint.acceptedCount - grammarAcceptedBefore
-                        try constraint.rollback(advanced - (index + 1))
-                    }
-                    break generate
-                }
+                if stopTokenIds.contains(correction) { break generate }
             }
-            let correction = verdict.next
-            tokens.append(correction)
-            onToken(correction)
-            generated += 1
-            stats.generatedTokens += 1
-            if stopTokenIds.contains(correction) { break generate }
         }
 
-        stats.generationSeconds = (genClock.now - genStart).inSeconds
         return stats
     }
 

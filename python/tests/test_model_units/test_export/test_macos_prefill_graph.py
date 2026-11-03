@@ -48,7 +48,11 @@ try:
     # Imported here rather than at module scope: `testing_utils` imports
     # `coreai_torch` unguarded, so a top-level import would break collection in
     # environments without the toolchain, which the skip below exists to tolerate.
-    from tests._runner_infra.testing_utils import assert_close
+    from tests._runner_infra.testing_utils import (
+        MACOS_27_KNOWN_ISSUE,
+        assert_close,
+        skip_os_coreai_below_macos,
+    )
 
     HAS_COREAI = True
 except ImportError:  # pragma: no cover - depends on the installed toolchain
@@ -267,6 +271,7 @@ def test_flattened_prefill_graph_kv_writes_match_torch() -> None:
     Same check as the eager path's, and the same eager reference: the graph declares no
     outputs, so the cache is the only place a mistrimmed graph would show up.
     """
+    skip_os_coreai_below_macos((27, 2), MACOS_27_KNOWN_ISSUE)
     model, program = _export_flattened()
     input_ids, position_ids = _prefill_inputs(_tiny_config())
 
@@ -292,6 +297,7 @@ def test_prefill_graph_kv_writes_match_torch() -> None:
     prefill-only forward to compare against. So this pins the conversion, not the
     authoring, which is what the rest of ``test_models/`` covers.
     """
+    skip_os_coreai_below_macos((27, 2), MACOS_27_KNOWN_ISSUE)
     model, program = _export(opts_in=True)
     input_ids, position_ids = _prefill_inputs(_tiny_config())
 

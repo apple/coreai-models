@@ -170,11 +170,44 @@ AIModelAsset.load("outputModel.aimodel").update_metadata(
 
 **Note:** the re-attach step is not optional bookkeeping. `program.save_asset()` persists only `creationDate`, `assetVersion` and `producer`; without it the round-trip silently drops the model's `author`, `license` and `description`, so a shipped asset would lose its attribution and license. The metadata attribute is `model_description`, even though the key serialized into `metadata.json` is `description`. `creationDate` is always reset to the time of the save.
 
+#### Speculative Decoding
+
+`llm-runner` can decode faster by proposing several tokens at a time and having the target verify them in one pass. The target runs on the static-shape engine, so it has to be exported for it (the Gemma 4 recipe is one); a draft model does too. The runner reports an engine that does not support speculation.
+
+| Proposals come from        | Flag                     | Notes                                                                                                                                              |
+|----------------------------|--------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------|
+| A separate draft model     | `--draft-model <bundle>` | Shares the tokenizer and vocabulary with `--model`. Greedy or sampling.                                                                            |
+| The running context        | `--prompt-lookup`        | Needs no extra model; a block whose recent tokens recur earlier proposes what followed. Helps when the output copies from the prompt. Greedy only. |
+| A draft head in the bundle | `--speculative`          | Gemma 4; see [its README](gemma4/README.md#draft-head-speculative-decoding). Greedy only.                                                          |
+
+With greedy decoding (`--sampling-strategy greedy` or `--temperature 0`) the output is token for token what the target produces alone. With `--draft-model` and temperature sampling, the output follows the target's distribution (the accept/reject scheme of [Chen et al. 2023](https://arxiv.org/abs/2302.01318)), and `--seed` makes a run reproducible. `--prompt-lookup` and `--speculative` supply no draft distribution, so they stop with a message unless decoding is greedy.
+
+```bash
+# Prompt lookup, no extra model
+swift run -c release llm-runner --model path/to/exported_model_folder \
+  --sampling-strategy greedy --prompt-lookup --prompt "..."
+
+# A draft model, greedy
+swift run -c release llm-runner --model path/to/target_folder \
+  --draft-model path/to/draft_folder --sampling-strategy greedy --prompt "..."
+
+# A draft model with sampling, reproducible
+swift run -c release llm-runner --model path/to/target_folder \
+  --draft-model path/to/draft_folder --temperature 0.7 --seed 1234 --prompt "..."
+```
+
+Run `llm-runner --help` for the options that tune speculation, such as the number of draft tokens per step. Options that cannot be combined with speculation, or that it does not apply, are reported when the run starts. Generation stops at the tokenizer's end-of-sequence tokens.
+
+The run summary reports how many proposed tokens the target accepted (`draft accepted`), the tokens committed per target pass (`tokens / target pass`, above 1 when the target ran fewer passes than tokens produced), and the speed of the generation loop alone (`generation-only`, to compare with the `Generation:` line of a plain run). Acceptance depends on the workload, so measure on prompts like yours.
+
+On a row of logits that contains NaN, plain greedy decoding and the verify scan can pick different tokens: plain greedy returns the first index, and the scan treats NaN as negative infinity.
+
 ### Diffusion Models
 
 ```bash
 uv run coreai.diffusion.export black-forest-labs/FLUX.2-klein-4B
 uv run coreai.diffusion.export sana-sprint-0.6b
+uv run coreai.diffusion.export sana-sprint-1.6b
 ```
 
 ### Vision-Language Models (VLMs)

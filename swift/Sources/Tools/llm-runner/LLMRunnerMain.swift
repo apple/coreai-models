@@ -151,6 +151,20 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     /// The whitespace limit named by `--json-max-whitespace`; nil for no limit.
     private var maxWhitespaceCount: Int? { jsonMaxWhitespace > 0 ? jsonMaxWhitespace : nil }
 
+    @Flag(
+        name: .customLong("speculative"),
+        help:
+            "Self-speculative decoding with the bundle's draft head (the 'drafter' component of metadata.json, added by models/gemma4/export_drafter.py --bundle). The head drafts from the target's hidden states and shared K/V, so --model must be exported with --emit-hidden-states. Greedy only; combines with --prompt-lookup and --json-schema."
+    )
+    var speculative: Bool = false
+
+    @Option(
+        name: .customLong("drafter-top-k"),
+        help:
+            "With --speculative: centroids whose candidates the draft head's scan scores (default: \(DraftScan.defaultTopK))."
+    )
+    var drafterTopK: Int?
+
     @Option(
         name: .customLong("grammar-proposal-max"),
         help:
@@ -380,7 +394,12 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         if promptLookupMinNgram < 1 {
             throw ValidationError("--prompt-lookup-min-ngram must be >= 1")
         }
-        let speculating = draftModel != nil || promptLookup
+        if let problem = SpeculativeDecodingOptions.draftHeadProblem(
+            draftHead: speculative, draftModel: draftModel != nil, drafterTopK: drafterTopK)
+        {
+            throw ValidationError(problem)
+        }
+        let speculating = draftModel != nil || promptLookup || speculative
         if seed != nil && !speculating {
             throw ValidationError("--seed applies to speculative decoding (--draft-model or --prompt-lookup)")
         }
@@ -400,7 +419,8 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
                 throw ValidationError(problem)
             }
             let greedy = samplingStrategy.lowercased() == "greedy" || temperature == 0
-            if let problem = SpeculativeDecodingOptions.samplingProblem(greedy: greedy, promptLookup: promptLookup)
+            if let problem = SpeculativeDecodingOptions.samplingProblem(
+                greedy: greedy, promptLookup: promptLookup, draftHead: speculative)
                 ?? SpeculativeDecodingOptions.grammarSamplingProblem(greedy: greedy, hasSchema: jsonSchema != nil)
                 ?? SpeculativeDecodingOptions.imageProblem(hasImage: imagePath != nil, hasRawTokens: rawTokens != nil)
             {
@@ -475,6 +495,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     private func runSpeculativeDecoding(
         targetPath: String, draftPath rawDraftPath: String?, resolver: ModelPaths
     ) async throws {
+        await PerformanceMetrics.shared.startOverallTiming()
         func loadSpeculativeEngine(from path: String, label: String) async throws
             -> (engine: any SpeculativeEngine, bundle: LanguageModelBundle)
         {
@@ -488,7 +509,9 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             )
             // The factory builds the vision-wired static-shape engine for a VLM bundle whose decoder
             // gathers its own token embeddings, so the target can encode and scatter an image.
-            let engine = try await EngineFactory.createEngine(bundle: bundle, options: options)
+            let engine = try await InstrumentsProfiler.profile(InstrumentsProfiler.beginModelLoad(name: bundle.name)) {
+                try await EngineFactory.createEngine(bundle: bundle, options: options)
+            }
             guard let spec = engine as? any SpeculativeEngine else {
                 print(
                     "Error: engine for \(bundle.name) (\(type(of: engine))) does not support "
@@ -632,7 +655,20 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         let decoder: SpeculativeDecoder
         let drafterLabel: String
         let adaptive = adaptiveDraftCount
-        if let draftEngine {
+        if speculative {
+            guard let staticTarget = targetEngine as? StaticShapeEngine else {
+                print("Error: --speculative needs the static-shape engine (got \(type(of: targetEngine))).")
+                throw ExitCode.failure
+            }
+            decoder = try await EngineFactory.createSpeculativeDecoder(
+                target: staticTarget, bundle: targetBundle,
+                options: EngineFactory.DraftHeadOptions(
+                    draftTokens: numDraftTokens, alignDraftsToVerifyTile: !noAlignProposals,
+                    adaptiveDraftCount: adaptive,
+                    promptLookupMinNgram: promptLookup ? promptLookupMinNgram : nil,
+                    drafterTopK: drafterTopK))
+            drafterLabel = promptLookup ? "draft head + prompt-lookup" : "draft head"
+        } else if let draftEngine {
             decoder = SpeculativeDecoder(
                 draft: draftEngine, target: targetEngine,
                 numDraftTokens: self.numDraftTokens ?? SpeculativeDefaults.numDraftTokens,
@@ -678,8 +714,6 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             }
         }
 
-        let clock = SuspendingClock()
-        let start = clock.now
         let stats: SpeculativeDecoder.Stats
         do {
             if useGreedy {
@@ -697,8 +731,9 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             print("\n[spec-decode] error: \(error)  |  reflected: \(String(reflecting: error))")
             throw error
         }
-        let seconds = (clock.now - start).inSeconds
-        let tokPerSec = seconds > 0 ? Double(stats.generatedTokens) / seconds : 0
+        await PerformanceMetrics.shared.endOverallTiming()
+        await PerformanceMetrics.shared.recordPromptTokens(promptTokensForGen.count)
+        await PerformanceMetrics.shared.recordGeneratedTokens(stats.generatedTokens)
 
         print("\n\n── Speculative decoding summary ──")
         print(
@@ -709,14 +744,6 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             "  draft accepted:        \(stats.draftTokensAccepted)/\(stats.draftTokensProposed) "
                 + "(\(String(format: "%.1f", stats.acceptanceRate * 100))%)")
         print("  tokens / target pass:  \(String(format: "%.2f", stats.meanTokensPerTargetPass))")
-        print(
-            "  throughput:            \(String(format: "%.1f", tokPerSec)) tok/s (\(String(format: "%.2f", seconds))s, incl. prompt/specialization)"
-        )
-        let genTokPerSec =
-            stats.generationSeconds > 0 ? Double(stats.generatedTokens) / stats.generationSeconds : 0
-        print(
-            "  generation-only:       \(String(format: "%.1f", genTokPerSec)) tok/s "
-                + "(\(String(format: "%.2f", stats.generationSeconds))s) — compare to base 'Generation:'")
         if stats.lookupProposals > 0 {
             print(
                 "  lookup proposals:      \(stats.lookupProposals) blocks, "
@@ -726,6 +753,13 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             print(
                 "  grammar proposals:     \(stats.grammarProposals) blocks, "
                     + "\(stats.grammarTokensAccepted)/\(stats.grammarTokensProposed) tokens accepted")
+        }
+
+        // The same timing summary as a plain run: prompt, generation and total, from the profiler's
+        // spans. With --verbose, the statistics table also lists the drafter and verify spans.
+        await PerformanceMetrics.shared.printSummary(verbose: CLILogger.isVerbose)
+        if verbose {
+            await StatsReporter(storage: .shared).printVerboseTable()
         }
     }
 
@@ -753,7 +787,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         }
 
         // Speculative decoding: a draft model, prompt lookup, or both.
-        if draftModel != nil || promptLookup {
+        if draftModel != nil || promptLookup || speculative {
             try await runSpeculativeDecoding(
                 targetPath: modelFile, draftPath: draftModel, resolver: resolver)
             return

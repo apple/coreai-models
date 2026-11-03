@@ -52,7 +52,15 @@ class CoreaiRuntime:
         self._coreai_program = coreai_program
         self._output_names = output_names
         self._exit_stack = AsyncExitStack()
-        self._function = asyncio.run(self._async_load_model(coreai_program, asset_path))
+        try:
+            self._function = asyncio.run(self._async_load_model(coreai_program, asset_path))
+        except RuntimeError as error:
+            asyncio.run(self._exit_stack.aclose())
+            # Imported here: testing_utils pulls in the whole export stack.
+            from ...testing_utils import skip_if_neural_engine_refused
+
+            skip_if_neural_engine_refused(error)
+            raise
 
     async def _async_forward(
         self: Self, named_inputs: dict[str, Tensor]
