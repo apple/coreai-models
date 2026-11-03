@@ -36,9 +36,14 @@ uv run export.py --help
 
 **Supported models:**
 
-| Model                         | Parameters |
-| ----------------------------- | ---------- |
-| nvidia/parakeet-tdt-0.6b-v3   | 0.6B       |
+| Model                         | Parameters | Languages     | Source format                |
+| ----------------------------- | ---------- | ------------- | ---------------------------- |
+| nvidia/parakeet-tdt-0.6b-v3   | 0.6B       | 25 European   | transformers                 |
+| nvidia/parakeet-tdt-0.6b-v2   | 0.6B       | English       | `.nemo`, converted at export |
+
+### NeMo-only checkpoints
+
+`nvidia/parakeet-tdt-0.6b-v2` is published only as a NeMo `.nemo` checkpoint. The file is still hosted on Hugging Face, and it is just a tar archive: `model_config.yaml`, `model_weights.ckpt` (a plain PyTorch state dict) and a SentencePiece tokenizer. So `export.py` downloads it with `huggingface_hub`, remaps it into `transformers.ParakeetForTDT` in memory, builds the matching processor, and then exports exactly as for v3. NeMo itself is not required.
 
 ## Running
 
