@@ -174,11 +174,11 @@ AIModelAsset.load("outputModel.aimodel").update_metadata(
 
 `llm-runner` can decode faster by proposing several tokens at a time and having the target verify them in one pass. The target runs on the static-shape engine, so it has to be exported for it (the Gemma 4 recipe is one); a draft model does too. The runner reports an engine that does not support speculation.
 
-| Proposals come from | Flag | Notes |
-|---|---|---|
-| A separate draft model | `--draft-model <bundle>` | Shares the tokenizer and vocabulary with `--model`. Greedy or sampling. |
-| The running context | `--prompt-lookup` | Needs no extra model; a block whose recent tokens recur earlier proposes what followed. Helps when the output copies from the prompt. Greedy only. |
-| A draft head in the bundle | `--speculative` | Gemma 4; see [its README](gemma4/README.md#draft-head-speculative-decoding). Greedy only. |
+| Proposals come from        | Flag                     | Notes                                                                                                                                              |
+|----------------------------|--------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------|
+| A separate draft model     | `--draft-model <bundle>` | Shares the tokenizer and vocabulary with `--model`. Greedy or sampling.                                                                            |
+| The running context        | `--prompt-lookup`        | Needs no extra model; a block whose recent tokens recur earlier proposes what followed. Helps when the output copies from the prompt. Greedy only. |
+| A draft head in the bundle | `--speculative`          | Gemma 4; see [its README](gemma4/README.md#draft-head-speculative-decoding). Greedy only.                                                          |
 
 With greedy decoding (`--sampling-strategy greedy` or `--temperature 0`) the output is token for token what the target produces alone. With `--draft-model` and temperature sampling, the output follows the target's distribution (the accept/reject scheme of [Chen et al. 2023](https://arxiv.org/abs/2302.01318)), and `--seed` makes a run reproducible. `--prompt-lookup` and `--speculative` supply no draft distribution, so they stop with a message unless decoding is greedy.
 
@@ -196,17 +196,7 @@ swift run -c release llm-runner --model path/to/target_folder \
   --draft-model path/to/draft_folder --temperature 0.7 --seed 1234 --prompt "..."
 ```
 
-| Option | Effect |
-|---|---|
-| `--num-draft-tokens N` | Tokens proposed per step, 1 to 256 (default 4; with `--speculative`, one less than the target's verify tile). The decoder shortens a proposal to what one verify pass can score. |
-| `--adaptive-draft-count` | Adapt the draft count to acceptance. |
-| `--no-align-proposals` | Do not shorten proposals to fit the target's single-forward window. A block that crosses a batch boundary then costs a second forward. |
-| `--prompt-lookup-min-ngram N` | With `--prompt-lookup`: the shortest recurring suffix that proposes by lookup (default 3). Combined with `--draft-model` or `--speculative`, a block that recurs is proposed from the context and any other by the draft. |
-| `--drafter-top-k N` | With `--speculative`: how many centroids the draft head's candidate scan scores. |
-| `--seed N` | Seed the random number generator for sampling with a draft model. |
-| `--json-schema` | Works with speculation under greedy decoding. Spans the grammar fully determines are verified as proposals; `--grammar-proposal-max N` caps their length (default 7, 0 disables, at most 63). |
-
-`--video`, `--continuation`, `--raw-continuation` and `--batch-prototype` cannot be combined with speculation. These are accepted but not applied, and a warning names them: `--top-k`, `--top-p`, `--min-p`, `--repetition-penalty`, `--repetition-penalty-window`, `--stop-tokens`, `--synchronous-sampling`, `--save-logits`, `--print-logits`, `--bucket-size`, `--chunk-size`, `--chunk-threshold` and `--image-strategy`. Generation stops at the tokenizer's end-of-sequence tokens.
+Run `llm-runner --help` for the options that tune speculation, such as the number of draft tokens per step. Options that cannot be combined with speculation, or that it does not apply, are reported when the run starts. Generation stops at the tokenizer's end-of-sequence tokens.
 
 The run summary reports how many proposed tokens the target accepted (`draft accepted`), the tokens committed per target pass (`tokens / target pass`, above 1 when the target ran fewer passes than tokens produced), and the speed of the generation loop alone (`generation-only`, to compare with the `Generation:` line of a plain run). Acceptance depends on the workload, so measure on prompts like yours.
 
