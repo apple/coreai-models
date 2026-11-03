@@ -26,6 +26,7 @@ import torch.nn.functional as F
 from coreai_models.embedding import export as embedding_export
 from coreai_models.embedding.contract import (
     AudioPreprocessing,
+    CheckpointFacts,
     EmbeddingFamily,
     EmbeddingPrecisionError,
     ImagePreprocessing,
@@ -60,12 +61,11 @@ WORDS = ["<unk>", "a", "photo", "of", "the", "cat", "dog", "sound"]
 TOY = EmbeddingFamily(
     key="toy-embed",
     hf_model_id="acme/toy-embed",
-    dimension=8,
-    bos_token_id=8,
-    eos_token_id=9,
-    pad_token_id=10,
-    max_tokens=6,
     precisions={"macOS": ("float32", "float16"), "iOS": ("float16",)},
+    modalities=("text",),
+)
+TOY_FACTS = CheckpointFacts(
+    dimension=8, bos_token_id=8, eos_token_id=9, pad_token_id=10, max_tokens=6
 )
 
 
@@ -89,7 +89,7 @@ def toy_block(revision: str) -> dict[str, Any]:
         "inputs": {"input_ids": "int32[B,L]", "attention_mask": "int32[B,L]"},
         "outputs": {"embedding": "float32[B,8]"},
         "compute_units": ["gpu"],
-        "functions": [function_entry("text_encoder", (1, 4), TOY.max_tokens)],
+        "functions": [function_entry("text_encoder", (1, 4), TOY_FACTS.max_tokens)],
     }
     return {
         "space": {"id": TOY.hf_model_id, "revision": revision},
@@ -100,11 +100,11 @@ def toy_block(revision: str) -> dict[str, Any]:
         "compute_precision": "float32",
         "components": {"text_encoder": component},
         "towers": [{"modality": "text", "pipeline": ["text_encoder"]}],
-        "text": text_block(TOY),
+        "text": text_block(TOY_FACTS),
     }
 
 
-def toy_export_programs(snapshot, out, *, revision, include_debug_info, **_):
+def toy_export_programs(snapshot, out, facts, *, revision, include_debug_info, **_):
     block = toy_block(revision)
     spec = block["components"]["text_encoder"]
     program = export_program([(ToyTextTower(), spec)], include_debug_info)
@@ -112,13 +112,14 @@ def toy_export_programs(snapshot, out, *, revision, include_debug_info, **_):
     return {"text_encoder": "text_encoder.aimodel"}, block
 
 
-TOY_EXPORTER = EmbeddingExporter(TOY, lambda snapshot: None, toy_export_programs)
+TOY_EXPORTER = EmbeddingExporter(TOY, lambda snapshot: TOY_FACTS, toy_export_programs)
 
 
 @pytest.fixture
 def toy_snapshot(tmp_path) -> Path:
     snapshot = snapshot_dir(tmp_path)
-    save_tiny_tokenizer(snapshot, WORDS, TOY.bos_token_id, TOY.eos_token_id, TOY.pad_token_id)
+    facts = TOY_FACTS
+    save_tiny_tokenizer(snapshot, WORDS, facts.bos_token_id, facts.eos_token_id, facts.pad_token_id)
     return snapshot
 
 
@@ -132,7 +133,7 @@ def test_block_builders():
         "batch": {"min": 1, "max": 64},
         "length": 77,
     }
-    assert text_block(TOY) == {
+    assert text_block(TOY_FACTS) == {
         "embedded_tokenizer": True,
         "add_bos_token": True,
         "add_eos_token": True,
@@ -144,15 +145,14 @@ def test_block_builders():
     }
     image = ImagePreprocessing("center_crop", 32, (0.5, 0.5, 0.5), (0.25, 0.25, 0.25))
     audio = AudioPreprocessing(16000, 400, 400, 160, 8, 11, 0.0, 8000.0)
-    family = dataclasses.replace(TOY, image=image)
-    assert family.modalities == ("text", "image")
-    assert media_block(family, "image") == {
+    facts = dataclasses.replace(TOY_FACTS, image=image)
+    assert media_block(facts, "image") == {
         "image_strategy": "center_crop",
         "image_size": 32,
         "image_mean": [0.5, 0.5, 0.5],
         "image_std": [0.25, 0.25, 0.25],
     }
-    assert list(media_block(dataclasses.replace(TOY, audio=audio), "audio")) == [
+    assert list(media_block(dataclasses.replace(TOY_FACTS, audio=audio), "audio")) == [
         "sample_rate",
         "n_fft",
         "win_length",
@@ -162,8 +162,8 @@ def test_block_builders():
         "f_min",
         "f_max",
     ]
-    with pytest.raises(ValueError, match="no audio tower"):
-        media_block(family, "audio")
+    with pytest.raises(ValueError, match="no audio preprocessing"):
+        media_block(facts, "audio")
 
 
 @pytest.mark.parametrize(
@@ -256,11 +256,12 @@ def test_resolve_snapshot_reads_the_revision(tmp_path, toy_snapshot):
 
 
 def test_save_tokenizer_turns_padding_off_and_checks_ids(tmp_path, toy_snapshot):
-    save_tokenizer(toy_snapshot, tmp_path / "tok", TOY)
+    save_tokenizer(toy_snapshot, tmp_path / "tok", TOY_FACTS)
     spec = json.loads((tmp_path / "tok" / "tokenizer.json").read_text())
     assert spec["padding"] is None and spec["truncation"] is None
-    with pytest.raises(ValueError, match="disagrees with the family"):
-        save_tokenizer(toy_snapshot, tmp_path / "bad", dataclasses.replace(TOY, pad_token_id=9))
+    bad = dataclasses.replace(TOY_FACTS, pad_token_id=9)
+    with pytest.raises(ValueError, match="disagrees with the facts"):
+        save_tokenizer(toy_snapshot, tmp_path / "bad", bad)
 
 
 def test_bpe_merges_are_written_as_pairs(tmp_path):
@@ -278,8 +279,8 @@ def test_bpe_merges_are_written_as_pairs(tmp_path):
     PreTrainedTokenizerFast(
         tokenizer_object=tokenizer, bos_token="<s>", eos_token="</s>", pad_token="</s>"
     ).save_pretrained(snapshot)
-    family = dataclasses.replace(TOY, bos_token_id=1, eos_token_id=2, pad_token_id=2)
-    save_tokenizer(snapshot, tmp_path / "tok", family)
+    facts = dataclasses.replace(TOY_FACTS, bos_token_id=1, eos_token_id=2, pad_token_id=2)
+    save_tokenizer(snapshot, tmp_path / "tok", facts)
     merges = json.loads((tmp_path / "tok" / "tokenizer.json").read_text())["model"]["merges"]
     assert merges and all(isinstance(m, list) and len(m) == 2 for m in merges)
 
@@ -303,7 +304,7 @@ def test_export_writes_the_bundle(tmp_path, toy_snapshot):
     assert meta["name"] == "toy-embed" and meta["source"]["hf_revision"] == REVISION
     spec = meta["embedding"]["components"]["text_encoder"]
     inputs, outputs = asset_signatures(out / "text_encoder.aimodel")["text_encoder"]
-    assert inputs == [(k, runtime_type(v, TOY.max_tokens)) for k, v in spec["inputs"].items()]
+    assert inputs == [(k, runtime_type(v, TOY_FACTS.max_tokens)) for k, v in spec["inputs"].items()]
     assert outputs == [(k, runtime_type(v, None)) for k, v in spec["outputs"].items()]
 
 
@@ -327,8 +328,8 @@ def test_toy_bundle_runs_from_its_metadata(compute_unit, tmp_path, toy_snapshot)
 
 
 def test_failed_or_refused_exports_leave_no_bundle(tmp_path, toy_snapshot):
-    def broken(snapshot, out, **kwargs):
-        assets, block = toy_export_programs(snapshot, out, **kwargs)
+    def broken(snapshot, out, facts, **kwargs):
+        assets, block = toy_export_programs(snapshot, out, facts, **kwargs)
         block["towers"] = []
         return assets, block
 

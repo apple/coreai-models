@@ -104,8 +104,8 @@ def export_embedding_bundle(
             download the snapshot.
 
     Raises:
-        ValueError: on unsupported options, a ``model_dir`` outside the HF cache, or a snapshot
-            that disagrees with the family.
+        ValueError: on unsupported options, a ``model_dir`` outside the HF cache, or a checkpoint
+            setting the contract cannot express.
         EmbeddingPrecisionError: if ``compute_precision`` is unsupported on ``platform``.
         FileExistsError: if ``output_dir`` exists and ``overwrite`` is False.
         FileNotFoundError: if ``model_dir`` is not a directory.
@@ -127,11 +127,12 @@ def export_embedding_bundle(
                 "cache snapshot directory (.../snapshots/<sha>), whose name is the revision the "
                 "bundle records"
             )
-        exporter.check_snapshot(snapshot)
-        save_tokenizer(snapshot, out / "tokenizer", family)
+        facts = exporter.read_facts(snapshot)
+        save_tokenizer(snapshot, out / "tokenizer", facts)
         assets, block = exporter.export_programs(
             snapshot,
             out,
+            facts,
             platform=platform,
             text_only=text_only,
             fused=fused,

@@ -23,7 +23,7 @@ import torch
 import torch.nn as nn
 
 from coreai_models._constants import DEFAULT_INCLUDE_DEBUG_INFO
-from coreai_models.embedding.contract import EmbeddingFamily
+from coreai_models.embedding.contract import CheckpointFacts, EmbeddingFamily
 
 if TYPE_CHECKING:
     from coreai.authoring import AIProgram
@@ -57,11 +57,11 @@ def resolve_snapshot(hf_model_id: str, model_dir: str | None = None) -> tuple[Pa
     return path, sha
 
 
-def save_tokenizer(snapshot: Path, dest: Path, family: EmbeddingFamily) -> None:
+def save_tokenizer(snapshot: Path, dest: Path, facts: CheckpointFacts) -> None:
     """Write the snapshot's tokenizer to ``dest`` with padding and truncation off.
 
     BPE merges are written as pairs, the form Swift ``CLIPTokenizer`` reads. Raises
-    ``ValueError`` if the special tokens disagree with the family or the tokenizer does not add
+    ``ValueError`` if the special tokens disagree with ``facts`` or the tokenizer does not add
     bos and eos.
     """
     from transformers import AutoTokenizer
@@ -69,11 +69,11 @@ def save_tokenizer(snapshot: Path, dest: Path, family: EmbeddingFamily) -> None:
     tokenizer = AutoTokenizer.from_pretrained(snapshot)
     ids = tokenizer("a")["input_ids"]
     got = (tokenizer.bos_token_id, tokenizer.eos_token_id, tokenizer.pad_token_id, ids[0], ids[-1])
-    bos, eos = family.bos_token_id, family.eos_token_id
-    want = (bos, eos, family.pad_token_id, bos, eos)
+    bos, eos = facts.bos_token_id, facts.eos_token_id
+    want = (bos, eos, facts.pad_token_id, bos, eos)
     if got != want:
         raise ValueError(
-            f"tokenizer (bos, eos, pad, first, last) {got} disagrees with the family {want}"
+            f"tokenizer (bos, eos, pad, first, last) {got} disagrees with the facts {want}"
         )
     tokenizer.save_pretrained(dest)
     path = dest / "tokenizer.json"
@@ -168,15 +168,16 @@ def save_program(program: AIProgram, out: Path, family: EmbeddingFamily, compone
 class EmbeddingExporter:
     """A model ``coreai.embedding.export`` can export.
 
-    - ``check_snapshot(snapshot)``: raises ``ValueError`` if the checkpoint disagrees with
-      ``family``. Runs before conversion.
-    - ``export_programs(snapshot, out, *, platform, text_only, fused, compute_precision,
+    - ``read_facts(snapshot)``: returns the checkpoint's ``CheckpointFacts``. Raises
+      ``ValueError`` if the checkpoint uses a setting the contract cannot express. Runs before
+      conversion.
+    - ``export_programs(snapshot, out, facts, *, platform, text_only, fused, compute_precision,
       include_debug_info, revision)``: writes the assets into ``out`` and returns
       ``(assets, embedding block)``.
     - ``fused``: whether the model supports ``--fused``.
     """
 
     family: EmbeddingFamily
-    check_snapshot: Callable[[Path], None]
+    read_facts: Callable[[Path], CheckpointFacts]
     export_programs: Callable[..., tuple[dict[str, str], dict[str, Any]]]
     fused: bool = False

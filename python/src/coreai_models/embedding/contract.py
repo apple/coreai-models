@@ -59,7 +59,8 @@ R8. ``audio``: the log-mel front end, with snake_case Swift ``MelConfig`` names 
     until a Swift reader exists): ``sample_rate``, ``n_fft``, ``win_length``, ``hop_length``,
     ``n_mel_bins``, ``n_frames``, ``f_min``, ``f_max``.
     - Clip: mono at ``sample_rate``, ``(n_frames - 1) * hop_length`` samples. A shorter clip is
-      repeated whole as many times as fits, then zero-padded; a longer one keeps its head.
+      repeated whole as many times as fits, then zero-padded; a longer one keeps its head, where
+      Hugging Face's ``ClapFeatureExtractor`` (``truncation="rand_trunc"``) takes a random window.
     - Spectrogram: periodic Hann window, centered frames with reflect padding, power spectrum,
       Slaney-scale mel filters with Slaney area normalization,
       ``10 * log10(max(power, 1e-10))``, no pre-emphasis.
@@ -121,25 +122,29 @@ class AudioPreprocessing:
 
 @dataclass(frozen=True)
 class EmbeddingFamily:
-    """An exportable embedding model: its Hugging Face id, token ids, precisions and
-    preprocessing."""
+    """An exportable embedding model: its Hugging Face id, precisions and tower modalities."""
 
     key: str
     hf_model_id: str
+    # platform -> allowed compute precisions, default first
+    precisions: dict[str, tuple[str, ...]]
+    modalities: tuple[str, ...]
+    # overrides the tokenizer's model_max_length
+    max_tokens: int | None = None
+
+
+@dataclass(frozen=True)
+class CheckpointFacts:
+    """What an exporter reads from the checkpoint: the embedding dimension, token ids, text length
+    and media preprocessing."""
+
     dimension: int
     bos_token_id: int
     eos_token_id: int
     pad_token_id: int
     max_tokens: int
-    # platform -> allowed compute precisions, default first
-    precisions: dict[str, tuple[str, ...]]
     image: ImagePreprocessing | None = None
     audio: AudioPreprocessing | None = None
-
-    @property
-    def modalities(self) -> tuple[str, ...]:
-        media = [m for m, facts in (("image", self.image), ("audio", self.audio)) if facts]
-        return ("text", *media)
 
 
 def resolve_compute_precision(family: EmbeddingFamily, requested: str | None, platform: str) -> str:
@@ -174,26 +179,26 @@ def function_entry(
     return entry
 
 
-def text_block(family: EmbeddingFamily) -> dict[str, Any]:
+def text_block(facts: CheckpointFacts) -> dict[str, Any]:
     """The ``text`` block (R6)."""
     return {
         "embedded_tokenizer": True,
         "add_bos_token": True,
         "add_eos_token": True,
-        "bos_token_id": family.bos_token_id,
-        "eos_token_id": family.eos_token_id,
-        "pad_token_id": family.pad_token_id,
+        "bos_token_id": facts.bos_token_id,
+        "eos_token_id": facts.eos_token_id,
+        "pad_token_id": facts.pad_token_id,
         "padding_side": "right",
-        "truncation": {"max_tokens": family.max_tokens, "keep_eos": True},
+        "truncation": {"max_tokens": facts.max_tokens, "keep_eos": True},
     }
 
 
-def media_block(family: EmbeddingFamily, modality: str) -> dict[str, Any]:
+def media_block(facts: CheckpointFacts, modality: str) -> dict[str, Any]:
     """The ``image`` or ``audio`` block (R7, R8)."""
-    facts = family.image if modality == "image" else family.audio
-    if facts is None:
-        raise ValueError(f"{family.key} has no {modality} tower")
-    return {k: list(v) if isinstance(v, tuple) else v for k, v in asdict(facts).items()}
+    preprocessing = facts.image if modality == "image" else facts.audio
+    if preprocessing is None:
+        raise ValueError(f"the checkpoint facts have no {modality} preprocessing")
+    return {k: list(v) if isinstance(v, tuple) else v for k, v in asdict(preprocessing).items()}
 
 
 _BLOCK_KEYS = (

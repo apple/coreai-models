@@ -25,6 +25,8 @@ This writes the bundle `<repo-root>/exports/clap-htsat/`:
 
 `B` is 1 to 64. Embeddings are L2-normalized; `logit_scale * dot(text, audio)` gives Hugging Face's `logits_per_audio`. Pass `--output-dir <path>` to write the bundle somewhere else.
 
+A clip longer than 10 s keeps its first 10 s; Hugging Face's `ClapFeatureExtractor` (`truncation="rand_trunc"`) takes a random 10 s window instead.
+
 `logit_scale` is 18.66, `exp(logit_scale_a)`. Hugging Face's `logits_per_text` uses `logit_scale_t` instead, which stayed at its initial value (14.29) in training.
 
 ```sh

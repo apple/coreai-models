@@ -21,6 +21,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +32,12 @@ import torch.nn.functional as F
 import transformers
 
 from coreai_models.embedding import clip_clap
-from coreai_models.embedding.contract import validate_block
+from coreai_models.embedding.contract import (
+    AudioPreprocessing,
+    CheckpointFacts,
+    ImagePreprocessing,
+    validate_block,
+)
 from coreai_models.embedding.export import EXPORTERS, export_embedding_bundle
 from tests.test_model_units.test_export._embedding_host import (
     Bundle,
@@ -76,6 +82,8 @@ CLAP_PREPROCESSOR = {
 }
 TEXTS = ["a photo of a cat", "the sound of a dog", "a", " ".join(["photo of the cat"] * 30)]
 DIM = 24
+# bos, eos, pad of the tiny tokenizers
+TINY_TOKEN_IDS = {"clip": (62, 63, 63), "clap": (0, 2, 1)}
 
 
 def _tiny_config(model: str):
@@ -122,15 +130,6 @@ def _tiny_config(model: str):
     )
 
 
-def _tiny_spec(model: str) -> clip_clap.DualEncoder:
-    spec = clip_clap.CLIP if model == "clip" else clip_clap.CLAP
-    family = dataclasses.replace(spec.family, dimension=DIM)
-    if model == "clip":
-        family = dataclasses.replace(family, bos_token_id=62, eos_token_id=63, pad_token_id=63)
-    outputs = {k: v.replace("512", str(DIM)) for k, v in spec.similarity_outputs.items()}
-    return dataclasses.replace(spec, family=family, similarity_outputs=outputs)
-
-
 @dataclasses.dataclass
 class Tiny:
     spec: clip_clap.DualEncoder
@@ -142,10 +141,12 @@ class Tiny:
     def exporter(self):
         return clip_clap.exporter(self.spec)
 
+    @property
+    def facts(self) -> CheckpointFacts:
+        return clip_clap.read_facts(self.spec, self.snapshot)
 
-def _save_tiny_snapshot(model: str, root: Path) -> tuple[clip_clap.DualEncoder, Path]:
-    spec = _tiny_spec(model)
-    family = spec.family
+
+def _save_tiny_snapshot(model: str, root: Path) -> Path:
     snapshot = snapshot_dir(root)
     torch.manual_seed(0)
     hf = (transformers.CLIPModel if model == "clip" else transformers.ClapModel)(
@@ -153,19 +154,18 @@ def _save_tiny_snapshot(model: str, root: Path) -> tuple[clip_clap.DualEncoder, 
     )
     hf.save_pretrained(snapshot)
     words = ["<unk>", "a", "photo", "of", "the", "cat", "sound", "dog"]
-    save_tiny_tokenizer(
-        snapshot, words, family.bos_token_id, family.eos_token_id, family.pad_token_id
-    )
+    save_tiny_tokenizer(snapshot, words, *TINY_TOKEN_IDS[model], model_max_length=77)
     proc = CLIP_PREPROCESSOR if model == "clip" else CLAP_PREPROCESSOR
     (snapshot / "preprocessor_config.json").write_text(json.dumps(proc))
-    return spec, snapshot
+    return snapshot
 
 
 @pytest.fixture(scope="module", params=["clip", "clap"])
 def tiny(request, tmp_path_factory) -> Tiny:
     """A tiny snapshot of the model and its float32 bundles: ``plain``, ``fused``."""
     root = tmp_path_factory.mktemp(request.param)
-    spec, snapshot = _save_tiny_snapshot(request.param, root)
+    spec = clip_clap.CLIP if request.param == "clip" else clip_clap.CLAP
+    snapshot = _save_tiny_snapshot(request.param, root)
     model = clip_clap.load_model(spec, snapshot)
     exporter = clip_clap.exporter(spec)
     bundles = {}
@@ -177,23 +177,24 @@ def tiny(request, tmp_path_factory) -> Tiny:
 
 def _text_inputs(tiny: Tiny, n: int) -> dict[str, torch.Tensor]:
     """``n`` rows of ids at length 77 with ragged masks; pads with ``pad_token_id``."""
-    family = tiny.spec.family
+    facts = tiny.facts
     generator = torch.Generator().manual_seed(n)
-    ids = torch.full((n, family.max_tokens), family.pad_token_id, dtype=torch.int32)
+    ids = torch.full((n, facts.max_tokens), facts.pad_token_id, dtype=torch.int32)
     mask = torch.zeros_like(ids)
-    words = torch.randint(3, 10, (n, family.max_tokens), generator=generator, dtype=torch.int32)
+    words = torch.randint(3, 10, (n, facts.max_tokens), generator=generator, dtype=torch.int32)
     for row in range(n):
-        size = 3 + (row * 7) % (family.max_tokens - 2)
+        size = 3 + (row * 7) % (facts.max_tokens - 2)
         ids[row, :size] = words[row, :size]
-        ids[row, 0], ids[row, size - 1] = family.bos_token_id, family.eos_token_id
+        ids[row, 0], ids[row, size - 1] = facts.bos_token_id, facts.eos_token_id
         mask[row, :size] = 1
     return {"input_ids": ids, "attention_mask": mask}
 
 
 def _media_inputs(tiny: Tiny, n: int) -> dict[str, torch.Tensor]:
     generator = torch.Generator().manual_seed(100 + n)
+    block = json.loads((tiny.bundles["plain"] / "metadata.json").read_text())["embedding"]
     inputs = {}
-    for name, spec in tiny.spec.media_inputs.items():
+    for name, spec in block["components"][tiny.spec.media_component]["inputs"].items():
         shape = [int(d) for d in spec[:-1].split("[")[1].split(",")[1:]]
         inputs[name] = torch.randn([n, *shape], generator=generator)
     return inputs
@@ -313,7 +314,7 @@ def test_reference_host_text_matches_hugging_face(tiny):
     tokenizer = transformers.AutoTokenizer.from_pretrained(tiny.snapshot)
     want = tokenizer(TEXTS, padding="max_length", max_length=77, truncation=True)
     assert ids.tolist() == want["input_ids"] and mask.tolist() == want["attention_mask"]
-    assert ids[3, -1] == tiny.spec.family.eos_token_id and mask[3].all()
+    assert ids[3, -1] == tiny.facts.eos_token_id and mask[3].all()
     got = bundle.embed_text(TEXTS)
     hf = _hf_features(tiny, {"input_ids": ids, "attention_mask": mask})
     torch.testing.assert_close(got, hf, atol=1e-4, rtol=1e-4)
@@ -390,18 +391,25 @@ def test_reduced_precisions(tiny, precision, tmp_path):
         assert F.cosine_similarity(got, _hf_features(tiny, inputs)).min() >= floor
 
 
-def test_check_snapshot_rejects_a_mismatch(tiny, tmp_path):
-    exporter = tiny.exporter
-    exporter.check_snapshot(tiny.snapshot)
-    bad = tmp_path / "bad"
-    bad.mkdir()
-    for name in ("config.json", "preprocessor_config.json"):
-        (bad / name).write_text((tiny.snapshot / name).read_text())
-    proc = json.loads((bad / "preprocessor_config.json").read_text())
-    proc["resample" if tiny.spec.modality == "image" else "hop_length"] = 2
-    (bad / "preprocessor_config.json").write_text(json.dumps(proc))
-    with pytest.raises(ValueError, match="disagrees"):
-        exporter.check_snapshot(bad)
+UNSUPPORTED = {
+    "image": [("resample", 2), ("crop_size", 200), ("do_normalize", False)],
+    "audio": [("truncation", "fusion"), ("padding", "pad"), ("top_db", 80)],
+}
+
+
+def test_read_facts_refuses_unsupported_preprocessing(tiny, tmp_path):
+    """The tiny snapshots preprocess like the real ones; settings outside R7 / R8 are refused."""
+    facts = tiny.exporter.read_facts(tiny.snapshot)
+    real = REAL_FACTS["clip" if tiny.spec.modality == "image" else "clap"]
+    assert (facts.dimension, facts.max_tokens) == (DIM, 77)
+    assert (facts.image, facts.audio) == (real.image, real.audio)
+    for key, value in UNSUPPORTED[tiny.spec.modality]:
+        bad = tmp_path / key
+        shutil.copytree(tiny.snapshot, bad, ignore=shutil.ignore_patterns("*.safetensors"))
+        proc = json.loads((bad / "preprocessor_config.json").read_text())
+        (bad / "preprocessor_config.json").write_text(json.dumps({**proc, key: value}))
+        with pytest.raises(ValueError, match=f"cannot express: .*{key}"):
+            tiny.exporter.read_facts(bad)
 
 
 def test_exporters_are_registered():
@@ -414,6 +422,24 @@ def test_exporters_are_registered():
 REAL = {
     "clip": ("openai/clip-vit-base-patch32", "3d74acf9a28c67741b2f4f2ea7635f0aaf6f0268"),
     "clap": ("laion/clap-htsat-unfused", "8fa0f1c6d0433df6e97c127f64b2a1d6c0dcda8a"),
+}
+REAL_FACTS = {
+    "clip": CheckpointFacts(
+        512,
+        49406,
+        49407,
+        49407,
+        77,
+        image=ImagePreprocessing(
+            "center_crop",
+            224,
+            (0.48145466, 0.4578275, 0.40821073),
+            (0.26862954, 0.26130258, 0.27577711),
+        ),
+    ),
+    "clap": CheckpointFacts(
+        512, 0, 2, 1, 77, audio=AudioPreprocessing(48000, 1024, 1024, 480, 64, 1001, 50, 14000)
+    ),
 }
 LABELS = {
     "clip": ["a photo of a cat", "a photo of a dog", "a diagram"],
@@ -428,6 +454,12 @@ def _real_snapshot(model: str) -> Path:
     if not (snapshot / "pytorch_model.bin").exists():
         pytest.skip(f"{hf_id} is not in the HF cache")
     return snapshot
+
+
+@pytest.mark.parametrize("model", ["clip", "clap"])
+def test_real_facts(model):
+    spec = clip_clap.CLIP if model == "clip" else clip_clap.CLAP
+    assert clip_clap.read_facts(spec, _real_snapshot(model)) == REAL_FACTS[model]
 
 
 @pytest.mark.slow

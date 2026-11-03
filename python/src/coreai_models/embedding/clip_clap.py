@@ -18,7 +18,6 @@ texts and a batch of images or clips.
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -36,6 +35,7 @@ from coreai_models.embedding.contract import (
     TEXT_COMPONENT,
     TEXT_INPUT_NAMES,
     AudioPreprocessing,
+    CheckpointFacts,
     EmbeddingFamily,
     ImagePreprocessing,
     function_entry,
@@ -52,6 +52,7 @@ from coreai_models.embedding.export_utils import (
 BATCH = (1, 64)
 FUSED_ASSET = "model"
 FUSED_FUNCTION = "main"
+BICUBIC = 3  # PIL.Image.Resampling.BICUBIC
 
 
 def _features(output: Any) -> torch.Tensor:
@@ -135,7 +136,9 @@ class DualEncoder:
     """A Hugging Face text + media model exported as two towers.
 
     ``similarity_inputs`` / ``similarity_outputs`` are the fused ``main`` signature, in the order
-    of ``similarity``'s arguments and results.
+    of ``similarity``'s arguments and results. Shapes in these and ``media_inputs`` take ``{dim}``
+    (the embedding dimension), ``{size}`` (the image size), ``{frames}`` and ``{mels}`` (the audio
+    frames and mel bins) from the checkpoint facts.
     """
 
     family: EmbeddingFamily
@@ -157,36 +160,25 @@ CLIP = DualEncoder(
     family=EmbeddingFamily(
         key="clip-vit-b32",
         hf_model_id="openai/clip-vit-base-patch32",
-        dimension=512,
-        # The tokenizer wraps text as <|startoftext|> ... <|endoftext|> and pads with <|endoftext|>.
-        bos_token_id=49406,
-        eos_token_id=49407,
-        pad_token_id=49407,
-        max_tokens=77,
         precisions={p: ("float32", "float16", "bfloat16") for p in ("macOS", "iOS")},
-        image=ImagePreprocessing(
-            image_strategy="center_crop",
-            image_size=224,
-            image_mean=(0.48145466, 0.4578275, 0.40821073),
-            image_std=(0.26862954, 0.26130258, 0.27577711),
-        ),
+        modalities=("text", "image"),
     ),
     model_class="CLIPModel",
     logit_scale="logit_scale",
     media_component=IMAGE_COMPONENT,
     media_tower=ImageTower,
-    media_inputs={"pixel_values": "float32[B,3,224,224]"},
+    media_inputs={"pixel_values": "float32[B,3,{size},{size}]"},
     similarity=ClipSimilarity,
     similarity_inputs={
-        "pixel_values": "float32[N,3,224,224]",
+        "pixel_values": "float32[N,3,{size},{size}]",
         "input_ids": "int32[B,L]",
         "attention_mask": "int32[B,L]",
     },
     similarity_outputs={
         "logits_per_image": "float32[N,B]",
         "logits_per_text": "float32[B,N]",
-        "image_embeds": "float32[N,512]",
-        "text_embeds": "float32[B,512]",
+        "image_embeds": "float32[N,{dim}]",
+        "text_embeds": "float32[B,{dim}]",
     },
 )
 
@@ -194,25 +186,10 @@ CLAP = DualEncoder(
     family=EmbeddingFamily(
         key="clap-htsat",
         hf_model_id="laion/clap-htsat-unfused",
-        dimension=512,
-        # The tokenizer wraps text as <s> ... </s> and pads with <pad>.
-        bos_token_id=0,
-        eos_token_id=2,
-        pad_token_id=1,
+        precisions={p: ("float32", "float16") for p in ("macOS", "iOS")},
+        modalities=("text", "audio"),
         # The training length; the tokenizer accepts up to 512.
         max_tokens=77,
-        precisions={p: ("float32", "float16") for p in ("macOS", "iOS")},
-        # From preprocessor_config.json: 10 s clips.
-        audio=AudioPreprocessing(
-            sample_rate=48000,
-            n_fft=1024,
-            win_length=1024,
-            hop_length=480,
-            n_mel_bins=64,
-            n_frames=1001,
-            f_min=50,
-            f_max=14000,
-        ),
     ),
     model_class="ClapModel",
     # The scale of HF logits_per_audio. HF logits_per_text uses logit_scale_t, still at its
@@ -220,19 +197,19 @@ CLAP = DualEncoder(
     logit_scale="logit_scale_a",
     media_component=AUDIO_COMPONENT,
     media_tower=AudioTower,
-    media_inputs={"input_features": "float32[B,1,1001,64]"},
+    media_inputs={"input_features": "float32[B,1,{frames},{mels}]"},
     similarity=ClapSimilarity,
     similarity_inputs={
         "input_ids": "int32[B,L]",
         "attention_mask": "int32[B,L]",
-        "input_features": "float32[N,1,1001,64]",
+        "input_features": "float32[N,1,{frames},{mels}]",
         "is_longer": "bool[N,1]",
     },
     similarity_outputs={
         "logits_per_audio": "float32[N,B]",
         "logits_per_text": "float32[B,N]",
-        "text_embeds": "float32[B,512]",
-        "audio_embeds": "float32[N,512]",
+        "text_embeds": "float32[B,{dim}]",
+        "audio_embeds": "float32[N,{dim}]",
     },
 )
 
@@ -253,8 +230,18 @@ def _component(
     }
 
 
+def _shapes(specs: dict[str, str], facts: CheckpointFacts) -> dict[str, str]:
+    sizes = {"dim": facts.dimension}
+    if facts.image is not None:
+        sizes["size"] = facts.image.image_size
+    if facts.audio is not None:
+        sizes.update(frames=facts.audio.n_frames, mels=facts.audio.n_mel_bins)
+    return {name: spec.format(**sizes) for name, spec in specs.items()}
+
+
 def dual_encoder_block(
     spec: DualEncoder,
+    facts: CheckpointFacts,
     *,
     revision: str,
     compute_precision: str,
@@ -265,8 +252,7 @@ def dual_encoder_block(
     """Build the ``embedding`` block. Component ``c`` is function ``c`` in asset ``c``, or in
     asset ``model`` when ``fused``.
     """
-    family = spec.family
-    embedding = {OUTPUT_NAME: f"float32[B,{family.dimension}]"}
+    embedding = {OUTPUT_NAME: f"float32[B,{facts.dimension}]"}
     text_inputs = {name: "int32[B,L]" for name in TEXT_INPUT_NAMES}
 
     def asset(component: str) -> str:
@@ -274,35 +260,36 @@ def dual_encoder_block(
 
     components = {
         TEXT_COMPONENT: _component(
-            asset(TEXT_COMPONENT), text_inputs, embedding, TEXT_COMPONENT, family.max_tokens
+            asset(TEXT_COMPONENT), text_inputs, embedding, TEXT_COMPONENT, facts.max_tokens
         )
     }
     towers = [{"modality": "text", "pipeline": [TEXT_COMPONENT]}]
     if not text_only:
         media = spec.media_component
-        components[media] = _component(asset(media), spec.media_inputs, embedding, media)
+        media_inputs = _shapes(spec.media_inputs, facts)
+        components[media] = _component(asset(media), media_inputs, embedding, media)
         towers.append({"modality": spec.modality, "pipeline": [media]})
     if fused:
         components[SIMILARITY_COMPONENT] = _component(
             FUSED_ASSET,
-            spec.similarity_inputs,
-            spec.similarity_outputs,
+            _shapes(spec.similarity_inputs, facts),
+            _shapes(spec.similarity_outputs, facts),
             FUSED_FUNCTION,
-            family.max_tokens,
+            facts.max_tokens,
         )
     block: dict[str, Any] = {
-        "space": {"id": family.hf_model_id, "revision": revision},
-        "dimension": family.dimension,
+        "space": {"id": spec.family.hf_model_id, "revision": revision},
+        "dimension": facts.dimension,
         "normalized": True,
         "metric": "cosine",
         "logit_scale": logit_scale,
         "compute_precision": compute_precision,
         "components": components,
         "towers": towers,
-        "text": text_block(family),
+        "text": text_block(facts),
     }
     if not text_only:
-        block[spec.modality] = media_block(family, spec.modality)
+        block[spec.modality] = media_block(facts, spec.modality)
     return block
 
 
@@ -318,6 +305,7 @@ def export_programs(
     spec: DualEncoder,
     snapshot: Path,
     out: Path,
+    facts: CheckpointFacts,
     *,
     platform: str,
     text_only: bool,
@@ -335,6 +323,7 @@ def export_programs(
     model.to(TORCH_DTYPES[compute_precision])
     block = dual_encoder_block(
         spec,
+        facts,
         revision=revision,
         compute_precision=compute_precision,
         logit_scale=logit_scale,
@@ -354,73 +343,110 @@ def export_programs(
     return {asset: f"{asset}.aimodel" for asset in by_asset}, block
 
 
-def _mismatches(source: str, got: dict[str, Any], want: dict[str, Any]) -> list[str]:
-    return [f"{source} {k} {got.get(k)!r} != {v!r}" for k, v in want.items() if got.get(k) != v]
+def _refuse(source: str, got: dict[str, Any], want: dict[str, Any]) -> None:
+    problems = [f"{k} {got[k]!r} (supported: {v!r})" for k, v in want.items() if got[k] != v]
+    if problems:
+        raise ValueError(f"{source} has settings the embedding contract cannot express: {problems}")
 
 
-def check_clip_snapshot(spec: DualEncoder, snapshot: Path) -> None:
-    """Raise ``ValueError`` if the snapshot's image preprocessing or projection disagree."""
-    image = spec.family.image
-    assert image is not None
-    proc = json.loads((snapshot / "preprocessor_config.json").read_text())
-    size = proc.get("size")
-    crop = proc.get("crop_size")
+def _image_preprocessing(processor: Any) -> ImagePreprocessing:
+    size = processor.size.get("shortest_edge")
+    crop = processor.crop_size
     got = {
-        "size": size.get("shortest_edge") if isinstance(size, dict) else size,
-        "crop_size": crop.get("height") if isinstance(crop, dict) else crop,
-        "do_center_crop": proc.get("do_center_crop"),
-        "resample": proc.get("resample"),
-        "image_mean": proc.get("image_mean"),
-        "image_std": proc.get("image_std"),
+        "do_convert_rgb": processor.do_convert_rgb,
+        "do_resize": processor.do_resize,
+        "resample": processor.resample,
+        "do_center_crop": processor.do_center_crop,
+        "crop_size": (crop.get("height"), crop.get("width")),
+        "do_rescale": processor.do_rescale,
+        "rescale_factor": processor.rescale_factor,
+        "do_normalize": processor.do_normalize,
     }
     want = {
-        "size": image.image_size,
-        "crop_size": image.image_size,
+        "do_convert_rgb": True,
+        "do_resize": True,
+        "resample": BICUBIC,
         "do_center_crop": True,
-        "resample": 3,  # PIL BICUBIC
-        "image_mean": list(image.image_mean),
-        "image_std": list(image.image_std),
+        "crop_size": (size, size),
+        "do_rescale": True,
+        "rescale_factor": 1 / 255,
+        "do_normalize": True,
     }
-    config = json.loads((snapshot / "config.json").read_text())
-    problems = _mismatches("preprocessor_config.json", got, want) + _mismatches(
-        "config.json", config, {"projection_dim": spec.family.dimension}
+    _refuse("the image processor", got, want)
+    return ImagePreprocessing(
+        image_strategy="center_crop",
+        image_size=size,
+        image_mean=tuple(processor.image_mean),
+        image_std=tuple(processor.image_std),
     )
-    if problems:
-        raise ValueError(f"Snapshot disagrees with the CLIP family: {problems}")
 
 
-def check_clap_snapshot(spec: DualEncoder, snapshot: Path) -> None:
-    """Raise ``ValueError`` if the snapshot's audio front end, fusion or projection disagree."""
-    audio = spec.family.audio
-    assert audio is not None
-    proc = json.loads((snapshot / "preprocessor_config.json").read_text())
+def _audio_preprocessing(extractor: Any, enable_fusion: bool) -> AudioPreprocessing:
+    hop, samples = extractor.hop_length, extractor.nb_max_samples
+    got = {
+        "padding": extractor.padding,
+        "truncation": extractor.truncation,
+        "top_db": extractor.top_db,
+        "nb_max_samples % hop_length": samples % hop,
+        "audio_config.enable_fusion": enable_fusion,
+    }
     want = {
-        "sampling_rate": audio.sample_rate,
-        "n_fft": audio.n_fft,
-        "fft_window_size": audio.win_length,
-        "hop_length": audio.hop_length,
-        "feature_size": audio.n_mel_bins,
-        "frequency_min": audio.f_min,
-        "frequency_max": audio.f_max,
-        "nb_max_samples": (audio.n_frames - 1) * audio.hop_length,
         "padding": "repeatpad",
+        "truncation": "rand_trunc",
+        "top_db": None,
+        "nb_max_samples % hop_length": 0,
+        "audio_config.enable_fusion": False,
     }
-    config = json.loads((snapshot / "config.json").read_text())
-    problems = _mismatches("preprocessor_config.json", proc, want)
-    problems += _mismatches("config.json", config, {"projection_dim": spec.family.dimension})
-    problems += _mismatches(
-        "config.json audio_config", config.get("audio_config", {}), {"enable_fusion": False}
+    _refuse("the feature extractor", got, want)
+    return AudioPreprocessing(
+        sample_rate=extractor.sampling_rate,
+        n_fft=extractor.fft_window_size,
+        win_length=extractor.fft_window_size,
+        hop_length=hop,
+        n_mel_bins=extractor.feature_size,
+        n_frames=samples // hop + 1,
+        f_min=extractor.frequency_min,
+        f_max=extractor.frequency_max,
     )
-    if problems:
-        raise ValueError(f"Snapshot disagrees with the CLAP family: {problems}")
+
+
+def read_facts(spec: DualEncoder, snapshot: Path) -> CheckpointFacts:
+    """The snapshot's facts, from ``transformers.AutoProcessor`` and ``AutoConfig``.
+
+    ``max_tokens`` is the family's, else the tokenizer's ``model_max_length``.
+
+    Raises:
+        ValueError: if the image processor does anything but convert to RGB, resize the shortest
+            edge bicubic, crop the center square, scale by 1/255 and normalize (R7), or the audio
+            front end is not the R8 one: ``repeatpad`` padding, ``rand_trunc`` truncation, no
+            ``top_db``, a clip of whole hops and an unfused model.
+    """
+    from transformers import AutoConfig, AutoProcessor
+
+    processor = AutoProcessor.from_pretrained(snapshot)
+    config = AutoConfig.from_pretrained(snapshot)
+    tokenizer = processor.tokenizer
+    image = audio = None
+    if spec.modality == "image":
+        image = _image_preprocessing(processor.image_processor)
+    else:
+        audio = _audio_preprocessing(processor.feature_extractor, config.audio_config.enable_fusion)
+    return CheckpointFacts(
+        dimension=config.projection_dim,
+        bos_token_id=tokenizer.bos_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+        pad_token_id=tokenizer.pad_token_id,
+        max_tokens=spec.family.max_tokens or tokenizer.model_max_length,
+        image=image,
+        audio=audio,
+    )
 
 
 def exporter(spec: DualEncoder) -> EmbeddingExporter:
     """The ``EmbeddingExporter`` for ``spec``."""
-    check = check_clip_snapshot if spec.modality == "image" else check_clap_snapshot
     return EmbeddingExporter(
         family=spec.family,
-        check_snapshot=partial(check, spec),
+        read_facts=partial(read_facts, spec),
         export_programs=partial(export_programs, spec),
         fused=True,
     )

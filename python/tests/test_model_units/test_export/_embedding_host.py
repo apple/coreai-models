@@ -199,7 +199,14 @@ def slaney_mel_filters(sr: int, n_fft: int, n_mels: int, f_min: float, f_max: fl
     return np.maximum(0, np.minimum(lower, upper)) * (2.0 / (hz[2:] - hz[:-2]))
 
 
-def save_tiny_tokenizer(snapshot: Path, words: list[str], bos: int, eos: int, pad: int) -> None:
+def save_tiny_tokenizer(
+    snapshot: Path,
+    words: list[str],
+    bos: int,
+    eos: int,
+    pad: int,
+    model_max_length: int | None = None,
+) -> None:
     """A word-level tokenizer with ``<s> A </s>`` post-processing: bos/eos/pad take the given ids
     (pad may equal eos), ``words`` the lowest free ids in order.
     """
@@ -220,6 +227,7 @@ def save_tiny_tokenizer(snapshot: Path, words: list[str], bos: int, eos: int, pa
         eos_token="</s>",
         pad_token="</s>" if pad == eos else "<pad>",
         unk_token=words[0],
+        model_max_length=model_max_length,
     ).save_pretrained(snapshot)
 
 
