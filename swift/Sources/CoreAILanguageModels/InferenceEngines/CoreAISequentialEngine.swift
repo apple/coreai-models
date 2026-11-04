@@ -1139,8 +1139,10 @@ extension CoreAISequentialEngine {
             tokens: input,
             commonPrefix: sessionState.history.resolve(input: input).commonPrefix,
             isMultimodal: embeddedInput != nil,
+            embeddedTokenCount: embeddedInput?.tokenCount,
             imageTokenId: visionConfig?.imageTokenId,
             historyCount: sessionState.history.count,
+            historyTokens: sessionState.history.tokens,
             processedTokenCount: sessionState.processedTokenCount,
             hasNonTruncatableStates: sessionState.hasNonTruncatableStates,
             ringCapacity: slidingRingCapacity)
@@ -1172,13 +1174,17 @@ extension CoreAISequentialEngine {
     /// A vision-language session follows `visionPrefixResetPlan`, cutting the match at the first
     /// image placeholder for a multimodal request. A text-only request throws when `tokens` hold
     /// an image placeholder at or past the position it resumes from, since that image is not in
-    /// the KV cache.
+    /// the KV cache. A request also throws when it would resume partway through a cached image, and
+    /// a multimodal request throws when its placeholders after the resume point don't match
+    /// `embeddedTokenCount`. All checks run before the session is touched.
     static func generationResetPlan(
         tokens: [Int32],
         commonPrefix: Int,
         isMultimodal: Bool,
+        embeddedTokenCount: Int? = nil,
         imageTokenId: Int32?,
         historyCount: Int,
+        historyTokens: [Int32] = [],
         processedTokenCount: Int,
         hasNonTruncatableStates: Bool,
         ringCapacity: Int? = nil
@@ -1199,11 +1205,25 @@ extension CoreAISequentialEngine {
                     ringCapacity: ringCapacity)
             }
         }
+        guard let imageTokenId else { return plan }
         let resumeAt = plan.resetTo ?? processedTokenCount
-        if !isMultimodal, let imageTokenId, tokens.dropFirst(resumeAt).contains(imageTokenId) {
+        if resumeAt > 0, resumeAt < historyTokens.count,
+            historyTokens[resumeAt - 1] == imageTokenId, historyTokens[resumeAt] == imageTokenId
+        {
+            throw InferenceRuntimeError.invalidArgument(
+                "The prompt matches the cached history only partway through an image, at position \(resumeAt). "
+                    + "Its image placeholders must match the cached image's.")
+        }
+        let newPlaceholders = tokens.dropFirst(resumeAt).count(where: { $0 == imageTokenId })
+        if !isMultimodal, newPlaceholders > 0 {
             throw InferenceRuntimeError.invalidArgument(
                 "The prompt has image placeholder tokens from position \(resumeAt) on that are not in the KV cache. "
                     + "Pass the image with generate(with:tokens:samplingConfiguration:inferenceOptions:).")
+        }
+        if let embeddedTokenCount, newPlaceholders != embeddedTokenCount {
+            throw InferenceRuntimeError.invalidArgument(
+                "The prompt has \(newPlaceholders) image placeholder tokens from position \(resumeAt) on, "
+                    + "but the embeddings cover \(embeddedTokenCount).")
         }
         return plan
     }
