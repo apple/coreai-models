@@ -10,8 +10,8 @@ import math
 import pytest
 import torch
 
-from coreai_models.embedding.embedding_gemma2 import TokenTableExportWrapper, scaled_token_table
-from coreai_models.embedding.export_ios import EncoderBandWrapper
+from coreai_models.embedding.embedding_gemma2.common import TokenTableExportWrapper
+from coreai_models.embedding.embedding_gemma2.ios import EncoderBandWrapper, scaled_token_table
 from coreai_models.models.ios.embedding_gemma2 import (
     load_embedding_gemma2_text_encoder_and_table,
     text_encoder_from_state_dict,

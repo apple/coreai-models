@@ -19,20 +19,21 @@ import torch.nn as nn
 
 from coreai_models._constants import DEFAULT_INCLUDE_DEBUG_INFO, MASK_NEG
 from coreai_models.embedding.contract import IMAGE_COMPONENT, OUTPUT_NAME, CheckpointFacts
-from coreai_models.embedding.embedding_gemma2 import (
-    ANE_ENCODER_INPUT_NAMES,
+from coreai_models.embedding.embedding_gemma2.common import (
     ENCODER_COMPONENT,
     IMAGE_INPUT_NAMES,
     IMAGE_OUTPUT_NAME,
     TOKEN_TABLE_COMPONENT,
+    TOKEN_TABLE_INPUT_NAMES,
+    TOKEN_TABLE_OUTPUT_NAME,
     EmbeddingGemma2Family,
     FunctionSpec,
     ImageTowerFacts,
+    TokenTableExportWrapper,
     encoder_functions,
-    export_token_table_program,
     image_reference_inputs,
     output_dtype,
-    scaled_token_table,
+    token_table_trace,
 )
 from coreai_models.embedding.export_utils import TORCH_DTYPES, save_program
 
@@ -40,8 +41,35 @@ if TYPE_CHECKING:
     from coreai.authoring import AIProgram
 
 
+ANE_ENCODER_INPUT_NAMES = ("inputs_embeds", "bias", "pool_weights")
 # The iOS programs compute in this dtype and output it.
 DTYPE = TORCH_DTYPES[output_dtype("iOS")]
+
+
+def scaled_token_table(table: torch.Tensor, scale: float, dtype: torch.dtype) -> nn.Embedding:
+    """Return an ``nn.Embedding`` of ``table * scale`` (computed in float32) as ``dtype``."""
+    return nn.Embedding.from_pretrained((table.float() * scale).to(dtype))
+
+
+def export_token_table_program(
+    embed_tokens: nn.Module,
+    max_length: int,
+    dtype: torch.dtype,
+    include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
+) -> AIProgram:
+    """``token_table``: function ``main``, ids -> scaled embeddings, dynamic length (batch 1)."""
+    from coreai_models.converter import export_stateless
+
+    # Placeholder ids look up like any id; the host overwrites those rows with soft tokens.
+    args, dynamic_shapes = token_table_trace(max_length)
+    return export_stateless(
+        TokenTableExportWrapper(embed_tokens, dtype),
+        args,
+        TOKEN_TABLE_INPUT_NAMES,
+        (TOKEN_TABLE_OUTPUT_NAME,),
+        dynamic_shapes=dynamic_shapes,
+        include_debug_info=include_debug_info,
+    )
 
 
 class EncoderBandWrapper(nn.Module):
