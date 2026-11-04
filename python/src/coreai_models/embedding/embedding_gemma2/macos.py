@@ -27,8 +27,7 @@ from coreai_models.embedding.contract import (
     TEXT_INPUT_NAMES,
     CheckpointFacts,
 )
-from coreai_models.embedding.embedding_gemma2 import (
-    ENCODER_INPUT_NAMES,
+from coreai_models.embedding.embedding_gemma2.common import (
     IMAGE_INPUT_NAMES,
     IMAGE_OUTPUT_NAME,
     TOKEN_TABLE_INPUT_NAMES,
@@ -49,6 +48,7 @@ if TYPE_CHECKING:
     from coreai.authoring import AIProgram
 
 
+ENCODER_INPUT_NAMES = ("inputs_embeds", "attention_mask")
 OUTPUT_DTYPE = TORCH_DTYPES[output_dtype("macOS")]
 
 
