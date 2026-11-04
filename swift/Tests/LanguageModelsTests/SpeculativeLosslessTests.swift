@@ -146,7 +146,7 @@ struct SpeculativeLosslessTests {
 }
 
 /// Proposes the model's own greedy continuation, so every draft is accepted.
-private final class ExactDrafter: DrafterEngine, @unchecked Sendable {
+private final class ExactDrafter: DrafterEngine {
     let model: HashModel
     let maxContextLength = 100_000
     init(model: HashModel) { self.model = model }

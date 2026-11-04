@@ -92,6 +92,11 @@ struct SpeculativeDecodingOptionsTests {
         #expect(split.ids == [7, 9])
         #expect(split.multiToken == ["two words", "three tok ens"])
         #expect(SpeculativeDecodingOptions.stopTokens([]).ids.isEmpty)
+        // A string given twice is named once.
+        let repeated = SpeculativeDecodingOptions.stopTokens([
+            (text: "a b", tokens: [1, 2]), (text: "c", tokens: [5]), (text: "a b", tokens: [1, 2]),
+        ])
+        #expect(repeated.multiToken == ["a b"] && repeated.ids == [5])
     }
 
     @Test("Multi-token stop strings are named in one warning, and nothing is said when there are none")

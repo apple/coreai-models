@@ -557,7 +557,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         let tokenizer = try await targetBundle.loadTokenizer()
         // `--stop-tokens` that encode to one token join the tokenizer's end-of-sequence tokens.
         let requestedStops = try stopTokens.map { text in
-            let tokens = tokenizer.encode(text: text, addSpecialTokens: false).map { Int32($0) }
+            let tokens = tokenizer.encode(text: text, addSpecialTokens: false).map(Int32.init)
             guard !tokens.isEmpty else {
                 print("Error: Stop token '\(text)' encodes to 0 tokens")
                 throw ExitCode.failure

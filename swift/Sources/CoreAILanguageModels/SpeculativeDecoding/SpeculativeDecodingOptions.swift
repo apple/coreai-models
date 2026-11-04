@@ -97,7 +97,12 @@ package enum SpeculativeDecodingOptions {
         var ids = Set<Int32>()
         var multiToken: [String] = []
         for (text, tokens) in encoded {
-            if tokens.count == 1 { ids.insert(tokens[0]) } else { multiToken.append(text) }
+            if tokens.count == 1 {
+                ids.insert(tokens[0])
+            } else if !multiToken.contains(text) {
+                // Kept in the order given, once each, so the warning names them as the user wrote them.
+                multiToken.append(text)
+            }
         }
         return (ids, multiToken)
     }
@@ -106,7 +111,7 @@ package enum SpeculativeDecodingOptions {
     package static func multiTokenStopWarning(_ multiToken: [String]) -> String? {
         guard !multiToken.isEmpty else { return nil }
         return "Warning: speculative decoding stops only at --stop-tokens that encode to a single "
-            + "token; ignoring \(multiToken.map { "'\($0)'" }.joined(separator: ", "))."
+            + "token; ignoring \(multiToken.map({ "'\($0)'" }).joined(separator: ", "))."
     }
 
     /// Raw tokens carry no text to place around the image, so they cannot be combined with it.
