@@ -83,26 +83,20 @@ struct SpeculativeDecodingOptionsTests {
         #expect(SpeculativeDecodingOptions.grammarProposalProblem(7, speculating: true, hasSchema: false) != nil)
     }
 
-    @Test("Single-token stop strings become stop ids, and the others are named, in order")
+    @Test("Single-token stops become stop ids; no token of a longer sequence does")
     func stopTokenSplit() {
-        let split = SpeculativeDecodingOptions.stopTokens([
-            (text: "<end>", tokens: [7]), (text: "two words", tokens: [3, 4]), (text: ".", tokens: [9]),
-            (text: "three tok ens", tokens: [1, 2, 3]),
-        ])
-        #expect(split.ids == [7, 9])
-        #expect(split.multiToken == ["two words", "three tok ens"])
-        #expect(SpeculativeDecodingOptions.stopTokens([]).ids.isEmpty)
-        // A string given twice is named once.
-        let repeated = SpeculativeDecodingOptions.stopTokens([
-            (text: "a b", tokens: [1, 2]), (text: "c", tokens: [5]), (text: "a b", tokens: [1, 2]),
-        ])
-        #expect(repeated.multiToken == ["a b"] && repeated.ids == [5])
+        let stops = SpeculativeDecodingOptions.stopTokenIds(
+            StopSequences(sequences: [[7], [3, 4], [9], [1, 2, 3]]))
+        #expect(stops.ids == [7, 9])
+        #expect(stops.ignored == [[3, 4], [1, 2, 3]])
+        #expect(SpeculativeDecodingOptions.stopTokenIds(StopSequences(sequences: [])).ids.isEmpty)
     }
 
     @Test("Multi-token stop strings are named in one warning, and nothing is said when there are none")
     func multiTokenStopWarning() throws {
         #expect(SpeculativeDecodingOptions.multiTokenStopWarning([]) == nil)
-        let warning = try #require(SpeculativeDecodingOptions.multiTokenStopWarning(["two words", "a b"]))
-        #expect(warning.contains("'two words', 'a b'") && warning.contains("single token"))
+        let warning = try #require(
+            SpeculativeDecodingOptions.multiTokenStopWarning(["two words", "a b", "two words"]))
+        #expect(warning.contains("'two words', 'a b'.") && warning.contains("single token"))
     }
 }

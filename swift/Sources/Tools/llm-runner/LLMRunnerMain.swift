@@ -555,25 +555,19 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         }
 
         let tokenizer = try await targetBundle.loadTokenizer()
-        // `--stop-tokens` that encode to one token join the tokenizer's end-of-sequence tokens.
-        let requestedStops = try stopTokens.map { text in
-            let tokens = tokenizer.encode(text: text, addSpecialTokens: false).map(Int32.init)
-            guard !tokens.isEmpty else {
-                print("Error: Stop token '\(text)' encodes to 0 tokens")
-                throw ExitCode.failure
-            }
-            return (text: text, tokens: tokens)
-        }
-        let userStops = SpeculativeDecodingOptions.stopTokens(requestedStops)
-        if let warning = SpeculativeDecodingOptions.multiTokenStopWarning(userStops.multiToken) {
+        // The stops a plain run uses: the end-of-sequence tokens and `--stop-tokens`. Speculative
+        // decoding stops at those that are one token; see `SpeculativeDecodingOptions.stopTokenIds`.
+        let stopSequences = try validateAndEncodeStopTokens(
+            stopTokens: stopTokens, tokenizer: tokenizer,
+            additionalEosTokenIds: RunnerPrompting.additionalStopTokenIds(
+                tokenizerDirectory: targetBundle.tokenizerPath, tokenizer: tokenizer))
+        let stops = SpeculativeDecodingOptions.stopTokenIds(stopSequences)
+        if let warning = SpeculativeDecodingOptions.multiTokenStopWarning(
+            stops.ignored.map { tokenizer.decode(tokens: $0.map(Int.init)) })
+        {
             print(warning)
         }
-        let stopTokenIds = RunnerPrompting.stopTokenIds(
-            tokenizer: tokenizer,
-            additional: RunnerPrompting.additionalStopTokenIds(
-                tokenizerDirectory: targetBundle.tokenizerPath, tokenizer: tokenizer)
-        )
-        .union(userStops.ids)
+        let stopTokenIds = stops.ids
 
         let promptInput = try resolvePromptInput()
         let promptTokens: [Int32]

@@ -87,28 +87,24 @@ package enum SpeculativeDecodingOptions {
             + "--stop-tokens, and samples with --temperature alone."
     }
 
-    /// Splits encoded `--stop-tokens` into the ids of those that encode to one token, which
-    /// speculative decoding stops at, and the strings of those that encode to more, which it does
-    /// not: a block can accept a sequence's first tokens before the stop is recognizable, so
-    /// stopping on a sequence would need the decoder to hold back accepted tokens.
-    package static func stopTokens(
-        _ encoded: [(text: String, tokens: [Int32])]
-    ) -> (ids: Set<Int32>, multiToken: [String]) {
-        var ids = Set<Int32>()
-        var multiToken: [String] = []
-        for (text, tokens) in encoded {
-            if tokens.count == 1 {
-                ids.insert(tokens[0])
-            } else if !multiToken.contains(text) {
-                // Kept in the order given, once each, so the warning names them as the user wrote them.
-                multiToken.append(text)
-            }
-        }
-        return (ids, multiToken)
+    /// The stops speculative decoding ends a run at, from the stops a plain run uses: the
+    /// single-token ones. The others are `ignored`: a verify block can accept the first tokens of a
+    /// sequence before the stop is recognizable, so stopping on a sequence would need the decoder to
+    /// hold back accepted tokens that might begin one. None of a sequence's tokens joins the stop set,
+    /// so a run never stops on part of one.
+    package static func stopTokenIds(_ stops: StopSequences) -> (ids: Set<Int32>, ignored: [[Int32]]) {
+        let ids = Set(stops.sequences.filter { $0.count == 1 }.map { $0[0] })
+        let ignored = stops.sequences.filter { $0.count > 1 }
+        return (ids, ignored)
     }
 
     /// A warning naming the `--stop-tokens` speculative decoding does not stop at, or `nil`.
-    package static func multiTokenStopWarning(_ multiToken: [String]) -> String? {
+    /// Each is named once, in the order given.
+    package static func multiTokenStopWarning(_ names: [String]) -> String? {
+        var multiToken: [String] = []
+        for name in names where !multiToken.contains(name) {
+            multiToken.append(name)
+        }
         guard !multiToken.isEmpty else { return nil }
         return "Warning: speculative decoding stops only at --stop-tokens that encode to a single "
             + "token; ignoring \(multiToken.map({ "'\($0)'" }).joined(separator: ", "))."
