@@ -106,6 +106,11 @@ final class DraftPack: @unchecked Sendable {
             throw DraftPackError.message("cannot mmap \(blob.path)")
         }
         base = p
+        // Start reading the table in now, while the target loads and prefills. Each drafted token
+        // scores scattered blocks of it; mapped lazily, the first decode after a load stalls on
+        // each block's first read from storage. The hint is advisory: a failure only loses the
+        // head start.
+        _ = madvise(p, length, MADV_WILLNEED)
     }
 
     deinit { munmap(base, length) }
