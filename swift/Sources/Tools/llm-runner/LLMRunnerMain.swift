@@ -555,10 +555,25 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         }
 
         let tokenizer = try await targetBundle.loadTokenizer()
+        // `--stop-tokens` that encode to one token join the tokenizer's end-of-sequence tokens.
+        let requestedStops = try stopTokens.map { text in
+            let tokens = tokenizer.encode(text: text, addSpecialTokens: false).map { Int32($0) }
+            guard !tokens.isEmpty else {
+                print("Error: Stop token '\(text)' encodes to 0 tokens")
+                throw ExitCode.failure
+            }
+            return (text: text, tokens: tokens)
+        }
+        let userStops = SpeculativeDecodingOptions.stopTokens(requestedStops)
+        if let warning = SpeculativeDecodingOptions.multiTokenStopWarning(userStops.multiToken) {
+            print(warning)
+        }
         let stopTokenIds = RunnerPrompting.stopTokenIds(
             tokenizer: tokenizer,
             additional: RunnerPrompting.additionalStopTokenIds(
-                tokenizerDirectory: targetBundle.tokenizerPath, tokenizer: tokenizer))
+                tokenizerDirectory: targetBundle.tokenizerPath, tokenizer: tokenizer)
+        )
+        .union(userStops.ids)
 
         let promptInput = try resolvePromptInput()
         let promptTokens: [Int32]
@@ -625,7 +640,6 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             minP != nil ? "--min-p" : nil,
             repetitionPenalty != nil ? "--repetition-penalty" : nil,
             repetitionPenaltyWindow != nil ? "--repetition-penalty-window" : nil,
-            stopTokens.isEmpty ? nil : "--stop-tokens",
             synchronousSampling ? "--synchronous-sampling" : nil,
             saveLogits != nil ? "--save-logits" : nil,
             printLogits ? "--print-logits" : nil,

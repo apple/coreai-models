@@ -83,8 +83,30 @@ package enum SpeculativeDecodingOptions {
     package static func ignoredWarning(ignored: [String]) -> String? {
         guard !ignored.isEmpty else { return nil }
         return "Warning: speculative decoding ignores \(ignored.joined(separator: ", ")). "
-            + "Generation stops only at the tokenizer's end-of-sequence tokens and samples with "
-            + "--temperature alone."
+            + "Generation stops at the tokenizer's end-of-sequence tokens and at single-token "
+            + "--stop-tokens, and samples with --temperature alone."
+    }
+
+    /// Splits encoded `--stop-tokens` into the ids of those that encode to one token, which
+    /// speculative decoding stops at, and the strings of those that encode to more, which it does
+    /// not: a block can accept a sequence's first tokens before the stop is recognizable, so
+    /// stopping on a sequence would need the decoder to hold back accepted tokens.
+    package static func stopTokens(
+        _ encoded: [(text: String, tokens: [Int32])]
+    ) -> (ids: Set<Int32>, multiToken: [String]) {
+        var ids = Set<Int32>()
+        var multiToken: [String] = []
+        for (text, tokens) in encoded {
+            if tokens.count == 1 { ids.insert(tokens[0]) } else { multiToken.append(text) }
+        }
+        return (ids, multiToken)
+    }
+
+    /// A warning naming the `--stop-tokens` speculative decoding does not stop at, or `nil`.
+    package static func multiTokenStopWarning(_ multiToken: [String]) -> String? {
+        guard !multiToken.isEmpty else { return nil }
+        return "Warning: speculative decoding stops only at --stop-tokens that encode to a single "
+            + "token; ignoring \(multiToken.map { "'\($0)'" }.joined(separator: ", "))."
     }
 
     /// Raw tokens carry no text to place around the image, so they cannot be combined with it.

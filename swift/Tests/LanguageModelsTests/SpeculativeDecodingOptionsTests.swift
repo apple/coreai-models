@@ -82,4 +82,22 @@ struct SpeculativeDecodingOptionsTests {
         #expect(SpeculativeDecodingOptions.grammarProposalProblem(7, speculating: false, hasSchema: true) != nil)
         #expect(SpeculativeDecodingOptions.grammarProposalProblem(7, speculating: true, hasSchema: false) != nil)
     }
+
+    @Test("Single-token stop strings become stop ids, and the others are named, in order")
+    func stopTokenSplit() {
+        let split = SpeculativeDecodingOptions.stopTokens([
+            (text: "<end>", tokens: [7]), (text: "two words", tokens: [3, 4]), (text: ".", tokens: [9]),
+            (text: "three tok ens", tokens: [1, 2, 3]),
+        ])
+        #expect(split.ids == [7, 9])
+        #expect(split.multiToken == ["two words", "three tok ens"])
+        #expect(SpeculativeDecodingOptions.stopTokens([]).ids.isEmpty)
+    }
+
+    @Test("Multi-token stop strings are named in one warning, and nothing is said when there are none")
+    func multiTokenStopWarning() throws {
+        #expect(SpeculativeDecodingOptions.multiTokenStopWarning([]) == nil)
+        let warning = try #require(SpeculativeDecodingOptions.multiTokenStopWarning(["two words", "a b"]))
+        #expect(warning.contains("'two words', 'a b'") && warning.contains("single token"))
+    }
 }

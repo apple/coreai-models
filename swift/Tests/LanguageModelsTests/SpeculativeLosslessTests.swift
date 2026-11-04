@@ -124,4 +124,46 @@ struct SpeculativeLosslessTests {
         }
         #expect(failures.isEmpty, Comment(rawValue: failures.joined(separator: "\n")))
     }
+
+    @Test("A stop token inside an accepted block ends the run at that token, as plain decoding does")
+    func stopInsideAcceptedBlock() async throws {
+        let model = HashModel(vocab: 32, levels: 1000, salt: 11)
+        let prompt: [Int32] = [1, 2, 3]
+        let unstopped = plainGreedy(model: model, prompt: prompt, maxNew: 40, stops: [])
+        // A token the run reaches past its first position, so a block can accept tokens around it.
+        let stop = try #require(unstopped.dropFirst(3).first { !unstopped.prefix(3).contains($0) })
+        let expected = plainGreedy(model: model, prompt: prompt, maxNew: 40, stops: [stop])
+        #expect(expected.last == stop && expected.count < unstopped.count)
+
+        // An exact drafter proposes the true continuation, so the stop lands inside an accepted block.
+        let decoder = SpeculativeDecoder(
+            drafter: ExactDrafter(model: model), target: HashEngine(model: model), numDraftTokens: 6)
+        var emitted: [Int32] = []
+        _ = try await decoder.generateGreedy(
+            promptTokens: prompt, maxNewTokens: 40, stopTokenIds: [stop], onToken: { emitted.append($0) })
+        #expect(emitted == expected)
+    }
+}
+
+/// Proposes the model's own greedy continuation, so every draft is accepted.
+private final class ExactDrafter: DrafterEngine, @unchecked Sendable {
+    let model: HashModel
+    let maxContextLength = 100_000
+    init(model: HashModel) { self.model = model }
+    func reset(to tokenIndex: Int) async throws {}
+    func commit(confirmedLength: Int, features: DrafterFeatures?) async throws {}
+    func draftAll(
+        confirmedPrefix: [Int32], count: Int, policy: VerificationPolicy,
+        using generator: inout some RandomNumberGenerator
+    ) async throws -> DraftProposal {
+        var h: UInt64 = 0
+        for t in confirmedPrefix { h = model.step(h, t) }
+        var tokens: [Int32] = []
+        for _ in 0..<count {
+            let t = firstMax(model.row(h))
+            tokens.append(t)
+            h = model.step(h, t)
+        }
+        return DraftProposal(tokens: tokens)
+    }
 }
