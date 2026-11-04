@@ -63,12 +63,6 @@ enum SequentialIterator {
         case .wholeBatch:
             let allLogits = try await batch(tokens)
             return lastTokenLogits(from: allLogits, vocabSize: vocabSize)
-        case .oneAtATime:
-            var lastLogits: [LogitsScalarType] = []
-            for j in tokens.indices {
-                lastLogits = try await batch(tokens[j...j])
-            }
-            return lastLogits
         }
     }
 }
