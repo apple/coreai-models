@@ -56,7 +56,7 @@ The lengths `{L}` differ by platform; read the function names from `embedding.co
 
 ## Using the bundle
 
-No Swift loader for embedding bundles exists yet; it lands in a separate PR. A host runs a bundle as follows:
+A host runs a bundle as follows:
 
 - **Text:** tokenize `prompts[name] + text` with the bundled tokenizer, which adds `<bos>` and `<eos>`. Right-pad with `pad_token_id` to the smallest function that fits the batch and the token count, with `attention_mask` 1 on real tokens.
 - **Documents with a title:** use `document_template` instead of `prompts.document`, replacing `{title}` and `{text}` literally.

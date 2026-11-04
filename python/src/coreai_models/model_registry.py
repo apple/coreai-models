@@ -605,7 +605,7 @@ DIFFUSION_PRESETS: list[ModelPreset] = [
 ]
 
 # ---------------------------------------------------------------------------
-# Utility model presets (standalone export scripts)
+# Utility model presets (export_script: a models/<name>/export.py script or a console script)
 # ---------------------------------------------------------------------------
 
 UTILITY_PRESETS: list[UtilityModel] = [

@@ -86,7 +86,7 @@ def test_embedding_cli_passes_the_flag_to_the_export(tmp_path, monkeypatch) -> N
     """Covers the wiring in ``main``, not just the parser."""
     seen = {}
     monkeypatch.setattr(
-        embedding_export, "export_embedding_bundle", lambda family, out, **kw: seen.update(kw)
+        embedding_export, "export_embedding_bundle", lambda exporter, out, **kw: seen.update(kw)
     )
     argv = ["embeddinggemma-2", "--output-dir", str(tmp_path)]
     for extra, expected in (([], False), (["--include-debug-info"], True)):
