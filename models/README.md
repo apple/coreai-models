@@ -196,7 +196,7 @@ swift run -c release llm-runner --model path/to/target_folder \
   --draft-model path/to/draft_folder --temperature 0.7 --seed 1234 --prompt "..."
 ```
 
-Run `llm-runner --help` for the options that tune speculation, such as the number of draft tokens per step. Options that cannot be combined with speculation, or that it does not apply, are reported when the run starts. Generation stops at the tokenizer's end-of-sequence tokens.
+Run `llm-runner --help` for the options that tune speculation, such as the number of draft tokens per step. Options that cannot be combined with speculation, or that it does not apply, are reported when the run starts. Generation stops at the tokenizer's end-of-sequence tokens and at each `--stop-tokens` string that encodes to a single token; one that encodes to several tokens is named in a warning and not applied.
 
 The run summary reports how many proposed tokens the target accepted (`draft accepted`), the tokens committed per target pass (`tokens / target pass`, above 1 when the target ran fewer passes than tokens produced), and the speed of the generation loop alone (`generation-only`, to compare with the `Generation:` line of a plain run). Acceptance depends on the workload, so measure on prompts like yours.
 
