@@ -228,10 +228,6 @@ package final class SpeculativeDecoder: @unchecked Sendable {
                 throw InferenceRuntimeError.invalidArgument(
                     "speculative sampling needs a positive finite temperature (got \(temperature))")
             }
-            guard promptLookup == nil else {
-                throw InferenceRuntimeError.invalidArgument(
-                    "prompt lookup supplies no draft distribution, so it supports greedy decoding only")
-            }
         }
         guard maxNewTokens > 0, !promptTokens.isEmpty else { return stats }
 
@@ -486,13 +482,14 @@ package final class SpeculativeDecoder: @unchecked Sendable {
         proposal: DraftProposal, targetLogits: [[LogitsScalarType]],
         temperature: Double, rng: inout some RandomNumberGenerator
     ) throws -> (path: [Int], next: Int32) {
-        // An empty proposal (no draft fits, as at the end of the context) needs no draft logits: the
-        // round only samples the target's next token.
-        let draftLogits = proposal.logits ?? []
-        guard draftLogits.count >= proposal.tokens.count else {
+        // A proposal without draft logits (prompt lookup, a draft head) is a deterministic guess: a
+        // draw from a distribution with all its mass on the proposed token. The rule below then
+        // accepts the token with the target's probability for it, and on rejection samples the target
+        // with that token removed, so the output still follows the target's distribution.
+        let draftLogits = proposal.logits
+        if let draftLogits, draftLogits.count < proposal.tokens.count {
             throw InferenceRuntimeError.invalidState(
-                "Speculative sampling needs per-candidate draft logits; prompt lookup and drafters "
-                    + "that return none support greedy decoding only.")
+                "the drafter returned \(draftLogits.count) draft logit rows for \(proposal.tokens.count) tokens")
         }
         try Self.requireRows(targetLogits.count, for: proposal)
 
@@ -501,8 +498,13 @@ package final class SpeculativeDecoder: @unchecked Sendable {
         var haveNext = false
         while accepted < proposal.tokens.count {
             let p = SpeculativeMath.temperatureSoftmax(targetLogits[accepted], temperature: temperature)
-            let q = SpeculativeMath.temperatureSoftmax(draftLogits[accepted], temperature: temperature)
             let x = Int(proposal.tokens[accepted])
+            let q: [Float]
+            if let draftLogits {
+                q = SpeculativeMath.temperatureSoftmax(draftLogits[accepted], temperature: temperature)
+            } else {
+                q = SpeculativeMath.pointMass(at: x, count: p.count)
+            }
             guard x >= 0, x < p.count, x < q.count else {
                 throw InferenceRuntimeError.invalidState(
                     "draft token \(x) is outside the vocabulary (target \(p.count), draft \(q.count))")

@@ -59,6 +59,15 @@ enum SpeculativeMath {
         return Int32(ReferenceSampler.multinomialSample(probs, using: &rng))
     }
 
+    /// A distribution of `count` entries with all its mass on `index`; empty when `index` is outside
+    /// it, so a caller's range check reports the bad token.
+    static func pointMass(at index: Int, count: Int) -> [Float] {
+        guard index >= 0, index < count else { return [] }
+        var probs = [Float](repeating: 0, count: count)
+        probs[index] = 1
+        return probs
+    }
+
     /// Sample from the normalized residual `norm(relu(p − q))` used on rejection.
     static func sampleResidual(
         p: [Float], q: [Float], using rng: inout some RandomNumberGenerator
