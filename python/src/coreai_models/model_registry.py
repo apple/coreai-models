@@ -611,6 +611,13 @@ DIFFUSION_PRESETS: list[ModelPreset] = [
 UTILITY_PRESETS: list[UtilityModel] = [
     # --- Embedding ---
     UtilityModel(
+        "embeddinggemma-2",
+        "google/embeddinggemma-2",
+        "embeddinggemma",
+        "embedding",
+        "coreai.embedding.export",
+    ),
+    UtilityModel(
         "clip-vit-b32",
         "openai/clip-vit-base-patch32",
         "clip",
