@@ -29,12 +29,13 @@ import torch
 from huggingface_hub import snapshot_download
 
 from coreai_models._constants import DEFAULT_INCLUDE_DEBUG_INFO
+from coreai_models.converter import export_stateless
 from coreai_models.diffusion.components import (
     MultiFunctionComponentSpec,
     get_component_registry,
     quant_weight_owner,
 )
-from coreai_models.diffusion.gpu import export_multifunction, export_stateless
+from coreai_models.diffusion.gpu import export_multifunction
 from coreai_models.diffusion.models import get_pipeline_type, unknown_pipeline_type_error
 from coreai_models.diffusion.presets import PRESETS, list_presets
 from coreai_models.export.compression import is_compression_mode_graph, quantize_pytorch_model
