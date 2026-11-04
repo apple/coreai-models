@@ -55,8 +55,8 @@ from huggingface_hub import snapshot_download
 from safetensors import safe_open
 
 from coreai_models.models.base import (
-    _load_tensors_for_keys,
-    _resolve_safetensors_files,
+    load_tensors_for_keys,
+    resolve_safetensors_files,
 )
 
 # ---------------------------------------------------------------------------
@@ -721,7 +721,7 @@ class MuseGlimmerVisionModel(nn.Module):
         model = model.to(dtype=dtype)
 
         # --- 4. Load vision weights from safetensors ---
-        safetensors_files = _resolve_safetensors_files(model_dir)
+        safetensors_files = resolve_safetensors_files(model_dir)
 
         # Build key->file index for vision-only keys
         vision_key_to_file: dict[str, str] = {}
@@ -736,7 +736,7 @@ class MuseGlimmerVisionModel(nn.Module):
                         vision_key_to_file[key] = path
 
         # Load all vision tensors (~ 1.8B params, fits in RAM)
-        raw_sd = _load_tensors_for_keys(vision_key_to_file, dtype)
+        raw_sd = load_tensors_for_keys(vision_key_to_file, dtype)
 
         # --- 5. Remap keys to our module structure ---
         mapped_sd: dict[str, torch.Tensor] = {}
@@ -759,7 +759,7 @@ class MuseGlimmerVisionModel(nn.Module):
         # _rope_inv_freq is non-persistent, not in the checkpoint
         model.load_state_dict(mapped_sd, strict=False, assign=True)
 
-        # _load_tensors_for_keys skips casting for "embedding_table" keys,
+        # load_tensors_for_keys skips casting for "embedding_table" keys,
         # so force everything to the target dtype now.
         model = model.to(dtype=dtype)
 
