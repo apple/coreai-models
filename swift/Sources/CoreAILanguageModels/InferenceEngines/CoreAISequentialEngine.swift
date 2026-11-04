@@ -220,7 +220,11 @@ public final class CoreAISequentialEngine: MultimodalInferenceEngine, Idempotent
         if let vision {
             // Vision-language decoder: token embeddings in, from `embed_tokens` plus the image
             // scatter-merge in the input handler.
-            // TODO: Reject or support decoders with an engine-managed sliding ring; this path has no ring handling.
+            // TODO: Support engine-managed sliding rings (compact position_ids, ring-bounded image prefill).
+            guard stateHandlers.slidingRingCapacity == nil else {
+                throw InferenceRuntimeError.invalidArgument(
+                    "Vision-language decoders with an engine-managed sliding-window cache are not supported")
+            }
             let names = try InputLayout.resolveEmbeddingsInputs(inputNames: descriptor.inputNames)
             self.logitsName = InputLayout.resolveLogitsName(from: descriptor.outputNames)
 
@@ -918,7 +922,6 @@ public final class CoreAISequentialEngine: MultimodalInferenceEngine, Idempotent
 
         CLILogger.log("VLM prefill: \(tokens.count) tokens")
 
-        // TODO: Split the image prefill into ring-bounded steps for sliding-ring decoders.
         return try await processTokenBatch(
             tokens, logits: .lastPosition, imageEmbeddings: embeddedInput.embeddings, sessionState: sessionState)
     }
