@@ -60,6 +60,10 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     public var vocabSize: Int { config.vocabSize }
 
     public let config: ModelConfig
+
+    /// Sampling behavior of the decode loop: the export's final-logit soft cap, applied on the
+    /// CPU, and sampling configurations used as given.
+    let samplingPolicy: SamplingPolicy
     private let model: AIModel
 
     // MARK: Properties
@@ -138,6 +142,8 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         visionConfig: VisionConfig? = nil
     ) async throws {
         self.config = configuration
+        self.samplingPolicy = SamplingPolicy(
+            logitSoftcap: configuration.overrides?.finalLogitSoftcapping, normalizesSampling: false)
         self.model = preparedModel.model
         self.functions = [:]
         self.visionModel = visionModel
@@ -562,6 +568,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
 
     // MARK: - Inference
 
+    @available(*, deprecated, message: "Use generate(with:samplingConfiguration:inferenceOptions:).")
     public func inference(
         inputTokens: [Int32], samplingConfig: SamplingConfiguration, returnsLogits: Bool,
         generationStartOffset: Int = 0, step: Int = 0
@@ -1250,17 +1257,7 @@ extension StaticShapeEngine.GenerationSequence {
         public typealias Failure = Error
 
         private let engine: StaticShapeEngine
-        private let samplingConfiguration: SamplingConfiguration
-        private let returnsLogits: Bool
-        private let forcedContinuation: [StaticShapeEngine.TokenId]?
-        private let maxTokens: Int
-        private let stopReasonStore: StopReasonStore
-        private let generationToken: GenerationToken
-
-        private var inputTokens: [StaticShapeEngine.TokenId]
-        private let generationStartOffset: Int
-        private var step: Int = 0
-        private var finished: Bool = false
+        private var loop: DecodeLoop
 
         init(
             engine: StaticShapeEngine,
@@ -1271,88 +1268,27 @@ extension StaticShapeEngine.GenerationSequence {
             generationToken: GenerationToken
         ) {
             self.engine = engine
-            self.samplingConfiguration = samplingConfiguration
-            self.returnsLogits = inferenceOptions.returnsLogits
-            self.forcedContinuation = inferenceOptions.forcedContinuation
-            self.stopReasonStore = stopReasonStore
-            self.generationToken = generationToken
-            self.inputTokens = input
-            self.generationStartOffset = input.count
-            if let forced = inferenceOptions.forcedContinuation {
-                self.maxTokens = forced.count
-            } else {
-                self.maxTokens = Swift.min(
-                    inferenceOptions.maxTokens ?? Int.max,
-                    Swift.max(0, engine.config.maxContextLength - input.count)
-                )
-            }
+            self.loop = DecodeLoop(
+                input: input,
+                samplingConfiguration: samplingConfiguration,
+                samplingPolicy: engine.samplingPolicy,
+                inferenceOptions: inferenceOptions,
+                maxContextLength: engine.config.maxContextLength,
+                stopReasonStore: stopReasonStore,
+                generationToken: generationToken,
+                release: { [engine] in engine.clearTokenIfActive(generationToken) }
+            )
         }
 
         public mutating func next() async throws -> InferenceOutput? {
-            if finished { return nil }
-
-            if generationToken.isCancelled {
-                stopReasonStore.set(.cancelled)
-                finishAndRelease()
-                return nil
-            }
-
-            guard step < maxTokens else {
-                // Natural exhaustion. Don't clobber a reason a decoder set (e.g. `.eos`).
-                stopReasonStore.setIfUnset(.maxTokens)
-                finishAndRelease()
-                return nil
-            }
-
-            do {
-                try Task.checkCancellation()
-
+            guard loop.shouldContinue() else { return nil }
+            let engine = self.engine
+            return try await loop.decodeStep { inputTokens in
                 let oldProcessedCount = engine.processedTokenCount
-
-                // When forced, we still need the forward pass (for logits + KV cache update)
-                // but skip the sampler — the next token is predetermined.
-                let (logits, sampledToken) = try await engine.inference(
-                    inputTokens: inputTokens,
-                    samplingConfig: samplingConfiguration,
-                    returnsLogits: returnsLogits || forcedContinuation != nil,
-                    generationStartOffset: generationStartOffset,
-                    step: step
-                )
-
-                // Update history with newly processed tokens
-                let processedSlice = inputTokens[oldProcessedCount..<engine.processedTokenCount]
-                engine.history.append(contentsOf: processedSlice)
-
-                // Check cancellation after inference step
-                if generationToken.isCancelled {
-                    stopReasonStore.set(.cancelled)
-                    finishAndRelease()
-                    return nil
-                }
-
-                let nextToken = forcedContinuation?[step] ?? sampledToken
-                inputTokens.append(nextToken)
-                step += 1
-
-                return InferenceOutput(
-                    tokenId: nextToken,
-                    logits: returnsLogits ? logits : nil
-                )
-            } catch is CancellationError {
-                stopReasonStore.set(.cancelled)
-                finishAndRelease()
-                throw CancellationError()
-            } catch {
-                stopReasonStore.set(.error)
-                finishAndRelease()
-                throw error
+                let logits = try await engine.forwardLastLogits(inputTokens: inputTokens)
+                engine.history.append(contentsOf: inputTokens[oldProcessedCount..<engine.processedTokenCount])
+                return logits
             }
-        }
-
-        private mutating func finishAndRelease() {
-            guard !finished else { return }
-            finished = true
-            engine.clearTokenIfActive(generationToken)
         }
     }
 }
