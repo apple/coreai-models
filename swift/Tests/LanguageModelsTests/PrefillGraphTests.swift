@@ -177,6 +177,22 @@ struct PrefillGraphTests {
 
     // MARK: - Falling back to `main` when there is no prefill graph
 
+    @Test("A one-token chunk runs on main, every wider chunk on the prefill graph")
+    func oneTokenChunkRunsOnMain() {
+        #expect(!chunkRunsOnPrefillGraph(queryLength: 1))
+        #expect(chunkRunsOnPrefillGraph(queryLength: 2))
+        #expect(chunkRunsOnPrefillGraph(queryLength: 4096))
+    }
+
+    @Test("A plan's last chunk can be a single token, past position 0")
+    func planCanEndInOneTokenChunk() {
+        // chunk + 2 tokens: one full chunk, one token, and the held-back token for `main`.
+        let held = prefillHeldBackTokens(hasPrefillGraph: true)
+        #expect(prefillChunkSizes(tokenCount: 4098, chunkSize: 4096, heldBack: held) == [4096, 1])
+        // A next prompt that adds one token to what was generated: the pending token and the new one.
+        #expect(prefillChunkSizes(tokenCount: 2, chunkSize: 4096, heldBack: held, startOffset: 349) == [1])
+    }
+
     @Test("Without a prefill graph, nothing is held back")
     func nothingHeldBackWithoutPrefillGraph() {
         // `main` serves prefill itself, so its trailing chunk carries the logits and no

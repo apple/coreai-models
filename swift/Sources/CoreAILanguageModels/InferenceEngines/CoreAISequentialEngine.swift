@@ -835,7 +835,7 @@ public final class CoreAISequentialEngine: MultimodalInferenceEngine, Idempotent
         ) { chunk, isHeldBack in
             // Held-back tail (and every chunk when there is no prefill graph) runs through
             // `main` for logits; earlier chunks fill the KV cache via the prefill graph.
-            if !isHeldBack, let prefillFn = self.prefillFunction {
+            if !isHeldBack, chunkRunsOnPrefillGraph(queryLength: chunk.count), let prefillFn = self.prefillFunction {
                 try await self.encodePrefillChunk(chunk, using: prefillFn, sessionState: sessionState)
                 return []
             }
