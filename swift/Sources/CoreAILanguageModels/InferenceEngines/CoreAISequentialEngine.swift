@@ -1004,18 +1004,6 @@ public final class CoreAISequentialEngine: MultimodalInferenceEngine, Idempotent
 
     // MARK: - Lifecycle
 
-    /// Wait for any in-flight generate() Task to finish.
-    private func drain() {
-        var attempts = 0
-        while session.tokenBox.isBusy {
-            attempts += 1
-            if attempts > 5000 {
-                fatalError("Sequential engine drain() timeout — generation Task stuck?")
-            }
-            Thread.sleep(forTimeInterval: 0.001)
-        }
-    }
-
     public func cancel() async throws {
         session.tokenBox.cancelActive()
     }
@@ -1056,6 +1044,7 @@ public final class CoreAISequentialEngine: MultimodalInferenceEngine, Idempotent
         resetSpan.end()
     }
 
+    @available(*, deprecated, message: "No-op: the engine holds nothing that needs cleanup.")
     public func cleanup() {
         let cleanupSpan = InstrumentsProfiler.beginCleanup(engine: "CoreAIClean")
         CLILogger.log("CoreAI clean engine cleanup complete")
