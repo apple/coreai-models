@@ -334,7 +334,10 @@ def warn_on_oversized_gather_tables(model: torch.nn.Module) -> None:
 
 
 def build_model(
-    resolved: ResolvedModel, temp_dir: str | None = None, export_backend: object | None = None
+    resolved: ResolvedModel,
+    temp_dir: str | None = None,
+    export_backend: object | None = None,
+    device: str | torch.device | None = None,
 ) -> BuiltModel:
     """Load ``resolved``'s weights and apply its compression.
 
@@ -343,6 +346,8 @@ def build_model(
             them in RAM.
         export_backend: The backend coreai-opt finalizes quantized or palettized weights for.
             None is Core AI.
+        device: Device for graph-mode quantization. The exported graph bakes in its device.
+            None keeps the model on CPU.
     """
     config, entry, model_class = resolved.config, resolved.entry, resolved.model_class
     hf_config, target_dtype = resolved.hf_config, resolved.target_dtype
@@ -429,7 +434,10 @@ def build_model(
             quantizer_mmap_dir = os.path.join(temp_dir, "quantized")
             os.makedirs(quantizer_mmap_dir, exist_ok=True)
 
-        if graph_mode and export_backend is None:
+        if graph_mode and device is not None:
+            model = model.to(device)
+
+        if graph_mode:
             patch_model_for_externalization(model)
             # externalization patches live on the eager module's composite op
             # submodules but quantize_for_export in graph-mode below returns a

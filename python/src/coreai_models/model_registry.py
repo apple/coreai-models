@@ -605,24 +605,31 @@ DIFFUSION_PRESETS: list[ModelPreset] = [
 ]
 
 # ---------------------------------------------------------------------------
-# Utility model presets (standalone export scripts)
+# Utility model presets (export_script: a models/<name>/export.py script or a console script)
 # ---------------------------------------------------------------------------
 
 UTILITY_PRESETS: list[UtilityModel] = [
     # --- Embedding ---
     UtilityModel(
+        "embeddinggemma-2",
+        "google/embeddinggemma-2",
+        "embeddinggemma",
+        "embedding",
+        "coreai.embedding.export",
+    ),
+    UtilityModel(
         "clip-vit-b32",
         "openai/clip-vit-base-patch32",
         "clip",
         "embedding",
-        "models/clip/export.py",
+        "coreai.embedding.export",
     ),
     UtilityModel(
         "clap-htsat",
         "laion/clap-htsat-unfused",
         "clap",
         "embedding",
-        "models/clap/export.py",
+        "coreai.embedding.export",
     ),
     # --- ASR ---
     UtilityModel(
@@ -1021,9 +1028,17 @@ def _format_diffusion_header() -> str:
     return f"{'SHORT_NAME':32s} {'COMPRESSION':18s} HF_ID"
 
 
-def _utility_to_export_args(model: UtilityModel) -> list[str]:
-    """Build the shell command to export a utility model."""
-    return ["uv", "run", model.export_script, "--model", model.hf_id]
+def _utility_to_export_args(model: UtilityModel, platform: str | None = None) -> list[str]:
+    """Build the shell command to export a utility model.
+
+    Scripts (``*.py``) take ``--model <hf_id>``; console scripts take the short name and
+    ``--platform iOS`` when targeting iOS.
+    """
+    if model.export_script.endswith(".py"):
+        return ["uv", "run", model.export_script, "--model", model.hf_id]
+    return ["uv", "run", model.export_script, model.short_name] + (
+        ["--platform", "iOS"] if platform == "iOS" else []
+    )
 
 
 def _format_utility_row(u: UtilityModel) -> str:
@@ -1328,7 +1343,7 @@ def _action_utility_model_info(args: argparse.Namespace) -> None:
         sys.stderr.write(f"Error: model {args.model_info!r} has no --platform {args.platform!r}\n")
         sys.exit(1)
     if args.format == "export-args":
-        print(" ".join(_utility_to_export_args(model)))
+        print(" ".join(_utility_to_export_args(model, args.platform)))
     elif args.format == "json":
         print(json.dumps(asdict(model), indent=2))
     elif args.format == "tsv":

@@ -83,8 +83,31 @@ package enum SpeculativeDecodingOptions {
     package static func ignoredWarning(ignored: [String]) -> String? {
         guard !ignored.isEmpty else { return nil }
         return "Warning: speculative decoding ignores \(ignored.joined(separator: ", ")). "
-            + "Generation stops only at the tokenizer's end-of-sequence tokens and samples with "
-            + "--temperature alone."
+            + "Generation stops at the tokenizer's end-of-sequence tokens and at single-token "
+            + "--stop-tokens, and samples with --temperature alone."
+    }
+
+    /// The stops speculative decoding ends a run at, from the stops a plain run uses: the
+    /// single-token ones. The others are `ignored`: a verify block can accept the first tokens of a
+    /// sequence before the stop is recognizable, so stopping on a sequence would need the decoder to
+    /// hold back accepted tokens that might begin one. None of a sequence's tokens joins the stop set,
+    /// so a run never stops on part of one.
+    package static func stopTokenIds(_ stops: StopSequences) -> (ids: Set<Int32>, ignored: [[Int32]]) {
+        let ids = Set(stops.sequences.filter { $0.count == 1 }.map { $0[0] })
+        let ignored = stops.sequences.filter { $0.count > 1 }
+        return (ids, ignored)
+    }
+
+    /// A warning naming the `--stop-tokens` speculative decoding does not stop at, or `nil`.
+    /// Each is named once, in the order given.
+    package static func multiTokenStopWarning(_ names: [String]) -> String? {
+        var multiToken: [String] = []
+        for name in names where !multiToken.contains(name) {
+            multiToken.append(name)
+        }
+        guard !multiToken.isEmpty else { return nil }
+        return "Warning: speculative decoding stops only at --stop-tokens that encode to a single "
+            + "token; ignoring \(multiToken.map({ "'\($0)'" }).joined(separator: ", "))."
     }
 
     /// Raw tokens carry no text to place around the image, so they cannot be combined with it.

@@ -291,6 +291,13 @@ def quantize_for_export(
             "for single-graph (macOS) models; iOS uses palettization."
         )
     graph_inputs = reference_inputs[MAIN_GRAPH_NAME]
+    # torch.export bakes the device of the example inputs into the graph, so they must be
+    # on the model's device.
+    device = next(model.parameters()).device
+    graph_inputs = {
+        name: value.to(device) if isinstance(value, torch.Tensor) else value
+        for name, value in graph_inputs.items()
+    }
     keys = list(graph_inputs)
     if quantization_config.get("calibrate_activations") and keys[:2] != [
         "input_ids",

@@ -124,4 +124,40 @@ struct SpeculativeLosslessTests {
         }
         #expect(failures.isEmpty, Comment(rawValue: failures.joined(separator: "\n")))
     }
+
+    @Test("A stop token inside an accepted block ends the run at that token, as plain decoding does")
+    func stopInsideAcceptedBlock() async throws {
+        let model = HashModel(vocab: 32, levels: 1000, salt: 11)
+        let prompt: [Int32] = [1, 2, 3]
+        let unstopped = plainGreedy(model: model, prompt: prompt, maxNew: 40, stops: [])
+        // A token the run reaches past its first position, so a block can accept tokens around it.
+        let stop = try #require(unstopped.dropFirst(3).first { !unstopped.prefix(3).contains($0) })
+        let expected = plainGreedy(model: model, prompt: prompt, maxNew: 40, stops: [stop])
+        #expect(expected.last == stop && expected.count < unstopped.count)
+
+        // The target model drafting for itself proposes the true continuation, so the stop lands
+        // inside an accepted block.
+        let decoder = SpeculativeDecoder(
+            draft: HashEngine(model: model), target: HashEngine(model: model), numDraftTokens: 6)
+        var emitted: [Int32] = []
+        _ = try await decoder.generateGreedy(
+            promptTokens: prompt, maxNewTokens: 40, stopTokenIds: [stop], onToken: { emitted.append($0) })
+        #expect(emitted == expected)
+    }
+
+    @Test("A multi-token stop sequence does not end a run, not even at its first token")
+    func multiTokenStopIsIgnored() async throws {
+        let model = HashModel(vocab: 32, levels: 1000, salt: 11)
+        let prompt: [Int32] = [1, 2, 3]
+        let unstopped = plainGreedy(model: model, prompt: prompt, maxNew: 40, stops: [])
+        // A sequence the run really produces, past its start.
+        let sequence = Array(unstopped[4...5])
+        let stops = SpeculativeDecodingOptions.stopTokenIds(StopSequences(sequences: [sequence]))
+        let decoder = SpeculativeDecoder(
+            draft: HashEngine(model: model), target: HashEngine(model: model), numDraftTokens: 6)
+        var emitted: [Int32] = []
+        _ = try await decoder.generateGreedy(
+            promptTokens: prompt, maxNewTokens: 40, stopTokenIds: stops.ids, onToken: { emitted.append($0) })
+        #expect(emitted == unstopped)
+    }
 }
