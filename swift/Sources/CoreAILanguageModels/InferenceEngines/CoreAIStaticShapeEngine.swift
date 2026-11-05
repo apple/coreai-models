@@ -566,6 +566,30 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         inputTokens: [Int32], samplingConfig: SamplingConfiguration, returnsLogits: Bool,
         generationStartOffset: Int = 0, step: Int = 0
     ) async throws -> (logits: [LogitsScalarType]?, token: Int32) {
+        var logitBuffer = try await forwardLastLogits(inputTokens: inputTokens)
+
+        // Final-logit soft cap. The iOS export leaves `c · tanh(logits / c)` out of the
+        // graph (tanh is best run on the CPU rather than in the graph), so apply it here
+        // — to the returned logits, and through the sampling pipeline before the sampler, so
+        // parity dumps and the sampled token see the same capped values the reference
+        // implementation produces.
+        let softcap = config.overrides?.finalLogitSoftcapping
+        var actualLogits = returnsLogits ? logitBuffer : nil
+        if let softcap, actualLogits != nil {
+            LogitSoftcapProcessor.apply(to: &actualLogits!, cap: Float(softcap))
+        }
+        let sampleSpan = InstrumentsProfiler.beginSample(strategy: "cpu-fallback")
+        let nextToken = samplingConfig.fallbackSampler(
+            from: &logitBuffer, tokenHistory: inputTokens[generationStartOffset...], step: step,
+            logitSoftcap: softcap)
+        sampleSpan.end()
+        CLILogger.log("Token: \(nextToken), processed: \(processedTokenCount)")
+        return (logits: actualLogits, token: nextToken)
+    }
+
+    /// Runs the not-yet-processed tokens of `inputTokens` through the rung graphs, advancing
+    /// `processedTokenCount`, and returns the last position's raw logits (no soft cap).
+    func forwardLastLogits(inputTokens: [Int32]) async throws -> [LogitsScalarType] {
         CLILogger.log("Inference: \(inputTokens.count) tokens, processed: \(processedTokenCount)")
 
         let totalTokenCount = inputTokens.count
@@ -640,24 +664,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
             currentPosition = batchEndToken + 1
             processedTokenCount = currentPosition
         }
-
-        // Final-logit soft cap. The iOS export leaves `c · tanh(logits / c)` out of the
-        // graph (tanh is best run on the CPU rather than in the graph), so apply it here
-        // — to the returned logits, and through the sampling pipeline before the sampler, so
-        // parity dumps and the sampled token see the same capped values the reference
-        // implementation produces.
-        let softcap = config.overrides?.finalLogitSoftcapping
-        var actualLogits = returnsLogits ? logitBuffer : nil
-        if let softcap, actualLogits != nil {
-            LogitSoftcapProcessor.apply(to: &actualLogits!, cap: Float(softcap))
-        }
-        let sampleSpan = InstrumentsProfiler.beginSample(strategy: "cpu-fallback")
-        let nextToken = samplingConfig.fallbackSampler(
-            from: &logitBuffer, tokenHistory: inputTokens[generationStartOffset...], step: step,
-            logitSoftcap: softcap)
-        sampleSpan.end()
-        CLILogger.log("Token: \(nextToken), processed: \(processedTokenCount)")
-        return (logits: actualLogits, token: nextToken)
+        return logitBuffer
     }
 
     // MARK: - Speculative decoding support (per-position results for verification)
