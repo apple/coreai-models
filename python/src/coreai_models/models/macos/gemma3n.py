@@ -417,7 +417,13 @@ class Gemma3nModel(nn.Module):
     def _get_per_layer_inputs(
         self, input_ids: torch.Tensor, inputs_embeds: torch.Tensor
     ) -> torch.Tensor:
-        per_layer = self.embed_tokens_per_layer(input_ids) * self.per_layer_embed_scale
+        # The per-layer table is smaller than the vocab; like HF, ids past it map to 0.
+        ple_ids = torch.where(
+            input_ids < self.config.vocab_size_per_layer_input,
+            input_ids,
+            torch.zeros_like(input_ids),
+        )
+        per_layer = self.embed_tokens_per_layer(ple_ids) * self.per_layer_embed_scale
         pli_dim = self.config.hidden_size_per_layer_input
         per_layer = per_layer.reshape(
             *input_ids.shape, self.config.num_hidden_layers, pli_dim
