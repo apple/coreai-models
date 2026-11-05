@@ -32,6 +32,9 @@ from coreai_models._constants import EXTEND_FUNCTION_NAME  # noqa: E402
 from coreai_models.models.base import TraceSpec, _is_layer_key_beyond  # noqa: E402
 from coreai_models.models.ios.gemma4_text import (  # noqa: E402
     Gemma4ForCausalLMForiOS,
+    NativeLutQuantConv1x1,
+    NativeQuantConv1x1,
+    NativeQuantLinear,
     _compute_kv_layout,
     sliding_ring_size,
 )
@@ -460,3 +463,104 @@ def test_emit_hidden_states_adds_the_final_hidden_output():
     logits, hidden = forward()
     torch.testing.assert_close(logits, plain)
     assert hidden.shape == (1, q_len, cfg.hidden_size)
+
+
+# ---------------------------------------------------------------------------
+# Native quantization primitives (QAT "-qat-mobile-transformers" checkpoints).
+#
+# These exercise the CoreAI-native weight-holder modules directly with synthetic
+# data -- no real checkpoint or network needed, since the modules only care about
+# their own buffers.
+# ---------------------------------------------------------------------------
+
+
+def test_native_quant_conv1x1_matches_manual_dequant():
+    """Affine dequant (scale * quantized_data) matches a plain broadcasted multiply."""
+    torch.manual_seed(0)
+    out_c, in_c, nbits = 16, 8, 4
+    mod = NativeQuantConv1x1(in_c, out_c, nbits=nbits)
+    q = torch.randint(-8, 8, (out_c, in_c, 1, 1), dtype=torch.int8)
+    scale = torch.rand(out_c, 1, 1, 1, dtype=torch.float16) * 0.01
+    with torch.no_grad():
+        mod.quantized_data.copy_(q)
+        mod.scale.copy_(scale)
+    mod.eval()
+
+    x = torch.randn(1, in_c, 1, 4, dtype=torch.float16)
+    with torch.no_grad():
+        out = mod(x)
+
+    expected_weight = q.to(torch.float16) * scale
+    expected = torch.nn.functional.conv2d(x, expected_weight)
+    torch.testing.assert_close(out, expected)
+
+
+def test_native_lut_quant_conv1x1_matches_manual_lookup():
+    """LUT decode + scale matches a plain ``(index - bias) * scale`` lookup.
+
+    Also pins the meta-device bug: ``lut`` is a non-persistent buffer built under
+    ``model_device="meta"`` construction, so nothing rescues it via
+    ``load_state_dict`` afterward -- without the explicit ``with torch.device("cpu")``
+    fix, it silently stays uninitialized meta data forever (caught during
+    development via a large numeric mismatch, not a crash).
+    """
+    torch.manual_seed(0)
+    out_c, in_c, nbits = 16, 8, 2
+    mod = NativeLutQuantConv1x1(in_c, out_c, nbits=nbits)
+
+    assert mod.lut.device.type != "meta"
+    assert mod.lut.flatten().tolist() == [-2, -1, 0, 1]
+
+    indices = torch.randint(0, 2**nbits, (out_c, in_c, 1, 1), dtype=torch.uint8)
+    scale = torch.rand(out_c, 1, 1, 1, dtype=torch.float16) * 0.01
+    with torch.no_grad():
+        mod.indices.copy_(indices)
+        mod.scale.copy_(scale)
+    mod.eval()
+
+    x = torch.randn(1, in_c, 1, 4, dtype=torch.float16)
+    with torch.no_grad():
+        out = mod(x)
+
+    bias = 1 << (nbits - 1)
+    expected_weight = (indices.to(torch.int16) - bias).to(torch.float16) * scale
+    expected = torch.nn.functional.conv2d(x, expected_weight)
+    torch.testing.assert_close(out, expected)
+
+
+def test_native_quant_linear_blocking_matches_unblocked():
+    """Output-dimension-blocked ``NativeQuantLinear`` matches an unblocked one bit-exact.
+
+    Pins the sliced-shared-buffer bug: each block must own its own
+    ``quantized_data``/``scale`` buffers (a ``NativeQuantLinearBlock``), not a slice of
+    one shared buffer, or CoreAI's converter silently stops promoting them to genuine
+    packed sub-byte constants at export time. This test only covers the numeric
+    behavior (identical either way in eager mode); the packing regression itself needs
+    an export-time check.
+    """
+    torch.manual_seed(0)
+    out_f, in_f, nbits, block = 32, 8, 4, 8
+    q = torch.randint(-8, 8, (out_f, in_f), dtype=torch.int8)
+    scale = torch.rand(out_f, 1, dtype=torch.float16) * 0.01
+
+    blocked = NativeQuantLinear(in_f, out_f, nbits=nbits, block_size=block)
+    assert blocked.blocks is not None
+    assert len(blocked.blocks) == out_f // block
+    with torch.no_grad():
+        for i, blk in enumerate(blocked.blocks):
+            blk.quantized_data.copy_(q[i * block : (i + 1) * block])
+            blk.scale.copy_(scale[i * block : (i + 1) * block])
+
+    unblocked = NativeQuantLinear(in_f, out_f, nbits=nbits, block_size=None)
+    assert unblocked.blocks is None
+    with torch.no_grad():
+        unblocked.quantized_data.copy_(q)
+        unblocked.scale.copy_(scale)
+
+    blocked.eval()
+    unblocked.eval()
+    x = torch.randn(1, 4, 1, in_f, dtype=torch.float16)
+    with torch.no_grad():
+        out_blocked = blocked(x)
+        out_unblocked = unblocked(x)
+    torch.testing.assert_close(out_blocked, out_unblocked)
