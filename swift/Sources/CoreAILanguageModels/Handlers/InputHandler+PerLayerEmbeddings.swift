@@ -8,8 +8,16 @@
 import CoreAI
 import CoreAIShared
 
-/// Gathers INT8 Per-Layer Embedding rows from the ``PerLayerEmbeddings`` sidecar
-/// into the `ple_embeddings` graph input.
+/// Gathers Per-Layer Embedding rows into the `ple_embeddings` graph input.
+///
+/// Models with per-layer embeddings carry one row of `numLayers · perLayerDim` values
+/// per vocabulary token. That table is multiple gigabytes, so it is externalized into a
+/// sidecar artifact instead of baked into the graph (see ``PerLayerEmbeddings``); each
+/// step the runner copies (and, for native-quantized checkpoints, dequantizes) the rows
+/// for the current batch's tokens into the input. The legacy per-tensor INT8 format
+/// keeps the graph doing the dequantization (baked-in scale/zero-point); the
+/// native-quantized format dequantizes here in Swift and feeds the graph a plain float
+/// input instead -- see ``PerLayerEmbeddings`` for why.
 struct PerLayerEmbeddingsInputHandler: StaticInputHandler {
     static let inputName = "ple_embeddings"
 
@@ -46,20 +54,33 @@ struct PerLayerEmbeddingsInputHandler: StaticInputHandler {
         let span = InstrumentsProfiler.beginPLEGather()
         do {
             try buffers.withMutableBuffer(Self.inputName) { array in
-                let view = array.mutableView(as: Int8.self)
-                // The flat row-major gather assumes a contiguous buffer. The
-                // ple_embeddings input is exported without interleave so it is, but
-                // verify rather than silently write to wrong offsets.
-                guard view.isContiguous else {
-                    throw InferenceRuntimeError.invalidState(
-                        "ple_embeddings array has non-contiguous layout")
-                }
-                view.withUnsafeMutablePointer { ptr, _, _ in
-                    // Zero first: a partial final batch leaves the padding slots
-                    // holding the previous step's rows otherwise.
-                    ptr.update(repeating: 0, count: elementCount)
-                    let buffer = UnsafeMutableBufferPointer(start: ptr, count: elementCount)
-                    table.gather(tokenIDs: tokenIDs, batchSize: batchSize, into: buffer)
+                if table.isNativeQuantized {
+                    let view = array.mutableView(as: Float16.self)
+                    guard view.isContiguous else {
+                        throw InferenceRuntimeError.invalidState(
+                            "ple_embeddings array has non-contiguous layout")
+                    }
+                    view.withUnsafeMutablePointer { ptr, _, _ in
+                        ptr.update(repeating: 0, count: elementCount)
+                        let buffer = UnsafeMutableBufferPointer(start: ptr, count: elementCount)
+                        table.gather(tokenIDs: tokenIDs, batchSize: batchSize, into: buffer)
+                    }
+                } else {
+                    let view = array.mutableView(as: Int8.self)
+                    // The flat row-major gather assumes a contiguous buffer. The
+                    // ple_embeddings input is exported without interleave so it is, but
+                    // verify rather than silently write to wrong offsets.
+                    guard view.isContiguous else {
+                        throw InferenceRuntimeError.invalidState(
+                            "ple_embeddings array has non-contiguous layout")
+                    }
+                    view.withUnsafeMutablePointer { ptr, _, _ in
+                        // Zero first: a partial final batch leaves the padding slots
+                        // holding the previous step's rows otherwise.
+                        ptr.update(repeating: 0, count: elementCount)
+                        let buffer = UnsafeMutableBufferPointer(start: ptr, count: elementCount)
+                        table.gather(tokenIDs: tokenIDs, batchSize: batchSize, into: buffer)
+                    }
                 }
             }
         } catch {

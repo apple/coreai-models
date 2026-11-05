@@ -30,6 +30,11 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     private static let valueCacheName = "value_cache"
     private static let embeddingTableName = "embedding_table"
     private static let hiddenStatesOutputName = "hidden_states"
+    // Companion per-row scale for native-quantized (QAT) embedding tables -- present as
+    // a second `load_embeddings` output / `gather_embeddings` input only for those
+    // checkpoints (see `Gemma4NativeQuantLoadEmbeddings`/`Gemma4NativeQuantGatherEmbeddings`
+    // on the Python side). Absent otherwise.
+    private static let embeddingScaleName = "embedding_scale"
     private static let tokenIDsInputName = "in_new_token_ids"
     private static let gatheredOutputName = "out_transformer_input"
 
@@ -81,6 +86,8 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
 
     // Embedding table loaded once at init.
     private let embeddingTable: NDArray
+    // Its companion per-row scale, for native-quantized checkpoints only (nil otherwise).
+    private let embeddingScale: NDArray?
 
     // Largest query length across all extend functions — used as prefill threshold.
     private let maxQueryLength: Int
@@ -203,7 +210,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
 
         try Self.validateIOContract(descriptor: referenceDescriptor, contextBucket: largestContext)
 
-        self.embeddingTable = try await Self.loadEmbeddingTable(from: model)
+        (self.embeddingTable, self.embeddingScale) = try await Self.loadEmbeddingTable(from: model)
 
         // States: classified fixed vs per-bucket from the asset itself.
         self.states = try StaticStateFactory.makeStateSet(
@@ -405,7 +412,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         }
     }
 
-    private static func loadEmbeddingTable(from model: AIModel) async throws -> NDArray {
+    private static func loadEmbeddingTable(from model: AIModel) async throws -> (NDArray, NDArray?) {
         CLILogger.log("Loading embeddings...")
         guard let embeddingFunction = try model.loadFunction(named: "load_embeddings") else {
             throw InferenceRuntimeError.invalidState("Cannot load 'load_embeddings'")
@@ -418,6 +425,25 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         }
         var embeddingArray = NDArray(descriptor: embeddingDesc)
 
+        // `MutableViews` is lifetime-dependent on the arrays it borrows via `insert`, so
+        // it can't be built across a branch that force-unwraps an `NDArray?` inout (the
+        // borrow checker can't prove that stays within scope) -- hence the duplicated
+        // run/return below rather than a single conditional `insert`.
+        if case .ndArray(let scaleDesc) = embeddingFunction.descriptor.outputDescriptor(of: embeddingScaleName) {
+            var embeddingScaleArray = NDArray(descriptor: scaleDesc)
+            var outputViews = InferenceFunction.MutableViews()
+            outputViews.insert(&embeddingArray, for: embeddingTableName)
+            outputViews.insert(&embeddingScaleArray, for: embeddingScaleName)
+
+            _ = try await embeddingFunction.run(
+                inputs: [:],
+                outputViews: consume outputViews
+            )
+
+            CLILogger.log("Embeddings loaded: shape=\(embeddingArray.shape)")
+            return (embeddingArray, embeddingScaleArray)
+        }
+
         var outputViews = InferenceFunction.MutableViews()
         outputViews.insert(&embeddingArray, for: embeddingTableName)
 
@@ -427,7 +453,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         )
 
         CLILogger.log("Embeddings loaded: shape=\(embeddingArray.shape)")
-        return embeddingArray
+        return (embeddingArray, nil)
     }
 
     // MARK: - Function Loading (lazy)
@@ -1121,6 +1147,9 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
 
         var inputs: [String: NDArray] = [Self.tokenIDsInputName: tokenArray]
         inputs[Self.embeddingTableName] = embeddingTable
+        if let embeddingScale, desc.inputNames.contains(Self.embeddingScaleName) {
+            inputs[Self.embeddingScaleName] = embeddingScale
+        }
 
         var outputs = try await fn.run(
             inputs: inputs,
