@@ -17,6 +17,56 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
+## SDPA aborts at load when the value width differs from the query width
+
+**Cause**: `coreai_torch.composite_ops.SDPA` with q and k wider than v converts and runs on CPU. On the GPU and the Neural Engine the process aborts at load: `'mps_spi.sdpa' op failed: query and value must have matching inner dimension but have 192 and 128`.
+**Fix**: Zero-pad v to the q width and slice the output back to the v width. The output then matches PyTorch within 0.003 on both units.
+
+```python
+import asyncio
+import tempfile
+from pathlib import Path
+
+import numpy as np
+import torch
+from coreai.runtime import AIModel, ComputeUnitKind, NDArray, SpecializationOptions
+from coreai_models.export.macos import export_to_coreai
+from coreai_torch.composite_ops import SDPA
+from torch.nn.functional import pad
+
+
+class Attention(torch.nn.Module):
+    def __init__(self, padded):
+        super().__init__()
+        self.sdpa, self.padded = SDPA(scale=0.1), padded
+
+    def forward(self, q, k, v):
+        value = pad(v, (0, q.shape[-1] - v.shape[-1])) if self.padded else v
+        return self.sdpa(query=q, key=k, value=value)[..., : v.shape[-1]]
+
+
+async def call(path, feeds, unit):
+    options = SpecializationOptions.from_preferred_compute_unit_kind(unit)
+    model = await AIModel.load(path, specialization_options=options)
+    return (await model.load_function("main")(feeds))["y"].numpy()
+
+
+rng = np.random.default_rng(0)
+shapes = {"q": (1, 4, 8, 192), "k": (1, 4, 16, 192), "v": (1, 4, 16, 128)}
+arrays = {name: rng.normal(size=s).astype(np.float16) for name, s in shapes.items()}
+inputs = {name: torch.from_numpy(a) for name, a in arrays.items()}
+reference = Attention(False)(**{name: t.float() for name, t in inputs.items()}).numpy()
+names = {"input_names": tuple(shapes), "output_names": ("y",)}
+for padded in (True, False):  # padded=False aborts the process at load on the GPU.
+    path = Path(tempfile.mkdtemp()) / "m.aimodel"
+    export_to_coreai(Attention(padded).eval(), reference_inputs=inputs, **names).save_asset(path)
+    for unit in (ComputeUnitKind.gpu(), ComputeUnitKind.neural_engine()):
+        y = asyncio.run(call(path, {n: NDArray(a) for n, a in arrays.items()}, unit))
+        print(f"padded {padded}, {unit}: max error {np.abs(y - reference).max():.4f}")
+```
+
+______________________________________________________________________
+
 ## Input data type mismatch — "Data type int32 does not match"
 
 **Cause**: Input JSON descriptor uses wrong type specifier.
@@ -189,6 +239,136 @@ ______________________________________________________________________
 
 **Cause**: Asset was created with an older toolchain and uses an incompatible format.
 **Fix**: Re-export and save via `deployable.save_asset()`, then recompile with `coreai-build compile`.
+
+______________________________________________________________________
+
+## `.aimodelc` fails to load — `AIModelError error 0` or `error 1`
+
+**Cause**: `coreai-build compile --architecture` exits 0 for any known architecture, and the bundle loads only on that one. On an M4 Max, `h16c` loads, while `h16s` and `h17c` raise `error 0`. Swift names both sides: `incompatibleCompiledAssetArchitecture(device: "h16c", asset: ["h17c"])`. `cpu_only()` raises `error 1` on a bundle from any `--preferred-compute` value (Swift: `failedToSpecialize`).
+**Fix**: Compile for the device's architecture and load bundles with `SpecializationOptions.default()`. Use the `.aimodel` for CPU-only runs.
+
+```python
+import asyncio
+import subprocess
+import tempfile
+from pathlib import Path
+
+import torch
+from coreai.runtime import AIModel, SpecializationOptions
+from coreai_torch import TorchConverter, get_decomp_table
+from torch import nn
+
+x = torch.zeros(1, 64, 1, 64).half()
+ep = torch.export.export(nn.Conv2d(64, 64, 1).eval().half(), (x,))
+ep = ep.run_decompositions(get_decomp_table())
+out = Path(tempfile.mkdtemp())
+names = {"input_names": ["x"], "output_names": ["y"]}
+TorchConverter().add_exported_program(ep, **names).to_coreai().save_asset(out / "m.aimodel")
+
+
+async def load(bundle, options):
+    try:
+        await AIModel.load(bundle, specialization_options=options)
+        return "loaded"
+    except RuntimeError as error:
+        return str(error).split("(CoreAIDelegates.")[-1].strip(").")
+
+
+for arch in ("h16c", "h16s", "h17c"):
+    command = ["xcrun", "coreai-build", "compile", str(out / "m.aimodel")]
+    command += ["--preferred-compute", "gpu", "--architecture", arch, "--output", str(out)]
+    done = subprocess.run(command, capture_output=True)
+    bundle = out / f"m.{arch}.aimodelc"
+    result = asyncio.run(load(bundle, SpecializationOptions.default()))
+    print(f"{arch}: compile exit {done.returncode}, default(): {result}")
+result = asyncio.run(load(out / "m.h16c.aimodelc", SpecializationOptions.cpu_only()))
+print(f"h16c: cpu_only(): {result}")
+```
+
+______________________________________________________________________
+
+## `.aimodelc` is larger than the `.aimodel`
+
+**Cause**: An `.aimodel` stores a shared weight once and keeps per-block int8. A `--preferred-compute gpu` bundle stores the weight once per function. With static shapes it also expands per-block int8 to the float size. A dynamic dimension keeps the int8 size, and per-block int4 stays small.
+**Fix**: Size the download from the compiled bundle, not from the `.aimodel`.
+
+```python
+import subprocess
+import tempfile
+from pathlib import Path
+
+import torch
+from coreai_opt.coreai_utils import CompressionGranularity, DType, quantize_weights
+from coreai_opt.coreai_utils.common import QScheme
+from coreai_torch import TorchConverter, get_decomp_table
+from torch import nn
+
+
+def megabytes(path):
+    return round(sum(f.stat().st_size for f in path.rglob("*") if f.is_file()) / 1e6, 1)
+
+
+def sizes(label, functions=1, dtype=None, dynamic=None):
+    module, converter = nn.Linear(2048, 2048, bias=False).eval().half(), TorchConverter()
+    for index in range(functions):
+        ep = torch.export.export(module, (torch.zeros(1, 8 + index, 2048).half(),), dynamic_shapes=dynamic)
+        name = "main" if index == 0 else f"f{index}"
+        names = {"input_names": ["x"], "output_names": ["y"], "entrypoint_name": name}
+        converter.add_exported_program(ep.run_decompositions(get_decomp_table()), **names)
+    program = converter.to_coreai()
+    if dtype is not None:
+        block = {"granularity": CompressionGranularity.PER_BLOCK, "block_size": 32}
+        program = quantize_weights(program, dtype=dtype, qscheme=QScheme.SYMMETRIC, **block)
+    out = Path(tempfile.mkdtemp())
+    program.save_asset(out / "m.aimodel")
+    command = ["xcrun", "coreai-build", "compile", str(out / "m.aimodel"), "--preferred-compute", "gpu"]
+    subprocess.run(command + ["--architecture", "h16c", "--output", str(out)], check=True, capture_output=True)
+    print(f"{label}: .aimodel {megabytes(out / 'm.aimodel')} MB, bundle {megabytes(out / 'm.h16c.aimodelc')} MB")
+
+
+sizes("fp16, 1 function")
+sizes("fp16, 3 functions", functions=3)
+sizes("int8 per block, static", dtype=DType.INT8)
+sizes("int8 per block, dynamic", dtype=DType.INT8, dynamic=({1: torch.export.Dim("S", min=2, max=256)},))
+sizes("int4 per block, static", dtype=DType.INT4)
+```
+
+______________________________________________________________________
+
+## First load writes a compiled copy to `~/Library/Caches/coreai-cache`
+
+**Cause**: `AIModel.load` writes the specialized model to `coreai-cache/<OS build>/<app or process name>/<main.hash>/`, about the size of the weights, and leaves it there. Re-running an export script gets a new `main.hash`, even with the same weights, so a development loop adds one entry per run.
+**Fix**: Budget twice the model size for the first load. Delete old entries during development.
+
+```python
+import asyncio
+import tempfile
+from pathlib import Path
+
+import torch
+from coreai.runtime import AIModel, SpecializationOptions
+from coreai_torch import TorchConverter, get_decomp_table
+from torch import nn
+
+CACHE = Path.home() / "Library/Caches/coreai-cache"
+
+
+def megabytes(path):
+    return round(sum(f.stat().st_size for f in path.rglob("*") if f.is_file()) / 1e6, 1)
+
+
+x = torch.zeros(1, 8, 2048).half()
+ep = torch.export.export(nn.Linear(2048, 2048, bias=False).eval().half(), (x,))
+ep = ep.run_decompositions(get_decomp_table())
+asset = Path(tempfile.mkdtemp()) / "m.aimodel"
+names = {"input_names": ["x"], "output_names": ["y"]}
+TorchConverter().add_exported_program(ep, **names).to_coreai().save_asset(asset)
+options = SpecializationOptions.default()
+asyncio.run(AIModel.load(asset, specialization_options=options))
+entry = next(CACHE.rglob((asset / "main.hash").read_bytes().hex()))
+print(f".aimodel {megabytes(asset)} MB, cache entry {megabytes(entry)} MB")
+print("entry:", entry.relative_to(CACHE).parent, "/ <main.hash>")
+```
 
 ______________________________________________________________________
 
