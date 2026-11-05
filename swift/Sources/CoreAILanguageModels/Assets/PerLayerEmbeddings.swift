@@ -154,9 +154,11 @@ struct PerLayerEmbeddings: Sendable {
     /// `batchSize * rowWidth` float16 values laid out row-major, ready to feed `ple_embeddings`. For a
     /// native-quantized table only.
     ///
-    /// The packing is the checkpoint's own: `8 / nbits` values per byte, low-order bits first, stored
-    /// unsigned and shifted by `2^(nbits - 1)` to a signed range. A value times its block's scale is
-    /// the dequantized element.
+    /// The packing is the checkpoint's own: `8 / nbits` values per byte, low-order bits first. Each
+    /// value is stored as an unsigned field holding the signed value plus `2^(nbits - 1)` (offset
+    /// binary, not two's complement), so the stored bytes are unsigned and the decoded values are
+    /// signed; for 2 bits, fields 0...3 decode to -2...1. A value times its block's scale is the
+    /// dequantized element.
     ///
     /// Rows for token ids outside the table, and for padding slots beyond `tokenIDs.count`, are left
     /// as whatever `dest` already contains (callers pass a zeroed buffer).

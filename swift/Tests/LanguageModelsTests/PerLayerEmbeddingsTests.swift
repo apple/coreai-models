@@ -3,6 +3,7 @@
 // Use of this source code is governed by a BSD-3-clause license that can
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
+import CoreAI
 import Foundation
 import Testing
 
@@ -48,7 +49,7 @@ struct PerLayerEmbeddingsTests {
     }
 
     /// Packs signed values the way the checkpoint does: `8 / nbits` per byte, low-order bits first,
-    /// stored unsigned after adding `2^(nbits - 1)`.
+    /// each stored as an unsigned field holding the value plus `2^(nbits - 1)`.
     private func pack(_ rows: [[Int]], nbits: Int) -> [UInt8] {
         let perByte = 8 / nbits
         let bias = 1 << (nbits - 1)
@@ -150,6 +151,18 @@ struct PerLayerEmbeddingsTests {
         var out = [Float16](repeating: 0, count: 6)
         out.withUnsafeMutableBufferPointer { table.gather(tokenIDs: [0], batchSize: 1, into: $0) }
         #expect(out == rows[0].map { Float16($0) })
+    }
+
+    @Test("The input handler rejects a graph whose ple_embeddings type or width does not match the table")
+    func handlerValidatesInput() throws {
+        let native = try PerLayerEmbeddings(
+            contentsOf: try nativeTable(rows: [[1, -2, 0, 1]], scales: [[1]], nbits: 2))
+        func check(_ width: Int, _ type: NDArray.ScalarType) -> String {
+            message { try PerLayerEmbeddingsInputHandler.validate(table: native, rowWidth: width, scalarType: type) }
+        }
+        #expect(check(native.rowWidth, .float16).isEmpty)
+        #expect(check(native.rowWidth, .int8).contains("PLE type mismatch"))
+        #expect(check(native.rowWidth + 1, .float16).contains("PLE row width mismatch"))
     }
 
     @Test("Malformed tables are reported by name, never trapped on or read out of bounds")

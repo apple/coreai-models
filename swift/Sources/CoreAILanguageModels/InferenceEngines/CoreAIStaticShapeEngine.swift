@@ -30,10 +30,8 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     private static let valueCacheName = "value_cache"
     private static let embeddingTableName = "embedding_table"
     private static let hiddenStatesOutputName = "hidden_states"
-    // Companion per-row scale for native-quantized (QAT) embedding tables -- present as
-    // a second `load_embeddings` output / `gather_embeddings` input only for those
-    // checkpoints (see `Gemma4NativeQuantLoadEmbeddings`/`Gemma4NativeQuantGatherEmbeddings`
-    // on the Python side). Absent otherwise.
+    // Per-row scale of a native-quantized (QAT) embedding table: a second `load_embeddings`
+    // output and a third `gather_embeddings` input, present only for those models.
     private static let embeddingScaleName = "embedding_scale"
     private static let tokenIDsInputName = "in_new_token_ids"
     private static let gatheredOutputName = "out_transformer_input"

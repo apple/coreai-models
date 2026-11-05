@@ -27,13 +27,26 @@ struct PerLayerEmbeddingsInputHandler: StaticInputHandler {
     private let descriptors: BucketedInputDescriptors
 
     init(table: PerLayerEmbeddings, descriptors: BucketedInputDescriptors) throws {
-        for descriptor in descriptors.descriptors where descriptor.shape.last != table.rowWidth {
-            throw InferenceRuntimeError.invalidState(
-                "PLE row width mismatch: graph expects \(descriptor.shape.last ?? -1), "
-                    + "table has \(table.rowWidth)")
+        for descriptor in descriptors.descriptors {
+            try Self.validate(table: table, rowWidth: descriptor.shape.last, scalarType: descriptor.scalarType)
         }
         self.table = table
         self.descriptors = descriptors
+    }
+
+    /// Throws unless a graph input with this row width and scalar type can take the table's rows:
+    /// float16 for a native-quantized table, INT8 otherwise.
+    static func validate(table: PerLayerEmbeddings, rowWidth: Int?, scalarType: NDArray.ScalarType) throws {
+        guard rowWidth == table.rowWidth else {
+            throw InferenceRuntimeError.invalidState(
+                "PLE row width mismatch: graph expects \(rowWidth ?? -1), table has \(table.rowWidth)")
+        }
+        let expected: NDArray.ScalarType = table.isNativeQuantized ? .float16 : .int8
+        guard scalarType == expected else {
+            throw InferenceRuntimeError.invalidState(
+                "PLE type mismatch: graph expects \(scalarType), "
+                    + "\(table.isNativeQuantized ? "native-quantized" : "INT8") table needs \(expected)")
+        }
     }
 
     func registerBuffers(into buffers: inout InputBuffers) {
