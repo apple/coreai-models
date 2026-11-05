@@ -451,7 +451,9 @@ def _real_snapshot(model: str) -> Path:
     hf_id, revision = REAL[model]
     root = Path(os.environ.get("HF_HUB_CACHE", Path.home() / ".cache/huggingface/hub"))
     snapshot = root / f"models--{hf_id.replace('/', '--')}" / "snapshots" / revision
-    if not (snapshot / "pytorch_model.bin").exists():
+    # A snapshot cached by another loader can hold the weights without the processor config.
+    needed = ("config.json", "preprocessor_config.json", "pytorch_model.bin")
+    if not all((snapshot / name).exists() for name in needed):
         pytest.skip(f"{hf_id} is not in the HF cache")
     return snapshot
 
