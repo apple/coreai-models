@@ -249,3 +249,17 @@ def test_utility_platform_filter_excludes_macos_only() -> None:
     names = [u.short_name for u in ios_models]
     assert "depth-anything-3-small" not in names
     assert "clip-vit-b32" in names
+
+
+def test_embedding_export_args_use_the_console_script() -> None:
+    model = lookup_utility_model("embeddinggemma-2")
+    assert model is not None
+    assert _utility_to_export_args(model, "iOS") == [
+        "uv",
+        "run",
+        "coreai.embedding.export",
+        "embeddinggemma-2",
+        "--platform",
+        "iOS",
+    ]
+    assert _utility_to_export_args(model, "macOS")[-1] == "embeddinggemma-2"

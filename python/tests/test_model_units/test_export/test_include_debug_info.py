@@ -79,6 +79,21 @@ def test_llm_cli_resolves_the_flag_onto_the_export_config() -> None:
         assert config.include_debug_info is expected
 
 
+# --- coreai.embedding.export ------------------------------------------
+
+
+def test_embedding_cli_passes_the_flag_to_the_export(tmp_path, monkeypatch) -> None:
+    """Covers the wiring in ``main``, not just the parser."""
+    seen = {}
+    monkeypatch.setattr(
+        embedding_export, "export_embedding_bundle", lambda exporter, out, **kw: seen.update(kw)
+    )
+    argv = ["embeddinggemma-2", "--output-dir", str(tmp_path)]
+    for extra, expected in (([], False), (["--include-debug-info"], True)):
+        assert embedding_export.main(argv + extra) == 0
+        assert seen["include_debug_info"] is expected
+
+
 # --- standalone models/*/export.py recipes ----------------------------
 
 # ``models/sam3/export.py`` and ``models/sam3_video/export.py`` delegate to the

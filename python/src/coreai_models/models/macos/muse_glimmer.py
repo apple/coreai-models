@@ -46,8 +46,8 @@ from coreai_models._constants import (
 from coreai_models.models.base import (
     BaseForCausalLM,
     TraceSpec,
-    _load_tensors_for_keys,
-    _resolve_safetensors_files,
+    load_tensors_for_keys,
+    resolve_safetensors_files,
 )
 from coreai_models.primitives.macos.cache import (
     KVCache,
@@ -381,7 +381,7 @@ class MuseGlimmerForCausalLM(BaseForCausalLM):
         model = cls(config=config, model_device="meta")
         model.to(dtype=target_dtype)
 
-        safetensors_files = _resolve_safetensors_files(model_dir)
+        safetensors_files = resolve_safetensors_files(model_dir)
 
         # Build key index with Muse Glimmer's actual key layout:
         #   model.language_model.layers.N.*  → per-layer
@@ -408,7 +408,7 @@ class MuseGlimmerForCausalLM(BaseForCausalLM):
                         shared[key] = path
 
         # Load shared params (embed_tokens, norm, lm_head)
-        shared_dict = _load_tensors_for_keys(shared, target_dtype)
+        shared_dict = load_tensors_for_keys(shared, target_dtype)
         # Normalize keys: strip "model.language_model." prefix where present
         normalized: dict[str, torch.Tensor] = {}
         prefix = "model.language_model."
@@ -425,7 +425,7 @@ class MuseGlimmerForCausalLM(BaseForCausalLM):
         # Load one layer at a time
         for layer_idx in sorted(per_layer.keys()):
             layer_key_to_file = per_layer.pop(layer_idx)
-            layer_sd = _load_tensors_for_keys(layer_key_to_file, target_dtype)
+            layer_sd = load_tensors_for_keys(layer_key_to_file, target_dtype)
             del layer_key_to_file
             # Strip prefix → "layers.N.*", then add "model." → "model.layers.N.*"
             remapped: dict[str, torch.Tensor] = {}
@@ -855,7 +855,7 @@ class MuseGlimmerForCausalLMEmbeddings(BaseForCausalLM):
         model = cls(config=config, model_device="meta")
         model.to(dtype=target_dtype)
 
-        safetensors_files = _resolve_safetensors_files(model_dir)
+        safetensors_files = resolve_safetensors_files(model_dir)
 
         layer_pattern = re.compile(r"model\.language_model\.layers\.(\d+)\.")
         from safetensors import safe_open
@@ -877,7 +877,7 @@ class MuseGlimmerForCausalLMEmbeddings(BaseForCausalLM):
                         shared[key] = path
 
         # Load shared params (norm, lm_head — embed_tokens dropped below)
-        shared_dict = _load_tensors_for_keys(shared, target_dtype)
+        shared_dict = load_tensors_for_keys(shared, target_dtype)
         normalized: dict[str, torch.Tensor] = {}
         prefix = "model.language_model."
         for k, v in shared_dict.items():
@@ -902,7 +902,7 @@ class MuseGlimmerForCausalLMEmbeddings(BaseForCausalLM):
         # Load one layer at a time
         for layer_idx in sorted(per_layer.keys()):
             layer_key_to_file = per_layer.pop(layer_idx)
-            layer_sd = _load_tensors_for_keys(layer_key_to_file, target_dtype)
+            layer_sd = load_tensors_for_keys(layer_key_to_file, target_dtype)
             del layer_key_to_file
             remapped: dict[str, torch.Tensor] = {}
             for k, v in layer_sd.items():
