@@ -33,6 +33,7 @@ from coreai_models.embedding.contract import (
     resolve_compute_precision,
     validate_block,
 )
+from coreai_models.embedding.embedding_gemma2 import EMBEDDINGGEMMA2_EXPORTER
 from coreai_models.embedding.export_utils import (
     EmbeddingExporter,
     resolve_snapshot,
@@ -46,6 +47,7 @@ EXPORTERS: dict[str, EmbeddingExporter] = {
     for exporter in (
         CLAP_EXPORTER,
         CLIP_EXPORTER,
+        EMBEDDINGGEMMA2_EXPORTER,
     )
 }
 
