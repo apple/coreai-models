@@ -73,8 +73,9 @@ jobs:
         run: |
           command -v uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-      # loadscope keeps each test class on one worker, so its cached exports are reused.
-      - run: uv run pytest python/tests/test_model_units -x -q -n 4 --dist loadscope --junitxml=test-results/python.xml
+      # worksteal (unlike loadscope) can re-queue a test whose worker crashed, so
+      # pytest-rerunfailures retries it instead of aborting the run with INTERNALERROR.
+      - run: uv run pytest python/tests/test_model_units -x -q -n 4 --dist worksteal --junitxml=test-results/python.xml
       - name: Test summary
         if: always()
         run: python3 .github/scripts/test_summary.py ${{ github.job }} test-results/python.xml
@@ -98,8 +99,9 @@ jobs:
         run: |
           command -v uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-      # loadscope keeps each test class on one worker, so its cached exports are reused.
-      - run: uv run pytest python/tests/test_model_units -x -q -n 4 --dist loadscope --junitxml=test-results/python.xml
+      # worksteal (unlike loadscope) can re-queue a test whose worker crashed, so
+      # pytest-rerunfailures retries it instead of aborting the run with INTERNALERROR.
+      - run: uv run pytest python/tests/test_model_units -x -q -n 4 --dist worksteal --junitxml=test-results/python.xml
       - name: Test summary
         if: always()
         run: python3 .github/scripts/test_summary.py ${{ github.job }} test-results/python.xml
