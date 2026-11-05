@@ -47,6 +47,7 @@ from coreai_models.export.presets import (
     DEFAULT_MACOS_COMPRESSION_PRESET,
     get_preset,
 )
+from coreai_models.hub import SNAPSHOT_PATTERNS, BackendName, get_backend
 from coreai_models.model_registry import ModelPreset
 from coreai_models.models.registry import ModelEntry, get_model_entry
 
@@ -98,6 +99,10 @@ class ExportConfig:
     # Experimental, macOS only. Max of the dynamic ``batch`` dim across input_ids/position_ids/
     # attn_mask and the KV cache. Defaults to 8 for batched exports; None for the causal mode.
     dynamic_max_batch_size: int | None = None
+    # Model download backend. The default keeps the exact original HF
+    # download behavior; "modelscope" routes downloads through the
+    # ModelScope hub (see coreai_models.hub).
+    backend: BackendName = "huggingface"
 
     @property
     def emits_attn_mask(self) -> bool:
@@ -228,7 +233,18 @@ class BuiltModel(NamedTuple):
 def resolve_model(config: ExportConfig) -> ResolvedModel:
     """Resolve ``config`` against the registry and the checkpoint's config, reading no weights."""
     # ---- 1. Resolve model class ----
-    hf_config = AutoConfig.from_pretrained(config.hf_model_id)
+    # The HuggingFace backend (default) keeps the original call below untouched:
+    # from_pretrained receives the hub id and runs its own download path (no-op
+    # guarantee). Only the ModelScope backend pre-downloads the snapshot.
+    if config.backend == "modelscope":
+        hf_config = AutoConfig.from_pretrained(
+            get_backend("modelscope").snapshot(
+                config.hf_model_id,
+                allow_patterns=SNAPSHOT_PATTERNS,
+            )
+        )
+    else:
+        hf_config = AutoConfig.from_pretrained(config.hf_model_id)
     model_type = config.model_type_override or getattr(hf_config, "model_type", None)
     if model_type is None:
         raise ValueError(
@@ -373,6 +389,7 @@ def build_model(
             num_layers=config.num_layers,
             hf_config_attr=entry.hf_config_attr,
             hf_state_dict_prefix=entry.hf_state_dict_prefix,
+            backend=config.backend,
             **attn_mask_kw,
         )
     else:
@@ -382,6 +399,7 @@ def build_model(
             target_dtype=target_dtype,
             num_layers=config.num_layers,
             disable_embedding_quantization=config.disable_embedding_quantization,
+            backend=config.backend,
             **attn_mask_kw,
         )
     model = model.eval()
@@ -400,7 +418,17 @@ def build_model(
         logger.info(f"Applying pre-export torch quantization (preset={config.compression})")
 
         def get_calibration_data():  # type: ignore[no-untyped-def]
-            tokenizer = AutoTokenizer.from_pretrained(config.hf_model_id)
+            # Default backend keeps the original call (hub id straight into
+            # from_pretrained); ModelScope pre-downloads the tokenizer files.
+            if config.backend == "modelscope":
+                tokenizer = AutoTokenizer.from_pretrained(
+                    get_backend("modelscope").snapshot(
+                        config.hf_model_id,
+                        allow_patterns=SNAPSHOT_PATTERNS,
+                    )
+                )
+            else:
+                tokenizer = AutoTokenizer.from_pretrained(config.hf_model_id)
             return get_c4(tokenizer)
 
         # Copy so we don't mutate the shared preset.
@@ -594,6 +622,7 @@ async def _async_export_model(config: ExportConfig) -> str:
                 max_context_length=max_context_length,
                 target_dtype=target_dtype,
                 target_model_id=config.hf_model_id,
+                backend=config.backend,
             )
             drafter_model = drafter_model.eval()
 
@@ -629,6 +658,7 @@ async def _async_export_model(config: ExportConfig) -> str:
             drafter_name=drafter_name,
             speculative_config=entry.drafter_config if drafter_name else None,
             max_batch_size=config.dynamic_max_batch_size or 1,
+            backend=config.backend,
         )
 
     logger.info(f"Export complete: {bundle_path}")

@@ -45,6 +45,11 @@ dependencies = [
     "diffusers>=0.37,<1.0",
 ]
 
+[project.optional-dependencies]
+# ModelScope download backend for coreai.llm.export (--backend modelscope).
+# Install with: uv run --extra modelscope ... (or: pip install coreai-models[modelscope])
+modelscope = ["modelscope>=1.37"]
+
 [project.scripts]
 "coreai.llm.export" = "coreai_models.llm.export:main"
 "coreai.llm.eval" = "coreai_models.llm.eval:main"

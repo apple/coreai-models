@@ -20,7 +20,6 @@ from typing import Any, TypeVar, cast
 
 import torch
 from coreai.authoring.types import AllocationType, HardwareConstraints
-from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from safetensors.torch import save_file
 from transformers import AutoConfig
@@ -51,6 +50,7 @@ from coreai_models._constants import (
     VALUE_CACHE_NAME,
     VALUE_CACHE_OUTPUT_NAME,
 )
+from coreai_models.hub import BackendName, get_backend
 from coreai_models.primitives.ios.cache import KVCacheHandler, causal_mask
 from coreai_models.primitives.ios.embedding import GatherEmbeddings, LoadEmbeddings
 from coreai_models.primitives.macos.cache import KVCache
@@ -767,6 +767,7 @@ class BaseForCausalLM(torch.nn.Module):
         num_layers: int | None = None,
         disable_embedding_quantization: bool = False,
         use_attention_mask: bool = False,
+        backend: BackendName = "huggingface",
     ) -> T:
         """Load model from HuggingFace model hub.
 
@@ -793,9 +794,22 @@ class BaseForCausalLM(torch.nn.Module):
         if cls._HF_MODEL_CLASS is None:
             raise ValueError(f"{cls.__name__} must define _HF_MODEL_CLASS class attribute")
 
-        # Load the HuggingFace model
+        # Load the HuggingFace model. With the default backend the id passes
+        # through unchanged and from_pretrained keeps its own download path;
+        # with the ModelScope backend the snapshot is pre-downloaded first.
+        load_id = huggingface_model_id
+        if backend == "modelscope":
+            load_id = get_backend("modelscope").snapshot(
+                huggingface_model_id,
+                allow_patterns=[
+                    "*.safetensors",
+                    "*.safetensors.index.json",
+                    "config.json",
+                    "generation_config.json",
+                ],
+            )
         hf_model = cast(PreTrainedModel, cls._HF_MODEL_CLASS).from_pretrained(
-            huggingface_model_id, dtype=target_dtype
+            load_id, dtype=target_dtype
         )
 
         # Convert config using the hook method (default: pass-through with context length)
@@ -856,6 +870,7 @@ class BaseForCausalLM(torch.nn.Module):
         hf_state_dict_prefix: str = "",
         disable_embedding_quantization: bool = False,
         use_attention_mask: bool = False,
+        backend: BackendName = "huggingface",
     ) -> T:
         """Load model from HuggingFace with layer-by-layer memory offloading.
 
@@ -888,7 +903,7 @@ class BaseForCausalLM(torch.nn.Module):
                 explicit additive ``attn_mask`` input (``is_causal`` off).
                 Ignored for iOS model classes.
         """
-        model_dir = snapshot_download(
+        model_dir = get_backend(backend).snapshot(
             huggingface_model_id,
             allow_patterns=["*.safetensors", "*.safetensors.index.json", "config.json"],
         )

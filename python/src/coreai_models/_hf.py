@@ -7,16 +7,21 @@ import glob
 from pathlib import Path
 from typing import Any
 
-import huggingface_hub
 import safetensors
 import torch
 
+from coreai_models.hub import BackendName, get_backend
 
-def _download_from_huggingface(huggingface_model_id: str) -> Path:
-    """
-    Download model from HuggingFace hub then return local path.
 
-    HuggingFace manages local cache, so will not re-download if already cached
+def load_named_tensors_from_weight_files(
+    huggingface_model_id: str,
+    backend: BackendName = "huggingface",
+) -> dict[str, torch.Tensor]:
+    """Download the model through the selected hub backend, then load all named tensors.
+
+    The hub manages local cache, so will not re-download if already cached.
+    With the default backend this keeps the original
+    ``huggingface_hub.snapshot_download`` call (via ``HuggingFaceBackend``).
     """
     allow_patterns = [
         "*.json",
@@ -29,17 +34,11 @@ def _download_from_huggingface(huggingface_model_id: str) -> Path:
         "*.jsonl",
         "*.jinja",
     ]
-    path_str = huggingface_hub.snapshot_download(
+    path_str = get_backend(backend).snapshot(
         huggingface_model_id,
         allow_patterns=allow_patterns,
     )
-    return Path(path_str)
-
-
-def load_named_tensors_from_weight_files(
-    huggingface_model_id: str,
-) -> dict[str, torch.Tensor]:
-    model_path = _download_from_huggingface(huggingface_model_id)
+    model_path = Path(path_str)
     weight_files = glob.glob(str(model_path / "model*.safetensors"))
     state_dict: dict[str, torch.Tensor] = {}
     for weight_file in weight_files:

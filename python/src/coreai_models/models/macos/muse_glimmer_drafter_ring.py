@@ -27,7 +27,6 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from huggingface_hub import snapshot_download
 from typing_extensions import Self, override
 
 from coreai_models._constants import (
@@ -35,6 +34,7 @@ from coreai_models._constants import (
     SLIDING_KEY_CACHE_NAME,
     SLIDING_VALUE_CACHE_NAME,
 )
+from coreai_models.hub import BackendName, get_backend
 from coreai_models.models.base import (
     BaseForCausalLM,
     TraceSpec,
@@ -252,6 +252,7 @@ class MuseGlimmerDrafterForCausalLM(BaseForCausalLM):
         mmap_path: str | None = None,
         num_layers: int | None = None,
         disable_embedding_quantization: bool = False,
+        backend: BackendName = "huggingface",
         *,
         target_model_id: str = "meta-models/Muse-Glimmer-30B",
     ) -> Self:
@@ -266,14 +267,16 @@ class MuseGlimmerDrafterForCausalLM(BaseForCausalLM):
             huggingface_model_id: Drafter checkpoint id
                 (e.g. ``meta-models/Muse-Glimmer-30B-assistant``).
             target_model_id: Full target model id to borrow embeddings from.
+            backend: Model download backend (see ``coreai_models.hub``).
             Other args: see :meth:`BaseForCausalLM.from_hf`.
         """
         from safetensors import safe_open
 
         # ---- 1. Download both checkpoints (safetensors + config only) --------
         allow = ["*.safetensors", "*.safetensors.index.json", "config.json"]
-        drafter_dir = snapshot_download(huggingface_model_id, allow_patterns=allow)
-        target_dir = snapshot_download(target_model_id, allow_patterns=allow)
+        download = get_backend(backend).snapshot
+        drafter_dir = download(huggingface_model_id, allow_patterns=allow)
+        target_dir = download(target_model_id, allow_patterns=allow)
 
         # ---- 2. Build drafter config, inject vocab_size from target ----------
         with open(os.path.join(drafter_dir, "config.json")) as f:
@@ -363,6 +366,7 @@ class MuseGlimmerDrafterForCausalLM(BaseForCausalLM):
         target_dtype: torch.dtype = torch.float16,
         mmap_path: str | None = None,
         num_layers: int | None = None,
+        backend: BackendName = "huggingface",
         **kwargs: Any,
     ) -> Self:
         return cls.from_hf(
@@ -371,6 +375,7 @@ class MuseGlimmerDrafterForCausalLM(BaseForCausalLM):
             target_dtype=target_dtype,
             mmap_path=mmap_path,
             num_layers=num_layers,
+            backend=backend,
         )
 
     # ------------------------------------------------------------------

@@ -26,6 +26,7 @@ from transformers.models.gemma3n.modeling_gemma3n import (
 from typing_extensions import Self, override
 
 from coreai_models._constants import MAX_GATHER_CONSTANT_ELEMENTS
+from coreai_models.hub import BackendName
 from coreai_models.models.base import BaseForCausalLM
 from coreai_models.primitives.macos.cache import KVCache
 from coreai_models.primitives.macos.rms_norm import RMSNorm
@@ -485,6 +486,7 @@ class Gemma3nForCausalLM(BaseForCausalLM):
         hf_config_attr: str | None = "text_config",
         hf_state_dict_prefix: str = "model.language_model.",
         disable_embedding_quantization: bool = False,
+        backend: BackendName = "huggingface",
     ):
         import gc
         import json
@@ -492,12 +494,12 @@ class Gemma3nForCausalLM(BaseForCausalLM):
         import re
         from types import SimpleNamespace
 
-        from huggingface_hub import snapshot_download
         from safetensors import safe_open
 
+        from coreai_models.hub import get_backend as _get_backend
         from coreai_models.models.base import load_tensors_for_keys, resolve_safetensors_files
 
-        model_dir = snapshot_download(
+        model_dir = _get_backend(backend).snapshot(
             huggingface_model_id,
             allow_patterns=["*.safetensors", "*.safetensors.index.json", "config.json"],
         )

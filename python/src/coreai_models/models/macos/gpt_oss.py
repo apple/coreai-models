@@ -16,6 +16,7 @@ from transformers.models.gpt_oss.modeling_gpt_oss import (
 from typing_extensions import Self, override
 
 from coreai_models._hf import load_named_tensors_from_weight_files, resolve_rope_theta
+from coreai_models.hub import BackendName, get_backend
 from coreai_models.models.base import BaseForCausalLM, _is_layer_key_beyond, move_model_to_disk
 from coreai_models.primitives.macos.cache import KVCache
 from coreai_models.primitives.macos.rms_norm import RMSNorm
@@ -303,6 +304,7 @@ class GptOssForCausalLM(BaseForCausalLM):
         target_dtype: torch.dtype = torch.float16,
         mmap_path: str | None = None,
         num_layers: int | None = None,
+        backend: BackendName = "huggingface",
     ) -> Self:
         """Load model from HuggingFace model hub.
 
@@ -315,11 +317,20 @@ class GptOssForCausalLM(BaseForCausalLM):
                        and memory-mapped to reduce RAM usage during import.
             num_layers: Optional number of transformer layers. When set, only layers
                         0..num_layers-1 are loaded and the config is truncated.
+            backend: Model download backend (see ``coreai_models.hub``).
 
         Returns:
             Instance of the model class loaded with HuggingFace weights
         """
-        config = GptOssConfig.from_pretrained(huggingface_model_id)
+        # Default backend keeps the hub id straight into from_pretrained;
+        # ModelScope pre-downloads the config first.
+        if backend == "huggingface":
+            config = GptOssConfig.from_pretrained(huggingface_model_id)
+        else:
+            local_path = get_backend(backend).snapshot(
+                huggingface_model_id, allow_patterns=["config.json"]
+            )
+            config = GptOssConfig.from_pretrained(local_path)
         if cls._HF_MODEL_CLASS is None:
             raise ValueError(f"{cls.__name__} must define _HF_MODEL_CLASS class attribute")
         msg = "All HuggingFace model should have architectures field populated"
@@ -331,7 +342,7 @@ class GptOssForCausalLM(BaseForCausalLM):
         )
         assert architecture == cls._HF_MODEL_CLASS.__name__, msg
 
-        named_tensors = load_named_tensors_from_weight_files(huggingface_model_id)
+        named_tensors = load_named_tensors_from_weight_files(huggingface_model_id, backend=backend)
         state_dict: dict[str, torch.Tensor] = {}
         for name, tensor in named_tensors.items():
             if tensor.dtype == torch.uint8:
@@ -392,6 +403,7 @@ class GptOssForCausalLM(BaseForCausalLM):
         num_layers: int | None = None,
         hf_config_attr: str | None = None,
         hf_state_dict_prefix: str = "",
+        backend: BackendName = "huggingface",
     ) -> Self:
         # GptOss falls back to the `from_hf` path
         assert hf_config_attr is None, (
@@ -409,6 +421,7 @@ class GptOssForCausalLM(BaseForCausalLM):
             target_dtype=target_dtype,
             mmap_path=file_mmap,
             num_layers=num_layers,
+            backend=backend,
         )
 
     @BaseForCausalLM.cast_logits_bfloat16_to_float16

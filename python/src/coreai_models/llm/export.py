@@ -8,6 +8,7 @@
 import argparse
 import logging
 from pathlib import Path
+from typing import get_args
 
 import yaml
 from coreai_opt.palettization.config.palettization_config import KMeansPalettizerConfig
@@ -26,6 +27,7 @@ from coreai_models.export.presets import (
     DEFAULT_IOS_COMPRESSION_PRESET as IOS_DEFAULT,
 )
 from coreai_models.export.presets import DEFAULT_MACOS_COMPRESSION_PRESET as MACOS_DEFAULT
+from coreai_models.hub import BackendName
 from coreai_models.model_registry import (
     presets_for_type,
     try_lookup_preset,
@@ -202,6 +204,16 @@ def build_parser() -> argparse.ArgumentParser:
             "Experimental, macOS only. Declare a DYNAMIC batch dim up to this max (traced at 2) "
             "across input_ids/position_ids/attn_mask and the KV cache. Must be >= 2. Pairs with "
             "--attention-mask batched."
+        ),
+    )
+    parser.add_argument(
+        "--backend",
+        choices=get_args(BackendName),
+        default=None,
+        help=(
+            "Model download backend. 'huggingface' (default) keeps the exact "
+            "original download behavior; 'modelscope' downloads from modelscope.cn "
+            "(requires the optional 'modelscope' extra: uv run --extra modelscope)."
         ),
     )
     return parser
@@ -384,6 +396,11 @@ def _resolve_export_config(args: argparse.Namespace) -> ExportConfig:
             max_context_length = preset.max_context_length
         if args.compression is None and getattr(preset, "compression_config", None) is not None:
             registry_compression_config = preset.compression_config
+        # Backend override map: a preset whose ModelScope repo lives under a
+        # different namespace records the ModelScope id here; models with the
+        # same org/name on both hubs need no entry (the HF id works as-is).
+        if args.backend == "modelscope" and preset.modelscope_id:
+            hf_model_id = preset.modelscope_id
     elif _is_hf_id(args.model) and not args.experimental:
         hint = ""
         if variant == "iOS":
@@ -442,6 +459,7 @@ def _resolve_export_config(args: argparse.Namespace) -> ExportConfig:
         with_drafter=args.with_drafter,
         attention_mask_mode=attention_mask_mode,
         dynamic_max_batch_size=args.dynamic_batch_size,
+        backend=args.backend or "huggingface",
     )
 
 
@@ -477,9 +495,11 @@ def main() -> None:
     if args.list_models:
         print("LLM presets (use short name or HuggingFace ID):")
         print()
+        backend = args.backend or "huggingface"
         for p in presets_for_type("llm"):
             platform = p.variant or "macOS"
-            print(f"  {p.short_name:35s} {p.hf_id:45s} {platform}")
+            display_id = (p.modelscope_id or p.hf_id) if backend == "modelscope" else p.hf_id
+            print(f"  {p.short_name:35s} {display_id:45s} {platform}")
         print()
         print("Supported architectures:")
         print()
@@ -507,6 +527,8 @@ def main() -> None:
         print(f"  compute_precision:  {config.compute_precision}")
         if config.max_context_length:
             print(f"  max_context_length: {config.max_context_length}")
+        if config.backend != "huggingface":
+            print(f"  download_backend:   {config.backend}")
         print(f"  output_dir:         {config.output_dir}")
         if config.output_name:
             print(f"  output_name:        {config.output_name}")
