@@ -55,7 +55,7 @@ ______________________________________________________________________
 
 ## Neural Engine SiLU PSNR low (~47 dB) — `silu()` or `x * torch.sigmoid(x)`
 
-**Cause**: On the Neural Engine these two forms return the same bits. For `|x| <= 8` they are up to 0.015 off, near `x = 0.5`; the GPU is at most 0.002 off. Conv → SiLU → conv with random fp16 weights reaches 47 dB against fp32 below. The GPU reaches 83 dB.
+**Cause**: On the Neural Engine these two forms return the same bits. For `|x| <= 8` they are up to 0.015 off, near `x = 0.5`; the GPU is at most 0.002 off. Conv → SiLU → conv with random fp16 weights reaches 47 dB against fp32 below. The GPU reaches 83 dB. With the 28 MLP blocks of Qwen3-0.6B on one prompt, the median (lowest) PSNR is 67.6 (55.2) dB, and 81.6 (69.7) dB through `tanh`.
 **Fix**: Write SiLU through `tanh`, with `c` an fp16 buffer holding 0.5: `x * (c * torch.tanh(x * c) + c)`. The same block reaches 71 dB and compiles to one Neural Engine region. `torch.sigmoid(x)` alone stays within 0.001.
 
 ```python
