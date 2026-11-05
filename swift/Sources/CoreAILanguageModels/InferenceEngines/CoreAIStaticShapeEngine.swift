@@ -7,7 +7,6 @@ import Accelerate
 import CoreAI
 import CoreAIShared
 import Foundation
-import Synchronization
 
 /// Static-shape inference engine using Core AI models.
 ///
@@ -100,9 +99,9 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     public private(set) var lastPrefixHitCount: Int = 0
 
     // Track in-flight generation via token
-    private let _activeToken = Mutex<GenerationToken?>(nil)
+    private let tokenBox = GenerationTokenBox()
 
-    public var isBusy: Bool { _activeToken.withLock { $0 != nil } }
+    public var isBusy: Bool { tokenBox.isBusy }
 
     // MARK: Multimodal (vision) — nil for text-only bundles
 
@@ -117,15 +116,10 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
 
     /// Clear the engine's active token if it matches the given token.
     func clearTokenIfActive(_ token: GenerationToken) {
-        let wasActive = _activeToken.withLock { current -> Bool in
-            guard current === token else { return false }
-            current = nil
-            return true
-        }
         // Only drop image state if this token was still the active one — a
         // superseded iterator finishing late (after a newer generate() call already
         // replaced both the token and any image state) must not clobber the new turn.
-        if wasActive {
+        if tokenBox.clearIfActive(token) {
             pendingImageEmbeddings = nil
             imageTokenPositions = []
         }
@@ -533,10 +527,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         inferenceOptions: InferenceOptions
     ) throws -> GenerationSequence {
         // Cancel any prior generation so its Iterator stops on next poll.
-        _activeToken.withLock {
-            $0?.cancel()
-            $0 = nil
-        }
+        tokenBox.cancelActive()
 
         // Implicit prefix caching: resolve input against history.
         if history.count > 0 {
@@ -559,7 +550,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         }
 
         let token = GenerationToken()
-        _activeToken.withLock { $0 = token }
+        tokenBox.install(token)
         return GenerationSequence(
             engine: self,
             input: input,
@@ -1134,10 +1125,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     // MARK: - Lifecycle
 
     public func cancel() async throws {
-        _activeToken.withLock {
-            $0?.cancel()
-            $0 = nil
-        }
+        tokenBox.cancelActive()
         pendingImageEmbeddings = nil
         imageTokenPositions = []
     }
@@ -1161,10 +1149,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
                     + "(\(processedTokenCount) tokens processed). Use reset(to: 0) and replay "
                     + "the prefix.")
         }
-        _activeToken.withLock {
-            $0?.cancel()
-            $0 = nil
-        }
+        tokenBox.cancelActive()
         pendingImageEmbeddings = nil
         imageTokenPositions = []
         let resetSpan = InstrumentsProfiler.beginReset(engine: "StaticShape")
