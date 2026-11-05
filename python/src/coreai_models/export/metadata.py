@@ -401,6 +401,16 @@ _METADATA: dict[str, AIModelMetadataFields] = {
             "labels. Source: https://huggingface.co/laion/clap-htsat-unfused"
         ),
     ),
+    "google/embeddinggemma-2": AIModelMetadataFields(
+        author="Google DeepMind",
+        license="Apache-2.0",
+        model_description=(
+            "EmbeddingGemma 2 is a multimodal retrieval embedding model from Google DeepMind "
+            "producing 768-d L2-normalized vectors (Matryoshka prefixes 512/256/128) for text "
+            "and images in one space. "
+            "Source: https://huggingface.co/google/embeddinggemma-2"
+        ),
+    ),
 }
 
 
