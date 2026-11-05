@@ -346,6 +346,7 @@ let package = Package(
             name: "DiffusionPipelineTests",
             dependencies: [
                 "CoreAIDiffusionPipeline",
+                "CoreAIShared",
                 "CoreAIVideoDiffusionPipeline",
                 "TestUtilities",
             ],
