@@ -33,7 +33,6 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from huggingface_hub import snapshot_download
 from typing_extensions import Self, override
 
 from coreai_models._constants import (
@@ -43,6 +42,7 @@ from coreai_models._constants import (
     SLIDING_VALUE_CACHE_NAME,
     VALUE_CACHE_NAME,
 )
+from coreai_models.hub import BackendName, get_backend
 from coreai_models.models.base import (
     BaseForCausalLM,
     TraceSpec,
@@ -340,6 +340,7 @@ class MuseGlimmerForCausalLM(BaseForCausalLM):
         mmap_path: str | None = None,
         num_layers: int | None = None,
         disable_embedding_quantization: bool = False,
+        backend: BackendName = "huggingface",
     ) -> Self:
         return cls.from_hf_memory_efficient(
             huggingface_model_id,
@@ -349,6 +350,7 @@ class MuseGlimmerForCausalLM(BaseForCausalLM):
             num_layers=num_layers,
             hf_config_attr="text_config",
             hf_state_dict_prefix="model.language_model.",
+            backend=backend,
         )
 
     @override
@@ -363,11 +365,12 @@ class MuseGlimmerForCausalLM(BaseForCausalLM):
         hf_config_attr: str | None = "text_config",
         hf_state_dict_prefix: str = "model.language_model.",
         disable_embedding_quantization: bool = False,
+        backend: BackendName = "huggingface",
     ) -> Self:
         """Load text decoder weights shard-by-shard, skipping the vision encoder."""
         import re
 
-        model_dir = snapshot_download(
+        model_dir = get_backend(backend).snapshot(
             huggingface_model_id,
             allow_patterns=["*.safetensors", "*.safetensors.index.json", "config.json"],
         )
@@ -814,6 +817,7 @@ class MuseGlimmerForCausalLMEmbeddings(BaseForCausalLM):
         mmap_path: str | None = None,
         num_layers: int | None = None,
         disable_embedding_quantization: bool = False,
+        backend: BackendName = "huggingface",
     ) -> Self:
         return cls.from_hf_memory_efficient(
             huggingface_model_id,
@@ -823,6 +827,7 @@ class MuseGlimmerForCausalLMEmbeddings(BaseForCausalLM):
             num_layers=num_layers,
             hf_config_attr="text_config",
             hf_state_dict_prefix="model.language_model.",
+            backend=backend,
         )
 
     @override
@@ -837,11 +842,12 @@ class MuseGlimmerForCausalLMEmbeddings(BaseForCausalLM):
         hf_config_attr: str | None = "text_config",
         hf_state_dict_prefix: str = "model.language_model.",
         disable_embedding_quantization: bool = False,
+        backend: BackendName = "huggingface",
     ) -> Self:
         """Load text decoder weights shard-by-shard, skipping vision encoder and embed_tokens."""
         import re
 
-        model_dir = snapshot_download(
+        model_dir = get_backend(backend).snapshot(
             huggingface_model_id,
             allow_patterns=["*.safetensors", "*.safetensors.index.json", "config.json"],
         )
