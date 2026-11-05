@@ -1,0 +1,9 @@
+# Copyright 2026 Apple Inc.
+#
+# Use of this source code is governed by a BSD-3-clause license that can
+# be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
+
+"""Embedding bundles: text and image or audio encoders that map into one vector space.
+
+Export one with ``uv run coreai.embedding.export <model>``.
+"""

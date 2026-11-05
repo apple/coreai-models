@@ -133,7 +133,7 @@ Pass `--include-debug-info` to switch the converter to `DEBUG` mode, which embed
 uv run coreai.llm.export Qwen/Qwen3-0.6B --include-debug-info
 ```
 
-The flag is available on `coreai.llm.export`, `coreai.vlm.export`, `coreai.diffusion.export`, `coreai.segmentation.export`, and every standalone `models/<name>/export.py` recipe, so all export paths produce assets carrying the same debug information by default.
+The flag is available on `coreai.llm.export`, `coreai.vlm.export`, `coreai.diffusion.export`, `coreai.segmentation.export`, `coreai.embedding.export`, and every standalone `models/<name>/export.py` recipe, so all export paths produce assets carrying the same debug information by default.
 
 **Note:** `--include-debug-info` is independent of `--verbose`/`-v`. `--verbose` only raises the console log level; it does not change what goes into the asset.
 
@@ -196,7 +196,7 @@ swift run -c release llm-runner --model path/to/target_folder \
   --draft-model path/to/draft_folder --temperature 0.7 --seed 1234 --prompt "..."
 ```
 
-Run `llm-runner --help` for the options that tune speculation, such as the number of draft tokens per step. Options that cannot be combined with speculation, or that it does not apply, are reported when the run starts. Generation stops at the tokenizer's end-of-sequence tokens.
+Run `llm-runner --help` for the options that tune speculation, such as the number of draft tokens per step. Options that cannot be combined with speculation, or that it does not apply, are reported when the run starts. Generation stops at the tokenizer's end-of-sequence tokens and at each `--stop-tokens` string that encodes to a single token; one that encodes to several tokens is named in a warning and not applied.
 
 The run summary reports how many proposed tokens the target accepted (`draft accepted`), the tokens committed per target pass (`tokens / target pass`, above 1 when the target ran fewer passes than tokens produced), and the speed of the generation loop alone (`generation-only`, to compare with the `Generation:` line of a plain run). Acceptance depends on the workload, so measure on prompts like yours.
 
@@ -221,6 +221,38 @@ This produces a single `<name>/` bundle (`kind=vlm`) holding the text
 decoder (`main`), token-embedding lookup (`embedding`), vision encoder
 (`vision`), tokenizer, and `metadata.json`. Pass `--skip-vision` to export the
 text portion only.
+
+### Embedding Models
+
+```bash
+uv run coreai.embedding.export --list-models
+uv run coreai.embedding.export clip-vit-b32                 # text + image towers (macOS)
+uv run coreai.embedding.export clap-htsat --platform iOS    # text + audio towers (iOS)
+uv run coreai.embedding.export clip-vit-b32 --fused         # a single fused asset, including a `main`
+uv run coreai.embedding.export embeddinggemma-2                 # text + image (macOS)
+uv run coreai.embedding.export embeddinggemma-2 --platform iOS  # Neural Engine
+```
+
+Each export writes a bundle directory `exports/<name>/` with:
+
+- one `.aimodel` per tower: `text_encoder`, plus `image_encoder` (CLIP) or `audio_encoder` (CLAP);
+  with `--fused`, a single `model.aimodel` holding every tower; EmbeddingGemma 2's are listed in
+  its model card
+- `tokenizer/`
+- `metadata.json`: how a host tokenizes, preprocesses and batches inputs
+  ([contract](../python/src/coreai_models/embedding/contract.py))
+
+Every tower returns L2-normalized vectors in one shared space: the cosine of a
+text vector and an image or audio vector is their similarity.
+
+- `--text-only` exports the text tower alone.
+- `--compute-precision` picks the compute precision; `--list-models` shows each model's options.
+
+Details are in the [CLIP](clip), [CLAP](clap) and [EmbeddingGemma 2](embedding_gemma2) model
+cards. To add a model, register an `EmbeddingExporter` in `EXPORTERS`
+([`embedding/export.py`](../python/src/coreai_models/embedding/export.py)) and
+add a `UtilityModel` row with `export_script="coreai.embedding.export"` to
+`UTILITY_PRESETS`.
 
 ### Standalone Export Scripts
 
@@ -258,7 +290,6 @@ uv run models/<name>/export.py --include-debug-info   # embed debug information 
 
 ### Vision Models
 
-- [CLIP](clip)
 - [Depth Anything v3](depth-anything)
 - [EDSR](edsr)
 - [EfficientSAM](efficient-sam)
@@ -268,7 +299,6 @@ uv run models/<name>/export.py --include-debug-info   # embed debug information 
 
 ### Audio Models
 
-- [CLAP](clap)
 - [Parakeet TDT](parakeet)
 - [Wav2Vec 2.0](wav2vec2)
 - [Whisper](whisper)
@@ -277,6 +307,12 @@ uv run models/<name>/export.py --include-debug-info   # embed debug information 
 
 - [RoBERTa](roberta)
 - [T5](t5)
+
+### Embedding Models
+
+- [CLAP](clap)
+- [CLIP](clip)
+- [EmbeddingGemma 2](embedding_gemma2)
 
 ## Adding a Model
 

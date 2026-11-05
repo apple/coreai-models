@@ -15,9 +15,11 @@ from coreai_models.model_registry import (
     ModelPreset,
     _preset_to_export_args,
     _preset_to_output_name,
+    _utility_to_export_args,
     filter_presets,
     filter_utility_models,
     lookup_preset,
+    lookup_utility_model,
     presets_for_type,
     try_lookup_preset,
 )
@@ -209,8 +211,55 @@ def test_try_lookup_with_explicit_variant() -> None:
     assert result.variant == "iOS"
 
 
+def test_embedding_utility_models_have_an_exporter() -> None:
+    from coreai_models.embedding.export import EXPORTERS
+    from coreai_models.model_registry import UTILITY_PRESETS
+
+    rows = [u for u in UTILITY_PRESETS if u.export_script == "coreai.embedding.export"]
+    assert {row.short_name for row in rows} == set(EXPORTERS)
+    for row in rows:
+        assert EXPORTERS[row.short_name].family.hf_model_id == row.hf_id
+        assert row.platforms == ("iOS", "macOS")
+
+
+def test_utility_export_args_for_console_scripts_and_recipes() -> None:
+    clip = lookup_utility_model("clip-vit-b32")
+    whisper = lookup_utility_model("whisper-large-v3-turbo")
+    assert clip is not None and whisper is not None
+    assert _utility_to_export_args(clip, "iOS") == [
+        "uv",
+        "run",
+        "coreai.embedding.export",
+        "clip-vit-b32",
+        "--platform",
+        "iOS",
+    ]
+    assert _utility_to_export_args(clip, "macOS")[-1] == "clip-vit-b32"
+    assert _utility_to_export_args(whisper) == [
+        "uv",
+        "run",
+        "models/whisper/export.py",
+        "--model",
+        "openai/whisper-large-v3-turbo",
+    ]
+
+
 def test_utility_platform_filter_excludes_macos_only() -> None:
     ios_models = filter_utility_models(platform="iOS")
     names = [u.short_name for u in ios_models]
     assert "depth-anything-3-small" not in names
     assert "clip-vit-b32" in names
+
+
+def test_embedding_export_args_use_the_console_script() -> None:
+    model = lookup_utility_model("embeddinggemma-2")
+    assert model is not None
+    assert _utility_to_export_args(model, "iOS") == [
+        "uv",
+        "run",
+        "coreai.embedding.export",
+        "embeddinggemma-2",
+        "--platform",
+        "iOS",
+    ]
+    assert _utility_to_export_args(model, "macOS")[-1] == "embeddinggemma-2"

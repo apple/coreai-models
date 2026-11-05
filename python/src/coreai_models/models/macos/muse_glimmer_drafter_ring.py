@@ -38,8 +38,8 @@ from coreai_models._constants import (
 from coreai_models.models.base import (
     BaseForCausalLM,
     TraceSpec,
-    _load_tensors_for_keys,
-    _resolve_safetensors_files,
+    load_tensors_for_keys,
+    resolve_safetensors_files,
 )
 from coreai_models.primitives.macos.cache import RingKVCache, concat_window_causal_mask
 from coreai_models.primitives.macos.mlp import MLP
@@ -296,7 +296,7 @@ class MuseGlimmerDrafterForCausalLM(BaseForCausalLM):
         model.to(dtype=target_dtype)
 
         # ---- 4. Load drafter weights (skip encoder.*, add model. prefix) -----
-        drafter_files = _resolve_safetensors_files(drafter_dir)
+        drafter_files = resolve_safetensors_files(drafter_dir)
         drafter_keys: dict[str, str] = {}
         for path in drafter_files:
             with safe_open(path, framework="pt", device="cpu") as f:
@@ -309,7 +309,7 @@ class MuseGlimmerDrafterForCausalLM(BaseForCausalLM):
                             continue
                     drafter_keys[key] = path
 
-        drafter_sd = _load_tensors_for_keys(drafter_keys, target_dtype)
+        drafter_sd = load_tensors_for_keys(drafter_keys, target_dtype)
         # "layers.0.*" → "model.layers.0.*", "norm.weight" → "model.norm.weight"
         remapped: dict[str, torch.Tensor] = {}
         for k, v in drafter_sd.items():
@@ -320,7 +320,7 @@ class MuseGlimmerDrafterForCausalLM(BaseForCausalLM):
         gc.collect()
 
         # ---- 5. Load embed_tokens and lm_head from target (2 tensors) -------
-        target_files = _resolve_safetensors_files(target_dir)
+        target_files = resolve_safetensors_files(target_dir)
         embed_hf_key = "model.language_model.embed_tokens.weight"
         lm_head_hf_key = "lm_head.weight"
         target_keys: dict[str, str] = {}
@@ -337,7 +337,7 @@ class MuseGlimmerDrafterForCausalLM(BaseForCausalLM):
                 f"found: {found}"
             )
 
-        target_sd = _load_tensors_for_keys(target_keys, target_dtype)
+        target_sd = load_tensors_for_keys(target_keys, target_dtype)
         shared: dict[str, torch.Tensor] = {
             "model.embed_tokens.weight": target_sd[embed_hf_key],
             "lm_head.weight": target_sd[lm_head_hf_key],
