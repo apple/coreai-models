@@ -170,4 +170,86 @@ struct LanguageModelBundleTests {
         #expect(bundle.modelBundle.userData?["git_sha"] == "abc1234")
         #expect(bundle.modelBundle.userData?["tags"] == "gold,recommended")
     }
+
+    private static func drafterBundle(
+        assets: String, auxiliary: String, overrides: String = "", speculative: String = ""
+    ) throws -> URL {
+        try tempBundle(
+            """
+            {
+              "metadata_version": "0.2",
+              "kind": "llm",
+              "name": "gemma",
+              "assets": { "main": "model.aimodel"\(assets) },
+              "auxiliary_assets": { \(auxiliary) },
+              \(speculative)
+              "language": {
+                "tokenizer": "x/y",
+                "vocab_size": 100,
+                "max_context_length": 512\(overrides)
+              }
+            }
+            """)
+    }
+
+    private static let drafterAssets = ", \"drafter\": \"draft_step.aimodel\""
+    private static let drafterSidecars = """
+        "drafter_config": "draft_step.json", "drafter_scan": "draft_scan.bin",
+        "drafter_scan_index": "draft_scan.json"
+        """
+
+    @Test("A bundle without a drafter component has no draft head and no hidden states")
+    func noDrafter() throws {
+        let bundle = try LanguageModelBundle(at: try Self.drafterBundle(assets: "", auxiliary: ""))
+        #expect(try bundle.drafter == nil)
+        #expect(!bundle.emitsHiddenStates)
+    }
+
+    @Test("The drafter component resolves the program and its sidecars within the bundle")
+    func drafterComponent() throws {
+        let url = try Self.drafterBundle(
+            assets: Self.drafterAssets, auxiliary: Self.drafterSidecars,
+            overrides: ", \"overrides\": { \"emits_hidden_states\": true }",
+            speculative: "\"speculative\": { \"drafter_kind\": \"mtp\" },")
+        let bundle = try LanguageModelBundle(at: url)
+        let drafter = try #require(try bundle.drafter)
+        #expect(drafter == DrafterComponent(directory: url))
+        #expect(bundle.emitsHiddenStates)
+    }
+
+    @Test("A drafter program listed without its sidecars is rejected, naming the missing one")
+    func drafterWithoutSidecars() throws {
+        let url = try Self.drafterBundle(
+            assets: Self.drafterAssets,
+            auxiliary: "\"drafter_config\": \"draft_step.json\", \"drafter_scan\": \"draft_scan.bin\"",
+            speculative: "\"speculative\": { \"drafter_kind\": \"mtp\" },")
+        let bundle = try LanguageModelBundle(at: url)
+        #expect {
+            _ = try bundle.drafter
+        } throws: { error in
+            "\(error)".contains("drafter_scan_index")
+        }
+    }
+
+    @Test(
+        "A drafter of another kind, or of none, is not read as a hidden-state draft head",
+        arguments: ["\"speculative\": { \"drafter_kind\": \"block\" },", ""])
+    func drafterOfAnotherKind(speculative: String) throws {
+        let url = try Self.drafterBundle(
+            assets: Self.drafterAssets, auxiliary: Self.drafterSidecars, speculative: speculative)
+        let bundle = try LanguageModelBundle(at: url)
+        #expect {
+            _ = try bundle.drafter
+        } throws: { error in
+            "\(error)".contains("mtp")
+        }
+    }
+
+    @Test("A bundle that declares no hidden states reports none")
+    func noHiddenStatesByDefault() throws {
+        let bundle = try LanguageModelBundle(
+            at: try Self.drafterBundle(
+                assets: "", auxiliary: "", overrides: ", \"overrides\": { \"sliding_window\": 512 }"))
+        #expect(!bundle.emitsHiddenStates)
+    }
 }

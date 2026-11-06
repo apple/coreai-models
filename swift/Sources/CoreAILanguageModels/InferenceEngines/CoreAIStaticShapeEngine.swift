@@ -3,6 +3,7 @@
 // Use of this source code is governed by a BSD-3-clause license that can
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
+import Accelerate
 import CoreAI
 import CoreAIShared
 import Foundation
@@ -28,6 +29,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     private static let keyCacheName = "key_cache"
     private static let valueCacheName = "value_cache"
     private static let embeddingTableName = "embedding_table"
+    private static let hiddenStatesOutputName = "hidden_states"
     private static let tokenIDsInputName = "in_new_token_ids"
     private static let gatheredOutputName = "out_transformer_input"
 
@@ -102,9 +104,31 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
 
     public var isBusy: Bool { _activeToken.withLock { $0 != nil } }
 
+    // MARK: Multimodal (vision) — nil for text-only bundles
+
+    let visionModel: AIModel?
+    let visionConfig: VisionConfig?
+
+    // Per-generation image state, set by `generate(with: InputEmbeddings, ...)` and
+    // consumed during `buildInputs`. Cleared by the text-only `generate` entry so a
+    // subsequent text turn never scatters stale embeddings.
+    var pendingImageEmbeddings: NDArray?
+    var imageTokenPositions: [Int] = []
+
     /// Clear the engine's active token if it matches the given token.
     func clearTokenIfActive(_ token: GenerationToken) {
-        _activeToken.withLock { if $0 === token { $0 = nil } }
+        let wasActive = _activeToken.withLock { current -> Bool in
+            guard current === token else { return false }
+            current = nil
+            return true
+        }
+        // Only drop image state if this token was still the active one — a
+        // superseded iterator finishing late (after a newer generate() call already
+        // replaced both the token and any image state) must not clobber the new turn.
+        if wasActive {
+            pendingImageEmbeddings = nil
+            imageTokenPositions = []
+        }
     }
 
     // MARK: - Initialization
@@ -115,11 +139,15 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     public init(
         configuration: ModelConfig,
         preparedModel: PreparedModel,
-        tensorData: [String: URL] = [:]
+        tensorData: [String: URL] = [:],
+        visionModel: AIModel? = nil,
+        visionConfig: VisionConfig? = nil
     ) async throws {
         self.config = configuration
         self.model = preparedModel.model
         self.functions = [:]
+        self.visionModel = visionModel
+        self.visionConfig = visionConfig
 
         let allNames = model.functionNames
         CLILogger.log("Model loaded: \(allNames.count) functions: \(allNames.sorted())")
@@ -298,10 +326,50 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
             tensorData: tensorData)
     }
 
+    /// Multimodal convenience init: main ladder at `modelURL` (+ its `tensorData` sidecars)
+    /// plus a separate vision encoder asset. Used for `kind:vlm` bundles whose decoder
+    /// is a Gemma4-style ladder (no separate `embedding` asset).
+    public convenience init(
+        configuration: ModelConfig,
+        modelURL: URL,
+        tensorData: [String: URL] = [:],
+        visionModel: AIModel,
+        visionConfig: VisionConfig
+    ) async throws {
+        let preparedModel = try await PreparedModel.prepare(at: modelURL)
+        try await self.init(
+            configuration: configuration,
+            preparedModel: preparedModel,
+            tensorData: tensorData,
+            visionModel: visionModel,
+            visionConfig: visionConfig)
+    }
+
+    /// Multimodal convenience init from URLs (prepares both assets internally). Lets
+    /// callers wire vision without importing `PreparedModel`/`AIModel` (e.g. `CoreAIRunner`).
+    public convenience init(
+        configuration: ModelConfig,
+        modelURL: URL,
+        tensorData: [String: URL] = [:],
+        visionModelURL: URL,
+        visionConfig: VisionConfig
+    ) async throws {
+        let preparedModel = try await PreparedModel.prepare(at: modelURL)
+        let preparedVision = try await PreparedModel.prepare(at: visionModelURL)
+        try await self.init(
+            configuration: configuration,
+            preparedModel: preparedModel,
+            tensorData: tensorData,
+            visionModel: preparedVision.model,
+            visionConfig: visionConfig)
+    }
+
     // MARK: - Initialization Helpers
 
-    private func canRewind(to target: Int) -> Bool {
-        states.canTruncate(processed: processedTokenCount, to: target)
+    /// Whether the states can be rewound to `target`, given the batch width `alignment` of the
+    /// forward that restarts there (see ``SlidingRing/allowsRewind(processed:to:alignment:)``).
+    private func canRewind(to target: Int, alignment: Int) -> Bool {
+        states.canTruncate(processed: processedTokenCount, to: target, alignment: alignment)
     }
 
     private static func requireFunction(
@@ -438,6 +506,32 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         samplingConfiguration: SamplingConfiguration,
         inferenceOptions: InferenceOptions
     ) async throws -> GenerationSequence {
+        // Text-only entry: drop any image state left over from a prior multimodal
+        // turn so a stale scatter can't corrupt this sequence.
+        pendingImageEmbeddings = nil
+        imageTokenPositions = []
+        return try startGeneration(
+            with: input,
+            samplingConfiguration: samplingConfiguration,
+            inferenceOptions: inferenceOptions)
+    }
+
+    /// Number of leading tokens of `matchedPrefix` whose cached KV can be reused: the token-id
+    /// match, cut at the first position that an image will be scattered into.
+    static func reusablePrefixLength(matchedPrefix: Int, firstImagePosition: Int?) -> Int {
+        guard let firstImagePosition else { return matchedPrefix }
+        return Swift.min(matchedPrefix, firstImagePosition)
+    }
+
+    /// Shared generation setup (prefix-cache resolution + token/sequence creation), used
+    /// by both the text-only `generate` above and the multimodal
+    /// `generate(with: InputEmbeddings, ...)` (see `CoreAIStaticShapeEngine+Multimodal.swift`),
+    /// which sets image state first and so must not go through the clearing entry point.
+    func startGeneration(
+        with input: [TokenId],
+        samplingConfiguration: SamplingConfiguration,
+        inferenceOptions: InferenceOptions
+    ) throws -> GenerationSequence {
         // Cancel any prior generation so its Iterator stops on next poll.
         _activeToken.withLock {
             $0?.cancel()
@@ -446,10 +540,18 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
 
         // Implicit prefix caching: resolve input against history.
         if history.count > 0 {
-            let (commonPrefix, _) = history.resolve(input: input)
+            let (matchedPrefix, _) = history.resolve(input: input)
+            // Every image position carries the same placeholder id, so a token-id match says
+            // nothing about image content: a pending image invalidates the cached prefix from
+            // its first position on.
+            let commonPrefix = Self.reusablePrefixLength(
+                matchedPrefix: matchedPrefix,
+                firstImagePosition: pendingImageEmbeddings == nil ? nil : imageTokenPositions.min())
             if let position = Self.resumePosition(
                 commonPrefix: commonPrefix, inputCount: input.count, historyCount: history.count,
-                processed: processedTokenCount, canRewind: canRewind(to:))
+                processed: processedTokenCount,
+                // The restart may run in any graph, the prefill graphs included.
+                canRewind: { canRewind(to: $0, alignment: maxQueryLength) })
             {
                 rewind(to: position)
             }
@@ -567,6 +669,349 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         return (logits: actualLogits, token: nextToken)
     }
 
+    // MARK: - Speculative decoding support (per-position results for verification)
+
+    /// The token history holds exactly the tokens the cache has processed. A mismatch means
+    /// tokens were processed or rewound outside the history's bookkeeping, and slicing batches
+    /// from it would skip or replay positions.
+    static func validateSpeculativeSequence(count: Int, processed: Int) throws {
+        guard count == processed else {
+            throw InferenceRuntimeError.invalidState(
+                "the token history holds \(count) tokens but \(processed) are processed; "
+                    + "reset(to: 0) and replay the prefix before speculative decoding")
+        }
+    }
+
+    /// Prefill `tokens` at the current position, discarding logits.
+    package func advance(_ tokens: [Int32]) async throws {
+        _ = try await processSpeculativeBlock(tokens, capture: .none)
+    }
+
+    /// Forward `tokens` in one pass; per-position `[vocabSize]` logits predicting the
+    /// following token. This is the verify primitive the speculative decoder needs: the
+    /// static-shape graph already computes every position's logits (see `inference`), so
+    /// verification of a draft block runs on the same engine.
+    package func forwardWithPerPositionLogits(_ tokens: [Int32]) async throws -> [[LogitsScalarType]] {
+        try await processSpeculativeBlock(tokens, capture: .fullLogits).logits
+    }
+
+    /// Forward `tokens` in one pass; per-position argmax (greedy) token.
+    ///
+    /// Computes the argmax directly from the logits buffer instead of materializing a
+    /// `[vocabSize]` row per position. The result is the token plain decoding picks, softcap
+    /// included: the cap rounds near-equal logits to the same value, and a tie goes to the lowest
+    /// index. Only entries that can reach the maximum after capping are capped.
+    package func forwardPerPositionArgmax(_ tokens: [Int32]) async throws -> [Int32] {
+        try await processSpeculativeBlock(tokens, capture: .argmax).argmax
+    }
+
+    /// The `count` highest entries of one position's logits, highest first, as plain decoding
+    /// ranks them: the final-logit softcap is applied the way `inference` applies it, rounding to
+    /// `LogitsScalarType` included, but only to the entries that can tie or beat the maximum
+    /// (see ``LogitRowScan``). The row is widened into `scratch` with a vectorized conversion.
+    static func scanRow(
+        _ row: UnsafePointer<LogitsScalarType>, vocab: Int, count: Int, softcap: Float?,
+        scratch: inout [Float]
+    ) -> (indices: [Int32], values: [Float]) {
+        if scratch.count != vocab { scratch = [Float](repeating: 0, count: vocab) }
+        return scratch.withUnsafeMutableBufferPointer { dst in
+            var src = vImage_Buffer(
+                data: UnsafeMutableRawPointer(mutating: row),
+                height: 1, width: vImagePixelCount(vocab), rowBytes: vocab * 2)
+            var dstBuf = vImage_Buffer(
+                data: dst.baseAddress, height: 1,
+                width: vImagePixelCount(vocab), rowBytes: vocab * 4)
+            _ = vImageConvert_Planar16FtoPlanarF(&src, &dstBuf, 0)
+            return LogitRowScan.topK(dst, k: count, cap: softcap)
+        }
+    }
+
+    /// What `processSpeculativeBlock` extracts from each verified position.
+    private enum SpecCapture: Equatable {
+        case none  // advance state only (no logits read back)
+        case argmax  // greedy: per-position argmax token (no full-vocab copy)
+        case fullLogits  // sampling: per-position `[vocabSize]` distribution
+    }
+
+    private struct SpecCaptureResult {
+        var logits: [[LogitsScalarType]] = []
+        var argmax: [Int32] = []
+        /// The post-norm final hidden state of each captured position, flattened row by row, when the
+        /// decode graphs emit `hidden_states`; `hiddenDim` is a row's width.
+        var hidden: [Float] = []
+        var hiddenDim = 0
+    }
+
+    /// Runs the delta `tokens` through the static-shape graph at the current position and
+    /// returns per-position results (when `capture`). Mirrors `inference`'s batch loop but
+    /// keeps every position and does no sampling or prefix-cache resolution: the decoder
+    /// owns rollback via `reset(to:)`.
+    @discardableResult
+    private func processSpeculativeBlock(
+        _ tokens: [Int32], capture: SpecCapture
+    ) async throws -> SpecCaptureResult {
+        guard !tokens.isEmpty else { return SpecCaptureResult() }
+        // A block longer than the widest graph starts in a prefill graph, which returns no logits,
+        // so it would yield fewer rows than tokens with the first rows missing. This is the caller
+        // breaking the contract of `maxVerifyBlockLength`, hence an invalid argument.
+        if capture != .none, tokens.count > maxQueryLength {
+            throw InferenceRuntimeError.invalidArgument(
+                "a verify block of \(tokens.count) tokens exceeds the widest graph "
+                    + "(\(maxQueryLength) tokens); keep blocks within maxVerifyBlockLength")
+        }
+        try Self.validateSpeculativeSequence(count: history.count, processed: processedTokenCount)
+        let captureFrom = processedTokenCount
+        let total = captureFrom + tokens.count
+        var result = SpecCaptureResult()
+
+        // Fixed for the whole call: the row width, the cap, and the scratch row the argmax widens into.
+        let vocab = config.vocabSize
+        let softcap = config.overrides?.finalLogitSoftcapping.map { Float($0) }
+        var scratch: [Float] = capture == .argmax ? [Float](repeating: 0, count: vocab) : []
+
+        while processedTokenCount < total {
+            let remaining = total - processedTokenCount
+            let usePrefill = remaining > maxQueryLength
+            let graphName = try forwardGraph(
+                numInputTokens: remaining, currentPosition: processedTokenCount, isPrefill: usePrefill)
+            let contextBucket = try contextLength(of: graphName)
+            try states.prepare(contextBucket: contextBucket, writtenTokenCount: processedTokenCount)
+
+            let batchSize = try queryLength(of: graphName)
+            // Batches start on a batchSize boundary, as in `inference`: the graph takes the aligned
+            // step as its write offset, and the palettized (int4) Gemma 4 program rejected a
+            // non-aligned offset at runtime ("Request cancelled"); other assets were not tried. A
+            // verify block that straddles a boundary therefore takes a second forward.
+            let batchStartToken = (processedTokenCount / batchSize) * batchSize
+            let batchEndToken = min(batchStartToken + batchSize - 1, total - 1)
+            let tokensInBatch = batchEndToken - batchStartToken + 1
+
+            // The batch's tokens by absolute position: those below the cursor are already in the
+            // history, the rest come from `tokens`.
+            let newInBatch = tokens[(processedTokenCount - captureFrom)...(batchEndToken - captureFrom)]
+            let batchTokens = history.tokens[batchStartToken..<processedTokenCount] + newInBatch
+
+            let inputs = try await buildInputs(
+                graphName: graphName,
+                batchTokens: batchTokens,
+                batchSize: batchSize,
+                alignedStep: batchStartToken,
+                contextBucket: contextBucket)
+
+            let fn = try loadFunction(named: graphName)
+            let desc = try functionDescriptor(for: graphName)
+            var outputs = try await runStaticStep(
+                function: fn, descriptor: desc, inputs: inputs, states: states)
+            let logitsArray = outputs.remove(Self.logitsOutputName)?.ndArray
+            let hiddenArray = outputs.remove(Self.hiddenStatesOutputName)?.ndArray
+
+            if capture != .none, !usePrefill, let logitsArray {
+                // Only the positions from `captureFrom` on are results; earlier rows of the batch
+                // are committed positions that were re-run to reach the batch boundary.
+                let firstRow = max(0, captureFrom - batchStartToken)
+                try Self.withLogitRows(logitsArray) { rows in
+                    switch capture {
+                    case .none:
+                        break
+                    case .argmax:
+                        for local in firstRow..<tokensInBatch {
+                            let top = Self.scanRow(
+                                rows + local * vocab, vocab: vocab, count: 1, softcap: softcap,
+                                scratch: &scratch)
+                            result.argmax.append(top.indices.first ?? 0)
+                        }
+                    case .fullLogits:
+                        for local in firstRow..<tokensInBatch {
+                            var row = Array(UnsafeBufferPointer(start: rows + local * vocab, count: vocab))
+                            if let softcap { LogitSoftcapProcessor.apply(to: &row, cap: softcap) }
+                            result.logits.append(row)
+                        }
+                    }
+                }
+            }
+
+            // The hidden states of the captured positions, in the order the rows above were taken.
+            if capture != .none, !usePrefill, let hiddenArray {
+                let firstRow = max(0, captureFrom - batchStartToken)
+                let view = hiddenArray.view(as: LogitsScalarType.self)
+                guard let hidden = view.contiguousElements else {
+                    throw InferenceRuntimeError.invalidState(
+                        "hidden_states has a non-contiguous layout — cannot extract values safely")
+                }
+                let width = hidden.count / batchSize
+                result.hiddenDim = width
+                for local in firstRow..<tokensInBatch {
+                    for i in 0..<width { result.hidden.append(Float(hidden[local * width + i])) }
+                }
+            }
+
+            history.append(contentsOf: newInBatch)
+            processedTokenCount = batchEndToken + 1
+        }
+        return result
+    }
+
+    /// Calls `body` with the start of a `[rows, vocab]` logits array read in place, so no row is
+    /// copied until a caller keeps it. The array must be Float16 and contiguous row-major, as the
+    /// graphs produce; anything else is reported, not read through a mismatched pointer.
+    static func withLogitRows(
+        _ array: NDArray, _ body: (UnsafePointer<LogitsScalarType>) -> Void
+    ) throws {
+        guard array.scalarType == .float16 else {
+            throw InferenceRuntimeError.unsupportedLogitsType(
+                "speculative decoding reads Float16 logits, got \(array.scalarType)")
+        }
+        let view = array.view(as: LogitsScalarType.self)
+        let contiguous = view.withUnsafePointer { _, shape, strides in
+            isContiguousRowMajor(shape: shape, strides: strides)
+        }
+        guard contiguous else {
+            throw InferenceRuntimeError.invalidState(
+                "Logits array has non-contiguous (interleaved) layout — cannot extract values safely")
+        }
+        view.withUnsafePointer { ptr, _, _ in body(ptr) }
+    }
+
+    /// Longest block the per-position forwards accept and the decoder can roll back from. The
+    /// widest graph bounds it: a longer block would run through prefill graphs that capture no
+    /// logits. The sliding-window ring bounds it further: rejecting every draft must rewind to
+    /// the anchor, which the ring allows only for blocks up to `SlidingRing.maxVerifyBlockLength`.
+    package var maxVerifyBlockLength: Int {
+        min(
+            maxQueryLength,
+            states.slidingRing?.maxVerifyBlockLength(alignment: verifyTileWidth ?? 1) ?? Int.max)
+    }
+
+    /// Verify batches start on a multiple of the decode width (see `processSpeculativeBlock`): the
+    /// widest `extend_*` rung, not `maxQueryLength`, which includes the prefill rungs.
+    package var verifyTileWidth: Int? {
+        extendFunctionNames.filter { $0.hasPrefix("extend") }
+            .compactMap { Self.parseFunctionDimensions($0)?.queryLength }.max()
+    }
+
+    /// Proposal tokens that fit with the anchor in one forward of the decode graph: the
+    /// anchor sits at the current position, and a block that crosses the next tile boundary
+    /// needs a second forward.
+    package var oneForwardDraftBudget: Int {
+        Self.batchAlignedDraftBudget(
+            batchSize: verifyTileWidth ?? maxQueryLength, anchorPosition: processedTokenCount)
+    }
+
+    /// `batchSize - 1 - (anchorPosition mod batchSize)`: the slots left in the anchor's batch
+    /// window after the anchor itself.
+    static func batchAlignedDraftBudget(batchSize: Int, anchorPosition: Int) -> Int {
+        guard batchSize > 0 else { return 0 }
+        return batchSize - 1 - (anchorPosition % batchSize)
+    }
+
+    // MARK: - Draft head support
+
+    /// Greedy verify of a block, with the hidden states a draft head seeds from when the decode
+    /// graphs emit them.
+    package func forwardProposalGreedy(
+        anchor: Int32, proposal: DraftProposal
+    ) async throws -> (argmax: [Int32], features: DrafterFeatures?) {
+        let start = processedTokenCount
+        let result = try await processSpeculativeBlock([anchor] + proposal.tokens, capture: .argmax)
+        return (result.argmax, Self.features(from: result, startPosition: start))
+    }
+
+    /// Full-logits verify of a block, with the hidden states a draft head seeds from when the decode
+    /// graphs emit them.
+    package func forwardProposal(
+        anchor: Int32, proposal: DraftProposal
+    ) async throws -> (logits: [[LogitsScalarType]], features: DrafterFeatures?) {
+        let start = processedTokenCount
+        let result = try await processSpeculativeBlock([anchor] + proposal.tokens, capture: .fullLogits)
+        return (result.logits, Self.features(from: result, startPosition: start))
+    }
+
+    private static func features(from result: SpecCaptureResult, startPosition: Int) -> DrafterFeatures? {
+        guard result.hiddenDim > 0, !result.hidden.isEmpty else { return nil }
+        return DrafterFeatures(
+            values: result.hidden, positionCount: result.hidden.count / result.hiddenDim,
+            hiddenDim: result.hiddenDim, startPosition: startPosition)
+    }
+
+    /// Width of the backbone's hidden state, which a draft head's inputs are sized from.
+    package var backboneHiddenSize: Int { embeddingTable.shape.last ?? 0 }
+
+    /// Whether the decode graphs emit `hidden_states`, the final hidden state a draft head seeds from
+    /// (an export with `--emit-hidden-states`).
+    package var emitsHiddenStates: Bool {
+        guard let decode = extendFunctionNames.first(where: { $0.hasPrefix(Self.decodeFunctionPrefix + "_") }),
+            let descriptor = try? functionDescriptor(for: decode)
+        else { return false }
+        return descriptor.outputNames.contains(Self.hiddenStatesOutputName)
+    }
+
+    /// The raw token embedding a draft head fuses with the hidden state, read through the asset's
+    /// narrowest gather graph.
+    ///
+    /// `gather_embeddings` returns `embed_tokens(token)` scaled down by the square root of the hidden
+    /// width, which the extend graph applies separately; the draft head wants the unscaled row, so
+    /// the factor is multiplied back in.
+    package func drafterEmbedding(_ token: Int32) async throws -> [Float] {
+        let prefix = "gather_embeddings_"
+        guard
+            let batchSize = gatherFunctionNames.compactMap({ name in
+                name.hasPrefix(prefix) ? Int(name.dropFirst(prefix.count)) : nil
+            }).min()
+        else {
+            throw InferenceRuntimeError.invalidState("the asset has no gather_embeddings graph")
+        }
+        let hidden = backboneHiddenSize
+        guard let gathered = try await runGather(tokenIDs: [token], batchSize: batchSize) else {
+            throw InferenceRuntimeError.invalidState("gather_embeddings returned no output")
+        }
+        let normalizer = Float(Double(hidden).squareRoot())
+        var out = [Float](repeating: 0, count: hidden)
+        gathered.view(as: LogitsScalarType.self).withUnsafePointer { ptr, _, _ in
+            for i in 0..<hidden { out[i] = Float(ptr[i]) * normalizer }  // row 0 holds the requested token
+        }
+        return out
+    }
+
+    /// One shared K/V cache of the last storing layer, read in place: no copy and no layout change.
+    ///
+    /// Element (position slot `r`, channel `d`) is at
+    /// `base[(d / factor) * ctx * factor + r * factor + d % factor]`. The sliding cache is a ring, so
+    /// position `p` lives in slot `p % ctx`; the full-attention cache is addressed by position.
+    package struct SharedKVCache {
+        package let base: UnsafePointer<LogitsScalarType>
+        package let channels: Int
+        package let ctx: Int
+        package let factor: Int
+    }
+
+    package enum SharedKVCacheKind: CaseIterable, Sendable { case fullK, fullV, slidingK, slidingV }
+
+    /// Runs `body` over one shared cache. The pointer is valid only inside `body`.
+    package func withSharedKVCache(
+        _ kind: SharedKVCacheKind, _ body: (SharedKVCache) -> Void
+    ) throws {
+        let name: String
+        switch kind {
+        case .fullK: name = Self.keyCacheName
+        case .fullV: name = Self.valueCacheName
+        case .slidingK: name = SlidingRing.keyCacheName
+        case .slidingV: name = SlidingRing.valueCacheName
+        }
+        guard let array = states.stateArray(named: name) else {
+            throw InferenceRuntimeError.invalidState("no state '\(name)' for shared KV")
+        }
+        let shape = array.shape
+        let channels = shape[2]
+        let ctx = shape[shape.count - 1]
+        let factor = array.interleaveLayout?.factor ?? 1
+        array.view(as: LogitsScalarType.self).withUnsafePointer { ptr, _, _ in
+            body(
+                SharedKVCache(
+                    base: ptr + (shape[0] - 1) * channels * ctx,
+                    channels: channels, ctx: ctx, factor: factor))
+        }
+    }
+
     // MARK: - Inference Helpers
 
     private func buildInputs<Tokens: Collection<Int32>>(
@@ -584,8 +1029,34 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
             batchSize: batchSize,
             slidingWindow: nil,
             contextBucket: contextBucket)
+
+        // Multimodal: HF masks image-placeholder positions to the pad token BEFORE the
+        // per-layer-embedding gather (`llm_input_ids = where(image_mask, pad_token_id,
+        // input_ids)`). The image rows carry vision soft tokens, not a real token, so
+        // gathering the placeholder id's own per-layer embedding would inject a spurious
+        // per-layer signal at every layer and corrupt the image representation. Only the
+        // PLE handler needs this correction — the raw embedding-table gather below is
+        // harmless waste for those rows since the scatter overwrites them afterward.
+        let pleContext: InputContext
+        if let imgId = visionConfig?.imageTokenId, pendingImageEmbeddings != nil {
+            let padId = visionConfig?.padTokenId ?? 0
+            let pleTokens = batchTokens.map { $0 == imgId ? padId : $0 }
+            pleContext = InputContext.static(
+                tokens: ArraySlice(pleTokens),
+                alignedStep: alignedStep,
+                batchSize: batchSize,
+                slidingWindow: config.overrides?.slidingWindow,
+                contextBucket: contextBucket)
+        } else {
+            pleContext = context
+        }
+
         for handler in inputHandlers {
-            try handler.fill(context, into: &inputBuffers)
+            if handler is PerLayerEmbeddingsInputHandler {
+                try handler.fill(pleContext, into: &inputBuffers)
+            } else {
+                try handler.fill(context, into: &inputBuffers)
+            }
         }
         var inputs = inputBuffers.borrowedInputs()
 
@@ -602,11 +1073,14 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
                     "No gather function '\(gatherName)' for batch size \(batchSize)")
             }
             let gatherSpan = InstrumentsProfiler.beginGatherEmbeddings()
-            let gathered = try await runGather(tokenIDs: Array(batchTokens), batchSize: batchSize)
+            let gatherResult = try await runGather(tokenIDs: Array(batchTokens), batchSize: batchSize)
             gatherSpan.end()
-            guard let gathered else {
+            guard var gathered = gatherResult else {
                 throw InferenceRuntimeError.invalidState("Gather '\(gatherName)' returned no output")
             }
+            // Multimodal: overwrite image-placeholder rows in this batch with the encoded
+            // image soft tokens before they enter the decoder.
+            try scatterImageEmbeddings(into: &gathered, alignedStep: alignedStep, batchSize: batchSize)
             inputs[txName] = gathered
         }
 
@@ -664,22 +1138,35 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
             $0?.cancel()
             $0 = nil
         }
+        pendingImageEmbeddings = nil
+        imageTokenPositions = []
     }
 
-    public func reset(to tokenIndex: Int) async throws {
-        precondition(
-            tokenIndex >= 0 && tokenIndex <= processedTokenCount,
-            "reset(to: \(tokenIndex)) out of range [0, \(processedTokenCount)]")
-        _activeToken.withLock {
-            $0?.cancel()
-            $0 = nil
+    /// Throws unless `tokenIndex` names a position the engine has processed (`0...processed`).
+    static func validateResetTarget(_ tokenIndex: Int, processed: Int) throws {
+        guard tokenIndex >= 0, tokenIndex <= processed else {
+            throw InferenceRuntimeError.invalidArgument(
+                "reset(to: \(tokenIndex)) out of range [0, \(processed)]")
         }
-        guard canRewind(to: tokenIndex) else {
+    }
+
+    /// Rewinds to `tokenIndex` processed tokens. Throws, leaving the engine unchanged, when
+    /// the index is out of range or the sliding-window ring no longer holds the keys the
+    /// restarted forward needs.
+    public func reset(to tokenIndex: Int) async throws {
+        try Self.validateResetTarget(tokenIndex, processed: processedTokenCount)
+        guard canRewind(to: tokenIndex, alignment: verifyTileWidth ?? 1) else {
             throw InferenceRuntimeError.invalidState(
                 "reset(to: \(tokenIndex)) needs keys the sliding-window ring has overwritten "
                     + "(\(processedTokenCount) tokens processed). Use reset(to: 0) and replay "
                     + "the prefix.")
         }
+        _activeToken.withLock {
+            $0?.cancel()
+            $0 = nil
+        }
+        pendingImageEmbeddings = nil
+        imageTokenPositions = []
         let resetSpan = InstrumentsProfiler.beginReset(engine: "StaticShape")
         rewind(to: tokenIndex)
         resetSpan.end()
@@ -793,7 +1280,7 @@ extension StaticShapeEngine.GenerationSequence {
         ) {
             self.engine = engine
             self.samplingConfiguration = samplingConfiguration
-            self.returnsLogits = inferenceOptions.includeLogits
+            self.returnsLogits = inferenceOptions.returnsLogits
             self.forcedContinuation = inferenceOptions.forcedContinuation
             self.stopReasonStore = stopReasonStore
             self.generationToken = generationToken
@@ -877,3 +1364,6 @@ extension StaticShapeEngine.GenerationSequence {
         }
     }
 }
+
+// The speculative primitives above are what the decoder verifies with on this engine.
+extension StaticShapeEngine: SpeculativeEngine {}

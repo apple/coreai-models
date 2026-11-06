@@ -265,6 +265,9 @@ class SSMState:
             layer_idx < self._states.size(0),
         )
 
+        if new_state.device != cache.device:
+            new_state = new_state.to(cache.device)
+
         # use the slice_update to update the cache
         layer_index = torch.tensor((layer_idx,), dtype=torch.int32)
         layer_index_end = torch.tensor((layer_idx + 1,), dtype=torch.int32)

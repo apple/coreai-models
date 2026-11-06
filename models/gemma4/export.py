@@ -22,6 +22,14 @@ loop, so the graph depends on the context length. The gather is traced and
 specialized as ``ios.py`` does it. A flat global KV cache pairs with a fixed-depth
 sliding-window ring, RoPE arrives precomputed as ``rope_cos``/``rope_sin``, and the
 INT8 Per-Layer Embeddings table is written as a sidecar next to the asset.
+
+``--include-vision`` runs a post-step (``coreai_models.export.gemma4_vision``) that
+adds a ``vision.aimodel`` encoder to the just-exported bundle and upgrades it to
+``kind:"vlm"``, for the multimodal (image input) checkpoints. The vision encoder is
+itself a ladder of canvas-size buckets (``--vision-image-sizes``), not one fixed
+size: the runner letterboxes an input image into the smallest bucket that fits it
+and masks out the padding, so arbitrary input image shapes are supported without
+upscaling small images or squashing large ones to a single resolution.
 """
 
 import argparse
@@ -116,7 +124,7 @@ def _resolve_eos_token_ids(hf_model_id: str, text_config: Any) -> list[int]:
     return ids
 
 
-def _ios_metadata_extras(text_config: Any) -> dict[str, Any]:
+def _ios_metadata_extras(text_config: Any, emit_hidden_states: bool = False) -> dict[str, Any]:
     """Extra ``language`` metadata the iOS runner needs, grouped under ``overrides``.
 
     * ``sliding_window`` -- the runner builds the windowed mask for the sliding
@@ -130,6 +138,8 @@ def _ios_metadata_extras(text_config: Any) -> dict[str, Any]:
     * ``final_logit_softcapping`` -- ``tanh`` is best run on the CPU rather than in the
       graph, so the iOS graph omits the ``c * tanh(logits / c)`` cap and the runner
       applies it on the CPU between reading the logits and sampling.
+    * ``emits_hidden_states`` -- present (``true``) when the decode graphs also output
+      ``hidden_states`` for a speculative-decoding draft head (``--emit-hidden-states``).
     """
     try:
         rope = text_config.rope_parameters
@@ -151,6 +161,8 @@ def _ios_metadata_extras(text_config: Any) -> dict[str, Any]:
     softcap = getattr(text_config, "final_logit_softcapping", None)
     if softcap:
         overrides["final_logit_softcapping"] = float(softcap)
+    if emit_hidden_states:
+        overrides["emits_hidden_states"] = True
     return {"overrides": overrides}
 
 
@@ -211,6 +223,14 @@ def _resolve_bundle_paths(output_dir: str, output_name: str, overwrite: bool) ->
 # ===========================================================================
 # iOS: per-context blocked ladder of statically-shaped programs
 # ===========================================================================
+
+# Speculative decoding: with --emit-hidden-states, the extend (decode) graphs emit
+# their post-norm final hidden state as a second output so a draft head can consume
+# it, and the bundle records it as `language.overrides.emits_hidden_states`. Off by
+# default; the shipping export is unchanged. The draft head's shared KV is sliced by
+# the runner from the target's existing KV-cache buffers, so no extra KV output is
+# needed.
+HIDDEN_STATES_OUTPUT_NAME = "hidden_states"
 
 # Shipping per-function-type query lengths. Prefill (``prompt_opt``) runs at q=64
 # and decode (``extend``) at q=8. The runner prefills in q=64 chunks while more than
@@ -277,6 +297,7 @@ def _export_programs(
     model: Gemma4ForCausalLMForiOS,
     config,
     buckets: list[int],
+    emit_hidden_states: bool = False,
 ) -> list[tuple[str, str, int, torch.export.ExportedProgram]]:
     """Trace one program per emitted entrypoint.
 
@@ -336,6 +357,9 @@ def _export_programs(
                 (PROMPT_OPT_FUNCTION_NAME, True, SHIPPING_PROMPT_QLENS),
             ):
                 model.set_prefill_mode(prefill)
+                # Prefill returns the cache-slice sentinel (its forward returns early,
+                # before the hidden-state path), so only the decode graph is two-output.
+                model.extend.emit_hidden_states = emit_hidden_states and not prefill
                 for q in qlens:
                     name = f"{entrypoint}_{ctx}_{q}"
                     logger.info(
@@ -364,6 +388,7 @@ async def _convert_to_coreai(
     config,
     gather_qlens: set[int],
     include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
+    emit_hidden_states: bool = False,
 ) -> AIProgram:
     """Convert the traced programs to one AIProgram with iOS constraints.
 
@@ -380,11 +405,15 @@ async def _convert_to_coreai(
     converter = TorchConverter(mode=mode)
     register_custom_torch_lowering(converter)
     for name, graph, _, program in programs:
+        output_names = list(outputs[graph])
+        if emit_hidden_states and name.startswith(f"{EXTEND_FUNCTION_NAME}_"):
+            # Decode graph emits (logits, hidden_state) for speculative decoding.
+            output_names.append(HIDDEN_STATES_OUTPUT_NAME)
         converter.add_exported_program(
             program,
             input_names=list(inputs[graph]),
             state_names=list(states[graph]),
-            output_names=list(outputs[graph]),
+            output_names=output_names,
             entrypoint_name=name,
         )
 
@@ -413,13 +442,16 @@ async def _export_blocked_ladder(
     config,
     max_context_length: int,
     include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
+    emit_hidden_states: bool = False,
 ) -> AIProgram:
     """Export the Gemma4 model as a per-context blocked-flash ladder AIProgram."""
     buckets = context_ladder(max_context_length)
     logger.info(f"iOS context ladder: {buckets}")
-    programs = _export_programs(model, config, buckets)
+    programs = _export_programs(model, config, buckets, emit_hidden_states)
     gather_qlens = set(SHIPPING_EXTEND_QLENS) | set(SHIPPING_PROMPT_QLENS)
-    return await _convert_to_coreai(model, programs, config, gather_qlens, include_debug_info)
+    return await _convert_to_coreai(
+        model, programs, config, gather_qlens, include_debug_info, emit_hidden_states
+    )
 
 
 def _palettization_inputs(model: Gemma4ForCausalLMForiOS, config, max_context_length: int) -> tuple:
@@ -526,6 +558,7 @@ async def _export_ios(args: argparse.Namespace) -> str:
             hf_config,
             max_ctx,
             include_debug_info=args.include_debug_info,
+            emit_hidden_states=args.emit_hidden_states,
         )
 
         del model
@@ -544,10 +577,11 @@ async def _export_ios(args: argparse.Namespace) -> str:
             compression=compression,
             name=output_name,
         )
-        # The iOS runner needs the sliding window, the dual-RoPE table parameters
-        # and the soft cap from `language.overrides`; the PLE sidecar is declared under
-        # `auxiliary_assets`; `assets` is reserved for Core AI models.
-        extras = _ios_metadata_extras(hf_config)
+        # The iOS runner needs the sliding window, the dual-RoPE table parameters and the soft
+        # cap from `language.overrides`, plus `emits_hidden_states` when the decode graphs also
+        # output the final hidden state (`--emit-hidden-states`). The PLE sidecar is declared
+        # under `auxiliary_assets`; `assets` is reserved for Core AI models.
+        extras = _ios_metadata_extras(hf_config, args.emit_hidden_states)
         auxiliary_assets = {"per_layer_embeddings": Path(ple_path).name}
         _patch_language_metadata(
             bundle_path, hf_model_id, hf_config, extras, auxiliary_assets=auxiliary_assets
@@ -560,6 +594,19 @@ async def _export_ios(args: argparse.Namespace) -> str:
 # ===========================================================================
 # CLI
 # ===========================================================================
+
+
+def _int_list(raw: str) -> tuple[int, ...]:
+    """argparse type for a comma-separated positive-int list."""
+    try:
+        values = tuple(int(x) for x in raw.split(",") if x.strip())
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"expected comma-separated integers, got {raw!r}") from exc
+    if not values:
+        raise argparse.ArgumentTypeError("expected at least one integer")
+    if any(v <= 0 for v in values):
+        raise argparse.ArgumentTypeError(f"values must be positive, got {list(values)}")
+    return values
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -613,6 +660,37 @@ def build_parser() -> argparse.ArgumentParser:
         "asset smaller.",
     )
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable DEBUG logging")
+    parser.add_argument(
+        "--emit-hidden-states",
+        action="store_true",
+        help="Also output the decode graphs' final hidden state (hidden_states), which a "
+        "speculative-decoding draft head seeds from (see export_drafter.py), and record it "
+        "in the bundle metadata. Default: off.",
+    )
+    parser.add_argument(
+        "--include-vision",
+        action="store_true",
+        help="Also export the vision encoder as vision.aimodel and upgrade the bundle "
+        "to kind:vlm, for multimodal (image input) Gemma4 checkpoints.",
+    )
+    parser.add_argument(
+        "--vision-image-sizes",
+        type=_int_list,
+        metavar="N[,N...]",
+        default=None,
+        help="Square canvas-size buckets (px) for the vision encoder's size ladder, "
+        "smallest first; the runner letterboxes an input image into the smallest "
+        "bucket that fits it (default: coreai_models.export.gemma4_vision."
+        "SHIPPING_IMAGE_SIZE_LADDER). Each must be a multiple of "
+        "patch_size*pooling_kernel_size (48 for E2B/E4B).",
+    )
+    parser.add_argument(
+        "--vision-compression",
+        default="4bit_weight_palettized_group32",
+        help="Palettization preset for the vision tower (default: "
+        "4bit_weight_palettized_group32, matching the text decoder). Use 'none' to "
+        "ship the fp16 tower.",
+    )
 
     return parser
 
@@ -668,7 +746,34 @@ def main() -> None:
             "performance of the result have not been verified."
         )
 
-    print(f"Export complete: {asyncio.run(_export_ios(args))}")
+    if args.include_vision:
+        from coreai_models.export.gemma4_vision import (
+            SHIPPING_IMAGE_SIZE_LADDER,
+            export_gemma4_vision_encoder,
+            validate_image_sizes_for_model,
+        )
+
+        # Check the size ladder against the checkpoint before the expensive text export.
+        try:
+            validate_image_sizes_for_model(
+                args.model, tuple(args.vision_image_sizes or SHIPPING_IMAGE_SIZE_LADDER)
+            )
+        except ValueError as e:
+            raise SystemExit(str(e)) from e
+
+    bundle_path = asyncio.run(_export_ios(args))
+    print(f"Export complete: {bundle_path}")
+
+    if args.include_vision:
+        logger.info("Exporting Gemma4 vision encoder into the bundle...")
+        export_gemma4_vision_encoder(
+            args.model,
+            Path(bundle_path),
+            image_sizes=tuple(args.vision_image_sizes or SHIPPING_IMAGE_SIZE_LADDER),
+            overwrite=args.overwrite,
+            compression=args.vision_compression,
+        )
+        print(f"Vision encoder added (kind:vlm): {bundle_path}")
 
 
 if __name__ == "__main__":

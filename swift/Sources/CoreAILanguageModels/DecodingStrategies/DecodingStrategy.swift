@@ -73,6 +73,13 @@ public struct StopSequences: Sendable {
         self.maxLength = sequences.map { $0.count }.max() ?? 0
     }
 
+    /// The stops that are one token each, as a JSON-schema grammar takes them: it allows them only
+    /// once the JSON is complete. Nil when there are none. A grammar cannot take longer sequences.
+    public var singleTokenStopIds: [Int32]? {
+        let ids = sequences.filter { $0.count == 1 }.map { $0[0] }
+        return ids.isEmpty ? nil : ids
+    }
+
     /// Initialize with tokenizer, automatically including EOS tokens
     /// - Parameter tokenizer: Tokenizer to extract EOS token from
     /// - Parameter additionalSequences: Optional additional stop sequences to include
@@ -171,7 +178,7 @@ public protocol DecodingStrategy: Sendable {
     ///   - tokenizer: Tokenizer for encoding/decoding
     ///   - inferenceEngine: Engine for model inference
     ///   - samplingConfiguration: Sampling parameters (temperature, topK, etc.)
-    ///   - options: Inference options (maxTokens, includeLogits)
+    ///   - options: Inference options (maxTokens, tokens, logits)
     ///   - stopSequences: Token sequences that halt generation
     /// - Returns: Stream of `GenerationResult` (text + optional logits)
     func decode(

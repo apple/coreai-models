@@ -103,11 +103,22 @@ private func handleAutoRoute(request: Request, state: ServerState) async throws 
 private func handleChatCompletionsFromBody(body: ByteBuffer, state: ServerState, sessionID: String? = nil) async throws
     -> Response
 {
-    // Non-streaming paths release the permit at each return; the streaming path
-    // hands it to the body closure. Release-on-deinit backstops a dropped response.
-    let permit: QueuePermit
+    let chatRequest: ChatCompletionRequest
     do {
-        permit = try await state.queue.acquire()
+        chatRequest = try JSONDecoder().decode(ChatCompletionRequest.self, from: body)
+    } catch {
+        let err = ErrorResponse(error: .init(message: "\(error)", type: "invalid_request_error", code: nil))
+        let data = try JSONEncoder().encode(err)
+        return Response(
+            status: .badRequest, headers: [.contentType: "application/json"],
+            body: .init(byteBuffer: ByteBuffer(data: data)))
+    }
+
+    let lane = BatchServingRouter.lane(
+        hasResponseSchema: chatRequest.responseFormat?.extractedSchema != nil)
+    let access: RequestAccess
+    do {
+        access = try await state.acquireAccess(lane: lane)
     } catch let error as ServerError {
         let err = ErrorResponse(
             error: .init(
@@ -117,31 +128,30 @@ private func handleChatCompletionsFromBody(body: ByteBuffer, state: ServerState,
             status: .tooManyRequests, headers: [.contentType: "application/json"],
             body: .init(byteBuffer: ByteBuffer(data: data)))
     }
-    let chatRequest: ChatCompletionRequest
-    do {
-        chatRequest = try JSONDecoder().decode(ChatCompletionRequest.self, from: body)
-    } catch {
-        permit.release()
-        let err = ErrorResponse(error: .init(message: "\(error)", type: "invalid_request_error", code: nil))
-        let data = try JSONEncoder().encode(err)
-        return Response(
-            status: .badRequest, headers: [.contentType: "application/json"],
-            body: .init(byteBuffer: ByteBuffer(data: data)))
-    }
+
     do {
         let shouldStream = chatRequest.stream ?? false
         if shouldStream {
-            // Ownership of the permit passes to the streaming body closure.
+            // Ownership of the access passes to the streaming body closure.
             return try await handleStreamingRequest(
-                chatRequest: chatRequest, state: state, sessionID: sessionID, permit: permit)
+                chatRequest: chatRequest, state: state, sessionID: sessionID, access: access)
         } else {
             let response = try await handleNonStreamingRequest(
                 chatRequest: chatRequest, state: state, sessionID: sessionID)
-            permit.release()
+            access.release()
             return response
         }
+    } catch let error as InferenceRuntimeError where error.isQueueFull {
+        // Thrown by a full batch scheduler on submit, on both the streaming and non-streaming paths.
+        access.release()
+        let err = ErrorResponse(
+            error: .init(message: error.localizedDescription, type: "server_error", code: "queue_full"))
+        let data = try JSONEncoder().encode(err)
+        return Response(
+            status: .tooManyRequests, headers: [.contentType: "application/json"],
+            body: .init(byteBuffer: ByteBuffer(data: data)))
     } catch let error as ServerError {
-        permit.release()
+        access.release()
         let status: HTTPResponse.Status = error.isBadRequest ? .badRequest : .internalServerError
         let err = ErrorResponse(error: .init(message: "\(error)", type: "invalid_request_error", code: nil))
         let data = try JSONEncoder().encode(err)
@@ -149,7 +159,7 @@ private func handleChatCompletionsFromBody(body: ByteBuffer, state: ServerState,
             status: status, headers: [.contentType: "application/json"], body: .init(byteBuffer: ByteBuffer(data: data))
         )
     } catch {
-        permit.release()
+        access.release()
         let err = ErrorResponse(error: .init(message: "\(error)", type: "server_error", code: nil))
         let data = try JSONEncoder().encode(err)
         return Response(
@@ -223,17 +233,19 @@ func runChatCompletion(chatRequest: ChatCompletionRequest, state: ServerState, s
     let t0 = SuspendingClock().now
 
     let strategy: any DecodingStrategy
-    if let schema = chatRequest.responseFormat?.extractedSchema {
+    let schema = chatRequest.responseFormat?.extractedSchema
+    if let schema {
         CLILogger.log("[\(requestID)] constrained generation (json_schema)", component: "Server")
         strategy = ConstrainedDecodingStrategy(jsonSchema: schema, vocabSize: state.config.vocabSize)
     } else {
         strategy = VanillaDecodingStrategy()
     }
 
+    let lane = BatchServingRouter.lane(hasResponseSchema: schema != nil)
     let stream = try await strategy.decode(
         from: input,
         tokenizer: state.tokenizer,
-        inferenceEngine: state.engine,
+        inferenceEngine: state.engineForRequest(lane: lane),
         samplingConfiguration: samplingConfig,
         options: InferenceOptions(maxTokens: requestMaxTokens),
         stopSequences: stopSequences
@@ -442,31 +454,49 @@ func prepareStreaming(chatRequest: ChatCompletionRequest, state: ServerState, se
         requestMaxTokens: requestMaxTokens, prefixReuseTokens: prefixReused)
 }
 
-/// The streaming generation core, shared by the HTTP SSE handler and `--replay`. Drives the
-/// incremental token loop with per-chunk think/tool parsing, delivering each `Delta` to `emit`,
-/// and returns per-request instrumentation. The caller owns SSE framing: the leading role chunk
-/// and the trailing done/`[DONE]` frames are added by the HTTP handler.
-func runStreamingLoop(
-    prepared: PreparedStream, chatRequest: ChatCompletionRequest, state: ServerState,
-    emit: (ChatCompletionChunk.Delta) async throws -> Void
-) async throws -> StreamingOutcome {
-    let genStart = SuspendingClock().now
+/// Token stream and start time of a streaming decode. On the batched lane the request is already in
+/// the batch scheduler. Iterate `tokens` from one task only.
+struct StartedDecode: @unchecked Sendable {
+    let tokens: any AsyncSequence<GenerationResult, Error>
+    let start: SuspendingClock.Instant
+}
 
+/// Starts decoding `prepared` on the engine for the request's lane, with constrained decoding when
+/// `chatRequest` has a JSON schema. Throws `InferenceRuntimeError.queueFull` when the batch
+/// scheduler is full.
+func startStreamingDecode(
+    prepared: PreparedStream, chatRequest: ChatCompletionRequest, state: ServerState
+) async throws -> StartedDecode {
+    let start = SuspendingClock().now
     let strategy: any DecodingStrategy
-    if let schema = chatRequest.responseFormat?.extractedSchema {
+    let schema = chatRequest.responseFormat?.extractedSchema
+    if let schema {
         strategy = ConstrainedDecodingStrategy(jsonSchema: schema, vocabSize: state.config.vocabSize)
     } else {
         strategy = VanillaDecodingStrategy()
     }
 
-    let tokenStream = try await strategy.decode(
+    let lane = BatchServingRouter.lane(hasResponseSchema: schema != nil)
+    let tokens = try await strategy.decode(
         from: prepared.input,
         tokenizer: state.tokenizer,
-        inferenceEngine: state.engine,
+        inferenceEngine: state.engineForRequest(lane: lane),
         samplingConfiguration: prepared.samplingConfig,
         options: InferenceOptions(maxTokens: prepared.requestMaxTokens),
         stopSequences: prepared.stopSequences
     )
+    return StartedDecode(tokens: tokens, start: start)
+}
+
+/// Iterates `started.tokens`, splits reasoning and tool calls out of the text unless the request is
+/// raw, and passes each `Delta` to `emit`. Records the request in `state.stats` and returns its
+/// timing, token counts and finish reason. Emits no role chunk, finish chunk or `[DONE]` frame.
+func runStreamingLoop(
+    started: StartedDecode, prepared: PreparedStream, chatRequest: ChatCompletionRequest,
+    state: ServerState, emit: (ChatCompletionChunk.Delta) async throws -> Void
+) async throws -> StreamingOutcome {
+    let genStart = started.start
+    let tokenStream = started.tokens
 
     var thinkParser = ThinkTagParser(format: state.thinkingFormat)
     var toolParser = state.makeToolCallParser()
@@ -583,19 +613,21 @@ func runStreamingLoop(
     )
 }
 
+/// Starts a streaming chat completion and returns its SSE response, which releases `access` when
+/// the stream ends. On a throw the caller still owns `access`. Throws `ServerError.badRequest` for
+/// a bad request and `InferenceRuntimeError.queueFull` when the batch scheduler is full.
 private func handleStreamingRequest(
-    chatRequest: ChatCompletionRequest, state: ServerState, sessionID: String? = nil, permit: QueuePermit
+    chatRequest: ChatCompletionRequest, state: ServerState, sessionID: String? = nil, access: RequestAccess
 )
     async throws -> Response
 {
-    // Preflight throws for bad requests before any SSE framing (mapped to HTTP 400 upstream).
     let prepared = try await prepareStreaming(chatRequest: chatRequest, state: state, sessionID: sessionID)
+    let started = try await startStreamingDecode(prepared: prepared, chatRequest: chatRequest, state: state)
     let created = Int(Date().timeIntervalSince1970)
 
     let responseBody = ResponseBody { writer in
-        // The closure owns the permit for the stream's lifetime; release-on-deinit
-        // covers a response the framework drops before entering this closure.
-        defer { permit.release() }
+        // If this closure never runs, the permit and lease release on deinit.
+        defer { access.release() }
         do {
             let encoder = JSONEncoder()
 
@@ -613,7 +645,8 @@ private func handleStreamingRequest(
             try await writeDelta(.init(role: "assistant", content: nil))
 
             let outcome = try await runStreamingLoop(
-                prepared: prepared, chatRequest: chatRequest, state: state, emit: { try await writeDelta($0) })
+                started: started, prepared: prepared, chatRequest: chatRequest, state: state,
+                emit: { try await writeDelta($0) })
 
             try await writeDelta(.init(role: nil, content: nil), finishReason: outcome.finishReason)
             try await writer.write(ByteBuffer(string: "data: [DONE]\n\n"))

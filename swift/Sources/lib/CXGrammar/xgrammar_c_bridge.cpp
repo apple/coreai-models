@@ -48,6 +48,8 @@ XGrammarTokenizerInfo* xgrammar_tokenizer_info_create(
     const char** encoded_vocab,
     int vocab_size,
     XGrammarVocabType vocab_type,
+    const int32_t* stop_token_ids,
+    int stop_token_count,
     bool add_prefix_space
 ) {
     try {
@@ -72,11 +74,16 @@ XGrammarTokenizerInfo* xgrammar_tokenizer_info_create(
                 cpp_vocab_type = VocabType::RAW;
         }
 
+        std::optional<std::vector<int32_t>> stops;
+        if (stop_token_ids != nullptr) {
+            stops = std::vector<int32_t>(stop_token_ids, stop_token_ids + stop_token_count);
+        }
+
         TokenizerInfo tok_info(
             cpp_vocab,
             cpp_vocab_type,
             std::nullopt,  // vocab_size
-            std::nullopt,  // stop_token_ids
+            stops,
             add_prefix_space
         );
 

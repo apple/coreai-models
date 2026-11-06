@@ -12,7 +12,8 @@ independently optimizable functions:
 
   * ``image_encode``  — vision backbone (palettized + fp16)
   * ``text_encode``   — text encoder + projection (palettized + fp16)
-  * ``detect``        — FPN + DETR + mask decoder + scoring (fp16)
+  * ``detect``        — FPN + DETR + mask decoder + scoring (fp16); takes the
+    text ``attention_mask`` so prompt padding is masked out, as in HF
 
 The output is a single ``.aimodel`` bundle directory containing the
 asset, the HF tokenizer, and a ``metadata.json`` (segmenter bundle,
@@ -33,6 +34,7 @@ import torch
 import torch.nn as nn
 
 from coreai_models._constants import DEFAULT_INCLUDE_DEBUG_INFO
+from coreai_models.models.ios.sam3.sam3_reauthored import text_mask_bias
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +69,10 @@ class TextEncoderModule(nn.Module):
 
 
 class DetectorModule(nn.Module):
-    """Wraps FPN + DETR encoder/decoder + mask decoder + scoring for ``detect``."""
+    """Wraps FPN + DETR encoder/decoder + mask decoder + scoring for ``detect``.
+
+    ``attention_mask`` is ``(1, 1, 1, seq)``, 1 for real prompt tokens and 0 for padding.
+    """
 
     def __init__(self, sam3_reauth: nn.Module) -> None:
         super().__init__()
@@ -79,8 +84,12 @@ class DetectorModule(nn.Module):
         self.register_buffer("spatial_shapes", sam3_reauth.spatial_shapes.clone())
 
     def forward(
-        self, backbone_features: torch.Tensor, text_features: torch.Tensor
+        self,
+        backbone_features: torch.Tensor,
+        text_features: torch.Tensor,
+        attention_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        text_bias, text_valid = text_mask_bias(attention_mask, text_features.dtype)
         fpn_hidden_states, fpn_position_encoding = self.fpn(backbone_features)
         fpn_hidden_states_trimmed = fpn_hidden_states[:-1]
         fpn_position_encoding_trimmed = fpn_position_encoding[:-1]
@@ -95,17 +104,20 @@ class DetectorModule(nn.Module):
             vision_feats=vision_bc1s,
             text_feats=text_features,
             vision_pos=pos_bc1s,
+            text_cross_attn_mask=text_bias,
         )
         final_hidden_states, pred_boxes, presence_logits = self.detr_decoder(
             vision_features=encoder_output,
             text_features=text_features,
             vision_pos=pos_bc1s,
             spatial_shapes=self.spatial_shapes,
+            text_cross_attn_mask=text_bias,
         )
         pred_logits = (
             self.scoring(
                 decoder_hidden_states=final_hidden_states.unsqueeze(0),
                 text_features=text_features,
+                text_valid=text_valid,
             )
             .squeeze(-1)
             .squeeze(0)
@@ -115,6 +127,7 @@ class DetectorModule(nn.Module):
             backbone_features=list(fpn_hidden_states_trimmed),
             encoder_hidden_states=encoder_output,
             prompt_features=text_features,
+            prompt_attention_mask=text_bias,
         )
         return (
             mask_outputs["pred_masks"],
@@ -224,6 +237,7 @@ async def _async_export_segmentation(config: SegmentationExportConfig) -> str:
     ids_ref = torch.randint(0, 49408, (1, config.max_text_seq_len), dtype=torch.int32)
     backbone_ref = torch.randn(1, 1024, 1, grid * grid)
     text_feat_ref = torch.randn(1, 256, 1, config.max_text_seq_len)
+    text_mask_ref = torch.ones(1, 1, 1, config.max_text_seq_len)
 
     logger.info(
         "Palettizing image encoder (%d-bit, group_size=%d)...",
@@ -261,7 +275,7 @@ async def _async_export_segmentation(config: SegmentationExportConfig) -> str:
     txt_program = cast_to_16_bit_precision(txt_program)
 
     logger.info("Exporting detect...")
-    det_program = torch.export.export(det, args=(backbone_ref, text_feat_ref))
+    det_program = torch.export.export(det, args=(backbone_ref, text_feat_ref, text_mask_ref))
     det_program = det_program.run_decompositions(coreai_torch.get_decomp_table())
     det_program = cast_to_16_bit_precision(det_program)
 
@@ -288,7 +302,7 @@ async def _async_export_segmentation(config: SegmentationExportConfig) -> str:
     converter.add_exported_program(
         det_program,
         entrypoint_name="detect",
-        input_names=["backbone_features", "text_features"],
+        input_names=["backbone_features", "text_features", "attention_mask"],
         output_names=["pred_masks", "pred_boxes", "pred_logits", "presence_logits", "semantic_seg"],
     )
     coreai_program = converter.to_coreai()
@@ -357,32 +371,56 @@ def _write_bundle_metadata(bundle_dir: Path, asset_filename: str) -> None:
 class FullExportConfig:
     """Configuration for the plain ``transformers.Sam3Model`` export.
 
-    Mirrors what the original ``models/sam3/export.py`` produced before the
-    ANE-targeted lite variant landed: a single-entrypoint ``main`` asset
-    that takes ``(pixel_values, input_ids)`` and returns the five raw
-    ``Sam3Model`` outputs.
+    A single-entrypoint ``main`` asset that takes ``(pixel_values, input_ids,
+    attention_mask)`` and returns the five raw ``Sam3Model`` outputs.
+
+    ``max_text_seq_len`` is the static prompt length. 32 matches HF's
+    ``Sam3Processor`` padding and CLIP's 32 position embeddings.
     """
 
     hf_model_id: str = "facebook/sam3"
     image_size: int = 1008
     dtype: str = "float32"  # "float16" | "float32"
+    max_text_seq_len: int = 32
     output_dir: str = "exports"
     output_name: str | None = None
     overwrite: bool = False
     include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO
 
 
-class _Sam3FullModule(nn.Module):
-    """Wrap ``transformers.Sam3Model`` and return the five detection tensors."""
+#: ``(input_names, output_names)`` of the full ``main`` entrypoint, in ``_Sam3FullModule`` order.
+_FULL_IO: tuple[list[str], list[str]] = (
+    ["pixel_values", "input_ids", "attention_mask"],
+    ["pred_masks", "pred_boxes", "pred_logits", "presence_logits", "semantic_seg"],
+)
 
-    def __init__(self, model_id: str) -> None:
+
+class _Sam3FullModule(nn.Module):
+    """Wrap ``transformers.Sam3Model`` and return the five detection tensors.
+
+    ``attention_mask`` is the tokenizer's ``(1, seq)`` mask, 1 for prompt tokens and 0 for
+    padding; ``Sam3Model`` masks the padding out of every attention over the prompt.
+    """
+
+    def __init__(self, model: nn.Module) -> None:
         super().__init__()
+        self._model = model
+
+    @classmethod
+    def from_pretrained(cls, model_id: str) -> _Sam3FullModule:
         import transformers
 
-        self._model = transformers.Sam3Model.from_pretrained(model_id)
+        return cls(transformers.Sam3Model.from_pretrained(model_id))
 
-    def forward(self, pixel_values: torch.Tensor, input_ids: torch.Tensor):
-        outputs = self._model(pixel_values=pixel_values, input_ids=input_ids)
+    def forward(
+        self,
+        pixel_values: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ):
+        outputs = self._model(
+            pixel_values=pixel_values, input_ids=input_ids, attention_mask=attention_mask
+        )
         return (
             outputs.pred_masks,
             outputs.pred_boxes,
@@ -436,15 +474,23 @@ async def _async_export_full(config: FullExportConfig) -> str:
         config.image_size,
         config.dtype,
     )
-    model = _Sam3FullModule(model_id=config.hf_model_id)
+    model = _Sam3FullModule.from_pretrained(config.hf_model_id)
     model.eval()
     model.to(torch_dtype)
 
+    # Pad the example prompt so the traced graph has a static, padded prompt length and sees a
+    # mask with real padding in it.
     processor = transformers.Sam3Processor.from_pretrained(config.hf_model_id)
-    text_inputs = processor.tokenizer(["dummy"], return_tensors="pt")
+    text_inputs = processor.tokenizer(
+        ["dummy"],
+        padding="max_length",
+        max_length=config.max_text_seq_len,
+        return_tensors="pt",
+    )
     example_inputs = {
         "pixel_values": torch.randn(1, 3, config.image_size, config.image_size).to(torch_dtype),
         "input_ids": text_inputs["input_ids"].to(torch.int32),
+        "attention_mask": text_inputs["attention_mask"].to(torch.int32),
     }
 
     logger.info("Running torch.export...")
@@ -461,14 +507,8 @@ async def _async_export_full(config: FullExportConfig) -> str:
         )
     ).add_exported_program(
         exported_program=exported,
-        input_names=["pixel_values", "input_ids"],
-        output_names=[
-            "pred_masks",
-            "pred_boxes",
-            "pred_logits",
-            "presence_logits",
-            "semantic_seg",
-        ],
+        input_names=_FULL_IO[0],
+        output_names=_FULL_IO[1],
     )
     coreai_program = converter.to_coreai()
 

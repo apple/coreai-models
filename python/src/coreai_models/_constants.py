@@ -26,6 +26,10 @@ VALUE_CACHE_NAME = "valueCache"
 SLIDING_KEY_CACHE_NAME = "slidingKeyCache"
 SLIDING_VALUE_CACHE_NAME = "slidingValueCache"
 
+# Function name of the Gemma 4 draft head's program (one `draft_step_<n>` function per context
+# bucket, plus the `draft_step.json` sidecar and the `draft_step.aimodel` asset).
+DRAFT_STEP_FUNCTION_NAME = "draft_step"
+
 # SSM state names for hybrid attention+SSM models (e.g. Qwen3.5)
 CONV_STATES_NAME = "convStates"
 RECURRENT_STATES_NAME = "recurrentStates"
@@ -72,6 +76,9 @@ OUTPUT_LOGITS_NAME = "out_logits"
 # --include-debug-info flag turns it on (DEBUG mode).
 DEFAULT_INCLUDE_DEBUG_INFO = False
 
+# Additive attention bias of a masked key in the Neural Engine embedding graphs; 0.0 attends.
+MASK_NEG = -30000.0
+
 # Max of the dynamic batch dim for `--attention-mask batched` exports when
 # --dynamic-batch-size is not given.
 DEFAULT_DYNAMIC_MAX_BATCH_SIZE = 8
@@ -80,3 +87,7 @@ DEFAULT_DYNAMIC_MAX_BATCH_SIZE = 8
 METADATA_VERSION = "0.2"
 # Batched LLM bundles use 0.3 (adds the max_batch_size field).
 METADATA_VERSION_BATCHED = "0.3"
+
+# Core AI GPU gathers from a single constant return wrong/zero rows for rows
+# starting at or past this element (apple/coreai-models#313). Tables this large are split.
+MAX_GATHER_CONSTANT_ELEMENTS = 2**31

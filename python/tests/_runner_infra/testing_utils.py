@@ -21,10 +21,14 @@ from __future__ import annotations
 
 import asyncio
 import collections.abc
+import functools
 import inspect
 import os
+import platform
 import re
+import sys
 import tempfile
+import warnings
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -711,7 +715,7 @@ def run_compare_coreai(
     atol: float = 1e-5,
     rtol: float = 1e-5,
 ) -> None:
-    asyncio.run(
+    _run_coreai(
         _asyn_run_compare_coreai(
             model=model,
             inputs=inputs,
@@ -795,7 +799,7 @@ def run_compare_coreai_explicit_kv_cache(
     Assumes inputs are (input_ids, position_ids, k_cache, v_cache).
     Exports, converts, runs Core AI runtime, and compares outputs against torch.
     """
-    asyncio.run(
+    _run_coreai(
         _async_run_compare_coreai_explicit_kv_cache(
             model=model,
             inputs=inputs,
@@ -1481,3 +1485,90 @@ def assert_layer_counts(
         for op, (expected, actual) in sorted(diff.items()):
             error_lines.append(f"  {op}: expected {expected}, got {actual}")
         raise AssertionError("\n".join(error_lines))
+
+
+def macos_version() -> tuple[int, ...]:
+    """The running macOS version, e.g. ``(27, 0)``; ``()`` when not on macOS."""
+    release = platform.mac_ver()[0] if sys.platform == "darwin" else ""
+    return tuple(int(part) for part in release.split(".")) if release else ()
+
+
+def uses_os_coreai() -> bool:
+    """Whether Core AI runs on the macOS framework rather than the bundled runtime."""
+    import coreai.runtime
+
+    return bool(getattr(coreai.runtime, "_use_os_coreai", False))
+
+
+def skip_os_coreai_below_macos(version: tuple[int, ...], reason: str) -> None:
+    """Skip the calling test on the macOS Core AI framework older than ``version``."""
+    current = macos_version()
+    if uses_os_coreai() and current < version:
+        have, need = ".".join(map(str, current)), ".".join(map(str, version))
+        pytest.skip(f"macOS {have} < {need}: {reason}")
+
+
+MACOS_27_KNOWN_ISSUE = "known issue on macOS 27.x"
+
+
+# Part of the RuntimeError Core AI raises when the Neural Engine refuses to load a program.
+_NEURAL_ENGINE_LOAD_ERROR = "createProgramInstanceForModel"
+
+
+def is_neural_engine_load_error(error: BaseException) -> bool:
+    """Whether ``error`` is the Neural Engine refusing to load a program."""
+    return _NEURAL_ENGINE_LOAD_ERROR in str(error)
+
+
+def _neural_engine_probe_program() -> AIProgram:
+    # Built like test_gemma3_mlp[f16], which Core AI places on the Neural Engine.
+    from coreai_models.models.macos.gemma3_text import MLP as Gemma3MLP
+
+    from .export.exporters.coreai_exporter import CoreaiExporter
+
+    torch.manual_seed(0)
+    model = Gemma3MLP(dim=4, hidden_dim=6).to(torch.float16).eval()
+    return CoreaiExporter().export(model, {"x": torch.randn(2, 2, 4, dtype=torch.float16)})
+
+
+async def _async_load_main(program: AIProgram) -> None:
+    with tempfile.TemporaryDirectory(suffix=".aimodel") as tmpdir:
+        asset = program.save_asset(Path(tmpdir))
+        async with asset.executable() as aimodel:
+            aimodel.load_function("main")
+
+
+def skip_if_neural_engine_refused(error: BaseException) -> None:
+    """Skip the calling test if ``error`` is a Neural Engine load refusal on a machine
+    where the probe is refused too; otherwise return so the caller raises."""
+    if is_neural_engine_load_error(error) and not neural_engine_available():
+        pytest.skip(MACOS_27_KNOWN_ISSUE)
+
+
+def _run_coreai(coroutine: collections.abc.Coroutine[Any, Any, None]) -> None:
+    """``asyncio.run`` for the Core AI compare helpers, with the Neural Engine skip."""
+    try:
+        asyncio.run(coroutine)
+    except RuntimeError as error:
+        skip_if_neural_engine_refused(error)
+        raise
+
+
+@functools.cache
+def neural_engine_available() -> bool:
+    """Whether Core AI can load a program onto the Neural Engine on this machine.
+
+    Loads a tiny f16 Gemma3 MLP, which Core AI places on the Neural Engine.
+    Returns False only when that load is refused; any other error is reported as
+    a warning and treated as available, so the test that hits it still fails
+    with its own error.
+    """
+    if sys.platform != "darwin":
+        return False
+    try:
+        asyncio.run(_async_load_main(_neural_engine_probe_program()))
+    except RuntimeError as error:
+        if is_neural_engine_load_error(error):
+            return False
+        warnings.warn(f"Neural Engine probe failed for another reason: {error}", stacklevel=2)
+    return True

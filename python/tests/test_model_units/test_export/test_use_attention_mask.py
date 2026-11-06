@@ -20,6 +20,10 @@ from coreai_models.export.pipeline import AttentionMaskMode, ExportConfig
 from coreai_models.llm.export import _resolve_export_config, build_parser
 
 
+def test_mode_values() -> None:
+    assert [mode.value for mode in AttentionMaskMode] == ["default", "batched", "paged"]
+
+
 def test_defaults() -> None:
     config = ExportConfig(hf_model_id="org/model")
     assert config.attention_mask_mode is AttentionMaskMode.DEFAULT
@@ -34,6 +38,16 @@ def test_batched_emits_mask_and_defaults_batch_to_8() -> None:
     )
     assert config.emits_attn_mask is True
     assert config.dynamic_max_batch_size == 8
+
+
+def test_allows_explicit_dynamic_batch_on_macos() -> None:
+    config = ExportConfig(
+        hf_model_id="org/model",
+        variant="macOS",
+        attention_mask_mode=AttentionMaskMode.BATCHED,
+        dynamic_max_batch_size=4,
+    )
+    assert config.dynamic_max_batch_size == 4
 
 
 def test_rejects_batched_mask_on_ios() -> None:
@@ -64,6 +78,18 @@ def test_rejects_dynamic_batch_without_attn_mask() -> None:
     """A dynamic batch without a batched attn_mask would trace a graph the runtime can't serve."""
     with pytest.raises(ValueError, match="requires attention_mask_mode=BATCHED"):
         ExportConfig(hf_model_id="org/model", variant="macOS", dynamic_max_batch_size=8)
+
+
+def test_cli_accepts_each_mode() -> None:
+    assert build_parser().parse_args(["qwen3-0.6b"]).attention_mask == "default"
+    for value in ("default", "batched", "paged"):
+        args = build_parser().parse_args(["qwen3-0.6b", "--attention-mask", value])
+        assert args.attention_mask == value
+
+
+def test_cli_rejects_unknown_mode() -> None:
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["qwen3-0.6b", "--attention-mask", "bogus"])
 
 
 def test_cli_resolves_attention_mask_onto_config() -> None:

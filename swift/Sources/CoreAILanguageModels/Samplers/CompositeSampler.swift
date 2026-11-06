@@ -216,7 +216,7 @@ public struct CompositeSampler {
     /// Vectorized softmax using vDSP. Operates in-place on the entire buffer.
     /// Numerically stable: subtracts max before exp. Handles `-.infinity` positions
     /// naturally (`exp(-inf) = 0`).
-    private static func softmaxVectorized(_ logits: inout [Float]) {
+    static func softmaxVectorized(_ logits: inout [Float]) {
         let n = vDSP_Length(logits.count)
 
         var maxLogit: Float = 0
@@ -237,7 +237,7 @@ public struct CompositeSampler {
 
     /// Multinomial sample from a normalized probability distribution via inverse CDF scan.
     /// Positions with probability `0` never advance the cumulative sum and are never selected.
-    private static func multinomialSample(
+    static func multinomialSample(
         _ probs: [Float],
         using rng: inout some RandomNumberGenerator
     ) -> Int {

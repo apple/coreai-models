@@ -30,7 +30,7 @@ from coreai_models._constants import (
     RECURRENT_STATES_NAME,
 )
 from coreai_models._hf import resolve_rope_theta
-from coreai_models.models.base import BaseForCausalLM, TraceSpec
+from coreai_models.models.base import BaseForCausalLM, EagerState, TraceSpec
 from coreai_models.primitives.macos.cache import DeltaNetCache, KVCache
 from coreai_models.primitives.macos.mlp import MLP
 from coreai_models.primitives.macos.rms_norm import RMSNormGated
@@ -202,6 +202,9 @@ class GatedDeltaNet(nn.Module):
             # below. Only the older conv_kernel_size - 1 rows are history for this step.
             conv_state = cache.conv_states[self.cache_layer_idx].narrow(1, 1, conv_kernel_size - 1)
             recurrent_state = cache.recurrent_states[self.cache_layer_idx]
+            if conv_state.device != mixed_qkv.device:
+                conv_state = conv_state.to(mixed_qkv.device)
+                recurrent_state = recurrent_state.to(mixed_qkv.device)
         else:
             conv_state = torch.zeros(B, conv_kernel_size - 1, self.conv_dim, dtype=x.dtype)
             recurrent_state = torch.zeros(
@@ -212,10 +215,12 @@ class GatedDeltaNet(nn.Module):
         conv_input = torch.cat([conv_state, mixed_qkv], dim=1)
 
         if cache is not None:
-            # Trailing conv_kernel_size tokens, already in the cache's layout.
+            # Trailing conv_kernel_size tokens, already in the cache's layout. Indexed
+            # from the end: an explicit `S - 1` gets attributed to the `torch.cat` above,
+            # which breaks graph-mode quantization.
             cache.update_conv_state(
                 self.cache_layer_idx,
-                conv_input.narrow(1, S - 1, conv_kernel_size),
+                conv_input.narrow(1, -conv_kernel_size, conv_kernel_size),
             )
 
         # The depthwise causal conv as conv_kernel_size scaled shifts, channels-last
@@ -358,8 +363,6 @@ class Qwen3_5ForCausalLM(BaseForCausalLM):
     _extra_hf_shared_keys = ["lm_head.weight"]
     # Hybrid: states are sized per layer type, so a plain layer-count cut isn't supported.
     supports_num_layers = False
-    # coreai-opt's graph-mode prepare rejects the GatedDeltaNet source partition.
-    supports_graph_quantization = False
 
     # Emit a second, prefill-only ``prefill`` entrypoint beside ``main``. Every state this
     # model carries is written by an in-place update, so all four survive the trim that
@@ -455,6 +458,16 @@ class Qwen3_5ForCausalLM(BaseForCausalLM):
         return KVCache.create_cache_tensors(
             cls._kv_sized_config(config), dtype=dtype, seq_len=seq_len
         )
+
+    @override
+    def new_eager_state(
+        self, *, dtype: torch.dtype, device: torch.device | str, max_seq_len: int | None = None
+    ) -> EagerState:
+        """The KV pair, then the conv and recurrent states: the order ``forward`` takes them."""
+        with torch.device(device):
+            kv = self.create_kv_cache_tensors(self.config, dtype=dtype, seq_len=max_seq_len)
+            delta = self.create_delta_cache_tensors(self.config, dtype=dtype)
+        return EagerState((*kv, *delta))
 
     @classmethod
     def create_delta_cache_tensors(

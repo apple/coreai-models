@@ -362,6 +362,15 @@ _METADATA: dict[str, AIModelMetadataFields] = {
             "Source: https://huggingface.co/Efficient-Large-Model/Sana_Sprint_0.6B_1024px_diffusers"
         ),
     ),
+    "Efficient-Large-Model/Sana_Sprint_1.6B_1024px_diffusers": AIModelMetadataFields(
+        author="NVIDIA, Sana",
+        license="Apache-2.0",
+        model_description=(
+            "Sana Sprint 1.6B is a few-step (1-4) text-to-image linear-attention "
+            "diffusion transformer distilled from Sana, generating 1024×1024 images. "
+            "Source: https://huggingface.co/Efficient-Large-Model/Sana_Sprint_1.6B_1024px_diffusers"
+        ),
+    ),
     # ---- Segmentation ----
     "facebook/sam3": AIModelMetadataFields(
         author="N. Carion et al.",
@@ -371,6 +380,35 @@ _METADATA: dict[str, AIModelMetadataFields] = {
             "images and videos. It can detect, segment, and track objects using "
             "text or visual prompts such as points, boxes, and masks. "
             "Source: https://github.com/facebookresearch/sam3"
+        ),
+    ),
+    # ---- Embedding ----
+    "openai/clip-vit-base-patch32": AIModelMetadataFields(
+        author="A. Radford et al.",
+        license="MIT",
+        model_description=(
+            "CLIP (Contrastive Language-Image Pretraining) learns joint representations of "
+            "images and text, enabling zero-shot image classification with natural language "
+            "labels. Source: https://huggingface.co/openai/clip-vit-base-patch32"
+        ),
+    ),
+    "laion/clap-htsat-unfused": AIModelMetadataFields(
+        author="Y. Wu et al.",
+        license="Apache-2.0",
+        model_description=(
+            "CLAP (Contrastive Language-Audio Pretraining) learns joint representations of "
+            "audio and text, enabling zero-shot audio classification with natural language "
+            "labels. Source: https://huggingface.co/laion/clap-htsat-unfused"
+        ),
+    ),
+    "google/embeddinggemma-2": AIModelMetadataFields(
+        author="Google DeepMind",
+        license="Apache-2.0",
+        model_description=(
+            "EmbeddingGemma 2 is a multimodal retrieval embedding model from Google DeepMind "
+            "producing 768-d L2-normalized vectors (Matryoshka prefixes 512/256/128) for text "
+            "and images in one space. "
+            "Source: https://huggingface.co/google/embeddinggemma-2"
         ),
     ),
 }

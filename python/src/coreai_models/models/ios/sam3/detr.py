@@ -544,7 +544,7 @@ class DETRDecoderReauthored(nn.Module):
         text_features: torch.Tensor,
         vision_pos: torch.Tensor,
         spatial_shapes: torch.Tensor | None = None,
-        text_mask: torch.Tensor | None = None,
+        text_cross_attn_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size = vision_features.shape[0]
 
@@ -556,15 +556,6 @@ class DETRDecoderReauthored(nn.Module):
 
         hidden_bsc = torch.cat([presence_token, query_embeds], dim=1)
         hidden_states = hidden_bsc.permute(0, 2, 1).unsqueeze(2)
-
-        text_cross_attn_mask = None
-        if text_mask is not None:
-            inv_mask = (~text_mask).to(dtype=vision_features.dtype) * (-40000.0)
-            text_cross_attn_mask = (
-                inv_mask.unsqueeze(1)
-                .unsqueeze(1)
-                .expand(-1, self.num_heads, hidden_states.shape[3], -1)
-            )
 
         normed_hs = None
         new_ref = None

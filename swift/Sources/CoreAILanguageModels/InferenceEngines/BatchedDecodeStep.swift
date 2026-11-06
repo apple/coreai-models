@@ -5,8 +5,9 @@
 
 // MARK: - Batched Decode Step
 
-/// Runs one forward pass over the `N` rows of a batch KV cache and returns each row's last-token
-/// logits. Sampling, stop handling and admission stay with the caller.
+/// Batched forward passes over the `N` rows of a batch KV cache: admitting a row, decoding all rows,
+/// and reading logits at every position. Sampling, stop handling and admission order stay with the
+/// caller.
 ///
 /// The caller tracks each row's cursor. Neither method advances `session.processedTokenCount`.
 ///
@@ -45,4 +46,15 @@ protocol BatchedDecodeStep {
         promptTokens: [Int32],
         session: GenerationSessionState
     ) async throws -> [LogitsScalarType]
+
+    /// Runs `tokensPerRow` (`[N][q]`, every row at `startPosition`) and returns the logits at every
+    /// position, flat row-major `[N, q, vocab]`.
+    func allPositionLogits(
+        tokensPerRow: [[Int32]],
+        startPosition: Int,
+        session: GenerationSessionState
+    ) async throws -> [LogitsScalarType]
+
+    /// Creates a session whose KV cache holds `batchSize` rows, at most `maxBatchCapacity`.
+    func makeSessionState(batchSize: Int) throws -> GenerationSessionState
 }

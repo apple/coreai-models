@@ -77,10 +77,12 @@ public struct EngineFactory: Sendable {
     /// Creates an inference engine from a parsed language bundle.
     ///
     /// Handles bundles that ship more than one asset. A vision-language bundle (`kind == .vlm`)
-    /// carries three components — vision, embedding, and a `main` decoder that consumes those
-    /// embeddings — and builds the sequential VLM engine. The `.vlm` kind in the metadata names
-    /// the modality, so the factory keys on it directly. Every other kind resolves its `main`
-    /// asset and hands off to ``createEngine(config:modelURL:options:)``.
+    /// carries a vision component and a `main` decoder, plus an embedding component when
+    /// `vision.token_merge` is `separate_embedding`. That field decides the engine:
+    /// `CoreAISequentialEngine` for `separate_embedding` (and bundles that predate the field), the
+    /// static-shape engine for `decoder_gather`. A variant override must name that engine
+    /// (`coreai-sequential` or `static-shape`). Every other kind resolves its `main` asset and hands
+    /// off to ``createEngine(config:modelURL:options:)``.
     ///
     /// - Parameters:
     ///   - bundle: The parsed language bundle (LLM or VLM).
@@ -96,8 +98,19 @@ public struct EngineFactory: Sendable {
         let languageModelURL = try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.main)
 
         if bundle.modelBundle.kind == .vlm {
-            return try await makeVLMEngine(
-                bundle: bundle, languageModelURL: languageModelURL, options: options)
+            guard let visionConfig = bundle.visionConfig else {
+                throw InferenceRuntimeError.invalidArgument(
+                    "VLM bundle missing 'vision' config in metadata.json")
+            }
+            try validateVLMVariant(options.variant, tokenMerge: visionConfig.tokenMerge)
+            switch visionConfig.tokenMerge {
+            case .decoderGather:
+                return try await makeStaticShapeVLMEngine(
+                    bundle: bundle, languageModelURL: languageModelURL, options: options)
+            case .separateEmbedding:
+                return try await makeVLMEngine(
+                    bundle: bundle, languageModelURL: languageModelURL, options: options)
+            }
         }
 
         // The bundle knows its own sidecars; assets passed explicitly still win.
@@ -146,9 +159,32 @@ public struct EngineFactory: Sendable {
         return VLMModelConfig(base: baseConfig, visionConfig: visionConfig)
     }
 
-    /// Build the sequential VLM engine: assemble the config, prepare the three components, and
-    /// construct the engine. Components are prepared one at a time to keep Core AI specialization
-    /// stable.
+    /// Build the static-shape engine with a vision encoder, for a ladder VLM whose decoder
+    /// embeds tokens itself (no `embedding` component).
+    private static func makeStaticShapeVLMEngine(
+        bundle: LanguageModelBundle,
+        languageModelURL: URL,
+        options: EngineOptions
+    ) async throws -> any InferenceEngine {
+        guard let visionConfig = bundle.visionConfig else {
+            throw InferenceRuntimeError.invalidArgument(
+                "VLM bundle missing 'vision' config in metadata.json")
+        }
+        let visionModelURL = try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.vision)
+
+        CLILogger.log("EngineFactory: Creating static-shape vision-language engine for \(bundle.name)")
+
+        return try await StaticShapeEngine(
+            configuration: ModelConfig(bundle: bundle),
+            modelURL: languageModelURL,
+            tensorData: bundle.tensorData.merging(options.tensorData) { _, explicit in explicit },
+            visionModelURL: visionModelURL,
+            visionConfig: visionConfig
+        )
+    }
+
+    /// Build `CoreAISequentialEngine` for a separate-embedding VLM: assemble the config, prepare the three components, and construct the engine with its vision
+    /// components. Components are prepared one at a time to keep Core AI specialization stable.
     private static func makeVLMEngine(
         bundle: LanguageModelBundle,
         languageModelURL: URL,
@@ -167,13 +203,33 @@ public struct EngineFactory: Sendable {
         let embedModel = try await PreparedModel.prepare(at: embeddingModelURL)
         let llmModel = try await PreparedModel.prepare(at: languageModelURL)
 
-        return try await CoreAISequentialVLMEngine(
-            config: vlmConfig,
-            visionModel: visionModel,
-            embedModel: embedModel,
-            llmModel: llmModel,
-            options: options
+        return try await CoreAISequentialEngine(
+            config: vlmConfig.base,
+            preparedModel: llmModel,
+            options: options,
+            vision: CoreAISequentialEngine.VisionComponents(
+                visionModel: visionModel, embedModel: embedModel, visionConfig: vlmConfig.visionConfig)
         )
+    }
+
+    /// Checks the variant override for a VLM. Each token-merge mode runs on one engine: a
+    /// separate-embedding VLM on `coreai-sequential`, a decoder-gather VLM on `static-shape`.
+    /// Auto-detection and that engine's variant pass; any other variant throws
+    /// `unsupportedEngineVariant`.
+    static func validateVLMVariant(_ override: String?, tokenMerge: VisionTokenMerge) throws {
+        guard let override, override != "auto", override != "default" else {
+            return
+        }
+        guard let variant = Variant(rawValue: override) else {
+            throw InferenceRuntimeError.unsupportedEngineVariant(
+                "Unknown variant '\(override)'. Valid: auto, coreai-sequential, coreai-pipelined, static-shape")
+        }
+        let supported: Variant = tokenMerge == .separateEmbedding ? .sequential : .staticShape
+        guard variant == supported else {
+            throw InferenceRuntimeError.unsupportedEngineVariant(
+                "Variant '\(override)' does not run \(tokenMerge.rawValue) vision-language models; "
+                    + "use \(supported.rawValue)")
+        }
     }
 
     // MARK: - Config Parsing
@@ -208,10 +264,12 @@ public struct EngineFactory: Sendable {
     // MARK: - Variant Resolution
 
     /// Resolves the engine variant based on override or auto-detection.
-    // Internal for EngineSupportTests.
     ///
-    /// A dynamic graph with an `attn_mask` input resolves to the sequential engine, which is the
-    /// only engine that fills the mask.
+    /// `takesAttentionMask` is true when the graph has an `attn_mask` input. Auto-detection picks
+    /// `.sequential` for a dynamic graph with one. Throws `unsupportedEngineVariant` for an unknown
+    /// or incompatible override, including `coreai-pipelined` on a dynamic graph with an `attn_mask`
+    /// input.
+    // Internal for EngineSupportTests.
     static func resolveVariant(
         override: String?,
         detectedStructure: ModelStructure,

@@ -28,6 +28,7 @@ from coreai_models._constants import (
     DEFAULT_DYNAMIC_MAX_BATCH_SIZE,
     DEFAULT_INCLUDE_DEBUG_INFO,
     IOS_DEFAULT_MAX_CONTEXT_LENGTH,
+    MAX_GATHER_CONSTANT_ELEMENTS,
     TRACE_KV_CACHE_SEQ_LEN,
 )
 from coreai_models.export.bundle import bundle_llm_asset
@@ -319,8 +320,24 @@ def resolve_model(config: ExportConfig) -> ResolvedModel:
     )
 
 
+def warn_on_oversized_gather_tables(model: torch.nn.Module) -> None:
+    """Warn about embedding tables a GPU gather would read incorrectly (#313)."""
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.Embedding):
+            numel = module.weight.numel()
+            if numel >= MAX_GATHER_CONSTANT_ELEMENTS:
+                logger.warning(
+                    f"Embedding '{name}' has {numel} elements (>= 2**31); GPU gathers "
+                    "from it return wrong rows for rows starting past element 2**31. "
+                    "Split it along the feature axis into smaller constants."
+                )
+
+
 def build_model(
-    resolved: ResolvedModel, temp_dir: str | None = None, export_backend: object | None = None
+    resolved: ResolvedModel,
+    temp_dir: str | None = None,
+    export_backend: object | None = None,
+    device: str | torch.device | None = None,
 ) -> BuiltModel:
     """Load ``resolved``'s weights and apply its compression.
 
@@ -329,6 +346,8 @@ def build_model(
             them in RAM.
         export_backend: The backend coreai-opt finalizes quantized or palettized weights for.
             None is Core AI.
+        device: Device for graph-mode quantization. The exported graph bakes in its device.
+            None keeps the model on CPU.
     """
     config, entry, model_class = resolved.config, resolved.entry, resolved.model_class
     hf_config, target_dtype = resolved.hf_config, resolved.target_dtype
@@ -415,7 +434,10 @@ def build_model(
             quantizer_mmap_dir = os.path.join(temp_dir, "quantized")
             os.makedirs(quantizer_mmap_dir, exist_ok=True)
 
-        if graph_mode and export_backend is None:
+        if graph_mode and device is not None:
+            model = model.to(device)
+
+        if graph_mode:
             patch_model_for_externalization(model)
             # externalization patches live on the eager module's composite op
             # submodules but quantize_for_export in graph-mode below returns a
@@ -516,6 +538,7 @@ async def _async_export_model(config: ExportConfig) -> str:
 
     with temp_dir_ctx as temp_dir:
         model, externalized_model = build_model(resolved, temp_dir)
+        warn_on_oversized_gather_tables(model)
 
         # ---- 4. Variant-specific export ----
         if config.variant == "macOS":

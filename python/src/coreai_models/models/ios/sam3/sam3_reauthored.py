@@ -12,7 +12,7 @@ forward pass that mirrors the IO of HF ``Sam3Model``.
 Usage:
     model = Sam3Lite.from_pretrained("facebook/sam3", image_size=336)
     pred_masks, pred_boxes, pred_logits, presence_logits, semantic_seg =
-     model(pixel_values, input_ids)
+     model(pixel_values, input_ids, attention_mask)
 """
 
 import torch
@@ -42,6 +42,19 @@ def _linear_to_conv2d(linear: nn.Linear) -> nn.Conv2d:
     return conv
 
 
+def text_mask_bias(
+    attention_mask: torch.Tensor, dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Turn a ``(B, seq)`` or ``(B, 1, 1, seq)`` text mask (1 = token, 0 = padding) into
+    ``(bias, valid)``, both ``(B, 1, 1, seq)``: an additive attention bias that is
+    ``-40000.0`` on padding, and the 0/1 weights for the scoring head's masked mean.
+    """
+    valid = attention_mask.reshape(attention_mask.shape[0], 1, 1, -1).to(dtype)
+    one = torch.tensor(1.0, dtype=dtype, device=valid.device)
+    neg = torch.tensor(40000.0, dtype=dtype, device=valid.device)
+    return (valid - one) * neg, valid
+
+
 class Sam3Lite(nn.Module):
     """SAM3 Lite model for iOS (palettized).
 
@@ -51,6 +64,9 @@ class Sam3Lite(nn.Module):
     Inputs:
         pixel_values: (B, 3, image_size, image_size) float tensor.
         input_ids: (B, seq_len) int32 token IDs.
+        attention_mask: optional (B, seq_len) mask, 1 for real tokens and 0 for
+            padding, as returned by the tokenizer. Without it the padding slots
+            are attended to, which changes the scores and masks (HF masks them).
 
     Outputs:
         Tuple ``(pred_masks, pred_boxes, pred_logits, presence_logits, semantic_seg)``.
@@ -81,6 +97,7 @@ class Sam3Lite(nn.Module):
         self,
         pixel_values: torch.Tensor,
         input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         backbone_features = self.image_encoder(pixel_values)
 
@@ -90,6 +107,10 @@ class Sam3Lite(nn.Module):
 
         text_hidden_states = self.text_encoder(input_ids)
         text_features = self.text_projection(text_hidden_states)
+
+        text_bias = text_valid = None
+        if attention_mask is not None:
+            text_bias, text_valid = text_mask_bias(attention_mask, text_features.dtype)
 
         vision_level2 = fpn_hidden_states_trimmed[-1]
         B = vision_level2.shape[0]
@@ -102,6 +123,7 @@ class Sam3Lite(nn.Module):
             vision_feats=vision_bc1s,
             text_feats=text_features,
             vision_pos=pos_bc1s,
+            text_cross_attn_mask=text_bias,
         )
 
         final_hidden_states, pred_boxes, presence_logits = self.detr_decoder(
@@ -109,12 +131,14 @@ class Sam3Lite(nn.Module):
             text_features=text_features,
             vision_pos=pos_bc1s,
             spatial_shapes=self.spatial_shapes,
+            text_cross_attn_mask=text_bias,
         )
 
         pred_logits = (
             self.scoring(
                 decoder_hidden_states=final_hidden_states.unsqueeze(0),
                 text_features=text_features,
+                text_valid=text_valid,
             )
             .squeeze(-1)
             .squeeze(0)
@@ -125,6 +149,7 @@ class Sam3Lite(nn.Module):
             backbone_features=list(fpn_hidden_states_trimmed),
             encoder_hidden_states=encoder_output,
             prompt_features=text_features,
+            prompt_attention_mask=text_bias,
         )
         pred_masks = mask_outputs["pred_masks"]
         semantic_seg = mask_outputs["semantic_seg"]

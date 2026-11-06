@@ -7,8 +7,8 @@ import CoreAILMCommon
 import Foundation
 import Testing
 
-/// Coverage for the shared replay JSONL format: request decoding (reusing
-/// `ChatCompletionRequest`), multi-line parsing with ordering, and result encoding.
+/// Coverage for the shared replay JSONL format: request decoding (chat and completion bodies),
+/// multi-line parsing with ordering, and result encoding.
 struct ReplayTypesTests {
     @Test("A replay request line decodes, wrapping a ChatCompletionRequest")
     func requestDecodes() throws {
@@ -19,9 +19,43 @@ struct ReplayTypesTests {
         #expect(req.id == "r1")
         #expect(req.session == "A")
         #expect(req.t == 1.5)
-        #expect(req.request.seed == 7)
-        #expect(req.request.maxTokens == 32)
-        #expect(req.request.messages.count == 1)
+        guard case .chat(let chat) = req.body else {
+            Issue.record("expected a chat body")
+            return
+        }
+        #expect(chat.seed == 7)
+        #expect(chat.maxTokens == 32)
+        #expect(chat.messages.count == 1)
+    }
+
+    @Test("A completion line decodes token-id prompts")
+    func completionRequestDecodes() throws {
+        let line = #"{"id":"d0","completion":{"prompt":[[1,2,3],[3,4]],"logprobs":0,"echo":false}}"#
+        let req = try JSONDecoder().decode(ReplayRequest.self, from: Data(line.utf8))
+        #expect(req.id == "d0")
+        #expect(!req.isStreaming)
+        guard case .completion(let completion) = req.body else {
+            Issue.record("expected a completion body")
+            return
+        }
+        #expect(completion.prompts.count == 2)
+        #expect(completion.logprobs == 0)
+        guard case .tokenIds(let ids) = completion.prompts[0] else {
+            Issue.record("expected token-id prompts")
+            return
+        }
+        #expect(ids == [1, 2, 3])
+    }
+
+    @Test("A line needs exactly one of request or completion")
+    func requestRequiresExactlyOneBody() {
+        let neither = #"{"id":"x"}"#
+        let both = #"{"request":{"messages":[{"role":"user","content":"hi"}]},"completion":{"prompt":"hi"}}"#
+        for line in [neither, both] {
+            #expect(throws: DecodingError.self) {
+                try JSONDecoder().decode(ReplayRequest.self, from: Data(line.utf8))
+            }
+        }
     }
 
     @Test("parseRequests skips blanks and comments and orders by timestamp")
@@ -102,6 +136,26 @@ struct ReplayTypesTests {
         let json = try ReplayIO.encodeResult(result)
         #expect(json.contains(#""error":"boom""#))
         #expect(!json.contains(#""choices""#))
+    }
+
+    @Test("A scored result encodes completion choices")
+    func scoredResultEncodes() throws {
+        let logprobs = CompletionResponse.LogprobsResult(
+            tokens: ["a", "b", "a"], tokenLogprobs: [nil, -0.5, -1.25], topLogprobs: [nil, nil, nil],
+            textOffset: [0, 1, 2])
+        let choice = CompletionResponse.CompletionChoice(index: 0, text: "", logprobs: logprobs, finishReason: "stop")
+        let result = ReplayResult(
+            id: "d0", session: nil, t: nil, completionChoices: [choice], promptTokens: 2, totalMs: 4.0)
+        let json = try ReplayIO.encodeResult(result)
+        #expect(json.contains(#""choices":[{"#))
+        #expect(json.contains(#""token_logprobs":[null,-0.5,-1.25]"#))
+        #expect(json.contains(#""text_offset":[0,1,2]"#))
+        #expect(json.contains(#""prompt_tokens":2"#))
+        #expect(json.contains(#""completion_tokens":0"#))
+        #expect(json.contains(#""ttft_ms":4"#))
+        #expect(json.contains(#""total_ms":4"#))
+        #expect(json.contains(#""streamed":false"#))
+        #expect(!json.contains(#""message""#))
     }
 
     @Test("A choice carries reasoning_content and tool_calls, alongside streamed")

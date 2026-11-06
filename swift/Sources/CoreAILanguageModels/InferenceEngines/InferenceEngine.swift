@@ -21,7 +21,7 @@ public typealias LogitsScalarType = Float
 public struct InferenceOutput: Sendable {
     public let tokenId: Int32
 
-    /// Populated when `InferenceOptions.includeLogits` is true. Shape: [vocabSize].
+    /// Populated when `InferenceOptions.logits` is not `.none`. Shape: [vocabSize].
     public let logits: [LogitsScalarType]?
 
     public init(tokenId: Int32, logits: [LogitsScalarType]? = nil) {
@@ -32,25 +32,110 @@ public struct InferenceOutput: Sendable {
 
 // MARK: - Inference Options
 
+/// Whether the engine samples a token each step.
+///
+/// Engines currently sample under both cases. `.none` marks requests whose caller does not
+/// read `InferenceOutput.tokenId`.
+public enum TokenRequest: Sendable, Equatable {
+    case none
+    case sample
+}
+
+/// Which positions' logits the engine returns.
+///
+/// Engines currently return one `[vocabSize]` row per output step for both `.lastPosition` and
+/// `.allPositions`. The pipelined engine rejects any value other than `.none`.
+public enum LogitsRequest: Sendable, Equatable {
+    case none
+    case lastPosition
+    case allPositions
+}
+
 /// Controls what the engine produces and how much.
-/// Struct-based for additive extensibility (future: embeddings, attention maps).
 public struct InferenceOptions: Sendable {
     /// Max tokens to generate. Nil = until EOS or context limit.
     public var maxTokens: Int?
-    /// Include raw logits in each `InferenceOutput`. May incur GPU→CPU copy cost.
-    public var includeLogits: Bool
-    /// When set, engines use these token IDs instead of sampling.
-    /// Used by MMLU-style evaluation to compute P(continuation|context).
+    /// Whether to sample a token each step. Default `.sample`.
+    public var tokens: TokenRequest
+    /// Which positions' logits to return. Default `.none`.
+    public var logits: LogitsRequest
+    /// Force these token IDs instead of sampling (MMLU-style scoring).
     public var forcedContinuation: [Int32]?
 
+    /// Creates options from explicit `tokens` and `logits` values. Every pair is valid; prefer the
+    /// presets below.
     public init(
         maxTokens: Int? = nil,
-        includeLogits: Bool = false,
+        tokens: TokenRequest = .sample,
+        logits: LogitsRequest = .none,
         forcedContinuation: [Int32]? = nil
     ) {
         self.maxTokens = maxTokens
-        self.includeLogits = includeLogits
+        self.tokens = tokens
+        self.logits = logits
         self.forcedContinuation = forcedContinuation
+    }
+
+    /// Creates options from the legacy `includeLogits` flag: `true` maps to `logits: .lastPosition`,
+    /// `false` to `logits: .none`. `tokens` is `.sample`.
+    @available(
+        *, deprecated,
+        message: "Use the tokens:/logits: initializer; includeLogits: true == logits: .lastPosition."
+    )
+    public init(
+        maxTokens: Int? = nil,
+        includeLogits: Bool,
+        forcedContinuation: [Int32]? = nil
+    ) {
+        self.init(
+            maxTokens: maxTokens,
+            tokens: .sample,
+            logits: includeLogits ? .lastPosition : .none,
+            forcedContinuation: forcedContinuation)
+    }
+
+    /// Whether `logits` is anything other than `.none`.
+    public var returnsLogits: Bool { logits != .none }
+
+    /// Legacy flag. Reads `returnsLogits`; writing `true` sets `logits` to `.lastPosition`, `false`
+    /// to `.none`.
+    @available(*, deprecated, message: "Use `logits` / `returnsLogits` instead.")
+    public var includeLogits: Bool {
+        get { returnsLogits }
+        set { logits = newValue ? .lastPosition : .none }
+    }
+}
+
+/// Presets for the common (tokens, logits) pairs. Engines currently sample a token under every
+/// preset; see `TokenRequest`.
+extension InferenceOptions {
+    /// Requests no token and no logits, for prefill and warmup chunks. Pass `maxTokens`; nil runs
+    /// until EOS.
+    public static func prefill(maxTokens: Int? = nil) -> InferenceOptions {
+        InferenceOptions(maxTokens: maxTokens, tokens: .none, logits: .none)
+    }
+    /// Sampled tokens, no logits. The default for decode.
+    public static func extend(maxTokens: Int? = nil) -> InferenceOptions {
+        InferenceOptions(maxTokens: maxTokens, tokens: .sample, logits: .none)
+    }
+    /// Same as `extend`.
+    public static func `default`(maxTokens: Int? = nil) -> InferenceOptions {
+        .extend(maxTokens: maxTokens)
+    }
+    /// Requests logits at every position and no token. For perplexity and scoring with
+    /// `forcedContinuation`.
+    public static func eval(maxTokens: Int? = nil, forcedContinuation: [Int32]? = nil) -> InferenceOptions {
+        InferenceOptions(
+            maxTokens: maxTokens, tokens: .none, logits: .allPositions, forcedContinuation: forcedContinuation)
+    }
+    /// Requests last-position logits and no token. For constrained decoding, where the caller masks
+    /// and samples.
+    public static func guided(maxTokens: Int? = nil) -> InferenceOptions {
+        InferenceOptions(maxTokens: maxTokens, tokens: .none, logits: .lastPosition)
+    }
+    /// Sampled tokens plus last-position logits. For inspecting logits during decode.
+    public static func sampleWithLogits(maxTokens: Int? = nil) -> InferenceOptions {
+        InferenceOptions(maxTokens: maxTokens, tokens: .sample, logits: .lastPosition)
     }
 }
 
@@ -96,7 +181,7 @@ public protocol InferenceEngine: Sendable {
     /// - Parameters:
     ///   - input: Token IDs (prompt, context, or continuation).
     ///   - sampling: Sampling configuration (temperature, topK, etc.).
-    ///   - generation: Inference options (maxTokens, includeLogits).
+    ///   - generation: Inference options (maxTokens, tokens, logits).
     /// - Returns: An `InferenceOutputSequence` — iterate for tokens, read
     ///   `stopReason` after the loop to learn why generation ended.
     func generate(
@@ -272,7 +357,17 @@ public enum InferenceRuntimeError: Error, LocalizedError {
     case unsupportedEngine(String)
     case unsupportedEngineVariant(String)
     case bufferAllocationFailed(String)
+    /// The scheduler's wait queue is full. `depth` is the queue limit.
+    case queueFull(depth: Int)
     case genericError(String)
+
+    /// True for `.queueFull`.
+    package var isQueueFull: Bool {
+        switch self {
+        case .queueFull: true
+        default: false
+        }
+    }
 
     public var errorDescription: String? {
         switch self {
@@ -305,6 +400,8 @@ public enum InferenceRuntimeError: Error, LocalizedError {
             return "Unknown variant \(variant)"
         case .bufferAllocationFailed(let details):
             return "GPU buffer allocation failed: \(details)"
+        case .queueFull(let depth):
+            return "Request queue full (depth: \(depth))"
         case .genericError(let message):
             return message
         }
@@ -315,6 +412,8 @@ public enum InferenceRuntimeError: Error, LocalizedError {
 
 // MARK: - Multimodal
 
+// TODO: Multimodal support in `CoreAIPipelinedEngine`.
+
 /// Engine that supports vision/audio input in addition to text tokens.
 ///
 /// The typical flow:
@@ -324,6 +423,10 @@ public enum InferenceRuntimeError: Error, LocalizedError {
 ///
 /// The caller owns the embeddings and decides caching strategy.
 public protocol MultimodalInferenceEngine: InferenceEngine {
+    /// Whether this engine instance accepts image and video input. An engine built from a text
+    /// bundle reports false.
+    var acceptsMultimodalInput: Bool { get }
+
     /// Encode an image into embeddings suitable for injection into the VLM.
     /// Returns the embedded representation — caller decides whether to cache.
     func encodeImage(at url: URL) async throws -> InputEmbeddings
@@ -338,8 +441,10 @@ public protocol MultimodalInferenceEngine: InferenceEngine {
     func encodeVideo(_ video: VideoInput) async throws -> InputEmbeddings
 
     /// Generate tokens from a token sequence with embedded image regions.
-    /// The engine scatter-merges `input.embeddingPositions` with the embedded data
-    /// during prefill, then continues standard autoregressive decode.
+    ///
+    /// The engine scatter-merges `input` over the image placeholder tokens during prefill, then
+    /// continues standard autoregressive decode. `input` holds the embeddings of every image
+    /// placeholder in `tokens`, in order.
     func generate(
         with input: InputEmbeddings,
         tokens: [TokenId],
@@ -347,10 +452,6 @@ public protocol MultimodalInferenceEngine: InferenceEngine {
         inferenceOptions: InferenceOptions
     ) async throws -> OutputSequence
 }
-
-// TODO: Multi-turn — caller can cache InputEmbeddings across turns and pass it
-// again with the accumulated token context. Engine keeps image in KV cache
-// via reset(to:) preserving the prefill portion.
 
 // MARK: - Engine Options
 

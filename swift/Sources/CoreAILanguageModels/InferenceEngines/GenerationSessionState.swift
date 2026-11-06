@@ -69,4 +69,10 @@ package final class GenerationSessionState {
         self.additionalStates = additionalStates
         self.hasNonTruncatableStates = hasNonTruncatableStates
     }
+
+    /// Bytes held by this session's KV cache and persistent states at their current capacity.
+    var estimatedStateBytes: Int { kvCache.estimatedBytes + (additionalStates?.estimatedBytes ?? 0) }
+
+    /// Bytes held by this session's reusable logits buffer; 0 until it is first allocated.
+    var estimatedLogitsScratchBytes: Int { logitsScratch.map(estimatedArrayBytes) ?? 0 }
 }

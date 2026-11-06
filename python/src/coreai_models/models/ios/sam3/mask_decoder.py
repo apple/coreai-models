@@ -186,11 +186,16 @@ class CrossAttentionReauthored(nn.Module):
 
         self.sdpa = BidirectionalSDPA(num_heads=num_heads, head_dim=self.head_dim)
 
-    def forward(self, query: torch.Tensor, key_value: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        query: torch.Tensor,
+        key_value: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         q = self.q_proj(query)
         k = self.k_proj(key_value)
         v = self.v_proj(key_value)
-        return self.o_proj(self.sdpa(q, k, v))
+        return self.o_proj(self.sdpa(q, k, v, attention_mask=attention_mask))
 
     @classmethod
     def from_hf_attention(cls, hf_attn: nn.Module) -> "CrossAttentionReauthored":
@@ -231,11 +236,14 @@ class MaskDecoderReauthored(nn.Module):
         backbone_features: list[torch.Tensor],
         encoder_hidden_states: torch.Tensor,
         prompt_features: torch.Tensor | None = None,
+        prompt_attention_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         if prompt_features is not None:
             residual = encoder_hidden_states
             normed = self.prompt_cross_attn_norm(encoder_hidden_states)
-            attn_out = self.prompt_cross_attn(normed, prompt_features)
+            attn_out = self.prompt_cross_attn(
+                normed, prompt_features, attention_mask=prompt_attention_mask
+            )
             encoder_hidden_states = residual + attn_out
 
         pixel_embed = self._embed_pixels(backbone_features, encoder_hidden_states)
@@ -329,14 +337,21 @@ class DotProductScoringReauthored(nn.Module):
         self,
         decoder_hidden_states: torch.Tensor,
         text_features: torch.Tensor,
+        text_valid: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """``text_valid`` is ``(B, 1, 1, seq)``, 1 for real tokens and 0 for padding."""
         orig_text = text_features
         h = self.text_mlp_layer1(text_features)
         h = F.relu(h)
         h = self.text_mlp_layer2(h)
         text_features = self.text_mlp_out_norm(h + orig_text)
 
-        pooled_text = text_features.mean(dim=3, keepdim=True)
+        if text_valid is None:
+            pooled_text = text_features.mean(dim=3, keepdim=True)
+        else:
+            one = torch.tensor(1.0, dtype=text_features.dtype, device=text_features.device)
+            num_valid = text_valid.sum(dim=3, keepdim=True).clamp(min=one)
+            pooled_text = (text_features * text_valid).sum(dim=3, keepdim=True) / num_valid
         proj_text = self.text_proj(pooled_text)
 
         scale = self._scale.to(dtype=decoder_hidden_states.dtype)

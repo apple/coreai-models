@@ -69,12 +69,13 @@ final class MockConstrainedEngine: InferenceEngine, ConstrainedGenerationCapable
         jsonSchema: String,
         tokenizer: any Tokenizer,
         vocabSize: Int,
-        stopTokenIds: [Int32]?
+        stopTokenIds: [Int32]?,
+        maxWhitespaceCount: Int?
     ) throws -> ConstrainedSessionHandle {
         getSessionCallCount += 1
         lastSchemaUsed = jsonSchema
 
-        if let handle = cached, handle.schema == jsonSchema {
+        if let handle = cached, handle.matches(schema: jsonSchema, maxWhitespaceCount: maxWhitespaceCount) {
             cached = nil
             handle.reset()
             return handle
@@ -85,7 +86,8 @@ final class MockConstrainedEngine: InferenceEngine, ConstrainedGenerationCapable
             jsonSchema: jsonSchema,
             tokenizer: tokenizer,
             vocabSize: vocabSize,
-            stopTokenIds: stopTokenIds
+            stopTokenIds: stopTokenIds,
+            maxWhitespaceCount: maxWhitespaceCount
         )
         return ConstrainedSessionHandle(session: session, tokenizer: tokenizer)
     }
@@ -342,11 +344,39 @@ extension PipelinedConstrainedDecodingStrategy {
             jsonSchema: jsonSchema,
             tokenizer: MockTokenizer(),
             vocabSize: 256,
-            stopTokenIds: nil
+            stopTokenIds: nil,
+            maxWhitespaceCount: ConstrainedGenerationSession.defaultMaxWhitespaceCount
         )
     }
 
     fileprivate var jsonSchema: String {
         Mirror(reflecting: self).children.first(where: { $0.label == "jsonSchema" })?.value as? String ?? ""
+    }
+}
+
+// MARK: - Session handle identity
+
+@Suite("Constrained session handle identity")
+struct ConstrainedSessionHandleIdentityTests {
+    private static let schema = #"{"type": "object", "properties": {"a": {"type": "integer"}}}"#
+
+    private func handle(limit: Int?) throws -> ConstrainedSessionHandle {
+        let tokenizer = MockTokenizer()
+        let session = try ConstrainedGenerationSession(
+            jsonSchema: Self.schema, tokenizer: tokenizer, vocabSize: 256, vocabType: .raw,
+            maxWhitespaceCount: limit)
+        return ConstrainedSessionHandle(session: session, tokenizer: tokenizer)
+    }
+
+    @Test("A handle matches only the schema and whitespace limit it was built with")
+    func matchesSchemaAndLimit() throws {
+        let h = try handle(limit: 32)
+        #expect(h.matches(schema: Self.schema, maxWhitespaceCount: 32))
+        #expect(!h.matches(schema: Self.schema, maxWhitespaceCount: 8))
+        #expect(!h.matches(schema: Self.schema, maxWhitespaceCount: nil))
+        #expect(!h.matches(schema: "{}", maxWhitespaceCount: 32))
+        let unlimited = try handle(limit: nil)
+        #expect(unlimited.matches(schema: Self.schema, maxWhitespaceCount: nil))
+        #expect(!unlimited.matches(schema: Self.schema, maxWhitespaceCount: 32))
     }
 }

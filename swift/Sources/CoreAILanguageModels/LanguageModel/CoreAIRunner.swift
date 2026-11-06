@@ -66,6 +66,21 @@ public struct CoreAIRunner {
         try bundle.modelBundle.validateModelAssets()
 
         let config = makeConfig()
+
+        // A vision-language bundle carries vision (and embedding) assets beside `main`; the factory
+        // builds its engine from all of them.
+        if bundle.modelBundle.kind == .vlm {
+            return try await EngineFactory.createEngine(
+                bundle: bundle,
+                options: EngineOptions(
+                    variant: engineVariant,
+                    kvCacheStrategy: kvCacheStrategy,
+                    prefillChunkSize: prefillChunkSizeOverride ?? bundle.language.prefillChunkSize,
+                    prefillChunkThreshold: prefillChunkThresholdOverride
+                        ?? bundle.language.prefillChunkThreshold,
+                    tensorData: bundle.tensorData))
+        }
+
         let configData = try JSONEncoder().encode(config)
 
         let resolvedChunkSize = prefillChunkSizeOverride ?? bundle.language.prefillChunkSize

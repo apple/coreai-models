@@ -369,6 +369,19 @@ func zeroFillNDArray(_ array: inout NDArray) {
     }
 }
 
+/// Bytes held by `array`, from its shape and element size. Packed sub-byte arrays count as 0.
+func estimatedArrayBytes(_ array: NDArray) -> Int {
+    array.shape.reduce(1, *) * (stateElementByteWidth(array.scalarType) ?? 0)
+}
+
+extension SyncStateHandler {
+    /// Bytes held by this handler's state arrays at their current capacity, estimated from their
+    /// shapes and element sizes.
+    package var estimatedBytes: Int {
+        (0..<stateCount).reduce(0) { total, index in total + estimatedArrayBytes(self[stateIndex: index].array) }
+    }
+}
+
 /// Bytes per element of a state, or nil for packed sub-byte types, whose element counts
 /// don't map to byte ranges.
 func stateElementByteWidth(_ type: NDArray.ScalarType) -> Int? {

@@ -648,10 +648,15 @@ public struct ReadyResponse: Codable, Sendable {
     public let busy: Bool
     public let cache: CacheStatus
     public let toolCalling: Bool
+    /// Memory held by the server's sessions, estimated from their arrays' shapes and element sizes.
+    public let estimatedMemory: EstimatedMemory?
+    /// Batch scheduler occupancy, present when the server decodes requests in batches.
+    public let batching: BatchingStatus?
 
     public init(
         status: String, model: String, maxContextLength: Int,
-        busy: Bool, cache: CacheStatus, toolCalling: Bool
+        busy: Bool, cache: CacheStatus, toolCalling: Bool,
+        estimatedMemory: EstimatedMemory? = nil, batching: BatchingStatus? = nil
     ) {
         self.status = status
         self.model = model
@@ -659,6 +664,52 @@ public struct ReadyResponse: Codable, Sendable {
         self.busy = busy
         self.cache = cache
         self.toolCalling = toolCalling
+        self.estimatedMemory = estimatedMemory
+        self.batching = batching
+    }
+
+    /// Memory held by the server's sessions in megabytes, estimated from their arrays' shapes and
+    /// element sizes.
+    public struct EstimatedMemory: Codable, Sendable, Equatable {
+        /// KV cache and persistent states of the single-request session.
+        public let kvCacheMB: Double
+        /// KV cache and persistent states of the batch session, for all its rows; nil without batching.
+        public let batchKVCacheMB: Double?
+        /// Logits buffers of both sessions.
+        public let logitsScratchMB: Double
+
+        public init(kvCacheMB: Double, batchKVCacheMB: Double?, logitsScratchMB: Double) {
+            self.kvCacheMB = kvCacheMB
+            self.batchKVCacheMB = batchKVCacheMB
+            self.logitsScratchMB = logitsScratchMB
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case kvCacheMB = "kv_cache_mb"
+            case batchKVCacheMB = "batch_kv_cache_mb"
+            case logitsScratchMB = "logits_scratch_mb"
+        }
+    }
+
+    /// Batch scheduler occupancy.
+    public struct BatchingStatus: Codable, Sendable, Equatable {
+        /// Requests the scheduler decodes together at most (`--concurrent-requests`).
+        public let concurrentRequests: Int
+        /// Requests decoding now.
+        public let active: Int
+        /// Requests waiting for a free row.
+        public let queued: Int
+
+        public init(concurrentRequests: Int, active: Int, queued: Int) {
+            self.concurrentRequests = concurrentRequests
+            self.active = active
+            self.queued = queued
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case concurrentRequests = "concurrent_requests"
+            case active, queued
+        }
     }
 
     public struct CacheStatus: Codable, Sendable {
@@ -684,5 +735,7 @@ public struct ReadyResponse: Codable, Sendable {
         case maxContextLength = "max_context_length"
         case busy, cache
         case toolCalling = "tool_calling"
+        case estimatedMemory = "estimated_memory"
+        case batching
     }
 }

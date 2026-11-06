@@ -55,4 +55,20 @@ struct BatchedSamplerTests {
         #expect(first[1] == second[1])
         #expect(first[1] >= 0 && first[1] < 64)
     }
+
+    @Test("Per-row isolation: changing one row's logits leaves the other row's token unchanged")
+    func batchedRowIsolation() {
+        let base = BatchedSampler.sample(
+            rows: [peakedRow(vocab: 16, peak: 1), peakedRow(vocab: 16, peak: 9)],
+            configurations: [.greedy, .greedy],
+            histories: [noHistory, noHistory],
+            steps: [nil, nil])
+        let changed = BatchedSampler.sample(
+            rows: [peakedRow(vocab: 16, peak: 4), peakedRow(vocab: 16, peak: 9)],
+            configurations: [.greedy, .greedy],
+            histories: [noHistory, noHistory],
+            steps: [nil, nil])
+        #expect(base == [1, 9])
+        #expect(changed == [4, 9])
+    }
 }

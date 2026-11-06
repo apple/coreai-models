@@ -44,6 +44,7 @@ def apply_rope(
     rope_cos: torch.Tensor,
     rope_sin: torch.Tensor,
     head_axis: int = 1,
+    ndim: int = 1,
 ) -> torch.Tensor:
     # `head_axis` is where the (broadcast) head dimension lives in `x`. The
     # default of 1 matches the `(B, n_heads, S, head_dim)` head-format layout.
@@ -55,8 +56,27 @@ def apply_rope(
     torch._check(len(rope_cos.shape) == 4)
     torch._check(len(rope_sin.shape) == 4)
 
-    # Apply rotary position embedding
-    return (x * rope_cos) + (rotate_half(x) * rope_sin)
+    if ndim == 1:
+        # Apply rotary position embedding
+        return (x * rope_cos) + (rotate_half(x) * rope_sin)
+
+    # N-dimensional RoPE (Gemma4 vision's 2D grid RoPE, HF's
+    # `apply_multidimensional_rope`): split the last dim into `ndim` equal parts
+    # (one spatial axis each) and apply standard rotate-half RoPE within each part
+    # independently, using that part's own cos/sin slice, then concatenate back.
+    # `rope_cos`/`rope_sin` carry every axis's frequencies pre-concatenated along
+    # the same last dim (baked once per axis at load time), so splitting them the
+    # same way as `x` pairs each axis with its own slice.
+    torch._check(x.shape[-1] % ndim == 0)
+    per = x.shape[-1] // ndim
+    x_parts = x.split(per, dim=-1)
+    cos_parts = rope_cos.split(per, dim=-1)
+    sin_parts = rope_sin.split(per, dim=-1)
+    out = [
+        (xp * cp) + (rotate_half(xp) * sp)
+        for xp, cp, sp in zip(x_parts, cos_parts, sin_parts, strict=True)
+    ]
+    return torch.cat(out, dim=-1)
 
 
 # On iOS, it is more efficient to compute RoPE using precomputed and cached cos/sin values

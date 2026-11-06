@@ -25,6 +25,7 @@ from transformers.models.gemma3n.modeling_gemma3n import (
 )
 from typing_extensions import Self, override
 
+from coreai_models._constants import MAX_GATHER_CONSTANT_ELEMENTS
 from coreai_models.models.base import BaseForCausalLM
 from coreai_models.primitives.macos.cache import KVCache
 from coreai_models.primitives.macos.rms_norm import RMSNorm
@@ -187,7 +188,11 @@ class Attention(nn.Module):
                 .reshape(batch_size, query_len, n_kv_heads, self.head_dim)
                 .permute(0, 2, 1, 3)
             )
-            value = value / torch.sqrt(value.pow(2).mean(-1, keepdim=True) + self._v_norm_eps)
+            # Every mean in this file is spelled `torch.mean`: export numbers `torch.mean` and
+            # `Tensor.mean` calls separately, and the clashing names break graph-mode quantization.
+            value = value / torch.sqrt(
+                torch.mean(value.pow(2), dim=-1, keepdim=True) + self._v_norm_eps
+            )
 
             if cache is not None:
                 key, value = cache.update_and_fetch(
@@ -220,8 +225,8 @@ class MLP(nn.Module):
     def _gaussian_topk(self, x: torch.Tensor) -> torch.Tensor:
         # Compute mean/std in float32 to avoid fp16 overflow in variance
         x_f32 = x.float()
-        mu = x_f32.mean(dim=-1, keepdim=True)
-        variance = (x_f32 - mu).pow(2).mean(dim=-1, keepdim=True)
+        mu = torch.mean(x_f32, dim=-1, keepdim=True)
+        variance = torch.mean((x_f32 - mu).pow(2), dim=-1, keepdim=True)
         std = variance.sqrt()
         cutoff = (mu + std * self._std_mult).to(x.dtype)
         return nn.functional.relu(x - cutoff)
@@ -297,6 +302,55 @@ class TransformerBlock(nn.Module):
         return corrected
 
 
+class ChunkedEmbedding(nn.Module):
+    """Embedding whose table is split along the feature axis into ``nn.Embedding``
+    chunks below ``max_elements``, since GPU gathers from larger constants return
+    wrong rows (apple/coreai-models#313). Chunks stay ``nn.Embedding`` so compression
+    configs match them like the unsplit table.
+
+    Checkpoints still store one ``weight``; it is split into ``chunks.{i}.weight`` on load.
+    """
+
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        max_elements: int = MAX_GATHER_CONSTANT_ELEMENTS,
+        align: int = 32,
+    ) -> None:
+        super().__init__()
+        # Widths are multiples of ``align`` because the int4 presets quantize in 32-column
+        # blocks and silently skip tables whose width is not a multiple of the block.
+        max_width = (max_elements - 1) // num_embeddings // align * align
+        if max_width < 1:
+            raise ValueError(
+                f"{align} columns of {num_embeddings} rows already reach {max_elements} "
+                "elements; the table cannot be split along the feature axis."
+            )
+        width = math.ceil(embedding_dim / math.ceil(embedding_dim / max_width))
+        width = math.ceil(width / align) * align
+        self.widths = [min(width, embedding_dim - i) for i in range(0, embedding_dim, width)]
+        self.chunks = nn.ModuleList([nn.Embedding(num_embeddings, w) for w in self.widths])
+        self._register_load_state_dict_pre_hook(self._split_weight)
+
+    def _split_weight(self, state_dict, prefix, *args) -> None:
+        full = state_dict.pop(prefix + "weight", None)
+        if full is None:
+            return
+        # Column slices are strided, so contiguous() already copies each one.
+        for i, chunk in enumerate(full.split(self.widths, dim=-1)):
+            state_dict[f"{prefix}chunks.{i}.weight"] = chunk.contiguous()
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return torch.cat([chunk(input_ids) for chunk in self.chunks], dim=-1)
+
+
+def _per_layer_embedding(num_embeddings: int, embedding_dim: int) -> nn.Module:
+    if num_embeddings * embedding_dim >= MAX_GATHER_CONSTANT_ELEMENTS:
+        return ChunkedEmbedding(num_embeddings, embedding_dim, MAX_GATHER_CONSTANT_ELEMENTS)
+    return nn.Embedding(num_embeddings, embedding_dim)
+
+
 class Gemma3nModel(nn.Module):
     def __init__(self, config: Gemma3nTextConfig) -> None:
         super().__init__()
@@ -306,7 +360,7 @@ class Gemma3nModel(nn.Module):
         self.per_layer_input_scale = 2.0**-0.5
 
         self.embed_tokens = nn.Embedding(config.vocab_size, hidden)
-        self.embed_tokens_per_layer = nn.Embedding(
+        self.embed_tokens_per_layer = _per_layer_embedding(
             config.vocab_size_per_layer_input,
             config.num_hidden_layers * config.hidden_size_per_layer_input,
         )
@@ -363,7 +417,13 @@ class Gemma3nModel(nn.Module):
     def _get_per_layer_inputs(
         self, input_ids: torch.Tensor, inputs_embeds: torch.Tensor
     ) -> torch.Tensor:
-        per_layer = self.embed_tokens_per_layer(input_ids) * self.per_layer_embed_scale
+        # The per-layer table is smaller than the vocab; like HF, ids past it map to 0.
+        ple_ids = torch.where(
+            input_ids < self.config.vocab_size_per_layer_input,
+            input_ids,
+            torch.zeros_like(input_ids),
+        )
+        per_layer = self.embed_tokens_per_layer(ple_ids) * self.per_layer_embed_scale
         pli_dim = self.config.hidden_size_per_layer_input
         per_layer = per_layer.reshape(
             *input_ids.shape, self.config.num_hidden_layers, pli_dim
@@ -445,7 +505,7 @@ class Gemma3nForCausalLM(BaseForCausalLM):
         from huggingface_hub import snapshot_download
         from safetensors import safe_open
 
-        from coreai_models.models.base import _load_tensors_for_keys, _resolve_safetensors_files
+        from coreai_models.models.base import load_tensors_for_keys, resolve_safetensors_files
 
         model_dir = snapshot_download(
             huggingface_model_id,
@@ -461,7 +521,7 @@ class Gemma3nForCausalLM(BaseForCausalLM):
         model = cls(config=config, model_device="meta")
         model.to(dtype=target_dtype)
 
-        safetensors_files = _resolve_safetensors_files(model_dir)
+        safetensors_files = resolve_safetensors_files(model_dir)
 
         prefix = hf_state_dict_prefix
         layer_pattern = re.compile(re.escape(prefix) + r"layers\.(\d+)\.")
@@ -482,7 +542,7 @@ class Gemma3nForCausalLM(BaseForCausalLM):
                     else:
                         shared[key] = path
 
-        shared_dict = _load_tensors_for_keys(shared, target_dtype)
+        shared_dict = load_tensors_for_keys(shared, target_dtype)
         normalized: dict[str, torch.Tensor] = {}
         for k, v in shared_dict.items():
             if k.startswith(prefix):
@@ -497,7 +557,7 @@ class Gemma3nForCausalLM(BaseForCausalLM):
 
         for layer_idx in sorted(per_layer.keys()):
             layer_key_to_file = per_layer.pop(layer_idx)
-            layer_sd = _load_tensors_for_keys(layer_key_to_file, target_dtype)
+            layer_sd = load_tensors_for_keys(layer_key_to_file, target_dtype)
             del layer_key_to_file
             remapped: dict[str, torch.Tensor] = {}
             for k, v in layer_sd.items():

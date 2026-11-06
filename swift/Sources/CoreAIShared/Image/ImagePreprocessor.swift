@@ -71,6 +71,20 @@ public struct ImagePreprocessor: Sendable {
         rescaleFactor: 1.0
     )
 
+    /// Load an image file (JPEG, PNG, HEIC, etc.) as a `CGImage`, rendered with a shared `CIContext`.
+    ///
+    /// - Throws: ``ImagePreprocessorError/loadFailed(_:)`` if the image cannot be loaded, or
+    ///   ``ImagePreprocessorError/renderFailed`` if rendering fails
+    public static func loadCGImage(contentsOf url: URL) throws -> CGImage {
+        guard let ciImage = CIImage(contentsOf: url) else {
+            throw ImagePreprocessorError.loadFailed(url)
+        }
+        guard let cgImage = ciContext.createCGImage(ciImage, from: ciImage.extent) else {
+            throw ImagePreprocessorError.renderFailed
+        }
+        return cgImage
+    }
+
     /// Preprocess an image from a file URL.
     ///
     /// - Parameter imageURL: URL to an image file (JPEG, PNG, HEIC, etc.)
@@ -194,7 +208,10 @@ public struct ImagePreprocessor: Sendable {
 
     // MARK: - Private Helpers
 
-    private func renderToContext(
+    /// Draws `cgImage` into `drawRect` of a new sRGB canvas of `canvasWidth` x `canvasHeight`
+    /// pixels (8-bit RGBX, high-quality interpolation) and returns the canvas. Pixels outside
+    /// `drawRect` are zero. The context origin is at the bottom left, as in CoreGraphics.
+    public func renderToContext(
         cgImage: CGImage, canvasWidth: Int, canvasHeight: Int,
         drawRect: CGRect
     ) throws -> CGImage {

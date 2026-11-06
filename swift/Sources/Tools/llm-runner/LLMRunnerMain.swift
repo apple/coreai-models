@@ -85,8 +85,19 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     @Option(name: .customLong("prompt-file"), help: "Read prompt text from file (UTF-8 text file)")
     var promptFile: String?
 
-    @Option(name: .customLong("raw-tokens"), help: "JSON file with pre-tokenized tokens: {\"tokens\": [...]}")
+    @Option(
+        name: .customLong("raw-tokens"),
+        help:
+            "JSON file with pre-tokenized tokens to use as the context: {\"tokens\": [...]}. Generates from them; to score a forced continuation instead, add --raw-continuation"
+    )
     var rawTokens: String?
+
+    @Option(
+        name: .customLong("raw-continuation"),
+        help:
+            "JSON file with token ids to score as a forced continuation of --raw-tokens: {\"tokens\": [...]} (requires --print-logits or --save-logits)"
+    )
+    var rawContinuation: String?
 
     @Option(help: "Maximum number of tokens to generate (default: 50)")
     var maxTokens: Int = 50
@@ -129,6 +140,37 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             "Constrain output to match a JSON schema. Accepts a JSON schema string or a file path. Example: '{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"]}'"
     )
     var jsonSchema: String?
+
+    @Option(
+        name: .customLong("json-max-whitespace"),
+        help:
+            "With --json-schema: most whitespace characters allowed between two JSON tokens (default: 32; 0 for no limit). Ends a model that keeps emitting whitespace after the last value; output that stays within the limit is unchanged."
+    )
+    var jsonMaxWhitespace: Int = ConstrainedGenerationSession.defaultMaxWhitespaceCount
+
+    /// The whitespace limit named by `--json-max-whitespace`; nil for no limit.
+    private var maxWhitespaceCount: Int? { jsonMaxWhitespace > 0 ? jsonMaxWhitespace : nil }
+
+    @Flag(
+        name: .customLong("speculative"),
+        help:
+            "Self-speculative decoding with the bundle's draft head (the 'drafter' component of metadata.json, added by models/gemma4/export_drafter.py --bundle). The head drafts from the target's hidden states and shared K/V, so --model must be exported with --emit-hidden-states. Greedy only; combines with --prompt-lookup and --json-schema."
+    )
+    var speculative: Bool = false
+
+    @Option(
+        name: .customLong("drafter-top-k"),
+        help:
+            "With --speculative: centroids whose candidates the draft head's scan scores (default: \(DraftScan.defaultTopK))."
+    )
+    var drafterTopK: Int?
+
+    @Option(
+        name: .customLong("grammar-proposal-max"),
+        help:
+            "With --json-schema and speculative decoding: most tokens the grammar may propose in one verify block when it fully determines the next span (0 disables; default \(GrammarConstraint.defaultForcedRunLimit), at most \(GrammarConstraint.maxForcedRunLimit), the grammar's rollback budget less the anchor)."
+    )
+    var grammarProposalMax: Int?
 
     @Option(help: "Model inference engine variant. Defaults to 'default'")
     var inferenceEngineVariant: String = "default"
@@ -257,6 +299,53 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     )
     var batchPrototypeRows: Int?
 
+    @Option(
+        name: .customLong("draft-model"),
+        help:
+            "Path to a draft model bundle to enable speculative decoding. Must share the tokenizer/vocabulary with --model. The static-shape engine verifies and drafts."
+    )
+    var draftModel: String?
+
+    @Option(
+        name: .customLong("num-draft-tokens"),
+        help:
+            "Tokens the draft proposes per speculative step, 1 to \(SpeculativeDefaults.maxDraftTokens) (default: \(SpeculativeDefaults.numDraftTokens))."
+    )
+    var numDraftTokens: Int?
+
+    @Option(
+        name: .customLong("seed"),
+        help:
+            "Speculative decoding with temperature sampling: seed the random number generator so a run is reproducible (default: the system generator)."
+    )
+    var seed: UInt64?
+
+    @Flag(
+        name: .customLong("adaptive-draft-count"),
+        help: "Speculative decoding: adapt the draft count to acceptance.")
+    var adaptiveDraftCount: Bool = false
+
+    @Flag(
+        name: .customLong("no-align-proposals"),
+        help:
+            "Speculative decoding: do not shorten proposals to fit the target's single-forward window (a verify block that crosses a batch boundary then costs a second forward)."
+    )
+    var noAlignProposals: Bool = false
+
+    @Flag(
+        name: .customLong("prompt-lookup"),
+        help:
+            "Speculative decoding from the running context: a block whose recent tokens recur earlier proposes what followed. Alone it needs no draft model; with --draft-model, a recurring block is proposed from the context and any other from the draft model. Greedy only."
+    )
+    var promptLookup: Bool = false
+
+    @Option(
+        name: .customLong("prompt-lookup-min-ngram"),
+        help:
+            "With --prompt-lookup: shortest recurring suffix that proposes by lookup (default: \(SpeculativeDefaults.lookupMinNgram))."
+    )
+    var promptLookupMinNgram: Int = SpeculativeDefaults.lookupMinNgram
+
     func validate() throws {
         if let rows = batchPrototypeRows {
             if rows < 1 { throw ValidationError("--batch-prototype must be >= 1") }
@@ -295,6 +384,48 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             throw ValidationError(
                 "--repetition-penalty cannot be used with --json-schema"
                     + " (constrained generation does not support penalty on the pipelined engine)")
+        }
+        if jsonMaxWhitespace < 0 {
+            throw ValidationError("--json-max-whitespace must be >= 0 (0 for no limit)")
+        }
+        if let problem = SpeculativeDecodingOptions.draftCountProblem(numDraftTokens) {
+            throw ValidationError(problem)
+        }
+        if promptLookupMinNgram < 1 {
+            throw ValidationError("--prompt-lookup-min-ngram must be >= 1")
+        }
+        if let problem = SpeculativeDecodingOptions.draftHeadProblem(
+            draftHead: speculative, draftModel: draftModel != nil, drafterTopK: drafterTopK)
+        {
+            throw ValidationError(problem)
+        }
+        let speculating = draftModel != nil || promptLookup || speculative
+        if seed != nil && !speculating {
+            throw ValidationError("--seed applies to speculative decoding (--draft-model or --prompt-lookup)")
+        }
+        if let problem = SpeculativeDecodingOptions.grammarProposalProblem(
+            grammarProposalMax, speculating: speculating, hasSchema: jsonSchema != nil)
+        {
+            throw ValidationError(problem)
+        }
+        if speculating {
+            let unsupported = [
+                videoPath != nil ? "--video" : nil,
+                continuation != nil ? "--continuation" : nil,
+                rawContinuation != nil ? "--raw-continuation" : nil,
+                batchPrototypeRows != nil ? "--batch-prototype" : nil,
+            ].compactMap { $0 }
+            if let problem = SpeculativeDecodingOptions.unsupportedProblem(used: unsupported) {
+                throw ValidationError(problem)
+            }
+            let greedy = samplingStrategy.lowercased() == "greedy" || temperature == 0
+            if let problem = SpeculativeDecodingOptions.samplingProblem(
+                greedy: greedy, promptLookup: promptLookup, draftHead: speculative)
+                ?? SpeculativeDecodingOptions.grammarSamplingProblem(greedy: greedy, hasSchema: jsonSchema != nil)
+                ?? SpeculativeDecodingOptions.imageProblem(hasImage: imagePath != nil, hasRawTokens: rawTokens != nil)
+            {
+                throw ValidationError(problem)
+            }
         }
     }
 
@@ -358,23 +489,334 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         }
     }
 
+    /// Speculative decoding: a draft + target pair, or the prompt-lookup drafter alone. Each engine is
+    /// created via `EngineFactory` (static-shape) and driven by ``SpeculativeDecoder``.
+    /// Greedy output is token-for-token identical to the target alone.
+    private func runSpeculativeDecoding(
+        targetPath: String, draftPath rawDraftPath: String?, resolver: ModelPaths
+    ) async throws {
+        await PerformanceMetrics.shared.startOverallTiming()
+        func loadSpeculativeEngine(from path: String, label: String) async throws
+            -> (engine: any SpeculativeEngine, bundle: LanguageModelBundle)
+        {
+            let bundle = try LanguageModelBundle(from: path)
+            try bundle.modelBundle.validateModelAssets()
+            let options = EngineOptions(
+                variant: inferenceEngineVariant,
+                kvCacheStrategy: kvCacheStrategy,
+                kvCacheSize: kvCacheInitialCapacity,
+                tensorData: bundle.tensorData
+            )
+            // The factory builds the vision-wired static-shape engine for a VLM bundle whose decoder
+            // gathers its own token embeddings, so the target can encode and scatter an image.
+            let engine = try await InstrumentsProfiler.profile(InstrumentsProfiler.beginModelLoad(name: bundle.name)) {
+                try await EngineFactory.createEngine(bundle: bundle, options: options)
+            }
+            guard let spec = engine as? any SpeculativeEngine else {
+                print(
+                    "Error: engine for \(bundle.name) (\(type(of: engine))) does not support "
+                        + "speculative decoding (needs the static-shape engine).")
+                throw ExitCode.failure
+            }
+            print("Loaded \(label): \(bundle.name)  engine=\(type(of: engine))")
+            return (spec, bundle)
+        }
+
+        print("\n⏳ Loading target for speculative decoding...")
+        let (targetEngine, targetBundle) = try await loadSpeculativeEngine(from: targetPath, label: "target")
+
+        // Draft: either a loaded draft model, or the free prompt-lookup drafter.
+        var draftEngine: (any SpeculativeEngine)?
+        if let rawDraftPath {
+            guard let draftURL = resolver.resolve(rawDraftPath) else {
+                print("Error: \(resolver.notFoundError(for: rawDraftPath))")
+                throw ExitCode.failure
+            }
+            let (draft, draftBundle) = try await loadSpeculativeEngine(from: draftURL.path, label: "draft")
+            guard targetBundle.vocabSize == draftBundle.vocabSize else {
+                print("Error: draft/target vocab mismatch (\(draftBundle.vocabSize) vs \(targetBundle.vocabSize)).")
+                throw ExitCode.failure
+            }
+            draftEngine = draft
+        }
+
+        // Warm up the engine(s) so their graphs are specialized before the loop.
+        let warmupSampling = try parseSamplingStrategy()
+        var warmEngines: [(any SpeculativeEngine, String)] = [(targetEngine, "target")]
+        if let draftEngine { warmEngines.append((draftEngine, "draft")) }
+        for (engine, label) in warmEngines {
+            if let inferenceEngine = engine as? any InferenceEngine {
+                print("Warming up \(label)...")
+                try await performWarmup(
+                    mode: warmup, warmupLength: warmupLength, engine: inferenceEngine,
+                    samplingConfiguration: warmupSampling)
+                try await engine.reset(to: 0)
+            }
+        }
+
+        let tokenizer = try await targetBundle.loadTokenizer()
+        // The stops a plain run uses: the end-of-sequence tokens and `--stop-tokens`. Speculative
+        // decoding stops at those that are one token; see `SpeculativeDecodingOptions.stopTokenIds`.
+        let stopSequences = try validateAndEncodeStopTokens(
+            stopTokens: stopTokens, tokenizer: tokenizer,
+            additionalEosTokenIds: RunnerPrompting.additionalStopTokenIds(
+                tokenizerDirectory: targetBundle.tokenizerPath, tokenizer: tokenizer))
+        let stops = SpeculativeDecodingOptions.stopTokenIds(stopSequences)
+        if let warning = SpeculativeDecodingOptions.multiTokenStopWarning(
+            stops.ignored.map { tokenizer.decode(tokens: $0.map(Int.init)) })
+        {
+            print(warning)
+        }
+        let stopTokenIds = stops.ids
+
+        let promptInput = try resolvePromptInput()
+        let promptTokens: [Int32]
+        switch promptInput {
+        case .text(let text):
+            let input: Input = applyChatTemplate ? .prompt(text) : .rawText(text)
+            promptTokens = try PromptUtils.maybeApplyTokenizerChatTemplate(input, tokenizer: tokenizer)
+                .map { Int32($0) }
+        case .rawTokens(let container):
+            promptTokens = container.tokens.map { Int32($0) }
+        }
+
+        // Vision: when an image is provided and the target is a multimodal static-shape
+        // engine, encode it, rebuild the prompt with image-placeholder tokens, and stage
+        // the image on the target via the decoder's `onPrefillReady` hook so the
+        // speculative prefill scatters it into the KV (the drafter then attends over the
+        // image-inclusive shared KV). Without this the spec path prefills text-only and
+        // the model never sees the image.
+        var promptTokensForGen = promptTokens
+        var onPrefillReady: (() async throws -> Void)?
+        if let imagePath {
+            guard let mmTarget = targetEngine as? StaticShapeEngine else {
+                print(
+                    "Error: --image with speculative decoding requires the static-shape target engine "
+                        + "(got \(type(of: targetEngine))).")
+                throw ExitCode.failure
+            }
+            guard let visionConfig = targetBundle.visionConfig else {
+                print("Error: --image given but target bundle has no 'vision' config in metadata.json")
+                throw ExitCode.failure
+            }
+            let imageURL = URL(fileURLWithPath: imagePath)
+            guard FileManager.default.fileExists(atPath: imageURL.path) else {
+                print("Error: image not found at \(imagePath)")
+                throw ExitCode.failure
+            }
+            let embedded = try await mmTarget.encodeImage(at: imageURL)
+            let displayText: String = {
+                if case .text(let t) = promptInput { return t } else { return "" }
+            }()
+            let vlmTokens = imagePromptTokens(
+                imagePromptText(displayText, imagePath: imagePath, visionConfig: visionConfig),
+                imageTokenCount: embedded.tokenCount, imageTokenId: visionConfig.imageTokenId,
+                tokenizer: tokenizer)
+            promptTokensForGen = vlmTokens
+            onPrefillReady = { try mmTarget.setPendingImage(embedded, tokens: vlmTokens) }
+            print("🖼️  image: \(embedded.tokenCount) soft tokens, VLM prompt \(vlmTokens.count) tokens")
+        }
+
+        let contextLength = min(
+            targetEngine.config.maxContextLength, draftEngine?.config.maxContextLength ?? .max)
+        if let problem = SpeculativeDecodingOptions.promptLengthProblem(
+            promptTokens: promptTokensForGen.count, contextLength: contextLength)
+        {
+            throw ValidationError(problem)
+        }
+
+        let useGreedy = samplingStrategy.lowercased() == "greedy" || temperature == 0
+
+        // The speculative path samples with temperature only (or takes the argmax).
+        let ignoredOptions = [
+            topK != nil ? "--top-k" : nil,
+            topP != nil ? "--top-p" : nil,
+            minP != nil ? "--min-p" : nil,
+            repetitionPenalty != nil ? "--repetition-penalty" : nil,
+            repetitionPenaltyWindow != nil ? "--repetition-penalty-window" : nil,
+            synchronousSampling ? "--synchronous-sampling" : nil,
+            saveLogits != nil ? "--save-logits" : nil,
+            printLogits ? "--print-logits" : nil,
+            bucketSize != nil ? "--bucket-size" : nil,
+            chunkSize != nil ? "--chunk-size" : nil,
+            chunkThreshold != nil ? "--chunk-threshold" : nil,
+            imageStrategy != nil ? "--image-strategy" : nil,
+        ].compactMap { $0 }
+        if let warning = SpeculativeDecodingOptions.ignoredWarning(ignored: ignoredOptions) {
+            print(warning)
+        }
+
+        // Grammar: with --json-schema (greedy only) acceptance follows the grammar, so the output is
+        // schema-valid while the target still verifies several tokens per pass. A span the grammar
+        // fully determines is proposed in place of drafted tokens.
+        var constraint: GrammarConstraint?
+        if let schemaInput = jsonSchema {
+            let session = try ConstrainedGenerationSession(
+                jsonSchema: try loadJSONSchema(schemaInput), tokenizer: tokenizer,
+                vocabSize: targetBundle.vocabSize, stopTokenIds: stopTokenIds.sorted(),
+                maxWhitespaceCount: maxWhitespaceCount)
+            let proposalMax = grammarProposalMax ?? GrammarConstraint.defaultForcedRunLimit
+            constraint = GrammarConstraint(session, tokenizer: tokenizer, forcedRunLimit: proposalMax)
+            print("Guided speculative decode: grammar proposals up to \(proposalMax) tokens")
+        }
+
+        let decoder: SpeculativeDecoder
+        let drafterLabel: String
+        let adaptive = adaptiveDraftCount
+        if speculative {
+            guard let staticTarget = targetEngine as? StaticShapeEngine else {
+                print("Error: --speculative needs the static-shape engine (got \(type(of: targetEngine))).")
+                throw ExitCode.failure
+            }
+            decoder = try await EngineFactory.createSpeculativeDecoder(
+                target: staticTarget, bundle: targetBundle,
+                options: EngineFactory.DraftHeadOptions(
+                    draftTokens: numDraftTokens, alignDraftsToVerifyTile: !noAlignProposals,
+                    adaptiveDraftCount: adaptive,
+                    promptLookupMinNgram: promptLookup ? promptLookupMinNgram : nil,
+                    drafterTopK: drafterTopK))
+            drafterLabel = promptLookup ? "draft head + prompt-lookup" : "draft head"
+        } else if let draftEngine {
+            decoder = SpeculativeDecoder(
+                draft: draftEngine, target: targetEngine,
+                numDraftTokens: self.numDraftTokens ?? SpeculativeDefaults.numDraftTokens,
+                adaptiveDraftCount: adaptive)
+            if promptLookup {
+                decoder.promptLookup = PromptLookup(
+                    maxNgram: max(SpeculativeDefaults.lookupMaxNgram, promptLookupMinNgram),
+                    minNgram: promptLookupMinNgram)
+            }
+            drafterLabel = promptLookup ? "draft-model + prompt-lookup" : "draft-model"
+        } else {
+            let lookup = PromptLookupDrafter(
+                maxNgram: max(SpeculativeDefaults.lookupMaxNgram, promptLookupMinNgram), minNgram: promptLookupMinNgram,
+                maxContextLength: targetBundle.maxContextLength)
+            decoder = SpeculativeDecoder(
+                drafter: lookup, target: targetEngine,
+                numDraftTokens: self.numDraftTokens ?? SpeculativeDefaults.numDraftTokens,
+                adaptiveDraftCount: adaptive)
+            drafterLabel = "prompt-lookup (free n-gram)"
+        }
+        let numDraftTokens = decoder.numDraftTokens
+        let widestProposal = targetEngine.maxVerifyBlockLength - 1
+        if numDraftTokens > widestProposal {
+            print(
+                "Note: the target verifies at most \(widestProposal + 1) tokens per pass, so each step "
+                    + "drafts at most \(widestProposal) (--num-draft-tokens \(numDraftTokens)).")
+        }
+        decoder.alignProposalsToForward = !noAlignProposals
+        print(
+            "\nGenerating (speculative, drafter=\(drafterLabel), k=\(numDraftTokens)\(adaptive ? " adaptive" : ""), \(useGreedy ? "greedy" : "sampling T=\(temperature)"))...\n"
+        )
+
+        var generatedIds: [Int] = []
+        var previousText = ""
+        let onToken: (Int32) -> Void = { token in
+            if !stopTokenIds.contains(token) {
+                generatedIds.append(Int(token))
+                let full = tokenizer.decode(tokens: generatedIds)
+                let delta = String(full.dropFirst(previousText.count))
+                previousText = full
+                print(delta, terminator: "")
+                fflush(stdout)
+            }
+        }
+
+        let stats: SpeculativeDecoder.Stats
+        do {
+            if useGreedy {
+                stats = try await decoder.generateGreedy(
+                    promptTokens: promptTokensForGen, maxNewTokens: maxTokens,
+                    stopTokenIds: stopTokenIds, constraint: constraint,
+                    onPrefillReady: onPrefillReady, onToken: onToken)
+            } else {
+                stats = try await decoder.generateSampling(
+                    promptTokens: promptTokensForGen, maxNewTokens: maxTokens,
+                    stopTokenIds: stopTokenIds, temperature: temperature, seed: seed,
+                    onPrefillReady: onPrefillReady, onToken: onToken)
+            }
+        } catch {
+            print("\n[spec-decode] error: \(error)  |  reflected: \(String(reflecting: error))")
+            throw error
+        }
+        await PerformanceMetrics.shared.endOverallTiming()
+        await PerformanceMetrics.shared.recordPromptTokens(promptTokensForGen.count)
+        await PerformanceMetrics.shared.recordGeneratedTokens(stats.generatedTokens)
+
+        print("\n\n── Speculative decoding summary ──")
+        print(
+            "  target=\(targetBundle.name)  drafter=\(drafterLabel)  k=\(numDraftTokens)\(adaptive ? " adaptive" : "")")
+        print("  generated tokens:      \(stats.generatedTokens)")
+        print("  target forward passes: \(stats.iterations)")
+        print(
+            "  draft accepted:        \(stats.draftTokensAccepted)/\(stats.draftTokensProposed) "
+                + "(\(String(format: "%.1f", stats.acceptanceRate * 100))%)")
+        print("  tokens / target pass:  \(String(format: "%.2f", stats.meanTokensPerTargetPass))")
+        if stats.lookupProposals > 0 {
+            print(
+                "  lookup proposals:      \(stats.lookupProposals) blocks, "
+                    + "\(stats.lookupTokensAccepted)/\(stats.lookupTokensProposed) tokens accepted")
+        }
+        if constraint != nil {
+            print(
+                "  grammar proposals:     \(stats.grammarProposals) blocks, "
+                    + "\(stats.grammarTokensAccepted)/\(stats.grammarTokensProposed) tokens accepted")
+        }
+
+        // The same timing summary as a plain run: prompt, generation and total, from the profiler's
+        // spans. With --verbose, the statistics table also lists the drafter and verify spans.
+        await PerformanceMetrics.shared.printSummary(verbose: CLILogger.isVerbose)
+        if verbose {
+            await StatsReporter(storage: .shared).printVerboseTable()
+        }
+    }
+
     func runModel(path modelFile: String, resolver: ModelPaths) async throws {
+        // Decide whether this run scores a forced continuation, refusing options that would skip
+        // the scoring. Done before the model loads, so a bad combination fails fast.
+        let rawScoring = try RawTokenScoring.request(
+            rawContinuationPath: rawContinuation,
+            rawTokensPath: rawTokens,
+            textContinuationGiven: continuation != nil,
+            logitsRequested: saveLogits != nil || printLogits,
+            conflictingFlags: [
+                batchPrototypeRows.map { _ in "--batch-prototype" },
+                imagePath.map { _ in "--image" },
+                videoPath.map { _ in "--video" },
+            ].compactMap { $0 }
+        )
+        if let notice = RawTokenScoring.generationNotice(
+            rawTokensGiven: rawTokens != nil,
+            rawContinuationGiven: rawContinuation != nil,
+            textContinuationGiven: continuation != nil,
+            logitsRequested: saveLogits != nil || printLogits
+        ) {
+            FileHandle.standardError.write(Data((notice + "\n").utf8))
+        }
+
+        // Speculative decoding: a draft model, prompt lookup, or both.
+        if draftModel != nil || promptLookup || speculative {
+            try await runSpeculativeDecoding(
+                targetPath: modelFile, draftPath: draftModel, resolver: resolver)
+            return
+        }
+
         // Validate continuation mode requirements
         if let continuation = continuation {
             guard !applyChatTemplate else {
                 CLILogger.log(
                     "Validation failed: chat template must be disabled for continuation mode", component: "Main")
-                throw ContinuationEvaluationError.requiresDisabledChatTemplate
+                throw ContinuationOptionError.requiresDisabledChatTemplate
             }
 
             guard saveLogits != nil || printLogits else {
                 CLILogger.log("Validation failed: logits output required for continuation mode", component: "Main")
-                throw ContinuationEvaluationError.requiresLogitsOutput
+                throw ContinuationOptionError.requiresLogitsOutput
             }
 
             guard !continuation.isEmpty else {
                 CLILogger.log("Validation failed: continuation string is empty", component: "Main")
-                throw ContinuationEvaluationError.emptyContinuation
+                throw ContinuationOptionError.emptyContinuation
             }
 
             CLILogger.log("Continuation evaluation mode enabled", component: "Main")
@@ -425,14 +867,20 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         try bundle.modelBundle.validateModelAssets()
         let modelName = bundle.name
         let modelVocabSize = bundle.vocabSize
+        if let rawScoring {
+            try RawTokenScoring.checkFits(
+                rawScoring, vocabSize: bundle.vocabSize, maxContextLength: bundle.maxContextLength)
+        }
 
         // Resolve component model URLs once; reused for the cache check and model loading below.
-        // An LLM bundle has only `main`; VLM bundles also have `vision` and `embedding`.
+        // An LLM bundle has only `main`; VLM bundles also have `vision`, plus `embedding` unless the
+        // decoder gathers its own token embeddings (`vision.token_merge` is `decoder_gather`).
         let isVLM = bundle.modelBundle.kind == .vlm
         let languageModelURL = try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.main)
         let visionModelURL = isVLM ? try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.vision) : nil
         let embeddingModelURL =
-            isVLM ? try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.embedding) : nil
+            isVLM && bundle.visionConfig?.tokenMerge != .decoderGather
+            ? try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.embedding) : nil
 
         if clearCoreAICache {
             let cleared = try PreparedModel.clearCache(at: bundle.bundlePath)
@@ -441,13 +889,16 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
 
         // Detect an existing cached specialization before loading so we can annotate the load
         // time below. This only inspects the cache; it never triggers specialization. For VLM
-        // bundles, all three components must be cached to count as a hit.
+        // bundles, every component the bundle actually declares must be cached to count as a hit.
         let cacheHit: Bool
         if let visionModelURL, let embeddingModelURL {
             cacheHit =
                 PreparedModel.isCached(at: visionModelURL)
                 && PreparedModel.isCached(at: embeddingModelURL)
                 && PreparedModel.isCached(at: languageModelURL)
+        } else if let visionModelURL {
+            cacheHit =
+                PreparedModel.isCached(at: visionModelURL) && PreparedModel.isCached(at: languageModelURL)
         } else {
             cacheHit = PreparedModel.isCached(at: languageModelURL)
         }
@@ -483,7 +934,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         let tokenizerLoadSpan = InstrumentsProfiler.beginTokenizerLoad(id: modelFile)
         async let tokenizerResult = bundle.loadTokenizer()
 
-        // The factory routes by bundle kind: VLM bundles build the sequential VLM engine from
+        // The factory routes by bundle kind: VLM bundles build a vision-language engine from
         // their vision/embedding/main components; everything else takes the single-asset path.
         let inferenceEngine = try await EngineFactory.createEngine(
             bundle: bundle, options: engineOptions)
@@ -496,26 +947,13 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             component: "Main")
 
         // Read additional stop token IDs from tokenizer_config.json (e.g. <end_of_turn> for Gemma)
-        var additionalEosTokenIds: Set<Int32>
-        if let tokenizerDir = bundle.tokenizerPath {
-            additionalEosTokenIds = LanguageConfig.additionalStopTokenIds(
-                from: tokenizerDir, tokenizer: tokenizer)
-            if !additionalEosTokenIds.isEmpty {
-                CLILogger.log(
-                    "Found \(additionalEosTokenIds.count) additional stop token(s) from tokenizer config: \(additionalEosTokenIds.sorted())",
-                    component: "Main")
-            }
-        } else {
-            additionalEosTokenIds = []
-        }
-
-        // Agentic models use <|eot|> as a turn boundary. It may not appear in
-        // tokenizer_config.json, so add it explicitly (skipping the main EOS).
-        let thinkingFormat = detectThinkingFormat(using: tokenizer)
-        if let eotId = agenticEndOfTurnTokenId(thinkingFormat: thinkingFormat, tokenizer: tokenizer),
-            eotId != tokenizer.eosTokenId.map({ Int32($0) })
-        {
-            additionalEosTokenIds.insert(eotId)
+        // and, for agentic models, the end-of-turn token.
+        let additionalEosTokenIds = RunnerPrompting.additionalStopTokenIds(
+            tokenizerDirectory: bundle.tokenizerPath, tokenizer: tokenizer)
+        if !additionalEosTokenIds.isEmpty {
+            CLILogger.log(
+                "Found \(additionalEosTokenIds.count) additional stop token(s): \(additionalEosTokenIds.sorted())",
+                component: "Main")
         }
 
         CLILogger.log("Model loaded successfully:", component: "Main")
@@ -643,19 +1081,31 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             print("Generating...")
         }
 
-        // Raw token evaluation: feed pre-tokenized IDs and save per-position logits
-        if case .rawTokens(let container) = promptInput, saveLogits != nil || printLogits {
+        // Raw token scoring (--raw-continuation): score those ids as a forced continuation of
+        // the whole --raw-tokens context, under --json-schema when it is given.
+        if let rawScoring {
             guard inferenceEngine.supportsLogits else {
-                throw ContinuationEvaluationError.engineDoesNotSupportLogits
+                throw ContinuationOptionError.engineDoesNotSupportLogits
             }
-            let result = try await generator.evaluateRawTokens(container.tokens.map { Int32($0) })
+            var result = try await generator.evaluateRawTokens(
+                context: rawScoring.context, continuation: rawScoring.continuation)
+            if let schemaInput = jsonSchema {
+                // The grammar generation would use: the same stop tokens, allowed once the JSON is
+                // complete, and the same whitespace limit.
+                let stopSequences = try validateAndEncodeStopTokens(
+                    stopTokens: stopTokens, tokenizer: tokenizer, additionalEosTokenIds: additionalEosTokenIds)
+                var grammar = try ConstrainedGenerationSession(
+                    jsonSchema: try loadJSONSchema(schemaInput), tokenizer: tokenizer, vocabSize: bundle.vocabSize,
+                    stopTokenIds: stopSequences.singleTokenStopIds, maxWhitespaceCount: maxWhitespaceCount)
+                result = try RawTokenScoring.maskedByGrammar(result, session: &grammar)
+            }
 
             await PerformanceMetrics.shared.endOverallTiming()
 
             try LogitsWriter.handleEvaluationOutput(
                 result: result,
-                context: "(raw tokens: \(container.tokens.count) ids)",
-                continuation: "(forced: \(container.tokens.count - 1) ids)",
+                context: "(raw tokens: \(rawScoring.context.count) ids)",
+                continuation: "(raw continuation: \(rawScoring.continuation.count) ids)",
                 tokenizer: tokenizer,
                 saveLogitsLength: saveLogitsLength,
                 saveJsonPath: saveLogits,
@@ -673,7 +1123,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             case .text(let text):
                 contextString = text
             case .rawTokens:
-                throw ContinuationEvaluationError.rawTokensNotSupported
+                throw ContinuationOptionError.rawTokensNotSupported
             }
 
             let signpostID = InstrumentsProfiler.beginInference(promptTokens: actualInputTokens, maxTokens: 0)
@@ -805,6 +1255,12 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
 
     // MARK: - Constrained Generation Helper
 
+    /// The `--json-schema` value: a file's contents when it names a file, otherwise the schema itself.
+    private func loadJSONSchema(_ schemaInput: String) throws -> String {
+        guard FileManager.default.fileExists(atPath: schemaInput) else { return schemaInput }
+        return try String(contentsOfFile: schemaInput, encoding: .utf8)
+    }
+
     private func runConstrainedGeneration(
         schemaInput: String,
         input: Input,
@@ -816,12 +1272,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         modelVocabSize: Int?,
         additionalEosTokenIds: Set<Int32> = []
     ) async throws {
-        let schema: String
-        if FileManager.default.fileExists(atPath: schemaInput) {
-            schema = try String(contentsOfFile: schemaInput, encoding: .utf8)
-        } else {
-            schema = schemaInput
-        }
+        let schema = try loadJSONSchema(schemaInput)
 
         CLILogger.log("Constrained generation with JSON schema", component: "Main")
 
@@ -842,12 +1293,14 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         if inferenceEngine is any ConstrainedGenerationCapable {
             constrainedStrategy = PipelinedConstrainedDecodingStrategy(
                 jsonSchema: schema,
-                vocabSize: vocabSize
+                vocabSize: vocabSize,
+                maxWhitespaceCount: maxWhitespaceCount
             )
         } else {
             constrainedStrategy = ConstrainedDecodingStrategy(
                 jsonSchema: schema,
-                vocabSize: vocabSize
+                vocabSize: vocabSize,
+                maxWhitespaceCount: maxWhitespaceCount
             )
         }
 
@@ -980,10 +1433,13 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
 
     // MARK: - VLM Inference
 
-    /// Runs `rows` copies of the prompt through `lockstepBatchedGenerate` and prints each row.
+    /// Runs `rows` copies of `promptTokens` through `lockstepBatchedGenerate`, up to `--max-tokens`
+    /// new tokens per row, and prints each row's decoded text.
     ///
-    /// Row 0 is greedy, so it should match a normal greedy run of the same prompt. The other rows
-    /// sample at `--temperature` (0.8 if that is 0) with a fixed seed per row, so reruns repeat.
+    /// Row 0 is greedy. Rows 1 and up sample at `--temperature` (0.8 when it is 0 or less) with
+    /// seed `1234 + row`. A row stops on the tokenizer's EOS or an `additionalEosTokenIds` token.
+    /// Throws `ValidationError` when the engine is not a `CoreAISequentialEngine` or `rows` exceeds
+    /// `bundle.maxBatchSize`.
     private func runBatchPrototype(
         rows: Int,
         inferenceEngine: any InferenceEngine,
@@ -1031,7 +1487,8 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         additionalEosTokenIds: Set<Int32>,
         displayPrompt: String
     ) async throws {
-        guard let vlmEngine = inferenceEngine as? any MultimodalInferenceEngine else {
+        guard let vlmEngine = inferenceEngine as? any MultimodalInferenceEngine, vlmEngine.acceptsMultimodalInput
+        else {
             print("Error: --image requires a vision-language model (engine does not support multimodal)")
             throw ExitCode.failure
         }
@@ -1055,23 +1512,8 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         let embeddedInput = try await vlmEngine.encodeImage(at: imageURL)
         CLILogger.log("Image encoded: \(embeddedInput.tokenCount) visual tokens", component: "VLM")
 
-        let shouldIncludeInfo =
-            switch imageInfo {
-            case .on: true
-            case .off: false
-            case .auto: visionConfig.includeImageInfo
-            }
-
-        var effectivePrompt = displayPrompt
-        if shouldIncludeInfo {
-            let imageURL = URL(fileURLWithPath: imagePath)
-            if let ciImage = CIImage(contentsOf: imageURL) {
-                let w = Int(ciImage.extent.width)
-                let h = Int(ciImage.extent.height)
-                effectivePrompt = "Image: \(w)x\(h)\n\(displayPrompt)"
-                CLILogger.log("Injected image info: \(w)x\(h)", component: "VLM")
-            }
-        }
+        let effectivePrompt = imagePromptText(
+            displayPrompt, imagePath: imagePath, visionConfig: visionConfig)
 
         try await runVLMGeneration(
             vlmEngine: vlmEngine,
@@ -1097,7 +1539,8 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         additionalEosTokenIds: Set<Int32>,
         displayPrompt: String
     ) async throws {
-        guard let vlmEngine = inferenceEngine as? any MultimodalInferenceEngine else {
+        guard let vlmEngine = inferenceEngine as? any MultimodalInferenceEngine, vlmEngine.acceptsMultimodalInput
+        else {
             print("Error: --video requires a vision-language model (engine does not support multimodal)")
             throw ExitCode.failure
         }
@@ -1151,32 +1594,12 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         additionalEosTokenIds: Set<Int32>,
         displayPrompt: String
     ) async throws {
-        let imageTokenCount = embeddedInput.tokenCount
-        let imageTokenId = visionConfig.imageTokenId
-        let vlmTokens: [Int32]
-
-        if let chatTemplateTokens = try? buildVLMPromptFromChatTemplate(
-            prompt: displayPrompt,
-            imageTokenCount: imageTokenCount,
-            imageTokenId: imageTokenId,
-            tokenizer: tokenizer
-        ) {
-            vlmTokens = chatTemplateTokens
-            CLILogger.log("VLM prompt: used tokenizer chat template", component: "VLM")
-        } else {
-            CLILogger.log(
-                "VLM prompt: no chat template found, using fallback USER/ASSISTANT format",
-                component: "VLM")
-            var tokens = tokenizer.encode(text: "USER: ", addSpecialTokens: true).map { Int32($0) }
-            tokens.append(contentsOf: [Int32](repeating: imageTokenId, count: imageTokenCount))
-            let suffix = "\n" + displayPrompt + "\nASSISTANT:"
-            tokens.append(
-                contentsOf: tokenizer.encode(text: suffix, addSpecialTokens: false).map { Int32($0) })
-            vlmTokens = tokens
-        }
+        let vlmTokens = imagePromptTokens(
+            displayPrompt, imageTokenCount: embeddedInput.tokenCount,
+            imageTokenId: visionConfig.imageTokenId, tokenizer: tokenizer)
 
         CLILogger.log(
-            "VLM prompt: \(vlmTokens.count) tokens (\(imageTokenCount) visual placeholders)",
+            "VLM prompt: \(vlmTokens.count) tokens (\(embeddedInput.tokenCount) visual placeholders)",
             component: "VLM")
 
         var eosTokenIds = Set<Int32>()
@@ -1200,10 +1623,8 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             with: embeddedInput,
             tokens: vlmTokens,
             samplingConfiguration: samplingConfiguration,
-            inferenceOptions: InferenceOptions(
-                maxTokens: maxTokens,
-                includeLogits: printLogits || saveLogits != nil
-            )
+            inferenceOptions: (printLogits || saveLogits != nil)
+                ? .sampleWithLogits(maxTokens: maxTokens) : .extend(maxTokens: maxTokens)
         )
 
         CLILogger.log("VLM generate started, maxTokens=\(maxTokens)", component: "VLM")
@@ -1274,6 +1695,49 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     /// Build a VLM prompt using the tokenizer's chat template.
     /// Returns nil if the tokenizer doesn't support multimodal chat templates
     /// or if the template doesn't produce the expected image placeholder tokens.
+    /// The prompt text sent with an image: `displayPrompt`, preceded by the image's resolution when
+    /// `--image-info` asks for it (`auto` follows the model's metadata). Used by plain and speculative
+    /// runs so both put the same text in front of the model.
+    private func imagePromptText(
+        _ displayPrompt: String, imagePath: String, visionConfig: VisionConfig
+    ) -> String {
+        let shouldIncludeInfo =
+            switch imageInfo {
+            case .on: true
+            case .off: false
+            case .auto: visionConfig.includeImageInfo
+            }
+        guard shouldIncludeInfo,
+            let ciImage = CIImage(contentsOf: URL(fileURLWithPath: imagePath))
+        else { return displayPrompt }
+        let w = Int(ciImage.extent.width)
+        let h = Int(ciImage.extent.height)
+        CLILogger.log("Injected image info: \(w)x\(h)", component: "VLM")
+        return "Image: \(w)x\(h)\n\(displayPrompt)"
+    }
+
+    /// Prompt tokens for an image prompt: the tokenizer's chat template with the image placeholder
+    /// expanded to `imageTokenCount` tokens, else a plain USER/ASSISTANT format. Used by plain and
+    /// speculative runs.
+    private func imagePromptTokens(
+        _ prompt: String, imageTokenCount: Int, imageTokenId: Int32, tokenizer: any Tokenizer
+    ) -> [Int32] {
+        if let chatTemplateTokens = try? buildVLMPromptFromChatTemplate(
+            prompt: prompt, imageTokenCount: imageTokenCount, imageTokenId: imageTokenId,
+            tokenizer: tokenizer)
+        {
+            CLILogger.log("VLM prompt: used tokenizer chat template", component: "VLM")
+            return chatTemplateTokens
+        }
+        CLILogger.log(
+            "VLM prompt: no chat template found, using fallback USER/ASSISTANT format", component: "VLM")
+        var tokens = tokenizer.encode(text: "USER: ", addSpecialTokens: true).map { Int32($0) }
+        tokens.append(contentsOf: [Int32](repeating: imageTokenId, count: imageTokenCount))
+        let suffix = "\n" + prompt + "\nASSISTANT:"
+        tokens.append(contentsOf: tokenizer.encode(text: suffix, addSpecialTokens: false).map { Int32($0) })
+        return tokens
+    }
+
     private func buildVLMPromptFromChatTemplate(
         prompt: String,
         imageTokenCount: Int,

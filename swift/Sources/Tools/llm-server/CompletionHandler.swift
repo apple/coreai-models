@@ -23,16 +23,15 @@ func handleCompletionsFromBody(body: ByteBuffer, state: ServerState) async throw
     guard state.config.supportsLogprobs else {
         let err = ErrorResponse(
             error: .init(
-                message: "Logprobs not supported. Use --variant coreai-sequential", type: "server_error",
-                code: "unsupported"))
+                message: logprobsUnsupportedMessage, type: "server_error", code: "unsupported"))
         let data = try JSONEncoder().encode(err)
         return Response(
             status: .notImplemented, headers: [.contentType: "application/json"],
             body: .init(byteBuffer: ByteBuffer(data: data)))
     }
-    let permit: QueuePermit
+    let access: RequestAccess
     do {
-        permit = try await state.queue.acquire()
+        access = try await state.acquireScoringAccess()
     } catch let error as ServerError {
         let err = ErrorResponse(
             error: .init(
@@ -42,7 +41,7 @@ func handleCompletionsFromBody(body: ByteBuffer, state: ServerState) async throw
             status: .tooManyRequests, headers: [.contentType: "application/json"],
             body: .init(byteBuffer: ByteBuffer(data: data)))
     }
-    defer { permit.release() }
+    defer { access.release() }
     let req: CompletionRequest
     do {
         req = try JSONDecoder().decode(CompletionRequest.self, from: body)
@@ -68,7 +67,29 @@ func handleCompletionsFromBody(body: ByteBuffer, state: ServerState) async throw
 
 // MARK: - Loglikelihood Implementation
 
+let logprobsUnsupportedMessage = "Logprobs not supported. Use --variant coreai-sequential"
+
 private func handleLoglikelihood(req: CompletionRequest, state: ServerState) async throws -> Response {
+    let outcome = try await runLoglikelihood(req: req, state: state)
+    let data = try JSONEncoder().encode(outcome.response)
+    return Response(
+        status: .ok,
+        headers: [.contentType: "application/json"],
+        body: .init(byteBuffer: ByteBuffer(data: data))
+    )
+}
+
+/// A scoring response with its token count and timing.
+struct LoglikelihoodOutcome {
+    let response: CompletionResponse
+    /// Tokens over all prompts.
+    let promptTokenCount: Int
+    let totalSeconds: Double
+}
+
+/// Scores the prompts in `req`, for `/v1/completions` and `--replay`. Call it while holding the
+/// scoring access, on an engine with `supportsLogprobs`.
+func runLoglikelihood(req: CompletionRequest, state: ServerState) async throws -> LoglikelihoodOutcome {
     let requestID = RequestID.next()
     let created = Int(Date().timeIntervalSince1970)
     let wantsEcho = req.echo ?? false
@@ -81,12 +102,26 @@ private func handleLoglikelihood(req: CompletionRequest, state: ServerState) asy
     let t0 = SuspendingClock().now
     var choices: [CompletionResponse.CompletionChoice] = []
 
-    for (idx, prompt) in req.prompts.enumerated() {
-        let choice = try await processOnePrompt(
-            prompt: prompt, index: idx,
-            wantsEcho: wantsEcho, topN: topN, state: state
-        )
-        choices.append(choice)
+    let prepared = try req.prompts.map { try preparePrompt($0, state: state) }
+    let scorable = prepared.compactMap { $0 }
+    var scores: [LogProbabilities] = []
+    if let scheduler = state.scoringScheduler {
+        scores = try await scheduler.score(
+            scorable.map { ScoreRequest(tokens: $0.tokens, targets: $0.targets, topK: topN) })
+    } else {
+        for prompt in scorable {
+            scores.append(try await scoreOnEngine(prompt, topN: topN, state: state))
+        }
+    }
+
+    var nextScore = scores.makeIterator()
+    for (index, prompt) in prepared.enumerated() {
+        guard let prompt, let probs = nextScore.next() else {
+            choices.append(.init(index: index, text: "", logprobs: nil, finishReason: "stop"))
+            continue
+        }
+        choices.append(
+            makeChoice(prompt, probs: probs, index: index, wantsEcho: wantsEcho, topN: topN, state: state))
     }
 
     let elapsed = SuspendingClock().now - t0
@@ -106,20 +141,19 @@ private func handleLoglikelihood(req: CompletionRequest, state: ServerState) asy
         id: requestID, object: "text_completion", created: created,
         model: state.config.modelName, choices: choices
     )
-
-    let data = try JSONEncoder().encode(response)
-    return Response(
-        status: .ok,
-        headers: [.contentType: "application/json"],
-        body: .init(byteBuffer: ByteBuffer(data: data))
-    )
+    return LoglikelihoodOutcome(response: response, promptTokenCount: totalTokens, totalSeconds: seconds)
 }
 
-private func processOnePrompt(
-    prompt: Prompt, index: Int,
-    wantsEcho: Bool, topN: Int,
-    state: ServerState
-) async throws -> CompletionResponse.CompletionChoice {
+/// Tokenized prompt to score, with the target token each position predicts.
+private struct PreparedPrompt {
+    let tokens: [Int32]
+    /// `tokens.dropFirst()` followed by `tokens[0]` as padding. Same count as `tokens`.
+    let targets: [Int32]
+}
+
+/// Tokenizes `prompt` into tokens and targets. Returns nil when it has fewer than two tokens.
+/// Throws `ServerError.badRequest` when it has more than `state.config.maxContextLength` tokens.
+private func preparePrompt(_ prompt: Prompt, state: ServerState) throws -> PreparedPrompt? {
     let allTokens: [Int32]
     switch prompt {
     case .tokenIds(let ids):
@@ -128,31 +162,30 @@ private func processOnePrompt(
         allTokens = state.tokenizer.encode(text: text).map { Int32($0) }
     }
 
-    guard allTokens.count >= 2 else {
-        return .init(index: index, text: "", logprobs: nil, finishReason: "stop")
-    }
+    guard allTokens.count >= 2 else { return nil }
 
     guard allTokens.count <= state.config.maxContextLength else {
         throw ServerError.badRequest(
             "Prompt length \(allTokens.count) exceeds max context \(state.config.maxContextLength)")
     }
+    return PreparedPrompt(tokens: allTokens, targets: Array(allTokens.dropFirst()) + [allTokens[0]])
+}
 
-    // lm-eval sends echo=true, max_tokens=1 and slices logprobs[ctxlen:-1].
-    // The :-1 discards the last entry. We append a padding token so :-1
-    // drops it instead of discarding real data.
-    let paddingToken = allTokens[0]
-    let continuation = Array(allTokens.dropFirst()) + [paddingToken]
-
-    let options = InferenceOptions(
-        maxTokens: continuation.count,
-        includeLogits: true,
-        forcedContinuation: continuation
+/// Scores `prompt` on the `.fallbackBatchOne` engine after a reset, by feeding `tokens[0]` and
+/// forcing `targets`. Reports the top `topN` alternatives per position.
+private func scoreOnEngine(_ prompt: PreparedPrompt, topN: Int, state: ServerState) async throws
+    -> LogProbabilities
+{
+    let options = InferenceOptions.eval(
+        maxTokens: prompt.targets.count,
+        forcedContinuation: prompt.targets
     )
 
-    try await state.engine.reset()
+    let scoringEngine = state.engineForRequest(lane: .fallbackBatchOne)
+    try await scoringEngine.reset()
 
-    let stream = try await state.engine.generate(
-        with: [allTokens[0]],
+    let stream = try await scoringEngine.generate(
+        with: [prompt.tokens[0]],
         samplingConfiguration: .greedy,
         inferenceOptions: options
     )
@@ -163,8 +196,14 @@ private func processOnePrompt(
             allLogits.append(logits)
         }
     }
+    return LogProbabilities.compute(logits: allLogits, targets: prompt.targets, topK: topN)
+}
 
-    let probs = LogProbabilities.compute(logits: allLogits, targets: continuation, topK: topN)
+private func makeChoice(
+    _ prompt: PreparedPrompt, probs: LogProbabilities, index: Int, wantsEcho: Bool, topN: Int,
+    state: ServerState
+) -> CompletionResponse.CompletionChoice {
+    let allTokens = prompt.tokens
 
     var tokens: [String] = []
     var tokenLogprobs: [Double?] = []

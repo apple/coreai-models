@@ -20,8 +20,10 @@ from coreai_models.primitives.ios.rope import RoPECache as NERoPE
 from coreai_models.primitives.ios.rope import RoPECache as iOSRoPE
 from coreai_models.primitives.ios.rope import apply_rope
 from tests._runner_infra.testing_utils import (
+    MACOS_27_KNOWN_ISSUE,
     assert_close,
     run_compare_coreai,
+    uses_os_coreai,
 )
 
 
@@ -275,6 +277,8 @@ class TestiOSStandardRope(BaseRoPETest):
         precision: torch.dtype,
     ) -> None:
         """Test Core AI compilation and execution."""
+        if uses_os_coreai():
+            pytest.skip(MACOS_27_KNOWN_ISSUE)
         self._run_test_coreai(
             precision=precision,
             config_class=config_class,
@@ -282,3 +286,11 @@ class TestiOSStandardRope(BaseRoPETest):
             apply_rotary_fn=apply_rotary_fn,
             head_is_different=head_is_different,
         )
+
+
+def test_apply_rope_rejects_ndim_not_dividing_last_dim():
+    x = torch.randn(1, 2, 3, 6)
+    cos = torch.randn(1, 3, 6)
+    sin = torch.randn(1, 3, 6)
+    with pytest.raises((RuntimeError, ValueError)):
+        apply_rope(x, cos, sin, ndim=4)
