@@ -22,7 +22,7 @@ import logging
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import numpy as np
 import torch
@@ -42,6 +42,13 @@ from coreai_models.export.compression import is_compression_mode_graph, quantize
 from coreai_models.export.metadata import build_aimodel_metadata
 
 logger = logging.getLogger(__name__)
+
+
+_PRECISIONS = {
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+    "float32": torch.float32,
+}
 
 
 @dataclass
@@ -68,12 +75,7 @@ def export_diffusion(config: DiffusionExportConfig) -> dict[str, str]:
     Returns:
         Dict mapping component name to its .aimodel path.
     """
-    precision_map = {
-        "float16": torch.float16,
-        "bfloat16": torch.bfloat16,
-        "float32": torch.float32,
-    }
-    model_dtype = precision_map.get(config.compute_precision, torch.float32)
+    model_dtype = _PRECISIONS.get(config.compute_precision, torch.float32)
 
     # 1. Determine pipeline type and load HF pipeline
     pipeline_type = get_pipeline_type(config.hf_model_id)
@@ -85,8 +87,24 @@ def export_diffusion(config: DiffusionExportConfig) -> dict[str, str]:
     component_names = config.components or list(registry.keys())
     logger.info(f"Pipeline type: {pipeline_type}, components: {component_names}")
 
-    # Resolve compression preset
-    quant_config = _resolve_compression(config.compression)
+    quant_configs = _resolve_compression(config.compression, list(hf_pipe.components))
+    _apply_component_precision(
+        hf_pipe, _resolve_component_precision(config.compression, list(hf_pipe.components))
+    )
+    # Each spec's config, checked before any export so a bad combination fails without
+    # leaving a half-written bundle.
+    spec_configs: dict[str, dict] = {}
+    if any(c is not None for c in quant_configs.values()):
+        for name in component_names:
+            spec = registry.get(name)
+            if spec is None or not spec.quantizable:
+                continue
+            owner = quant_weight_owner(spec.wrapper_fn(hf_pipe))
+            component = _pipeline_component_name(hf_pipe, owner)
+            component_config = quant_configs[component]
+            if component_config is not None:
+                _check_quantization_precision(component_config, owner, component)
+                spec_configs[name] = component_config
 
     # Output goes to <output_dir>/<model-name>/
     model_subdir = config.hf_model_id.split("/")[-1]
@@ -116,7 +134,8 @@ def export_diffusion(config: DiffusionExportConfig) -> dict[str, str]:
         wrapper = spec.wrapper_fn(hf_pipe)
 
         # Quantize weights here, before export.
-        if quant_config is not None and spec.quantizable:
+        quant_config = spec_configs.get(name)
+        if quant_config is not None:
             logger.info(f"Quantizing {name}...")
             _quantize_component_weights(
                 wrapper,
@@ -494,21 +513,122 @@ def _build_wan_config(hf_pipe: Any, model_id: str, *, vae_tile_size: int | None 
 # ---------------------------------------------------------------------------
 
 
-def _resolve_compression(compression: str) -> dict | None:
-    """Resolve a compression string to a config dict or None."""
-    if compression in PRESETS:
-        config = PRESETS[compression].get("config")
-        return cast(dict | None, config)
-    try:
-        parsed: dict = json.loads(compression)
-    except (json.JSONDecodeError, TypeError) as e:
-        available = ", ".join(list_presets())
-        raise ValueError(
-            f"Unknown compression value '{compression}'. "
-            f"Expected a preset name ({available}) or a JSON config dict."
-        ) from e
+def _resolve_compression(compression: str, component_names: list[str]) -> dict[str, dict | None]:
+    """Resolve a compression string to a quantization config per pipeline component.
 
-    return parsed
+    A preset holds either one ``config`` for every component or ``component_configs`` keyed
+    by diffusers component name. A JSON value is a coreai-opt config, or
+    ``{"components": {...}}`` for the keyed form. Unlisted components stay dense.
+
+    Args:
+        compression: Preset name or JSON string.
+        component_names: The pipeline's component names, e.g. ``hf_pipe.components``.
+    """
+    if compression in PRESETS:
+        preset = PRESETS[compression]
+        per_component = preset.get("component_configs")
+        uniform = preset.get("config")
+    else:
+        try:
+            parsed: dict = json.loads(compression)
+        except (json.JSONDecodeError, TypeError) as e:
+            available = ", ".join(list_presets())
+            raise ValueError(
+                f"Unknown compression value '{compression}'. "
+                f"Expected a preset name ({available}) or a JSON config dict."
+            ) from e
+        parsed.pop("component_precision", None)  # read by `_resolve_component_precision`
+        per_component = parsed.get("components")
+        uniform = None if per_component is not None else parsed
+
+    if per_component is None:
+        return {name: uniform for name in component_names}
+
+    # A misspelled name would leave that component silently dense.
+    unknown = sorted(set(per_component) - set(component_names))
+    if unknown:
+        raise ValueError(
+            f"Compression names unknown pipeline components {unknown}. "
+            f"Valid: {sorted(component_names)}."
+        )
+    return {name: per_component.get(name) for name in component_names}
+
+
+def _resolve_component_precision(compression: str, component_names: list[str]) -> dict[str, str]:
+    """Per-component compute precision overrides a compression preset declares.
+
+    A preset's ``component_precision`` (or the same key in a JSON value) overrides
+    ``compute_precision`` for the named components; others keep the pipeline's precision.
+
+    Args:
+        compression: Preset name or JSON string.
+        component_names: The pipeline's component names, e.g. ``hf_pipe.components``.
+    """
+    if compression in PRESETS:
+        overrides = PRESETS[compression].get("component_precision", {})
+    else:
+        try:
+            overrides = json.loads(compression).get("component_precision", {})
+        except (json.JSONDecodeError, TypeError, AttributeError):
+            overrides = {}  # `_resolve_compression` reports a malformed value
+
+    unknown = sorted(set(overrides) - set(component_names))
+    if unknown:
+        raise ValueError(
+            f"Precision names unknown pipeline components {unknown}. "
+            f"Valid: {sorted(component_names)}."
+        )
+    invalid = {name: p for name, p in overrides.items() if p not in _PRECISIONS}
+    if invalid:
+        raise ValueError(f"Unknown precisions {invalid}. Valid: {sorted(_PRECISIONS)}.")
+    return dict(overrides)
+
+
+def _apply_component_precision(hf_pipe: Any, overrides: dict[str, str]) -> None:
+    """Cast the named pipeline components in place, before quantization reads them."""
+    for name, precision in overrides.items():
+        logger.info(f"Casting {name} to {precision}")
+        getattr(hf_pipe, name).to(_PRECISIONS[precision])
+
+
+def _pipeline_component_name(hf_pipe: Any, weight_owner: torch.nn.Module) -> str:
+    """The diffusers component name of ``weight_owner``, found by identity."""
+    for name, module in hf_pipe.components.items():
+        if module is weight_owner:
+            return str(name)
+    raise ValueError(
+        f"{type(weight_owner).__name__} is not a component of {type(hf_pipe).__name__}"
+    )
+
+
+def _uses_int4(config: Any) -> bool:
+    """Whether any spec in a coreai-opt config quantizes to a 4-bit integer dtype."""
+    if not isinstance(config, dict):
+        return False
+    return any(
+        (key == "dtype" and value in ("int4", "uint4")) or _uses_int4(value)
+        for key, value in config.items()
+    )
+
+
+def _check_quantization_precision(
+    quantization_config: dict | None, module: torch.nn.Module, component: str
+) -> None:
+    """Reject int4 weights quantized from bf16, which export fine but abort at runtime.
+
+    Int scales take the weight dtype, and the Core AI GPU int4 dequant kernel asserts
+    ``scale should be half or float`` on bf16 ones.
+    """
+    if quantization_config is None or not _uses_int4(quantization_config):
+        return
+    dtype = next((p.dtype for p in module.parameters() if p.is_floating_point()), None)
+    if dtype == torch.bfloat16:
+        raise ValueError(
+            f"{component}: INT4 weights quantized from bfloat16 get bfloat16 scales, which the "
+            "Core AI GPU int4 dequant kernel rejects at runtime. Export it in float16 with "
+            f'`component_precision` (e.g. {{"{component}": "float16"}}), use an INT8 config for '
+            "it, or pick a preset that does either (e.g. t8bit-te4bit-asym)."
+        )
 
 
 def _quantize_component_weights(

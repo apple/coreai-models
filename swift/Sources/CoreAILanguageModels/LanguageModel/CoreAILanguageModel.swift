@@ -602,12 +602,11 @@ public struct CoreAILanguageModel: LanguageModel {
             let name: String
             let arguments: String
 
-            var message: [String: any Sendable] {
-                [
-                    "id": id,
-                    "type": "function",
-                    "function": ["name": name, "arguments": arguments] as [String: any Sendable],
-                ]
+            /// The call as a template's `tool_calls` entry. Decoding sorts the arguments' keys, which
+            /// also makes them render the same way every time: `GeneratedContent` keeps no order of
+            /// its own (its `jsonString` varies from one instance to the next).
+            var message: any Sendable {
+                TemplateValues.toolCall(id: id, name: name, arguments: arguments)
             }
         }
 
@@ -690,8 +689,11 @@ public struct CoreAILanguageModel: LanguageModel {
                     messages: messages, tools: toolSpecs,
                     additionalContext: extra.isEmpty ? nil : extra)
             } catch {
-                CLILogger.log(
-                    "Failed to apply chat template: \(error), falling back to simple encoding",
+                // Shown without --verbose, once per kind of failure: the simple encoding below is not
+                // what the model was trained on.
+                CLILogger.warnOnce(
+                    "chat template: \(error)",
+                    "Warning: failed to apply chat template: \(error), falling back to simple encoding",
                     component: component)
                 let text = messages.compactMap { $0["content"] as? String }.joined(separator: "\n")
                 return tokenizer.encode(text: text)

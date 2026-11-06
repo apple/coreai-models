@@ -71,6 +71,20 @@ public struct ImagePreprocessor: Sendable {
         rescaleFactor: 1.0
     )
 
+    /// Load an image file (JPEG, PNG, HEIC, etc.) as a `CGImage`, rendered with a shared `CIContext`.
+    ///
+    /// - Throws: ``ImagePreprocessorError/loadFailed(_:)`` if the image cannot be loaded, or
+    ///   ``ImagePreprocessorError/renderFailed`` if rendering fails
+    public static func loadCGImage(contentsOf url: URL) throws -> CGImage {
+        guard let ciImage = CIImage(contentsOf: url) else {
+            throw ImagePreprocessorError.loadFailed(url)
+        }
+        guard let cgImage = ciContext.createCGImage(ciImage, from: ciImage.extent) else {
+            throw ImagePreprocessorError.renderFailed
+        }
+        return cgImage
+    }
+
     /// Preprocess an image from a file URL.
     ///
     /// - Parameter imageURL: URL to an image file (JPEG, PNG, HEIC, etc.)

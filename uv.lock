@@ -410,7 +410,7 @@ dependencies = [
 requires-dist = [
     { name = "accelerate", specifier = ">=1.12,<2.0" },
     { name = "coreai-core", specifier = "==1.0.0b3" },
-    { name = "coreai-opt", specifier = "==0.3.0" },
+    { name = "coreai-opt", specifier = "==0.4.0" },
     { name = "coreai-torch", specifier = "==0.4.3" },
     { name = "datasets", specifier = ">=4.0,<5.0" },
     { name = "diffusers", specifier = ">=0.37,<1.0" },
@@ -429,7 +429,7 @@ requires-dist = [
 
 [[package]]
 name = "coreai-opt"
-version = "0.3.0"
+version = "0.4.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "ninja" },
@@ -444,9 +444,9 @@ dependencies = [
     { name = "torchao" },
     { name = "tqdm" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/fd/95/0012225daf2b3426b295107a8cc44a196bea2daa0ad356cbf1414168c684/coreai_opt-0.3.0.tar.gz", hash = "sha256:33fb96dbd22c7ec809918d0202f1a15954968bac863437b01a7594ab616ce329", size = 352103, upload-time = "2026-09-25T20:51:31.791Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/6d/6f/c3263b2df8e5cbfe3df03bc460022a68b692a080d20891811dbd603b883e/coreai_opt-0.4.0.tar.gz", hash = "sha256:996657cc4f85438d0f4a33b1657bb469d040a1b5161388c8dd481aba4c0c67f0", size = 380529, upload-time = "2026-11-05T19:08:03.957Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/dc/14/a44238e7de695ef588eda1697c92c92c9865418dc6dbc165b7c819e2e14d/coreai_opt-0.3.0-py3-none-any.whl", hash = "sha256:d04283a8ecd3c91a18f73f7c69249dd0826048f39717c7fb4deae99270f6c1fe", size = 390696, upload-time = "2026-09-25T20:51:30.066Z" },
+    { url = "https://files.pythonhosted.org/packages/12/c5/329186b2133d7a23b23deedc456bc3294961038005a09c48fd5c1b4272df/coreai_opt-0.4.0-py3-none-any.whl", hash = "sha256:bbb4c6c383dd74deba5573deea6be097aa62a3efcd46578e1879af5fb68b5a3b", size = 416151, upload-time = "2026-11-05T19:08:02.414Z" },
 ]
 
 [[package]]

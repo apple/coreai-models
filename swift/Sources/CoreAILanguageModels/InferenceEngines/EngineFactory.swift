@@ -80,9 +80,9 @@ public struct EngineFactory: Sendable {
     /// carries a vision component and a `main` decoder, plus an embedding component when
     /// `vision.token_merge` is `separate_embedding`. That field decides the engine:
     /// `CoreAISequentialEngine` for `separate_embedding` (and bundles that predate the field), the
-    /// static-shape engine for `decoder_gather`. A `separate_embedding` bundle accepts only the
-    /// `coreai-sequential` variant override. Every other kind resolves its `main` asset and hands off to
-    /// ``createEngine(config:modelURL:options:)``.
+    /// static-shape engine for `decoder_gather`. A variant override must name that engine
+    /// (`coreai-sequential` or `static-shape`). Every other kind resolves its `main` asset and hands
+    /// off to ``createEngine(config:modelURL:options:)``.
     ///
     /// - Parameters:
     ///   - bundle: The parsed language bundle (LLM or VLM).

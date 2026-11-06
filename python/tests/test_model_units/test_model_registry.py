@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import pytest
 
+from coreai_models.diffusion.presets import PRESETS as DIFFUSION_COMPRESSION_PRESETS
 from coreai_models.model_registry import (
     DIFFUSION_PRESETS,
     LLM_PRESETS,
@@ -37,6 +38,12 @@ def test_no_duplicate_short_name_variant_pairs() -> None:
 def test_diffusion_presets_have_no_variant() -> None:
     for p in DIFFUSION_PRESETS:
         assert p.variant is None, f"{p.short_name} should have variant=None"
+
+
+def test_diffusion_presets_name_a_known_compression_preset() -> None:
+    """A typo would only surface minutes into an export, after the pipeline loads."""
+    for p in DIFFUSION_PRESETS:
+        assert p.compression in DIFFUSION_COMPRESSION_PRESETS, p.short_name
 
 
 def test_filter_by_family_and_variant() -> None:
