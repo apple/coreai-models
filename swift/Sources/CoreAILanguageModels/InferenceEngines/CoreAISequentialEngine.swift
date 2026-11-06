@@ -90,6 +90,9 @@ public final class CoreAISequentialEngine: MultimodalInferenceEngine, Idempotent
     /// Retained to build per-session state handlers in `makeSessionState()`.
     private let options: EngineOptions
 
+    /// Sampling behavior of the decode loop: normalized configurations, no soft cap.
+    let samplingPolicy = SamplingPolicy(logitSoftcap: nil, normalizesSampling: true)
+
     // Per-request mutable state. The `generate()` shim owns one internal session and
     // reuses it across calls, preserving implicit prefix-cache reuse and reset(to:)
     // semantics. Idempotent callers pass their own session instead.
@@ -408,6 +411,27 @@ public final class CoreAISequentialEngine: MultimodalInferenceEngine, Idempotent
             return .chunked(chunkSize: config.prefillChunkSize)
         }
         return .wholeBatch
+    }
+
+    /// Run a prompt through the forward pass with the given prefill strategy, returning the
+    /// logits of its last position.
+    ///
+    /// `chunked` runs a chunked prefill and returns last-position logits. `batch` runs one
+    /// forward pass over a slice.
+    static func lastPositionLogits(
+        for tokens: ArraySlice<Int32>,
+        strategy: PrefillStrategy,
+        vocabSize: Int,
+        chunked: (ArraySlice<Int32>, Int) async throws -> [LogitsScalarType],
+        batch: (ArraySlice<Int32>) async throws -> [LogitsScalarType]
+    ) async throws -> [LogitsScalarType] {
+        switch strategy {
+        case .chunked(let chunkSize):
+            return try await chunked(tokens, chunkSize)
+        case .wholeBatch:
+            let allLogits = try await batch(tokens)
+            return lastTokenLogits(from: allLogits, vocabSize: vocabSize)
+        }
     }
 
     // MARK: - Token Batch Processing
@@ -980,18 +1004,6 @@ public final class CoreAISequentialEngine: MultimodalInferenceEngine, Idempotent
 
     // MARK: - Lifecycle
 
-    /// Wait for any in-flight generate() Task to finish.
-    private func drain() {
-        var attempts = 0
-        while session.tokenBox.isBusy {
-            attempts += 1
-            if attempts > 5000 {
-                fatalError("Sequential engine drain() timeout — generation Task stuck?")
-            }
-            Thread.sleep(forTimeInterval: 0.001)
-        }
-    }
-
     public func cancel() async throws {
         session.tokenBox.cancelActive()
     }
@@ -1032,6 +1044,7 @@ public final class CoreAISequentialEngine: MultimodalInferenceEngine, Idempotent
         resetSpan.end()
     }
 
+    @available(*, deprecated, message: "No-op: the engine holds nothing that needs cleanup.")
     public func cleanup() {
         let cleanupSpan = InstrumentsProfiler.beginCleanup(engine: "CoreAIClean")
         CLILogger.log("CoreAI clean engine cleanup complete")
@@ -1332,7 +1345,7 @@ extension CoreAISequentialEngine.GenerationSequence {
         private let engine: CoreAISequentialEngine
         private let sessionState: GenerationSessionState
         private let generationToken: GenerationToken
-        private var loop: SequentialDecodeLoop
+        private var loop: DecodeLoop
 
         // Pre-computed logits for batched forcedContinuation evaluation.
         // When non-nil, next() yields from this buffer instead of running inference.
@@ -1355,9 +1368,10 @@ extension CoreAISequentialEngine.GenerationSequence {
             self.sessionState = sessionState
             self.generationToken = generationToken
             self.embeddedInput = embeddedInput
-            self.loop = SequentialDecodeLoop(
+            self.loop = DecodeLoop(
                 input: input,
                 samplingConfiguration: samplingConfiguration,
+                samplingPolicy: engine.samplingPolicy,
                 inferenceOptions: inferenceOptions,
                 maxContextLength: engine.config.maxContextLength,
                 stopReasonStore: stopReasonStore,
@@ -1408,7 +1422,7 @@ extension CoreAISequentialEngine.GenerationSequence {
                         embeddedInput: embedded, tokens: newTokens, sessionState: sessionState)
                     embeddedInput = nil
                 } else {
-                    logitBuffer = try await SequentialIterator.lastPositionLogits(
+                    logitBuffer = try await CoreAISequentialEngine.lastPositionLogits(
                         for: newTokens,
                         strategy: engine.selectPrefillStrategy(newTokenCount: newTokens.count),
                         vocabSize: engine.config.vocabSize,
