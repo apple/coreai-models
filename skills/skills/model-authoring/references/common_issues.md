@@ -49,50 +49,21 @@ ______________________________________________________________________
 
 ## Neural Engine MLP — SiLU less precise than on the GPU
 
-**Cause**: With coreai-build 3600.83.1, `silu()` compiles to one Neural Engine region (h16c, h18p) with no invalid ops, and `x * torch.sigmoid(x)` returns the same bits there. Conv → SiLU → conv with random fp16 weights (snippet below) reaches 47 dB against fp32, the GPU 83 dB. Over the 28 MLP blocks of Qwen3-0.6B on one 64-token prompt, the Neural Engine median (lowest) PSNR is 67.6 (55.2) dB.
+**Cause**: With coreai-build 3600.83.1, `silu()` compiles to one Neural Engine region (h16c, h18p) with no invalid ops, and `x * torch.sigmoid(x)` returns the same bits there. Conv → SiLU → conv with random fp16 weights reaches 47 dB against fp32, the GPU 83 dB. Over the 28 MLP blocks of Qwen3-0.6B on one 64-token prompt, the Neural Engine median (lowest) PSNR is 67.6 (55.2) dB.
 **Fix**: Keep `silu()`. If more is needed, `x * (c * torch.tanh(x * c) + c)`, with `c` an fp16 buffer holding 0.5, reaches 71 dB and 81.6 (69.7) dB. On an M4 Max Neural Engine one Qwen3-0.6B MLP block takes 2.74 ms, not 0.40 ms, at 64 tokens (equal at 1 token).
 
 ```python
-import asyncio
-import tempfile
-from pathlib import Path
-
-import numpy as np
 import torch
-from coreai.runtime import AIModel, ComputeUnitKind, NDArray, SpecializationOptions
-from coreai_torch import TorchConverter, get_decomp_table
 from torch import nn
 
 
 class TanhSiLU(nn.Module):
     def __init__(self):
         super().__init__()
-        self.c = nn.Buffer(torch.tensor(0.5))
+        self.c = nn.Buffer(torch.tensor(0.5, dtype=torch.float16))
 
     def forward(self, x):
         return x * (self.c * torch.tanh(x * self.c) + self.c)
-
-
-async def run(path, x, unit):
-    options = SpecializationOptions.from_preferred_compute_unit_kind(unit)
-    model = await AIModel.load(path, specialization_options=options)
-    return (await model.load_function("main")({"x": NDArray(x)}))["y"].numpy()
-
-
-x = np.random.default_rng(0).standard_normal((1, 256, 1, 64)).astype(np.float16)
-names = {"input_names": ["x"], "output_names": ["y"]}
-for act in (nn.SiLU(), TanhSiLU()):
-    torch.manual_seed(0)
-    module = nn.Sequential(nn.Conv2d(256, 1024, 1), act, nn.Conv2d(1024, 256, 1))
-    module = module.eval().half()
-    ep = torch.export.export(module, (torch.from_numpy(x),))
-    ep = ep.run_decompositions(get_decomp_table())
-    path = Path(tempfile.mkdtemp()) / "m.aimodel"
-    TorchConverter().add_exported_program(ep, **names).to_coreai().save_asset(path)
-    ref = module.float()(torch.from_numpy(x).float()).detach().numpy()
-    for unit in (ComputeUnitKind.gpu(), ComputeUnitKind.neural_engine()):
-        mse = np.mean((asyncio.run(run(path, x, unit)) - ref) ** 2)
-        print(type(act).__name__, unit, 10 * np.log10(np.abs(ref).max() ** 2 / mse))
 ```
 
 ______________________________________________________________________
@@ -153,94 +124,41 @@ ______________________________________________________________________
 ## Neural Engine wrong for tiny divisors, clamp floors and eps
 
 **Cause**: In three cases the Neural Engine departs from CPU and GPU. `x / v` with `|v|` below 2^-16 (~1.5e-5), including 0, returns `x * 65536` with the sign of `v`. `v.clamp(min=c)` with `c` below 2^-14, the smallest normal fp16 (`1e-6`, `2e-5`, also `6.1e-5`, which rounds below it), returns 0 where it clamps. `torch.rsqrt(v + 1e-6)` returns inf at `v = 0` and 256, not 301, at `v = 1e-5`.
-**Fix**: Floor with `v.clamp(min=torch.finfo(torch.float16).tiny)` (2^-14) or higher; both units then agree (snippet below). `x / (v + 2^-14)` instead was 7% off at `v = 1e-5`. On the Neural Engine, `x / torch.sqrt(...)` and `x * torch.rsqrt(...)` match bitwise, and the iOS `RMSNorm` (eps 1e-6) is right, all-zero rows included.
+**Fix**: Floor with `v.clamp(min=torch.finfo(torch.float16).tiny)` (2^-14) or higher; both units then agree. `x / (v + 2^-14)` instead was 7% off at `v = 1e-5`. On the Neural Engine, `x / torch.sqrt(...)` and `x * torch.rsqrt(...)` match bitwise, and the iOS `RMSNorm` (eps 1e-6) is right, all-zero rows included.
 
 ```python
-import asyncio
-import tempfile
-from pathlib import Path
-
-import numpy as np
 import torch
-from coreai.runtime import AIModel, ComputeUnitKind, NDArray, SpecializationOptions
-from coreai_torch import TorchConverter, get_decomp_table
 
 TINY = torch.finfo(torch.float16).tiny  # 2^-14, the smallest normal fp16
 
 
-class Small(torch.nn.Module):
-    def forward(self, x, v):
-        floors = (x / v.clamp(min=2e-5), x / v.clamp(min=TINY))
-        return x / v, *floors, torch.rsqrt(v + 1e-6), torch.rsqrt(v.clamp(min=TINY))
+def floored_div(x, v):
+    return x / v.clamp(min=TINY)
 
 
-async def run(path, feeds, unit):
-    options = SpecializationOptions.from_preferred_compute_unit_kind(unit)
-    model = await AIModel.load(path, specialization_options=options)
-    outputs = await model.load_function("main")(feeds)
-    return [outputs[f"y{i}"].numpy()[0, 0, 0, :5] for i in range(5)]
-
-
-v = np.tile(np.array([0, 1e-6, 1e-5, 2e-5, 1e-3], np.float16), (1, 64, 1, 8))
-x = np.full_like(v, 1e-6)
-names = {"input_names": ["x", "v"], "output_names": [f"y{i}" for i in range(5)]}
-inputs = (torch.from_numpy(x), torch.from_numpy(v))
-ep = torch.export.export(Small().eval().half(), inputs)
-ep = ep.run_decompositions(get_decomp_table())
-path = Path(tempfile.mkdtemp()) / "m.aimodel"
-TorchConverter().add_exported_program(ep, **names).to_coreai().save_asset(path)
-forms = ["x / v", "x / v.clamp(min=2e-5)", "x / v.clamp(min=TINY)"]
-forms += ["rsqrt(v + 1e-6)", "rsqrt(v.clamp(min=TINY))"]
-feeds = {"x": NDArray(x), "v": NDArray(v)}
-for unit in (ComputeUnitKind.gpu(), ComputeUnitKind.neural_engine()):
-    for form, y in zip(forms, asyncio.run(run(path, feeds, unit))):
-        print(f"{unit}, {form}:", y)
+def floored_rsqrt(v):
+    return torch.rsqrt(v.clamp(min=TINY))
 ```
 
 ______________________________________________________________________
 
 ## Neural Engine model compiles but runs on CPU or GPU
 
-**Cause**: Without `--preferred-compute neural-engine`, the macOS (h16c) compile of the fp16 graph below has no Neural Engine region; the iOS (h18p) compile has one. The flag is only a preference: with an fp32 graph or a dynamic dimension, `coreai-build compile` still exits 0, prints no error, and nothing runs on the Neural Engine.
-**Fix**: Export fp16 with static shapes, and compile with `xcrun coreai-build compile model.aimodel --preferred-compute neural-engine`. In the snippet below, the exports with no region (fp32, dynamic width) return the same bits whether the load prefers `ComputeUnitKind.neural_engine()` or `gpu()`; the one-region fp16 export does not. The check does not show partial placement, and a CPU fallback, not tried here, could also change the bits.
+**Cause**: Without `--preferred-compute neural-engine`, the macOS (h16c) compile of an fp16 conv → ReLU → conv graph has no Neural Engine region; the iOS (h18p) compile has one. The flag is only a preference: with an fp32 graph or a dynamic dimension, `coreai-build compile` still exits 0, prints no error, and nothing runs on the Neural Engine.
+**Fix**: Export fp16 with static shapes, and compile with `xcrun coreai-build compile model.aimodel --preferred-compute neural-engine`. With the check below, the exports with no region (fp32, dynamic width) return the same bits whether the load prefers `ComputeUnitKind.neural_engine()` or `gpu()`; the one-region fp16 export does not. The check does not show partial placement, and a CPU fallback, not tried here, could also change the bits.
 
 ```python
-import asyncio
-import tempfile
-from pathlib import Path
-
 import numpy as np
-import torch
-from coreai.runtime import AIModel, ComputeUnitKind, NDArray, SpecializationOptions
-from coreai_torch import TorchConverter, get_decomp_table
-from torch import nn
+from coreai.runtime import AIModel, ComputeUnitKind, SpecializationOptions
 
 
-async def run(path, x, unit):
-    options = SpecializationOptions.from_preferred_compute_unit_kind(unit)
-    model = await AIModel.load(path, specialization_options=options)
-    return (await model.load_function("main")({"x": NDArray(x)}))["y"].numpy()
-
-
-def same_bits_as_gpu(module, x, dynamic_shapes=None):
-    inputs = (torch.from_numpy(x),)
-    ep = torch.export.export(module.eval(), inputs, dynamic_shapes=dynamic_shapes)
-    ep = ep.run_decompositions(get_decomp_table())
-    path = Path(tempfile.mkdtemp()) / "m.aimodel"
-    names = {"input_names": ["x"], "output_names": ["y"]}
-    TorchConverter().add_exported_program(ep, **names).to_coreai().save_asset(path)
-    gpu = asyncio.run(run(path, x, ComputeUnitKind.gpu()))
-    neural_engine = asyncio.run(run(path, x, ComputeUnitKind.neural_engine()))
-    return np.array_equal(gpu, neural_engine)
-
-
-torch.manual_seed(0)
-module = nn.Sequential(nn.Conv2d(64, 64, 1), nn.ReLU(), nn.Conv2d(64, 64, 1))
-x = np.random.default_rng(0).standard_normal((1, 64, 1, 64)).astype(np.float16)
-dim = {3: torch.export.Dim("S", min=2, max=512)}
-print("fp16:", same_bits_as_gpu(module.half(), x))
-print("fp32:", same_bits_as_gpu(module.float(), x.astype(np.float32)))
-print("fp16, dynamic width:", same_bits_as_gpu(module.half(), x, (dim,)))
+async def same_bits_as_gpu(path, feeds, output):
+    results = []
+    for unit in (ComputeUnitKind.gpu(), ComputeUnitKind.neural_engine()):
+        options = SpecializationOptions.from_preferred_compute_unit_kind(unit)
+        model = await AIModel.load(path, specialization_options=options)
+        results.append((await model.load_function("main")(feeds))[output].numpy())
+    return np.array_equal(*results)
 ```
 
 ______________________________________________________________________
