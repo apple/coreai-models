@@ -188,7 +188,11 @@ class Attention(nn.Module):
                 .reshape(batch_size, query_len, n_kv_heads, self.head_dim)
                 .permute(0, 2, 1, 3)
             )
-            value = value / torch.sqrt(value.pow(2).mean(-1, keepdim=True) + self._v_norm_eps)
+            # Every mean in this file is spelled `torch.mean`: export numbers `torch.mean` and
+            # `Tensor.mean` calls separately, and the clashing names break graph-mode quantization.
+            value = value / torch.sqrt(
+                torch.mean(value.pow(2), dim=-1, keepdim=True) + self._v_norm_eps
+            )
 
             if cache is not None:
                 key, value = cache.update_and_fetch(
@@ -221,8 +225,8 @@ class MLP(nn.Module):
     def _gaussian_topk(self, x: torch.Tensor) -> torch.Tensor:
         # Compute mean/std in float32 to avoid fp16 overflow in variance
         x_f32 = x.float()
-        mu = x_f32.mean(dim=-1, keepdim=True)
-        variance = (x_f32 - mu).pow(2).mean(dim=-1, keepdim=True)
+        mu = torch.mean(x_f32, dim=-1, keepdim=True)
+        variance = torch.mean((x_f32 - mu).pow(2), dim=-1, keepdim=True)
         std = variance.sqrt()
         cutoff = (mu + std * self._std_mult).to(x.dtype)
         return nn.functional.relu(x - cutoff)
@@ -413,7 +417,13 @@ class Gemma3nModel(nn.Module):
     def _get_per_layer_inputs(
         self, input_ids: torch.Tensor, inputs_embeds: torch.Tensor
     ) -> torch.Tensor:
-        per_layer = self.embed_tokens_per_layer(input_ids) * self.per_layer_embed_scale
+        # The per-layer table is smaller than the vocab; like HF, ids past it map to 0.
+        ple_ids = torch.where(
+            input_ids < self.config.vocab_size_per_layer_input,
+            input_ids,
+            torch.zeros_like(input_ids),
+        )
+        per_layer = self.embed_tokens_per_layer(ple_ids) * self.per_layer_embed_scale
         pli_dim = self.config.hidden_size_per_layer_input
         per_layer = per_layer.reshape(
             *input_ids.shape, self.config.num_hidden_layers, pli_dim
