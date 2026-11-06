@@ -97,6 +97,9 @@ final class VisionFrontEnd {
             name: "CoreAIVLM EncodeImage",
             details: "cgImage"
         )
+        defer {
+            InstrumentsProfiler.endCustomInterval(name: "CoreAIVLM EncodeImage", signpostID: encodeSignpost)
+        }
 
         // Step 1: Preprocess image to CHW Float32
         let chwPixels = try imagePreprocessor.preprocessCHW(
@@ -108,11 +111,6 @@ final class VisionFrontEnd {
         // Step 3: Run projector (skip if fused with encoder)
         let projectedEmbeddings =
             visionProjectorFused ? encoderOutput : try await runProjector(encoderOutput: encoderOutput)
-
-        InstrumentsProfiler.endCustomInterval(
-            name: "CoreAIVLM EncodeImage",
-            signpostID: encodeSignpost
-        )
 
         // The image token positions will be determined during generate() when we know the
         // full token sequence. For now, record the expected token count.
