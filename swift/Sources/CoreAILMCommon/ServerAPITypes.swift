@@ -141,6 +141,22 @@ public enum JSONValue: Codable, Sendable {
         }
     }
 
+    /// The value as a chat template takes it. Numbers decode as `Double`, which swift-jinja's
+    /// `tojson` writes as `1.0`, so a whole number becomes an integer, as clients mostly write it
+    /// (`"minimum": 1`); one written `1.0` becomes `1` too, as decoding cannot tell them apart.
+    public var templateValue: any Sendable {
+        switch self {
+        case .string(let s): return s
+        case .number(let n):
+            if let int = Int(exactly: n) { return int }
+            return n
+        case .bool(let b): return b
+        case .null: return Optional<String>.none as any Sendable
+        case .object(let obj): return obj.mapValues(\.templateValue) as [String: any Sendable]
+        case .array(let arr): return arr.map(\.templateValue) as [any Sendable]
+        }
+    }
+
     public func asJSONObject() -> Any {
         switch self {
         case .string(let s): return s
