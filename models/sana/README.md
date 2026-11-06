@@ -38,9 +38,6 @@ For the full-precision `bfloat16` export, pass `--compression none`:
 uv run coreai.diffusion.export sana-sprint-1.6b --compression none
 ```
 
-The uniform `4bit` and `4bit-asym` presets are rejected for these models: INT4 weights quantized from
-`bfloat16` export fine but fail at runtime on the GPU.
-
 ## Components
 
 | Component      | Asset                 | Size (default)                | Size (`--compression none`)   | Description                                                   |
