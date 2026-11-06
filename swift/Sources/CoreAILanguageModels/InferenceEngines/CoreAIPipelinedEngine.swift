@@ -578,6 +578,7 @@ private struct EngineImpl: ~Copyable {
     let options: EngineOptions
     let function: InferenceFunction
     let pipelineQueue: MTLCommandQueue
+    let gpuErrors: GPUErrorHolder
     let computeStream: ComputeStream
     let device: MTLDevice
 
@@ -846,11 +847,15 @@ private struct EngineImpl: ~Copyable {
                 "Cannot load function '\(config.function)'")
         }
 
-        guard let pipelineQueue = device.makeCommandQueue() else {
+        guard let baseQueue = device.makeCommandQueue() else {
             throw InferenceRuntimeError.invalidState(
                 "Failed to allocate MTLCommandQueue for CoreAIPipelinedEngine")
         }
-        pipelineQueue.label = "CoreAIPipelinedEngine.queue"
+        baseQueue.label = "CoreAIPipelinedEngine.queue"
+        // Every command buffer on the queue, including the ones Core AI and the samplers make,
+        // records a failure in `gpuErrors`.
+        let gpuErrors = GPUErrorHolder()
+        let pipelineQueue = ErrorRecordingCommandQueue(baseQueue, errors: gpuErrors)
         let computeStream = ComputeStream(commandQueue: pipelineQueue)
 
         // Assign
@@ -860,6 +865,7 @@ private struct EngineImpl: ~Copyable {
         self.prefillFunction = prefillFn
         self.prefillMaxQueryLength = prefillMaxQueryLen
         self.pipelineQueue = pipelineQueue
+        self.gpuErrors = gpuErrors
         self.computeStream = computeStream
         self.device = device
         self.inputIdsName = inputIdsName
@@ -1095,6 +1101,7 @@ private struct EngineImpl: ~Copyable {
         let queue = pipelineQueue
         let localInFlightGate = inFlightGate
         let localPenaltyState = penaltyState
+        let localGPUErrors = gpuErrors
         let completionCallback: (Int32, Error?) -> Void = { nextToken, error in
             // Update penalty state BEFORE releasing the gate.
             localPenaltyState?.recordToken(nextToken)
@@ -1110,7 +1117,8 @@ private struct EngineImpl: ~Copyable {
                 continuation.finish(throwing: error)
                 return
             }
-            continuation.yield(nextToken)
+            // A failed command buffer (this step's or an earlier one's) left the logits unwritten.
+            localGPUErrors.yield(nextToken, to: continuation)
         }
 
         do {
@@ -1219,6 +1227,7 @@ private struct EngineImpl: ~Copyable {
         yieldingTo continuation: AsyncThrowingStream<InferenceEngine.TokenId, Error>.Continuation
     ) async throws {
         let gpuSampler = try getOrCreateSampler(for: sampler)
+        gpuErrors.reset()
 
         let isCancelled = Atomic<Bool>(false)
         continuation.onTermination = { _ in
@@ -1303,6 +1312,8 @@ private struct EngineImpl: ~Copyable {
                 cmdBuf.commit()
             }
         }
+        // A failure on the last step has no later yield to catch it.
+        if let error = gpuErrors.error { throw error }
     }
 
     // MARK: - Constrained Run Completion
