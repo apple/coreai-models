@@ -411,6 +411,15 @@ _METADATA: dict[str, AIModelMetadataFields] = {
             "Source: https://huggingface.co/google/embeddinggemma-2"
         ),
     ),
+    "Qwen/Qwen3-Embedding-0.6B": AIModelMetadataFields(
+        author="Qwen Team",
+        license="Apache-2.0",
+        model_description=(
+            "Qwen3-Embedding-0.6B is a multilingual text embedding model from the Qwen3 family "
+            "producing 1024-d L2-normalized vectors (Matryoshka prefixes down to 32) from the "
+            "last token. Source: https://huggingface.co/Qwen/Qwen3-Embedding-0.6B"
+        ),
+    ),
 }
 
 

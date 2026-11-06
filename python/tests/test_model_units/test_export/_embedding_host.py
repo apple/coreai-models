@@ -202,28 +202,36 @@ def slaney_mel_filters(sr: int, n_fft: int, n_mels: int, f_min: float, f_max: fl
 def save_tiny_tokenizer(
     snapshot: Path,
     words: list[str],
-    bos: int,
+    bos: int | None,
     eos: int,
     pad: int,
     model_max_length: int | None = None,
 ) -> None:
-    """A word-level tokenizer with ``<s> A </s>`` post-processing: bos/eos/pad take the given ids
-    (pad may equal eos), ``words`` the lowest free ids in order.
+    """A word-level tokenizer with ``<s> A </s>`` post-processing (``A </s>`` when ``bos`` is
+    None): bos/eos/pad take the given ids (pad may equal eos), ``words`` the lowest free ids in
+    order.
     """
     from tokenizers import Tokenizer, models, pre_tokenizers, processors
     from transformers import PreTrainedTokenizerFast
 
     free = (i for i in range(len(words) + 3) if i not in (bos, eos, pad))
     vocab = dict(zip(words, free, strict=False))
-    vocab.update({"<s>": bos, "</s>": eos})
+    vocab["</s>"] = eos
+    if bos is not None:
+        vocab["<s>"] = bos
     if pad != eos:
         vocab["<pad>"] = pad
     tokenizer = Tokenizer(models.WordLevel(vocab, unk_token=words[0]))
     tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
-    tokenizer.post_processor = processors.RobertaProcessing(sep=("</s>", eos), cls=("<s>", bos))
+    if bos is None:
+        tokenizer.post_processor = processors.TemplateProcessing(
+            single="$A </s>", special_tokens=[("</s>", eos)]
+        )
+    else:
+        tokenizer.post_processor = processors.RobertaProcessing(sep=("</s>", eos), cls=("<s>", bos))
     PreTrainedTokenizerFast(
         tokenizer_object=tokenizer,
-        bos_token="<s>",
+        bos_token=None if bos is None else "<s>",
         eos_token="</s>",
         pad_token="</s>" if pad == eos else "<pad>",
         unk_token=words[0],

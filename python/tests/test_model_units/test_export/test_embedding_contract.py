@@ -264,6 +264,28 @@ def test_save_tokenizer_turns_padding_off_and_checks_ids(tmp_path, toy_snapshot)
         save_tokenizer(toy_snapshot, tmp_path / "bad", bad)
 
 
+def test_a_tokenizer_without_bos(tmp_path, toy_snapshot):
+    """``bos_token_id=None``: the text block says so, and ``save_tokenizer`` accepts a tokenizer
+    that adds only eos and refuses one that adds bos too.
+    """
+    facts = dataclasses.replace(TOY_FACTS, bos_token_id=None, pad_token_id=TOY_FACTS.eos_token_id)
+    text = text_block(facts)
+    assert (text["add_bos_token"], text["bos_token_id"], text["add_eos_token"]) == (
+        False,
+        None,
+        True,
+    )
+    snapshot = tmp_path / "no-bos"
+    save_tiny_tokenizer(snapshot, WORDS, None, facts.eos_token_id, facts.pad_token_id)
+    save_tokenizer(snapshot, tmp_path / "tok", facts)
+    for tokenizer, wrong in (
+        (snapshot, dataclasses.replace(facts, bos_token_id=TOY_FACTS.bos_token_id)),
+        (toy_snapshot, dataclasses.replace(TOY_FACTS, bos_token_id=None)),
+    ):
+        with pytest.raises(ValueError, match="disagrees with the facts"):
+            save_tokenizer(tokenizer, tmp_path / "bad", wrong)
+
+
 def test_bpe_merges_are_written_as_pairs(tmp_path):
     from tokenizers import Tokenizer, models, pre_tokenizers, processors, trainers
     from transformers import PreTrainedTokenizerFast

@@ -62,19 +62,17 @@ def save_tokenizer(snapshot: Path, dest: Path, facts: CheckpointFacts) -> None:
 
     BPE merges are written as pairs, the form Swift ``CLIPTokenizer`` reads. Raises
     ``ValueError`` if the special tokens disagree with ``facts`` or the tokenizer does not add
-    bos and eos.
+    exactly bos (none when ``facts.bos_token_id`` is None) and eos.
     """
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(snapshot)
-    ids = tokenizer("a")["input_ids"]
-    got = (tokenizer.bos_token_id, tokenizer.eos_token_id, tokenizer.pad_token_id, ids[0], ids[-1])
     bos, eos = facts.bos_token_id, facts.eos_token_id
-    want = (bos, eos, facts.pad_token_id, bos, eos)
+    text = tokenizer("a", add_special_tokens=False)["input_ids"]
+    got = (tokenizer.bos_token_id, tokenizer.pad_token_id, tokenizer("a")["input_ids"])
+    want = (bos, facts.pad_token_id, ([] if bos is None else [bos]) + text + [eos])
     if got != want:
-        raise ValueError(
-            f"tokenizer (bos, eos, pad, first, last) {got} disagrees with the facts {want}"
-        )
+        raise ValueError(f"tokenizer (bos, pad, ids of 'a') {got} disagrees with the facts {want}")
     tokenizer.save_pretrained(dest)
     path = dest / "tokenizer.json"
     spec = json.loads(path.read_text())
