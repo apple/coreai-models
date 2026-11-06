@@ -153,7 +153,7 @@ ______________________________________________________________________
 ## Neural Engine wrong for tiny divisors, clamp floors and eps
 
 **Cause**: In three cases the Neural Engine departs from CPU and GPU. `x / v` with `|v|` below 2^-16 (about 1.5e-5), including 0, returns `x * 65536` with the sign of `v`. `v.clamp(min=c)` with `c` below 2^-14, the smallest normal fp16 (`1e-6`, `2e-5`, also `6.1e-5`, which rounds below it), returns 0 where it clamps. `torch.rsqrt(v + 1e-6)` returns inf at `v = 0` and 256, not 301, at `v = 1e-5`.
-**Fix**: Floor with `v.clamp(min=torch.finfo(torch.float16).tiny)` (2^-14) or higher; both units agree below. Adding 2^-14 instead of clamping leaves up to 7% error. On the Neural Engine, `x / torch.sqrt(...)` and `x * torch.rsqrt(...)` give the same bits, and the iOS `RMSNorm` primitive (eps 1e-6) is right, all-zero rows included.
+**Fix**: Floor with `v.clamp(min=torch.finfo(torch.float16).tiny)` (2^-14) or higher; both units agree below. Adding 2^-14 instead was 7% off at `v = 1e-5`. On the Neural Engine, `x / torch.sqrt(...)` and `x * torch.rsqrt(...)` give the same bits, and the iOS `RMSNorm` primitive (eps 1e-6) is right, all-zero rows included.
 
 ```python
 import asyncio
@@ -201,8 +201,8 @@ ______________________________________________________________________
 
 ## Neural Engine model compiles but runs on CPU or GPU
 
-**Cause**: Model was compiled without Neural Engine preference. Without `--preferred-compute neural-engine`, a macOS (h16c) compile of a static fp16 graph has no Neural Engine region; an iOS (h18p) compile has one. The flag is only a preference: with an fp32 graph, a dynamic dimension, or per-block INT4 weights, `coreai-build compile` still exits 0, prints no error, and nothing runs on the Neural Engine.
-**Fix**: Export fp16 with static shapes, and compile with `xcrun coreai-build compile model.aimodel --preferred-compute neural-engine`. A load that prefers `ComputeUnitKind.neural_engine()` returns the same bits as one that prefers `gpu()` when nothing runs on the Neural Engine, and different bits when any part does.
+**Cause**: Model was compiled without Neural Engine preference. Without `--preferred-compute neural-engine`, a macOS (h16c) compile of a static fp16 graph has no Neural Engine region; an iOS (h18p) compile has one. The flag is only a preference: with an fp32 graph or a dynamic dimension, `coreai-build compile` still exits 0, prints no error, and nothing runs on the Neural Engine.
+**Fix**: Export fp16 with static shapes, and compile with `xcrun coreai-build compile model.aimodel --preferred-compute neural-engine`. When nothing runs on the Neural Engine, a load that prefers `ComputeUnitKind.neural_engine()` returns the same bits as one that prefers `gpu()`, so different bits mean some or all of it does.
 
 ```python
 import asyncio
