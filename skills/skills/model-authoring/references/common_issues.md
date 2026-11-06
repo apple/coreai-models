@@ -4,7 +4,7 @@
 
 - **Float32 constants**: Any Python float literal (e.g., `x * 2.0`) creates an f32 constant Neural Engine rejects. Cast to float16.
 - **Always use float16 weights**.
-- **4-bit weights for Neural Engine**: Palettize; do not quantize to INT4. A static Qwen3-0.6B export (context 4096) with per-block INT4 weights compiles for h18p with exit 0 and no Neural Engine region; the only sign is an `ANECCompileOffline() failed` error among the warnings (#205). With the iOS default preset, `4bit_weight_palettized_group32`, it compiles to 30 regions.
+- **4-bit weights for Neural Engine**: Palettize; do not quantize to INT4. A static Qwen3-0.6B export (context 4096) with per-block INT4 weights compiles for h18p with exit 0 and no Neural Engine region; its output includes `ANE regionCall op not found` warnings and an `ANECCompileOffline() failed` error (#205). With the iOS default preset, `4bit_weight_palettized_group32`, it compiles to 30 regions.
 - **Layout mismatch in comparisons**: Apply the appropriate transform before PSNR. Never compare raw tensors across layouts.
 - **Non-contiguous tensors**: Call `.contiguous()` on ALL tensors before wrapping in `NDArray`.
 
