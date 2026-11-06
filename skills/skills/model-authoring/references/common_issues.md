@@ -337,8 +337,8 @@ ______________________________________________________________________
 
 ## First load writes a compiled copy to `~/Library/Caches/coreai-cache`
 
-**Cause**: `AIModel.load` writes the specialized model to `coreai-cache/<OS build>/<app or process name>/<main.hash>/`, about the size of the weights, and leaves it there. Re-running an export script gets a new `main.hash`, even with the same weights, so a development loop adds one entry per run.
-**Fix**: Budget twice the model size for the first load. Delete old entries during development.
+**Cause**: The first `AIModel.load` of an `.aimodel` writes a specialized copy, about the size of the weights, under `~/Library/Caches/coreai-cache` and leaves it there. Running an export script again, even with the same weights, adds another copy at its first load, so a development loop adds one per run.
+**Fix**: Budget twice the model size for the first load. Delete old copies during development.
 
 ```python
 import asyncio
@@ -354,20 +354,20 @@ CACHE = Path.home() / "Library/Caches/coreai-cache"
 
 
 def megabytes(path):
-    return round(sum(f.stat().st_size for f in path.rglob("*") if f.is_file()) / 1e6, 1)
+    return sum(f.stat().st_size for f in path.rglob("*") if f.is_file()) / 1e6
 
 
+torch.manual_seed(0)
 x = torch.zeros(1, 8, 2048).half()
 ep = torch.export.export(nn.Linear(2048, 2048, bias=False).eval().half(), (x,))
 ep = ep.run_decompositions(get_decomp_table())
 asset = Path(tempfile.mkdtemp()) / "m.aimodel"
 names = {"input_names": ["x"], "output_names": ["y"]}
 TorchConverter().add_exported_program(ep, **names).to_coreai().save_asset(asset)
-options = SpecializationOptions.default()
-asyncio.run(AIModel.load(asset, specialization_options=options))
-entry = next(CACHE.rglob((asset / "main.hash").read_bytes().hex()))
-print(f".aimodel {megabytes(asset)} MB, cache entry {megabytes(entry)} MB")
-print("entry:", entry.relative_to(CACHE).parent, "/ <main.hash>")
+before = megabytes(CACHE)
+asyncio.run(AIModel.load(asset, specialization_options=SpecializationOptions.default()))
+grew = megabytes(CACHE) - before
+print(f".aimodel {megabytes(asset):.1f} MB, cache grew {grew:.1f} MB")
 ```
 
 ______________________________________________________________________
