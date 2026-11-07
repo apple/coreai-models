@@ -224,6 +224,7 @@ MODEL_TYPE_REMAPPING: dict[str, str] = {
     "diffusion_gemma": "diffusion_gemma_text",
     "muse_glimmer": "muse_glimmer_text",
     "qwen2_5": "qwen2",
+    "smollm3": "qwen2",
 }
 
 
