@@ -201,8 +201,8 @@ ______________________________________________________________________
 
 ## `runner(**inputs)` fails — wrong call signature
 
-**Cause**: `InferenceFunction.__call__` uses `**kwargs`, not a positional dict.
-**Fix**: Use `await runner(**inputs)` with keyword arguments, not `runner(inputs_dict)`.
+**Cause**: `InferenceFunction.__call__` takes one `inputs` dict, so `runner(**inputs)` raises `TypeError: ... got an unexpected keyword argument`.
+**Fix**: Use `await runner(inputs)`, not `await runner(**inputs)`.
 
 ______________________________________________________________________
 
