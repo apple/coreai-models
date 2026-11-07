@@ -69,10 +69,17 @@ def check_divisibility(model, axis: int, block_size: int) -> dict[str, tuple[int
     """
     incompatible: dict[str, tuple[int, int]] = {}
     for name, module in model.named_modules():
-        if hasattr(module, "weight") and module.weight is not None:
-            dim = module.weight.shape[axis]
-            if dim % block_size != 0:
-                incompatible[name] = (dim, block_size)
+        weight = getattr(module, "weight", None)
+        if not isinstance(weight, torch.Tensor):
+            continue
+        if axis >= weight.ndim or axis < -weight.ndim:
+            # 1-D weights (LayerNorm, RMSNorm, BatchNorm, ...) have no
+            # in-features axis to block along; per-block and grouped-channel
+            # configs never target them, so they cannot be "incompatible".
+            continue
+        dim = weight.shape[axis]
+        if dim % block_size != 0:
+            incompatible[name] = (dim, block_size)
     return incompatible
 
 
