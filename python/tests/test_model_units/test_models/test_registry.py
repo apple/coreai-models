@@ -45,6 +45,13 @@ class TestModelRegistry:
         entry = get_model_entry("qwen3")
         assert entry.ios_class is Qwen3ForCausalLMForiOS
 
+    def test_get_smollm3_entry_maps_to_qwen2(self):
+        """SmolLM3 uses Qwen2 architecture and resolves correctly."""
+        entry = get_model_entry("smollm3")
+        qwen2_entry = get_model_entry("qwen2")
+        assert entry.macos_class is qwen2_entry.macos_class
+        assert entry.ios_class is qwen2_entry.ios_class
+
     def test_unknown_model_raises_key_error(self):
         """Requesting a nonexistent model should raise KeyError."""
         with pytest.raises(KeyError, match="nonexistent_model"):
