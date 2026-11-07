@@ -376,6 +376,7 @@ let package = Package(
             name: "LLMServerTests",
             dependencies: [
                 "llm-server",
+                "CoreAILanguageModels",
                 "CoreAILMCommon",
                 "TestUtilities",
                 .product(name: "Transformers", package: "swift-transformers"),

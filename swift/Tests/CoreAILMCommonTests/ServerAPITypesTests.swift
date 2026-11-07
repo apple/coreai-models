@@ -115,6 +115,27 @@ struct ServerAPITypesTests {
         #expect(models[0]["id"] as? String == "qwen3_4b")
     }
 
+    @Test("ModelInfo lists vision only for a model that accepts image input", arguments: [false, true])
+    func modelCapabilities(vision: Bool) throws {
+        let info = ModelsResponse.ModelInfo(
+            id: "m", created: 0, ownedBy: "coreai", capabilities: ModelsResponse.ModelInfo.capabilities(vision: vision))
+        let obj = try JSONSerialization.jsonObject(with: JSONEncoder().encode(info)) as! [String: Any]
+        #expect(obj["capabilities"] as? [String] == (vision ? ["completion", "vision"] : ["completion"]))
+    }
+
+    @Test("HealthResponse and ReadyResponse encode modalities")
+    func modalities() throws {
+        let health = HealthResponse(status: "ok", modalities: Modalities(vision: true))
+        let ready = ReadyResponse(
+            status: "ready", model: "m", maxContextLength: 4096, busy: false,
+            cache: .init(usedTokens: 0, maxTokens: 4096, utilization: 0), toolCalling: false,
+            modalities: Modalities(vision: true))
+        for data in [try JSONEncoder().encode(health), try JSONEncoder().encode(ready)] {
+            let obj = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+            #expect(obj["modalities"] as? [String: Bool] == ["vision": true])
+        }
+    }
+
     @Test("ErrorResponse encodes")
     func errorResponse() throws {
         let response = ErrorResponse(error: ErrorResponse.ErrorDetail(message: "bad request", type: "invalid_request"))

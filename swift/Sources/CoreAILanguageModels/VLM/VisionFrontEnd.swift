@@ -138,10 +138,7 @@ final class VisionFrontEnd {
     /// Frames are encoded sequentially because the GPU vision encoder cannot run
     /// multiple inference calls concurrently on the same model function.
     func encodeVideo(_ video: VideoInput) async throws -> InputEmbeddings {
-        let tokensPerFrame = visionConfig.tokensPerFrame ?? visionConfig.imageTokenCount
-
-        var frameEmbeddings: [NDArray] = []
-        var frameIndex = 0
+        var frameEmbeddings: [InputEmbeddings] = []
 
         for try await frame in video.frames {
             let chwPixels = try imagePreprocessor.preprocessCHW(
@@ -149,59 +146,18 @@ final class VisionFrontEnd {
             let encoderOutput = try await runVisionEncoder(pixels: chwPixels)
             let projected =
                 visionProjectorFused ? encoderOutput : try await runProjector(encoderOutput: encoderOutput)
-            frameEmbeddings.append(projected)
-            frameIndex += 1
-            CLILogger.log("  - encoded video frame \(frameIndex)", level: 2)
+            frameEmbeddings.append(
+                try InputEmbeddings(embeddings: projected, embeddingPositions: 0..<projected.shape[1]))
+            CLILogger.log("  - encoded video frame \(frameEmbeddings.count)", level: 2)
         }
 
         guard !frameEmbeddings.isEmpty else {
             throw InferenceRuntimeError.invalidArgument("encodeVideo: no frames in video input")
         }
 
-        if frameEmbeddings.count == 1 {
-            CLILogger.log("VLM encodeVideo complete: 1 frame, \(tokensPerFrame) tokens")
-            return try InputEmbeddings(
-                embeddings: frameEmbeddings[0],
-                embeddingPositions: 0..<tokensPerFrame
-            )
-        }
-
-        let totalTokens = frameEmbeddings.count * tokensPerFrame
-        let hiddenDim = frameEmbeddings[0].shape[2]
-        let scalarType = frameEmbeddings[0].scalarType
-
-        var concatenated = NDArray(shape: [1, totalTokens, hiddenDim], scalarType: scalarType)
-        let elementsPerFrame = tokensPerFrame * hiddenDim
-
-        switch scalarType {
-        case .float16, .bfloat16:
-            var destView = concatenated.mutableView(as: Float16.self)
-            destView.withUnsafeMutablePointer { destPtr, _, _ in
-                for (i, embedding) in frameEmbeddings.enumerated() {
-                    embedding.view(as: Float16.self).withUnsafePointer { srcPtr, _, _ in
-                        (destPtr + i * elementsPerFrame).update(from: srcPtr, count: elementsPerFrame)
-                    }
-                }
-            }
-        case .float32:
-            var destView = concatenated.mutableView(as: Float.self)
-            destView.withUnsafeMutablePointer { destPtr, _, _ in
-                for (i, embedding) in frameEmbeddings.enumerated() {
-                    embedding.view(as: Float.self).withUnsafePointer { srcPtr, _, _ in
-                        (destPtr + i * elementsPerFrame).update(from: srcPtr, count: elementsPerFrame)
-                    }
-                }
-            }
-        default:
-            throw InferenceRuntimeError.invalidInputType(
-                "encodeVideo: unsupported embedding scalar type \(scalarType)")
-        }
-
-        CLILogger.log("VLM encodeVideo complete: \(frameEmbeddings.count) frames, \(totalTokens) tokens")
-        return try InputEmbeddings(
-            embeddings: concatenated,
-            embeddingPositions: 0..<totalTokens
-        )
+        let concatenated = try InputEmbeddings.concatenating(frameEmbeddings)
+        CLILogger.log("VLM encodeVideo complete: \(frameEmbeddings.count) frames, \(concatenated.tokenCount) tokens")
+        return concatenated
     }
 
     /// Run the vision encoder on preprocessed pixel values.
