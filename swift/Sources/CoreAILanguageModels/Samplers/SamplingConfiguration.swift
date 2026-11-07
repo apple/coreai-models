@@ -399,7 +399,7 @@ extension SamplingConfiguration {
         guard let step else {
             preconditionFailure("A generation step index is required when a sampling seed is set.")
         }
-        var rng = SeededRandomNumberGenerator(seed: seed &+ UInt64(bitPattern: Int64(step)))
+        var rng = CoreAIShared.SeededRandomNumberGenerator(seed: seed &+ UInt64(bitPattern: Int64(step)))
         return CompositeSampler.sample(from: &logits, config: self, using: &rng)
     }
 }
