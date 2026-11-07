@@ -163,6 +163,36 @@ def test_attention_inv_freq_shapes() -> None:
     assert full.v_proj is None  # full layers tie V to K
 
 
+def test_attention_inv_freq_stays_fp32_under_to_dtype() -> None:
+    cfg = _tiny_config()
+    enc = DiffusionGemmaEncoder(cfg)
+    dec = DiffusionGemmaDecoder(cfg)
+
+    # Calling to(dtype) downcasts parameters and buffers, but inv_freq must
+    # remain float32 to avoid precision loss on rotary frequencies (#482).
+    enc.to(dtype=torch.bfloat16)
+    dec.to(dtype=torch.bfloat16)
+
+    for i, layer in enumerate(enc.model.layers):
+        assert layer.self_attn.inv_freq.dtype == torch.float32, (
+            f"Encoder layer {i} inv_freq cast to {layer.self_attn.inv_freq.dtype}"
+        )
+
+    for i, layer in enumerate(dec.model.layers):
+        assert layer.self_attn.inv_freq.dtype == torch.float32, (
+            f"Decoder layer {i} inv_freq cast to {layer.self_attn.inv_freq.dtype}"
+        )
+
+    # Verify cos/sin values match fp32 reference at long sequence positions.
+    attn = enc.model.layers[0].self_attn
+    pos = torch.arange(2048, 4096).unsqueeze(0)
+    cos, sin = attn._cos_sin(pos, dtype=torch.float32)
+    ref_inv_freq = attn._default_inv_freq(cfg.head_dim, 10_000.0)
+    ref_angles = pos.float().unsqueeze(-1) * ref_inv_freq
+    assert torch.allclose(cos, ref_angles.cos(), atol=1e-5)
+    assert torch.allclose(sin, ref_angles.sin(), atol=1e-5)
+
+
 def test_encoder_cache_update_pads_and_narrows() -> None:
     # Unified cache [layers, 1, cache_kv=2, ctx=6, cache_hd=4]; write a layer with
     # native (n_kv=1, hd=3) -> padded to (2, 4) on write, narrowed back on read.

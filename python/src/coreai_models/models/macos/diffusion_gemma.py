@@ -249,7 +249,9 @@ class DiffusionGemmaAttention(nn.Module):
         self.k_norm = DiffusionGemmaRMSNorm(hd, eps=config.rms_norm_eps)
         self.v_norm = DiffusionGemmaRMSNorm(hd, eps=config.rms_norm_eps, with_scale=False)
 
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        # Stored as a plain attribute (like DecomposedRoPE._inv_freq) so
+        # model.to(dtype) does not round the frequencies to bfloat16.
+        self.inv_freq = inv_freq.float()
 
         if is_encoder:
             self.sdpa = SDPA(scale=1.0, window_size=sdpa_window, is_causal=True)
@@ -277,8 +279,8 @@ class DiffusionGemmaAttention(nn.Module):
         self, position_ids: torch.Tensor, dtype: torch.dtype
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Half-dim cos/sin [B, T, head_dim/2] from position_ids [B, T]."""
-        inv_freq = self.inv_freq
-        inv_freq_expanded = inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+        inv_freq = self.inv_freq.to(device=position_ids.device, dtype=torch.float32)
+        inv_freq_expanded = inv_freq[None, :, None].expand(position_ids.shape[0], -1, 1)
         position_ids_expanded = position_ids[:, None, :].float()
         freqs = (inv_freq_expanded @ position_ids_expanded).transpose(1, 2)  # [B, T, hd/2]
         return freqs.cos().to(dtype), freqs.sin().to(dtype)
