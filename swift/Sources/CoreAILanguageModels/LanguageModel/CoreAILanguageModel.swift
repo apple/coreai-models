@@ -95,8 +95,8 @@ public struct CoreAILanguageModel: LanguageModel {
     /// - Parameter url: URL to the model bundle directory.
     /// - Parameter mode: When to load the engine. Defaults to `.lazy`. With
     ///   `.eager`, the tokenizer and engine load concurrently
-    /// - Parameter variant: Engine variant override (e.g. "coreai-sequential",
-    ///   "ane"). Nil for auto-detect from model structure.
+    /// - Parameter variant: Engine variant override: "coreai-sequential", "coreai-pipelined" or
+    ///   "static-shape". Nil for auto-detect from model structure.
     /// - Parameter kvCacheStrategy: KV cache memory strategy. Defaults to
     ///   `.auto` (256-token initial size for dynamic models). Pass
     ///   `.fixedSize` to pre-allocate at full `maxContextLength`.
