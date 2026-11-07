@@ -17,6 +17,28 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
+## SDPA aborts at load when the value width differs from the query width
+
+**Cause**: `coreai_torch.composite_ops.SDPA` with q and k wider than v converts and runs on CPU. On the GPU and the Neural Engine the process aborts at load: `'mps_spi.sdpa' op failed: query and value must have matching inner dimension but have 192 and 128`.
+**Fix**: Zero-pad v to the q width and slice the output back to the v width. The output then matches PyTorch within 0.003 on both units.
+
+```python
+from coreai_torch.composite_ops import SDPA
+from torch import nn
+
+
+class PaddedSDPA(nn.Module):
+    def __init__(self, scale):
+        super().__init__()
+        self.sdpa = SDPA(scale=scale)
+
+    def forward(self, q, k, v):  # q and k wider than v
+        value = nn.functional.pad(v, (0, q.shape[-1] - v.shape[-1]))
+        return self.sdpa(query=q, key=k, value=value)[..., : v.shape[-1]]
+```
+
+______________________________________________________________________
+
 ## Input data type mismatch — "Data type int32 does not match"
 
 **Cause**: Input JSON descriptor uses wrong type specifier.
@@ -189,6 +211,58 @@ ______________________________________________________________________
 
 **Cause**: Asset was created with an older toolchain and uses an incompatible format.
 **Fix**: Re-export and save via `deployable.save_asset()`, then recompile with `coreai-build compile`.
+
+______________________________________________________________________
+
+## `.aimodelc` fails to load — `AIModelError error 0` or `error 1`
+
+**Cause**: `coreai-build compile --architecture` exits 0 for any known architecture, and the bundle loads only on that one. On an M4 Max, `h16c` loads, while `h16s` and `h17c` raise `error 0`. Swift names both sides: `incompatibleCompiledAssetArchitecture(device: "h16c", asset: ["h17c"])`. `cpu_only()` raises `error 1` on a bundle from any `--preferred-compute` value (Swift: `failedToSpecialize`).
+**Fix**: Compile for the device's architecture and load bundles with `SpecializationOptions.default()`. Use the `.aimodel` for CPU-only runs.
+
+```python
+import subprocess
+
+from coreai.runtime import AIModel, SpecializationOptions
+
+
+async def compile_and_load(asset, arch):  # arch: the loading device's, h16c on an M4 Max
+    command = ["xcrun", "coreai-build", "compile", str(asset), "--preferred-compute", "gpu"]
+    subprocess.run(command + ["--architecture", arch, "--output", str(asset.parent)], check=True)
+    bundle = asset.with_name(f"{asset.stem}.{arch}.aimodelc")
+    return await AIModel.load(bundle, specialization_options=SpecializationOptions.default())
+```
+
+______________________________________________________________________
+
+## `.aimodelc` is larger than the `.aimodel`
+
+**Cause**: An `.aimodel` stores a shared weight once and keeps per-block int8. A `--preferred-compute gpu` bundle stores the weight once per function. With static shapes it also expands per-block int8 to the float size. A dynamic dimension keeps the int8 size, and per-block int4 stays small.
+**Fix**: Size the download from the compiled bundle, not from the `.aimodel`.
+
+```python
+from pathlib import Path
+
+
+def megabytes(bundle):  # an .aimodelc is a directory: sum its files
+    return sum(f.stat().st_size for f in Path(bundle).rglob("*") if f.is_file()) / 1e6
+```
+
+______________________________________________________________________
+
+## First load writes a compiled copy to `~/Library/Caches/coreai-cache`
+
+**Cause**: The first `AIModel.load` of an `.aimodel` writes a specialized copy, about the size of the weights, under `~/Library/Caches/coreai-cache` and leaves it there. Running an export script again, even with the same weights, adds another copy at its first load, so a development loop adds one per run.
+**Fix**: Budget twice the model size for the first load. Delete old copies during development.
+
+```python
+from pathlib import Path
+
+CACHE = Path.home() / "Library/Caches/coreai-cache"
+
+
+def cache_megabytes():
+    return sum(f.stat().st_size for f in CACHE.rglob("*") if f.is_file()) / 1e6
+```
 
 ______________________________________________________________________
 
