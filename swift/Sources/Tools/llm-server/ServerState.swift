@@ -390,24 +390,46 @@ final class ServerState: @unchecked Sendable {
         )
     }
 
+    /// Request values over server defaults. Throws `ServerError.badRequest` on the first out-of-range
+    /// value; temperature 0 is greedy, which ignores the rest.
     func makeSamplingConfig(
         temperature: Double?,
         topP: Double?,
         topK: Int?,
         minP: Double?,
         seed: UInt64? = nil
-    ) -> SamplingConfiguration {
+    ) throws -> SamplingConfiguration {
         let temp = temperature ?? config.defaultTemperature
         if temp == 0 {
             return .greedy
         }
+        let topK = topK ?? config.defaultTopK
+        let topP = topP ?? config.defaultTopP
+        let minP = minP ?? config.defaultMinP
+        if let error = SamplingConfiguration.parameterError(temp, topK, topP, minP) {
+            throw ServerError.badRequest(error.message(naming: error.parameter.requestField))
+        }
         return SamplingConfiguration(
             temperature: temp,
-            topK: topK ?? config.defaultTopK,
-            topP: topP ?? config.defaultTopP,
-            minP: minP ?? config.defaultMinP,
+            topK: topK,
+            topP: topP,
+            minP: minP,
             seed: seed
         )
+    }
+}
+
+extension SamplingParameterError.Parameter {
+    /// The OpenAI request field that carries this parameter.
+    fileprivate var requestField: String {
+        switch self {
+        case .temperature: "temperature"
+        case .topK: "top_k"
+        case .topP: "top_p"
+        case .minP: "min_p"
+        case .repetitionPenalty: "repetition_penalty"
+        case .repetitionPenaltyWindow: "repetition_penalty_window"
+        }
     }
 }
 
