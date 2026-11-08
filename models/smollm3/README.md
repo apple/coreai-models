@@ -12,7 +12,7 @@ HuggingFace's SmolLM3 for on-device inference via Core AI.
 ## Export models
 
 ```bash
-# 3B (INT4 quantized with FP16 embedding)
+# 3B (Mixed 4-bit/8-bit quantized with FP16 embedding)
 uv run coreai.llm.export HuggingFaceTB/SmolLM3-3B
 
 # 3B Base

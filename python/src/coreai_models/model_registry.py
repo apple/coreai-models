@@ -264,7 +264,7 @@ LLM_PRESETS: list[ModelPreset] = [
         "4bit",
         "float16",
         8192,
-        compression_config="models/smollm3/smollm3_4bit_embedding_excluded.yaml",
+        compression_config="models/smollm3/smollm3_mixed_4bit_8bit.yaml",
         _model_type_override="qwen2",
     ),
     ModelPreset(
@@ -276,7 +276,7 @@ LLM_PRESETS: list[ModelPreset] = [
         "4bit",
         "float16",
         8192,
-        compression_config="models/smollm3/smollm3_4bit_embedding_excluded.yaml",
+        compression_config="models/smollm3/smollm3_mixed_4bit_8bit.yaml",
         _model_type_override="qwen2",
     ),
     ModelPreset(

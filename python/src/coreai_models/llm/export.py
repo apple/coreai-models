@@ -236,7 +236,7 @@ def _load_compression_config_object(yaml_path: Path, variant: str):  # type: ign
             f"{yaml_path}: 'coreai_models' must be a mapping, got "
             f"{type(pipeline_level_options).__name__}."
         )
-    allowed_pipeline_level_keys = {"calibrate_activations"}
+    allowed_pipeline_level_keys = {"calibrate_activations", "untie_word_embeddings"}
     unknown = set(pipeline_level_options) - allowed_pipeline_level_keys
     if unknown:
         raise SystemExit(
@@ -280,6 +280,8 @@ def _load_compression_config_object(yaml_path: Path, variant: str):  # type: ign
         merged = dict(inner)
         if "calibrate_activations" in pipeline_level_options:
             merged["calibrate_activations"] = pipeline_level_options["calibrate_activations"]
+        if "untie_word_embeddings" in pipeline_level_options:
+            merged["untie_word_embeddings"] = pipeline_level_options["untie_word_embeddings"]
         return merged
 
     raise SystemExit(

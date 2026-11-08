@@ -406,6 +406,15 @@ def build_model(
         # Copy so we don't mutate the shared preset.
         quant_cfg = dict(torch_quantization_config)
 
+        if quant_cfg.pop("untie_word_embeddings", False) and (
+            hasattr(model, "lm_head")
+            and hasattr(model.config, "tie_word_embeddings")
+            and model.config.tie_word_embeddings
+        ):
+            logger.info("Untying lm_head from word embeddings for quantization")
+            model.lm_head.weight = torch.nn.Parameter(model.lm_head.weight.clone())
+            model.config.tie_word_embeddings = False
+
         # The preset or YAML is the source of truth; `--quantization-mode` overrides
         # it only when given.
         if config.quantization_mode is not None:

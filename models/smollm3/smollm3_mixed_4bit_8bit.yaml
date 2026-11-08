@@ -1,0 +1,47 @@
+# INT4 weight quantization with INT8 on the most sensitive blocks and on the output projection.
+# Blocks 0 and 1 carry most of SmolLM3's INT4 loss (per-block sensitivity sweep). lm_head is
+# untied from the 128k-vocab embedding so it can be INT8 while the embedding lookup stays FP16.
+coreai_models:
+  untie_word_embeddings: true
+quantization_config:
+  execution_mode: eager
+  global_config:
+    op_state_spec:
+      weight:
+        dtype: int4
+        qscheme: symmetric_with_clipping
+        granularity:
+          type: per_block
+          block_size: 32
+          axis: 1
+    op_input_spec: null
+    op_output_spec: null
+  module_type_configs:
+    coreai_models.primitives.macos.sdpa.SDPA: null
+    coreai_models.primitives.macos.rope.RoPE: null
+    coreai_models.primitives.macos.rms_norm.RMSNorm: null
+    coreai_models.primitives.macos.rms_norm.RMSNormPlusOne: null
+    torch.nn.modules.sparse.Embedding: null
+  module_name_configs:
+    'model\.layers\.(0|1)\.(self_attn|mlp)\.(qkv_proj|o_proj|gate_proj|up_proj|down_proj)':
+      op_state_spec:
+        weight:
+          dtype: int8
+          qscheme: symmetric_with_clipping
+          granularity:
+            type: per_block
+            block_size: 32
+            axis: 1
+      op_input_spec: null
+      op_output_spec: null
+    lm_head:
+      op_state_spec:
+        weight:
+          dtype: int8
+          qscheme: symmetric_with_clipping
+          granularity:
+            type: per_block
+            block_size: 32
+            axis: 1
+      op_input_spec: null
+      op_output_spec: null
