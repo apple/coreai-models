@@ -184,13 +184,58 @@ def test_attention_inv_freq_stays_fp32_under_to_dtype() -> None:
         )
 
     # Verify cos/sin values match fp32 reference at long sequence positions.
-    attn = enc.model.layers[0].self_attn
     pos = torch.arange(2048, 4096).unsqueeze(0)
-    cos, sin = attn._cos_sin(pos, dtype=torch.float32)
-    ref_inv_freq = attn._default_inv_freq(cfg.head_dim, 10_000.0)
-    ref_angles = pos.float().unsqueeze(-1) * ref_inv_freq
-    assert torch.allclose(cos, ref_angles.cos(), atol=1e-5)
-    assert torch.allclose(sin, ref_angles.sin(), atol=1e-5)
+
+    # 1. Sliding-attention layer (layers[0]: default RoPE)
+    attn_sliding = enc.model.layers[0].self_attn
+    cos_sliding, sin_sliding = attn_sliding._cos_sin(pos, dtype=torch.float32)
+    ref_inv_freq_sliding = attn_sliding._default_inv_freq(cfg.head_dim, 10_000.0)
+    ref_angles_sliding = pos.float().unsqueeze(-1) * ref_inv_freq_sliding
+    assert torch.allclose(cos_sliding, ref_angles_sliding.cos(), atol=1e-5)
+    assert torch.allclose(sin_sliding, ref_angles_sliding.sin(), atol=1e-5)
+
+    # 2. Full-attention layer (layers[1]: proportional RoPE with partial_rotary_factor)
+    attn_full = enc.model.layers[1].self_attn
+    cos_full, sin_full = attn_full._cos_sin(pos, dtype=torch.float32)
+    rope_full = dgm._rope_params(cfg, full=True)
+    partial_factor = rope_full.get("partial_rotary_factor", 0.25)
+    rope_base = rope_full.get("rope_theta", 1_000_000.0)
+    ref_inv_freq_full = attn_full._proportional_inv_freq(
+        attn_full.head_dim, rope_base, partial_factor
+    )
+    ref_angles_full = pos.float().unsqueeze(-1) * ref_inv_freq_full
+    assert torch.allclose(cos_full, ref_angles_full.cos(), atol=1e-5)
+    assert torch.allclose(sin_full, ref_angles_full.sin(), atol=1e-5)
+
+
+def test_long_context_forward_inv_freq_fp32_vs_bf16_drift() -> None:
+    """Verify that keeping inv_freq in FP32 prevents long-context drift at ~4k tokens (#482)."""
+    torch.manual_seed(0)
+    cfg = _tiny_config()
+    cfg.max_position_embeddings = 4096
+    enc = DiffusionGemmaEncoder(cfg).eval()
+    _init_linears(enc)
+
+    seq_len = 8
+    pos = torch.arange(4096 - seq_len, 4096, dtype=torch.int32).unsqueeze(0)
+    input_ids = torch.randint(0, cfg.vocab_size, (1, seq_len), dtype=torch.int32)
+    k_cache = torch.zeros(cfg.num_hidden_layers, 1, enc.num_key_value_heads, 4096, enc.head_dim)
+    v_cache = torch.zeros_like(k_cache)
+
+    # 1. Forward with FP32 inv_freq (our fix)
+    with torch.no_grad():
+        out_fp32 = enc(input_ids, pos, k_cache=k_cache.clone(), v_cache=v_cache.clone())
+
+    # 2. Simulate buggy behavior where inv_freq got cast to bfloat16
+    for layer in enc.model.layers:
+        layer.self_attn.inv_freq = layer.self_attn.inv_freq.to(torch.bfloat16).to(torch.float32)
+
+    with torch.no_grad():
+        out_bf16_rounded = enc(input_ids, pos, k_cache=k_cache.clone(), v_cache=v_cache.clone())
+
+    # The drift between FP32 and bf16-rounded inv_freq must be measurable at pos ~4k
+    diff = (out_fp32 - out_bf16_rounded).abs().max()
+    assert diff > 1e-4, f"Expected drift from bf16 rounding at 4k context, got {diff}"
 
 
 def test_encoder_cache_update_pads_and_narrows() -> None:

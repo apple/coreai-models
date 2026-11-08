@@ -251,6 +251,9 @@ class DiffusionGemmaAttention(nn.Module):
 
         # Stored as a plain attribute (like DecomposedRoPE._inv_freq) so
         # model.to(dtype) does not round the frequencies to bfloat16.
+        # Note: Because inv_freq is a plain attribute, it is not tracked by
+        # named_buffers() or model.to(device). Runtime device placement and
+        # float32 precision are handled explicitly in _cos_sin.
         self.inv_freq = inv_freq.float()
 
         if is_encoder:
