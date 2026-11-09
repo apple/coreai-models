@@ -34,6 +34,8 @@ struct PerLayerEmbeddings: Sendable {
     let isNativeQuantized: Bool
     /// Bits per packed element; 8 for an INT8 table.
     private let nbits: Int
+    /// Packed elements per byte (`8 / nbits`).
+    private let valuesPerByte: Int
     /// Elements per scale block; 0 for an INT8 table.
     private let blockSize: Int
     /// Scales per row; 0 for an INT8 table.
@@ -101,6 +103,7 @@ struct PerLayerEmbeddings: Sendable {
             self.scales = scales
             self.isNativeQuantized = true
             self.nbits = nbits
+            self.valuesPerByte = valuesPerByte
             self.rowWidth = rowWidth
             self.numBlocks = numBlocks
             self.blockSize = rowWidth / numBlocks
@@ -119,6 +122,7 @@ struct PerLayerEmbeddings: Sendable {
             self.scales = nil
             self.isNativeQuantized = false
             self.nbits = 8
+            self.valuesPerByte = 1
             self.rowWidth = tensor.shape[1]
             self.numBlocks = 0
             self.blockSize = 0
@@ -167,7 +171,7 @@ struct PerLayerEmbeddings: Sendable {
     ) {
         guard let scales else { preconditionFailure("the float16 gather needs a native-quantized table") }
         precondition(dest.count >= batchSize * rowWidth, "PLE destination buffer too small")
-        let valuesPerByte = 8 / nbits
+        let valuesPerByte = self.valuesPerByte
         // Built in `Int` before narrowing: `UInt8(1) << 8` would mask to 0, not trap.
         let mask = UInt8((1 << nbits) - 1)
         let bias = Int32(1 << (nbits - 1))

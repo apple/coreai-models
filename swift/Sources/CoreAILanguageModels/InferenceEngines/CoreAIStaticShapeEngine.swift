@@ -423,35 +423,19 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         }
         var embeddingArray = NDArray(descriptor: embeddingDesc)
 
-        // `MutableViews` is lifetime-dependent on the arrays it borrows via `insert`, so
-        // it can't be built across a branch that force-unwraps an `NDArray?` inout (the
-        // borrow checker can't prove that stays within scope) -- hence the duplicated
-        // run/return below rather than a single conditional `insert`.
-        if case .ndArray(let scaleDesc) = embeddingFunction.descriptor.outputDescriptor(of: embeddingScaleName) {
-            var embeddingScaleArray = NDArray(descriptor: scaleDesc)
-            var outputViews = InferenceFunction.MutableViews()
-            outputViews.insert(&embeddingArray, for: embeddingTableName)
-            outputViews.insert(&embeddingScaleArray, for: embeddingScaleName)
-
-            _ = try await embeddingFunction.run(
-                inputs: [:],
-                outputViews: consume outputViews
-            )
-
-            CLILogger.log("Embeddings loaded: shape=\(embeddingArray.shape)")
-            return (embeddingArray, embeddingScaleArray)
-        }
-
         var outputViews = InferenceFunction.MutableViews()
         outputViews.insert(&embeddingArray, for: embeddingTableName)
 
-        _ = try await embeddingFunction.run(
+        // A native-quantized table also returns its per-row scale; `run` hands back any output
+        // it was not given a view for.
+        var outputs = try await embeddingFunction.run(
             inputs: [:],
             outputViews: consume outputViews
         )
+        let embeddingScale = outputs.remove(embeddingScaleName)?.ndArray
 
         CLILogger.log("Embeddings loaded: shape=\(embeddingArray.shape)")
-        return (embeddingArray, nil)
+        return (embeddingArray, embeddingScale)
     }
 
     // MARK: - Function Loading (lazy)
