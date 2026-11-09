@@ -7,6 +7,9 @@ import CoreAI
 import CoreGraphics
 
 /// Controls which model components are loaded and how decoding is performed.
+///
+/// A dynamically-shaped bundle loads the same assets in every mode: `.half` makes half the
+/// bundle's size the default output size, and `.tiled` decodes in half-size tiles.
 public enum DecodeResolution: String, Hashable, Sendable, CaseIterable {
     /// Auto-detect: picks the highest quality mode available in the model directory.
     case auto
@@ -33,6 +36,82 @@ public enum ReferenceGrid: String, Hashable, Sendable, CaseIterable {
     case half
     /// Quarter the linear side — 1/16 of the tokens (256 @1024, 64 @512). Fast, coarse guidance.
     case quarter
+
+    /// Reference token-grid side for an output grid `outputSide` tokens across.
+    func side(outputSide: Int) -> Int {
+        switch self {
+        case .full: outputSide
+        case .half: outputSide / 2
+        case .quarter: outputSide / 4
+        }
+    }
+}
+
+/// Size each img2img reference image is encoded at: `.full`, `.half` or `.quarter` of
+/// the output, or `.pixels(384)`.
+///
+/// Round-trips through `LosslessStringConvertible` as `full`/`half`/`quarter`/`384` for
+/// command-line parsing.
+public enum ReferenceSize: Hashable, Sendable {
+    /// A preset fraction of the output size. Works on static and dynamic bundles.
+    case relative(ReferenceGrid)
+    /// An absolute square size in pixels, a multiple of 16 within the bundle's encoder
+    /// range. Dynamic bundles only, unless it equals one of a static bundle's presets.
+    case pixels(Int)
+
+    public static let full = ReferenceSize.relative(.full)
+    public static let half = ReferenceSize.relative(.half)
+    public static let quarter = ReferenceSize.relative(.quarter)
+
+    /// The square size, in pixels, each reference is encoded at for an output of
+    /// `outputSize` pixels. A preset rounds down to whole 16-pixel tokens; a pixel size is
+    /// returned as given.
+    public func pixelSize(outputSize: Int) -> Int {
+        switch self {
+        case .relative(let grid): grid.side(outputSide: outputSize / 16) * 16
+        case .pixels(let pixels): pixels
+        }
+    }
+
+    /// Reference token-grid side for an output grid `outputSide` tokens across, where one
+    /// token covers `patchSize` pixels.
+    func side(outputSide: Int, patchSize: Int) -> Int {
+        switch self {
+        case .relative(let grid): grid.side(outputSide: outputSide)
+        case .pixels(let pixels): pixels / patchSize
+        }
+    }
+
+    /// The preset this size names at the given output grid. Static bundles are traced
+    /// per preset, so this is the only form they can serve.
+    func preset(outputSide: Int, patchSize: Int) -> ReferenceGrid? {
+        switch self {
+        case .relative(let grid):
+            return grid
+        case .pixels(let pixels):
+            guard pixels % patchSize == 0 else { return nil }
+            return ReferenceGrid.allCases.first { $0.side(outputSide: outputSide) == pixels / patchSize }
+        }
+    }
+}
+
+extension ReferenceSize: LosslessStringConvertible {
+    public init?(_ description: String) {
+        if let grid = ReferenceGrid(rawValue: description) {
+            self = .relative(grid)
+        } else if let pixels = Int(description), pixels > 0 {
+            self = .pixels(pixels)
+        } else {
+            return nil
+        }
+    }
+
+    public var description: String {
+        switch self {
+        case .relative(let grid): grid.rawValue
+        case .pixels(let pixels): String(pixels)
+        }
+    }
 }
 
 /// Whether the pipeline performs classifier-free guidance (CFG) itself.
@@ -65,9 +144,18 @@ public struct PipelineConfiguration: Hashable, Sendable {
     public var schedulerType: SchedulerType
 
     // Image-to-image
+    /// The image to start denoising from, noised according to `strength` (classic img2img).
+    /// FLUX.2 has no starting latent, so it treats this as its first reference image, for
+    /// callers written before `referenceImages`.
     public var startingImage: CGImage?
+    /// Images the model conditions on, in order: FLUX.2 reference tokens, referred to in
+    /// the prompt as image 1, image 2, ... More than one requires a dynamic bundle.
+    public var referenceImages: [CGImage]
+    /// How much noise to add to `startingImage`, 0...1. FLUX.2 ignores it: its images are
+    /// conditioning, not a starting point.
     public var strength: Float
-    public var referenceGrid: ReferenceGrid
+    /// Size every reference image is encoded at.
+    public var referenceSize: ReferenceSize
     public var guidanceMode: GuidanceMode
 
     // VAE scale factors (from the metadata.json diffusion block)
@@ -77,6 +165,11 @@ public struct PipelineConfiguration: Hashable, Sendable {
 
     // Decode resolution
     public var decodeResolution: DecodeResolution
+
+    /// Square output size in pixels. `nil` uses the size the pipeline was loaded for
+    /// (its `DecodeResolution`). A dynamically-shaped bundle accepts any supported size;
+    /// a static one only the size it was loaded for.
+    public var imageSize: Int?
 
     /// Load model components on demand and unload after each pipeline stage to reduce peak memory.
     /// Disable to keep all models resident and exercise full memory pressure (e.g. profiling peak footprint).
@@ -90,13 +183,15 @@ public struct PipelineConfiguration: Hashable, Sendable {
         guidanceScale: Float = 7.5,
         schedulerType: SchedulerType = .discreteFlow,
         startingImage: CGImage? = nil,
+        referenceImages: [CGImage] = [],
         strength: Float = 1.0,
-        referenceGrid: ReferenceGrid = .full,
+        referenceSize: ReferenceSize = .full,
         guidanceMode: GuidanceMode = .distilled,
         encoderScaleFactor: Float = 0.18215,
         decoderScaleFactor: Float = 0.18215,
         decoderShiftFactor: Float = 0.0,
         decodeResolution: DecodeResolution = .full,
+        imageSize: Int? = nil,
         lazyModelLoading: Bool = true
     ) {
         self.prompt = prompt
@@ -106,20 +201,71 @@ public struct PipelineConfiguration: Hashable, Sendable {
         self.guidanceScale = guidanceScale
         self.schedulerType = schedulerType
         self.startingImage = startingImage
+        self.referenceImages = referenceImages
         self.strength = strength
-        self.referenceGrid = referenceGrid
+        self.referenceSize = referenceSize
         self.guidanceMode = guidanceMode
         self.encoderScaleFactor = encoderScaleFactor
         self.decoderScaleFactor = decoderScaleFactor
         self.decoderShiftFactor = decoderShiftFactor
         self.decodeResolution = decodeResolution
+        self.imageSize = imageSize
         self.lazyModelLoading = lazyModelLoading
     }
 
-    public var isImageToImage: Bool { startingImage != nil }
+    /// The images FLUX.2 conditions on: `startingImage` (if set) as image 1, then
+    /// `referenceImages`.
+    public var allReferenceImages: [CGImage] {
+        (startingImage.map { [$0] } ?? []) + referenceImages
+    }
+
+    public var isImageToImage: Bool { !allReferenceImages.isEmpty }
 }
 
-/// Hashable conformance — CGImage excluded (not Hashable).
+// MARK: - Pre-`referenceSize` API
+
+extension PipelineConfiguration {
+    /// The reference preset. A `.pixels` size has no preset without knowing the output
+    /// size, so it reads as `.full`.
+    @available(*, deprecated, renamed: "referenceSize")
+    public var referenceGrid: ReferenceGrid {
+        get {
+            if case .relative(let grid) = referenceSize { return grid }
+            return .full
+        }
+        set { referenceSize = .relative(newValue) }
+    }
+
+    @available(*, deprecated, message: "Use init(prompt:...referenceSize:...) instead.")
+    public init(
+        prompt: String,
+        negativePrompt: String = "",
+        seed: UInt32 = 0,
+        stepCount: Int = 50,
+        guidanceScale: Float = 7.5,
+        schedulerType: SchedulerType = .discreteFlow,
+        startingImage: CGImage? = nil,
+        strength: Float = 1.0,
+        referenceGrid: ReferenceGrid,
+        guidanceMode: GuidanceMode = .distilled,
+        encoderScaleFactor: Float = 0.18215,
+        decoderScaleFactor: Float = 0.18215,
+        decoderShiftFactor: Float = 0.0,
+        decodeResolution: DecodeResolution = .full,
+        lazyModelLoading: Bool = true
+    ) {
+        self.init(
+            prompt: prompt, negativePrompt: negativePrompt, seed: seed, stepCount: stepCount,
+            guidanceScale: guidanceScale, schedulerType: schedulerType,
+            startingImage: startingImage, strength: strength,
+            referenceSize: .relative(referenceGrid), guidanceMode: guidanceMode,
+            encoderScaleFactor: encoderScaleFactor, decoderScaleFactor: decoderScaleFactor,
+            decoderShiftFactor: decoderShiftFactor, decodeResolution: decodeResolution,
+            lazyModelLoading: lazyModelLoading)
+    }
+}
+
+/// Hashable conformance — CGImage excluded (not Hashable); the reference count is kept.
 extension PipelineConfiguration {
     public func hash(into hasher: inout Hasher) {
         hasher.combine(prompt)
@@ -128,13 +274,15 @@ extension PipelineConfiguration {
         hasher.combine(stepCount)
         hasher.combine(guidanceScale)
         hasher.combine(schedulerType)
+        hasher.combine(allReferenceImages.count)
         hasher.combine(strength)
-        hasher.combine(referenceGrid)
+        hasher.combine(referenceSize)
         hasher.combine(guidanceMode)
         hasher.combine(encoderScaleFactor)
         hasher.combine(decoderScaleFactor)
         hasher.combine(decoderShiftFactor)
         hasher.combine(decodeResolution)
+        hasher.combine(imageSize)
         hasher.combine(lazyModelLoading)
     }
 
@@ -145,13 +293,15 @@ extension PipelineConfiguration {
             && lhs.stepCount == rhs.stepCount
             && lhs.guidanceScale == rhs.guidanceScale
             && lhs.schedulerType == rhs.schedulerType
+            && lhs.allReferenceImages.count == rhs.allReferenceImages.count
             && lhs.strength == rhs.strength
-            && lhs.referenceGrid == rhs.referenceGrid
+            && lhs.referenceSize == rhs.referenceSize
             && lhs.guidanceMode == rhs.guidanceMode
             && lhs.encoderScaleFactor == rhs.encoderScaleFactor
             && lhs.decoderScaleFactor == rhs.decoderScaleFactor
             && lhs.decoderShiftFactor == rhs.decoderShiftFactor
             && lhs.decodeResolution == rhs.decodeResolution
+            && lhs.imageSize == rhs.imageSize
             && lhs.lazyModelLoading == rhs.lazyModelLoading
     }
 }

@@ -38,6 +38,9 @@ from coreai_models.diffusion.flux2 import (
     dummy_flux2_vae_decoder_half,
     dummy_flux2_vae_encoder,
     dummy_flux2_vae_encoder_half,
+    flux2_transformer_dynamic_shapes,
+    flux2_vae_decoder_dynamic_shapes,
+    flux2_vae_encoder_dynamic_shapes,
 )
 from coreai_models.diffusion.models import unknown_pipeline_type_error
 from coreai_models.diffusion.sana import (
@@ -412,6 +415,42 @@ FLUX2_MULTIFUNCTION_COMPONENTS: dict[str, ComponentSpec | MultiFunctionComponent
 ALL_FLUX2_MULTIFUNCTION_COMPONENTS: list[str] = list(FLUX2_MULTIFUNCTION_COMPONENTS.keys())
 
 
+# --dynamic: one symbolic "main" per asset serves every resolution, reference size
+# and reference count, replacing both the `_512`/`_half` pairs and the variant matrix.
+# Asset names match the static registry, so the export goes to its own directory.
+FLUX2_DYNAMIC_COMPONENTS: dict[str, ComponentSpec | MultiFunctionComponentSpec] = {
+    "transformer": ComponentSpec(
+        asset_name="Transformer",
+        input_names=_FLUX2_TRANSFORMER_INPUT_NAMES,
+        output_names=("output",),
+        wrapper_fn=lambda p: Flux2TransformerWrapper(p.transformer, dynamic=True),
+        dummy_fn=dummy_flux2_transformer,
+        quant_dummy_fn=dummy_flux2_transformer_quant_trace,
+        quantizable=True,
+        dynamic_shapes_fn=flux2_transformer_dynamic_shapes,
+    ),
+    "text_encoder": FLUX2_COMPONENTS["text_encoder"],
+    "vae_decoder": ComponentSpec(
+        asset_name="VAEDecoder",
+        input_names=("z",),
+        output_names=("image",),
+        wrapper_fn=lambda p: Flux2VAEDecoderWrapper(p.vae, dynamic=True),
+        dummy_fn=dummy_flux2_vae_decoder,
+        dynamic_shapes_fn=flux2_vae_decoder_dynamic_shapes,
+    ),
+    "vae_encoder": ComponentSpec(
+        asset_name="VAEEncoder",
+        input_names=("image",),
+        output_names=("latent_params",),
+        wrapper_fn=lambda p: Flux2VAEEncoderWrapper(p.vae),
+        dummy_fn=dummy_flux2_vae_encoder,
+        dynamic_shapes_fn=flux2_vae_encoder_dynamic_shapes,
+    ),
+}
+
+ALL_FLUX2_DYNAMIC_COMPONENTS: list[str] = list(FLUX2_DYNAMIC_COMPONENTS.keys())
+
+
 WAN_COMPONENTS: dict[str, ComponentSpec] = {
     "transformer": ComponentSpec(
         asset_name="Transformer",
@@ -487,6 +526,7 @@ def get_component_registry(
     hf_pipe: Any,
     pipeline_type: str,
     multifunction: bool = False,
+    dynamic: bool = False,
 ) -> dict[str, ComponentSpec | MultiFunctionComponentSpec]:
     """Return the component registry for the given pipeline type.
 
@@ -495,9 +535,13 @@ def get_component_registry(
             available for future introspection).
         pipeline_type: One of "flux2", "wan", or "sana_sprint".
         multifunction: If True, use multi-function export for FLUX.2 transformer
-            (5 functions in one .aimodel: main, half, img2img_quarter/half/full).
+            (8 functions in one .aimodel: main, half, and six img2img variants).
+        dynamic: If True, use the FLUX.2 dynamic registry: one symbolic "main" per
+            asset. Takes precedence over ``multifunction``.
     """
     if pipeline_type == "flux2":
+        if dynamic:
+            return FLUX2_DYNAMIC_COMPONENTS
         if multifunction:
             return FLUX2_MULTIFUNCTION_COMPONENTS
         return FLUX2_COMPONENTS
@@ -508,9 +552,13 @@ def get_component_registry(
     raise unknown_pipeline_type_error(pipeline_type)
 
 
-def get_valid_components(pipeline_type: str, multifunction: bool = False) -> list[str]:
+def get_valid_components(
+    pipeline_type: str, multifunction: bool = False, dynamic: bool = False
+) -> list[str]:
     """Return valid component names for a given pipeline type."""
     if pipeline_type == "flux2":
+        if dynamic:
+            return ALL_FLUX2_DYNAMIC_COMPONENTS
         if multifunction:
             return ALL_FLUX2_MULTIFUNCTION_COMPONENTS
         return ALL_FLUX2_COMPONENTS

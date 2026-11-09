@@ -13,7 +13,25 @@ import ImageIO
 
 extension DecodeResolution: ExpressibleByArgument {}
 extension ReferenceGrid: ExpressibleByArgument {}
+extension ReferenceSize: ExpressibleByArgument {}
 extension GuidanceMode: ExpressibleByArgument {}
+
+/// `--image-size`: a preset or a square size in pixels.
+enum ImageSizeOption: Equatable, ExpressibleByArgument {
+    case auto, full, half
+    case pixels(Int)
+
+    init?(argument: String) {
+        switch argument {
+        case "auto": self = .auto
+        case "full": self = .full
+        case "half": self = .half
+        default:
+            guard let pixels = Int(argument), pixels > 0 else { return nil }
+            self = .pixels(pixels)
+        }
+    }
+}
 
 @main
 struct DiffusionRunner: AsyncParsableCommand {
@@ -43,12 +61,43 @@ struct DiffusionRunner: AsyncParsableCommand {
     @Option(help: "Output image path (default: output.png)")
     var output: String = "output.png"
 
-    @Option(help: "Path to input image for image-to-image generation")
-    var inputImage: String?
+    @Option(
+        help:
+            "Path to an input image for image-to-image generation. Repeat for multiple FLUX.2 reference images (dynamic bundles only), referred to in the prompt as image 1, image 2, ... in order."
+    )
+    var inputImage: [String] = []
+
+    @Option(
+        help: ArgumentHelp(
+            "Output size: auto (the best the bundle has), full, half, or a square pixel size such as 768. Dynamic bundles take any multiple of 16 in their range; static bundles only the sizes they were exported for. Default: auto",
+            valueName: "auto|full|half|px")
+    )
+    var imageSize: ImageSizeOption?
+
+    @Flag(
+        help:
+            "Decode the image in half-size tiles. Lowers peak memory on static bundles, which then load the half-size decoder. Needs a full-size output (at least 512 px on a dynamic bundle)."
+    )
+    var tiledDecode = false
+
+    /// Deprecated spelling of `--image-size auto|full|half` and `--tiled-decode`.
+    @Option(help: .hidden)
+    var decodeResolution: DecodeResolution?
+
+    @Option(
+        help: ArgumentHelp(
+            "img2img reference size: full, half, or quarter of the output size (half = 1/4 the tokens), or a pixel size such as 384 (dynamic bundles only; a multiple of 16, at least 128). Only applies with --input-image. Default: full",
+            valueName: "full|half|quarter|px")
+    )
+    var referenceSize: ReferenceSize?
+
+    /// Deprecated spelling of `--reference-size full|half|quarter`.
+    @Option(help: .hidden)
+    var referenceGrid: ReferenceGrid?
 
     @Option(
         help:
-            "Denoising strength for image-to-image, 0.0–1.0 (default: 0.85). Use 0.8–0.9 for semantic edits, 0.5–0.75 for style/texture changes."
+            "How much noise to add to a starting image, 0.0–1.0 (default: 0.85). FLUX.2 ignores it: its input images are references, not a starting point."
     )
     var strength: Float = 0.85
 
@@ -58,15 +107,6 @@ struct DiffusionRunner: AsyncParsableCommand {
             "Load models on demand and unload after each stage to reduce peak memory; disable to exercise full memory pressure (default: on)"
     )
     var lazyModelLoading: Bool = true
-
-    @Option(help: "VAE decode resolution: full, half, or tiled (default: full)")
-    var decodeResolution: DecodeResolution = .full
-
-    @Option(
-        help:
-            "img2img reference-token grid, relative to the output grid: full (1:1, ~4096 tokens @1024 / 1024 @512), half (1/4 the tokens), quarter (1/16 the tokens). Only applies with --input-image. Default: full"
-    )
-    var referenceGrid: ReferenceGrid?
 
     @Option(
         help:
@@ -99,6 +139,56 @@ struct DiffusionRunner: AsyncParsableCommand {
         help: ArgumentHelp("Path to parity data directory (numpy .npy files)", visibility: .hidden)
     )
     var parityTestDir: String?
+
+    func validate() throws {
+        if referenceSize != nil && referenceGrid != nil {
+            throw ValidationError("--reference-grid is a deprecated alias of --reference-size; pass only one.")
+        }
+        if decodeResolution != nil && (imageSize != nil || tiledDecode) {
+            throw ValidationError(
+                "--decode-resolution is a deprecated alias of --image-size and --tiled-decode; pass only one.")
+        }
+    }
+
+    /// The pipeline's load mode plus an explicit per-run size, from `--image-size`,
+    /// `--tiled-decode` and the deprecated `--decode-resolution`.
+    ///
+    /// A static bundle picks its assets by mode, so a pixel size must name its full or half
+    /// size; a dynamic bundle loads the same assets for any size.
+    private func resolveOutputSize(_ diffusion: DiffusionConfig) throws -> (DecodeResolution, Int?) {
+        if let decodeResolution { return (decodeResolution, nil) }
+        var mode: DecodeResolution
+        var pixels: Int?
+        switch imageSize ?? .auto {
+        case .auto: mode = .auto
+        case .full: mode = .full
+        case .half: mode = .half
+        case .pixels(let requested):
+            let full = diffusion.imageSize ?? DiffusionDefaults.Image.imageSize
+            let isFlux2 = diffusion.type == .flux2
+            if diffusion.dynamicShapes == true {
+                (mode, pixels) = (.full, requested)
+            } else if requested == full {
+                mode = .full
+            } else if isFlux2 && requested == full / 2 {
+                mode = .half
+            } else {
+                let sizes = isFlux2 ? "\(full) (full) or \(full / 2) (half)" : "\(full)"
+                let remedy = isFlux2 ? " Export with --dynamic for other sizes." : ""
+                print("Error: this bundle only produces \(sizes); got --image-size \(requested).\(remedy)")
+                throw ExitCode.failure
+            }
+        }
+        if tiledDecode {
+            // Checked after mapping, since a static bundle's pixel size can name half too.
+            guard mode != .half else {
+                print("Error: --tiled-decode splits a full-size output into tiles; it can't take a half-size output.")
+                throw ExitCode.failure
+            }
+            mode = .tiled
+        }
+        return (mode, pixels)
+    }
 
     func run() async throws {
         // --tune-fit: fit coefficients from collected pairs, no model needed
@@ -147,21 +237,24 @@ struct DiffusionRunner: AsyncParsableCommand {
         let effectiveGuidance =
             guidanceScale ?? diffusion.defaultGuidanceScale ?? DiffusionDefaults.Runner.guidanceScale
 
-        var startingCGImage: CGImage? = nil
-        if let imagePath = inputImage {
+        var inputCGImages: [CGImage] = []
+        for imagePath in inputImage {
             do {
-                startingCGImage = try CGImageUtils.load(from: imagePath)
+                inputCGImages.append(try CGImageUtils.load(from: imagePath))
             } catch {
                 print("Error: could not load input image at \(imagePath)")
                 throw ExitCode.failure
             }
         }
 
-        // --reference-grid only affects the img2img reference-token path; it is
+        let (decodeMode, requestedSize) = try resolveOutputSize(diffusion)
+        let effectiveReferenceSize = referenceSize ?? referenceGrid.map { .relative($0) }
+
+        // The reference size only affects the img2img reference-token path; it is
         // ignored for txt2img. Warn if it was set without an input image.
-        if referenceGrid != nil && startingCGImage == nil {
+        if inputCGImages.isEmpty && effectiveReferenceSize != nil {
             FileHandle.standardError.write(
-                Data("Warning: --reference-grid is ignored without --input-image (txt2img).\n".utf8))
+                Data("Warning: --reference-size is ignored without --input-image (txt2img).\n".utf8))
         }
 
         let config = PipelineConfiguration(
@@ -171,25 +264,33 @@ struct DiffusionRunner: AsyncParsableCommand {
             stepCount: effectiveSteps,
             guidanceScale: effectiveGuidance,
             schedulerType: schedulerType,
-            startingImage: startingCGImage,
+            // FLUX.2 conditions on every input image; a starting-image model starts from the first.
+            startingImage: diffusion.type == .flux2 ? nil : inputCGImages.first,
+            referenceImages: diffusion.type == .flux2 ? inputCGImages : Array(inputCGImages.dropFirst()),
             strength: strength,
-            referenceGrid: referenceGrid ?? .full,
+            referenceSize: effectiveReferenceSize ?? .full,
             guidanceMode: guidanceMode ?? .distilled,
             encoderScaleFactor: diffusion.encoderScaleFactor ?? DiffusionDefaults.Image.scaleFactor,
             decoderScaleFactor: diffusion.decoderScaleFactor ?? DiffusionDefaults.Image.scaleFactor,
             decoderShiftFactor: diffusion.decoderShiftFactor ?? DiffusionDefaults.Image.decoderShiftFactor,
-            decodeResolution: decodeResolution,
+            decodeResolution: decodeMode,
+            imageSize: requestedSize,
             lazyModelLoading: lazyModelLoading
         )
 
         if isFlowTransformer {
             let pipeline = try await FlowTransformerPipeline(
-                from: bundleURL, mode: decodeResolution)
+                from: bundleURL, mode: decodeMode)
 
             let family = diffusion.type == .sanaSprint ? "Sana Sprint" : "FLUX.2"
             print("Generating (\(family)): \"\(prompt)\"")
             print("Steps: \(effectiveSteps), Guidance: \(effectiveGuidance), Seed: \(seed)")
-            print("Image size: \(pipeline.defaultImageSize.width)x\(pipeline.defaultImageSize.height)")
+            let outputSize = requestedSize ?? pipeline.defaultImageSize.width
+            print("Image size: \(outputSize)x\(outputSize)\(pipeline.mode == .tiled ? " (tiled decode)" : "")")
+            if !inputCGImages.isEmpty, diffusion.type == .flux2 {
+                let referencePixels = config.referenceSize.pixelSize(outputSize: outputSize)
+                print("Reference images: \(inputCGImages.count) at \(referencePixels)x\(referencePixels)")
+            }
 
             let tuneHelper = tunePreviewDir.map { PreviewTuneHelper(outputDir: URL(fileURLWithPath: $0)) }
             let start = ContinuousClock.now

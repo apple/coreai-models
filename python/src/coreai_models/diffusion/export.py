@@ -98,6 +98,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--components; implied by --platform iOS.",
     )
     parser.add_argument(
+        "--dynamic",
+        action="store_true",
+        help="FLUX.2 only. Export every asset as one 'main' with symbolic shape axes, so a "
+        "single transformer serves any resolution (256-1024), any reference size, and "
+        "multiple img2img reference images. Writes to <output-dir>/<model>-dynamic/. "
+        "Replaces the multi-function and per-resolution variants. Not available with "
+        "--platform iOS.",
+    )
+    parser.add_argument(
         "--experimental",
         action="store_true",
         help="Allow exporting models without a registry preset. Requires --compute-precision.",
@@ -202,8 +211,26 @@ def main() -> None:
     if args.platform == "iOS":
         multifunction = False
 
+    if args.dynamic:
+        if pipeline_type != "flux2":
+            parser.error(f"--dynamic is only supported for FLUX.2, not {pipeline_type}.")
+        if args.platform == "iOS":
+            parser.error(
+                "--dynamic is not supported with --platform iOS: its peak memory depends on the "
+                "sizes requested at runtime. Drop --platform iOS to export a dynamic bundle."
+            )
+        # One symbolic asset per component, so there are no variants to select.
+        for flag, given in [
+            ("--platform", args.platform is not None),
+            ("--single-function", args.single_function),
+            ("--resolution", args.resolution is not None),
+            ("--low-memory", args.low_memory),
+        ]:
+            if given:
+                _warn(f"{flag} is ignored with --dynamic: one asset serves every resolution.")
+        multifunction = False
     # Warn of unused flags with multifunction.
-    if args.platform is None:
+    elif args.platform is None:
         if args.resolution is not None:
             _warn(
                 "--resolution only applies with --platform; every component is exported without it."
@@ -226,14 +253,16 @@ def main() -> None:
             )
 
     if args.components:
-        valid = get_valid_components(pipeline_type, multifunction=multifunction)
+        valid = get_valid_components(
+            pipeline_type, multifunction=multifunction, dynamic=args.dynamic
+        )
         invalid = [c for c in args.components if c not in valid]
         if invalid:
             # Per-resolution names only exist under --single-function.
             hint = (
                 " Per-resolution/grid names (e.g. transformer_512, "
                 "transformer_img2img_full) require --single-function."
-                if multifunction
+                if multifunction and not args.dynamic
                 else ""
             )
             parser.error(
@@ -242,7 +271,8 @@ def main() -> None:
 
     # Platform-based component selection (FLUX.2 only)
     target_components: list[str] | None = None
-    if args.platform and pipeline_type == "flux2":
+    # --dynamic needs no selection: its registry is exactly the four components to export.
+    if args.platform and pipeline_type == "flux2" and not args.dynamic:
         # Resolve effective resolution: --resolution overrides platform default
         resolution = args.resolution
         if resolution is None:
@@ -301,6 +331,7 @@ def main() -> None:
         overwrite=args.overwrite,
         include_debug_info=args.include_debug_info,
         multifunction=multifunction,
+        dynamic=args.dynamic,
     )
 
     if args.dry_run:
@@ -314,6 +345,7 @@ def main() -> None:
         else:
             print("  components:        all")
         print(f"  multifunction:     {config.multifunction}")
+        print(f"  dynamic:           {config.dynamic}")
         print(f"  overwrite:         {config.overwrite}")
         print(f"  include_debug_info: {config.include_debug_info}")
         return
