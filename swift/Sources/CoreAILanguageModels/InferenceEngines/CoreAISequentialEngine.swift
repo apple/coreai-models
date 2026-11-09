@@ -1163,8 +1163,8 @@ extension CoreAISequentialEngine {
     /// Prefix-cache plan for a request of `tokens` whose first `commonPrefix` match the session
     /// history. `imageTokenId` is `nil` for a text model.
     ///
-    /// A vision-language session follows `visionPrefixResetPlan`, cutting the match at the first
-    /// image placeholder for a multimodal request. A text-only request throws when `tokens` hold
+    /// A vision-language session cuts the match at the first image placeholder for a multimodal
+    /// request before running `prefixResetPlan`. A text-only request throws when `tokens` hold
     /// an image placeholder at or past the position it resumes from, since that image is not in
     /// the KV cache. A request also throws when it would resume partway through a cached image, and
     /// a multimodal request throws when its placeholders after the resume point don't match
@@ -1182,20 +1182,17 @@ extension CoreAISequentialEngine {
         ringCapacity: Int? = nil
     ) throws -> (resetTo: Int?, prefixHitCount: Int) {
         var plan: (resetTo: Int?, prefixHitCount: Int) = (nil, 0)
-        if historyCount > 0 {
-            if let imageTokenId {
-                plan = visionPrefixResetPlan(
-                    reusablePrefix: isMultimodal
-                        ? reusablePrefix(commonPrefix: commonPrefix, tokens: tokens, imageTokenId: imageTokenId)
-                        : commonPrefix,
-                    historyCount: historyCount, processedTokenCount: processedTokenCount, inputCount: tokens.count,
-                    hasNonTruncatableStates: hasNonTruncatableStates, ringCapacity: ringCapacity)
-            } else {
-                plan = prefixResetPlan(
-                    commonPrefix: commonPrefix, historyCount: historyCount, processedTokenCount: processedTokenCount,
-                    inputCount: tokens.count, hasNonTruncatableStates: hasNonTruncatableStates,
-                    ringCapacity: ringCapacity)
-            }
+        if historyCount > 0 || processedTokenCount > 0 {
+            let effectivePrefix =
+                if let imageTokenId, isMultimodal {
+                    reusablePrefix(commonPrefix: commonPrefix, tokens: tokens, imageTokenId: imageTokenId)
+                } else {
+                    commonPrefix
+                }
+            plan = prefixResetPlan(
+                commonPrefix: effectivePrefix, historyCount: historyCount,
+                processedTokenCount: processedTokenCount, inputCount: tokens.count,
+                hasNonTruncatableStates: hasNonTruncatableStates, ringCapacity: ringCapacity)
         }
         guard let imageTokenId else { return plan }
         let resumeAt = plan.resetTo ?? processedTokenCount
@@ -1235,8 +1232,11 @@ extension CoreAISequentialEngine {
     /// current cursor state, decides how far to rewind the KV cache and what to
     /// report as the prefix hit count. `resetTo == nil` means no reset is needed.
     ///
-    /// Extracted so the four-way routing can be unit-tested without a compiled model;
-    /// the logic is equivalent to the inline decision it replaced.
+    /// On divergence (`commonPrefix < inputCount` and shorter than the cached
+    /// history/cursor), rewinds to `commonPrefix` so the shared prefix stays in the
+    /// KV cache, falling back to a full reset (`0`) when `commonPrefix == 0`, the
+    /// session has non-truncatable recurrent state, or a sliding-window ring has
+    /// wrapped past `commonPrefix`.
     static func prefixResetPlan(
         commonPrefix: Int,
         historyCount: Int,
@@ -1245,18 +1245,27 @@ extension CoreAISequentialEngine {
         hasNonTruncatableStates: Bool,
         ringCapacity: Int? = nil
     ) -> (resetTo: Int?, prefixHitCount: Int) {
+        guard historyCount > 0 || processedTokenCount > 0 else {
+            return (nil, 0)
+        }
         if hasNonTruncatableStates {
             // Hybrid model: recurrent state can't be partially rewound.
             // Full reset and replay the entire prompt.
-            if commonPrefix < historyCount || processedTokenCount >= inputCount {
+            if commonPrefix < historyCount || commonPrefix < processedTokenCount || processedTokenCount >= inputCount {
                 return (0, 0)
             }
             return (nil, 0)
-        } else if commonPrefix < inputCount && commonPrefix < historyCount {
-            // Divergence: input differs from history. Full reset needed.
-            return (0, commonPrefix)
+        } else if commonPrefix < inputCount && (commonPrefix < historyCount || commonPrefix < processedTokenCount) {
+            // Divergence (or unrecorded trailing steps): rewind to the shared prefix when safe.
+            guard commonPrefix > 0,
+                StateHandlerFactory.ringRewindIsSafe(
+                    from: processedTokenCount, to: commonPrefix, ringCapacity: ringCapacity)
+            else {
+                return (0, 0)
+            }
+            return (commonPrefix, commonPrefix)
         } else if processedTokenCount >= inputCount {
-            // Pure extension: all input tokens match history. Rewind for seeding.
+            // All input tokens match history: rewind one token so prefill reseeds sampling.
             let target = Swift.max(0, commonPrefix - 1)
             guard
                 StateHandlerFactory.ringRewindIsSafe(
@@ -1269,33 +1278,6 @@ extension CoreAISequentialEngine {
         } else {
             return (nil, commonPrefix)
         }
-    }
-
-    /// Prefix-cache plan for a vision-language session.
-    ///
-    /// `reusablePrefix` is the history match, cut at its first image placeholder for a multimodal
-    /// request. A request with tokens past a `reusablePrefix` shorter than the history rewinds to
-    /// `reusablePrefix`, keeping the cached KV before it, images included. A hybrid session resets to
-    /// 0 instead, as does a rewind past a wrapped sliding ring. Every other request follows
-    /// `prefixResetPlan`.
-    static func visionPrefixResetPlan(
-        reusablePrefix: Int,
-        historyCount: Int,
-        processedTokenCount: Int,
-        inputCount: Int,
-        hasNonTruncatableStates: Bool,
-        ringCapacity: Int? = nil
-    ) -> (resetTo: Int?, prefixHitCount: Int) {
-        guard reusablePrefix < historyCount, reusablePrefix < inputCount, !hasNonTruncatableStates else {
-            return prefixResetPlan(
-                commonPrefix: reusablePrefix, historyCount: historyCount, processedTokenCount: processedTokenCount,
-                inputCount: inputCount, hasNonTruncatableStates: hasNonTruncatableStates, ringCapacity: ringCapacity)
-        }
-        guard reusablePrefix > 0,
-            StateHandlerFactory.ringRewindIsSafe(
-                from: processedTokenCount, to: reusablePrefix, ringCapacity: ringCapacity)
-        else { return (0, 0) }
-        return (reusablePrefix, reusablePrefix)
     }
 }
 
