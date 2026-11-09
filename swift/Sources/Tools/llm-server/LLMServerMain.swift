@@ -82,7 +82,9 @@ struct LLMServer: AsyncParsableCommand {
     )
     var replayConcurrent: Bool = false
 
-    @Option(name: .customLong("variant"), help: "Engine variant: auto, coreai-pipelined, coreai-sequential")
+    @Option(
+        name: .customLong("variant"),
+        help: "Engine variant: auto, coreai-pipelined, coreai-sequential, static-shape")
     var inferenceEngineVariant: String = "default"
 
     @Option(name: .customLong("kv-cache-strategy"), help: "KV cache strategy: auto, growing, fixed_size")

@@ -153,7 +153,8 @@ private func handleChatCompletionsFromBody(body: ByteBuffer, state: ServerState,
     } catch let error as ServerError {
         access.release()
         let status: HTTPResponse.Status = error.isBadRequest ? .badRequest : .internalServerError
-        let err = ErrorResponse(error: .init(message: "\(error)", type: "invalid_request_error", code: nil))
+        let err = ErrorResponse(
+            error: .init(message: error.localizedDescription, type: "invalid_request_error", code: nil))
         let data = try JSONEncoder().encode(err)
         return Response(
             status: status, headers: [.contentType: "application/json"], body: .init(byteBuffer: ByteBuffer(data: data))
@@ -201,7 +202,7 @@ func runChatCompletion(chatRequest: ChatCompletionRequest, state: ServerState, s
     let requestID = RequestID.next()
     let created = Int(Date().timeIntervalSince1970)
 
-    let samplingConfig = state.makeSamplingConfig(
+    let samplingConfig = try state.makeSamplingConfig(
         temperature: chatRequest.temperature,
         topP: chatRequest.topP,
         topK: chatRequest.topK,
@@ -408,8 +409,8 @@ struct StreamingOutcome {
 }
 
 /// Preflight for the streaming path: tokenize, validate, and prime the prefix cache. Throws
-/// `ServerError.badRequest` for oversized prompts / non-positive max_tokens so callers can map
-/// to HTTP 400 before opening the stream.
+/// `ServerError.badRequest` for oversized prompts, non-positive max_tokens and out-of-range
+/// sampling values so callers can map to HTTP 400 before opening the stream.
 func prepareStreaming(chatRequest: ChatCompletionRequest, state: ServerState, sessionID: String? = nil) async throws
     -> PreparedStream
 {
@@ -419,7 +420,7 @@ func prepareStreaming(chatRequest: ChatCompletionRequest, state: ServerState, se
     }
     let requestID = RequestID.next()
 
-    let samplingConfig = state.makeSamplingConfig(
+    let samplingConfig = try state.makeSamplingConfig(
         temperature: chatRequest.temperature,
         topP: chatRequest.topP,
         topK: chatRequest.topK,
