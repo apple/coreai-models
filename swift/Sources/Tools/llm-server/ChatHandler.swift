@@ -153,7 +153,8 @@ private func handleChatCompletionsFromBody(body: ByteBuffer, state: ServerState,
     } catch let error as ServerError {
         access.release()
         let status: HTTPResponse.Status = error.isBadRequest ? .badRequest : .internalServerError
-        let err = ErrorResponse(error: .init(message: "\(error)", type: "invalid_request_error", code: nil))
+        let err = ErrorResponse(
+            error: .init(message: error.localizedDescription, type: "invalid_request_error", code: nil))
         let data = try JSONEncoder().encode(err)
         return Response(
             status: status, headers: [.contentType: "application/json"], body: .init(byteBuffer: ByteBuffer(data: data))
@@ -201,7 +202,7 @@ func runChatCompletion(chatRequest: ChatCompletionRequest, state: ServerState, s
     let requestID = RequestID.next()
     let created = Int(Date().timeIntervalSince1970)
 
-    let samplingConfig = state.makeSamplingConfig(
+    let samplingConfig = try state.makeSamplingConfig(
         temperature: chatRequest.temperature,
         topP: chatRequest.topP,
         topK: chatRequest.topK,
@@ -212,7 +213,8 @@ func runChatCompletion(chatRequest: ChatCompletionRequest, state: ServerState, s
     let reasoningEffort = ReasoningEffort.resolve(
         request: chatRequest.reasoningEffort, default: state.config.defaultReasoningEffort)
     let promptTokens = tokenizeMessages(
-        chatRequest.messages, tools: chatRequest.tools, reasoningEffort: reasoningEffort, state: state)
+        chatRequest.messages, tools: chatRequest.tools, reasoningEffort: reasoningEffort,
+        tokenizer: state.tokenizer, toolCallDetection: state.toolCallDetection)
     let stopSequences = buildStopSequences(from: chatRequest, state: state)
     let input: Input = .tokens(promptTokens)
 
@@ -407,8 +409,8 @@ struct StreamingOutcome {
 }
 
 /// Preflight for the streaming path: tokenize, validate, and prime the prefix cache. Throws
-/// `ServerError.badRequest` for oversized prompts / non-positive max_tokens so callers can map
-/// to HTTP 400 before opening the stream.
+/// `ServerError.badRequest` for oversized prompts, non-positive max_tokens and out-of-range
+/// sampling values so callers can map to HTTP 400 before opening the stream.
 func prepareStreaming(chatRequest: ChatCompletionRequest, state: ServerState, sessionID: String? = nil) async throws
     -> PreparedStream
 {
@@ -418,7 +420,7 @@ func prepareStreaming(chatRequest: ChatCompletionRequest, state: ServerState, se
     }
     let requestID = RequestID.next()
 
-    let samplingConfig = state.makeSamplingConfig(
+    let samplingConfig = try state.makeSamplingConfig(
         temperature: chatRequest.temperature,
         topP: chatRequest.topP,
         topK: chatRequest.topK,
@@ -429,7 +431,8 @@ func prepareStreaming(chatRequest: ChatCompletionRequest, state: ServerState, se
     let reasoningEffort = ReasoningEffort.resolve(
         request: chatRequest.reasoningEffort, default: state.config.defaultReasoningEffort)
     let promptTokens = tokenizeMessages(
-        chatRequest.messages, tools: chatRequest.tools, reasoningEffort: reasoningEffort, state: state)
+        chatRequest.messages, tools: chatRequest.tools, reasoningEffort: reasoningEffort,
+        tokenizer: state.tokenizer, toolCallDetection: state.toolCallDetection)
     let stopSequences = buildStopSequences(from: chatRequest, state: state)
     let input: Input = .tokens(promptTokens)
 
@@ -671,9 +674,12 @@ private func handleStreamingRequest(
 
 // MARK: - Helpers
 
-private func tokenizeMessages(
+/// A chat request's messages and tools rendered through the model's chat template, as tokens.
+///
+/// Internal, not private, so tests can render a request through a real template.
+func tokenizeMessages(
     _ messages: [ChatMessage], tools: [ToolDefinition]? = nil,
-    reasoningEffort: String? = nil, state: ServerState
+    reasoningEffort: String? = nil, tokenizer: any Tokenizer, toolCallDetection: ToolCallDetection?
 ) -> [Int] {
     var templateMessages: [[String: any Sendable]] = []
     // Resolved effort is the single source of truth: `none` also injects the legacy `/no_think`
@@ -686,17 +692,9 @@ private func tokenizeMessages(
             dict["content"] = msg.content.textContent
             if let id = msg.toolCallId { dict["tool_call_id"] = id }
         } else if msg.role == "assistant", let calls = msg.toolCalls, !calls.isEmpty {
-            let callDicts: [[String: any Sendable]] = calls.map { call in
-                [
-                    "id": call.id,
-                    "type": "function",
-                    "function": [
-                        "name": call.function.name,
-                        "arguments": call.function.arguments,
-                    ] as [String: any Sendable],
-                ]
+            dict["tool_calls"] = calls.map { call in
+                TemplateValues.toolCall(id: call.id, name: call.function.name, arguments: call.function.arguments)
             }
-            dict["tool_calls"] = callDicts
             dict["content"] = msg.content.textContent
         } else {
             var content = msg.content.textContent
@@ -718,7 +716,7 @@ private func tokenizeMessages(
             "description": tool.function.description ?? "",
         ]
         if let params = tool.function.parameters {
-            funcDict["parameters"] = jsonValueToSendable(params)
+            funcDict["parameters"] = params.templateValue
         }
         let spec: [String: any Sendable] = [
             "type": tool.type,
@@ -731,32 +729,26 @@ private func tokenizeMessages(
     // `tools` variable. Attach the specs there (and synthesize a system message if none exists)
     // only for that dialect, so top-level-`tools` families (e.g. Qwen3) are not perturbed.
     templateMessages = injectToolsIntoSystemMessageIfNeeded(
-        templateMessages, toolSpecs: toolSpecs, detection: state.toolCallDetection)
+        templateMessages, toolSpecs: toolSpecs, detection: toolCallDetection)
 
     do {
         let additionalContext = ReasoningEffort.templateContext(reasoningEffort)
-        let tokens = try state.tokenizer.applyChatTemplate(
+        let tokens = try tokenizer.applyChatTemplate(
             messages: templateMessages, tools: toolSpecs,
             additionalContext: additionalContext.isEmpty ? nil : additionalContext)
         return tokens
     } catch {
-        CLILogger.log("applyChatTemplate failed: \(error)", component: "Server")
+        // Shown without --verbose, once per kind of failure: the plain-text prompt below is not what
+        // the model was trained on.
+        CLILogger.warnOnce(
+            "chat template: \(error)",
+            "Warning: the chat template failed (\(error)); using a plain-text prompt instead",
+            component: "Server")
     }
 
     let text = templateMessages.map { "\($0["role"] ?? "user"): \($0["content"] ?? "")" }
         .joined(separator: "\n")
-    return state.tokenizer.encode(text: text)
-}
-
-private func jsonValueToSendable(_ value: JSONValue) -> any Sendable {
-    switch value {
-    case .string(let s): return s
-    case .number(let n): return n
-    case .bool(let b): return b
-    case .null: return Optional<String>.none as any Sendable
-    case .object(let obj): return obj.mapValues { jsonValueToSendable($0) } as [String: any Sendable]
-    case .array(let arr): return arr.map { jsonValueToSendable($0) } as [any Sendable]
-    }
+    return tokenizer.encode(text: text)
 }
 
 private func buildStopSequences(from request: ChatCompletionRequest, state: ServerState) -> StopSequences {

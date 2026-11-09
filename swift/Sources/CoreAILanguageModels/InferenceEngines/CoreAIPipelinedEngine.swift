@@ -632,6 +632,8 @@ private struct EngineImpl: ~Copyable {
     var cachedSampler: (any MPSGraphSampler)?
     var cachedSamplerTemperature: Double?
     var penaltyState: RepetitionPenaltyGPUState?
+    // No step using `penaltyState` is in flight; set by the end-of-generation sentinel and reset().
+    var penaltyStateIdle = true
 
     // State
     var processedTokenCount: Int = 0
@@ -915,25 +917,17 @@ private struct EngineImpl: ~Copyable {
                 throw InferenceRuntimeError.genericError(
                     "Temperature changed mid-generation (\(existingTemp) -> \(temperature)). Call reset() first.")
             }
-            return existingSampler
+            // The penalty stage is compiled into the graph; rebuild when this request needs it.
+            let cachedPenaltyEnabled = (existingSampler as? MPSGraphCompositeSampler)?.penaltyEnabled ?? false
+            if cachedPenaltyEnabled || !config.needsRepetitionPenalty {
+                return existingSampler
+            }
         }
 
-        // Create penalized sampler if repetition penalty is configured
-        if config.needsRepetitionPenalty {
-            if config.temperature == 0 {
-                throw InferenceRuntimeError.invalidArgument(
-                    "Repetition penalty with greedy sampling is not supported on pipelined engine. "
-                        + "Use temperature > 0, or use a sequential engine.")
-            }
-            if penaltyState == nil {
-                penaltyState = try RepetitionPenaltyGPUState(
-                    device: device,
-                    vocabSize: self.config.vocabSize,
-                    pipelineDepth: pipelineDepth,
-                    penalty: config.repetitionPenalty!,
-                    windowSize: config.repetitionPenaltyWindow
-                )
-            }
+        if config.needsRepetitionPenalty && config.temperature == 0 {
+            throw InferenceRuntimeError.invalidArgument(
+                "Repetition penalty with greedy sampling is not supported on pipelined engine. "
+                    + "Use temperature > 0, or use a sequential engine.")
         }
 
         let newSampler = try MPSGraphSamplerFactory.makeSampler(
@@ -1226,6 +1220,7 @@ private struct EngineImpl: ~Copyable {
         maxTokens: Int?,
         yieldingTo continuation: AsyncThrowingStream<InferenceEngine.TokenId, Error>.Continuation
     ) async throws {
+        let sampler = sampler.normalized()
         let gpuSampler = try getOrCreateSampler(for: sampler)
         gpuErrors.reset()
 
@@ -1256,6 +1251,18 @@ private struct EngineImpl: ~Copyable {
                 }
             }
         }
+
+        // Each generation starts with empty penalty history; the old state is reused only when idle.
+        penaltyState = try RepetitionPenaltyGPUState.forGeneration(
+            reusing: penaltyState,
+            existingIsIdle: penaltyStateIdle,
+            device: device,
+            vocabSize: config.vocabSize,
+            pipelineDepth: pipelineDepth,
+            penalty: sampler.needsRepetitionPenalty ? sampler.repetitionPenalty : nil,
+            windowSize: sampler.repetitionPenaltyWindow
+        )
+        penaltyStateIdle = false
 
         // Prefill the prompt, then sample from the tokens prefill left behind.
         // Skip it entirely if the prompt is empty (prefix-cached continuation).
@@ -1301,14 +1308,14 @@ private struct EngineImpl: ~Copyable {
         // continuation.yield has returned before the caller calls finish().
         // We use a bare command buffer instead of the sampler to avoid the shared
         // MPSGraphExecutableExecutionDescriptor issue in MPSGraphCompositeSampler.
-        await withCheckedContinuation { (sentinelCont: CheckedContinuation<Void, Never>) in
+        penaltyStateIdle = await withCheckedContinuation { (sentinelCont: CheckedContinuation<Bool, Never>) in
             do {
                 let queue = pipelineQueue
                 guard let cmdBuf = queue.makeCommandBuffer() else {
-                    sentinelCont.resume()
+                    sentinelCont.resume(returning: false)
                     return
                 }
-                cmdBuf.addCompletedHandler { _ in sentinelCont.resume() }
+                cmdBuf.addCompletedHandler { _ in sentinelCont.resume(returning: true) }
                 cmdBuf.commit()
             }
         }
@@ -1851,6 +1858,9 @@ private struct EngineImpl: ~Copyable {
         step = 0
         cachedSampler = nil
         cachedSamplerTemperature = nil
+        // Steps still in flight hold their own reference.
+        penaltyState = nil
+        penaltyStateIdle = true
         // Zero SSM states so the next conversation starts from a clean slate.
         additionalStates?.reset()
         span.end()
