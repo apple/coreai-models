@@ -41,6 +41,28 @@ uv run coreai.llm.export org/NewModel \
     --max-context-length 4096
 ```
 
+#### Downloading from ModelScope
+
+By default models are downloaded from the HuggingFace Hub. Pass
+`--backend modelscope` to `coreai.llm.export` to download from
+[ModelScope](https://modelscope.cn) instead. Install it with
+`uv pip install "modelscope>=1.37"` (or `pip install "modelscope>=1.37"`);
+it is imported lazily, so the default HuggingFace path needs nothing. Model ids belong to the selected hub's namespace; the registry
+carries a ModelScope id override for the one preset whose repo lives under a
+different namespace (`gpt-oss-20b` → `openai-mirror/gpt-oss-20b`), so
+`--list-models --backend modelscope` shows the id each preset resolves to.
+
+```bash
+uv run coreai.llm.export Qwen/Qwen3-0.6B --backend modelscope
+```
+
+Add `--dry-run` to preview which backend and repo id the export will use
+without downloading anything:
+
+```bash
+uv run coreai.llm.export Qwen/Qwen3-0.6B --backend modelscope --dry-run
+```
+
 #### Quantization Options
 
 | Platform      | Preset                                     | Description                                          |
