@@ -939,3 +939,42 @@ def test_e2b_qat_native_quantization_dispatch_and_bit_exactness():
     assert False in compared, "expected at least one 4-bit MLP layer in this checkpoint"
 
     del hf_model, model
+
+
+def test_native_quant_conv1x1_activation_quant_matches_hf_srq():
+    """With activation scales set, the module quantizes its input and output exactly as the
+    HF QAT layer does (``apply_srq`` around the matmul); a scale of 0 leaves that side alone."""
+    gemma_quant = pytest.importorskip("transformers.integrations.gemma_quant")
+    torch.manual_seed(0)
+    out_c, in_c = 16, 8
+    mod = NativeQuantConv1x1(in_c, out_c, nbits=4)
+    q = torch.randint(-8, 8, (out_c, in_c, 1, 1), dtype=torch.int8)
+    scale = torch.rand(out_c, 1, 1, 1, dtype=torch.float16) * 0.05
+    with torch.no_grad():
+        mod.quantized_data.copy_(q)
+        mod.scale.copy_(scale)
+    x = torch.randn(1, in_c, 1, 6, dtype=torch.float16)
+    weight = q.reshape(out_c, in_c).to(torch.float16) * scale.reshape(out_c, 1)
+
+    def reference(s_in: float, s_out: float) -> torch.Tensor:
+        xs = x.squeeze(2).transpose(1, 2)  # (1, 6, in_c): the HF linear layout
+        xs = gemma_quant.apply_srq(xs, torch.tensor(s_in))
+        out = gemma_quant.apply_srq(torch.nn.functional.linear(xs, weight), torch.tensor(s_out))
+        return out.transpose(1, 2).unsqueeze(2)
+
+    for s_in in (0.0, 0.02):
+        mod.input_activation_scale, mod.output_activation_scale = s_in, 0.0
+        with torch.no_grad():
+            torch.testing.assert_close(mod(x), reference(s_in, 0.0), atol=1e-3, rtol=1e-3)
+    # With the output quantized too, the conv and the linear accumulate in a different fp16
+    # order, so a value on a rounding boundary can land one step either way.
+    mod.input_activation_scale, mod.output_activation_scale = 0.02, 0.01
+    with torch.no_grad():
+        diff = (mod(x) - reference(0.02, 0.01)).abs()
+    assert diff.max() <= 0.01 + 1e-3
+    assert (diff > 1e-3).float().mean() < 0.05
+    # The scales really do change the result.
+    mod.input_activation_scale = mod.output_activation_scale = 0.0
+    plain = mod(x)
+    mod.input_activation_scale, mod.output_activation_scale = 0.05, 0.05
+    assert not torch.allclose(mod(x), plain)
