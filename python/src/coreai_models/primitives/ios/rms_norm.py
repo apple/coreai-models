@@ -74,7 +74,10 @@ class MaxAbsRMSNormNoScale(nn.Module):
     def __init__(self, eps: float = 1e-6, axis: int = -1) -> None:
         super().__init__()
         self.axis = axis
-        self.register_buffer("_eps_sqrt", torch.tensor(eps**0.5), persistent=False)
+        # On the CPU even when built under a meta device: a non-persistent buffer is never
+        # replaced by `load_state_dict`, so it would otherwise keep no data.
+        with torch.device("cpu"):
+            self.register_buffer("_eps_sqrt", torch.tensor(eps**0.5), persistent=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Max magnitude along ``axis``; the floor keeps an all-zero row at zero instead of NaN.

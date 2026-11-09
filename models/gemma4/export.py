@@ -638,6 +638,7 @@ async def _export_ios(args: argparse.Namespace) -> str:
             max_context_length=max_ctx,
             target_dtype=target_dtype,
             mmap_path=os.path.join(temp_dir, "weights"),
+            activation_quant=not args.weights_only,
         ).eval()
         hf_config.max_position_embeddings = max_ctx
 
@@ -778,6 +779,12 @@ def build_parser() -> argparse.ArgumentParser:
         "asset smaller.",
     )
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable DEBUG logging")
+    parser.add_argument(
+        "--weights-only",
+        action="store_true",
+        help="For a native-quantized (QAT) checkpoint, drop its static INT8 activation "
+        "quantization and keep only the quantized weights. Default: off.",
+    )
     parser.add_argument(
         "--emit-hidden-states",
         action="store_true",
