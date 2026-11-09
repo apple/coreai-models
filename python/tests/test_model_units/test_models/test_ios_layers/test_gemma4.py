@@ -38,7 +38,12 @@ from coreai_models.models.ios.gemma4_text import (  # noqa: E402
     _compute_kv_layout,
     sliding_ring_size,
 )
-from coreai_models.primitives.ios.quantization import quantize_per_tensor  # noqa: E402
+from coreai_models.primitives.ios.quantization import (  # noqa: E402
+    dequantize_native,
+    quantize_per_tensor,
+    unpack_signed_subbyte,
+    unpack_unsigned_subbyte,
+)
 from coreai_models.primitives.ios.rope import RoPECache  # noqa: E402
 
 DTYPE = torch.float32
@@ -564,3 +569,26 @@ def test_native_quant_linear_blocking_matches_unblocked():
         out_blocked = blocked(x)
         out_unblocked = unblocked(x)
     torch.testing.assert_close(out_blocked, out_unblocked)
+
+
+@pytest.mark.parametrize("nbits", [2, 4, 8])
+def test_unpack_subbyte_signed_is_unsigned_minus_offset(nbits):
+    """Both unpackers read the same fields; the signed one subtracts 2**(nbits-1)."""
+    packed = torch.randint(0, 256, (3, 5), dtype=torch.uint8)
+    width = 5 * (8 // nbits) - 1  # a partial final byte keeps only the leading fields
+    unsigned = unpack_unsigned_subbyte(packed, nbits, width)
+    signed = unpack_signed_subbyte(packed, nbits, width)
+    assert unsigned.shape == signed.shape == (3, width)
+    bias = 0 if nbits == 8 else 1 << (nbits - 1)
+    expected = unsigned.to(torch.int16) - bias if nbits != 8 else packed.to(torch.int8)[:, :width]
+    assert torch.equal(signed.to(torch.int16), expected.to(torch.int16))
+
+
+@pytest.mark.parametrize("nbits", [1, 3, 16])
+def test_native_quant_helpers_reject_unsupported_nbits(nbits):
+    with pytest.raises(ValueError, match="nbits must be one of"):
+        unpack_signed_subbyte(torch.zeros(1, 1, dtype=torch.uint8), nbits, 1)
+    with pytest.raises(ValueError, match="nbits must be one of"):
+        unpack_unsigned_subbyte(torch.zeros(1, 1, dtype=torch.uint8), nbits, 1)
+    with pytest.raises(ValueError, match="nbits must be one of"):
+        dequantize_native(torch.zeros(1, 1), torch.ones(1, 1), nbits, torch.float16)

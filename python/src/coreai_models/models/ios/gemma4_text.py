@@ -30,6 +30,9 @@ Key differences from other iOS models (Qwen3, Llama):
 
 from typing import Any
 
+# Registers `torch.ops.coreai.lut_to_dense` and `torch.ops.coreai.constexpr_blockwise_shift_scale`,
+# used by the native quantized weight modules.
+import coreai_torch._compression.custom_layers  # noqa: F401
 import torch
 import torch.nn as nn
 from coreai.authoring.types import AllocationType, HardwareConstraints
