@@ -53,6 +53,25 @@ struct ThinkTagParserTests {
         #expect(eventStrings(events, kind: .reasoning) == ["unterminated thoughts"])
     }
 
+    @Test("Prompt ends in <think> — output starts as reasoning, the close splits it")
+    func promptOpensReasoning() {
+        let format = ThinkTagParser.Format.tagPair(open: "<think>", close: "</think>")
+        var parser = ThinkTagParser(format: format, promptOpensReasoning: true)
+        let events = parser.consume("thoughts</think>\n\nanswer") + parser.flush()
+        #expect(eventStrings(events, kind: .reasoning) == ["thoughts"])
+        #expect(eventStrings(events, kind: .text) == ["\n\nanswer"])
+    }
+
+    @Test("A prompt tail opens reasoning only when it ends in the open marker")
+    func promptTailDetection() {
+        let format = ThinkTagParser.Format.tagPair(open: "<think>", close: "</think>")
+        // Qwen3 with thinking on, and with it off (an empty block).
+        #expect(ThinkTagParser.promptOpensReasoning("<|im_start|>assistant\n<think>\n", format: format))
+        #expect(!ThinkTagParser.promptOpensReasoning("assistant\n<think>\n\n</think>\n\n", format: format))
+        #expect(!ThinkTagParser.promptOpensReasoning("<|im_start|>assistant\n", format: format))
+        #expect(!ThinkTagParser.promptOpensReasoning("<think>\nquoted", format: format))
+    }
+
     // MARK: - Helpers
 
     private enum EventKind { case text, reasoning }

@@ -50,6 +50,29 @@ public struct ThinkTagParser {
         }
     }
 
+    /// - Parameter promptOpensReasoning: The prompt already ends inside a reasoning block, so the
+    ///   output begins as reasoning and the first marker the model writes is the close. See
+    ///   ``promptOpensReasoning(_:format:)``.
+    public init(format: Format, promptOpensReasoning: Bool) {
+        self.init(format: format)
+        if case .tagPair = format, promptOpensReasoning {
+            self.insideThink = true
+        }
+    }
+
+    /// Whether `promptTail`, the end of a rendered prompt, leaves the model inside a reasoning block:
+    /// it ends with the open marker and nothing after it but whitespace.
+    ///
+    /// A chat template that turns thinking on can write the open marker itself (Qwen3 ends the
+    /// prompt with `<think>\n`), so the model never generates it. A template that turns thinking off
+    /// writes an empty block (`<think>\n\n</think>\n\n`), which ends with the close, not the open.
+    public static func promptOpensReasoning(_ promptTail: String, format: Format) -> Bool {
+        guard case .tagPair(let open, _) = format,
+            let opened = promptTail.range(of: open, options: .backwards)
+        else { return false }
+        return promptTail[opened.upperBound...].allSatisfy(\.isWhitespace)
+    }
+
     public mutating func consume(_ delta: String) -> [Event] {
         buffer.append(delta)
         switch format {
