@@ -150,6 +150,14 @@ private func handleChatCompletionsFromBody(body: ByteBuffer, state: ServerState,
         return Response(
             status: .tooManyRequests, headers: [.contentType: "application/json"],
             body: .init(byteBuffer: ByteBuffer(data: data)))
+    } catch InferenceRuntimeError.outOfMemory(let reason) {
+        // Past the device's memory recommendation: refused until a restart, rather than a server fault.
+        access.release()
+        let err = ErrorResponse(error: .init(message: reason, type: "server_error", code: "out_of_memory"))
+        let data = try JSONEncoder().encode(err)
+        return Response(
+            status: .serviceUnavailable, headers: [.contentType: "application/json"],
+            body: .init(byteBuffer: ByteBuffer(data: data)))
     } catch let error as ServerError {
         access.release()
         let status: HTTPResponse.Status = error.isBadRequest ? .badRequest : .internalServerError

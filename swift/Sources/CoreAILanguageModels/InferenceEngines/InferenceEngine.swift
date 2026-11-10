@@ -359,6 +359,9 @@ public enum InferenceRuntimeError: Error, LocalizedError {
     case bufferAllocationFailed(String)
     /// The scheduler's wait queue is full. `depth` is the queue limit.
     case queueFull(depth: Int)
+    /// The process is past its memory bound and admits nothing more until it restarts. The server
+    /// maps it to 503.
+    case outOfMemory(String)
     case genericError(String)
 
     /// True for `.queueFull`.
@@ -402,6 +405,8 @@ public enum InferenceRuntimeError: Error, LocalizedError {
             return "GPU buffer allocation failed: \(details)"
         case .queueFull(let depth):
             return "Request queue full (depth: \(depth))"
+        case .outOfMemory(let reason):
+            return "Out of memory: \(reason)"
         case .genericError(let message):
             return message
         }

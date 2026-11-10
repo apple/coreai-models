@@ -38,6 +38,8 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
     package let maxConcurrent: Int
     /// Requests allowed to wait beyond the free rows, or `nil` for no limit. At least 0.
     private let maxQueued: Int?
+    /// Refuses new requests once the process is past the device's memory recommendation.
+    private let memoryGuard: DeviceMemoryGuard?
 
     /// True when more than one request can decode at a time (`maxConcurrent > 1`).
     package var supportsContinuousBatching: Bool { maxConcurrent > 1 }
@@ -93,20 +95,26 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
     ///   - maxConcurrent: Rows in the batch, from 1 to the graph's batch capacity. Above 1,
     ///     `engine.supportsBatching` must be true.
     ///   - maxQueued: Requests allowed to wait beyond the free rows, at least 0. `nil` means no limit.
+    ///   - memoryGuard: When set, a request submitted once it trips throws
+    ///     `InferenceRuntimeError.outOfMemory`.
     ///
     /// Throws when the session cannot be created. Out-of-range values fail a precondition.
-    package convenience init(engine: CoreAISequentialEngine, maxConcurrent: Int, maxQueued: Int? = nil) throws {
+    package convenience init(
+        engine: CoreAISequentialEngine, maxConcurrent: Int, maxQueued: Int? = nil,
+        memoryGuard: DeviceMemoryGuard? = nil
+    ) throws {
         precondition(
             maxConcurrent == 1 || engine.supportsBatching,
             "maxConcurrent \(maxConcurrent) needs a graph with an attn_mask input and a batch dimension above 1")
         self.init(
             decodeStep: engine, session: try engine.makeSessionState(batchSize: maxConcurrent),
-            maxConcurrent: maxConcurrent, maxQueued: maxQueued, maxPositions: engine.config.maxContextLength)
+            maxConcurrent: maxConcurrent, maxQueued: maxQueued, maxPositions: engine.config.maxContextLength,
+            memoryGuard: memoryGuard)
     }
 
     init(
         decodeStep: any BatchedDecodeStep, session: GenerationSessionState, maxConcurrent: Int,
-        maxQueued: Int? = nil, maxPositions: Int = .max
+        maxQueued: Int? = nil, maxPositions: Int = .max, memoryGuard: DeviceMemoryGuard? = nil
     ) {
         precondition(maxConcurrent >= 1, "maxConcurrent must be >= 1")
         precondition(
@@ -117,6 +125,7 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
         self.session = session
         self.maxConcurrent = maxConcurrent
         self.maxQueued = maxQueued
+        self.memoryGuard = memoryGuard
         self.scorer = Scorer(decodeStep: decodeStep, maxConcurrent: maxConcurrent, maxPositions: maxPositions)
     }
 
@@ -124,7 +133,8 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
 
     /// Queues `request` and returns its event stream.
     ///
-    /// Throws `invalidArgument` when the prompt is empty, and `InferenceRuntimeError.queueFull` when
+    /// Throws `invalidArgument` when the prompt is empty, `outOfMemory` once the memory guard has
+    /// tripped, and `InferenceRuntimeError.queueFull` when
     /// admitted plus queued requests would exceed `maxConcurrent + maxQueued`. With
     /// `maxConcurrent == 2` and `maxQueued == 1`, a request throws while three others are admitted or
     /// queued. With `maxQueued == nil`, it throws only for an empty prompt.
@@ -140,6 +150,9 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
     ) throws -> [AsyncThrowingStream<BatchSinkEvent, Error>] {
         if requests.contains(where: { $0.promptTokens.isEmpty }) {
             throw InferenceRuntimeError.invalidArgument("a batched request needs a non-empty prompt")
+        }
+        if let reason = memoryGuard?.refusalReason() {
+            throw InferenceRuntimeError.outOfMemory(reason)
         }
         var streams: [AsyncThrowingStream<BatchSinkEvent, Error>] = []
         var pending: [Pending] = []

@@ -666,13 +666,16 @@ public struct ReadyResponse: Codable, Sendable {
     public let toolCalling: Bool
     /// Memory held by the server's sessions, estimated from their arrays' shapes and element sizes.
     public let estimatedMemory: EstimatedMemory?
+    /// What the process holds against what the device recommends, measured at the time of the call.
+    public let memory: MemoryStatus?
     /// Batch scheduler occupancy, present when the server decodes requests in batches.
     public let batching: BatchingStatus?
 
     public init(
         status: String, model: String, maxContextLength: Int,
         busy: Bool, cache: CacheStatus, toolCalling: Bool,
-        estimatedMemory: EstimatedMemory? = nil, batching: BatchingStatus? = nil
+        estimatedMemory: EstimatedMemory? = nil, memory: MemoryStatus? = nil,
+        batching: BatchingStatus? = nil
     ) {
         self.status = status
         self.model = model
@@ -681,7 +684,34 @@ public struct ReadyResponse: Codable, Sendable {
         self.cache = cache
         self.toolCalling = toolCalling
         self.estimatedMemory = estimatedMemory
+        self.memory = memory
         self.batching = batching
+    }
+
+    /// Device memory in megabytes, measured rather than estimated.
+    public struct MemoryStatus: Codable, Sendable, Equatable {
+        /// What Metal has allocated on the device: weights, sessions and the framework's scratch.
+        public let metalAllocatedMB: Double
+        /// What the device recommends this process stay under; zero when it gives no figure.
+        public let recommendedMB: Double
+        /// What the kernel charges this process.
+        public let footprintMB: Double
+        /// Why batched requests are being refused (503) until a restart, or nil while they are not.
+        public let refusing: String?
+
+        public init(metalAllocatedMB: Double, recommendedMB: Double, footprintMB: Double, refusing: String?) {
+            self.metalAllocatedMB = metalAllocatedMB
+            self.recommendedMB = recommendedMB
+            self.footprintMB = footprintMB
+            self.refusing = refusing
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case metalAllocatedMB = "metal_allocated_mb"
+            case recommendedMB = "recommended_mb"
+            case footprintMB = "footprint_mb"
+            case refusing
+        }
     }
 
     /// Memory held by the server's sessions in megabytes, estimated from their arrays' shapes and
@@ -752,6 +782,7 @@ public struct ReadyResponse: Codable, Sendable {
         case busy, cache
         case toolCalling = "tool_calling"
         case estimatedMemory = "estimated_memory"
+        case memory
         case batching
     }
 }

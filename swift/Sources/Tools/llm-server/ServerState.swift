@@ -135,6 +135,10 @@ final class ServerState: @unchecked Sendable {
     /// `SchedulerSession`. Nil when batched serving is off.
     private let batchServing: (scheduler: BatchScheduler, modelConfig: ModelConfig)?
     private var batchScheduler: BatchScheduler? { batchServing?.scheduler }
+
+    /// What the process holds against the device's recommendation, for /ready; it also gates the
+    /// batch scheduler's admission.
+    private let memoryGuard: DeviceMemoryGuard?
     private let _state = Mutex<InternalState>(InternalState())
 
     private struct InternalState {
@@ -150,8 +154,10 @@ final class ServerState: @unchecked Sendable {
         engine: any InferenceEngine,
         tokenizer: any Tokenizer,
         config: ServerConfig,
-        batchServing: (scheduler: BatchScheduler, modelConfig: ModelConfig)? = nil
+        batchServing: (scheduler: BatchScheduler, modelConfig: ModelConfig)? = nil,
+        memoryGuard: DeviceMemoryGuard? = nil
     ) {
+        self.memoryGuard = memoryGuard
         self.engine = engine
         self.tokenizer = tokenizer
         self.config = config
@@ -382,6 +388,15 @@ final class ServerState: @unchecked Sendable {
             ),
             toolCalling: supportsToolCalling,
             estimatedMemory: estimatedMemory(),
+            memory: memoryGuard.map { memoryGuard in
+                let now = memoryGuard.snapshot
+                let megabyte = 1024.0 * 1024.0
+                return .init(
+                    metalAllocatedMB: Double(now.allocated) / megabyte,
+                    recommendedMB: Double(now.recommended) / megabyte,
+                    footprintMB: Double(now.footprint) / megabyte,
+                    refusing: memoryGuard.trippedReason)
+            },
             batching: batchScheduler.map { scheduler in
                 .init(
                     concurrentRequests: scheduler.maxConcurrent, active: occupancy?.active ?? 0,

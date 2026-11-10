@@ -220,6 +220,24 @@ struct ServerAPITypesTests {
         #expect(bareObj["batching"] == nil)
     }
 
+    @Test("ReadyResponse encodes measured memory, and its refusal only while refusing")
+    func readyResponseMemory() throws {
+        let cache = ReadyResponse.CacheStatus(usedTokens: 0, maxTokens: 4096, utilization: 0)
+        func encoded(refusing: String?) throws -> [String: Any]? {
+            let ready = ReadyResponse(
+                status: "ready", model: "m", maxContextLength: 4096, busy: false, cache: cache, toolCalling: false,
+                memory: .init(metalAllocatedMB: 9000, recommendedMB: 12000, footprintMB: 8000, refusing: refusing))
+            let obj = try JSONSerialization.jsonObject(with: JSONEncoder().encode(ready)) as! [String: Any]
+            return obj["memory"] as? [String: Any]
+        }
+        let serving = try encoded(refusing: nil)
+        #expect(serving?["metal_allocated_mb"] as? Double == 9000)
+        #expect(serving?["recommended_mb"] as? Double == 12000)
+        #expect(serving?["footprint_mb"] as? Double == 8000)
+        #expect(serving?["refusing"] == nil)
+        #expect(try encoded(refusing: "past the line")?["refusing"] as? String == "past the line")
+    }
+
     @Test("ReadyResponse round-trips through JSON")
     func readyResponseRoundTrip() throws {
         let ready = ReadyResponse(
