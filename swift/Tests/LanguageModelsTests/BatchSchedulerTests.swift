@@ -216,6 +216,23 @@ struct BatchSchedulerTests {
         #expect(results.map(\.stopReason) == [.eos, .maxTokens, .stopSequence("8")])
     }
 
+    @Test("generateBatch returns each reply in request order, without its EOS, and counts the batch")
+    func generateBatchTimesEachRequest() async throws {
+        let scheduler = makeScheduler(CountUpDecodeStep(capacity: 2), maxConcurrent: 2)
+        // Three requests on two rows: the last waits for a free one.
+        let (results, metrics) = try await scheduler.generateBatch([
+            req(prompt: [9], maxTokens: 100, eos: [12]),
+            req(prompt: [1, 2], maxTokens: 3),
+            req(prompt: [20], maxTokens: 1),
+        ])
+        #expect(results.map(\.tokens) == [[10, 11], [3, 4, 5], [21]])
+        #expect(results.map(\.stopReason) == [.eos, .maxTokens, .maxTokens])
+        #expect(results.map(\.promptTokenCount) == [1, 2, 1])
+        #expect(results.allSatisfy { $0.timeToFirstToken >= 0 && $0.decodeSeconds >= 0 })
+        #expect(metrics.requestCount == 3)
+        #expect(metrics.generatedTokens == 6)
+    }
+
     @Test("Rows decode at their own cursors, and a retired row's slot admits the next request")
     func raggedCursorsAndSlotReuse() async throws {
         let mock = CountUpDecodeStep(capacity: 2)

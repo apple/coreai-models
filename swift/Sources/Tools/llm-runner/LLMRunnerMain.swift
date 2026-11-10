@@ -300,6 +300,20 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     var batchPrototypeRows: Int?
 
     @Option(
+        name: .customLong("prompt-list"),
+        help:
+            "Run each non-blank line of this file as its own prompt, several at once through the continuous-batching scheduler, and report per-request and aggregate tokens/sec. Needs the coreai-sequential engine and a model exported with --attention-mask batched --dynamic-batch-size N."
+    )
+    var promptList: String?
+
+    @Option(
+        name: .customLong("concurrent-requests"),
+        help:
+            "With --prompt-list: prompts generating at once (default: every prompt, up to the model's max batch size). The rest wait for a free row."
+    )
+    var concurrentRequests: Int?
+
+    @Option(
         name: .customLong("draft-model"),
         help:
             "Path to a draft model bundle to enable speculative decoding. Must share the tokenizer/vocabulary with --model. The static-shape engine verifies and drafts."
@@ -347,6 +361,34 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     var promptLookupMinNgram: Int = SpeculativeDefaults.lookupMinNgram
 
     func validate() throws {
+        if let n = concurrentRequests {
+            if n < 1 { throw ValidationError("--concurrent-requests must be >= 1") }
+            if promptList == nil { throw ValidationError("--concurrent-requests applies to --prompt-list") }
+        }
+        if promptList != nil {
+            let conflicting = [
+                prompt != nil ? "--prompt" : nil,
+                promptFile != nil ? "--prompt-file" : nil,
+                rawTokens != nil ? "--raw-tokens" : nil,
+                jsonSchema != nil ? "--json-schema" : nil,
+                continuation != nil ? "--continuation" : nil,
+                rawContinuation != nil ? "--raw-continuation" : nil,
+                saveLogits != nil ? "--save-logits" : nil,
+                printLogits ? "--print-logits" : nil,
+                imagePath != nil ? "--image" : nil,
+                videoPath != nil ? "--video" : nil,
+                batchPrototypeRows != nil ? "--batch-prototype" : nil,
+                draftModel != nil ? "--draft-model" : nil,
+                promptLookup ? "--prompt-lookup" : nil,
+                speculative ? "--speculative" : nil,
+            ].compactMap { $0 }
+            if !conflicting.isEmpty {
+                throw ValidationError("--prompt-list cannot be used with \(conflicting.joined(separator: ", "))")
+            }
+            if !["default", "auto", "coreai-sequential"].contains(inferenceEngineVariant) {
+                throw ValidationError("--prompt-list runs on the coreai-sequential engine")
+            }
+        }
         if let rows = batchPrototypeRows {
             if rows < 1 { throw ValidationError("--batch-prototype must be >= 1") }
             if !["default", "auto", "coreai-sequential"].contains(inferenceEngineVariant) {
@@ -975,6 +1017,17 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             let prepareElapsed = await PerformanceMetrics.shared.modelLoadTime
             let cacheSuffix = cacheHit ? " (cache hit)" : ""
             print(" done in \(String(format: "%.3f", prepareElapsed))s\(cacheSuffix)\n")
+        }
+
+        if let promptList {
+            try await runBatchGeneration(
+                promptListPath: promptList,
+                inferenceEngine: inferenceEngine,
+                bundle: bundle,
+                tokenizer: tokenizer,
+                samplingConfiguration: samplingConfiguration,
+                additionalEosTokenIds: additionalEosTokenIds)
+            return
         }
 
         // Resolve prompt input and tokenize

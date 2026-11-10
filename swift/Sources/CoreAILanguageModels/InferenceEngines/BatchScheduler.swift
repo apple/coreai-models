@@ -429,7 +429,7 @@ package struct BatchRequest: Sendable {
     /// Cancels the request when set. Dropping the request's stream also cancels it.
     let cancellation = RequestCancellation()
 
-    init(
+    package init(
         promptTokens: [Int32],
         sampling: SamplingConfiguration,
         eosTokenIds: Set<Int32>,
