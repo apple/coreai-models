@@ -77,7 +77,8 @@ extension FlowTransformerPipeline {
         let textSeqLen = textEmbeddings.count / hiddenDim(textEmbeddings)
 
         // 2. Determine latent dimensions from image size
-        let imageSize = try resolveImageSize(configuration.imageSize)
+        let imageSize = try Self.resolveImageSize(
+            configuration.imageSize, loadedSize: defaultImageSize.width, config: config)
         let spatialSide = imageSize / Self.patchSize
         let inChannels = Self.latentChannels
         let seqLen = spatialSide * spatialSide
@@ -90,32 +91,9 @@ extension FlowTransformerPipeline {
         let isActuallyImg2Img = configuration.isImageToImage && encoder != nil
         let references = isActuallyImg2Img ? configuration.allReferenceImages : []
 
-        // Each extra reference lengthens the concatenated sequence, and a static graph is
-        // traced at exactly one length.
-        if references.count > 1 && !isDynamic {
-            throw PipelineLoadError.unsupportedConfiguration(
-                "\(references.count) reference images were given but this bundle is statically "
-                    + "shaped and takes one. Export with --dynamic for multiple references.")
-        }
-
+        try Self.checkReferenceCount(references.count, config: config)
         if mode == .tiled {
-            if isDynamic {
-                // Tiles are half the output on a side, and the decoder's exported range has
-                // to cover them.
-                let minTile = config.minImageSize ?? 0
-                guard imageSize / 2 >= minTile else {
-                    throw PipelineLoadError.unsupportedConfiguration(
-                        "tiled decode splits the output into \(imageSize / 2)px tiles, below this "
-                            + "bundle's \(minTile)px decoder minimum. Use an image size of at least "
-                            + "\(2 * minTile), or decode without tiling.")
-                }
-            } else if isActuallyImg2Img {
-                // A static tiled bundle loads the half-size encoder, which can't take the
-                // full-size reference.
-                throw PipelineLoadError.unsupportedConfiguration(
-                    "img2img is not supported with tiled decode on a statically shaped bundle. "
-                        + "Decode without tiling, or export with --dynamic.")
-            }
+            try Self.checkTiledDecode(imageSize: imageSize, isImageToImage: isActuallyImg2Img, config: config)
         }
 
         let sigmaMax: Float = 1.0
@@ -140,11 +118,12 @@ extension FlowTransformerPipeline {
         var staticPreset: ReferenceGrid?
 
         if let enc = encoder, !references.isEmpty {
-            let (refSide, preset) = try resolveReferenceSide(
-                configuration.referenceSize, spatialSide: spatialSide)
+            let (refSide, preset) = try Self.resolveReferenceSide(
+                configuration.referenceSize, spatialSide: spatialSide,
+                loadedSize: defaultImageSize.width, config: config)
             staticPreset = preset
             refSides = Array(repeating: refSide, count: references.count)
-            try checkImageTokenBudget(noiseTokens: seqLen, refSides: refSides)
+            try Self.checkImageTokenBudget(noiseTokens: seqLen, refSides: refSides, config: config)
 
             var tokens: [Float] = []
             tokens.reserveCapacity(references.count * refSide * refSide * inChannels)
@@ -346,21 +325,24 @@ extension FlowTransformerPipeline {
             imageSize: imageSize)
     }
 
-    // MARK: - Size Resolution
+    // MARK: - Request Validation
+    //
+    // Static and parameterized by the bundle's `config` (and the size the pipeline was loaded
+    // for), so the rules can be tested without a bundle on disk. A dynamic bundle is one
+    // whose `config.dynamicShapes` is set.
 
     /// Resolve the output size, validating a caller-requested one. A static bundle only
     /// produces the size it was loaded for; a dynamic one accepts any aligned size within
     /// its exported bounds (the token grid is `imageSize / 16`).
-    private func resolveImageSize(_ requested: Int?) throws -> Int {
-        let loadedSize = defaultImageSize.width
+    static func resolveImageSize(_ requested: Int?, loadedSize: Int, config: DiffusionConfig) throws -> Int {
         guard let requested, requested != loadedSize else { return loadedSize }
-        guard isDynamic else {
+        guard config.dynamicShapes == true else {
             throw PipelineLoadError.unsupportedConfiguration(
                 "imageSize \(requested) was requested but this bundle is statically shaped; "
                     + "as loaded it only produces \(loadedSize)×\(loadedSize). Export with --dynamic "
                     + "to vary resolution.")
         }
-        let multiple = config.imageSizeMultiple ?? Self.patchSize
+        let multiple = config.imageSizeMultiple ?? patchSize
         let minSize = config.minImageSize ?? multiple
         let maxSize = config.maxImageSize ?? loadedSize
         guard requested >= minSize, requested <= maxSize else {
@@ -375,20 +357,49 @@ extension FlowTransformerPipeline {
         return requested
     }
 
+    /// Each extra reference lengthens the concatenated sequence, and a static graph is traced
+    /// at exactly one length.
+    static func checkReferenceCount(_ count: Int, config: DiffusionConfig) throws {
+        guard count > 1, config.dynamicShapes != true else { return }
+        throw PipelineLoadError.unsupportedConfiguration(
+            "\(count) reference images were given but this bundle is statically shaped and takes "
+                + "one. Export with --dynamic for multiple references.")
+    }
+
+    static func checkTiledDecode(imageSize: Int, isImageToImage: Bool, config: DiffusionConfig) throws {
+        if config.dynamicShapes == true {
+            // Tiles are half the output on a side, and the decoder's exported range has to
+            // cover them.
+            let minTile = config.minImageSize ?? 0
+            guard imageSize / 2 >= minTile else {
+                throw PipelineLoadError.unsupportedConfiguration(
+                    "tiled decode splits the output into \(imageSize / 2)px tiles, below this "
+                        + "bundle's \(minTile)px decoder minimum. Use an image size of at least "
+                        + "\(2 * minTile), or decode without tiling.")
+            }
+        } else if isImageToImage {
+            // A static tiled bundle loads the half-size encoder, which can't take the
+            // full-size reference.
+            throw PipelineLoadError.unsupportedConfiguration(
+                "img2img is not supported with tiled decode on a statically shaped bundle. "
+                    + "Decode without tiling, or export with --dynamic.")
+        }
+    }
+
     /// Resolve the reference token-grid side shared by every reference, and on a static
     /// bundle the preset whose traced graph serves it.
     ///
     /// Dynamic bundles encode each reference at its own size, so any aligned size inside
     /// the encoder's exported range works. Static bundles are traced per preset, so a
     /// pixel size must equal one of them.
-    private func resolveReferenceSide(
-        _ size: ReferenceSize, spatialSide: Int
+    static func resolveReferenceSide(
+        _ size: ReferenceSize, spatialSide: Int, loadedSize: Int, config: DiffusionConfig
     ) throws -> (side: Int, preset: ReferenceGrid?) {
-        let side = size.side(outputSide: spatialSide, patchSize: Self.patchSize)
-        if case .pixels(let pixels) = size, pixels % Self.patchSize != 0 {
+        let side = size.side(outputSide: spatialSide, patchSize: patchSize)
+        if case .pixels(let pixels) = size, pixels % patchSize != 0 {
             throw PipelineLoadError.unsupportedConfiguration(
-                "reference size \(pixels) must be a multiple of \(Self.patchSize): each reference "
-                    + "token covers \(Self.patchSize)×\(Self.patchSize) pixels.")
+                "reference size \(pixels) must be a multiple of \(patchSize): each reference "
+                    + "token covers \(patchSize)×\(patchSize) pixels.")
         }
         guard side >= 1 else {
             throw PipelineLoadError.unsupportedConfiguration(
@@ -397,11 +408,11 @@ extension FlowTransformerPipeline {
                     + "reference size.")
         }
 
-        guard isDynamic else {
+        guard config.dynamicShapes == true else {
             let presets = ReferenceGrid.allCases.map {
-                "\($0)=\($0.side(outputSide: spatialSide) * Self.patchSize)"
+                "\($0)=\($0.side(outputSide: spatialSide) * patchSize)"
             }
-            guard let preset = size.preset(outputSide: spatialSide, patchSize: Self.patchSize) else {
+            guard let preset = size.preset(outputSide: spatialSide, patchSize: patchSize) else {
                 throw PipelineLoadError.unsupportedConfiguration(
                     "reference size \(size) is not one of this statically shaped bundle's presets "
                         + "(\(presets.joined(separator: ", ")) px). Export with --dynamic for "
@@ -417,9 +428,9 @@ extension FlowTransformerPipeline {
             return (side, preset)
         }
 
-        let minPixels = config.minReferenceSize ?? Self.patchSize
-        let maxPixels = config.maxImageSize ?? defaultImageSize.width
-        let pixels = side * Self.patchSize
+        let minPixels = config.minReferenceSize ?? patchSize
+        let maxPixels = config.maxImageSize ?? loadedSize
+        let pixels = side * patchSize
         guard pixels >= minPixels, pixels <= maxPixels else {
             throw PipelineLoadError.unsupportedConfiguration(
                 "reference size \(size) encodes at \(pixels)px, outside this bundle's encoder "
@@ -430,8 +441,8 @@ extension FlowTransformerPipeline {
 
     /// The exported sequence `Dim` caps noise plus every reference grid; past it the
     /// graph fails deep inside the runtime, so reject up front with the remedy.
-    private func checkImageTokenBudget(noiseTokens: Int, refSides: [Int]) throws {
-        guard isDynamic, let maxTokens = config.maxImageTokens else { return }
+    static func checkImageTokenBudget(noiseTokens: Int, refSides: [Int], config: DiffusionConfig) throws {
+        guard config.dynamicShapes == true, let maxTokens = config.maxImageTokens else { return }
         let refTokens = refSides.reduce(0) { $0 + $1 * $1 }
         guard noiseTokens + refTokens > maxTokens else { return }
         throw PipelineLoadError.unsupportedConfiguration(

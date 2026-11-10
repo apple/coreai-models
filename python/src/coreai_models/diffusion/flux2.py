@@ -249,9 +249,9 @@ class Flux2VAEEncoderWrapper(torch.nn.Module):
 # Dummy-input factories
 # ---------------------------------------------------------------------------
 
-# Reference i carries T=10*(i+1) on RoPE axis 0 (diffusers `_prepare_image_ids`), so
-# in-graph RoPE separates each reference from the noise grid and from each other where
-# H/W coincide. Mirrors FlowTransformerPipeline.referenceTokenTimeOffset.
+# Reference tokens carry T=10 on RoPE axis 0 so the in-graph RoPE keeps them
+# positionally distinct from the noise grid even where H/W coincide. Mirrors
+# FlowTransformerPipeline.referenceTokenTimeOffset (FlowTransformerPipeline+Flux2.swift).
 REFERENCE_TOKEN_TIME_OFFSET = 10.0
 
 
@@ -353,7 +353,7 @@ def dummy_flux2_transformer_512(pipe: Any) -> tuple[torch.Tensor, ...]:
 
 
 def _dummy_flux2_transformer_img2img(
-    pipe: Any, noise_grid: int, ref_grids: tuple[int, ...]
+    pipe: Any, noise_grid: int, ref_grid: int
 ) -> tuple[torch.Tensor, ...]:
     """Build dummy inputs for img2img transformer with concatenated reference tokens.
 
@@ -364,21 +364,21 @@ def _dummy_flux2_transformer_img2img(
     Args:
         pipe: HF pipeline (for config access).
         noise_grid: Grid size for noise tokens (64 = 1024×1024).
-        ref_grids: Grid size of each reference image, in order (16/32/64 =
-            quarter/half/full at 1024).
+        ref_grid: Grid size for reference image tokens (16/32/64 = quarter/half/full).
     """
     cfg = pipe.transformer.config
     dtype = next(pipe.transformer.parameters()).dtype
-    total_img_seq = noise_grid * noise_grid + sum(g * g for g in ref_grids)
+    noise_seq = noise_grid * noise_grid
+    ref_seq = ref_grid * ref_grid
+    total_img_seq = noise_seq + ref_seq
     text_seq = 512
     num_rope_axes = len(cfg.axes_dims_rope)
 
-    # Position IDs: noise (T=0), then reference i at T=10*(i+1)
+    # Position IDs: text (T=0) + noise (T=0) + reference (T=10)
     img_ids = torch.cat(
-        [_grid_position_ids(noise_grid, num_rope_axes)]
-        + [
-            _grid_position_ids(g, num_rope_axes, time_offset=REFERENCE_TOKEN_TIME_OFFSET * (i + 1))
-            for i, g in enumerate(ref_grids)
+        [
+            _grid_position_ids(noise_grid, num_rope_axes),
+            _grid_position_ids(ref_grid, num_rope_axes, time_offset=REFERENCE_TOKEN_TIME_OFFSET),
         ]
     ).unsqueeze(0)
     txt_ids = _text_position_ids(text_seq, num_rope_axes)
@@ -395,32 +395,32 @@ def _dummy_flux2_transformer_img2img(
 
 def dummy_flux2_transformer_img2img_quarter(pipe: Any) -> tuple[torch.Tensor, ...]:
     """img2img quarter (1024×1024): 4096 noise + 256 reference = 4352 img tokens."""
-    return _dummy_flux2_transformer_img2img(pipe, noise_grid=64, ref_grids=(16,))
+    return _dummy_flux2_transformer_img2img(pipe, noise_grid=64, ref_grid=16)
 
 
 def dummy_flux2_transformer_img2img_half(pipe: Any) -> tuple[torch.Tensor, ...]:
     """img2img half (1024×1024): 4096 noise + 1024 reference = 5120 img tokens."""
-    return _dummy_flux2_transformer_img2img(pipe, noise_grid=64, ref_grids=(32,))
+    return _dummy_flux2_transformer_img2img(pipe, noise_grid=64, ref_grid=32)
 
 
 def dummy_flux2_transformer_img2img_full(pipe: Any) -> tuple[torch.Tensor, ...]:
     """img2img full (1024×1024): 4096 noise + 4096 reference = 8192 img tokens."""
-    return _dummy_flux2_transformer_img2img(pipe, noise_grid=64, ref_grids=(64,))
+    return _dummy_flux2_transformer_img2img(pipe, noise_grid=64, ref_grid=64)
 
 
 def dummy_flux2_transformer_img2img_512_quarter(pipe: Any) -> tuple[torch.Tensor, ...]:
     """img2img quarter (512×512): 1024 noise + 64 reference = 1088 img tokens."""
-    return _dummy_flux2_transformer_img2img(pipe, noise_grid=32, ref_grids=(8,))
+    return _dummy_flux2_transformer_img2img(pipe, noise_grid=32, ref_grid=8)
 
 
 def dummy_flux2_transformer_img2img_512_half(pipe: Any) -> tuple[torch.Tensor, ...]:
     """img2img half (512×512): 1024 noise + 256 reference = 1280 img tokens."""
-    return _dummy_flux2_transformer_img2img(pipe, noise_grid=32, ref_grids=(16,))
+    return _dummy_flux2_transformer_img2img(pipe, noise_grid=32, ref_grid=16)
 
 
 def dummy_flux2_transformer_img2img_512_full(pipe: Any) -> tuple[torch.Tensor, ...]:
     """img2img full (512×512): 1024 noise + 1024 reference = 2048 img tokens."""
-    return _dummy_flux2_transformer_img2img(pipe, noise_grid=32, ref_grids=(32,))
+    return _dummy_flux2_transformer_img2img(pipe, noise_grid=32, ref_grid=32)
 
 
 # ---------------------------------------------------------------------------

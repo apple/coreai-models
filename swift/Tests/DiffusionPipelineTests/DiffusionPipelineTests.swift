@@ -58,26 +58,6 @@ struct DiffusionPipelineTests {
         }
     }
 
-    /// A static bundle is traced per preset, so a pixel size is only servable when it
-    /// equals one of them at the current output grid.
-    @Test("Pixel reference sizes map to the preset they equal at the output grid")
-    func referenceSizePresetMapping() {
-        let outputSide = 32  // 512 px output, 16 px per token
-        #expect(ReferenceSize.pixels(512).preset(outputSide: outputSide, patchSize: 16) == .full)
-        #expect(ReferenceSize.pixels(256).preset(outputSide: outputSide, patchSize: 16) == .half)
-        #expect(ReferenceSize.pixels(128).preset(outputSide: outputSide, patchSize: 16) == .quarter)
-        #expect(ReferenceSize.pixels(384).preset(outputSide: outputSide, patchSize: 16) == nil)
-        #expect(ReferenceSize.pixels(250).preset(outputSide: outputSide, patchSize: 16) == nil)
-        #expect(ReferenceSize.relative(.half).preset(outputSide: outputSide, patchSize: 16) == .half)
-    }
-
-    @Test("Reference sizes resolve to a token-grid side")
-    func referenceSizeSide() {
-        #expect(ReferenceSize.pixels(384).side(outputSide: 64, patchSize: 16) == 24)
-        #expect(ReferenceSize.relative(.half).side(outputSide: 48, patchSize: 16) == 24)
-        #expect(ReferenceSize.relative(.quarter).side(outputSide: 64, patchSize: 16) == 16)
-    }
-
     /// Presets round down to whole 16-pixel tokens, so the reported size is what is encoded.
     /// A pixel size comes back unchanged, so an invalid one is reported as given.
     @Test("Reference sizes resolve to pixels at an output size")

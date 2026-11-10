@@ -212,6 +212,11 @@ def main() -> None:
         multifunction = False
 
     if args.dynamic:
+        if pipeline_type == "wan":
+            parser.error(
+                "--dynamic is not needed for Wan: its transformer is always exported with a "
+                "dynamic frame count. The flag only selects FLUX.2's dynamic registry."
+            )
         if pipeline_type != "flux2":
             parser.error(f"--dynamic is only supported for FLUX.2, not {pipeline_type}.")
         if args.platform == "iOS":
@@ -244,7 +249,7 @@ def main() -> None:
             _warn(
                 f"--resolution {args.resolution} is not used without --single-function: one "
                 "asset holds both resolutions. Select at runtime with the pipeline's "
-                "--decode-resolution, or export with --single-function."
+                "--image-size, or export with --single-function."
             )
         if args.low_memory:
             _warn(
