@@ -64,7 +64,7 @@ class DiffusionExportConfig:
     vae_tile_size: int | None = None
     include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO
     multifunction: bool = True
-    # FLUX.2 only: one symbolic "main" per asset. Takes precedence over multifunction.
+    # FLUX.2 only: one symbolic "main" per asset. Takes precedence over multifunction if True.
     dynamic: bool = False
 
 

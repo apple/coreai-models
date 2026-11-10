@@ -415,9 +415,8 @@ FLUX2_MULTIFUNCTION_COMPONENTS: dict[str, ComponentSpec | MultiFunctionComponent
 ALL_FLUX2_MULTIFUNCTION_COMPONENTS: list[str] = list(FLUX2_MULTIFUNCTION_COMPONENTS.keys())
 
 
-# --dynamic: one symbolic "main" per asset serves every resolution, reference size
-# and reference count, replacing both the `_512`/`_half` pairs and the variant matrix.
-# Asset names match the static registry, so the export goes to its own directory.
+# --dynamic: one symbolic "main" per asset replaces the size variants and the multi-function
+# entrypoints. Asset names match the static registry, so the export gets its own directory.
 FLUX2_DYNAMIC_COMPONENTS: dict[str, ComponentSpec | MultiFunctionComponentSpec] = {
     "transformer": ComponentSpec(
         asset_name="Transformer",
@@ -537,7 +536,7 @@ def get_component_registry(
         multifunction: If True, use multi-function export for FLUX.2 transformer
             (8 functions in one .aimodel: main, half, and six img2img variants).
         dynamic: If True, use the FLUX.2 dynamic registry: one symbolic "main" per
-            asset. Takes precedence over ``multifunction``.
+            asset. Takes precedence over ``multifunction`` if True.
     """
     if pipeline_type == "flux2":
         if dynamic:

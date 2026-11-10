@@ -71,7 +71,7 @@ uv run coreai.diffusion.export flux2-klein-4b --dynamic
 ```
 
 One transformer then serves any square output size from 256 to 1024 and any reference size
-from 128 to 1024 px (both multiples of 16), and **multiple reference images**, so it replaces
+from 128 to 1024 px (both multiples of 16), and **multiple reference images**, so it can replace
 both the multi-function variants and `--single-function`. Those bounds go into `metadata.json`,
 and the pipeline checks requests against them before generating. Not available with
 `--platform iOS`.

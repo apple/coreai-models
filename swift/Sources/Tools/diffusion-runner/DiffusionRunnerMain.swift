@@ -151,10 +151,8 @@ struct DiffusionRunner: AsyncParsableCommand {
     }
 
     /// The pipeline's load mode plus an explicit per-run size, from `--image-size`,
-    /// `--tiled-decode` and the deprecated `--decode-resolution`.
-    ///
-    /// A static bundle picks its assets by mode, so a pixel size must name its full or half
-    /// size; a dynamic bundle loads the same assets for any size.
+    /// `--tiled-decode` and the deprecated `--decode-resolution`. A static bundle picks its
+    /// assets by mode, so a pixel size there must be its full or half size.
     private func resolveOutputSize(_ diffusion: DiffusionConfig) throws -> (DecodeResolution, Int?) {
         if let decodeResolution { return (decodeResolution, nil) }
         var mode: DecodeResolution

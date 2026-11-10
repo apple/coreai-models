@@ -22,9 +22,8 @@ extension FlowTransformerPipeline {
     private static let textSeqLen = 512
     private static let qwen3PadTokenId = 151643
 
-    /// Reference *i* sits at T=10·(i+1) on RoPE axis 0, separating each reference from
-    /// the noise grid (T=0) and from the others where H/W would otherwise collide.
-    /// Matches diffusers `_prepare_image_ids` and the export-time dummies.
+    /// Reference *i* sits at T=10·(i+1) on RoPE axis 0, keeping references and the noise
+    /// grid (T=0) distinct where H/W coincide. Matches diffusers `_prepare_image_ids`.
     static let referenceTokenTimeOffset: Float = 10
 
     /// FLUX.2 flow-matching timestep shift.
@@ -327,9 +326,8 @@ extension FlowTransformerPipeline {
 
     // MARK: - Request Validation
     //
-    // Static and parameterized by the bundle's `config` (and the size the pipeline was loaded
-    // for), so the rules can be tested without a bundle on disk. A dynamic bundle is one
-    // whose `config.dynamicShapes` is set.
+    // Static and parameterized by the bundle's `config`, so the rules can be tested without
+    // a bundle on disk.
 
     /// Resolve the output size, validating a caller-requested one. A static bundle only
     /// produces the size it was loaded for; a dynamic one accepts any aligned size within
@@ -386,12 +384,9 @@ extension FlowTransformerPipeline {
         }
     }
 
-    /// Resolve the reference token-grid side shared by every reference, and on a static
-    /// bundle the preset whose traced graph serves it.
-    ///
-    /// Dynamic bundles encode each reference at its own size, so any aligned size inside
-    /// the encoder's exported range works. Static bundles are traced per preset, so a
-    /// pixel size must equal one of them.
+    /// Resolve the reference token-grid side shared by every reference, plus the preset
+    /// that serves it on a static bundle. A dynamic bundle takes any aligned size in its
+    /// encoder's range; a static one only its traced presets.
     static func resolveReferenceSide(
         _ size: ReferenceSize, spatialSide: Int, loadedSize: Int, config: DiffusionConfig
     ) throws -> (side: Int, preset: ReferenceGrid?) {
@@ -439,8 +434,8 @@ extension FlowTransformerPipeline {
         return (side, nil)
     }
 
-    /// The exported sequence `Dim` caps noise plus every reference grid; past it the
-    /// graph fails deep inside the runtime, so reject up front with the remedy.
+    /// Noise plus every reference grid must fit the exported sequence `Dim`; past it the graph
+    /// fails inside the runtime.
     static func checkImageTokenBudget(noiseTokens: Int, refSides: [Int], config: DiffusionConfig) throws {
         guard config.dynamicShapes == true, let maxTokens = config.maxImageTokens else { return }
         let refTokens = refSides.reduce(0) { $0 + $1 * $1 }

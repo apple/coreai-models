@@ -64,9 +64,8 @@ public struct FlowTransformerPipeline: DiffusionPipeline {
         return (size, size)
     }
 
-    /// Whether the assets carry symbolic shape axes, so one `main` serves any supported
-    /// resolution and reference count. Read from metadata: probing an input descriptor
-    /// would load the whole transformer.
+    /// Whether the assets carry symbolic shape axes (per metadata.json), so one `main` serves
+    /// any supported size and reference count.
     public var isDynamic: Bool { config.dynamicShapes == true }
 
     public var supportedSchedulers: [SchedulerType] {
@@ -152,7 +151,7 @@ public struct FlowTransformerPipeline: DiffusionPipeline {
         let denoiser: CoreAIDiffusionModelFunction
         let initialNoise: [Float]
         let noiseShape: [Int]
-        /// Square output size in pixels. Per run, since a dynamic bundle's differs from
+        /// Square output size in pixels; on a dynamic bundle it can differ from
         /// `defaultImageSize`.
         let imageSize: Int
     }
