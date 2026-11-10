@@ -113,6 +113,14 @@ struct LLMServer: AsyncParsableCommand {
     var maxQueueDepth: Int = 16
 
     @Option(
+        name: .customLong("batch-prefill-chunk"),
+        help: ArgumentHelp(
+            "With --concurrent-requests above 1, prompt tokens of a joining request computed between decode steps. "
+                + "Smaller keeps the running requests' pauses shorter; larger gets the joining request to its first "
+                + "token sooner. While no request is decoding, prompts go in the model's prefill chunks."))
+    var batchPrefillChunk: Int = BatchScheduler.defaultPrefillChunk
+
+    @Option(
         name: .customLong("concurrent-requests"),
         help: ArgumentHelp(
             "Max requests decoded together in one batch: a number, or auto for the model's max batch size. "
@@ -145,6 +153,9 @@ struct LLMServer: AsyncParsableCommand {
     func validate() throws {
         guard maxQueueDepth >= 0 else {
             throw ValidationError("--max-queue-depth must be >= 0 (got \(maxQueueDepth))")
+        }
+        guard batchPrefillChunk >= 1 else {
+            throw ValidationError("--batch-prefill-chunk must be >= 1 (got \(batchPrefillChunk))")
         }
         guard ConcurrentRequests(concurrentRequests) != nil else {
             throw ValidationError("--concurrent-requests must be auto or a number >= 1 (got \(concurrentRequests))")
@@ -282,9 +293,16 @@ struct LLMServer: AsyncParsableCommand {
             }
         }
         if rows > 1, let sequentialEngine {
-            batchScheduler = try BatchScheduler(
-                engine: sequentialEngine, maxConcurrent: rows, maxQueued: maxQueueDepth)
-            print("Batched serving: \(rows) concurrent requests (asset max batch \(bundle.maxBatchSize))")
+            do {
+                batchScheduler = try BatchScheduler(
+                    engine: sequentialEngine, maxConcurrent: rows, maxQueued: maxQueueDepth,
+                    prefillChunk: batchPrefillChunk)
+                print("Batched serving: \(rows) concurrent requests (asset max batch \(bundle.maxBatchSize))")
+            } catch let error as InferenceRuntimeError {
+                print(
+                    "⚠️  --concurrent-requests \(concurrentRequests): serving one request at a time: "
+                        + error.localizedDescription)
+            }
         } else if requested != .count(1), !supportsBatching {
             print(
                 "⚠️  --concurrent-requests \(concurrentRequests): serving one request at a time. Batched serving needs "
