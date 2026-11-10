@@ -182,7 +182,7 @@ extension FlowTransformerPipeline {
         from url: URL, bundle: DiffusionBundle, mode: DecodeResolution
     ) async throws -> Self {
         func function(_ url: URL) -> CoreAIDiffusionModelFunction {
-            CoreAIDiffusionModelFunction(modelURL: url)
+            CoreAIDiffusionModelFunction(modelURL: url, expectFrequentReshapes: true)
         }
         return Self(
             config: bundle.config,

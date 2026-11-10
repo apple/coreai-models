@@ -206,7 +206,8 @@ class Flux2VAEDecoderWrapper(torch.nn.Module):
         type 'memref<?x512x128x?x?xf16>'  ->  Pass failed: ANERegionFormationPass
 
     Stock ``F.interpolate`` exports and runs correctly at every latent size, so the
-    dynamic path takes it and forfeits the patch's placement benefit.
+    dynamic path takes it. Loaded with ``expectFrequentReshapes`` (as the Swift pipeline
+    does for dynamic bundles) it decodes as fast as the patched static decoder.
     """
 
     def __init__(self, vae: torch.nn.Module, dynamic: bool = False) -> None:
