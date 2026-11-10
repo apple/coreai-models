@@ -111,17 +111,22 @@ extension TrialResult {
     ///
     /// - `promptTps`: every prompt token over the time until the last request's first token, which
     ///   is when the last prefill finished.
-    /// - `genTps`: decode rates summed across requests, the decode throughput while every request
-    ///   runs; a total, as `--batch-size` reports one.
+    /// - `genTps`: tokens decoded after each request's first, over the span from the earliest first
+    ///   token to the latest last one; a total, as `--batch-size` reports one. Summing each request's
+    ///   own rate would count requests that never ran at the same time, as when more are in flight
+    ///   than the batch holds.
     /// - `perRequestGenTps`: decode rate per request, averaged; what one user sees.
     /// - `endToEndTps`: every generated token over the batch's wall clock, prefill and queueing in.
     init(results: [BatchGenerationResult], metrics: BatchGenerationMetrics) {
         let lastFirstToken = results.map(\.timeToFirstToken).max() ?? 0
         let promptTotal = results.reduce(0) { $0 + $1.promptTokenCount }
         let rates = results.map(\.tokensPerSecond)
+        let decodeStart = results.map(\.timeToFirstToken).min() ?? 0
+        let decodeEnd = results.map { $0.timeToFirstToken + $0.decodeSeconds }.max() ?? 0
+        let decoded = results.reduce(0) { $0 + Swift.max(0, $1.tokens.count - 1) }
         self.init(
             promptTps: lastFirstToken > 0 ? Double(promptTotal) / lastFirstToken : 0,
-            genTps: rates.reduce(0, +),
+            genTps: decodeEnd > decodeStart ? Double(decoded) / (decodeEnd - decodeStart) : 0,
             perRequestGenTps: rates.isEmpty ? 0 : rates.reduce(0, +) / Double(rates.count),
             endToEndTps: metrics.aggregateTokensPerSecond,
             meanTtftSeconds: results.isEmpty
