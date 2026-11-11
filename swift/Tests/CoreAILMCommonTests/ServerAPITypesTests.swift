@@ -226,9 +226,9 @@ struct ServerAPITypesTests {
         func encoded(refusing: String?) throws -> [String: Any]? {
             let ready = ReadyResponse(
                 status: "ready", model: "m", maxContextLength: 4096, busy: false, cache: cache, toolCalling: false,
-                deviceMemory: .init(metalAllocatedMB: 9000, recommendedMB: 12000, footprintMB: 8000, mappedMB: 3000,
-                    refusing: refusing)
-            )
+                deviceMemory: .init(
+                    metalAllocatedMB: 9000, recommendedMB: 12000, footprintMB: 8000, mappedMB: 3000,
+                    refusing: refusing))
             let obj = try JSONSerialization.jsonObject(with: JSONEncoder().encode(ready)) as! [String: Any]
             return obj["device_memory"] as? [String: Any]
         }
