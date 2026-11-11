@@ -44,6 +44,15 @@ class Attention(nn.Module):
 
         self.sdpa = SDPA(head_dim=self.head_dim)
 
+        no_rope_layers = getattr(config, "no_rope_layers", None)
+        no_rope_interval = getattr(config, "no_rope_layer_interval", None)
+        if no_rope_layers is not None and layer_idx < len(no_rope_layers):
+            self.use_rope = bool(no_rope_layers[layer_idx])
+        elif no_rope_interval is not None and no_rope_interval > 0:
+            self.use_rope = (layer_idx + 1) % no_rope_interval != 0
+        else:
+            self.use_rope = True
+
     def forward(
         self,
         x: torch.Tensor,
@@ -76,8 +85,9 @@ class Attention(nn.Module):
         torch._check_is_size(query_len)
         torch._check_is_size(seq_len)
 
-        query = apply_rope(query, rope_cos, rope_sin)
-        key = apply_rope(key, rope_cos, rope_sin)
+        if self.use_rope:
+            query = apply_rope(query, rope_cos, rope_sin)
+            key = apply_rope(key, rope_cos, rope_sin)
 
         query = (
             query.transpose(-2, -3)
