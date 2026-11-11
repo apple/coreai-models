@@ -293,15 +293,13 @@ struct LLMServer: AsyncParsableCommand {
             }
         }
         if rows > 1, let sequentialEngine {
-            do {
+            if let reason = sequentialEngine.batchedPrefillUnsupportedReason {
+                print("⚠️  --concurrent-requests \(concurrentRequests): serving one request at a time: \(reason)")
+            } else {
                 batchScheduler = try BatchScheduler(
                     engine: sequentialEngine, maxConcurrent: rows, maxQueued: maxQueueDepth,
                     prefillChunk: batchPrefillChunk)
                 print("Batched serving: \(rows) concurrent requests (asset max batch \(bundle.maxBatchSize))")
-            } catch let error as InferenceRuntimeError {
-                print(
-                    "⚠️  --concurrent-requests \(concurrentRequests): serving one request at a time: "
-                        + error.localizedDescription)
             }
         } else if requested != .count(1), !supportsBatching {
             print(

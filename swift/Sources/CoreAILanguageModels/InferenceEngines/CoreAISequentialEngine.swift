@@ -735,11 +735,15 @@ public final class CoreAISequentialEngine: MultimodalInferenceEngine, Idempotent
         return out
     }
 
-    /// Throws if this decoder's KV cache can't be written one row at a time: for vision-language
-    /// decoders, caches that aren't NDArray-backed, and models with additional state (conv, recurrent
-    /// or sliding window), which isn't stored per row.
+    /// Throws if this decoder can't prefill one row of a batch at a time: for vision-language decoders,
+    /// assets without a prefill graph, caches that aren't NDArray-backed, and models with additional
+    /// state (conv, recurrent or sliding window), which isn't stored per row.
     func requireRowWritableCache(_ session: GenerationSessionState) throws {
         try requireBatchableDecoder()
+        guard prefillFunction != nil else {
+            throw InferenceRuntimeError.invalidState(
+                "batched prefill requires an asset with a '\(prefillGraphFunctionName)' graph")
+        }
         guard session.kvCache is GrowingNDArrayState else {
             throw InferenceRuntimeError.invalidState(
                 "batched prefill requires an NDArray-backed (GrowingNDArrayState) KV cache")
@@ -750,13 +754,26 @@ public final class CoreAISequentialEngine: MultimodalInferenceEngine, Idempotent
         }
     }
 
-    /// Prefills `tokens`, split into the engine's prefill chunks. Chunks run on the prefill graph when
-    /// the asset has one, so the decode graph keeps a single shape, and on the decode graph otherwise.
-    /// One-token chunks always run on the decode graph: past position 0, a one-token query on the
-    /// prefill graph can abort in MPSGraph ("Failed to resolve dynamic dimensions for memref.alloc").
-    /// No logits are read.
+    /// Why this engine can't serve requests in batches with prompts prefilled per row, or nil when it
+    /// can. See ``requireRowWritableCache(_:)``.
+    package var batchedPrefillUnsupportedReason: String? {
+        do {
+            try requireRowWritableCache(session)
+            return nil
+        } catch {
+            return error.localizedDescription
+        }
+    }
+
+    /// Prefills `tokens` on the prefill graph, split into the engine's prefill chunks, so the decode
+    /// graph keeps its decode shape. One-token chunks run on the decode graph instead: past position 0,
+    /// a one-token query on the prefill graph can abort in MPSGraph ("Failed to resolve dynamic
+    /// dimensions for memref.alloc"). No logits are read.
     func prefillPiece(_ tokens: ArraySlice<Int32>, scratch: GenerationSessionState) async throws {
-        try requireRowWritableCache(scratch)
+        guard let prefillFn = prefillFunction else {
+            throw InferenceRuntimeError.invalidState(
+                "batched prefill requires an asset with a '\(prefillGraphFunctionName)' graph")
+        }
         var remaining = tokens
         for size in prefillChunkSizes(
             tokenCount: tokens.count, chunkSize: config.prefillChunkSize, heldBack: 0,
@@ -764,7 +781,7 @@ public final class CoreAISequentialEngine: MultimodalInferenceEngine, Idempotent
         {
             let chunk = remaining.prefix(size)
             remaining = remaining.dropFirst(size)
-            if chunk.count > 1, let prefillFn = prefillFunction {
+            if chunk.count > 1 {
                 try await encodePrefillChunk(chunk, using: prefillFn, sessionState: scratch)
             } else {
                 _ = try await processTokenBatch(chunk, logits: .none, sessionState: scratch)
@@ -775,7 +792,6 @@ public final class CoreAISequentialEngine: MultimodalInferenceEngine, Idempotent
     func commitRow(
         _ row: Int, from scratch: GenerationSessionState, count: Int, session: GenerationSessionState
     ) throws {
-        try requireRowWritableCache(session)
         guard let target = session.kvCache as? GrowingNDArrayState,
             let source = scratch.kvCache as? GrowingNDArrayState
         else {

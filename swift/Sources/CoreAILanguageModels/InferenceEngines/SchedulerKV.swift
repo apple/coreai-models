@@ -18,17 +18,17 @@ protocol SchedulerKV: AnyObject, Sendable {
     var estimatedBytes: (states: Int, logitsScratch: Int) { get }
 
     /// Maximum number of tokens one ``prefill(row:tokens:)`` call writes while other rows are decoding.
-    /// Prompts are prefilled in chunks that alternate with decode steps, so a long prompt doesn't stall
-    /// the other rows.
+    /// Prompts are prefilled in chunks that alternate with decode steps, so the other rows keep
+    /// generating while a long prompt is prefilled.
     var prefillChunk: Int { get }
 
     /// Maximum chunk size when no row is decoding, at least ``prefillChunk``. With no stream to keep
     /// moving, larger chunks get the new request started sooner.
     var idlePrefillChunk: Int { get }
 
-    /// Reserves `row` for a request with `prompt`, without running anything. Everything but the last
-    /// prompt token is then written with ``prefill(row:tokens:)``. The last token is processed by the
-    /// row's first decode step, whose logits give the first sample.
+    /// Reserves `row` for a request with `prompt`. Everything but the last prompt token is then written
+    /// with ``prefill(row:tokens:)``. The last token is processed by the row's first decode step, whose
+    /// logits give the first sample.
     func reserve(row: Int, prompt: [Int32]) throws
 
     /// Writes `tokens`, the next chunk of `row`'s prompt. Nothing is sampled.
