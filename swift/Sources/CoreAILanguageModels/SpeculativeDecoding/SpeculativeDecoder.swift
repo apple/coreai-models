@@ -198,7 +198,7 @@ package final class SpeculativeDecoder: @unchecked Sendable {
         onToken: (Int32) -> Void
     ) async throws -> Stats {
         if let seed {
-            var rng = SeededRandomNumberGenerator(seed: seed)
+            var rng = CoreAIShared.SeededRandomNumberGenerator(seed: seed)
             return try await generateSampling(
                 promptTokens: promptTokens, maxNewTokens: maxNewTokens, stopTokenIds: stopTokenIds,
                 temperature: temperature, using: &rng, onPrefillReady: onPrefillReady,
