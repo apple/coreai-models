@@ -18,7 +18,10 @@ import Synchronization
 /// - Metal's allocated size, which follows the sessions' KV caches as they grow (a 4-row batch
 ///   session on a 0.6B model went from 140 MB to 4.7 GB over four 3,500-token prompts), against
 ///   ``defaultTripFraction`` of the recommendation.
-/// - The process's physical footprint, against the recommendation itself.
+/// - What the process holds resident: its physical footprint, plus its memory-mapped files, against the
+///   recommendation itself. The footprint leaves out clean file-backed pages, and the asset's weights
+///   are memory-mapped: a 3.8 GB 4-bit 7B model served from a 504 MB footprint, with 3.9 GB of mapped
+///   file pages beside it.
 ///
 /// Neither figure only grows: a KV cache that doubles holds its old and new buffers together while it
 /// copies (the pipelined engine keeps the old ones until the GPU is done with them), and scratch
@@ -38,22 +41,27 @@ package final class DeviceMemoryGuard: Sendable {
     /// figure that was already past its line refuses.
     package static let pastArmMargin = 0.02
 
-    /// What Metal has allocated on the device and what it recommends, and what the kernel charges
-    /// this process.
+    /// What Metal has allocated on the device and what it recommends, and what this process holds.
     package struct Snapshot: Sendable {
         /// Metal's `currentAllocatedSize`: the asset's buffers, the sessions and the framework's
         /// scratch alike.
         package let allocated: Int
         /// Metal's `recommendedMaxWorkingSetSize`; zero when the device gives none.
         package let recommended: Int
-        /// The process's physical footprint.
+        /// The process's physical footprint, which leaves out clean file-backed pages.
         package let footprint: Int
+        /// The process's resident memory-mapped file pages, such as the asset's weights.
+        package let mapped: Int
 
-        package init(allocated: Int, recommended: Int, footprint: Int) {
+        package init(allocated: Int, recommended: Int, footprint: Int, mapped: Int = 0) {
             self.allocated = allocated
             self.recommended = recommended
             self.footprint = footprint
+            self.mapped = mapped
         }
+
+        /// The footprint and the mapped files together: what the process holds resident.
+        package var resident: Int { footprint + mapped }
 
         package var allocatedFraction: Double {
             recommended > 0 ? Double(allocated) / Double(recommended) : 0
@@ -61,7 +69,7 @@ package final class DeviceMemoryGuard: Sendable {
 
         package var description: String {
             "Metal \(Self.gib(allocated)) allocated of \(Self.gib(recommended)) recommended, "
-                + "footprint \(Self.gib(footprint))"
+                + "footprint \(Self.gib(footprint)) and mapped files \(Self.gib(mapped))"
         }
 
         static func gib(_ bytes: Int) -> String {
@@ -72,7 +80,7 @@ package final class DeviceMemoryGuard: Sendable {
     /// The bytes at which each figure refuses, set by ``arm()``; nil before it.
     private struct Lines {
         var allocated: Int
-        var footprint: Int
+        var resident: Int
     }
 
     private struct Watch {
@@ -87,10 +95,10 @@ package final class DeviceMemoryGuard: Sendable {
 
     package convenience init(device: any MTLDevice, tripFraction: Double = DeviceMemoryGuard.defaultTripFraction) {
         self.init(tripFraction: tripFraction) {
-            Snapshot(
-                allocated: device.currentAllocatedSize,
-                recommended: Int(device.recommendedMaxWorkingSetSize),
-                footprint: DeviceMemoryGuard.physicalFootprint)
+            let process = DeviceMemoryGuard.processMemory
+            return Snapshot(
+                allocated: device.currentAllocatedSize, recommended: Int(device.recommendedMaxWorkingSetSize),
+                footprint: process.footprint, mapped: process.mapped)
         }
     }
 
@@ -111,14 +119,15 @@ package final class DeviceMemoryGuard: Sendable {
         let metalLine = Int(Double(start.recommended) * tripFraction)
         let lines = Lines(
             allocated: start.allocated < metalLine ? metalLine : start.allocated + margin,
-            footprint: start.footprint < start.recommended ? start.recommended : start.footprint + margin)
+            resident: start.resident < start.recommended ? start.recommended : start.resident + margin)
         watch.withLock { $0.lines = lines }
     }
 
     package var snapshot: Snapshot { measure() }
 
-    /// What the kernel charges this process, in bytes; zero when it cannot be read.
-    package static var physicalFootprint: Int {
+    /// This process's physical footprint and resident memory-mapped file pages (`external`), in bytes;
+    /// zeros when they cannot be read.
+    package static var processMemory: (footprint: Int, mapped: Int) {
         var info = task_vm_info_data_t()
         var count = mach_msg_type_number_t(
             MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
@@ -127,7 +136,7 @@ package final class DeviceMemoryGuard: Sendable {
                 task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
             }
         }
-        return status == KERN_SUCCESS ? Int(info.phys_footprint) : 0
+        return status == KERN_SUCCESS ? (Int(info.phys_footprint), Int(info.external)) : (0, 0)
     }
 
     /// Measures once, and returns the figures with why this process should admit nothing more right
@@ -142,10 +151,11 @@ package final class DeviceMemoryGuard: Sendable {
                 refusal =
                     "Metal has allocated \(Snapshot.gib(now.allocated)) of the \(Snapshot.gib(now.recommended)) "
                     + "this device recommends, past which the GPU can drop work without an error"
-            } else if now.footprint >= lines.footprint {
+            } else if now.resident >= lines.resident {
                 refusal =
-                    "this process's footprint is \(Snapshot.gib(now.footprint)), past the "
-                    + "\(Snapshot.gib(now.recommended)) this device recommends"
+                    "this process holds \(Snapshot.gib(now.resident)) (footprint \(Snapshot.gib(now.footprint)), "
+                    + "mapped files \(Snapshot.gib(now.mapped))), past the \(Snapshot.gib(now.recommended)) "
+                    + "this device recommends"
             } else {
                 refusal = nil
             }
@@ -169,7 +179,7 @@ package final class DeviceMemoryGuard: Sendable {
     package func report(after stage: String, advice: String) {
         let now = measure()
         guard now.recommended > 0 else { return }
-        if now.allocatedFraction >= 1 || now.footprint >= now.recommended {
+        if now.allocatedFraction >= 1 || now.resident >= now.recommended {
             CLILogger.log(
                 "after \(stage): \(now.description) — past what this device recommends. The GPU may drop "
                     + "work without an error. \(advice)",

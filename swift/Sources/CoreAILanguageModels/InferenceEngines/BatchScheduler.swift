@@ -381,8 +381,8 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
     /// prompt is empty, `queueFull` when the queue cannot take all of `requests`, and any error that
     /// ends a request's stream.
     ///
-    /// The requests are queued in one step, so either all of them are or none is, and they are
-    /// admitted in request order with no other caller's request between them.
+    /// `requests` are queued together: when the queue can't take all of them, none is queued. They
+    /// are admitted in the order given, and no other caller's request is admitted between them.
     func run(_ requests: [BatchRequest]) async throws -> [RowResult] {
         let streams = try enqueue(requests)
         return try await withThrowingTaskGroup(of: (Int, RowResult).self) { group in

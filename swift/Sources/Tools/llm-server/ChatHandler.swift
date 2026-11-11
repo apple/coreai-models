@@ -61,7 +61,7 @@ func startServer(state: ServerState, port: Int) async throws {
         let data = try JSONEncoder().encode(ready)
         // 503 while refusing for memory, so a load balancer or supervisor stops routing here.
         return Response(
-            status: ready.memory?.refusing == nil ? .ok : .serviceUnavailable,
+            status: ready.deviceMemory?.refusing == nil ? .ok : .serviceUnavailable,
             headers: [.contentType: "application/json"],
             body: .init(byteBuffer: ByteBuffer(data: data))
         )

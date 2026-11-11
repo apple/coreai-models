@@ -381,8 +381,8 @@ final class ServerState: @unchecked Sendable {
 
     /// Readiness snapshot for /ready endpoint.
     ///
-    /// `status` is `"refusing"` while new requests get 503 for memory, `"ready"` otherwise; `memory`
-    /// reports the figures and the refusal from one measurement.
+    /// `status` is `"refusing"` while new requests get 503 for memory, `"ready"` otherwise;
+    /// `deviceMemory` reports the figures and the refusal from one measurement.
     func readySnapshot() -> ReadyResponse {
         let memory = memoryGuard?.check()
         let occupancy = batchScheduler?.occupancy
@@ -402,12 +402,13 @@ final class ServerState: @unchecked Sendable {
             ),
             toolCalling: supportsToolCalling,
             estimatedMemory: estimatedMemory(),
-            memory: memory.map { memory in
+            deviceMemory: memory.map { memory in
                 let megabyte = 1024.0 * 1024.0
                 return .init(
                     metalAllocatedMB: Double(memory.snapshot.allocated) / megabyte,
                     recommendedMB: Double(memory.snapshot.recommended) / megabyte,
                     footprintMB: Double(memory.snapshot.footprint) / megabyte,
+                    mappedMB: Double(memory.snapshot.mapped) / megabyte,
                     refusing: memory.refusal)
             },
             batching: batchScheduler.map { scheduler in

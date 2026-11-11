@@ -26,18 +26,20 @@ struct DeviceMemoryGuardTests {
 
     /// Figures a test sets, read by a guard as if from the device. Recommended is 100 unless set.
     private final class Figures: Sendable {
-        private let value = Mutex((allocated: 10, footprint: 10, recommended: 100))
-        func set(allocated: Int? = nil, footprint: Int? = nil, recommended: Int? = nil) {
+        private let value = Mutex((allocated: 10, footprint: 10, mapped: 0, recommended: 100))
+        func set(allocated: Int? = nil, footprint: Int? = nil, mapped: Int? = nil, recommended: Int? = nil) {
             value.withLock {
                 if let allocated { $0.allocated = allocated }
                 if let footprint { $0.footprint = footprint }
+                if let mapped { $0.mapped = mapped }
                 if let recommended { $0.recommended = recommended }
             }
         }
         var snapshot: DeviceMemoryGuard.Snapshot {
             value.withLock {
                 DeviceMemoryGuard.Snapshot(
-                    allocated: $0.allocated, recommended: $0.recommended, footprint: $0.footprint)
+                    allocated: $0.allocated, recommended: $0.recommended, footprint: $0.footprint,
+                    mapped: $0.mapped)
             }
         }
     }
@@ -68,6 +70,16 @@ struct DeviceMemoryGuardTests {
         #expect(memoryGuard.refusalReason()?.contains("footprint") == true)
         figures.set(footprint: 99)
         #expect(memoryGuard.refusalReason() == nil)
+    }
+
+    @Test("Memory-mapped files, such as the weights, count with the footprint")
+    func mappedFilesCount() {
+        let figures = Figures()
+        let memoryGuard = guarding(figures)
+        figures.set(footprint: 60, mapped: 39)
+        #expect(memoryGuard.refusalReason() == nil)
+        figures.set(mapped: 40)
+        #expect(memoryGuard.refusalReason()?.contains("mapped files") == true)
     }
 
     @Test("check() reports the refusal from the same measurement as its figures")
