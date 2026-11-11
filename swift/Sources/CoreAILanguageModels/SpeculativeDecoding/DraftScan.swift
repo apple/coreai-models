@@ -3,6 +3,7 @@
 // Use of this source code is governed by a BSD-3-clause license that can
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
+import Accelerate
 import CoreAIShared
 import Foundation
 
@@ -47,6 +48,13 @@ final class DraftPack: @unchecked Sendable {
         let headDim: Int?
         let fullHeadDim: Int?
         let ffn: Int?
+        /// Positions the head's sliding layers attend to (a ``Role/head`` pack).
+        let slidingWindow: Int?
+        /// RoPE base of the sliding and of the full-attention layers (a ``Role/head`` pack).
+        let slidingTheta: Float?
+        let fullTheta: Float?
+        /// Share of the full-attention layer's frequency pairs that rotate (a ``Role/head`` pack).
+        let fullPartialRotaryFactor: Float?
         let tensors: [String: Entry]
 
         enum CodingKeys: String, CodingKey {
@@ -54,6 +62,10 @@ final class DraftPack: @unchecked Sendable {
             case perCentroid = "per_centroid"
             case headDim = "head_dim"
             case fullHeadDim = "full_head_dim"
+            case slidingWindow = "sliding_window"
+            case slidingTheta = "sliding_theta"
+            case fullTheta = "full_theta"
+            case fullPartialRotaryFactor = "full_partial_rotary_factor"
         }
     }
 
@@ -65,6 +77,9 @@ final class DraftPack: @unchecked Sendable {
         /// The masked embedder's candidate scan (`draft_scan.bin`): the permuted output table and
         /// the permutation.
         case scan
+        /// The whole draft head for ``CPUDrafter`` (`draft_head.safetensors`, from
+        /// `models/gemma4/export_draft_pack.py`): the scan, the centroids and every layer.
+        case head
     }
 
     private let base: UnsafeMutableRawPointer
@@ -76,8 +91,7 @@ final class DraftPack: @unchecked Sendable {
     /// - Parameters:
     ///   - blob: the flat tensor file.
     ///   - indexURL: its JSON index; by default the blob's path with a `.json` extension.
-    init(blob: URL, index indexURL: URL? = nil, role: Role? = nil) throws {
-        let name = blob.lastPathComponent
+    convenience init(blob: URL, index indexURL: URL? = nil, role: Role? = nil) throws {
         let meta = indexURL ?? blob.deletingPathExtension().appendingPathExtension("json")
         let metaData: Data
         do {
@@ -85,6 +99,7 @@ final class DraftPack: @unchecked Sendable {
         } catch {
             throw DraftPackError.message("cannot read \(meta.lastPathComponent): \(error.localizedDescription)")
         }
+        let index: Index
         do {
             index = try JSONDecoder().decode(Index.self, from: metaData)
         } catch {
@@ -92,18 +107,80 @@ final class DraftPack: @unchecked Sendable {
                 "\(meta.lastPathComponent) is not a draft pack index (\(error.localizedDescription)); "
                     + "re-export it with models/gemma4/export_drafter.py")
         }
-        let fd = open(blob.path, O_RDONLY)
-        guard fd >= 0 else { throw DraftPackError.message("cannot open \(blob.path)") }
+        try self.init(index: index, mapping: blob, role: role)
+    }
+
+    /// The `__metadata__["format"]` of a draft head written by `models/gemma4/export_draft_pack.py`.
+    static let safetensorsFormat = "gemma4_draft_head"
+
+    /// A pack stored as one `.safetensors` file, whose `__metadata__` holds the index's geometry.
+    convenience init(safetensors url: URL, role: Role? = nil) throws {
+        let header: SafeTensorsReader.Header
+        do {
+            header = try SafeTensorsReader.header(of: url)
+        } catch {
+            throw DraftPackError.message("\(url.lastPathComponent) is not a readable safetensors file: \(error)")
+        }
+        try self.init(index: Self.index(of: header, name: url.lastPathComponent), mapping: url, role: role)
+    }
+
+    /// The index a safetensors header describes: its tensors, and the geometry in `__metadata__`.
+    static func index(of header: SafeTensorsReader.Header, name: String) throws -> Index {
+        let repack = "re-export it with models/gemma4/export_draft_pack.py"
+        let meta = header.metadata
+        guard meta["format"] == safetensorsFormat else {
+            throw DraftPackError.message(
+                "\(name) is not a draft head pack (its metadata format is \(meta["format"].map { "'\($0)'" } ?? "missing")); "
+                    + repack)
+        }
+        func int(_ key: String) throws -> Int? {
+            guard let raw = meta[key] else { return nil }
+            guard let value = Int(raw) else {
+                throw DraftPackError.message("\(name) metadata '\(key)' is '\(raw)', not an integer; \(repack)")
+            }
+            return value
+        }
+        func float(_ key: String) throws -> Float? {
+            guard let raw = meta[key] else { return nil }
+            guard let value = Float(raw) else {
+                throw DraftPackError.message("\(name) metadata '\(key)' is '\(raw)', not a number; \(repack)")
+            }
+            return value
+        }
+        func required(_ key: String) throws -> Int {
+            guard let value = try int(key) else {
+                throw DraftPackError.message("\(name) metadata has no '\(key)'; \(repack)")
+            }
+            return value
+        }
+        let dtypes = ["F16": "float16", "F32": "float32", "I8": "int8", "I32": "int32"]
+        return Index(
+            version: try int("version"), vocab: try required("vocab"), centroids: try required("centroids"),
+            perCentroid: try required("per_centroid"), layers: try required("layers"), hidden: try int("hidden"),
+            heads: try int("heads"), headDim: try int("head_dim"), fullHeadDim: try int("full_head_dim"),
+            ffn: try int("ffn"), slidingWindow: try int("sliding_window"), slidingTheta: try float("sliding_theta"),
+            fullTheta: try float("full_theta"), fullPartialRotaryFactor: try float("full_partial_rotary_factor"),
+            tensors: header.tensors.mapValues {
+                Entry(offset: $0.fileOffset, bytes: $0.byteCount, shape: $0.shape, dtype: dtypes[$0.dtype] ?? $0.dtype)
+            })
+    }
+
+    /// Validates `index` against the file at `url` and maps it.
+    private init(index: Index, mapping url: URL, role: Role?) throws {
+        let name = url.lastPathComponent
+        self.index = index
+        let fd = open(url.path, O_RDONLY)
+        guard fd >= 0 else { throw DraftPackError.message("cannot open \(url.path)") }
         defer { close(fd) }
         var st = stat()
-        guard fstat(fd, &st) == 0 else { throw DraftPackError.message("cannot stat \(blob.path)") }
+        guard fstat(fd, &st) == 0 else { throw DraftPackError.message("cannot stat \(url.path)") }
         length = Int(st.st_size)
         try Self.validate(index: index, length: length, name: name)
         if let role { try Self.require(role, index: index, name: name) }
         guard length > 0,
             let p = mmap(nil, length, PROT_READ, MAP_PRIVATE, fd, 0), p != MAP_FAILED
         else {
-            throw DraftPackError.message("cannot mmap \(blob.path)")
+            throw DraftPackError.message("cannot mmap \(url.path)")
         }
         base = p
         // Start reading the table in now, while the target loads and prefills. Each drafted token
@@ -210,10 +287,11 @@ final class DraftPack: @unchecked Sendable {
     /// Checks the tensors `role` reads are present with the right dtype and shape.
     static func require(_ role: Role, index: Index, name: String) throws {
         let rows = try candidateRows(index: index, name: name)
+        let exporter = role == .head ? "export_draft_pack.py" : "export_drafter.py"
         func tensor(_ tensorName: String, _ dtype: String, shape: [Int?]) throws {
             guard let entry = index.tensors[tensorName] else {
                 throw DraftPackError.message(
-                    "\(name) has no tensor '\(tensorName)'; re-export it with models/gemma4/export_drafter.py")
+                    "\(name) has no tensor '\(tensorName)'; re-export it with models/gemma4/\(exporter)")
             }
             guard entry.dtype == dtype else {
                 throw DraftPackError.message(
@@ -230,6 +308,60 @@ final class DraftPack: @unchecked Sendable {
         // The scan: one row per candidate, as wide as the head's state.
         try tensor("embed_perm_f16", "float16", shape: [rows, nil])
         try tensor("token_ordering_i32", "int32", shape: [rows])
+        guard role == .head else { return }
+
+        let repack = "re-export it with models/gemma4/export_draft_pack.py"
+        func positive<T: Comparable & Numeric>(_ value: T?, _ key: String) throws -> T {
+            guard let value, value > 0 else {
+                throw DraftPackError.message("\(name) does not declare a positive '\(key)'; \(repack)")
+            }
+            return value
+        }
+        let hidden = try positive(index.hidden, "hidden")
+        let heads = try positive(index.heads, "heads")
+        let headDim = try positive(index.headDim, "head_dim")
+        let fullHeadDim = try positive(index.fullHeadDim, "full_head_dim")
+        let ffn = try positive(index.ffn, "ffn")
+        _ = try positive(index.slidingWindow, "sliding_window")
+        _ = try positive(index.slidingTheta, "sliding_theta")
+        _ = try positive(index.fullTheta, "full_theta")
+        _ = try positive(index.fullPartialRotaryFactor, "full_partial_rotary_factor")
+        guard index.layers > 0 else { throw DraftPackError.message("\(name) declares no layers; \(repack)") }
+        guard headDim % 2 == 0, fullHeadDim % 2 == 0 else {
+            throw DraftPackError.message("\(name) declares an odd head width, which RoPE cannot rotate; \(repack)")
+        }
+        try tensor("embed_perm_f16", "float16", shape: [rows, hidden])
+        try tensor("centroids_f16", "float16", shape: [index.centroids, hidden])
+        try tensor("pre_projection.weight", "float16", shape: [hidden, nil])
+        try tensor("post_projection.weight", "float16", shape: [nil, hidden])
+        try tensor("model.norm.weight", "float16", shape: [hidden])
+        // A projection is fp16, or int8 with an fp16 scale per output row.
+        func projection(_ tensorName: String, rows: Int, columns: Int) throws {
+            if index.tensors[tensorName]?.dtype == "int8" {
+                try tensor(tensorName, "int8", shape: [rows, columns])
+                try tensor(tensorName + ".scale", "float16", shape: [rows])
+            } else {
+                try tensor(tensorName, "float16", shape: [rows, columns])
+            }
+        }
+        // The last layer attends to the full cache, the others to the sliding one.
+        for layer in 0..<index.layers {
+            let dim = layer == index.layers - 1 ? fullHeadDim : headDim
+            let p = "model.layers.\(layer)."
+            try projection(p + "self_attn.q_proj.weight", rows: heads * dim, columns: hidden)
+            try projection(p + "self_attn.o_proj.weight", rows: hidden, columns: heads * dim)
+            try projection(p + "mlp.gate_proj.weight", rows: ffn, columns: hidden)
+            try projection(p + "mlp.up_proj.weight", rows: ffn, columns: hidden)
+            try projection(p + "mlp.down_proj.weight", rows: hidden, columns: ffn)
+            try tensor(p + "self_attn.q_norm.weight", "float16", shape: [dim])
+            for norm in [
+                "input_layernorm", "post_attention_layernorm", "pre_feedforward_layernorm",
+                "post_feedforward_layernorm",
+            ] {
+                try tensor(p + norm + ".weight", "float16", shape: [hidden])
+            }
+            try tensor(p + "layer_scalar", "float16", shape: [1])
+        }
     }
 }
 
@@ -244,6 +376,85 @@ package enum DraftScan {
             throw DraftPackError.message("the draft head's top-k must be a positive integer (got \(requested))")
         }
         return min(requested, centroids)
+    }
+
+    /// The masked embedder's candidate scan over a pack's permuted output table: score only the
+    /// tokens of the `topK` best centroids and take the best. Holds its scratch rows, so one
+    /// drafter owns one.
+    struct Scanner {
+        let scan: DraftPack
+        let topK: Int
+        /// One centroid's candidate rows as fp32, and their scores.
+        private var candidateRows: [Float] = []
+        private var candidateScores: [Float] = []
+
+        init(pack: DraftPack, topK: Int) {
+            self.scan = pack
+            self.topK = topK
+        }
+
+        /// The best-scoring token for the head's state `x`, given its centroid logits `cl`.
+        mutating func bestToken(x: [Float], centroidLogits cl: [Float]) -> Int32 {
+            let perCentroid = scan.index.perCentroid
+            let hidden = scan.shape("embed_perm_f16")[1]
+            var topV = [Float](repeating: -.greatestFiniteMagnitude, count: topK)
+            var topI = [Int](repeating: 0, count: topK)
+            for c in 0..<scan.index.centroids where cl[c] > topV[topK - 1] {
+                var j = topK - 1
+                while j > 0 && cl[c] > topV[j - 1] {
+                    topV[j] = topV[j - 1]
+                    topI[j] = topI[j - 1]
+                    j -= 1
+                }
+                topV[j] = cl[c]
+                topI[j] = c
+            }
+            // A centroid's candidates are contiguous rows, so each is one fp16 -> fp32 conversion and one
+            // matrix-vector product. Scoring row by row through `DraftScan.dot` spent most of the scan
+            // in the runtime availability check `SIMD8<Float>(SIMD8<Float16>)` makes on every call.
+            let table = scan.f16("embed_perm_f16")
+            let block = perCentroid * hidden
+            if candidateRows.count != block { candidateRows = [Float](repeating: 0, count: block) }
+            if candidateScores.count != perCentroid { candidateScores = [Float](repeating: 0, count: perCentroid) }
+            var best = -Float.greatestFiniteMagnitude
+            var bestSlot = 0
+            x.withUnsafeBufferPointer { xp in
+                candidateRows.withUnsafeMutableBufferPointer { rows in
+                    candidateScores.withUnsafeMutableBufferPointer { scores in
+                        for c in topI {
+                            var src = vImage_Buffer(
+                                data: UnsafeMutableRawPointer(mutating: table + c * block), height: 1,
+                                width: vImagePixelCount(block), rowBytes: block * 2)
+                            var dst = vImage_Buffer(
+                                data: rows.baseAddress, height: 1, width: vImagePixelCount(block), rowBytes: block * 4)
+                            guard vImageConvert_Planar16FtoPlanarF(&src, &dst, 0) == kvImageNoError else {
+                                // Unconverted rows would score stale data, so this centroid is scored row by row.
+                                for j in 0..<perCentroid {
+                                    let slot = c * perCentroid + j
+                                    let score = DraftScan.dot(x, table + slot * hidden, n: hidden)
+                                    if score > best {
+                                        best = score
+                                        bestSlot = slot
+                                    }
+                                }
+                                continue
+                            }
+                            vDSP_mmul(
+                                rows.baseAddress!, 1, xp.baseAddress!, 1, scores.baseAddress!, 1,
+                                vDSP_Length(perCentroid), 1, vDSP_Length(hidden))
+                            var score: Float = 0
+                            var j: vDSP_Length = 0
+                            vDSP_maxvi(scores.baseAddress!, 1, &score, &j, vDSP_Length(perCentroid))
+                            if score > best {
+                                best = score
+                                bestSlot = c * perCentroid + Int(j)
+                            }
+                        }
+                    }
+                }
+            }
+            return scan.i32("token_ordering_i32")[bestSlot]
+        }
     }
 
     /// dot(x, weights) with weights fp16 contiguous: the masked embedder's per-candidate score. Reads

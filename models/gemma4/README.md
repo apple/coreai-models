@@ -160,6 +160,12 @@ Run the model with its draft head through `llm-runner --speculative`:
 llm-runner --model <bundle> --sampling-strategy greedy --speculative --prompt "..."
 ```
 
+`--draft-head-pack <draft_head.safetensors>` runs the same head on the CPU instead, from the pack
+`export_draft_pack.py` writes, and leaves the target's accelerator to the target. The bundle then
+need not declare a `drafter`; the target still needs `--emit-hidden-states`. The CPU head drafts
+what the program drafts, up to rounding. Its full-attention layer attends to the most recent 1024
+positions, which keeps a draft step's cost flat at long context.
+
 The head and the target live in the same bundle, so `--speculative` takes no separate path. The
 output is token for token what greedy decoding of the target alone produces; the head only changes
 how many tokens one verify pass of the target commits. The runner needs greedy decoding, a bundle

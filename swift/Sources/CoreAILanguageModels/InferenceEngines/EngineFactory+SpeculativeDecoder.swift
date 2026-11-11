@@ -29,15 +29,20 @@ extension EngineFactory {
         /// Centroids whose candidates the head's scan scores. nil for ``DraftScan/defaultTopK``.
         package var drafterTopK: Int?
 
+        /// A draft-head pack (`draft_head.safetensors` from `models/gemma4/export_draft_pack.py`) to run the
+        /// head on the CPU from, with ``CPUDrafter``. nil runs the bundle's draft head program.
+        package var cpuPack: URL?
+
         package init(
             draftTokens: Int? = nil, alignDraftsToVerifyTile: Bool = true, adaptiveDraftCount: Bool = false,
-            promptLookupMinNgram: Int? = nil, drafterTopK: Int? = nil
+            promptLookupMinNgram: Int? = nil, drafterTopK: Int? = nil, cpuPack: URL? = nil
         ) {
             self.draftTokens = draftTokens
             self.alignDraftsToVerifyTile = alignDraftsToVerifyTile
             self.adaptiveDraftCount = adaptiveDraftCount
             self.promptLookupMinNgram = promptLookupMinNgram
             self.drafterTopK = drafterTopK
+            self.cpuPack = cpuPack
         }
 
         /// The draft count for a target whose verify tile is `verifyTileWidth` wide.
@@ -59,36 +64,56 @@ extension EngineFactory {
             throw InferenceRuntimeError.invalidArgument(
                 "\(bundle.name) has no draft head; add one with models/gemma4/export_drafter.py --bundle")
         }
+        try requireHiddenStates(bundle: bundle, targetEmitsHiddenStates: targetEmitsHiddenStates)
+        return component
+    }
+
+    /// Throws unless the target's decode graphs emit the hidden states a draft head seeds from.
+    static func requireHiddenStates(bundle: LanguageModelBundle, targetEmitsHiddenStates: Bool) throws {
         guard targetEmitsHiddenStates else {
             throw InferenceRuntimeError.invalidArgument(
                 "\(bundle.name)'s decode graphs do not emit hidden_states, which the draft head seeds from; "
                     + "re-export the model with models/gemma4/export.py --emit-hidden-states")
         }
-        return component
     }
 
     /// A speculative decoder that verifies on `target` and drafts with `bundle`'s draft head
-    /// (``LanguageModelBundle/drafter``).
+    /// (``LanguageModelBundle/drafter``), or with the head in ``DraftHeadOptions/cpuPack`` on the CPU.
     ///
-    /// - Throws: When the bundle ships no draft head, when `target` does not emit the hidden states
-    ///   the head seeds from, or when the head does not match the target.
+    /// - Throws: When the bundle ships no draft head and no pack is given, when `target` does not
+    ///   emit the hidden states the head seeds from, or when the head does not match the target.
     package static func createSpeculativeDecoder(
         target: StaticShapeEngine, bundle: LanguageModelBundle, options: DraftHeadOptions = DraftHeadOptions()
     ) async throws -> SpeculativeDecoder {
-        let component = try requireDraftHead(bundle: bundle, targetEmitsHiddenStates: target.emitsHiddenStates)
         if let problem = SpeculativeDecodingOptions.draftCountProblem(options.draftTokens) {
             throw InferenceRuntimeError.invalidArgument(problem)
         }
-        let drafter = try await StaticShapeDrafter.load(
-            component: component, backboneHiddenSize: target.backboneHiddenSize,
-            maxContextLength: bundle.maxContextLength, vocabSize: bundle.vocabSize, topK: options.drafterTopK)
-        drafter.sharedKVProvider = { [weak target] kind, body in
-            guard let target else { throw InferenceRuntimeError.invalidState("the target engine was released") }
-            try target.withSharedKVCache(kind, body)
-        }
-        drafter.embeddingProvider = { [weak target] token in
+        let sharedKV: (StaticShapeEngine.SharedKVCacheKind, (StaticShapeEngine.SharedKVCache) -> Void) throws -> Void =
+            { [weak target] kind, body in
+                guard let target else { throw InferenceRuntimeError.invalidState("the target engine was released") }
+                try target.withSharedKVCache(kind, body)
+            }
+        let embedding: (Int32) async throws -> [Float] = { [weak target] token in
             guard let target else { throw InferenceRuntimeError.invalidState("the target engine was released") }
             return try await target.drafterEmbedding(token)
+        }
+        let drafter: any DrafterEngine
+        if let pack = options.cpuPack {
+            try requireHiddenStates(bundle: bundle, targetEmitsHiddenStates: target.emitsHiddenStates)
+            let cpu = try CPUDrafter(
+                pack: pack, backboneHiddenSize: target.backboneHiddenSize,
+                maxContextLength: bundle.maxContextLength, vocabSize: bundle.vocabSize, topK: options.drafterTopK)
+            cpu.sharedKVProvider = sharedKV
+            cpu.embeddingProvider = embedding
+            drafter = cpu
+        } else {
+            let component = try requireDraftHead(bundle: bundle, targetEmitsHiddenStates: target.emitsHiddenStates)
+            let head = try await StaticShapeDrafter.load(
+                component: component, backboneHiddenSize: target.backboneHiddenSize,
+                maxContextLength: bundle.maxContextLength, vocabSize: bundle.vocabSize, topK: options.drafterTopK)
+            head.sharedKVProvider = sharedKV
+            head.embeddingProvider = embedding
+            drafter = head
         }
         let decoder = SpeculativeDecoder(
             drafter: drafter, target: target,
