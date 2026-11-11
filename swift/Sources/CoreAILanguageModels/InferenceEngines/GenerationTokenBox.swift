@@ -7,8 +7,8 @@ import Synchronization
 
 /// Thread-safe holder for an engine's in-flight `GenerationToken`.
 ///
-/// Each `CoreAISequentialEngine` session tracks a single active generation: a new
-/// `generate()` cancels the previous one, and the iterator releases the session when it
+/// Each `CoreAISequentialEngine` session, and the `StaticShapeEngine`, tracks a single active
+/// generation: a new `generate()` cancels the previous one, and the iterator releases it when it
 /// finishes. This holds that `Mutex<GenerationToken?>` bookkeeping.
 final class GenerationTokenBox: Sendable {
     private let _token = Mutex<GenerationToken?>(nil)
@@ -32,7 +32,14 @@ final class GenerationTokenBox: Sendable {
 
     /// Clear the active token only if it is `token`. Called by the iterator when
     /// generation finishes or is cancelled, so a newer generation is left untouched.
-    func clearIfActive(_ token: GenerationToken) {
-        _token.withLock { if $0 === token { $0 = nil } }
+    ///
+    /// - Returns: Whether `token` was the active one.
+    @discardableResult
+    func clearIfActive(_ token: GenerationToken) -> Bool {
+        _token.withLock { current in
+            guard current === token else { return false }
+            current = nil
+            return true
+        }
     }
 }

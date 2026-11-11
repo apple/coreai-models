@@ -21,20 +21,23 @@ struct VLMResetPlanTests {
 
     private func multimodal(
         commonPrefix: Int, tokens: [Int32], historyCount: Int, processedTokenCount: Int,
-        hybrid: Bool = false, ring: Int? = nil
+        hybrid: Bool = false, ring: Int? = nil, embeddedTokenCount: Int? = nil
     ) throws -> (resetTo: Int?, prefixHitCount: Int) {
         try CoreAISequentialEngine.generationResetPlan(
-            tokens: tokens, commonPrefix: commonPrefix, isMultimodal: true, imageTokenId: image,
+            tokens: tokens, commonPrefix: commonPrefix, isMultimodal: true, embeddedTokenCount: embeddedTokenCount,
+            imageTokenId: image,
             historyCount: historyCount, processedTokenCount: processedTokenCount, hasNonTruncatableStates: hybrid,
             ringCapacity: ring)
     }
 
     private func textOnly(
-        commonPrefix: Int, tokens: [Int32], historyCount: Int, processedTokenCount: Int, hybrid: Bool = false
+        commonPrefix: Int, tokens: [Int32], historyCount: Int, processedTokenCount: Int, hybrid: Bool = false,
+        history: [Int32] = []
     ) throws -> (resetTo: Int?, prefixHitCount: Int) {
         try CoreAISequentialEngine.generationResetPlan(
             tokens: tokens, commonPrefix: commonPrefix, isMultimodal: false, imageTokenId: image,
-            historyCount: historyCount, processedTokenCount: processedTokenCount, hasNonTruncatableStates: hybrid)
+            historyCount: historyCount, historyTokens: history, processedTokenCount: processedTokenCount,
+            hasNonTruncatableStates: hybrid)
     }
 
     @Test("the token match is cut at the first image placeholder it covers")
@@ -132,6 +135,38 @@ struct VLMResetPlanTests {
                 hasNonTruncatableStates: false)
             #expect(vlm.resetTo == text.resetTo)
             #expect(vlm.prefixHitCount == text.prefixHitCount)
+        }
+    }
+
+    @Test("a text-only request matching partway into a cached image throws")
+    func textMatchInsideCachedImageThrows() {
+        // Cached: 8 placeholders at 5..<13. Request: 4 placeholders at 5..<9, then other text.
+        let history = tokens(20, imageAt: 5..<13)
+        #expect(throws: InferenceRuntimeError.self) {
+            try textOnly(
+                commonPrefix: 9, tokens: tokens(30, imageAt: 5..<9), historyCount: 20, processedTokenCount: 20,
+                history: history)
+        }
+    }
+
+    @Test("a text-only request diverging right after a whole cached image rewinds there")
+    func textDivergenceAtImageEndRewinds() throws {
+        let p = try textOnly(
+            commonPrefix: 9, tokens: tokens(30, imageAt: 5..<9), historyCount: 20, processedTokenCount: 20,
+            history: tokens(20, imageAt: 5..<9))
+        #expect(p.resetTo == 9)
+        #expect(p.prefixHitCount == 9)
+    }
+
+    @Test("a multimodal request whose new placeholders don't match its embeddings throws")
+    func multimodalPlaceholderCountMismatchThrows() throws {
+        let input = tokens(30, imageAt: 12..<16)
+        let p = try multimodal(
+            commonPrefix: 10, tokens: input, historyCount: 10, processedTokenCount: 10, embeddedTokenCount: 4)
+        #expect(p.resetTo == nil)
+        #expect(throws: InferenceRuntimeError.self) {
+            try multimodal(
+                commonPrefix: 10, tokens: input, historyCount: 10, processedTokenCount: 10, embeddedTokenCount: 8)
         }
     }
 
