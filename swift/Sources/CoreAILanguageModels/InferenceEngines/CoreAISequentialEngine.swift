@@ -735,9 +735,9 @@ public final class CoreAISequentialEngine: MultimodalInferenceEngine, Idempotent
         return out
     }
 
-    /// Throws for a decoder whose KV cache can't be written a row at a time: a vision-language
-    /// decoder, a cache that isn't NDArray rows, or one with additional states (conv, recurrent or
-    /// sliding window), which are not per row.
+    /// Throws if this decoder's KV cache can't be written one row at a time: for vision-language
+    /// decoders, caches that aren't NDArray-backed, and models with additional state (conv, recurrent
+    /// or sliding window), which isn't stored per row.
     func requireRowWritableCache(_ session: GenerationSessionState) throws {
         try requireBatchableDecoder()
         guard session.kvCache is GrowingNDArrayState else {
@@ -750,10 +750,11 @@ public final class CoreAISequentialEngine: MultimodalInferenceEngine, Idempotent
         }
     }
 
-    /// Writes `tokens` in the asset's prefill chunks: on the prefill graph when the asset has one, so
-    /// the decode graph keeps its one shape, and on the decode graph otherwise. A one-token chunk runs
-    /// on the decode graph either way: past position 0, a one-token query on the prefill graph can
-    /// abort in MPSGraph ("Failed to resolve dynamic dimensions for memref.alloc"). Reads no logits.
+    /// Prefills `tokens`, split into the engine's prefill chunks. Chunks run on the prefill graph when
+    /// the asset has one, so the decode graph keeps a single shape, and on the decode graph otherwise.
+    /// One-token chunks always run on the decode graph: past position 0, a one-token query on the
+    /// prefill graph can abort in MPSGraph ("Failed to resolve dynamic dimensions for memref.alloc").
+    /// No logits are read.
     func prefillPiece(_ tokens: ArraySlice<Int32>, scratch: GenerationSessionState) async throws {
         try requireRowWritableCache(scratch)
         var remaining = tokens

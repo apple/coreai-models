@@ -115,9 +115,9 @@ struct LLMServer: AsyncParsableCommand {
     @Option(
         name: .customLong("batch-prefill-chunk"),
         help: ArgumentHelp(
-            "With --concurrent-requests above 1, prompt tokens of a joining request computed between decode steps. "
-                + "Smaller keeps the running requests' pauses shorter; larger gets the joining request to its first "
-                + "token sooner. While no request is decoding, prompts go in the model's prefill chunks."))
+            "With --concurrent-requests above 1, the most prompt tokens of a new request to prefill between "
+                + "decode steps. Smaller values keep pauses in running streams shorter; larger values give the new "
+                + "request its first token sooner. When nothing is decoding, the model's prefill chunk size is used."))
     var batchPrefillChunk: Int = BatchScheduler.defaultPrefillChunk
 
     @Option(

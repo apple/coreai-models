@@ -3,82 +3,83 @@
 // Use of this source code is governed by a BSD-3-clause license that can
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
-// MARK: - The KV a batch scheduler decodes in
+// MARK: - KV storage for a batch scheduler
 
-/// The KV under a ``BatchScheduler``: rows a request's prompt is written into a piece at a time, and
-/// one decode step over the live rows.
+/// The KV cache behind a ``BatchScheduler``: a set of rows, each prefilled with one request's prompt in
+/// chunks, and a decode step that runs over the active rows.
 ///
-/// The scheduler's pump calls every member but ``estimatedBytes`` and the chunk sizes, one at a time.
+/// Apart from ``estimatedBytes`` and the chunk sizes, members are only called from the scheduler's
+/// pump, one call at a time.
 protocol SchedulerKV: AnyObject, Sendable {
-    /// Rows, and so the most requests decoded at once.
+    /// Number of rows, which is the most requests that can decode at once.
     var rowCount: Int { get }
 
-    /// Bytes the KV and the logits scratch occupy, estimated from their shapes.
+    /// Estimated bytes used by the KV cache and the logits scratch, based on their shapes.
     var estimatedBytes: (states: Int, logitsScratch: Int) { get }
 
-    /// Largest piece of a prompt one ``prefill(row:tokens:)`` call writes while other rows are
-    /// decoding. A prompt is written a piece at a time, taking turns with decode steps, so a long
-    /// prompt does not stall every other row while it computes.
+    /// Maximum number of tokens one ``prefill(row:tokens:)`` call writes while other rows are decoding.
+    /// Prompts are prefilled in chunks that alternate with decode steps, so a long prompt doesn't stall
+    /// the other rows.
     var prefillChunk: Int { get }
 
-    /// Largest piece while no row is decoding, at least ``prefillChunk``: there is no row to keep
-    /// moving, only the next request to admit.
+    /// Maximum chunk size when no row is decoding, at least ``prefillChunk``. With no stream to keep
+    /// moving, larger chunks get the new request started sooner.
     var idlePrefillChunk: Int { get }
 
-    /// Takes `row` for a request with `prompt`, computing nothing. Everything but the prompt's last
-    /// token is then written with ``prefill(row:tokens:)``; the last is the row's first decode step,
-    /// whose logits are the first sample.
+    /// Reserves `row` for a request with `prompt`, without running anything. Everything but the last
+    /// prompt token is then written with ``prefill(row:tokens:)``. The last token is processed by the
+    /// row's first decode step, whose logits give the first sample.
     func reserve(row: Int, prompt: [Int32]) throws
 
-    /// Writes `tokens`, the next piece of `row`'s prompt, in one call that samples nothing.
+    /// Writes `tokens`, the next chunk of `row`'s prompt. Nothing is sampled.
     func prefill(row: Int, tokens: ArraySlice<Int32>) async throws
 
-    /// One decode step: each of `rows` writes its token at its cursor. One step result per entry,
-    /// in order.
+    /// Runs one decode step, in which each entry in `rows` writes its token at its position. Returns one
+    /// result per entry, in the same order.
     func decode(_ rows: [SchedulerKVRow]) async throws -> [SchedulerKVStep]
 
-    /// Gives back whatever `row` held, once its request has ended.
+    /// Releases whatever `row` holds, once its request has finished.
     func retire(row: Int)
 }
 
-/// One live row in a decode step: the token it writes, and where.
+/// An active row in a decode step: the token it writes, and the position it writes it at.
 struct SchedulerKVRow {
     let row: Int
     let token: Int32
     let cursor: Int
 }
 
-/// What a decode step produced for one row.
+/// The result of a decode step for one row.
 enum SchedulerKVStep {
-    /// The logits after the row's token.
+    /// Logits after processing the row's token.
     case logits([LogitsScalarType])
-    /// The row holds no more positions, so its request ends as if at `maxTokens`.
+    /// The row has no positions left, so its request finishes as if it had reached `maxTokens`.
     case rowFull
 }
 
-// MARK: - A contiguous batch session
+// MARK: - Contiguous batch session
 
-/// A contiguous batch session as a ``BatchScheduler``'s KV, driven through ``BatchedDecodeStep``.
+/// A ``SchedulerKV`` backed by a contiguous batch session, driven through ``BatchedDecodeStep``.
 ///
-/// A prompt is written a piece at a time into a batch-1 scratch session of its own, made on its first
-/// piece, and copied into its row once complete, before the row's first decode step. It cannot go
-/// into the row as it is written, since every decode step writes every row.
+/// Each prompt is prefilled in chunks into its own batch-1 scratch session, created on the first chunk,
+/// and copied into its row once complete, before the row's first decode step. It can't be written into
+/// the row directly, because every decode step writes every row.
 ///
-/// A decode step is one ``BatchedDecodeStep/decodeBatch(tokensPerRow:startPositions:session:)`` over
-/// every row, each at its own cursor, a free or still-prefilling row with token 0 at cursor 0, its
-/// logits dropped. A row whose token would land past `maxPositions` reports
-/// ``SchedulerKVStep/rowFull``.
+/// A decode step is a single ``BatchedDecodeStep/decodeBatch(tokensPerRow:startPositions:session:)``
+/// over all rows, each at its own position. Rows that are free or still prefilling get token 0 at
+/// position 0, and their logits are discarded. A row whose next token would go past `maxPositions`
+/// reports ``SchedulerKVStep/rowFull``.
 final class ContiguousSchedulerKV: SchedulerKV, @unchecked Sendable {
     let step: any BatchedDecodeStep
     let session: GenerationSessionState
     let rowCount: Int
     let prefillChunk: Int
     let idlePrefillChunk: Int
-    /// Positions one row holds, prompt and generation together.
+    /// Number of positions in a row, covering both the prompt and the generated tokens.
     let maxPositions: Int
 
-    /// A row whose prompt is being written: how many tokens go into the row, how many have, and the
-    /// scratch session they are written into, made on the first piece.
+    /// A row that's still prefilling: how many tokens go into the row, how many have been written so
+    /// far, and the scratch session they're written into, created on the first chunk.
     private struct Prefilling {
         let target: Int
         var written = 0
@@ -103,20 +104,21 @@ final class ContiguousSchedulerKV: SchedulerKV, @unchecked Sendable {
         (session.estimatedStateBytes, session.estimatedLogitsScratchBytes)
     }
 
-    /// Everything but the prompt's last token goes into the row; a one-token prompt writes nothing
+    /// Everything but the last prompt token goes into the row. A one-token prompt needs no prefill
     /// before its first decode step.
     func reserve(row: Int, prompt: [Int32]) throws {
         guard !prompt.isEmpty else {
             throw InferenceRuntimeError.invalidArgument("a request needs at least one prompt token")
         }
-        // The last prompt token is decoded at cursor `prompt.count - 1`, which has to be a position.
+        // The last prompt token is decoded at position `prompt.count - 1`, which must fit in the row.
         guard prompt.count <= maxPositions else {
             throw InferenceRuntimeError.contextLengthExceeded(prompt.count, maxPositions)
         }
         prefilling[row] = prompt.count > 1 ? Prefilling(target: prompt.count - 1) : nil
     }
 
-    /// Writes `tokens` into `row`'s scratch session, and copies it into the row once the prompt is in.
+    /// Writes `tokens` into `row`'s scratch session, then copies it into the row once the whole prompt
+    /// is in.
     func prefill(row: Int, tokens: ArraySlice<Int32>) async throws {
         guard var entry = prefilling[row] else {
             throw InferenceRuntimeError.invalidState("row \(row) prefilled with nothing reserved")
