@@ -3,81 +3,21 @@
 // Use of this source code is governed by a BSD-3-clause license that can
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
-/// Token-count clamp, next-token selection, and prefill-strategy dispatch shared by the
-/// sequential engines' iterators (see `SequentialDecodeLoop`).
-enum SequentialIterator {
-    /// The generation-length cap for an iterator.
-    ///
-    /// A forced continuation replays exactly its own tokens; otherwise the requested budget
-    /// (`nil` meaning "unbounded") is clamped to the context left after the prompt.
-    static func clampMaxTokens(
-        requested: Int?,
-        forcedCount: Int?,
-        inputCount: Int,
-        maxContextLength: Int
-    ) -> Int {
-        if let forcedCount {
-            return forcedCount
-        }
-        return min(requested ?? Int.max, max(0, maxContextLength - inputCount))
-    }
-
-    /// Select the next token: the forced-continuation token when replaying, otherwise the
-    /// sampler's choice.
-    ///
-    /// `logits` is taken by value; the sampler mutates a copy-on-write copy so the caller's
-    /// buffer (which it may also return to the consumer) is left untouched.
-    static func nextToken(
-        fromLogits logits: [LogitsScalarType],
-        forced: [Int32]?,
-        step: Int,
-        sampling: SamplingConfiguration,
-        tokenHistory: ArraySlice<Int32>
-    ) -> Int32 {
-        if let forced {
-            return forced[step]
-        }
-        return BatchedSampler.sample(
-            rows: [logits],
-            configurations: [sampling],
-            histories: [tokenHistory],
-            steps: [step]
-        )[0]
-    }
-
-    /// Run a prompt through the forward pass with the given prefill strategy, returning the
-    /// logits of its last position.
-    ///
-    /// `chunked` runs a chunked prefill and returns last-position logits. `batch` runs one
-    /// forward pass over a slice.
-    static func lastPositionLogits(
-        for tokens: ArraySlice<Int32>,
-        strategy: PrefillStrategy,
-        vocabSize: Int,
-        chunked: (ArraySlice<Int32>, Int) async throws -> [LogitsScalarType],
-        batch: (ArraySlice<Int32>) async throws -> [LogitsScalarType]
-    ) async throws -> [LogitsScalarType] {
-        switch strategy {
-        case .chunked(let chunkSize):
-            return try await chunked(tokens, chunkSize)
-        case .wholeBatch:
-            let allLogits = try await batch(tokens)
-            return lastTokenLogits(from: allLogits, vocabSize: vocabSize)
-        case .oneAtATime:
-            var lastLogits: [LogitsScalarType] = []
-            for j in tokens.indices {
-                lastLogits = try await batch(tokens[j...j])
-            }
-            return lastLogits
-        }
-    }
+/// How a decode loop turns logits into the next token. Fixed per engine at init, so each engine
+/// keeps its own sampling behavior.
+struct SamplingPolicy: Sendable {
+    /// Final-logit soft cap, applied on the CPU before sampling and to returned logits, for
+    /// exports that leave `c · tanh(logits / c)` out of the graph. `nil` for none.
+    let logitSoftcap: Double?
+    /// Whether the sampling configuration goes through `SamplingConfiguration.normalized()`.
+    let normalizesSampling: Bool
 }
 
-/// Decode-loop bookkeeping shared by the sequential engines' iterators.
+/// Decode-loop bookkeeping shared by the sequential and static-shape engines' iterators.
 ///
 /// Owns the growing token sequence, the step count, stop and cancel handling, and next-token
 /// selection. An iterator drives it from `next()` and supplies its engine's forward pass.
-struct SequentialDecodeLoop {
+struct DecodeLoop {
     /// Prompt tokens followed by every token generated so far.
     private(set) var inputTokens: [Int32]
     let generationStartOffset: Int
@@ -89,6 +29,7 @@ struct SequentialDecodeLoop {
     private(set) var finished: Bool = false
 
     private let samplingConfiguration: SamplingConfiguration
+    private let logitSoftcap: Double?
     private let generationToken: GenerationToken
     private let release: () -> Void
 
@@ -97,6 +38,7 @@ struct SequentialDecodeLoop {
     init(
         input: [Int32],
         samplingConfiguration: SamplingConfiguration,
+        samplingPolicy: SamplingPolicy,
         inferenceOptions: InferenceOptions,
         maxContextLength: Int,
         stopReasonStore: StopReasonStore,
@@ -105,7 +47,7 @@ struct SequentialDecodeLoop {
     ) {
         self.inputTokens = input
         self.generationStartOffset = input.count
-        self.maxTokens = SequentialIterator.clampMaxTokens(
+        self.maxTokens = Self.clampMaxTokens(
             requested: inferenceOptions.maxTokens,
             forcedCount: inferenceOptions.forcedContinuation?.count,
             inputCount: input.count,
@@ -113,7 +55,9 @@ struct SequentialDecodeLoop {
         )
         self.forcedContinuation = inferenceOptions.forcedContinuation
         self.returnsLogits = inferenceOptions.returnsLogits
-        self.samplingConfiguration = samplingConfiguration.normalized()
+        self.samplingConfiguration =
+            samplingPolicy.normalizesSampling ? samplingConfiguration.normalized() : samplingConfiguration
+        self.logitSoftcap = samplingPolicy.logitSoftcap
         self.stopReasonStore = stopReasonStore
         self.generationToken = generationToken
         self.release = release
@@ -140,7 +84,8 @@ struct SequentialDecodeLoop {
     }
 
     /// Run one decode step: `forward` processes the not-yet-seen tokens of `inputTokens` and
-    /// returns the last position's logits; the next token is then selected and appended.
+    /// returns the last position's raw logits; the next token is then selected and appended.
+    /// Returned logits carry the policy's soft cap.
     ///
     /// Returns `nil` when generation was cancelled during the forward pass. Errors from
     /// `forward` finish the loop with `.cancelled` or `.error` and are rethrown.
@@ -159,21 +104,23 @@ struct SequentialDecodeLoop {
                 return nil
             }
 
-            let nextToken = SequentialIterator.nextToken(
+            let nextToken = Self.nextToken(
                 fromLogits: logitBuffer,
                 forced: forcedContinuation,
                 step: step,
                 sampling: samplingConfiguration,
-                tokenHistory: inputTokens[generationStartOffset...]
+                tokenHistory: inputTokens[generationStartOffset...],
+                logitSoftcap: logitSoftcap
             )
 
             inputTokens.append(nextToken)
             step += 1
 
-            return InferenceOutput(
-                tokenId: nextToken,
-                logits: returnsLogits ? logitBuffer : nil
-            )
+            var returnedLogits = returnsLogits ? logitBuffer : nil
+            if let logitSoftcap, returnedLogits != nil {
+                LogitSoftcapProcessor.apply(to: &returnedLogits!, cap: Float(logitSoftcap))
+            }
+            return InferenceOutput(tokenId: nextToken, logits: returnedLogits)
         } catch is CancellationError {
             stopReasonStore.set(.cancelled)
             finish()
@@ -183,6 +130,43 @@ struct SequentialDecodeLoop {
             finish()
             throw error
         }
+    }
+
+    /// The generation-length cap for an iterator.
+    ///
+    /// A forced continuation replays exactly its own tokens; otherwise the requested budget
+    /// (`nil` meaning "unbounded") is clamped to the context left after the prompt.
+    static func clampMaxTokens(
+        requested: Int?,
+        forcedCount: Int?,
+        inputCount: Int,
+        maxContextLength: Int
+    ) -> Int {
+        if let forcedCount {
+            return forcedCount
+        }
+        return min(requested ?? Int.max, max(0, maxContextLength - inputCount))
+    }
+
+    /// Select the next token: the forced-continuation token when replaying, otherwise the
+    /// sampler's choice, with `logitSoftcap` applied first.
+    ///
+    /// `logits` is taken by value; the sampler mutates a copy-on-write copy so the caller's
+    /// buffer (which it may also return to the consumer) is left untouched.
+    static func nextToken(
+        fromLogits logits: [LogitsScalarType],
+        forced: [Int32]?,
+        step: Int,
+        sampling: SamplingConfiguration,
+        tokenHistory: ArraySlice<Int32>,
+        logitSoftcap: Double? = nil
+    ) -> Int32 {
+        if let forced {
+            return forced[step]
+        }
+        var logits = logits
+        return sampling.fallbackSampler(
+            from: &logits, tokenHistory: tokenHistory, step: step, logitSoftcap: logitSoftcap)
     }
 
     /// Mark generation finished and release the engine's active token. Idempotent.

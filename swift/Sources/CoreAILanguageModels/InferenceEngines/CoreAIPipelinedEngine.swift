@@ -578,6 +578,7 @@ private struct EngineImpl: ~Copyable {
     let options: EngineOptions
     let function: InferenceFunction
     let pipelineQueue: MTLCommandQueue
+    let gpuErrors: GPUErrorHolder
     let computeStream: ComputeStream
     let device: MTLDevice
 
@@ -631,6 +632,8 @@ private struct EngineImpl: ~Copyable {
     var cachedSampler: (any MPSGraphSampler)?
     var cachedSamplerTemperature: Double?
     var penaltyState: RepetitionPenaltyGPUState?
+    // No step using `penaltyState` is in flight; set by the end-of-generation sentinel and reset().
+    var penaltyStateIdle = true
 
     // State
     var processedTokenCount: Int = 0
@@ -846,11 +849,15 @@ private struct EngineImpl: ~Copyable {
                 "Cannot load function '\(config.function)'")
         }
 
-        guard let pipelineQueue = device.makeCommandQueue() else {
+        guard let baseQueue = device.makeCommandQueue() else {
             throw InferenceRuntimeError.invalidState(
                 "Failed to allocate MTLCommandQueue for CoreAIPipelinedEngine")
         }
-        pipelineQueue.label = "CoreAIPipelinedEngine.queue"
+        baseQueue.label = "CoreAIPipelinedEngine.queue"
+        // Every command buffer on the queue, including the ones Core AI and the samplers make,
+        // records a failure in `gpuErrors`.
+        let gpuErrors = GPUErrorHolder()
+        let pipelineQueue = ErrorRecordingCommandQueue(baseQueue, errors: gpuErrors)
         let computeStream = ComputeStream(commandQueue: pipelineQueue)
 
         // Assign
@@ -860,6 +867,7 @@ private struct EngineImpl: ~Copyable {
         self.prefillFunction = prefillFn
         self.prefillMaxQueryLength = prefillMaxQueryLen
         self.pipelineQueue = pipelineQueue
+        self.gpuErrors = gpuErrors
         self.computeStream = computeStream
         self.device = device
         self.inputIdsName = inputIdsName
@@ -909,25 +917,17 @@ private struct EngineImpl: ~Copyable {
                 throw InferenceRuntimeError.genericError(
                     "Temperature changed mid-generation (\(existingTemp) -> \(temperature)). Call reset() first.")
             }
-            return existingSampler
+            // The penalty stage is compiled into the graph; rebuild when this request needs it.
+            let cachedPenaltyEnabled = (existingSampler as? MPSGraphCompositeSampler)?.penaltyEnabled ?? false
+            if cachedPenaltyEnabled || !config.needsRepetitionPenalty {
+                return existingSampler
+            }
         }
 
-        // Create penalized sampler if repetition penalty is configured
-        if config.needsRepetitionPenalty {
-            if config.temperature == 0 {
-                throw InferenceRuntimeError.invalidArgument(
-                    "Repetition penalty with greedy sampling is not supported on pipelined engine. "
-                        + "Use temperature > 0, or use a sequential engine.")
-            }
-            if penaltyState == nil {
-                penaltyState = try RepetitionPenaltyGPUState(
-                    device: device,
-                    vocabSize: self.config.vocabSize,
-                    pipelineDepth: pipelineDepth,
-                    penalty: config.repetitionPenalty!,
-                    windowSize: config.repetitionPenaltyWindow
-                )
-            }
+        if config.needsRepetitionPenalty && config.temperature == 0 {
+            throw InferenceRuntimeError.invalidArgument(
+                "Repetition penalty with greedy sampling is not supported on pipelined engine. "
+                    + "Use temperature > 0, or use a sequential engine.")
         }
 
         let newSampler = try MPSGraphSamplerFactory.makeSampler(
@@ -1095,6 +1095,7 @@ private struct EngineImpl: ~Copyable {
         let queue = pipelineQueue
         let localInFlightGate = inFlightGate
         let localPenaltyState = penaltyState
+        let localGPUErrors = gpuErrors
         let completionCallback: (Int32, Error?) -> Void = { nextToken, error in
             // Update penalty state BEFORE releasing the gate.
             localPenaltyState?.recordToken(nextToken)
@@ -1110,7 +1111,8 @@ private struct EngineImpl: ~Copyable {
                 continuation.finish(throwing: error)
                 return
             }
-            continuation.yield(nextToken)
+            // A failed command buffer (this step's or an earlier one's) left the logits unwritten.
+            localGPUErrors.yield(nextToken, to: continuation)
         }
 
         do {
@@ -1218,7 +1220,9 @@ private struct EngineImpl: ~Copyable {
         maxTokens: Int?,
         yieldingTo continuation: AsyncThrowingStream<InferenceEngine.TokenId, Error>.Continuation
     ) async throws {
+        let sampler = sampler.normalized()
         let gpuSampler = try getOrCreateSampler(for: sampler)
+        gpuErrors.reset()
 
         let isCancelled = Atomic<Bool>(false)
         continuation.onTermination = { _ in
@@ -1247,6 +1251,18 @@ private struct EngineImpl: ~Copyable {
                 }
             }
         }
+
+        // Each generation starts with empty penalty history; the old state is reused only when idle.
+        penaltyState = try RepetitionPenaltyGPUState.forGeneration(
+            reusing: penaltyState,
+            existingIsIdle: penaltyStateIdle,
+            device: device,
+            vocabSize: config.vocabSize,
+            pipelineDepth: pipelineDepth,
+            penalty: sampler.needsRepetitionPenalty ? sampler.repetitionPenalty : nil,
+            windowSize: sampler.repetitionPenaltyWindow
+        )
+        penaltyStateIdle = false
 
         // Prefill the prompt, then sample from the tokens prefill left behind.
         // Skip it entirely if the prompt is empty (prefix-cached continuation).
@@ -1292,17 +1308,19 @@ private struct EngineImpl: ~Copyable {
         // continuation.yield has returned before the caller calls finish().
         // We use a bare command buffer instead of the sampler to avoid the shared
         // MPSGraphExecutableExecutionDescriptor issue in MPSGraphCompositeSampler.
-        await withCheckedContinuation { (sentinelCont: CheckedContinuation<Void, Never>) in
+        penaltyStateIdle = await withCheckedContinuation { (sentinelCont: CheckedContinuation<Bool, Never>) in
             do {
                 let queue = pipelineQueue
                 guard let cmdBuf = queue.makeCommandBuffer() else {
-                    sentinelCont.resume()
+                    sentinelCont.resume(returning: false)
                     return
                 }
-                cmdBuf.addCompletedHandler { _ in sentinelCont.resume() }
+                cmdBuf.addCompletedHandler { _ in sentinelCont.resume(returning: true) }
                 cmdBuf.commit()
             }
         }
+        // A failure on the last step has no later yield to catch it.
+        if let error = gpuErrors.error { throw error }
     }
 
     // MARK: - Constrained Run Completion
@@ -1841,6 +1859,9 @@ private struct EngineImpl: ~Copyable {
         step = 0
         cachedSampler = nil
         cachedSamplerTemperature = nil
+        // Steps still in flight hold their own reference.
+        penaltyState = nil
+        penaltyStateIdle = true
         // Zero SSM states so the next conversation starts from a clean slate.
         additionalStates?.reset()
         span.end()
