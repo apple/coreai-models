@@ -6,6 +6,7 @@
 import Accelerate
 import CoreAIShared
 import Foundation
+import simd
 
 // The Gemma 4 MTP/EAGLE draft head run entirely on the CPU, from the pack
 // `models/gemma4/export_draft_pack.py` writes. It computes what `StaticShapeDrafter` runs as a
@@ -200,7 +201,9 @@ struct CPUDraftHead {
     }
 
     /// `n` fp16 weights at `row` dotted with `x`. Four independent accumulators keep each fused
-    /// multiply-add from waiting on the one before it.
+    /// multiply-add from waiting on the one before it. The weights widen through `simd_float`: the
+    /// generic `SIMD8<Float>(_:)` initializer converts lane by lane and made a step about ten times
+    /// slower on a Mac.
     @inline(__always)
     static func dotF16(_ row: UnsafeRawPointer, _ x: UnsafePointer<Float>, n: Int) -> Float {
         var a0 = SIMD8<Float>()
@@ -211,16 +214,16 @@ struct CPUDraftHead {
         var i = 0
         while i + 32 <= n {
             a0 +=
-                SIMD8<Float>(row.loadUnaligned(fromByteOffset: i * 2, as: SIMD8<Float16>.self))
+                simd_float(row.loadUnaligned(fromByteOffset: i * 2, as: SIMD8<Float16>.self))
                 * xr.loadUnaligned(fromByteOffset: i * 4, as: SIMD8<Float>.self)
             a1 +=
-                SIMD8<Float>(row.loadUnaligned(fromByteOffset: i * 2 + 16, as: SIMD8<Float16>.self))
+                simd_float(row.loadUnaligned(fromByteOffset: i * 2 + 16, as: SIMD8<Float16>.self))
                 * xr.loadUnaligned(fromByteOffset: i * 4 + 32, as: SIMD8<Float>.self)
             a2 +=
-                SIMD8<Float>(row.loadUnaligned(fromByteOffset: i * 2 + 32, as: SIMD8<Float16>.self))
+                simd_float(row.loadUnaligned(fromByteOffset: i * 2 + 32, as: SIMD8<Float16>.self))
                 * xr.loadUnaligned(fromByteOffset: i * 4 + 64, as: SIMD8<Float>.self)
             a3 +=
-                SIMD8<Float>(row.loadUnaligned(fromByteOffset: i * 2 + 48, as: SIMD8<Float16>.self))
+                simd_float(row.loadUnaligned(fromByteOffset: i * 2 + 48, as: SIMD8<Float16>.self))
                 * xr.loadUnaligned(fromByteOffset: i * 4 + 96, as: SIMD8<Float>.self)
             i += 32
         }
@@ -244,16 +247,16 @@ struct CPUDraftHead {
         var i = 0
         while i + 32 <= n {
             a0 +=
-                SIMD8<Float>(row.loadUnaligned(fromByteOffset: i, as: SIMD8<Int8>.self))
+                simd_float(row.loadUnaligned(fromByteOffset: i, as: SIMD8<Int8>.self))
                 * xr.loadUnaligned(fromByteOffset: i * 4, as: SIMD8<Float>.self)
             a1 +=
-                SIMD8<Float>(row.loadUnaligned(fromByteOffset: i + 8, as: SIMD8<Int8>.self))
+                simd_float(row.loadUnaligned(fromByteOffset: i + 8, as: SIMD8<Int8>.self))
                 * xr.loadUnaligned(fromByteOffset: i * 4 + 32, as: SIMD8<Float>.self)
             a2 +=
-                SIMD8<Float>(row.loadUnaligned(fromByteOffset: i + 16, as: SIMD8<Int8>.self))
+                simd_float(row.loadUnaligned(fromByteOffset: i + 16, as: SIMD8<Int8>.self))
                 * xr.loadUnaligned(fromByteOffset: i * 4 + 64, as: SIMD8<Float>.self)
             a3 +=
-                SIMD8<Float>(row.loadUnaligned(fromByteOffset: i + 24, as: SIMD8<Int8>.self))
+                simd_float(row.loadUnaligned(fromByteOffset: i + 24, as: SIMD8<Int8>.self))
                 * xr.loadUnaligned(fromByteOffset: i * 4 + 96, as: SIMD8<Float>.self)
             i += 32
         }
