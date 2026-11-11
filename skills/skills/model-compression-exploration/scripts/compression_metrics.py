@@ -73,9 +73,12 @@ def check_divisibility(model, axis: int, block_size: int) -> dict[str, tuple[int
         if not isinstance(weight, torch.Tensor):
             continue
         if axis >= weight.ndim or axis < -weight.ndim:
-            # 1-D weights (LayerNorm, RMSNorm, BatchNorm, ...) have no
-            # in-features axis to block along; per-block and grouped-channel
-            # configs never target them, so they cannot be "incompatible".
+            # The requested axis does not exist on this weight (e.g. axis=1
+            # on a 1-D LayerNorm/RMSNorm/BatchNorm weight), so there is no
+            # dimension to block along and divisibility does not apply. Note
+            # axis=0 exists on 1-D weights and is checked normally: grouped
+            # palettization groups along axis 0 (see coreai_opt's
+            # kmeans_palettizer_config presets) and can target them.
             continue
         dim = weight.shape[axis]
         if dim % block_size != 0:

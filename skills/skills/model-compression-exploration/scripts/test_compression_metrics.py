@@ -35,8 +35,18 @@ class TestCheckDivisibility:
 
     def test_reports_offending_dims_along_axis_0(self):
         result = check_divisibility(_toy_model(), axis=0, block_size=16)
-        # Out-features: 48 % 16 == 0, 48 (norm, skipped), 10 % 16 != 0.
+        # Out-features: 48 % 16 == 0, 48 (norm: axis 0 exists on a 1-D
+        # weight, checked and divisible), 10 % 16 != 0.
         assert list(result.values()) == [(10, 16)]
+
+    def test_one_dimensional_weight_checked_along_axis_0(self):
+        # Grouped palettization groups along axis 0, which exists on a 1-D
+        # weight (coreai_opt's kmeans palettizer presets use axis=0), so an
+        # indivisible norm weight must be reported — only a nonexistent axis
+        # (e.g. axis=1 on 1-D) is skipped.
+        model = nn.Sequential(nn.LayerNorm(50))
+        result = check_divisibility(model, axis=0, block_size=16)
+        assert list(result.values()) == [(50, 16)]
 
     def test_all_divisible_returns_empty(self):
         model = nn.Sequential(nn.Linear(64, 64), nn.LayerNorm(64))
