@@ -280,7 +280,8 @@ func runChatCompletion(chatRequest: ChatCompletionRequest, state: ServerState, s
         // Separate reasoning from text using the streaming parser on the full output
         var thinkParser = ThinkTagParser(
             format: state.thinkingFormat,
-            promptOpensReasoning: promptOpensReasoning(promptTokens, state: state))
+            startsInReasoning: ThinkTagParser.promptOpensReasoning(
+                promptTokens, tokenizer: state.tokenizer, format: state.thinkingFormat))
         let events = thinkParser.consume(text) + thinkParser.flush()
         var textParts: [String] = []
         var reasoningParts: [String] = []
@@ -459,7 +460,8 @@ func prepareStreaming(chatRequest: ChatCompletionRequest, state: ServerState, se
         requestID: requestID, promptTokenCount: promptTokens.count, promptTokensInt32: promptTokensInt32,
         input: input, samplingConfig: samplingConfig, stopSequences: stopSequences,
         requestMaxTokens: requestMaxTokens, prefixReuseTokens: prefixReused,
-        promptOpensReasoning: promptOpensReasoning(promptTokens, state: state))
+        promptOpensReasoning: ThinkTagParser.promptOpensReasoning(
+            promptTokens, tokenizer: state.tokenizer, format: state.thinkingFormat))
 }
 
 /// Token stream and start time of a streaming decode. On the batched lane the request is already in
@@ -507,7 +509,7 @@ func runStreamingLoop(
     let tokenStream = started.tokens
 
     var thinkParser = ThinkTagParser(
-        format: state.thinkingFormat, promptOpensReasoning: prepared.promptOpensReasoning)
+        format: state.thinkingFormat, startsInReasoning: prepared.promptOpensReasoning)
     var toolParser = state.makeToolCallParser()
     var tokenCount = 0
     var hasToolCalls = false
@@ -755,13 +757,6 @@ func tokenizeMessages(
     let text = templateMessages.map { "\($0["role"] ?? "user"): \($0["content"] ?? "")" }
         .joined(separator: "\n")
     return tokenizer.encode(text: text)
-}
-
-/// Whether the chat template left the prompt inside a reasoning block, judged from its last few
-/// tokens. See ``ThinkTagParser/promptOpensReasoning(_:format:)``.
-private func promptOpensReasoning(_ promptTokens: [Int], state: ServerState) -> Bool {
-    ThinkTagParser.promptOpensReasoning(
-        state.tokenizer.decode(tokens: Array(promptTokens.suffix(8))), format: state.thinkingFormat)
 }
 
 private func buildStopSequences(from request: ChatCompletionRequest, state: ServerState) -> StopSequences {

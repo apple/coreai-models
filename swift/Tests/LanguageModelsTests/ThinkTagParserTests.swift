@@ -56,7 +56,7 @@ struct ThinkTagParserTests {
     @Test("Prompt ends in <think> — output starts as reasoning, the close splits it")
     func promptOpensReasoning() {
         let format = ThinkTagParser.Format.tagPair(open: "<think>", close: "</think>")
-        var parser = ThinkTagParser(format: format, promptOpensReasoning: true)
+        var parser = ThinkTagParser(format: format, startsInReasoning: true)
         let events = parser.consume("thoughts</think>\n\nanswer") + parser.flush()
         #expect(eventStrings(events, kind: .reasoning) == ["thoughts"])
         #expect(eventStrings(events, kind: .text) == ["\n\nanswer"])

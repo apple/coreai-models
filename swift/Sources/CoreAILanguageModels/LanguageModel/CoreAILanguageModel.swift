@@ -363,8 +363,8 @@ public struct CoreAILanguageModel: LanguageModel {
             // block, so the stream starts as reasoning.
             var thinkParser = ThinkTagParser(
                 format: model.thinkingFormat,
-                promptOpensReasoning: ThinkTagParser.promptOpensReasoning(
-                    tokenizer.decode(tokens: Array(promptTokens.suffix(8))), format: model.thinkingFormat))
+                startsInReasoning: ThinkTagParser.promptOpensReasoning(
+                    promptTokens, tokenizer: tokenizer, format: model.thinkingFormat))
             // Routes tool call markup to .toolCalls(...) channel events.
             // nil when the model's tokenizer has no tool call tokens.
             var toolCallParser: ToolCallParser? = model.toolCallDetection.map {
