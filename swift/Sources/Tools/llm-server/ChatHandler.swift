@@ -281,7 +281,10 @@ func runChatCompletion(chatRequest: ChatCompletionRequest, state: ServerState, s
 
     if chatRequest.raw != true {
         // Separate reasoning from text using the streaming parser on the full output
-        var thinkParser = ThinkTagParser(format: state.thinkingFormat)
+        var thinkParser = ThinkTagParser(
+            format: state.thinkingFormat,
+            startsInReasoning: ThinkTagParser.promptOpensReasoning(
+                promptTokens, tokenizer: state.tokenizer, format: state.thinkingFormat))
         let events = thinkParser.consume(text) + thinkParser.flush()
         var textParts: [String] = []
         var reasoningParts: [String] = []
@@ -398,6 +401,8 @@ struct PreparedStream {
     let stopSequences: StopSequences
     let requestMaxTokens: Int
     let prefixReuseTokens: Int
+    /// The chat template ended the prompt inside a reasoning block.
+    let promptOpensReasoning: Bool
 }
 
 /// Instrumented outcome of a streaming chat generation.
@@ -457,7 +462,9 @@ func prepareStreaming(chatRequest: ChatCompletionRequest, state: ServerState, se
     return PreparedStream(
         requestID: requestID, promptTokenCount: promptTokens.count, promptTokensInt32: promptTokensInt32,
         input: input, samplingConfig: samplingConfig, stopSequences: stopSequences,
-        requestMaxTokens: requestMaxTokens, prefixReuseTokens: prefixReused)
+        requestMaxTokens: requestMaxTokens, prefixReuseTokens: prefixReused,
+        promptOpensReasoning: ThinkTagParser.promptOpensReasoning(
+            promptTokens, tokenizer: state.tokenizer, format: state.thinkingFormat))
 }
 
 /// Token stream and start time of a streaming decode. On the batched lane the request is already in
@@ -504,7 +511,8 @@ func runStreamingLoop(
     let genStart = started.start
     let tokenStream = started.tokens
 
-    var thinkParser = ThinkTagParser(format: state.thinkingFormat)
+    var thinkParser = ThinkTagParser(
+        format: state.thinkingFormat, startsInReasoning: prepared.promptOpensReasoning)
     var toolParser = state.makeToolCallParser()
     var tokenCount = 0
     var hasToolCalls = false
