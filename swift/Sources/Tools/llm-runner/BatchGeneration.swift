@@ -20,8 +20,9 @@ extension LLMRunner {
     /// The non-blank lines of `path`, each one prompt. Throws when there are none.
     static func readPromptList(_ path: String) throws -> [String] {
         let contents = try String(contentsOfFile: path, encoding: .utf8)
-        let prompts = contents.split(separator: "\n")
-            .map { $0.trimmingCharacters(in: .whitespaces) }
+        // Any newline, so a file saved with CRLF line endings splits too.
+        let prompts = contents.split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
         guard !prompts.isEmpty else {
             throw ValidationError("--prompt-list \(path) has no prompts: every line is blank")
@@ -103,14 +104,12 @@ extension LLMRunner {
                     + " · \(Self.rate(result.tokensPerSecond)) tok/s")
         }
 
-        let perRequest = results.map(\.tokensPerSecond)
-        let sum = perRequest.reduce(0, +)
-        let mean = perRequest.isEmpty ? 0 : sum / Double(perRequest.count)
         print("\nAggregate")
         print("  wall           \(Self.seconds(metrics.wallSeconds))")
         print("  generated      \(metrics.generatedTokens) tokens")
-        print("  aggregate      \(Self.rate(metrics.aggregateTokensPerSecond)) tok/s")
-        print("  per-request    mean \(Self.rate(mean)) tok/s, sum \(Self.rate(sum)) tok/s")
+        print("  decode         \(Self.rate(metrics.decodeTokensPerSecond)) tok/s across requests")
+        print("  end-to-end     \(Self.rate(metrics.endToEndTokensPerSecond)) tok/s, prefill and queueing in")
+        print("  per request    \(Self.rate(metrics.meanRequestTokensPerSecond)) tok/s mean")
     }
 
     private static func seconds(_ value: Double) -> String { String(format: "%.2fs", value) }

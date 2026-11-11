@@ -53,8 +53,7 @@ extension LLMBenchmark {
                 + "tokens, \(concurrency) requests at once\n")
         var trials: [TrialResult] = []
         for i in 0..<numTrials {
-            let (results, metrics) = try await scheduler.generateBatch(requests())
-            let trial = TrialResult(results: results, metrics: metrics)
+            let trial = TrialResult(metrics: try await scheduler.generateBatch(requests()).metrics)
             trials.append(trial)
             if i > 0 { print() }
             print("🧪 Trial \(i + 1)")
@@ -107,29 +106,14 @@ extension LLMBenchmark {
 }
 
 extension TrialResult {
-    /// One concurrent trial's numbers.
-    ///
-    /// - `promptTps`: every prompt token over the time until the last request's first token, which
-    ///   is when the last prefill finished.
-    /// - `genTps`: tokens decoded after each request's first, over the span from the earliest first
-    ///   token to the latest last one; a total, as `--batch-size` reports one. Summing each request's
-    ///   own rate would count requests that never ran at the same time, as when more are in flight
-    ///   than the batch holds.
-    /// - `perRequestGenTps`: decode rate per request, averaged; what one user sees.
-    /// - `endToEndTps`: every generated token over the batch's wall clock, prefill and queueing in.
-    init(results: [BatchGenerationResult], metrics: BatchGenerationMetrics) {
-        let lastFirstToken = results.map(\.timeToFirstToken).max() ?? 0
-        let promptTotal = results.reduce(0) { $0 + $1.promptTokenCount }
-        let rates = results.map(\.tokensPerSecond)
-        let decodeStart = results.map(\.timeToFirstToken).min() ?? 0
-        let decodeEnd = results.map { $0.timeToFirstToken + $0.decodeSeconds }.max() ?? 0
-        let decoded = results.reduce(0) { $0 + Swift.max(0, $1.tokens.count - 1) }
+    /// One concurrent trial's numbers, from ``BatchGenerationMetrics``. `genTps` is the decode
+    /// throughput across requests, a total, as `--batch-size` reports one.
+    init(metrics: BatchGenerationMetrics) {
         self.init(
-            promptTps: lastFirstToken > 0 ? Double(promptTotal) / lastFirstToken : 0,
-            genTps: decodeEnd > decodeStart ? Double(decoded) / (decodeEnd - decodeStart) : 0,
-            perRequestGenTps: rates.isEmpty ? 0 : rates.reduce(0, +) / Double(rates.count),
-            endToEndTps: metrics.aggregateTokensPerSecond,
-            meanTtftSeconds: results.isEmpty
-                ? 0 : results.map(\.timeToFirstToken).reduce(0, +) / Double(results.count))
+            promptTps: metrics.promptTokensPerSecond,
+            genTps: metrics.decodeTokensPerSecond,
+            perRequestGenTps: metrics.meanRequestTokensPerSecond,
+            endToEndTps: metrics.endToEndTokensPerSecond,
+            meanTtftSeconds: metrics.meanTimeToFirstToken)
     }
 }

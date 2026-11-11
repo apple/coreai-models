@@ -114,6 +114,7 @@ private func handleChatCompletionsFromBody(body: ByteBuffer, state: ServerState,
             body: .init(byteBuffer: ByteBuffer(data: data)))
     }
 
+    if let reason = state.memoryRefusal() { return try outOfMemoryResponse(reason) }
     let lane = BatchServingRouter.lane(
         hasResponseSchema: chatRequest.responseFormat?.extractedSchema != nil)
     let access: RequestAccess
@@ -149,14 +150,6 @@ private func handleChatCompletionsFromBody(body: ByteBuffer, state: ServerState,
         let data = try JSONEncoder().encode(err)
         return Response(
             status: .tooManyRequests, headers: [.contentType: "application/json"],
-            body: .init(byteBuffer: ByteBuffer(data: data)))
-    } catch InferenceRuntimeError.outOfMemory(let reason) {
-        // Past the device's memory recommendation: refused until a restart, rather than a server fault.
-        access.release()
-        let err = ErrorResponse(error: .init(message: reason, type: "server_error", code: "out_of_memory"))
-        let data = try JSONEncoder().encode(err)
-        return Response(
-            status: .serviceUnavailable, headers: [.contentType: "application/json"],
             body: .init(byteBuffer: ByteBuffer(data: data)))
     } catch let error as ServerError {
         access.release()
@@ -757,6 +750,16 @@ func tokenizeMessages(
     let text = templateMessages.map { "\($0["role"] ?? "user"): \($0["content"] ?? "")" }
         .joined(separator: "\n")
     return tokenizer.encode(text: text)
+}
+
+/// 503 `out_of_memory` for a request refused because the process is past the device's memory
+/// recommendation, rather than a server fault.
+func outOfMemoryResponse(_ reason: String) throws -> Response {
+    let err = ErrorResponse(error: .init(message: reason, type: "server_error", code: "out_of_memory"))
+    let data = try JSONEncoder().encode(err)
+    return Response(
+        status: .serviceUnavailable, headers: [.contentType: "application/json"],
+        body: .init(byteBuffer: ByteBuffer(data: data)))
 }
 
 private func buildStopSequences(from request: ChatCompletionRequest, state: ServerState) -> StopSequences {

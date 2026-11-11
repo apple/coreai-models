@@ -14,9 +14,14 @@ import Synchronization
 ///
 /// Past the device's recommendation, Metal drops command buffers out of memory and the calls that
 /// issued them return anyway: nothing fails, the GPU computes wrong answers and the machine swaps.
-/// A serving process's allocations only grow while it runs, so the guard trips once, when either
-/// figure crosses the line after load, and stays tripped until a restart. The requests already
-/// running finish; new ones are refused.
+/// The two figures behave differently, so the guard treats them differently:
+/// - Metal's allocated size only grows once the sessions are allocated, and past the line the GPU
+///   computes wrong answers. Once it crosses, the guard refuses until a restart.
+/// - The physical footprint can rise and fall (a large prompt, the tokenizer, compiler scratch),
+///   and past the line the machine swaps. The guard refuses only while it is over, checking again
+///   on every call.
+///
+/// The requests already running finish; new ones are refused.
 ///
 /// The guard watches only from ``arm()``, called once the model and its sessions are loaded. A
 /// figure already past the line then is reported, not refused: the process served that way before
@@ -52,10 +57,13 @@ package final class DeviceMemoryGuard: Sendable {
     }
 
     private struct Watch {
-        /// Whether each figure was under the line at ``arm()``; only those can trip the guard.
+        /// Whether each figure was under the line at ``arm()``; only those can refuse.
         var allocated = false
         var footprint = false
+        /// Why Metal's figure tripped the guard, which then refuses until a restart.
         var tripped: String?
+        /// Whether the footprint was over the line at the last check, so each crossing is reported once.
+        var footprintOver = false
     }
 
     private let device: any MTLDevice
@@ -98,34 +106,45 @@ package final class DeviceMemoryGuard: Sendable {
         return status == KERN_SUCCESS ? Int(info.phys_footprint) : 0
     }
 
-    /// Why this process should admit nothing more, or nil while it is under the line or the guard is
-    /// not armed. Once non-nil, it stays.
+    /// Why this process should admit nothing more right now, or nil while it is under the line or the
+    /// guard is not armed. Once Metal's figure has crossed, it stays non-nil.
     package func refusalReason() -> String? {
         watch.withLock { watch in
             if let tripped = watch.tripped { return tripped }
             guard watch.allocated || watch.footprint else { return nil }
             let now = snapshot
-            let reason: String
-            if watch.footprint, now.footprint >= now.recommended {
-                reason =
-                    "this process's footprint is \(Snapshot.gb(now.footprint)), past the "
-                    + "\(Snapshot.gb(now.recommended)) this device recommends; restart to serve more"
-            } else if watch.allocated, now.allocatedFraction >= tripFraction {
-                reason =
+            if watch.allocated, now.allocatedFraction >= tripFraction {
+                let reason =
                     "Metal has allocated \(Snapshot.gb(now.allocated)) of the "
                     + "\(Snapshot.gb(now.recommended)) this device recommends, past which the GPU "
                     + "computes wrong answers without an error; restart to serve more"
-            } else {
+                watch.tripped = reason
+                CLILogger.report("[Memory] \(reason). Refusing new requests.")
+                return reason
+            }
+            let over = watch.footprint && now.footprint >= now.recommended
+            defer { watch.footprintOver = over }
+            guard over else {
+                if watch.footprintOver {
+                    CLILogger.report("[Memory] footprint back under the recommendation. Admitting requests again.")
+                }
                 return nil
             }
-            watch.tripped = reason
-            CLILogger.report("[Memory] \(reason). Refusing new requests.")
+            let reason =
+                "this process's footprint is \(Snapshot.gb(now.footprint)), past the "
+                + "\(Snapshot.gb(now.recommended)) this device recommends; try again once running requests finish"
+            if !watch.footprintOver { CLILogger.report("[Memory] \(reason). Refusing new requests.") }
             return reason
         }
     }
 
-    /// The reason the guard tripped, without checking again; nil while it has not.
-    package var trippedReason: String? { watch.withLock { $0.tripped } }
+    /// Why the guard is refusing as of its last check, without checking again; nil while it is not.
+    package var lastRefusal: String? {
+        watch.withLock { watch in
+            if let tripped = watch.tripped { return tripped }
+            return watch.footprintOver ? "this process's footprint is past what the device recommends" : nil
+        }
+    }
 
     /// Reports where the process stands after `stage` (such as load or warmup): a warning when it is
     /// near or past the device's recommendation, naming `advice` as what would give memory back.

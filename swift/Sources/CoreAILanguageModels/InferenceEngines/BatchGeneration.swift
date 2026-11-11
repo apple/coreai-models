@@ -24,15 +24,47 @@ package struct BatchGenerationResult: Sendable {
     }
 }
 
-/// Whole-batch numbers from ``RequestSink/generateBatch(_:)``.
+/// Whole-batch numbers from ``RequestSink/generateBatch(_:)``, computed once for every tool that
+/// reports them.
+///
+/// Rates across requests divide by the time the requests actually spanned, never sum each request's
+/// own rate: with more requests than rows they run in turns, and a sum would count turns that never
+/// overlapped.
 package struct BatchGenerationMetrics: Sendable {
     package let requestCount: Int
     /// Wall clock for the whole batch, queueing included.
     package let wallSeconds: Double
     package let generatedTokens: Int
+    /// Every prompt token over the time until the last request's first token, when the last prefill
+    /// finished.
+    package let promptTokensPerSecond: Double
+    /// Tokens decoded after each request's first, over the span from the earliest first token to the
+    /// latest last one.
+    package let decodeTokensPerSecond: Double
+    /// Each request's own decode rate, averaged: what one caller sees.
+    package let meanRequestTokensPerSecond: Double
+    package let meanTimeToFirstToken: Double
 
-    package var aggregateTokensPerSecond: Double {
+    /// Every generated token over the batch's wall clock, prefill and queueing in.
+    package var endToEndTokensPerSecond: Double {
         wallSeconds > 0 ? Double(generatedTokens) / wallSeconds : 0
+    }
+
+    package init(results: [BatchGenerationResult], wallSeconds: Double) {
+        self.requestCount = results.count
+        self.wallSeconds = wallSeconds
+        self.generatedTokens = results.reduce(0) { $0 + $1.tokens.count }
+        let lastFirstToken = results.map(\.timeToFirstToken).max() ?? 0
+        let promptTotal = results.reduce(0) { $0 + $1.promptTokenCount }
+        self.promptTokensPerSecond = lastFirstToken > 0 ? Double(promptTotal) / lastFirstToken : 0
+        let decodeStart = results.map(\.timeToFirstToken).min() ?? 0
+        let decodeEnd = results.map { $0.timeToFirstToken + $0.decodeSeconds }.max() ?? 0
+        let decoded = results.reduce(0) { $0 + Swift.max(0, $1.tokens.count - 1) }
+        self.decodeTokensPerSecond = decodeEnd > decodeStart ? Double(decoded) / (decodeEnd - decodeStart) : 0
+        let rates = results.map(\.tokensPerSecond)
+        self.meanRequestTokensPerSecond = rates.isEmpty ? 0 : rates.reduce(0, +) / Double(rates.count)
+        self.meanTimeToFirstToken =
+            results.isEmpty ? 0 : results.map(\.timeToFirstToken).reduce(0, +) / Double(results.count)
     }
 }
 
@@ -50,7 +82,7 @@ extension RequestSink {
         guard !requests.isEmpty else {
             throw InferenceRuntimeError.invalidArgument("generateBatch called with no requests")
         }
-        let started = ContinuousClock.now
+        let started = SuspendingClock.now
         let streams = try requests.map { try submit($0) }
         let results = try await withThrowingTaskGroup(of: (Int, BatchGenerationResult).self) { group in
             for (index, stream) in streams.enumerated() {
@@ -58,7 +90,7 @@ extension RequestSink {
                 group.addTask {
                     var tokens: [Int32] = []
                     var reason = StopReason.maxTokens
-                    var first: ContinuousClock.Instant?
+                    var first: SuspendingClock.Instant?
                     var last = started
                     for try await event in stream {
                         switch event {
@@ -88,9 +120,7 @@ extension RequestSink {
         }
         return (
             results,
-            BatchGenerationMetrics(
-                requestCount: requests.count, wallSeconds: (ContinuousClock.now - started).inSeconds,
-                generatedTokens: results.reduce(0) { $0 + $1.tokens.count })
+            BatchGenerationMetrics(results: results, wallSeconds: (SuspendingClock.now - started).inSeconds)
         )
     }
 }

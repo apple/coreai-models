@@ -25,6 +25,13 @@ struct PromptListTests {
         #expect(try LLMRunner.readPromptList(path) == ["Name a fruit.", "Name a planet.", "Name a colour."])
     }
 
+    @Test("A file with CRLF line endings splits into its prompts")
+    func readsCRLF() throws {
+        let path = try writeList("Name a fruit.\r\nName a planet.\r\n\r\nName a colour.\r\n")
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        #expect(try LLMRunner.readPromptList(path) == ["Name a fruit.", "Name a planet.", "Name a colour."])
+    }
+
     @Test("A list with one prompt runs that prompt")
     func readsOneLine() throws {
         let path = try writeList("Only this.\n")

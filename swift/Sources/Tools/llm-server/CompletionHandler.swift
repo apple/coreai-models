@@ -29,6 +29,7 @@ func handleCompletionsFromBody(body: ByteBuffer, state: ServerState) async throw
             status: .notImplemented, headers: [.contentType: "application/json"],
             body: .init(byteBuffer: ByteBuffer(data: data)))
     }
+    if let reason = state.memoryRefusal() { return try outOfMemoryResponse(reason) }
     let access: RequestAccess
     do {
         access = try await state.acquireScoringAccess()

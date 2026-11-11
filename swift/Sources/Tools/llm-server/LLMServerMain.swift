@@ -267,7 +267,7 @@ struct LLMServer: AsyncParsableCommand {
 
         // The scheduler holds up to --concurrent-requests plus --max-queue-depth requests, then rejects.
         var batchScheduler: BatchScheduler? = nil
-        // Refuses new batched requests once the process passes the device's memory recommendation.
+        // Refuses new requests while the process is past the device's memory recommendation.
         let memoryGuard = MTLCreateSystemDefaultDevice().map { DeviceMemoryGuard(device: $0) }
         let requested = ConcurrentRequests(concurrentRequests) ?? .count(1)
         let sequentialEngine = engine as? CoreAISequentialEngine
@@ -286,8 +286,7 @@ struct LLMServer: AsyncParsableCommand {
         }
         if rows > 1, let sequentialEngine {
             batchScheduler = try BatchScheduler(
-                engine: sequentialEngine, maxConcurrent: rows, maxQueued: maxQueueDepth,
-                memoryGuard: memoryGuard)
+                engine: sequentialEngine, maxConcurrent: rows, maxQueued: maxQueueDepth)
             print("Batched serving: \(rows) concurrent requests (asset max batch \(bundle.maxBatchSize))")
         } else if requested != .count(1), !supportsBatching {
             print(

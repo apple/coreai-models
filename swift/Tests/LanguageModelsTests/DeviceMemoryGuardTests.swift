@@ -29,7 +29,7 @@ struct DeviceMemoryGuardTests {
         // A trip fraction of zero would trip on any allocation at all, once armed.
         let memoryGuard = DeviceMemoryGuard(device: device, tripFraction: 0)
         #expect(memoryGuard.refusalReason() == nil)
-        #expect(memoryGuard.trippedReason == nil)
+        #expect(memoryGuard.lastRefusal == nil)
     }
 
     @Test("A figure already past the line when armed is not refused")

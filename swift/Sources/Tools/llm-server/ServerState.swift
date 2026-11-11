@@ -136,8 +136,8 @@ final class ServerState: @unchecked Sendable {
     private let batchServing: (scheduler: BatchScheduler, modelConfig: ModelConfig)?
     private var batchScheduler: BatchScheduler? { batchServing?.scheduler }
 
-    /// What the process holds against the device's recommendation, for /ready; it also gates the
-    /// batch scheduler's admission.
+    /// What the process holds against the device's recommendation: reported in /ready, and checked
+    /// before a request takes its access (``memoryRefusal()``).
     private let memoryGuard: DeviceMemoryGuard?
     private let _state = Mutex<InternalState>(InternalState())
 
@@ -215,6 +215,10 @@ final class ServerState: @unchecked Sendable {
     /// defer { access.release() }
     /// let engine = state.engineForRequest(lane: lane)
     /// ```
+    /// Why a new request should be refused for memory (503), or nil to admit it. Checked before a
+    /// request takes its access, on every lane, batched or not.
+    func memoryRefusal() -> String? { memoryGuard?.refusalReason() }
+
     func acquireAccess(lane: BatchServingLane) async throws -> RequestAccess {
         let permit = needsServerPermit(lane: lane) ? try await queue.acquire() : nil
         let lease = lane == .fallbackBatchOne ? await batchScheduler?.acquireExclusiveAccess() : nil
@@ -395,7 +399,7 @@ final class ServerState: @unchecked Sendable {
                     metalAllocatedMB: Double(now.allocated) / megabyte,
                     recommendedMB: Double(now.recommended) / megabyte,
                     footprintMB: Double(now.footprint) / megabyte,
-                    refusing: memoryGuard.trippedReason)
+                    refusing: memoryGuard.lastRefusal)
             },
             batching: batchScheduler.map { scheduler in
                 .init(
