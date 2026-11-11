@@ -696,7 +696,9 @@ public struct ReadyResponse: Codable, Sendable {
         public let recommendedMB: Double
         /// What the kernel charges this process.
         public let footprintMB: Double
-        /// Why batched requests are being refused (503) until a restart, or nil while they are not.
+        /// Why new requests are being refused with 503 `out_of_memory`, or nil while they are not. Past
+        /// Metal's line this stays until a restart; past the footprint line it clears once the
+        /// footprint is back under.
         public let refusing: String?
 
         public init(metalAllocatedMB: Double, recommendedMB: Double, footprintMB: Double, refusing: String?) {

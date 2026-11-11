@@ -92,18 +92,26 @@ extension RequestSink {
                     var reason = StopReason.maxTokens
                     var first: SuspendingClock.Instant?
                     var last = started
+                    var beforeLast = started
                     for try await event in stream {
                         switch event {
                         case .token(let token, _):
                             tokens.append(token)
+                            beforeLast = last
                             last = .now
                             if first == nil { first = last }
                         case .finished(let stopReason):
                             reason = stopReason
                         }
                     }
-                    // The end-of-sequence token is delivered like any other; it is not part of the reply.
-                    if reason == .eos, !tokens.isEmpty { tokens.removeLast() }
+                    // The end-of-sequence token is delivered like any other; it is not part of the reply,
+                    // so the reply's span ends at the token before it.
+                    if reason == .eos, tokens.count > 1 {
+                        tokens.removeLast()
+                        last = beforeLast
+                    } else if reason == .eos {
+                        tokens.removeAll()
+                    }
                     let firstAt = first ?? last
                     return (
                         index,

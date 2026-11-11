@@ -196,6 +196,10 @@ final class ServerState: @unchecked Sendable {
         }
     }
 
+    /// Why a new request should be refused for memory (503), or nil to admit it. Checked before a
+    /// request takes its access, on every lane, batched or not.
+    func memoryRefusal() -> String? { memoryGuard?.refusalReason() }
+
     /// Waits for and returns the access a request on `lane` holds while it uses the engine.
     ///
     /// - Single-slot permit from `queue`: on every lane except `.batched` with a scheduler that
@@ -215,10 +219,6 @@ final class ServerState: @unchecked Sendable {
     /// defer { access.release() }
     /// let engine = state.engineForRequest(lane: lane)
     /// ```
-    /// Why a new request should be refused for memory (503), or nil to admit it. Checked before a
-    /// request takes its access, on every lane, batched or not.
-    func memoryRefusal() -> String? { memoryGuard?.refusalReason() }
-
     func acquireAccess(lane: BatchServingLane) async throws -> RequestAccess {
         let permit = needsServerPermit(lane: lane) ? try await queue.acquire() : nil
         let lease = lane == .fallbackBatchOne ? await batchScheduler?.acquireExclusiveAccess() : nil

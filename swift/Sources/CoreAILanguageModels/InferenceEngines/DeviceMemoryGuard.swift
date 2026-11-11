@@ -15,11 +15,13 @@ import Synchronization
 /// Past the device's recommendation, Metal drops command buffers out of memory and the calls that
 /// issued them return anyway: nothing fails, the GPU computes wrong answers and the machine swaps.
 /// The two figures behave differently, so the guard treats them differently:
-/// - Metal's allocated size only grows once the sessions are allocated, and past the line the GPU
-///   computes wrong answers. Once it crosses, the guard refuses until a restart.
-/// - The physical footprint can rise and fall (a large prompt, the tokenizer, compiler scratch),
-///   and past the line the machine swaps. The guard refuses only while it is over, checking again
-///   on every call.
+/// - Metal's allocated size counts the sessions' KV caches as they grow, along with the framework's
+///   scratch (a 4-row batch session on a 0.6B model went from 140 MB to 4.7 GB over four 3,500-token
+///   prompts). It only grows while the process serves, and past the line the GPU computes wrong
+///   answers, so once it crosses, the guard refuses until a restart.
+/// - The physical footprint is what the kernel charges the process. It can rise and fall (a large
+///   prompt, the tokenizer, compiler scratch), and past the line the machine swaps, so the guard
+///   refuses only while it is over, checking again on every call.
 ///
 /// The requests already running finish; new ones are refused.
 ///
@@ -42,6 +44,12 @@ package final class DeviceMemoryGuard: Sendable {
         /// The process's physical footprint. Past the recommendation the machine swaps.
         package let footprint: Int
 
+        package init(allocated: Int, recommended: Int, footprint: Int) {
+            self.allocated = allocated
+            self.recommended = recommended
+            self.footprint = footprint
+        }
+
         package var allocatedFraction: Double {
             recommended > 0 ? Double(allocated) / Double(recommended) : 0
         }
@@ -62,16 +70,29 @@ package final class DeviceMemoryGuard: Sendable {
         var footprint = false
         /// Why Metal's figure tripped the guard, which then refuses until a restart.
         var tripped: String?
-        /// Whether the footprint was over the line at the last check, so each crossing is reported once.
-        var footprintOver = false
+        /// Why the footprint is over the line as of the last check, or nil while it is under; also
+        /// how each crossing is reported once.
+        var footprintOver: String?
     }
 
-    private let device: any MTLDevice
+    private let measure: @Sendable () -> Snapshot
     private let tripFraction: Double
     private let watch = Mutex(Watch())
 
-    package init(device: any MTLDevice, tripFraction: Double = DeviceMemoryGuard.defaultTripFraction) {
-        self.device = device
+    package convenience init(device: any MTLDevice, tripFraction: Double = DeviceMemoryGuard.defaultTripFraction) {
+        self.init(tripFraction: tripFraction) {
+            Snapshot(
+                allocated: device.currentAllocatedSize,
+                recommended: Int(device.recommendedMaxWorkingSetSize),
+                footprint: DeviceMemoryGuard.physicalFootprint)
+        }
+    }
+
+    /// A guard that reads its figures from `measure`, so its decisions can be tested without a device.
+    package init(
+        tripFraction: Double = DeviceMemoryGuard.defaultTripFraction, measure: @escaping @Sendable () -> Snapshot
+    ) {
+        self.measure = measure
         self.tripFraction = tripFraction
     }
 
@@ -84,14 +105,7 @@ package final class DeviceMemoryGuard: Sendable {
         }
     }
 
-    package var snapshot: Snapshot { Self.snapshot(of: device) }
-
-    private static func snapshot(of device: any MTLDevice) -> Snapshot {
-        Snapshot(
-            allocated: device.currentAllocatedSize,
-            recommended: Int(device.recommendedMaxWorkingSetSize),
-            footprint: physicalFootprint)
-    }
+    package var snapshot: Snapshot { measure() }
 
     /// What the kernel charges this process, in bytes; zero when it cannot be read.
     package static var physicalFootprint: Int {
@@ -122,28 +136,26 @@ package final class DeviceMemoryGuard: Sendable {
                 CLILogger.report("[Memory] \(reason). Refusing new requests.")
                 return reason
             }
-            let over = watch.footprint && now.footprint >= now.recommended
-            defer { watch.footprintOver = over }
-            guard over else {
-                if watch.footprintOver {
+            guard watch.footprint, now.footprint >= now.recommended else {
+                if watch.footprintOver != nil {
                     CLILogger.report("[Memory] footprint back under the recommendation. Admitting requests again.")
                 }
+                watch.footprintOver = nil
                 return nil
             }
             let reason =
                 "this process's footprint is \(Snapshot.gb(now.footprint)), past the "
                 + "\(Snapshot.gb(now.recommended)) this device recommends; try again once running requests finish"
-            if !watch.footprintOver { CLILogger.report("[Memory] \(reason). Refusing new requests.") }
+            if watch.footprintOver == nil { CLILogger.report("[Memory] \(reason). Refusing new requests.") }
+            watch.footprintOver = reason
             return reason
         }
     }
 
-    /// Why the guard is refusing as of its last check, without checking again; nil while it is not.
+    /// Why the guard is refusing as of its last check, the same text a refused request gets, without
+    /// checking again; nil while it is not refusing.
     package var lastRefusal: String? {
-        watch.withLock { watch in
-            if let tripped = watch.tripped { return tripped }
-            return watch.footprintOver ? "this process's footprint is past what the device recommends" : nil
-        }
+        watch.withLock { $0.tripped ?? $0.footprintOver }
     }
 
     /// Reports where the process stands after `stage` (such as load or warmup): a warning when it is

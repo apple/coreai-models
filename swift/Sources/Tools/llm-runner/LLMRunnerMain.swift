@@ -309,7 +309,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     @Option(
         name: .customLong("concurrent-requests"),
         help:
-            "With --prompt-list: prompts generating at once (default: every prompt, up to the model's max batch size). The rest wait for a free row."
+            "With --prompt-list: how many prompts generate at once, a number (default: every prompt, up to the model's max batch size; unlike llm-server's, no 'auto'). The rest wait for a free row."
     )
     var concurrentRequests: Int?
 
