@@ -48,6 +48,14 @@ public protocol InferenceOutputSequence: AsyncSequence<InferenceOutput, any Erro
 /// iterator (or a producer Task) and read by the caller after iteration. A
 /// reference-typed box lets the sequence value, its iterator, and the caller
 /// observe the same slot.
+/// A token count a decoded stream's iterator writes and the stream reads back, for
+/// ``DecodeOutcomeReporting/tokensGenerated``.
+final class TokenCountStore: Sendable {
+    private let value = Mutex(0)
+    var count: Int { value.withLock { $0 } }
+    func set(_ count: Int) { value.withLock { $0 = count } }
+}
+
 final class StopReasonStore: Sendable {
     private let value = Mutex<StopReason?>(nil)
 

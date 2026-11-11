@@ -97,7 +97,7 @@ final class MockConstrainedEngine: InferenceEngine, ConstrainedGenerationCapable
         samplingConfiguration: SamplingConfiguration,
         maxTokens: Int,
         session: ConstrainedSessionHandle
-    ) throws -> InferenceTokenSequence {
+    ) async throws -> InferenceTokenSequence {
         generateCallCount += 1
         let tokens = scriptedTokens
         let limit = min(tokens.count, maxTokens)

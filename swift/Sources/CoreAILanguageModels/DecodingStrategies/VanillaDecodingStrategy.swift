@@ -84,7 +84,7 @@ public struct VanillaDecodingStrategy: DecodingStrategy {
 
 extension VanillaDecodingStrategy {
     /// Async sequence of `GenerationResult` produced by `decode()`.
-    public struct VanillaDecodedSequence: AsyncSequence {
+    public struct VanillaDecodedSequence: AsyncSequence, DecodeOutcomeReporting {
         public typealias Element = GenerationResult
         public typealias Failure = Error
 
@@ -93,6 +93,11 @@ extension VanillaDecodingStrategy {
             let initialInputTokenCount: Int
             var engineSequence: (any InferenceOutputSequence)?
             var upstreamIterator: (any AsyncIteratorProtocol<InferenceOutput, Error>)?
+            /// Why the stream ended, kept apart from the engine sequence so that dropping that sequence
+            /// to stop the engine does not lose it.
+            let outcome = StopReasonStore()
+            /// Tokens the engine produced, for ``VanillaDecodedSequence/tokensGenerated``.
+            let tokenCount = TokenCountStore()
 
             init(
                 initialInputTokenCount: Int,
@@ -116,6 +121,10 @@ extension VanillaDecodingStrategy {
                 stopSequences: stopSequences
             )
         }
+
+        public var stopReason: StopReason? { prepared.outcome.stopReason }
+
+        public var tokensGenerated: Int { prepared.tokenCount.count }
     }
 }
 
@@ -132,6 +141,8 @@ extension VanillaDecodingStrategy.VanillaDecodedSequence {
         private var engineSequence: (any InferenceOutputSequence)?
         private var upstreamIterator: (any AsyncIteratorProtocol<InferenceOutput, Error>)?
         private let initialInputTokenCount: Int
+        private let outcome: StopReasonStore
+        private let tokenCount: TokenCountStore
 
         // Decoding state
         private var generatedTokenCount: Int = 0
@@ -141,6 +152,13 @@ extension VanillaDecodingStrategy.VanillaDecodedSequence {
         private var inferenceSpan: ProfileSpan?
         private var stopped: Bool = false
         private var flushed: Bool = false
+        /// Ids in a row that the tokenizer has no token for; see ``maxConsecutiveUnknownIds``.
+        private var consecutiveUnknownIds = 0
+
+        /// Ids in a row with no token in the tokenizer before the stream fails. One is skipped: the
+        /// output layer is often padded past the vocabulary, and sampling can land in the padding.
+        /// Several in a row is a sampler stuck there, which otherwise runs silently to `maxTokens`.
+        static let maxConsecutiveUnknownIds = 4
 
         fileprivate init(
             prepared: VanillaDecodingStrategy.VanillaDecodedSequence.Prepared,
@@ -150,6 +168,8 @@ extension VanillaDecodingStrategy.VanillaDecodedSequence {
             self.tokenizer = tokenizer
             self.stopSequences = stopSequences
             self.initialInputTokenCount = prepared.initialInputTokenCount
+            self.outcome = prepared.outcome
+            self.tokenCount = prepared.tokenCount
             self.engineSequence = prepared.engineSequence.take()
             self.upstreamIterator = prepared.upstreamIterator.take()
             self.inferenceSpan = InstrumentsProfiler.beginPrompt(tokens: prepared.initialInputTokenCount)
@@ -174,7 +194,7 @@ extension VanillaDecodingStrategy.VanillaDecodedSequence {
             }
 
             // Drive the upstream engine iterator until we have a non-empty text delta to emit.
-            while let output = try await iterator.next() {
+            while let output = try await nextOutput(&iterator) {
                 try Task.checkCancellation()
                 let step = generatedTokenCount
 
@@ -183,29 +203,40 @@ extension VanillaDecodingStrategy.VanillaDecodedSequence {
                 CLILogger.log("✅ Generated token ID: \(output.tokenId)", level: 2)
 
                 let decodingSpan = InstrumentsProfiler.beginDecode(step: step)
-
-                newlyGeneratedTokens.append(Int(output.tokenId))
                 generatedTokenCount += 1
+                tokenCount.set(generatedTokenCount)
 
-                let fullDecode = tokenizer.decode(tokens: newlyGeneratedTokens)
-
-                let safeEnd = VanillaDecodingStrategy.safeUTF8Prefix(of: fullDecode)
-                let emittable = String(fullDecode[fullDecode.startIndex..<safeEnd])
-
-                let newText: String
-                if emittable.count > pendingText.count, emittable.hasPrefix(pendingText) {
-                    newText = String(emittable.dropFirst(pendingText.count))
-                    pendingText = emittable
-                } else if emittable != pendingText {
-                    newText = emittable
-                    pendingText = emittable
-                } else {
-                    newText = ""
+                // An id with no token adds no text, but still counts and can still end a stop sequence.
+                let known = tokenizer.convertIdToToken(Int(output.tokenId)) != nil
+                consecutiveUnknownIds = known ? 0 : consecutiveUnknownIds + 1
+                if consecutiveUnknownIds >= Self.maxConsecutiveUnknownIds {
+                    decodingSpan.end()
+                    outcome.setIfUnset(.error)
+                    throw InferenceRuntimeError.invalidState(
+                        "the sampler returned \(consecutiveUnknownIds) ids in a row that are no token in this "
+                            + "tokenizer (last \(output.tokenId)), after \(generatedTokenCount) token(s)")
                 }
 
-                if newText.hasSuffix("\n") {
-                    newlyGeneratedTokens = []
-                    pendingText = ""
+                var newText = ""
+                if known {
+                    newlyGeneratedTokens.append(Int(output.tokenId))
+                    let fullDecode = tokenizer.decode(tokens: newlyGeneratedTokens)
+
+                    let safeEnd = VanillaDecodingStrategy.safeUTF8Prefix(of: fullDecode)
+                    let emittable = String(fullDecode[fullDecode.startIndex..<safeEnd])
+
+                    if emittable.count > pendingText.count, emittable.hasPrefix(pendingText) {
+                        newText = String(emittable.dropFirst(pendingText.count))
+                        pendingText = emittable
+                    } else if emittable != pendingText {
+                        newText = emittable
+                        pendingText = emittable
+                    }
+
+                    if newText.hasSuffix("\n") {
+                        newlyGeneratedTokens = []
+                        pendingText = ""
+                    }
                 }
 
                 recentTokens.append(output.tokenId)
@@ -221,9 +252,17 @@ extension VanillaDecodingStrategy.VanillaDecodedSequence {
                     // Record why the engine stream ended before abandoning it.
                     let matchedText = tokenizer.decode(tokens: matched.map(Int.init))
                     engineSequence?.setStopReason(.stopSequence(matchedText))
+                    outcome.set(.stopSequence(matchedText))
 
-                    // Drain remaining tokens so the pipelined engine's producer Task completes.
-                    while try await iterator.next() != nil {}
+                    // Release the engine stream instead of draining it. Draining waited for every
+                    // remaining token up to maxTokens, full forward passes whose output was thrown
+                    // away: with a large maxTokens, minutes of GPU work after the answer was complete.
+                    //
+                    // Dropping the sequence and its iterator ends the engine's generation between
+                    // tokens: the pipelined engine's output stream terminates and its producer sees
+                    // the cancellation; the sequential and static-shape engines simply stop being
+                    // asked for tokens, and their iterators give back the engine in `deinit`; on the
+                    // batched lane, `setStopReason` above cancels the request.
                     engineSequence = nil
                     upstreamIterator = nil
 
@@ -242,21 +281,30 @@ extension VanillaDecodingStrategy.VanillaDecodedSequence {
 
                 if !newText.isEmpty {
                     upstreamIterator = iterator
-                    return GenerationResult(
-                        text: newText,
-                        tokenId: output.tokenId,
-                        rawLogits: output.logits
-                    )
+                    return GenerationResult(text: newText, tokenId: output.tokenId, rawLogits: output.logits)
                 }
                 CLILogger.log("✅ Generated newText: \(newText)", level: 2)
             }
 
             // Engine stream exhausted naturally — its iterator already recorded `.maxTokens` (or `.cancelled`/`.error`
             // if it threw above).
+            outcome.setIfUnset(engineSequence?.stopReason ?? .maxTokens)
             engineSequence = nil
             upstreamIterator = nil
             endInferenceSpan()
             return try await flushTrailingText()
+        }
+
+        /// The engine's next output, recording `.error` as the stream's stop reason if it throws.
+        private func nextOutput(
+            _ iterator: inout any AsyncIteratorProtocol<InferenceOutput, Error>
+        ) async throws -> InferenceOutput? {
+            do {
+                return try await iterator.next()
+            } catch {
+                outcome.setIfUnset(.error)
+                throw error
+            }
         }
 
         private func endInferenceSpan() {
