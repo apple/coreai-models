@@ -751,7 +751,9 @@ public final class CoreAISequentialEngine: MultimodalInferenceEngine, Idempotent
     }
 
     /// Writes `tokens` in the asset's prefill chunks: on the prefill graph when the asset has one, so
-    /// the decode graph keeps its one shape, and on the decode graph otherwise. Reads no logits.
+    /// the decode graph keeps its one shape, and on the decode graph otherwise. A one-token chunk runs
+    /// on the decode graph either way: past position 0, a one-token query on the prefill graph can
+    /// abort in MPSGraph ("Failed to resolve dynamic dimensions for memref.alloc"). Reads no logits.
     func prefillPiece(_ tokens: ArraySlice<Int32>, scratch: GenerationSessionState) async throws {
         try requireRowWritableCache(scratch)
         var remaining = tokens
@@ -761,7 +763,7 @@ public final class CoreAISequentialEngine: MultimodalInferenceEngine, Idempotent
         {
             let chunk = remaining.prefix(size)
             remaining = remaining.dropFirst(size)
-            if let prefillFn = prefillFunction {
+            if chunk.count > 1, let prefillFn = prefillFunction {
                 try await encodePrefillChunk(chunk, using: prefillFn, sessionState: scratch)
             } else {
                 _ = try await processTokenBatch(chunk, logits: .none, sessionState: scratch)
