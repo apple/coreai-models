@@ -20,6 +20,8 @@ struct SafeTensorsReader: Sendable {
     /// Safetensors dtype string, e.g. `"I8"` or `"F16"`.
     let dtype: String
     let shape: [Int]
+    /// The file's `__metadata__` strings; empty when the header has none.
+    let metadata: [String: String]
 
     enum ReadError: Error, CustomStringConvertible {
         case tooSmall
@@ -70,5 +72,6 @@ struct SafeTensorsReader: Sendable {
         self.byteCount = offsets[1] - offsets[0]
         self.dtype = dtype
         self.shape = shape
+        self.metadata = json["__metadata__"] as? [String: String] ?? [:]
     }
 }

@@ -29,6 +29,9 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     private static let valueCacheName = "value_cache"
     private static let embeddingTableName = "embedding_table"
     private static let hiddenStatesOutputName = "hidden_states"
+    // Per-row scale of a native-quantized (QAT) embedding table: a second `load_embeddings`
+    // output and a third `gather_embeddings` input, present only for those models.
+    private static let embeddingScaleName = "embedding_scale"
     private static let tokenIDsInputName = "in_new_token_ids"
     private static let gatheredOutputName = "out_transformer_input"
 
@@ -84,6 +87,8 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
 
     // Embedding table loaded once at init.
     private let embeddingTable: NDArray
+    // Its companion per-row scale, for native-quantized checkpoints only (nil otherwise).
+    private let embeddingScale: NDArray?
 
     // Largest query length across all extend functions — used as prefill threshold.
     private let maxQueryLength: Int
@@ -203,7 +208,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
 
         try Self.validateIOContract(descriptor: referenceDescriptor, contextBucket: largestContext)
 
-        self.embeddingTable = try await Self.loadEmbeddingTable(from: model)
+        (self.embeddingTable, self.embeddingScale) = try await Self.loadEmbeddingTable(from: model)
 
         // States: classified fixed vs per-bucket from the asset itself.
         self.states = try StaticStateFactory.makeStateSet(
@@ -405,7 +410,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         }
     }
 
-    private static func loadEmbeddingTable(from model: AIModel) async throws -> NDArray {
+    private static func loadEmbeddingTable(from model: AIModel) async throws -> (NDArray, NDArray?) {
         CLILogger.log("Loading embeddings...")
         guard let embeddingFunction = try model.loadFunction(named: "load_embeddings") else {
             throw InferenceRuntimeError.invalidState("Cannot load 'load_embeddings'")
@@ -421,13 +426,16 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         var outputViews = InferenceFunction.MutableViews()
         outputViews.insert(&embeddingArray, for: embeddingTableName)
 
-        _ = try await embeddingFunction.run(
+        // A native-quantized table also returns its per-row scale; `run` hands back any output
+        // it was not given a view for.
+        var outputs = try await embeddingFunction.run(
             inputs: [:],
             outputViews: consume outputViews
         )
+        let embeddingScale = outputs.remove(embeddingScaleName)?.ndArray
 
         CLILogger.log("Embeddings loaded: shape=\(embeddingArray.shape)")
-        return embeddingArray
+        return (embeddingArray, embeddingScale)
     }
 
     // MARK: - Function Loading (lazy)
@@ -1126,6 +1134,9 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
 
         var inputs: [String: NDArray] = [Self.tokenIDsInputName: tokenArray]
         inputs[Self.embeddingTableName] = embeddingTable
+        if let embeddingScale, desc.inputNames.contains(Self.embeddingScaleName) {
+            inputs[Self.embeddingScaleName] = embeddingScale
+        }
 
         var outputs = try await fn.run(
             inputs: inputs,
