@@ -55,7 +55,7 @@ extension FlowTransformerPipeline {
         let latentCount = latentShape.reduce(1, *)
 
         // diffusers draws the initial latents and every step's renoise from one generator.
-        var rng = TorchRandomSource(seed: configuration.seed)
+        var rng = CoreAIShared.TorchRandomSource(seed: configuration.seed)
         let noise = rng.normalArray([latentCount])
 
         let scheduler = DiscreteFlowScheduler(
