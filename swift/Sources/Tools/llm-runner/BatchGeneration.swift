@@ -42,9 +42,9 @@ extension LLMRunner {
     }
 
     func runBatchGeneration(
-        promptListPath: String,
+        prompts: [String],
+        width: Int,
         inferenceEngine: any InferenceEngine,
-        bundle: LanguageModelBundle,
         tokenizer: any Tokenizer,
         samplingConfiguration: SamplingConfiguration,
         additionalEosTokenIds: Set<Int32>
@@ -54,10 +54,6 @@ extension LLMRunner {
                 "--prompt-list needs the coreai-sequential engine and a model exported with "
                     + "--attention-mask batched --dynamic-batch-size N")
         }
-        let prompts = try Self.readPromptList(promptListPath)
-        let width = try Self.batchWidth(
-            requested: concurrentRequests, promptCount: prompts.count, maxBatchSize: bundle.maxBatchSize)
-
         // End-of-sequence ids end a reply as `eos`; --stop-tokens end it as a stop sequence.
         var eosTokenIds = additionalEosTokenIds
         if let eos = tokenizer.eosTokenId { eosTokenIds.insert(Int32(eos)) }
@@ -101,12 +97,16 @@ extension LLMRunner {
             print(
                 "    \(result.tokens.count) tokens · \(Self.describe(result.stopReason))"
                     + " · TTFT \(Self.seconds(result.timeToFirstToken))"
-                    + " · \(Self.rate(result.tokensPerSecond)) tok/s")
+                    + (result.tokensPerSecond.map { " · \(Self.rate($0)) tok/s" } ?? ""))
         }
 
         print("\nAggregate")
         print("  wall           \(Self.seconds(metrics.wallSeconds))")
         print("  generated      \(metrics.generatedTokens) tokens")
+        print(
+            "  prompt         \(Self.rate(metrics.promptTokensPerSecond)) tok/s, first \(Swift.min(width, requests.count)) requests"
+        )
+        print("  TTFT           \(Self.seconds(metrics.meanTimeToFirstToken)) mean, queueing included")
         print("  decode         \(Self.rate(metrics.decodeTokensPerSecond)) tok/s across requests")
         print("  end-to-end     \(Self.rate(metrics.endToEndTokensPerSecond)) tok/s, prefill and queueing in")
         print("  per request    \(Self.rate(metrics.meanRequestTokensPerSecond)) tok/s mean")

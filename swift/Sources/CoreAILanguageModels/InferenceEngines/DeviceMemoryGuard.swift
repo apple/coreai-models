@@ -12,36 +12,41 @@ import Synchronization
 /// Watches what this process holds against what the device recommends, and says when a server
 /// should stop admitting requests.
 ///
-/// Past the device's recommendation, Metal drops command buffers out of memory and the calls that
-/// issued them return anyway: nothing fails, the GPU computes wrong answers and the machine swaps.
-/// The two figures behave differently, so the guard treats them differently:
-/// - Metal's allocated size counts the sessions' KV caches as they grow, along with the framework's
-///   scratch (a 4-row batch session on a 0.6B model went from 140 MB to 4.7 GB over four 3,500-token
-///   prompts). It only grows while the process serves, and past the line the GPU computes wrong
-///   answers, so once it crosses, the guard refuses until a restart.
-/// - The physical footprint is what the kernel charges the process. It can rise and fall (a large
-///   prompt, the tokenizer, compiler scratch), and past the line the machine swaps, so the guard
-///   refuses only while it is over, checking again on every call.
+/// Past the device's recommendation (`recommendedMaxWorkingSetSize`), Metal can drop command buffers
+/// out of memory while the calls that issued them return anyway: nothing fails and the GPU computes
+/// wrong answers. Two figures are checked, each against its own line, on every request:
+/// - Metal's allocated size, which follows the sessions' KV caches as they grow (a 4-row batch
+///   session on a 0.6B model went from 140 MB to 4.7 GB over four 3,500-token prompts), against
+///   ``defaultTripFraction`` of the recommendation.
+/// - The process's physical footprint, against the recommendation itself.
 ///
-/// The requests already running finish; new ones are refused.
+/// Neither figure only grows: a KV cache that doubles holds its old and new buffers together while it
+/// copies (the pipelined engine keeps the old ones until the GPU is done with them), and scratch
+/// comes and goes. So the guard refuses only while a figure is over its line,
+/// and admits again once it is back under. The requests already running finish; they can still take
+/// a figure past the line, which is what the margin under the recommendation is for.
 ///
 /// The guard watches only from ``arm()``, called once the model and its sessions are loaded. A
-/// figure already past the line then is reported, not refused: the process served that way before
-/// the guard existed.
+/// figure already past its line then gets a line ``pastArmMargin`` of the recommendation above where
+/// it stood: a server that ran that way before still serves, and still refuses once it grows.
 package final class DeviceMemoryGuard: Sendable {
-    /// Fraction of the device's recommendation, in Metal's allocated size, at which the guard trips,
+    /// Fraction of the device's recommendation, in Metal's allocated size, at which the guard refuses,
     /// leaving room for the requests already running.
     package static let defaultTripFraction = 0.98
+
+    /// Growth past where a figure stood at ``arm()``, as a fraction of the recommendation, at which a
+    /// figure that was already past its line refuses.
+    package static let pastArmMargin = 0.02
 
     /// What Metal has allocated on the device and what it recommends, and what the kernel charges
     /// this process.
     package struct Snapshot: Sendable {
         /// Metal's `currentAllocatedSize`: the asset's buffers, the sessions and the framework's
-        /// scratch alike. Past the recommendation the GPU computes wrong answers.
+        /// scratch alike.
         package let allocated: Int
         /// Metal's `recommendedMaxWorkingSetSize`; zero when the device gives none.
         package let recommended: Int
-        /// The process's physical footprint. Past the recommendation the machine swaps.
+        /// The process's physical footprint.
         package let footprint: Int
 
         package init(allocated: Int, recommended: Int, footprint: Int) {
@@ -55,24 +60,25 @@ package final class DeviceMemoryGuard: Sendable {
         }
 
         package var description: String {
-            "Metal \(Self.gb(allocated)) allocated of \(Self.gb(recommended)) recommended, "
-                + "footprint \(Self.gb(footprint))"
+            "Metal \(Self.gib(allocated)) allocated of \(Self.gib(recommended)) recommended, "
+                + "footprint \(Self.gib(footprint))"
         }
 
-        static func gb(_ bytes: Int) -> String {
-            String(format: "%.1f GB", Double(bytes) / 1_073_741_824)
+        static func gib(_ bytes: Int) -> String {
+            String(format: "%.1f GiB", Double(bytes) / 1_073_741_824)
         }
     }
 
+    /// The bytes at which each figure refuses, set by ``arm()``; nil before it.
+    private struct Lines {
+        var allocated: Int
+        var footprint: Int
+    }
+
     private struct Watch {
-        /// Whether each figure was under the line at ``arm()``; only those can refuse.
-        var allocated = false
-        var footprint = false
-        /// Why Metal's figure tripped the guard, which then refuses until a restart.
-        var tripped: String?
-        /// Why the footprint is over the line as of the last check, or nil while it is under; also
-        /// how each crossing is reported once.
-        var footprintOver: String?
+        var lines: Lines?
+        /// Whether the last check refused, so each change is logged once.
+        var refusing = false
     }
 
     private let measure: @Sendable () -> Snapshot
@@ -96,13 +102,17 @@ package final class DeviceMemoryGuard: Sendable {
         self.tripFraction = tripFraction
     }
 
-    /// Starts watching, against where the process stands now.
+    /// Starts watching, against where the process stands now. Does nothing when the device gives no
+    /// recommendation, so the guard never refuses.
     package func arm() {
-        let start = snapshot
-        watch.withLock {
-            $0.allocated = start.recommended > 0 && start.allocatedFraction < tripFraction
-            $0.footprint = start.recommended > 0 && start.footprint < start.recommended
-        }
+        let start = measure()
+        guard start.recommended > 0 else { return }
+        let margin = Int(Double(start.recommended) * Self.pastArmMargin)
+        let metalLine = Int(Double(start.recommended) * tripFraction)
+        let lines = Lines(
+            allocated: start.allocated < metalLine ? metalLine : start.allocated + margin,
+            footprint: start.footprint < start.recommended ? start.recommended : start.footprint + margin)
+        watch.withLock { $0.lines = lines }
     }
 
     package var snapshot: Snapshot { measure() }
@@ -120,58 +130,55 @@ package final class DeviceMemoryGuard: Sendable {
         return status == KERN_SUCCESS ? Int(info.phys_footprint) : 0
     }
 
-    /// Why this process should admit nothing more right now, or nil while it is under the line or the
-    /// guard is not armed. Once Metal's figure has crossed, it stays non-nil.
-    package func refusalReason() -> String? {
-        watch.withLock { watch in
-            if let tripped = watch.tripped { return tripped }
-            guard watch.allocated || watch.footprint else { return nil }
-            let now = snapshot
-            if watch.allocated, now.allocatedFraction >= tripFraction {
-                let reason =
-                    "Metal has allocated \(Snapshot.gb(now.allocated)) of the "
-                    + "\(Snapshot.gb(now.recommended)) this device recommends, past which the GPU "
-                    + "computes wrong answers without an error; restart to serve more"
-                watch.tripped = reason
-                CLILogger.report("[Memory] \(reason). Refusing new requests.")
-                return reason
+    /// Measures once, and returns the figures with why this process should admit nothing more right
+    /// now, or nil while every figure is under its line or the guard is not armed. Logs each change
+    /// between refusing and admitting once.
+    package func check() -> (snapshot: Snapshot, refusal: String?) {
+        let now = measure()
+        let (refusal, changed) = watch.withLock { watch -> (String?, Bool) in
+            guard let lines = watch.lines else { return (nil, false) }
+            let refusal: String?
+            if now.allocated >= lines.allocated {
+                refusal =
+                    "Metal has allocated \(Snapshot.gib(now.allocated)) of the \(Snapshot.gib(now.recommended)) "
+                    + "this device recommends, past which the GPU can drop work without an error"
+            } else if now.footprint >= lines.footprint {
+                refusal =
+                    "this process's footprint is \(Snapshot.gib(now.footprint)), past the "
+                    + "\(Snapshot.gib(now.recommended)) this device recommends"
+            } else {
+                refusal = nil
             }
-            guard watch.footprint, now.footprint >= now.recommended else {
-                if watch.footprintOver != nil {
-                    CLILogger.report("[Memory] footprint back under the recommendation. Admitting requests again.")
-                }
-                watch.footprintOver = nil
-                return nil
-            }
-            let reason =
-                "this process's footprint is \(Snapshot.gb(now.footprint)), past the "
-                + "\(Snapshot.gb(now.recommended)) this device recommends; try again once running requests finish"
-            if watch.footprintOver == nil { CLILogger.report("[Memory] \(reason). Refusing new requests.") }
-            watch.footprintOver = reason
-            return reason
+            defer { watch.refusing = refusal != nil }
+            return (refusal, watch.refusing != (refusal != nil))
         }
+        if changed {
+            CLILogger.log(
+                refusal.map { "\($0). Refusing new requests until it is back under." }
+                    ?? "back under the device's recommendation (\(now.description)). Admitting requests again.",
+                component: "Memory", level: 0)
+        }
+        return (now, refusal)
     }
 
-    /// Why the guard is refusing as of its last check, the same text a refused request gets, without
-    /// checking again; nil while it is not refusing.
-    package var lastRefusal: String? {
-        watch.withLock { $0.tripped ?? $0.footprintOver }
-    }
+    /// Why this process should admit nothing more right now, or nil. See ``check()``.
+    package func refusalReason() -> String? { check().refusal }
 
     /// Reports where the process stands after `stage` (such as load or warmup): a warning when it is
     /// near or past the device's recommendation, naming `advice` as what would give memory back.
     package func report(after stage: String, advice: String) {
-        let now = snapshot
+        let now = measure()
         guard now.recommended > 0 else { return }
         if now.allocatedFraction >= 1 || now.footprint >= now.recommended {
-            CLILogger.report(
-                "[Memory] after \(stage): \(now.description) — past what this device recommends. "
-                    + "The GPU may drop work without an error and the machine may swap. \(advice)")
+            CLILogger.log(
+                "after \(stage): \(now.description) — past what this device recommends. The GPU may drop "
+                    + "work without an error. \(advice)",
+                component: "Memory", level: 0)
         } else if now.allocatedFraction >= tripFraction {
-            CLILogger.report(
-                "[Memory] after \(stage): \(now.description) — "
-                    + "\(Int(now.allocatedFraction * 100))% of this device's recommendation, with no "
-                    + "headroom left. \(advice)")
+            CLILogger.log(
+                "after \(stage): \(now.description) — \(Int(now.allocatedFraction * 100))% of this device's "
+                    + "recommendation, with no headroom left. \(advice)",
+                component: "Memory", level: 0)
         } else {
             CLILogger.log("after \(stage): \(now.description)", component: "Memory")
         }

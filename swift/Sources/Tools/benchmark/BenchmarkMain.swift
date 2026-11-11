@@ -42,7 +42,7 @@ struct LLMBenchmark: AsyncParsableCommand {
     @Option(
         name: [.customShort("c"), .customLong("concurrency")],
         help:
-            "Requests in flight at once through the continuous-batching scheduler, each with its own prompt. Above 1, needs the coreai-sequential engine and a model exported with --attention-mask batched."
+            "Requests in flight at once through the continuous-batching scheduler, each with its own prompt. Up to the model's max batch size decode together; the rest queue for a free row, as on llm-server. Above 1, needs the coreai-sequential engine and a model exported with --attention-mask batched."
     )
     var concurrency: Int = 1
 
@@ -350,8 +350,12 @@ struct BenchmarkReport: Codable {
     let promptTokens: Int
     let generationTokens: Int
     let numTrials: Int
+    /// Rows decoded in lockstep (`--batch-size`); 1 for a `--concurrency` run, which has none.
     let batchSize: Int
+    /// Requests in flight at once, for a `--concurrency` run.
     var concurrency: Int?
+    /// Of `concurrency`, how many the scheduler decodes at once; the rest queue.
+    var residentRows: Int?
     let prepareSeconds: Double
     let cacheHit: Bool
     let warmupSeconds: Double

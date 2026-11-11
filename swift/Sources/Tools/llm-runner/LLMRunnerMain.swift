@@ -309,7 +309,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     @Option(
         name: .customLong("concurrent-requests"),
         help:
-            "With --prompt-list: how many prompts generate at once, a number (default: every prompt, up to the model's max batch size; unlike llm-server's, no 'auto'). The rest wait for a free row."
+            "With --prompt-list: rows that decode at once, a number up to the model's max batch size (default: every prompt, up to that size; unlike llm-server's, no 'auto'). The other prompts wait for a free row."
     )
     var concurrentRequests: Int?
 
@@ -913,6 +913,13 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             try RawTokenScoring.checkFits(
                 rawScoring, vocabSize: bundle.vocabSize, maxContextLength: bundle.maxContextLength)
         }
+        // Read and size a prompt list before the model loads, so a bad file or width fails fast.
+        let promptBatch = try promptList.map { path in
+            let prompts = try Self.readPromptList(path)
+            let width = try Self.batchWidth(
+                requested: concurrentRequests, promptCount: prompts.count, maxBatchSize: bundle.maxBatchSize)
+            return (prompts: prompts, width: width)
+        }
 
         // Resolve component model URLs once; reused for the cache check and model loading below.
         // An LLM bundle has only `main`; VLM bundles also have `vision`, plus `embedding` unless the
@@ -1019,11 +1026,11 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             print(" done in \(String(format: "%.3f", prepareElapsed))s\(cacheSuffix)\n")
         }
 
-        if let promptList {
+        if let promptBatch {
             try await runBatchGeneration(
-                promptListPath: promptList,
+                prompts: promptBatch.prompts,
+                width: promptBatch.width,
                 inferenceEngine: inferenceEngine,
-                bundle: bundle,
                 tokenizer: tokenizer,
                 samplingConfiguration: samplingConfiguration,
                 additionalEosTokenIds: additionalEosTokenIds)

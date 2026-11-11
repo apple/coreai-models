@@ -57,16 +57,26 @@ struct PromptListTests {
         }
     }
 
+    /// The message `llm-runner` prints for `arguments`, or nil when they parse.
+    private func parseError(_ arguments: [String]) -> String? {
+        do {
+            _ = try LLMRunner.parse(arguments)
+            return nil
+        } catch {
+            return LLMRunner.message(for: error)
+        }
+    }
+
     @Test("--prompt-list refuses a single-prompt input, and --concurrent-requests needs it")
     func refusesConflicts() {
-        #expect(throws: (any Error).self) {
-            try LLMRunner.parse(["--prompt-list", "p.txt", "--prompt", "hi"])
-        }
-        #expect(throws: (any Error).self) {
-            try LLMRunner.parse(["--concurrent-requests", "2", "--prompt", "hi"])
-        }
-        #expect(throws: (any Error).self) {
-            try LLMRunner.parse(["--prompt-list", "p.txt", "--inference-engine-variant", "coreai-pipelined"])
-        }
+        #expect(
+            parseError(["--prompt-list", "p.txt", "--prompt", "hi"])?.contains("cannot be used with --prompt") == true)
+        #expect(
+            parseError(["--concurrent-requests", "2", "--prompt", "hi"])?.contains("applies to --prompt-list") == true)
+        #expect(parseError(["--prompt-list", "p.txt", "--concurrent-requests", "0"])?.contains(">= 1") == true)
+        #expect(
+            parseError(["--prompt-list", "p.txt", "--inference-engine-variant", "coreai-pipelined"])?
+                .contains("runs on the coreai-sequential engine") == true)
+        #expect(parseError(["--prompt-list", "p.txt", "--concurrent-requests", "2"]) == nil)
     }
 }

@@ -54,17 +54,6 @@ public struct CLILogger {
         Self.level >= level
     }
 
-    /// A line the operator sees whatever the verbosity, from a library target.
-    ///
-    /// For the handful of things a run has to say about itself — memory past what the device
-    /// recommends, requests being refused — where staying silent would leave a degraded session
-    /// looking like a normal one. Distinct from ``log(_:component:level:)`` so that
-    /// choosing to be unconditional is visible at the call site rather than a level argument
-    /// somebody tunes later. Goes to stderr, like ``log(_:component:level:)``.
-    public static func report(_ message: String, component: String? = nil) {
-        log(message, component: component, level: 0)
-    }
-
     public static var isVerbose: Bool {
         Self.level >= 1
     }

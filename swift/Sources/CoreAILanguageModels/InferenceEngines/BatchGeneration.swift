@@ -6,7 +6,7 @@
 import CoreAIShared
 import Foundation
 
-/// One request's reply from ``RequestSink/generateBatch(_:)``, and when it came.
+/// One request's reply from ``BatchScheduler/generateBatch(_:)``, and when it came.
 package struct BatchGenerationResult: Sendable {
     /// The reply, without the end-of-sequence token that ended it.
     package let tokens: [Int32]
@@ -14,17 +14,46 @@ package struct BatchGenerationResult: Sendable {
     package let promptTokenCount: Int
     /// Submission to first token, queueing included.
     package let timeToFirstToken: Double
-    /// First token to last, what the request's own rate divides by.
+    /// First token of the reply to its last, what the request's own rate divides by.
     package let decodeSeconds: Double
 
-    /// Decode rate for this request alone; zero for a single token, which has no interval.
-    package var tokensPerSecond: Double {
-        guard tokens.count > 1, decodeSeconds > 0 else { return 0 }
+    package init(
+        tokens: [Int32], stopReason: StopReason, promptTokenCount: Int, timeToFirstToken: Double,
+        decodeSeconds: Double
+    ) {
+        self.tokens = tokens
+        self.stopReason = stopReason
+        self.promptTokenCount = promptTokenCount
+        self.timeToFirstToken = timeToFirstToken
+        self.decodeSeconds = decodeSeconds
+    }
+
+    /// `row` as a reply, timed from `started`. The end-of-sequence token that ended it is not part
+    /// of the reply, so it leaves both the tokens and the span. An EOS-only reply has no tokens, and
+    /// its EOS still marks its time to first token.
+    init(_ row: RowResult, promptTokenCount: Int, started: SuspendingClock.Instant) {
+        var tokens = row.tokens
+        var times = row.tokenTimes
+        if row.stopReason == .eos, !tokens.isEmpty {
+            tokens.removeLast()
+            times.removeLast()
+        }
+        let first = times.first ?? row.tokenTimes.first ?? started
+        let last = times.last ?? first
+        self.init(
+            tokens: tokens, stopReason: row.stopReason, promptTokenCount: promptTokenCount,
+            timeToFirstToken: (first - started).inSeconds, decodeSeconds: (last - first).inSeconds)
+    }
+
+    /// Decode rate for this request alone, or nil for a reply of fewer than two tokens, which has no
+    /// interval to divide by.
+    package var tokensPerSecond: Double? {
+        guard tokens.count > 1, decodeSeconds > 0 else { return nil }
         return Double(tokens.count - 1) / decodeSeconds
     }
 }
 
-/// Whole-batch numbers from ``RequestSink/generateBatch(_:)``, computed once for every tool that
+/// Whole-batch numbers from ``BatchScheduler/generateBatch(_:)``, computed once for every tool that
 /// reports them.
 ///
 /// Rates across requests divide by the time the requests actually spanned, never sum each request's
@@ -35,13 +64,16 @@ package struct BatchGenerationMetrics: Sendable {
     /// Wall clock for the whole batch, queueing included.
     package let wallSeconds: Double
     package let generatedTokens: Int
-    /// Every prompt token over the time until the last request's first token, when the last prefill
-    /// finished.
+    /// Prompt tokens over prefill time for the first `rows` requests to start, the ones admitted
+    /// before any request queued: their prompt tokens over the time until the last of them produced
+    /// its first token.
     package let promptTokensPerSecond: Double
     /// Tokens decoded after each request's first, over the span from the earliest first token to the
-    /// latest last one.
+    /// latest last one. With more requests than rows, that span also covers the later requests'
+    /// prefills.
     package let decodeTokensPerSecond: Double
-    /// Each request's own decode rate, averaged: what one caller sees.
+    /// Each request's own decode rate, averaged over the replies long enough to have one: what one
+    /// caller sees. Zero when none is.
     package let meanRequestTokensPerSecond: Double
     package let meanTimeToFirstToken: Double
 
@@ -50,30 +82,32 @@ package struct BatchGenerationMetrics: Sendable {
         wallSeconds > 0 ? Double(generatedTokens) / wallSeconds : 0
     }
 
-    package init(results: [BatchGenerationResult], wallSeconds: Double) {
+    /// - Parameter rows: Requests the scheduler decodes at once, which bounds the first wave.
+    package init(results: [BatchGenerationResult], wallSeconds: Double, rows: Int) {
         self.requestCount = results.count
         self.wallSeconds = wallSeconds
         self.generatedTokens = results.reduce(0) { $0 + $1.tokens.count }
-        let lastFirstToken = results.map(\.timeToFirstToken).max() ?? 0
-        let promptTotal = results.reduce(0) { $0 + $1.promptTokenCount }
-        self.promptTokensPerSecond = lastFirstToken > 0 ? Double(promptTotal) / lastFirstToken : 0
+        let firstWave = results.sorted { $0.timeToFirstToken < $1.timeToFirstToken }.prefix(Swift.max(1, rows))
+        let firstWaveEnd = firstWave.map(\.timeToFirstToken).max() ?? 0
+        let firstWavePrompt = firstWave.reduce(0) { $0 + $1.promptTokenCount }
+        self.promptTokensPerSecond = firstWaveEnd > 0 ? Double(firstWavePrompt) / firstWaveEnd : 0
         let decodeStart = results.map(\.timeToFirstToken).min() ?? 0
         let decodeEnd = results.map { $0.timeToFirstToken + $0.decodeSeconds }.max() ?? 0
         let decoded = results.reduce(0) { $0 + Swift.max(0, $1.tokens.count - 1) }
         self.decodeTokensPerSecond = decodeEnd > decodeStart ? Double(decoded) / (decodeEnd - decodeStart) : 0
-        let rates = results.map(\.tokensPerSecond)
+        let rates = results.compactMap(\.tokensPerSecond)
         self.meanRequestTokensPerSecond = rates.isEmpty ? 0 : rates.reduce(0, +) / Double(rates.count)
         self.meanTimeToFirstToken =
             results.isEmpty ? 0 : results.map(\.timeToFirstToken).reduce(0, +) / Double(results.count)
     }
 }
 
-extension RequestSink {
+extension BatchScheduler {
     /// Generates a fixed set of requests at once, through the same loop that serves requests arriving
     /// over time, and times each one.
     ///
-    /// Requests are submitted in order, so admission order is request order; up to `maxConcurrent`
-    /// run at once and the rest wait their turn.
+    /// The requests are queued in one step (see ``run(_:)``): all or none, admitted in request order,
+    /// up to `maxConcurrent` at once with the rest waiting their turn.
     ///
     /// - Returns: One result per request in request order, and whole-batch numbers.
     package func generateBatch(
@@ -83,52 +117,14 @@ extension RequestSink {
             throw InferenceRuntimeError.invalidArgument("generateBatch called with no requests")
         }
         let started = SuspendingClock.now
-        let streams = try requests.map { try submit($0) }
-        let results = try await withThrowingTaskGroup(of: (Int, BatchGenerationResult).self) { group in
-            for (index, stream) in streams.enumerated() {
-                let promptTokens = requests[index].promptTokens.count
-                group.addTask {
-                    var tokens: [Int32] = []
-                    var reason = StopReason.maxTokens
-                    var first: SuspendingClock.Instant?
-                    var last = started
-                    var beforeLast = started
-                    for try await event in stream {
-                        switch event {
-                        case .token(let token, _):
-                            tokens.append(token)
-                            beforeLast = last
-                            last = .now
-                            if first == nil { first = last }
-                        case .finished(let stopReason):
-                            reason = stopReason
-                        }
-                    }
-                    // The end-of-sequence token is delivered like any other; it is not part of the reply,
-                    // so the reply's span ends at the token before it.
-                    if reason == .eos, tokens.count > 1 {
-                        tokens.removeLast()
-                        last = beforeLast
-                    } else if reason == .eos {
-                        tokens.removeAll()
-                    }
-                    let firstAt = first ?? last
-                    return (
-                        index,
-                        BatchGenerationResult(
-                            tokens: tokens, stopReason: reason, promptTokenCount: promptTokens,
-                            timeToFirstToken: (firstAt - started).inSeconds,
-                            decodeSeconds: (last - firstAt).inSeconds)
-                    )
-                }
-            }
-            var results = [BatchGenerationResult?](repeating: nil, count: requests.count)
-            for try await (index, result) in group { results[index] = result }
-            return results.map { $0! }
+        let rows = try await run(requests)
+        let results = zip(rows, requests).map { row, request in
+            BatchGenerationResult(row, promptTokenCount: request.promptTokens.count, started: started)
         }
         return (
             results,
-            BatchGenerationMetrics(results: results, wallSeconds: (SuspendingClock.now - started).inSeconds)
+            BatchGenerationMetrics(
+                results: results, wallSeconds: (SuspendingClock.now - started).inSeconds, rows: maxConcurrent)
         )
     }
 }

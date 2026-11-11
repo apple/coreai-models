@@ -696,9 +696,9 @@ public struct ReadyResponse: Codable, Sendable {
         public let recommendedMB: Double
         /// What the kernel charges this process.
         public let footprintMB: Double
-        /// Why new requests are being refused with 503 `out_of_memory`, or nil while they are not. Past
-        /// Metal's line this stays until a restart; past the footprint line it clears once the
-        /// footprint is back under.
+        /// Why new requests are being refused with 503 `out_of_memory`, or nil while they are not. It
+        /// clears once the process is back under the line. While it is set, `/ready` answers 503 and
+        /// `status` is `"refusing"`.
         public let refusing: String?
 
         public init(metalAllocatedMB: Double, recommendedMB: Double, footprintMB: Double, refusing: String?) {

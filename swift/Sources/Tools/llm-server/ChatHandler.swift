@@ -59,8 +59,9 @@ func startServer(state: ServerState, port: Int) async throws {
     router.get("/ready") { _, _ in
         let ready = state.readySnapshot()
         let data = try JSONEncoder().encode(ready)
+        // 503 while refusing for memory, so a load balancer or supervisor stops routing here.
         return Response(
-            status: .ok,
+            status: ready.memory?.refusing == nil ? .ok : .serviceUnavailable,
             headers: [.contentType: "application/json"],
             body: .init(byteBuffer: ByteBuffer(data: data))
         )
@@ -114,12 +115,13 @@ private func handleChatCompletionsFromBody(body: ByteBuffer, state: ServerState,
             body: .init(byteBuffer: ByteBuffer(data: data)))
     }
 
-    if let reason = state.memoryRefusal() { return try outOfMemoryResponse(reason) }
     let lane = BatchServingRouter.lane(
         hasResponseSchema: chatRequest.responseFormat?.extractedSchema != nil)
     let access: RequestAccess
     do {
         access = try await state.acquireAccess(lane: lane)
+    } catch let refusal as MemoryRefusal {
+        return try outOfMemoryResponse(refusal.reason)
     } catch let error as ServerError {
         let err = ErrorResponse(
             error: .init(
@@ -753,14 +755,23 @@ func tokenizeMessages(
 }
 
 /// 503 `out_of_memory` for a request refused because the process is past the device's memory
-/// recommendation, rather than a server fault.
+/// recommendation, rather than a server fault. `Retry-After` because the refusal clears once the
+/// running requests finish and the process is back under the line.
 func outOfMemoryResponse(_ reason: String) throws -> Response {
-    let err = ErrorResponse(error: .init(message: reason, type: "server_error", code: "out_of_memory"))
+    let err = ErrorResponse(
+        error: .init(
+            message: reason + "; try again once running requests finish", type: "server_error",
+            code: "out_of_memory"))
     let data = try JSONEncoder().encode(err)
     return Response(
-        status: .serviceUnavailable, headers: [.contentType: "application/json"],
+        status: .serviceUnavailable,
+        headers: [.contentType: "application/json", .retryAfter: outOfMemoryRetryAfterSeconds],
         body: .init(byteBuffer: ByteBuffer(data: data)))
 }
+
+/// Seconds a client refused for memory is told to wait, long enough for a running request to finish
+/// a few hundred tokens.
+let outOfMemoryRetryAfterSeconds = "5"
 
 private func buildStopSequences(from request: ChatCompletionRequest, state: ServerState) -> StopSequences {
     var additionalSequences: [[Int32]] = []

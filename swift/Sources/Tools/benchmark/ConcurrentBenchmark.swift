@@ -57,7 +57,7 @@ extension LLMBenchmark {
             trials.append(trial)
             if i > 0 { print() }
             print("🧪 Trial \(i + 1)")
-            print("⚡ Prompt:     \(fmt(trial.promptTps)) tokens/sec, all requests together")
+            print("⚡ Prompt:     \(fmt(trial.promptTps)) tokens/sec, first \(width) requests together")
             print("⏱️  TTFT:       \(fmt(trial.meanTtftSeconds ?? 0))s mean")
             print("🏃 Generation: \(fmt(trial.perRequestGenTps ?? 0)) tokens/sec per request")
             print("📈 Aggregate:  \(fmt(trial.genTps)) tokens/sec decode")
@@ -79,7 +79,7 @@ extension LLMBenchmark {
         print("Prepare:    \(fmt(prepareSeconds))s\(cacheSuffix)")
         print("Warmup:     \(fmt(warmupSeconds))s")
         print("Requests:   \(concurrency) at once, \(width) resident")
-        print("Prompt:     \(fmt(averages.promptTps)) tokens/sec, all requests together")
+        print("Prompt:     \(fmt(averages.promptTps)) tokens/sec, first \(width) requests together")
         print("TTFT:       \(fmt(averages.meanTtftSeconds ?? 0))s mean")
         print("Generation: \(fmt(averages.perRequestGenerationTps ?? 0)) tokens/sec per request")
         print("Aggregate:  \(fmt(averages.generationTps)) tokens/sec decode")
@@ -92,8 +92,10 @@ extension LLMBenchmark {
                 promptTokens: promptTokens,
                 generationTokens: generationTokens,
                 numTrials: numTrials,
-                batchSize: width,
+                // No lockstep batch: the scheduler batches whichever requests are running.
+                batchSize: 1,
                 concurrency: concurrency,
+                residentRows: width,
                 prepareSeconds: prepareSeconds,
                 cacheHit: cacheHit,
                 warmupSeconds: warmupSeconds,
