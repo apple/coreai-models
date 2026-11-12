@@ -20,24 +20,17 @@ from coreai_models.models.ios.embedding_gemma2 import (
     conv1x1,
     load_conv_weights,
 )
-from coreai_models.models.macos.embedding_gemma2 import rope_inv_freq
 from coreai_models.models.macos.embedding_gemma2_vision import (
     EmbeddingGemma2ImageEncoder as MacEmbeddingGemma2ImageEncoder,
 )
 from coreai_models.models.macos.embedding_gemma2_vision import EmbeddingGemma2VisionConfig
 from coreai_models.primitives.ios.rms_norm import MaxAbsRMSNorm, MaxAbsRMSNormNoScale
+from coreai_models.primitives.ios.rope import apply_rope, rope_cos_sin, rope_inv_freq
 
 
 def one_hot_f16(coord: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
     """Exact one-hot of integer ``coord [..., 1]`` over ``grid [G]``; padding (-1) gives zeros."""
     return torch.relu(1.0 - (coord - grid).abs())
-
-
-def rotate_half_axial(x: torch.Tensor) -> torch.Tensor:
-    """Rotate-half inside each spatial half of the head dim; ``x``: ``(B, H, hd, P)``."""
-    q = x.shape[2] // 4
-    x0, x1, x2, x3 = x[:, :, :q], x[:, :, q : 2 * q], x[:, :, 2 * q : 3 * q], x[:, :, 3 * q :]
-    return torch.cat((-x1, x0, -x3, x2), dim=2)
 
 
 class VisionAttention(nn.Module):
@@ -65,8 +58,9 @@ class VisionAttention(nn.Module):
         q = self.q_norm(self._heads(self.q_proj(x)))
         k = self.k_norm(self._heads(self.k_proj(x)))
         v = self.v_norm(self._heads(self.v_proj(x)))
-        q = q * cos + rotate_half_axial(q) * sin
-        k = k * cos + rotate_half_axial(k) * sin
+        # Axial RoPE over (B, H, hd, P): one rotate-half concat, full-width multiply-add.
+        q = apply_rope(q, cos, sin, head_axis=None, ndim=2, dim=2, fused=True)
+        k = apply_rope(k, cos, sin, head_axis=None, ndim=2, dim=2, fused=True)
         c = self.n_heads * self.head_dim
         key_bias = bias.reshape(b, 1, 1, p)
         qt, vt = q.transpose(2, 3), v.transpose(2, 3)  # (B, H, P, hd)
@@ -127,10 +121,14 @@ class EmbeddingGemma2ImageEncoder(nn.Module):
             raise ValueError(f"position table has {table.shape[1]} rows; budget needs {g}")
         self.pos_x.copy_(table[0, :g])
         self.pos_y.copy_(table[1, :g])
-        inv = rope_inv_freq(cfg.head_dim // 2, cfg.rope_theta)
-        ang = torch.arange(g, dtype=torch.float32)[:, None] * inv[None, :]
-        self.cos_tab.copy_(ang.cos())
-        self.sin_tab.copy_(ang.sin())
+        # Per-axis half-dim tables [G, hd/4], gathered by the exact one-hot in ``forward``.
+        cos, sin = rope_cos_sin(
+            torch.arange(g, dtype=torch.float32),
+            rope_inv_freq(cfg.head_dim // 2, cfg.rope_theta),
+            torch.float32,
+        )
+        self.cos_tab.copy_(cos)
+        self.sin_tab.copy_(sin)
 
     def forward(self, pixel_values: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
         dt = self.input_proj.weight.dtype
