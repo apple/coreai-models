@@ -18,7 +18,7 @@ from typing_extensions import Self
 
 from coreai_models.primitives.ios.rope import RoPECache as NERoPE
 from coreai_models.primitives.ios.rope import RoPECache as iOSRoPE
-from coreai_models.primitives.ios.rope import apply_rope
+from coreai_models.primitives.ios.rope import apply_rope, rope_cos_sin, rope_inv_freq
 from tests._runner_infra.testing_utils import (
     MACOS_27_KNOWN_ISSUE,
     assert_close,
@@ -294,3 +294,39 @@ def test_apply_rope_rejects_ndim_not_dividing_last_dim():
     sin = torch.randn(1, 3, 6)
     with pytest.raises((RuntimeError, ValueError)):
         apply_rope(x, cos, sin, ndim=4)
+
+
+def test_apply_rope_channels_first_and_fused():
+    """``dim=2`` rotates a channels-first ``(B, H, D, S)`` tensor; ``fused`` matches the split."""
+    x = torch.randn(2, 3, 16, 5)
+    cos = torch.randn(1, 1, 16, 5)
+    sin = torch.randn(1, 1, 16, 5)
+
+    last = apply_rope(x.transpose(2, 3), cos.transpose(2, 3), sin.transpose(2, 3), head_axis=None)
+    out = apply_rope(x, cos, sin, head_axis=None, dim=2)
+    assert torch.equal(out, last.transpose(2, 3))
+
+    x0, x1, x2, x3 = x.split(4, dim=2)
+    expected = x * cos + torch.cat((-x1, x0, -x3, x2), dim=2) * sin
+    for fused in (True, False):
+        out = apply_rope(x, cos, sin, head_axis=None, ndim=2, dim=2, fused=fused)
+        assert torch.equal(out, expected)
+
+
+def test_rope_cos_sin_layouts():
+    """Half-dim, axial and full layouts of ``rope_cos_sin``, tied to ``RoPECache``'s table."""
+    inv_freq = rope_inv_freq(8, 100.0)
+    assert torch.equal(inv_freq, 1.0 / (100.0 ** (torch.arange(0, 8, 2).float() / 8)))
+
+    positions = torch.tensor([[[0, 0], [3, 1], [-1, -1]]])  # [B, P, 2]; -1 is padding
+    cos, sin = rope_cos_sin(positions, inv_freq, torch.float32, ndim=2, full=True)
+    fx = positions[..., 0:1].float() * inv_freq
+    fy = positions[..., 1:2].float() * inv_freq
+    angles = torch.cat((fx, fx, fy, fy), dim=-1)
+    assert torch.equal(cos, angles.cos())
+    assert torch.equal(sin, angles.sin())
+
+    cos, sin = rope_cos_sin(torch.arange(6), inv_freq, torch.float32)
+    cache = iOSRoPE(8, 6, base=100.0)
+    assert torch.equal(cos, cache.cos_cached[:, :4])
+    assert torch.equal(sin, cache.sin_cached[:, :4])
