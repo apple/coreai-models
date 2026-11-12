@@ -242,7 +242,7 @@ func runChatCompletion(chatRequest: ChatCompletionRequest, state: ServerState, s
     let schema = chatRequest.responseFormat?.extractedSchema
     if let schema {
         CLILogger.log("[\(requestID)] constrained generation (json_schema)", component: "Server")
-        strategy = ConstrainedDecodingStrategy(jsonSchema: schema, vocabSize: state.config.vocabSize)
+        strategy = jsonSchemaStrategy(schema, state: state)
     } else {
         strategy = VanillaDecodingStrategy()
     }
@@ -487,7 +487,7 @@ func startStreamingDecode(
     let strategy: any DecodingStrategy
     let schema = chatRequest.responseFormat?.extractedSchema
     if let schema {
-        strategy = ConstrainedDecodingStrategy(jsonSchema: schema, vocabSize: state.config.vocabSize)
+        strategy = jsonSchemaStrategy(schema, state: state)
     } else {
         strategy = VanillaDecodingStrategy()
     }
@@ -820,16 +820,26 @@ func reportedFinishReason(
     }
 }
 
-/// Throws a 400 for a `json_schema` the engine can't serve: guided generation masks each step's
-/// logits, and an engine that samples on the GPU returns none. Checked before any generation, so a
-/// streaming request is refused before its response starts rather than after.
+/// The strategy for a `json_schema` request. An engine that masks the logits on the GPU itself (the
+/// pipelined engine) gets its own path; any other engine returns each step's logits for the strategy
+/// to mask.
+func jsonSchemaStrategy(_ schema: String, state: ServerState) -> any DecodingStrategy {
+    if state.engineForRequest(lane: .fallbackBatchOne) is any ConstrainedGenerationCapable {
+        return PipelinedConstrainedDecodingStrategy(jsonSchema: schema, vocabSize: state.config.vocabSize)
+    }
+    return ConstrainedDecodingStrategy(jsonSchema: schema, vocabSize: state.config.vocabSize)
+}
+
+/// Throws a 400 for a `json_schema` the engine can't serve: one that neither returns logits nor masks
+/// them on the GPU. Checked before any generation, so a streaming request is refused before its
+/// response starts rather than after.
 func requireSchemaSupport(_ chatRequest: ChatCompletionRequest, state: ServerState) throws {
     guard chatRequest.responseFormat?.extractedSchema != nil,
-        !state.engineForRequest(lane: .fallbackBatchOne).supportsLogits
+        !state.engineForRequest(lane: .fallbackBatchOne).supportsGuidedGeneration
     else { return }
     throw ServerError.badRequest(
-        "response_format json_schema needs an engine that returns logits, and this server's samples on the "
-            + "GPU; serve the model with --variant coreai-sequential for guided generation")
+        "response_format json_schema needs an engine that returns logits or masks them on the GPU, and this "
+            + "server's does neither; serve the model with --variant coreai-sequential for guided generation")
 }
 
 /// An SSE frame carrying `error`, for a stream that fails after its response has started, so the
