@@ -67,7 +67,6 @@ public struct EmbeddingsInputHandler: SyncInputHandler {
             CLILogger.log("  - scatter merge complete")
         }
 
-        // TODO: Build compact position_ids for all-sliding (ring) decoders, as TokenInputHandler does.
         let totalPositions = context.processedTokenCount + batchSize
         let resolvedPosDesc = positionIdsDescriptor.resolvingDynamicDimensions([1, totalPositions])
         var positionIds = NDArray(descriptor: resolvedPosDesc)

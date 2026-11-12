@@ -28,9 +28,8 @@ from coreai_models.models.macos.diffusion_gemma import DiffusionGemmaRMSNorm as 
 from coreai_models.models.macos.embedding_gemma2 import (
     EmbeddingGemma2Attention,
     EmbeddingGemma2SandwichLayer,
-    rope_inv_freq,
 )
-from coreai_models.primitives.ios.rope import apply_rope
+from coreai_models.primitives.ios.rope import apply_rope, rope_cos_sin, rope_inv_freq
 
 # Special token ids from the EG2 tokenizer / config.json.
 EG2_BOS_TOKEN_ID = 2
@@ -106,8 +105,8 @@ class EmbeddingGemma2VisionConfig:
 class VisionAttention(EmbeddingGemma2Attention):
     """``EmbeddingGemma2Attention`` with axial 2-D RoPE.
 
-    Half of ``head_dim`` rotates by x and half by y, with cos/sin from ``axial_rope_cos_sin``
-    laid out ``[fx, fx, fy, fy]``.
+    Half of ``head_dim`` rotates by x and half by y, with cos/sin from ``rope_cos_sin`` laid out
+    ``[fx, fx, fy, fy]``.
     """
 
     def __init__(self, config: EmbeddingGemma2VisionConfig) -> None:
@@ -197,19 +196,6 @@ class EmbeddingGemma2ImageEncoder(nn.Module):
 
     # -- pieces -------------------------------------------------------------------------
 
-    def axial_rope_cos_sin(
-        self, position_ids: torch.Tensor, dtype: torch.dtype
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """``[B, P, 2]`` positions -> cos/sin ``[B, P, head_dim]`` laid out ``[fx, fx, fy, fy]``.
-
-        Padding rows keep their raw ``-1`` coordinates, as in HF; attention masks them and the
-        pooler drops them.
-        """
-        freqs = position_ids.unsqueeze(-1).float() * self.rope_inv_freq  # [B, P, 2, D/4]
-        fx, fy = freqs[..., 0, :], freqs[..., 1, :]
-        angles = torch.cat([fx, fx, fy, fy], dim=-1)
-        return angles.cos().to(dtype), angles.sin().to(dtype)
-
     def pool(
         self, hidden: torch.Tensor, position_ids: torch.Tensor, padding: torch.Tensor
     ) -> torch.Tensor:
@@ -240,7 +226,9 @@ class EmbeddingGemma2ImageEncoder(nn.Module):
             )
         padding = position_ids[..., 0] < 0
         x = self.patch_embedder(pixel_values, position_ids, padding)
-        cos, sin = self.axial_rope_cos_sin(position_ids, x.dtype)
+        # Axial cos/sin [B, P, head_dim] laid out [fx, fx, fy, fy]. Padding rows keep their raw -1
+        # coordinates, as in HF; attention masks them and the pooler drops them.
+        cos, sin = rope_cos_sin(position_ids, self.rope_inv_freq, x.dtype, ndim=2, full=True)
         # Boolean key mask, True = attend. The SDPA primitive reads any mask as boolean; do not
         # pass an additive float mask.
         attn_mask = torch.logical_not(padding)[:, None, None, :]

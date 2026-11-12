@@ -3,6 +3,7 @@
 // Use of this source code is governed by a BSD-3-clause license that can
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
+import CoreAIShared
 import Testing
 
 @testable import CoreAILanguageModels
@@ -12,25 +13,6 @@ import Testing
 /// hardware-free — pure CPU sampling over hand-built logits.
 @Suite("Seeded sampling", .serialized)
 struct SeededSamplingTests {
-    // MARK: - SeededRandomNumberGenerator
-
-    @Test("Same seed reproduces the same stream")
-    func sameSeedSameStream() {
-        var a = SeededRandomNumberGenerator(seed: 12345)
-        var b = SeededRandomNumberGenerator(seed: 12345)
-        for _ in 0..<32 {
-            #expect(a.next() == b.next())
-        }
-    }
-
-    @Test("Different seeds diverge immediately")
-    func differentSeedsDiverge() {
-        var a = SeededRandomNumberGenerator(seed: 1)
-        var b = SeededRandomNumberGenerator(seed: 2)
-        // SplitMix64 mixes hard, so adjacent seeds differ on the first draw.
-        #expect(a.next() != b.next())
-    }
-
     // MARK: - Reproducible token selection
 
     /// A flat distribution: equal logits so softmax is uniform and the RNG alone
