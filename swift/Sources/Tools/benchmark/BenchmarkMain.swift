@@ -169,7 +169,8 @@ struct LLMBenchmark: AsyncParsableCommand {
                         + "with --attention-mask batched --dynamic-batch-size N")
             }
             try await runConcurrent(
-                engine: seq, bundle: bundle, prepareSeconds: prepareSeconds, cacheHit: cacheHit)
+                engine: seq, bundle: bundle, prepareSeconds: prepareSeconds, cacheHit: cacheHit,
+                measurement: measurement)
             return
         }
 
