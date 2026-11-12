@@ -21,9 +21,9 @@ from coreai_models._constants import MASK_NEG
 from coreai_models.models.macos.embedding_gemma2 import (
     EmbeddingGemma2TextConfig,
     load_embedding_gemma2_text_encoder,
-    rope_inv_freq,
 )
 from coreai_models.primitives.ios.rms_norm import MaxAbsRMSNorm, MaxAbsRMSNormNoScale
+from coreai_models.primitives.ios.rope import apply_rope, rope_inv_freq
 from coreai_models.primitives.ios.sdpa import SDPA
 
 # Smallest positive normal float16; floor for the row max-abs and squared norm in the output L2
@@ -59,12 +59,12 @@ class EmbeddingGemma2Attention(nn.Module):
         ``(1, L, 1, L)``, ``bias[0, k, 0, q]`` for key ``k`` and query ``q``. Returns
         ``(B, C, 1, L)``."""
         b, _, _, length = x.shape
-        hd, half = self.head_dim, self.head_dim // 2
+        hd = self.head_dim
         q = self.q_norm(self.q_proj(x).reshape(b, self.n_heads, hd, length))
         k = self.k_norm(self.k_proj(x).reshape(b, self.n_kv, hd, length))
         v = self.v_norm(self.v_proj(x).reshape(b, self.n_kv, hd, length))
-        q = q * cos + torch.cat((-q[:, :, half:], q[:, :, :half]), dim=2) * sin
-        k = k * cos + torch.cat((-k[:, :, half:], k[:, :, :half]), dim=2) * sin
+        q = apply_rope(q, cos, sin, head_axis=None, dim=2)
+        k = apply_rope(k, cos, sin, head_axis=None, dim=2)
         q, k, v = (t.reshape(b, -1, 1, length) for t in (q, k, v))
         return self.o_proj(self.sdpa(q, k, v, bias))
 
@@ -138,7 +138,11 @@ class EmbeddingGemma2TextEncoder(nn.Module):
         self.embedding_projection = conv1x1(dim, config.embedding_dim)
 
     def _cos_sin(self, sliding: bool, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """cos/sin ``[1, 1, head_dim, L]`` in ``x``'s dtype for the sliding or full layers."""
+        """cos/sin ``[1, 1, head_dim, L]`` in ``x``'s dtype for the sliding or full layers.
+
+        Built channels-first so no transpose enters the graph (``rope_cos_sin`` puts frequencies
+        last).
+        """
         head_dim = self.config.rope_head_dim(sliding)
         theta = self.config.rope_theta_sliding if sliding else self.config.rope_theta_full
         length = x.shape[-1]

@@ -113,6 +113,24 @@ class TestmacOSRoPE:
         out = rope(x, offset=torch.tensor([0], dtype=torch.int32))
         assert out.shape == x.shape
 
+    @pytest.mark.parametrize("dims", [16, 8])
+    def test_decomposed_rope_applies_given_cos_sin(self, dims, monkeypatch):
+        """Under FORCE_DECOMPOSED_ROPE, given cos/sin rotate exactly as the composite does.
+
+        ``x`` is ``[B, L, H, D]``, so positions inferred from ``shape[-2]`` would be wrong.
+        """
+        from coreai_models.primitives.macos.rope import DecomposedRoPE, RoPE, initialize_rope
+
+        x = torch.randn(2, 5, 3, 16)
+        angles = torch.randn(1, 5, 1, dims // 2)
+        cos, sin = angles.cos(), angles.sin()
+        expected = RoPE(dims=dims)(x, cos=cos, sin=sin)
+
+        monkeypatch.setenv("FORCE_DECOMPOSED_ROPE", "1")
+        rope = initialize_rope(dims=dims)
+        assert isinstance(rope, DecomposedRoPE)
+        assert torch.equal(rope(x, cos=cos, sin=sin), expected)
+
 
 # =============================================================================
 # Functional-parity tests
