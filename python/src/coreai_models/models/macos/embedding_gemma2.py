@@ -29,18 +29,12 @@ from coreai_models.models.macos.diffusion_gemma import (
 from coreai_models.models.macos.diffusion_gemma import (
     DiffusionGemmaRMSNorm as EmbeddingGemma2RMSNorm,
 )
-from coreai_models.models.macos.diffusion_gemma import (
-    ScaledEmbedding,
-    apply_rotary_pos_emb,
-)
+from coreai_models.models.macos.diffusion_gemma import ScaledEmbedding
+from coreai_models.primitives.ios.rope import rope_cos_sin, rope_inv_freq
+from coreai_models.primitives.macos.rope import initialize_rope
 from coreai_models.primitives.macos.sdpa import SDPA
 
 HF_TEXT_PREFIX = "language_model."
-
-
-def rope_inv_freq(dim: int, base: float, device: torch.device | None = None) -> torch.Tensor:
-    """Return RoPE inverse frequencies ``base ** (-arange(0, dim, 2) / dim)`` in float32."""
-    return 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim))
 
 
 @dataclass
@@ -200,12 +194,14 @@ class EmbeddingGemma2Attention(nn.Module):
         self.q_norm = EmbeddingGemma2RMSNorm(hd, eps=eps)
         self.k_norm = EmbeddingGemma2RMSNorm(hd, eps=eps)
         self.v_norm = EmbeddingGemma2RMSNorm(hd, eps=eps, with_scale=False)
+        # cos/sin arrive precomputed per layer type (``rope_cos_sin``); ``base`` is unused there.
+        self.rope = initialize_rope(dims=hd)
         # The mask carries both the window and the key padding; the composite itself stays
         # windowless and non-causal.
         self.sdpa = SDPA(scale=1.0, window_size=0, is_causal=False)
 
     def _rope(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-        return apply_rotary_pos_emb(x, cos, sin, unsqueeze_dim=2)
+        return self.rope(x, cos=cos.unsqueeze(2), sin=sin.unsqueeze(2))
 
     def forward(
         self,
@@ -357,16 +353,6 @@ class EmbeddingGemma2TextEncoder(nn.Module):
             persistent=False,
         )
 
-    @staticmethod
-    def _cos_sin(
-        inv_freq: torch.Tensor, seq_len: int, dtype: torch.dtype, device: torch.device
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Half-dim cos/sin ``[1, L, head_dim/2]`` for positions ``0..L-1`` (fp32 math)."""
-        positions = torch.arange(seq_len, device=device, dtype=torch.float32)
-        freqs = positions.unsqueeze(1) * inv_freq.float().to(device).unsqueeze(0)
-        freqs = freqs.unsqueeze(0)
-        return freqs.cos().to(dtype), freqs.sin().to(dtype)
-
     def encode_tokens(
         self,
         input_ids: torch.Tensor | None = None,
@@ -395,8 +381,10 @@ class EmbeddingGemma2TextEncoder(nn.Module):
         per_layer_inputs = self.ple(inputs_embeds)
         full_mask, sliding_mask = build_attention_masks(attention_mask, self.config.sliding_window)
         dtype, device = inputs_embeds.dtype, inputs_embeds.device
-        sliding_cs = self._cos_sin(self.sliding_inv_freq, seq_len, dtype, device)
-        full_cs = self._cos_sin(self.full_inv_freq, seq_len, dtype, device)
+        # Half-dim cos/sin [1, L, head_dim/2] for positions 0..L-1 (fp32 math).
+        positions = torch.arange(seq_len, device=device, dtype=torch.float32)[None]
+        sliding_cs = rope_cos_sin(positions, self.sliding_inv_freq, dtype)
+        full_cs = rope_cos_sin(positions, self.full_inv_freq, dtype)
 
         h = inputs_embeds
         for i, layer in enumerate(self.layers):
@@ -459,5 +447,4 @@ __all__ = [
     "EmbeddingGemma2TextEncoder",
     "build_attention_masks",
     "load_embedding_gemma2_text_encoder",
-    "rope_inv_freq",
 ]

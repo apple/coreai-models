@@ -147,6 +147,20 @@ struct LogitsWriterTests {
         #expect(top3[1].tokenId == 3)  // Index of 0.5
         #expect(top3[2].tokenId == 2)  // Index of 0.3
     }
+
+    @Test("extractTopK ranks Float16, Float and Double rows alike, ties toward the lower index")
+    func extractTopKElementTypes() {
+        let logits: [Float16] = [0.1, 0.5, 0.3, 0.5, 0.2]
+        let mockTokenizer = MockTokenizer()
+
+        let fromHalf = LogitsWriter.extractTopK(from: logits, tokenizer: mockTokenizer, k: 3)
+        let fromFloat = LogitsWriter.extractTopK(from: logits.map { Float($0) }, tokenizer: mockTokenizer, k: 3)
+        let fromDouble = LogitsWriter.extractTopK(from: logits.map { Double($0) }, tokenizer: mockTokenizer, k: 3)
+
+        #expect(fromHalf.map(\.tokenId) == [1, 3, 2])
+        #expect(fromFloat.map(\.tokenId) == [1, 3, 2])
+        #expect(fromDouble.map(\.tokenId) == [1, 3, 2])
+    }
 }
 
 @Suite("LogitsLength")
