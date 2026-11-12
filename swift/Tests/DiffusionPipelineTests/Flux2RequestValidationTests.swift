@@ -107,6 +107,25 @@ struct Flux2RequestValidationTests {
         try Pipeline.checkImageTokenBudget(noiseTokens: full * full, refSides: [full, full, full, full], config: fixed)
     }
 
+    // MARK: Encoder
+
+    @Test("Input images without a VAE encoder are refused, not dropped")
+    func missingEncoder() throws {
+        try Pipeline.checkEncoder(hasReferences: false, hasEncoder: false, mode: .full, config: fixed)
+        try Pipeline.checkEncoder(hasReferences: true, hasEncoder: true, mode: .full, config: fixed)
+        for (mode, config, asset) in [
+            (DecodeResolution.full, fixed, "vae_encoder"), (.half, fixed, "vae_encoder_half"),
+            (.half, dynamic, "vae_encoder"),
+        ] {
+            do {
+                try Pipeline.checkEncoder(hasReferences: true, hasEncoder: false, mode: mode, config: config)
+                Issue.record("accepted input images without an encoder (\(mode))")
+            } catch PipelineLoadError.unsupportedConfiguration(let message) {
+                #expect(message.contains("the \(asset) component"))
+            }
+        }
+    }
+
     // MARK: Tiled decode
 
     @Test("Tiled decode needs tiles the decoder accepts, and static img2img can't tile")

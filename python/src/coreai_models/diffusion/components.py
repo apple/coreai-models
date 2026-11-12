@@ -14,7 +14,7 @@ dummy inputs.
 """
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, cast
 
 import torch
@@ -418,32 +418,19 @@ ALL_FLUX2_MULTIFUNCTION_COMPONENTS: list[str] = list(FLUX2_MULTIFUNCTION_COMPONE
 # --dynamic: one symbolic "main" per asset replaces the size variants and the multi-function
 # entrypoints. Asset names match the static registry, so the export gets its own directory.
 FLUX2_DYNAMIC_COMPONENTS: dict[str, ComponentSpec | MultiFunctionComponentSpec] = {
-    "transformer": ComponentSpec(
-        asset_name="Transformer",
-        input_names=_FLUX2_TRANSFORMER_INPUT_NAMES,
-        output_names=("output",),
+    "transformer": replace(
+        FLUX2_COMPONENTS["transformer"],
         wrapper_fn=lambda p: Flux2TransformerWrapper(p.transformer, dynamic=True),
-        dummy_fn=dummy_flux2_transformer,
-        quant_dummy_fn=dummy_flux2_transformer_quant_trace,
-        quantizable=True,
         dynamic_shapes_fn=flux2_transformer_dynamic_shapes,
     ),
     "text_encoder": FLUX2_COMPONENTS["text_encoder"],
-    "vae_decoder": ComponentSpec(
-        asset_name="VAEDecoder",
-        input_names=("z",),
-        output_names=("image",),
+    "vae_decoder": replace(
+        FLUX2_COMPONENTS["vae_decoder"],
         wrapper_fn=lambda p: Flux2VAEDecoderWrapper(p.vae, dynamic=True),
-        dummy_fn=dummy_flux2_vae_decoder,
         dynamic_shapes_fn=flux2_vae_decoder_dynamic_shapes,
     ),
-    "vae_encoder": ComponentSpec(
-        asset_name="VAEEncoder",
-        input_names=("image",),
-        output_names=("latent_params",),
-        wrapper_fn=lambda p: Flux2VAEEncoderWrapper(p.vae),
-        dummy_fn=dummy_flux2_vae_encoder,
-        dynamic_shapes_fn=flux2_vae_encoder_dynamic_shapes,
+    "vae_encoder": replace(
+        FLUX2_COMPONENTS["vae_encoder"], dynamic_shapes_fn=flux2_vae_encoder_dynamic_shapes
     ),
 }
 

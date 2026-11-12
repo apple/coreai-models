@@ -40,6 +40,11 @@ extension FlowTransformerPipeline {
         } else {
             resolvedMode = mode
         }
+        if resolvedMode == .tiled, try Self.optionalAsset(AssetKey.transformer, in: bundle) == nil {
+            throw PipelineLoadError.unsupportedConfiguration(
+                "tiled decode needs the full-size transformer, which this bundle doesn't have. "
+                    + "Decode at half size, or export the transformer component.")
+        }
 
         let textEncoderURL = try resolveDeclaredPipelineAsset(AssetKey.textEncoder, in: bundle)
 
@@ -188,7 +193,9 @@ extension FlowTransformerPipeline {
             config: bundle.config,
             mode: mode == .auto ? .full : mode,
             transformer: function(try resolveDeclaredPipelineAsset(AssetKey.transformer, in: bundle)),
-            textEncoder: function(try resolveDeclaredPipelineAsset(AssetKey.textEncoder, in: bundle)),
+            // The text encoder stays fixed-shape under --dynamic.
+            textEncoder: CoreAIDiffusionModelFunction(
+                modelURL: try resolveDeclaredPipelineAsset(AssetKey.textEncoder, in: bundle)),
             decoder: function(try resolveDeclaredPipelineAsset(AssetKey.vaeDecoder, in: bundle)),
             encoder: try optionalAsset(AssetKey.vaeEncoder, in: bundle).map(function),
             tokenizer: try await AutoTokenizer.from(modelFolder: url.appendingPathComponent("tokenizer")),

@@ -70,14 +70,23 @@ extension FlowTransformerPipeline {
         let steps = configuration.stepCount
         let guidanceScale = configuration.guidanceScale
 
+        // Reject a request this bundle can't serve before any model loads.
+        let imageSize = try Self.resolveImageSize(
+            configuration.imageSize, loadedSize: defaultImageSize.width, config: config)
+        let references = configuration.allReferenceImages
+        try Self.checkReferenceCount(references.count, config: config)
+        if mode == .tiled {
+            try Self.checkTiledDecode(imageSize: imageSize, isImageToImage: !references.isEmpty, config: config)
+        }
+        try Self.checkEncoder(
+            hasReferences: !references.isEmpty, hasEncoder: encoder != nil, mode: mode, config: config)
+
         // 1. Encode text
         let textEmbeddings = try await encodeText(configuration.prompt)
         if configuration.lazyModelLoading { await textEncoder.unloadResources() }
         let textSeqLen = textEmbeddings.count / hiddenDim(textEmbeddings)
 
         // 2. Determine latent dimensions from image size
-        let imageSize = try Self.resolveImageSize(
-            configuration.imageSize, loadedSize: defaultImageSize.width, config: config)
         let spatialSide = imageSize / Self.patchSize
         let inChannels = Self.latentChannels
         let seqLen = spatialSide * spatialSide
@@ -87,13 +96,6 @@ extension FlowTransformerPipeline {
         // from the concatenated reference tokens, not from noise blending. txt2img
         // also uses [1.0 → 0]. So sigmaMax is 1.0 in both cases.
         let mu = Self.computeEmpiricalMu(imageSeqLen: seqLen, numSteps: steps)
-        let isActuallyImg2Img = configuration.isImageToImage && encoder != nil
-        let references = isActuallyImg2Img ? configuration.allReferenceImages : []
-
-        try Self.checkReferenceCount(references.count, config: config)
-        if mode == .tiled {
-            try Self.checkTiledDecode(imageSize: imageSize, isImageToImage: isActuallyImg2Img, config: config)
-        }
 
         let sigmaMax: Float = 1.0
         let scheduler = DiscreteFlowScheduler(
@@ -362,6 +364,19 @@ extension FlowTransformerPipeline {
         throw PipelineLoadError.unsupportedConfiguration(
             "\(count) reference images were given but this bundle is statically shaped and takes "
                 + "one. Export with --dynamic for multiple references.")
+    }
+
+    /// Input images are only read through the VAE encoder, so without one they'd be silently
+    /// dropped and the run would quietly become txt2img.
+    static func checkEncoder(
+        hasReferences: Bool, hasEncoder: Bool, mode: DecodeResolution, config: DiffusionConfig
+    ) throws {
+        guard hasReferences, !hasEncoder else { return }
+        // A static half or tiled bundle loads the half-size encoder.
+        let asset = config.dynamicShapes != true && mode != .full ? "vae_encoder_half" : "vae_encoder"
+        throw PipelineLoadError.unsupportedConfiguration(
+            "input images need the \(asset) component, which this bundle doesn't have. Export it, "
+                + "or generate without input images.")
     }
 
     static func checkTiledDecode(imageSize: Int, isImageToImage: Bool, config: DiffusionConfig) throws {

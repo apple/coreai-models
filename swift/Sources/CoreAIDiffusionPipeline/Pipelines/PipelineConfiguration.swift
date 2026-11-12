@@ -64,13 +64,11 @@ public enum ReferenceSize: Hashable, Sendable {
     public static let quarter = ReferenceSize.relative(.quarter)
 
     /// The square size, in pixels, each reference is encoded at for an output of
-    /// `outputSize` pixels. A preset rounds down to whole 16-pixel tokens; a pixel size is
-    /// returned as given.
-    public func pixelSize(outputSize: Int) -> Int {
-        switch self {
-        case .relative(let grid): grid.side(outputSide: outputSize / 16) * 16
-        case .pixels(let pixels): pixels
-        }
+    /// `outputSize` pixels, where one token covers `patchSize` pixels (16 for FLUX.2). A preset
+    /// rounds down to whole tokens; a pixel size is returned as given.
+    public func pixelSize(outputSize: Int, patchSize: Int = 16) -> Int {
+        if case .pixels(let pixels) = self { return pixels }
+        return side(outputSide: outputSize / patchSize, patchSize: patchSize) * patchSize
     }
 
     /// Reference token-grid side for an output grid `outputSide` tokens across, where one

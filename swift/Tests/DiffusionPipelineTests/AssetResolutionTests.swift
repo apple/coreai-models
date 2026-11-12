@@ -84,4 +84,18 @@ struct AssetResolutionTests {
             #expect(message == detail)
         }
     }
+
+    @Test("Tiled decode on a bundle without the full-size transformer says why")
+    func tiledNeedsFullTransformer() async throws {
+        let assets = ["transformer_512": "Transformer_512.aimodel", "vae_decoder_half": "VAEDecoder_half.aimodel"]
+        let dir = try Self.makeBundle(assets: assets, files: Array(assets.values))
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        do {
+            _ = try await FlowTransformerPipeline(from: dir, mode: .tiled)
+            Issue.record("loaded a tiled pipeline without the full-size transformer")
+        } catch PipelineLoadError.unsupportedConfiguration(let message) {
+            #expect(message.hasPrefix("tiled decode needs the full-size transformer"))
+        }
+    }
 }

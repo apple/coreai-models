@@ -53,6 +53,8 @@ def _patch_attn_split_for_dynamic(transformer: torch.nn.Module) -> int:
 def _slice_split_processor_cls() -> type:
     """Build the patched processor class lazily (it subclasses a diffusers class), and only
     once so :func:`_patch_attn_split_for_dynamic` can recognize already-patched modules."""
+    # _get_qkv_projections is private to diffusers; test_slice_split_processor_matches_stock
+    # catches a pin bump that changes it.
     from diffusers.models.attention_dispatch import dispatch_attention_fn
     from diffusers.models.embeddings import apply_rotary_emb
     from diffusers.models.transformers.transformer_flux2 import (
@@ -78,12 +80,10 @@ def _slice_split_processor_cls() -> type:
             key = attn.norm_k(key.unflatten(-1, (attn.heads, -1)))
             value = value.unflatten(-1, (attn.heads, -1))
 
-            txt_len = None
             if attn.added_kv_proj_dim is not None:
                 encoder_query = attn.norm_added_q(encoder_query.unflatten(-1, (attn.heads, -1)))
                 encoder_key = attn.norm_added_k(encoder_key.unflatten(-1, (attn.heads, -1)))
                 encoder_value = encoder_value.unflatten(-1, (attn.heads, -1))
-                txt_len = encoder_query.shape[1]
                 query = torch.cat([encoder_query, query], dim=1)
                 key = torch.cat([encoder_key, key], dim=1)
                 value = torch.cat([encoder_value, value], dim=1)
@@ -104,6 +104,7 @@ def _slice_split_processor_cls() -> type:
 
             if encoder_hidden_states is not None:
                 # Constant offsets instead of split_with_sizes; see _patch_attn_split_for_dynamic.
+                txt_len = encoder_hidden_states.shape[1]
                 encoder_hidden_states = attn.to_add_out(hidden_states[:, :txt_len])
                 hidden_states = hidden_states[:, txt_len:]
 
