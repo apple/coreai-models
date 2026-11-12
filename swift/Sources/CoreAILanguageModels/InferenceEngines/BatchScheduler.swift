@@ -3,38 +3,42 @@
 // Use of this source code is governed by a BSD-3-clause license that can
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
+import CoreAIShared
 import Synchronization
 
 /// A `RequestSink` that decodes up to `maxConcurrent` requests in one shared batch session and
-/// admits new requests while others are still decoding. Safe to call from any task.
+/// admits new requests as rows free up. Safe to call from any task.
+///
+/// `submit(_:)` queues a request and returns its event stream. Wrap the scheduler in a
+/// `SchedulerSession`, one per request, to use it as an `InferenceEngine`. `score(_:)` runs scoring
+/// requests as their own padded batch between steps.
+///
+/// A, B and C hold rows 0 to 2 of a batch session with `N` = 4 rows. A and B are decoding when C
+/// joins, so C's prompt chunks alternate with their decode steps:
 ///
 /// ```
-///   submit(_:) ---> waiting queue ---> free row? ---> prefill the prompt into that row
-///                   [ F ][ G ]
-///
-///   batch session, N = 4 rows, one decodeBatch per step over all rows:
-///
-///     row 0   A A A A A a       a = token sampled this step
-///     row 1   B B b             every row decodes at its own cursor
-///     row 2   E e               E took the row that D freed when it finished
-///     row 3   C C C C c
+///   iteration   1   2   3   4   5   6   7
+///   row 0  A        a       a       a   a     a = token sampled by a decode step
+///   row 1  B        b       b       b   b
+///   row 2  C    p       p       p   c   c     p = chunk of C's prompt
+///   row 3       .   .   .   .   .   .   .     free row
 /// ```
 ///
 /// Slot `i` is row `i` of the batch KV cache, and `N` is `maxConcurrent`. A slot goes through these
 /// phases:
-/// - Admission: a queued request takes a free slot, is prefilled into its row and samples its first
-///   token.
-/// - Decode: each step runs `decodeBatch` over all `N` rows, every live row at its own cursor.
-/// - Retirement: the row ends on EOS, a stop sequence, `maxTokens` or cancellation, and the slot
-///   takes the next queued request while the other rows keep decoding.
+/// - Admission: a queued request takes the next free slot.
+/// - Prefill: the prompt up to its last token is prefilled in chunks, oldest request first. While
+///   other rows are decoding, chunks of at most ``SchedulerKV/prefillChunk`` tokens alternate with
+///   decode steps; otherwise chunks are up to ``SchedulerKV/idlePrefillChunk`` tokens.
+/// - Decode: each step advances every prefilled row by one token, at its own position. A row's first
+///   step processes its last prompt token and samples its first token (C at iteration 6 above).
+/// - Retirement: a row finishes on EOS, a stop sequence, `maxTokens`, running out of positions, or
+///   cancellation, and its slot takes the next queued request.
 ///
-/// A request is cancelled by `BatchRequest.cancellation` or by dropping its stream. A cancelled
-/// request leaves before the next decode step, or leaves the queue without a prefill.
-///
-/// `score(_:)` requests run as their own padded batch between decode steps.
+/// A request is cancelled by `BatchRequest.cancellation` or by dropping its stream, and leaves at the
+/// next step.
 package final class BatchScheduler: RequestSink, @unchecked Sendable {
-    private let decodeStep: any BatchedDecodeStep
-    private let session: GenerationSessionState
+    private let kv: any SchedulerKV
     package let maxConcurrent: Int
     /// Requests allowed to wait beyond the free rows, or `nil` for no limit. At least 0.
     private let maxQueued: Int?
@@ -48,10 +52,10 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
     }
 
     /// Bytes held by the shared batch session: its KV cache and persistent states for all rows, and its
-    /// logits buffer, estimated from their shapes and element sizes.
-    package var estimatedSessionBytes: (states: Int, logitsScratch: Int) {
-        (session.estimatedStateBytes, session.estimatedLogitsScratchBytes)
-    }
+    /// logits buffer, estimated from their shapes and element sizes. The batch-1 scratch session of a
+    /// row that is still prefilling isn't included; it holds up to that prompt's KV until the prompt
+    /// is copied into its row.
+    package var estimatedSessionBytes: (states: Int, logitsScratch: Int) { kv.estimatedBytes }
 
     private struct Pending {
         let request: BatchRequest
@@ -79,8 +83,8 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
     /// Lock held by the pump during each iteration, and by an `ExclusiveEngineLease` until it is
     /// released.
     private let engineLock = AsyncFIFOLock()
-    /// Scorer that runs the scoring batches.
-    private let scorer: Scorer
+    /// Runs the scoring batches. Only set when the KV is a contiguous batch session.
+    private let scorer: Scorer?
 
     private struct ScoringJob {
         let request: ScoreRequest
@@ -93,31 +97,59 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
     ///   - maxConcurrent: Rows in the batch, from 1 to the graph's batch capacity. Above 1,
     ///     `engine.supportsBatching` must be true.
     ///   - maxQueued: Requests allowed to wait beyond the free rows, at least 0. `nil` means no limit.
+    ///   - prefillChunk: Maximum number of prompt tokens prefilled between two decode steps, at least 1.
+    ///     Smaller values keep the pauses in running streams shorter; larger values give a new request
+    ///     its first token sooner. When no row is decoding, the engine's prefill chunk size is used.
     ///
-    /// Throws when the session cannot be created. Out-of-range values fail a precondition.
-    package convenience init(engine: CoreAISequentialEngine, maxConcurrent: Int, maxQueued: Int? = nil) throws {
+    /// Throws if the session can't be created, or if the model can't prefill a single row of it
+    /// (vision-language models, assets without a prefill graph, and models with conv, recurrent or
+    /// sliding-window state). Out-of-range values fail a precondition.
+    package convenience init(
+        engine: CoreAISequentialEngine, maxConcurrent: Int, maxQueued: Int? = nil,
+        prefillChunk: Int = BatchScheduler.defaultPrefillChunk
+    ) throws {
         precondition(
             maxConcurrent == 1 || engine.supportsBatching,
             "maxConcurrent \(maxConcurrent) needs a graph with an attn_mask input and a batch dimension above 1")
+        let session = try engine.makeSessionState(batchSize: maxConcurrent)
+        try engine.requireRowWritableCache(session)
         self.init(
-            decodeStep: engine, session: try engine.makeSessionState(batchSize: maxConcurrent),
-            maxConcurrent: maxConcurrent, maxQueued: maxQueued, maxPositions: engine.config.maxContextLength)
+            decodeStep: engine, session: session, maxConcurrent: maxConcurrent, maxQueued: maxQueued,
+            maxPositions: engine.config.maxContextLength, prefillChunk: prefillChunk,
+            idlePrefillChunk: engine.config.prefillChunkSize)
     }
 
-    init(
+    /// Default number of prompt tokens prefilled between two decode steps.
+    package static let defaultPrefillChunk = 512
+
+    convenience init(
         decodeStep: any BatchedDecodeStep, session: GenerationSessionState, maxConcurrent: Int,
-        maxQueued: Int? = nil, maxPositions: Int = .max
+        maxQueued: Int? = nil, maxPositions: Int = .max, prefillChunk: Int = BatchScheduler.defaultPrefillChunk,
+        idlePrefillChunk: Int? = nil
     ) {
         precondition(maxConcurrent >= 1, "maxConcurrent must be >= 1")
         precondition(
             maxConcurrent <= decodeStep.maxBatchCapacity,
             "maxConcurrent \(maxConcurrent) exceeds the graph's batch capacity \(decodeStep.maxBatchCapacity)")
+        self.init(
+            kv: ContiguousSchedulerKV(
+                step: decodeStep, session: session, rows: maxConcurrent, prefillChunk: prefillChunk,
+                idlePrefillChunk: idlePrefillChunk ?? prefillChunk, maxPositions: maxPositions),
+            maxQueued: maxQueued,
+            scorer: Scorer(decodeStep: decodeStep, maxConcurrent: maxConcurrent, maxPositions: maxPositions))
+    }
+
+    /// Creates a scheduler over the rows of `kv`. Scoring needs all-position logits from a contiguous
+    /// batch session, so it's only available when `scorer` is passed.
+    init(kv: any SchedulerKV, maxQueued: Int? = nil, scorer: Scorer? = nil) {
+        precondition(kv.rowCount >= 1, "a scheduler needs a row")
+        precondition(kv.prefillChunk >= 1, "prefill chunks must be >= 1 token")
+        precondition(kv.idlePrefillChunk >= kv.prefillChunk, "idlePrefillChunk must be >= prefillChunk")
         precondition((maxQueued ?? 0) >= 0, "maxQueued must be >= 0")
-        self.decodeStep = decodeStep
-        self.session = session
-        self.maxConcurrent = maxConcurrent
+        self.kv = kv
+        self.maxConcurrent = kv.rowCount
         self.maxQueued = maxQueued
-        self.scorer = Scorer(decodeStep: decodeStep, maxConcurrent: maxConcurrent, maxPositions: maxPositions)
+        self.scorer = scorer
     }
 
     // MARK: - RequestSink
@@ -169,11 +201,18 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
     }
 
     /// A request that holds a slot. `cursor` is the next KV write position in its row.
+    ///
+    /// `pendingPrompt` is the part of the prompt that hasn't been prefilled yet, which never includes
+    /// the last token. That one is `lastToken`, which the row's first decode step processes and samples
+    /// from.
     private struct ActiveRow {
         let continuation: AsyncThrowingStream<BatchSinkEvent, Error>.Continuation
         var adapter: BatchSessionAdapter
         var lastToken: Int32
         var cursor: Int
+        var pendingPrompt: ArraySlice<Int32> = []
+        /// Order of admission, so the oldest prompt is prefilled first.
+        var admission = 0
     }
 
     /// Scheduling loop, run by at most one task at a time. Each iteration does the following:
@@ -181,22 +220,26 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
     /// 2. Admit queued requests into free slots, and retire cancelled rows.
     /// 3. If no slot is live, loop again when requests or scoring jobs are waiting, otherwise clear
     ///    `pumping` and return.
-    /// 4. Run one `decodeBatch` over all `N` slots with `tokens` `[N][1]` and `cursors` `[N]`. A free
-    ///    slot gets token 0 at cursor 0 and its logits are dropped.
-    /// 5. Advance each live cursor, then sample, emit or retire each live row.
+    /// 4. Prefill the next chunk of the oldest prompt that's still prefilling, unless the previous
+    ///    iteration also prefilled and a row is waiting to decode. This makes prefill chunks and decode
+    ///    steps alternate.
+    /// 5. Otherwise, run one decode step over the rows that have finished prefilling, then sample,
+    ///    emit or retire each of them.
     ///
-    /// If `decodeBatch` throws, every resident row, queued request and queued scoring job ends with
-    /// that error.
+    /// If a decode step throws, every active row, queued request and queued scoring job fails with
+    /// that error, and every row is released back to the KV.
     private func pump() async {
         var active: [ActiveRow?] = Array(repeating: nil, count: maxConcurrent)
+        // Prefill chunks and decode steps alternate so that neither starves the other.
+        var lastWasPrefill = false
+        var admissions = 0
         do {
             while true {
                 await engineLock.lock()
                 defer { engineLock.unlock() }
                 await runPendingScoring()
-                await admit(into: &active)
+                admit(into: &active, admissions: &admissions)
                 for slot in active.indices where active[slot]?.adapter.request.cancellation.isCancelled == true {
-                    active[slot]!.continuation.finish()
                     retire(slot, active: &active)
                 }
 
@@ -214,15 +257,50 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
                     return
                 }
 
-                let tokens = active.map { [$0?.lastToken ?? 0] }
-                let cursors = active.map { $0?.cursor ?? 0 }
-                let logits = try await decodeStep.decodeBatch(
-                    tokensPerRow: tokens, startPositions: cursors, session: session)
-                for slot in active.indices where active[slot] != nil { active[slot]!.cursor += 1 }
-                for slot in liveSlots { stepSlot(slot, logits: logits[slot], active: &active) }
+                let prefilling = liveSlots.filter { !active[$0]!.pendingPrompt.isEmpty }
+                let decoding = liveSlots.filter { active[$0]!.pendingPrompt.isEmpty }
+                if let slot = prefilling.min(by: { active[$0]!.admission < active[$1]!.admission }),
+                    decoding.isEmpty || !lastWasPrefill
+                {
+                    lastWasPrefill = true
+                    // When no row is decoding there's no stream to keep moving, so use larger chunks.
+                    let piece = active[slot]!.pendingPrompt.prefix(
+                        decoding.isEmpty ? kv.idlePrefillChunk : kv.prefillChunk)
+                    do {
+                        try await kv.prefill(row: slot, tokens: piece)
+                        active[slot]!.pendingPrompt.removeFirst(piece.count)
+                    } catch {
+                        retire(slot, active: &active, throwing: error)
+                    }
+                    continue
+                }
+                lastWasPrefill = false
+
+                let steps = try await kv.decode(
+                    decoding.map {
+                        SchedulerKVRow(row: $0, token: active[$0]!.lastToken, cursor: active[$0]!.cursor)
+                    })
+                guard steps.count == decoding.count else {
+                    throw InferenceRuntimeError.invalidState(
+                        "a decode step of \(decoding.count) rows returned \(steps.count) results")
+                }
+                for (slot, step) in zip(decoding, steps) {
+                    switch step {
+                    case .logits(let logits):
+                        active[slot]!.cursor += 1
+                        stepSlot(slot, logits: logits, active: &active)
+                    case .rowFull:
+                        CLILogger.log(
+                            "row \(slot) has no positions left at \(active[slot]!.cursor); ending its request as "
+                                + "maxTokens", component: "BatchScheduler")
+                        active[slot]!.continuation.yield(.finished(.maxTokens))
+                        retire(slot, active: &active)
+                    }
+                }
             }
         } catch {
-            for row in active where row != nil { row!.continuation.finish(throwing: error) }
+            let resident = active.compactMap { $0?.continuation }
+            for slot in active.indices where active[slot] != nil { kv.retire(row: slot) }
             let (orphaned, orphanedScoring) = state.withLock { s -> ([Pending], [ScoringJob]) in
                 let waiting = (s.queue, s.scoring)
                 s.queue.removeAll()
@@ -231,35 +309,38 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
                 s.pumping = false
                 return waiting
             }
+            for continuation in resident { continuation.finish(throwing: error) }
             for pending in orphaned { pending.continuation.finish(throwing: error) }
             for job in orphanedScoring { job.continuation.finish(throwing: error) }
         }
     }
 
-    /// Fills free slots from the queue. Each admitted request is prefilled into its row and its first
-    /// token is sampled immediately. A request can retire during admission.
-    ///
-    /// A prefill error fails only that request's stream and leaves its slot free.
-    private func admit(into active: inout [ActiveRow?]) async {
-        for slot in active.indices where active[slot] == nil {
-            let pending: Pending? = state.withLock { s in
-                s.dropCancelledRequests()
-                guard !s.queue.isEmpty else { return nil }
-                s.occupiedRows += 1
-                return s.queue.removeFirst()
-            }
-            guard let pending else { break }
+    /// Assigns queued requests to free slots. Each prompt is prefilled later, between decode steps. If
+    /// reserving a row fails, only that request's stream fails.
+    private func admit(into active: inout [ActiveRow?], admissions: inout Int) {
+        var free = active.indices.filter { active[$0] == nil }
+        guard !free.isEmpty else { return }
+        let taken = state.withLock { s -> [Pending] in
+            s.dropCancelledRequests()
+            let taken = Array(s.queue.prefix(free.count))
+            s.queue.removeFirst(taken.count)
+            s.occupiedRows += taken.count
+            return taken
+        }
+        for pending in taken {
+            let slot = free.removeFirst()
+            let prompt = pending.request.promptTokens
             do {
-                let adapter = BatchSessionAdapter(request: pending.request)
-                let logits = try await decodeStep.prefillRow(
-                    row: slot, promptTokens: pending.request.promptTokens, session: session)
+                try kv.reserve(row: slot, prompt: prompt)
                 active[slot] = ActiveRow(
-                    continuation: pending.continuation, adapter: adapter, lastToken: 0,
-                    cursor: pending.request.promptTokens.count)
-                stepSlot(slot, logits: logits, active: &active)
+                    continuation: pending.continuation, adapter: BatchSessionAdapter(request: pending.request),
+                    lastToken: prompt[prompt.count - 1], cursor: prompt.count - 1,
+                    pendingPrompt: prompt[..<(prompt.count - 1)], admission: admissions)
+                admissions += 1
             } catch {
                 state.withLock { $0.occupiedRows -= 1 }
                 pending.continuation.finish(throwing: error)
+                free.insert(slot, at: 0)
             }
         }
     }
@@ -278,14 +359,18 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
             active[slot]!.lastToken = token
         } else {
             active[slot]!.continuation.yield(.finished(active[slot]!.adapter.stopReason ?? .maxTokens))
-            active[slot]!.continuation.finish()
             retire(slot, active: &active)
         }
     }
 
-    private func retire(_ slot: Int, active: inout [ActiveRow?]) {
+    /// Releases `slot`'s row, then finishes its stream, throwing `error` if one is given. The row is
+    /// released first, so anyone who sees the stream end also sees the row as free.
+    private func retire(_ slot: Int, active: inout [ActiveRow?], throwing error: Error? = nil) {
+        let continuation = active[slot]!.continuation
         active[slot] = nil
         state.withLock { $0.occupiedRows -= 1 }
+        kv.retire(row: slot)
+        if let error { continuation.finish(throwing: error) } else { continuation.finish() }
     }
 
     // MARK: - Scoring
@@ -300,6 +385,10 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
     /// `maxConcurrent` requests, each batch on a new session. Decode rows pause during a scoring
     /// batch and keep their KV state. A failed scoring batch fails only its own requests.
     package func score(_ requests: [ScoreRequest]) async throws -> [LogProbabilities] {
+        guard scorer != nil else {
+            throw InferenceRuntimeError.invalidArgument(
+                "scoring needs every position's logits, which only a contiguous batch session gives")
+        }
         if requests.contains(where: { $0.tokens.isEmpty || $0.targets.count != $0.tokens.count }) {
             throw InferenceRuntimeError.invalidArgument(
                 "a scoring request needs a non-empty prompt and one target per token")
@@ -335,9 +424,12 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
     /// Runs every waiting scoring job, in batches of up to `maxConcurrent` sized by
     /// `Scorer.batchCount(_:limit:)`. Call only while holding `engineLock`.
     private func runPendingScoring() async {
+        // `score(_:)` never queues a job when there's no scorer.
+        guard let scorer else { return }
         while true {
             let jobs = state.withLock { s -> [ScoringJob] in
-                let count = Scorer.batchCount(s.scoring.map(\.request.tokens.count), limit: scorer.maxConcurrent)
+                let count = Scorer.batchCount(
+                    s.scoring.map(\.request.tokens.count), limit: scorer.maxConcurrent)
                 let taken = Array(s.scoring.prefix(count))
                 s.scoring.removeFirst(taken.count)
                 return taken

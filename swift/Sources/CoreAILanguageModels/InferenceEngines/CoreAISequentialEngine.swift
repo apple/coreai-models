@@ -546,8 +546,8 @@ public final class CoreAISequentialEngine: MultimodalInferenceEngine, Idempotent
     /// row is done. Pass an empty `eosTokenIds` to always generate `maxNewTokens` per row.
     ///
     /// The prompts are prefilled as one `decodeBatch` step on the decode graph, not through the
-    /// chunked prefill path that `prefillRow` uses. For rows at different cursors, use `prefillRow`
-    /// and `decodeBatch` directly.
+    /// chunked prefill path that `prefillPiece` uses. For rows at different cursors, use `prefillPiece`,
+    /// `commitRow` and `decodeBatch` directly.
     package func lockstepBatchedGenerate(
         promptRows: [[Int32]],
         configs: [SamplingConfiguration],
@@ -735,47 +735,75 @@ public final class CoreAISequentialEngine: MultimodalInferenceEngine, Idempotent
         return out
     }
 
-    /// See ``BatchedDecodeStep`` for the contract.
-    ///
-    /// The prompt runs alone on a batch-1 scratch session through the normal prefill path, so the
-    /// row matches a standalone request. Its `[0, promptLen)` KV prefix is then copied into the row.
-    /// Throws for models with additional states (conv or sliding window), which are not per row.
-    func prefillRow(
-        row: Int,
-        promptTokens: [Int32],
-        session: GenerationSessionState
-    ) async throws -> [LogitsScalarType] {
+    /// Throws if this decoder can't prefill one row of a batch at a time: for vision-language decoders,
+    /// assets without a prefill graph, caches that aren't NDArray-backed, and models with additional
+    /// state (conv, recurrent or sliding window), which isn't stored per row.
+    func requireRowWritableCache(_ session: GenerationSessionState) throws {
         try requireBatchableDecoder()
-        precondition(!promptTokens.isEmpty, "prefillRow requires a non-empty prompt")
-        guard let target = session.kvCache as? GrowingNDArrayState else {
+        guard prefillFunction != nil else {
             throw InferenceRuntimeError.invalidState(
-                "prefillRow requires an NDArray-backed (GrowingNDArrayState) KV cache")
+                "batched prefill requires an asset with a '\(prefillGraphFunctionName)' graph")
+        }
+        guard session.kvCache is GrowingNDArrayState else {
+            throw InferenceRuntimeError.invalidState(
+                "batched prefill requires an NDArray-backed (GrowingNDArrayState) KV cache")
         }
         if session.additionalStates != nil {
             throw InferenceRuntimeError.invalidState(
-                "prefillRow does not yet support models with additional (conv/sliding) states")
+                "batched prefill does not yet support models with additional (conv/sliding) states")
         }
-        let promptLen = promptTokens.count
-        // Use the normal prefill path, which runs chunks on the separate `prefill` graph when the asset
-        // has one. Running the prompt through `decodeBatch(q: promptLen)` would change the decode
-        // executable's input shapes on every admission, and each shape change leaks its heap.
-        // Assets without a prefill graph still run the prompt on the decode graph.
-        let scratch = try makeSessionState(batchSize: 1)
-        let promptSlice = promptTokens[...]
-        let logits: [LogitsScalarType]
-        switch selectPrefillStrategy(newTokenCount: promptLen) {
-        case .chunked(let chunkSize):
-            logits = try await processChunkedPrompt(
-                tokens: promptSlice, chunkSize: chunkSize, sessionState: scratch)
-        case .wholeBatch:
-            logits = try await processTokenBatch(promptSlice, logits: .lastPosition, sessionState: scratch)
+    }
+
+    /// Why this engine can't serve requests in batches with prompts prefilled per row, or nil when it
+    /// can. See ``requireRowWritableCache(_:)``.
+    package var batchedPrefillUnsupportedReason: String? {
+        do {
+            try requireRowWritableCache(session)
+            return nil
+        } catch {
+            return error.localizedDescription
         }
-        guard let scratchCache = scratch.kvCache as? GrowingNDArrayState else {
-            throw InferenceRuntimeError.invalidState("prefillRow scratch cache is not NDArray-backed")
+    }
+
+    /// Prefills `tokens` on the prefill graph, split into the engine's prefill chunks, so the decode
+    /// graph keeps its decode shape. One-token chunks run on the decode graph instead: past position 0,
+    /// a one-token query on the prefill graph can abort in MPSGraph ("Failed to resolve dynamic
+    /// dimensions for memref.alloc"). No logits are read.
+    func prefillPiece(_ tokens: ArraySlice<Int32>, scratch: GenerationSessionState) async throws {
+        guard let prefillFn = prefillFunction else {
+            throw InferenceRuntimeError.invalidState(
+                "batched prefill requires an asset with a '\(prefillGraphFunctionName)' graph")
         }
-        _ = try target.ensureCapacity(forContextLength: promptLen)
-        target.copyRowPrefix(from: scratchCache, toRow: row, count: promptLen)
-        return logits
+        var remaining = tokens
+        for size in prefillChunkSizes(
+            tokenCount: tokens.count, chunkSize: config.prefillChunkSize, heldBack: 0,
+            startOffset: scratch.processedTokenCount, ringCapacity: slidingRingCapacity)
+        {
+            let chunk = remaining.prefix(size)
+            remaining = remaining.dropFirst(size)
+            if chunk.count > 1 {
+                try await encodePrefillChunk(chunk, using: prefillFn, sessionState: scratch)
+            } else {
+                _ = try await processTokenBatch(chunk, logits: .none, sessionState: scratch)
+            }
+        }
+    }
+
+    func commitRow(
+        _ row: Int, from scratch: GenerationSessionState, count: Int, session: GenerationSessionState
+    ) throws {
+        guard let target = session.kvCache as? GrowingNDArrayState,
+            let source = scratch.kvCache as? GrowingNDArrayState
+        else {
+            throw InferenceRuntimeError.invalidState(
+                "commitRow requires NDArray-backed (GrowingNDArrayState) KV caches")
+        }
+        guard count <= scratch.processedTokenCount else {
+            throw InferenceRuntimeError.invalidState(
+                "commitRow of \(count) positions from a scratch holding \(scratch.processedTokenCount)")
+        }
+        _ = try target.ensureCapacity(forContextLength: count)
+        target.copyRowPrefix(from: source, toRow: row, count: count)
     }
 
     /// Run one prefill chunk on the prefill graph: KV cache writes only, no logits.
