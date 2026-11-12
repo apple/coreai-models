@@ -331,8 +331,12 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
                 )
                 continuation.finish()
             } catch is CancellationError {
+                // Cancelled from the engine side (a later generation, or `cancel()`): say so, so the
+                // reader doesn't take the early end for the grammar's.
+                stopReasonStore.setIfUnset(.cancelled)
                 continuation.finish()
             } catch {
+                stopReasonStore.setIfUnset(.error)
                 continuation.finish(throwing: error)
             }
         }

@@ -161,6 +161,8 @@ extension PipelinedConstrainedSequence {
         private let maxTokens: Int
 
         private var innerIterator: AsyncThrowingStream<Int32, Error>.AsyncIterator?
+        /// The engine's stream, for why it ended when it ends without an error.
+        private var engineStream: InferenceTokenSequence?
         private var generatedTokens: [Int32] = []
         private var previousDecodedText: String = ""
         private var recentTokens: [Int32] = []
@@ -201,6 +203,7 @@ extension PipelinedConstrainedSequence {
                     maxTokens: maxTokens,
                     session: session
                 )
+                self.engineStream = stream
                 self.innerIterator = stream.makeAsyncIterator()
             }
 
@@ -219,8 +222,10 @@ extension PipelinedConstrainedSequence {
                     guard let tokenId = try await iterator.next() else {
                         finished = true
                         self.innerIterator = nil
-                        // The engine stops at the limit, or once the grammar accepts the end of sequence.
-                        outcome.setIfUnset(generatedTokens.count >= maxTokens ? .maxTokens : .eos)
+                        // The engine says when it was cancelled. Otherwise it stopped at the limit, or once
+                        // the grammar accepted the end of sequence.
+                        outcome.setIfUnset(
+                            engineStream?.stopReason ?? (generatedTokens.count >= maxTokens ? .maxTokens : .eos))
                         return nil
                     }
                     self.innerIterator = iterator

@@ -207,6 +207,8 @@ extension VanillaDecodingStrategy.VanillaDecodedSequence {
                 tokenCount.set(generatedTokenCount)
 
                 // An id with no token adds no text, but still counts and can still end a stop sequence.
+                // BPE and WordPiece tokenizers return nil for an id past their vocabulary. Unigram
+                // tokenizers index an array and trap on such an id, as `decode` already does.
                 let known = tokenizer.convertIdToToken(Int(output.tokenId)) != nil
                 consecutiveUnknownIds = known ? 0 : consecutiveUnknownIds + 1
                 if consecutiveUnknownIds >= Self.maxConsecutiveUnknownIds {

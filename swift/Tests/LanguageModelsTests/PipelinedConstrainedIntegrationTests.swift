@@ -29,6 +29,10 @@ final class MockConstrainedEngine: InferenceEngine, ConstrainedGenerationCapable
     /// Tokens the mock engine will yield from generateConstrained
     var scriptedTokens: [Int32]
 
+    /// When set, the stream ends after this many tokens with this reason, as the real engine's does
+    /// when it is cancelled from the engine side.
+    var endsEarly: (after: Int, reason: StopReason)?
+
     /// Track session lifecycle
     private(set) var getSessionCallCount = 0
     private(set) var storeSessionCallCount = 0
@@ -101,6 +105,7 @@ final class MockConstrainedEngine: InferenceEngine, ConstrainedGenerationCapable
         generateCallCount += 1
         let tokens = scriptedTokens
         let limit = min(tokens.count, maxTokens)
+        let endsEarly = self.endsEarly
 
         let (stream, continuation) = AsyncThrowingStream<TokenId, Error>.makeStream()
         let stopReasonStore = StopReasonStore()
@@ -108,6 +113,10 @@ final class MockConstrainedEngine: InferenceEngine, ConstrainedGenerationCapable
         let task = Task {
             defer { self.storeConstrainedSessionForReuse(session) }
             for i in 0..<limit {
+                if let endsEarly, i == endsEarly.after {
+                    stopReasonStore.setIfUnset(endsEarly.reason)
+                    break
+                }
                 do { try Task.checkCancellation() } catch { break }
                 if !session.acceptToken(tokens[i]) { break }
                 if session.isTerminated { break }
@@ -332,6 +341,55 @@ struct PipelinedConstrainedIntegrationTests {
         // Give the Task a moment to complete its defer block
         try await Task.sleep(for: .milliseconds(50))
         #expect(engine.storeSessionCallCount == 1)
+    }
+}
+
+// MARK: - How a stream ends
+
+@Suite("PipelinedConstrainedSequence — how a stream ends")
+struct PipelinedConstrainedStopTests {
+    private func decode(
+        _ engine: MockConstrainedEngine, maxTokens: Int
+    ) async throws -> PipelinedConstrainedSequence {
+        let tokenizer = MockTokenizer()
+        return try await PipelinedConstrainedDecodingStrategy(jsonSchema: #"{"type": "integer"}"#, vocabSize: 256)
+            .decode(
+                from: .tokens([1]), tokenizer: tokenizer, inferenceEngine: engine, samplingConfiguration: .greedy,
+                options: InferenceOptions(maxTokens: maxTokens),
+                stopSequences: StopSequences(for: tokenizer, additionalEosTokenIds: []))
+    }
+
+    private func text(_ stream: PipelinedConstrainedSequence) async throws -> String {
+        var text = ""
+        for try await result in stream { text += result.text }
+        return text
+    }
+
+    @Test("Running to the limit reports maxTokens and counts every token")
+    func limitReportsMaxTokens() async throws {
+        let stream = try await decode(MockConstrainedEngine(scriptedTokens: [49, 50, 51, 52, 53]), maxTokens: 3)
+        #expect(try await text(stream) == "123")
+        #expect(stream.stopReason == .maxTokens)
+        #expect(stream.tokensGenerated == 3)
+    }
+
+    @Test("The grammar accepting the end of sequence reports eos")
+    func grammarEndReportsEos() async throws {
+        // "1", then the end-of-sequence token (2), which completes the integer and ends the stream.
+        let stream = try await decode(MockConstrainedEngine(scriptedTokens: [49, 2, 50]), maxTokens: 10)
+        #expect(try await text(stream) == "1")
+        #expect(stream.stopReason == .eos)
+        #expect(stream.tokensGenerated == 1)
+    }
+
+    @Test("A stream the engine ends as cancelled reports cancelled, not eos")
+    func engineCancellationReportsCancelled() async throws {
+        let engine = MockConstrainedEngine(scriptedTokens: [49, 50, 51, 52, 53])
+        engine.endsEarly = (after: 2, reason: .cancelled)
+        let stream = try await decode(engine, maxTokens: 10)
+        #expect(try await text(stream) == "12")
+        #expect(stream.stopReason == .cancelled)
+        #expect(stream.tokensGenerated == 2)
     }
 }
 
