@@ -472,20 +472,24 @@ package final class BatchScheduler: RequestSink, @unchecked Sendable {
     /// request order. Can be called while other requests stream. Throws `invalidArgument` when a
     /// prompt is empty, `queueFull` when the queue cannot take all of `requests`, and any error that
     /// ends a request's stream.
+    ///
+    /// `requests` are queued together: when the queue can't take all of them, none is queued. They
+    /// are admitted in the order given, and no other caller's request is admitted between them.
     func run(_ requests: [BatchRequest]) async throws -> [RowResult] {
         let streams = try enqueue(requests)
         return try await withThrowingTaskGroup(of: (Int, RowResult).self) { group in
             for (i, stream) in streams.enumerated() {
                 group.addTask {
-                    var tokens: [Int32] = []
-                    var reason = StopReason.maxTokens
+                    var row = RowResult(tokens: [], stopReason: .maxTokens)
                     for try await event in stream {
                         switch event {
-                        case .token(let token, _): tokens.append(token)
-                        case .finished(let stopReason): reason = stopReason
+                        case .token(let token, _):
+                            row.tokens.append(token)
+                            row.tokenTimes.append(.now)
+                        case .finished(let stopReason): row.stopReason = stopReason
                         }
                     }
-                    return (i, RowResult(tokens: tokens, stopReason: reason))
+                    return (i, row)
                 }
             }
             var results = Array(
@@ -521,7 +525,7 @@ package struct BatchRequest: Sendable {
     /// Cancels the request when set. Dropping the request's stream also cancels it.
     let cancellation = RequestCancellation()
 
-    init(
+    package init(
         promptTokens: [Int32],
         sampling: SamplingConfiguration,
         eosTokenIds: Set<Int32>,
@@ -611,8 +615,11 @@ final class AsyncFIFOLock: Sendable {
     }
 }
 
-/// Generated tokens and stop reason for one request from `BatchScheduler.run(_:)`.
+/// Generated tokens and stop reason for one request from `BatchScheduler.run(_:)`, with when each
+/// token arrived.
 struct RowResult: Sendable {
-    let tokens: [Int32]
-    let stopReason: StopReason
+    var tokens: [Int32]
+    var stopReason: StopReason
+    /// When each of `tokens` reached the caller, in order.
+    var tokenTimes: [SuspendingClock.Instant] = []
 }

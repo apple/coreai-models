@@ -9,6 +9,7 @@ import CoreAILanguageModels
 import CoreAIShared
 import Foundation
 import Hummingbird
+import Metal
 import Tokenizers
 
 @main
@@ -277,6 +278,8 @@ struct LLMServer: AsyncParsableCommand {
 
         // The scheduler holds up to --concurrent-requests plus --max-queue-depth requests, then rejects.
         var batchScheduler: BatchScheduler? = nil
+        // Refuses new requests while the process is past the device's memory recommendation.
+        let memoryGuard = MTLCreateSystemDefaultDevice().map { DeviceMemoryGuard(device: $0) }
         let requested = ConcurrentRequests(concurrentRequests) ?? .count(1)
         let sequentialEngine = engine as? CoreAISequentialEngine
         let supportsBatching = sequentialEngine?.supportsBatching ?? false
@@ -311,8 +314,14 @@ struct LLMServer: AsyncParsableCommand {
             engine: engine,
             tokenizer: tokenizer,
             config: config,
-            batchServing: batchScheduler.map { (scheduler: $0, modelConfig: engineConfig) }
+            batchServing: batchScheduler.map { (scheduler: $0, modelConfig: engineConfig) },
+            memoryGuard: memoryGuard
         )
+        // Loaded and warmed, with the batch session allocated: where the process stands from here on.
+        memoryGuard?.report(
+            after: "load",
+            advice: "Lower --concurrent-requests, --kv-cache-initial-capacity or --chunk-size to give memory back.")
+        memoryGuard?.arm()
 
         if let replayPath {
             try await ReplayRunner.run(

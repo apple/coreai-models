@@ -300,6 +300,20 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     var batchPrototypeRows: Int?
 
     @Option(
+        name: .customLong("prompt-list"),
+        help:
+            "Run each non-blank line of this file as its own prompt, several at once through the continuous-batching scheduler, and report per-request and aggregate tokens/sec. Needs the coreai-sequential engine and a model exported with --attention-mask batched --dynamic-batch-size N."
+    )
+    var promptList: String?
+
+    @Option(
+        name: .customLong("concurrent-requests"),
+        help:
+            "With --prompt-list: rows that decode at once, a number up to the model's max batch size (default: every prompt, up to that size; unlike llm-server's, no 'auto'). The other prompts wait for a free row."
+    )
+    var concurrentRequests: Int?
+
+    @Option(
         name: .customLong("draft-model"),
         help:
             "Path to a draft model bundle to enable speculative decoding. Must share the tokenizer/vocabulary with --model. The static-shape engine verifies and drafts."
@@ -347,6 +361,34 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     var promptLookupMinNgram: Int = SpeculativeDefaults.lookupMinNgram
 
     func validate() throws {
+        if let n = concurrentRequests {
+            if n < 1 { throw ValidationError("--concurrent-requests must be >= 1") }
+            if promptList == nil { throw ValidationError("--concurrent-requests applies to --prompt-list") }
+        }
+        if promptList != nil {
+            let conflicting = [
+                prompt != nil ? "--prompt" : nil,
+                promptFile != nil ? "--prompt-file" : nil,
+                rawTokens != nil ? "--raw-tokens" : nil,
+                jsonSchema != nil ? "--json-schema" : nil,
+                continuation != nil ? "--continuation" : nil,
+                rawContinuation != nil ? "--raw-continuation" : nil,
+                saveLogits != nil ? "--save-logits" : nil,
+                printLogits ? "--print-logits" : nil,
+                imagePath != nil ? "--image" : nil,
+                videoPath != nil ? "--video" : nil,
+                batchPrototypeRows != nil ? "--batch-prototype" : nil,
+                draftModel != nil ? "--draft-model" : nil,
+                promptLookup ? "--prompt-lookup" : nil,
+                speculative ? "--speculative" : nil,
+            ].compactMap { $0 }
+            if !conflicting.isEmpty {
+                throw ValidationError("--prompt-list cannot be used with \(conflicting.joined(separator: ", "))")
+            }
+            if !["default", "auto", "coreai-sequential"].contains(inferenceEngineVariant) {
+                throw ValidationError("--prompt-list runs on the coreai-sequential engine")
+            }
+        }
         if let rows = batchPrototypeRows {
             if rows < 1 { throw ValidationError("--batch-prototype must be >= 1") }
             if !["default", "auto", "coreai-sequential"].contains(inferenceEngineVariant) {
@@ -871,6 +913,13 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             try RawTokenScoring.checkFits(
                 rawScoring, vocabSize: bundle.vocabSize, maxContextLength: bundle.maxContextLength)
         }
+        // Read and size a prompt list before the model loads, so a bad file or width fails fast.
+        let promptBatch = try promptList.map { path in
+            let prompts = try Self.readPromptList(path)
+            let width = try Self.batchWidth(
+                requested: concurrentRequests, promptCount: prompts.count, maxBatchSize: bundle.maxBatchSize)
+            return (prompts: prompts, width: width)
+        }
 
         // Resolve component model URLs once; reused for the cache check and model loading below.
         // An LLM bundle has only `main`; VLM bundles also have `vision`, plus `embedding` unless the
@@ -975,6 +1024,17 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             let prepareElapsed = await PerformanceMetrics.shared.modelLoadTime
             let cacheSuffix = cacheHit ? " (cache hit)" : ""
             print(" done in \(String(format: "%.3f", prepareElapsed))s\(cacheSuffix)\n")
+        }
+
+        if let promptBatch {
+            try await runBatchGeneration(
+                prompts: promptBatch.prompts,
+                width: promptBatch.width,
+                inferenceEngine: inferenceEngine,
+                tokenizer: tokenizer,
+                samplingConfiguration: samplingConfiguration,
+                additionalEosTokenIds: additionalEosTokenIds)
+            return
         }
 
         // Resolve prompt input and tokenize
