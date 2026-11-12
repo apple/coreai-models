@@ -53,7 +53,7 @@ private final class CountUpDecodeStep: BatchedDecodeStep, @unchecked Sendable {
     struct Boom: Error {}
 
     let maxBatchCapacity: Int
-    /// `prefillRow` throws `Boom` for a prompt that starts with this token.
+    /// `prefillPiece` throws `Boom` for a piece that starts with this token.
     private let failPrefillFor: Int32?
     /// When true, every `decodeBatch` throws `Boom`.
     private let failDecode: Bool
@@ -98,14 +98,15 @@ private final class CountUpDecodeStep: BatchedDecodeStep, @unchecked Sendable {
 
     private func leave() { record.withLock { $0.inFlight -= 1 } }
 
-    func prefillRow(
-        row: Int, promptTokens: [Int32], session: GenerationSessionState
-    ) async throws -> [LogitsScalarType] {
+    func prefillPiece(_ tokens: ArraySlice<Int32>, scratch: GenerationSessionState) async throws {
         await enter()
         defer { leave() }
-        if let failPrefillFor, promptTokens.first == failPrefillFor { throw Boom() }
-        return oneHot(((promptTokens.last ?? 0) + 1) % 64)
+        if let failPrefillFor, tokens.first == failPrefillFor { throw Boom() }
     }
+
+    func commitRow(
+        _ row: Int, from scratch: GenerationSessionState, count: Int, session: GenerationSessionState
+    ) throws {}
 
     func decodeBatch(
         tokensPerRow: [[Int32]], startPositions: [Int], session: GenerationSessionState
@@ -132,8 +133,8 @@ private final class CountUpDecodeStep: BatchedDecodeStep, @unchecked Sendable {
     func makeSessionState(batchSize: Int) throws -> GenerationSessionState { dummySession() }
 }
 
-/// Mock count-up `BatchedDecodeStep` whose `prefillRow` blocks until `release()`.
-private final class GatedPrefillStep: BatchedDecodeStep, @unchecked Sendable {
+/// Mock count-up `BatchedDecodeStep` whose first `decodeBatch` blocks until `release()`.
+private final class GatedDecodeStep: BatchedDecodeStep, @unchecked Sendable {
     let maxBatchCapacity: Int
 
     private struct Gate {
@@ -144,7 +145,7 @@ private final class GatedPrefillStep: BatchedDecodeStep, @unchecked Sendable {
 
     init(capacity: Int) { maxBatchCapacity = capacity }
 
-    /// Unblocks the waiting `prefillRow` call. Later calls return without blocking.
+    /// Unblocks the waiting `decodeBatch` call. Later calls return without blocking.
     func release() {
         let waiter: CheckedContinuation<Void, Never>? = gate.withLock { g in
             g.released = true
@@ -154,22 +155,22 @@ private final class GatedPrefillStep: BatchedDecodeStep, @unchecked Sendable {
         waiter?.resume()
     }
 
-    func prefillRow(
-        row: Int, promptTokens: [Int32], session: GenerationSessionState
-    ) async throws -> [LogitsScalarType] {
+    func decodeBatch(
+        tokensPerRow: [[Int32]], startPositions: [Int], session: GenerationSessionState
+    ) async throws -> [[LogitsScalarType]] {
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             gate.withLock { g in
                 if g.released { cont.resume() } else { g.releaseWaiter = cont }
             }
         }
-        return oneHot((promptTokens.last ?? 0) + 1)
+        return tokensPerRow.map { oneHot(($0.last ?? 0) + 1) }
     }
 
-    func decodeBatch(
-        tokensPerRow: [[Int32]], startPositions: [Int], session: GenerationSessionState
-    ) async throws -> [[LogitsScalarType]] {
-        tokensPerRow.map { oneHot(($0.last ?? 0) + 1) }
-    }
+    func prefillPiece(_ tokens: ArraySlice<Int32>, scratch: GenerationSessionState) async throws {}
+
+    func commitRow(
+        _ row: Int, from scratch: GenerationSessionState, count: Int, session: GenerationSessionState
+    ) throws {}
 
     func allPositionLogits(
         tokensPerRow: [[Int32]], startPosition: Int, session: GenerationSessionState
@@ -243,7 +244,8 @@ struct BatchSchedulerTests {
             req(prompt: [20], maxTokens: 1),
         ])
         #expect(results.map(\.tokens) == [[2, 3], [4, 5, 6], [21]])
-        #expect(mock.observedStartPositions.first == [1, 3])
+        // Row 0's one-token prompt decodes at cursor 0 once row 1's first two tokens are written.
+        #expect(mock.observedStartPositions.first == [0, 2])
     }
 
     @Test("Forwards from run and submit never overlap")
@@ -261,7 +263,7 @@ struct BatchSchedulerTests {
         "A burst of submits fills the free rows plus maxQueued, then throws queueFull",
         arguments: [(1, 3), (0, 2)] as [(Int, Int)])
     func backpressure(maxQueued: Int, accepted: Int) async throws {
-        let mock = GatedPrefillStep(capacity: 2)
+        let mock = GatedDecodeStep(capacity: 2)
         let scheduler = makeScheduler(mock, maxConcurrent: 2, maxQueued: maxQueued)
         let streams = try (0..<accepted).map { _ in try scheduler.submit(req(prompt: [0], maxTokens: 1)) }
         #expect(throws: InferenceRuntimeError.self) {
@@ -274,11 +276,11 @@ struct BatchSchedulerTests {
 
     @Test("occupancy counts admitted and queued requests")
     func occupancy() async throws {
-        let mock = GatedPrefillStep(capacity: 1)
+        let mock = GatedDecodeStep(capacity: 1)
         let scheduler = makeScheduler(mock, maxConcurrent: 1)
         #expect(scheduler.occupancy == (0, 0))
 
-        // The first request is admitted and blocks in prefill; the second waits for its row.
+        // The first request is admitted and blocks in its first decode; the second waits for its row.
         let streams = try (0..<2).map { _ in try scheduler.submit(req(prompt: [0], maxTokens: 1)) }
         for _ in 0..<1000 where scheduler.occupancy.active == 0 { try await Task.sleep(for: .milliseconds(1)) }
         #expect(scheduler.occupancy == (1, 1))
@@ -319,7 +321,7 @@ struct BatchSchedulerTests {
     func prefillFailureIsolated() async throws {
         let scheduler = makeScheduler(
             CountUpDecodeStep(capacity: 2, failPrefillFor: 50), maxConcurrent: 2)
-        let failing = try scheduler.submit(req(prompt: [50], maxTokens: 4))
+        let failing = try scheduler.submit(req(prompt: [50, 1], maxTokens: 4))
         let healthy = try scheduler.submit(req(prompt: [5], maxTokens: 3))
 
         await #expect(throws: CountUpDecodeStep.Boom.self) { _ = try await drain(failing) }
