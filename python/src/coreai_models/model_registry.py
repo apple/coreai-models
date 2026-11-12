@@ -634,7 +634,7 @@ UTILITY_PRESETS: list[UtilityModel] = [
     UtilityModel(
         "qwen3-embedding-0.6b",
         "Qwen/Qwen3-Embedding-0.6B",
-        "qwen3",
+        "qwen3-embedding",
         "embedding",
         "coreai.embedding.export",
         platforms=("macOS",),

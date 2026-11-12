@@ -31,12 +31,14 @@ from coreai_models.embedding.contract import (
     resolve_compute_precision,
     text_block,
 )
-from coreai_models.embedding.embedding_gemma2 import fetch_weights, read_prompts
-from coreai_models.embedding.embedding_gemma2.common import FunctionSpec, bucket_plan
 from coreai_models.embedding.export_utils import (
     TORCH_DTYPES,
     EmbeddingExporter,
+    FunctionSpec,
+    bucket_plan,
     export_program,
+    fetch_weights,
+    read_prompts,
     save_program,
 )
 
@@ -179,15 +181,20 @@ def read_facts(family: Qwen3EmbeddingFamily, snapshot: Path) -> CheckpointFacts:
     """The snapshot's facts: the dimension from the pooling config, eos from ``config.json``,
     bos (none) and pad from the tokenizer, and the family's ``max_tokens``.
 
+    eos is the token the tokenizer appends (``<|endoftext|>``), not the tokenizer's
+    ``eos_token`` (``<|im_end|>``).
+
     Raises:
-        ValueError: if the pooling config disagrees with the family (``read_pooling_dimension``).
+        ValueError: if the family sets no ``max_tokens``, or the pooling config disagrees with
+            the family (``read_pooling_dimension``).
     """
     from transformers import AutoTokenizer
 
+    if family.max_tokens is None:
+        raise ValueError(f"{family.key} sets no max_tokens")
     dimension = read_pooling_dimension(snapshot)
     config = json.loads((snapshot / "config.json").read_text())
     tokenizer = AutoTokenizer.from_pretrained(snapshot)
-    assert family.max_tokens is not None
     return CheckpointFacts(
         dimension=dimension,
         bos_token_id=tokenizer.bos_token_id,

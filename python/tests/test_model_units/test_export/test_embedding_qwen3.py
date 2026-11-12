@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -32,6 +33,7 @@ from coreai_models.embedding.qwen3_embedding import (
 )
 from tests.test_model_units.test_export._embedding_host import (
     REVISION,
+    Bundle,
     asset_signatures,
     run_function,
     runtime_options,
@@ -64,6 +66,8 @@ POOLING = {
     "include_prompt": True,
 }
 EOS = 2
+# Like the real tokenizer, the tiny one names <|im_end|> as its eos_token but appends EOS.
+IM_END = 9
 WORDS = ["<unk>", "a", "photo", "of", "the", "cat", "dog", "sound"]
 TINY_CONFIG = {
     "hidden_size": 32,
@@ -82,9 +86,19 @@ TINY_CONFIG = {
 TINY = dataclasses.replace(
     FAMILY, length_buckets=(16,), batch_sizes=(2,), max_tokens=64, matryoshka_dimensions=(32, 16)
 )
+# Functions len512_b1 and len512_b8, on a checkpoint with 512 positions.
+TINY_512 = dataclasses.replace(TINY, length_buckets=(512,), batch_sizes=(8,), max_tokens=512)
+TINY_512_CONFIG = {**TINY_CONFIG, "max_position_embeddings": 512}
 
 
-def _snapshot(root: Path, *, pooling=POOLING, modules=MODULES, weights: bool = False) -> Path:
+def _snapshot(
+    root: Path,
+    *,
+    pooling=POOLING,
+    modules=MODULES,
+    weights: bool = False,
+    config: dict = TINY_CONFIG,
+) -> Path:
     """A fake HF snapshot of a tiny Qwen3-Embedding: tokenizer, sentence-transformers files and
     ``config.json``; with ``weights``, a random ``Qwen3Model`` checkpoint (keys without a prefix,
     as in the real one).
@@ -98,32 +112,35 @@ def _snapshot(root: Path, *, pooling=POOLING, modules=MODULES, weights: bool = F
     }
     for name, content in files.items():
         (snap / name).write_text(json.dumps(content))
-    save_tiny_tokenizer(snap, WORDS, None, EOS, EOS)
+    save_tiny_tokenizer(snap, WORDS, None, EOS, EOS, named_eos=IM_END)
     if weights:
         from transformers import Qwen3Config, Qwen3Model
 
         torch.manual_seed(0)
-        model = Qwen3Model(Qwen3Config(**TINY_CONFIG))
+        model = Qwen3Model(Qwen3Config(**config))
         with torch.no_grad():
             for param in model.parameters():
                 param.normal_(std=0.5)
         model.save_pretrained(snap)
     else:
-        (snap / "config.json").write_text(json.dumps({"model_type": "qwen3", **TINY_CONFIG}))
+        (snap / "config.json").write_text(json.dumps({"model_type": "qwen3", **config}))
     return snap
 
 
-def _ragged_inputs() -> tuple[torch.Tensor, torch.Tensor, list[int]]:
-    """Two right-padded rows of 9 and 16 tokens, eos last, for the length-16 functions."""
+def _ragged_inputs(
+    lengths: tuple[int, ...] = (9, 16), width: int = 16
+) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
+    """Right-padded rows of ``lengths`` tokens in ``width`` columns, eos last (by default two rows
+    of 9 and 16 tokens for the length-16 functions).
+    """
     generator = torch.Generator().manual_seed(1)
-    ids = torch.randint(3, TINY_CONFIG["vocab_size"], (2, 16), generator=generator)
-    lengths = [9, 16]
-    mask = torch.zeros((2, 16), dtype=torch.int32)
+    ids = torch.randint(3, TINY_CONFIG["vocab_size"], (len(lengths), width), generator=generator)
+    mask = torch.zeros((len(lengths), width), dtype=torch.int32)
     for row, n in enumerate(lengths):
         ids[row, n - 1] = EOS
         ids[row, n:] = EOS
         mask[row, :n] = 1
-    return ids.to(torch.int32), mask, lengths
+    return ids.to(torch.int32), mask, list(lengths)
 
 
 def _hugging_face_embeddings(snapshot: Path, ids: torch.Tensor, lengths: list[int]):
@@ -208,10 +225,19 @@ def test_embedding_block_rejects(family, overrides, message):
 
 
 def test_read_facts_from_the_snapshot(tmp_path):
-    facts = read_facts(TINY, _snapshot(tmp_path))
+    """eos is the token the tokenizer appends (config.json ``eos_token_id``), not its
+    ``eos_token``; a family without ``max_tokens`` is refused.
+    """
+    from transformers import AutoTokenizer
+
+    snapshot = _snapshot(tmp_path)
+    facts = read_facts(TINY, snapshot)
     assert facts == CheckpointFacts(
         dimension=32, bos_token_id=None, eos_token_id=EOS, pad_token_id=EOS, max_tokens=64
     )
+    assert AutoTokenizer.from_pretrained(snapshot).eos_token_id == IM_END
+    with pytest.raises(ValueError, match="sets no max_tokens"):
+        read_facts(dataclasses.replace(TINY, max_tokens=None), snapshot)
 
 
 @pytest.mark.parametrize(
@@ -311,6 +337,68 @@ def test_tiny_bundle_matches_hugging_face(tiny_bundle, compute_unit):
         one = {name: value[row : row + 1] for name, value in inputs.items()}
         (got,) = run_function(asset, "len16_b1", one, options).values()
         torch.testing.assert_close(got[0], want[row], atol=1e-4, rtol=1e-4)
+
+
+def test_reference_host_tokenizes_the_bundle(tiny_bundle, tmp_path):
+    """The reference host (R6) sends the tokenizer's ids with no bos and eos last, right-padded to
+    16, whether the bundle lists both functions or one; a longer text keeps eos last.
+    """
+    from tokenizers import Tokenizer
+
+    _, out = tiny_bundle
+    one = tmp_path / "one-function"
+    shutil.copytree(out, one)
+    meta = json.loads((one / "metadata.json").read_text())
+    spec = meta["embedding"]["components"]["text_encoder"]
+    spec["functions"] = spec["functions"][:1]
+    (one / "metadata.json").write_text(json.dumps(meta))
+    tokenizer = Tokenizer.from_file(str(out / "tokenizer" / "tokenizer.json"))
+    short = [tokenizer.token_to_id(word) for word in ["a", "photo", "of", "the", "cat"]] + [EOS]
+    long = [tokenizer.token_to_id(word) for word in ["cat", "dog"] * 10][:15] + [EOS]
+    for path in (out, one):
+        ids, mask = Bundle(path, None).tokenize(["a photo of the cat", " ".join(["cat dog"] * 10)])
+        assert ids.tolist() == [short + [EOS] * (16 - len(short)), long]
+        assert mask.tolist() == [[1] * len(short) + [0] * (16 - len(short)), [1] * 16]
+
+
+@pytest.mark.parametrize("compute_unit", ["cpu", "gpu"])
+def test_reference_host_embeds_like_hugging_face(tiny_bundle, compute_unit):
+    """The reference host picks ``len16_b2`` for three texts (two calls, the second padded with a
+    copy of its row, R4) and ``len16_b1`` for one; both match Hugging Face within 1e-4.
+    """
+    snapshot, out = tiny_bundle
+    bundle = Bundle(out, runtime_options(compute_unit))
+    texts = ["a photo of the cat", "the dog", "cat dog sound of a photo the cat dog"]
+    ids, mask = bundle.tokenize(texts)
+    want = _hugging_face_embeddings(snapshot, ids, mask.sum(dim=1).tolist())
+    assert bundle.function("text_encoder", len(texts), ids.shape[1])["function"] == "len16_b2"
+    assert bundle.function("text_encoder", 1, ids.shape[1])["function"] == "len16_b1"
+    torch.testing.assert_close(bundle.embed_text(texts), want, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(bundle.embed_text(texts[2:]), want[2:], atol=1e-4, rtol=1e-4)
+
+
+@pytest.fixture(scope="module")
+def tiny_bundle_512(tmp_path_factory) -> tuple[Path, Path]:
+    """``(snapshot, bundle)``: ``TINY_512`` exported from a tiny random checkpoint."""
+    root = tmp_path_factory.mktemp("qwen3-512")
+    snapshot = _snapshot(root / "hf", weights=True, config=TINY_512_CONFIG)
+    out = root / "bundle"
+    embedding_export.export_embedding_bundle(q3.exporter(TINY_512), out, model_dir=str(snapshot))
+    return snapshot, out
+
+
+@pytest.mark.parametrize("compute_unit", ["cpu", "gpu"])
+def test_len512_b8_matches_hugging_face(tiny_bundle_512, compute_unit):
+    """``len512_b8`` on eight right-padded rows of 1 to 512 tokens, run by the Core AI runtime,
+    matches Hugging Face on each row within atol = rtol = 1e-4.
+    """
+    options = runtime_options(compute_unit)
+    snapshot, out = tiny_bundle_512
+    ids, mask, lengths = _ragged_inputs((1, 2, 31, 128, 200, 384, 511, 512), 512)
+    inputs = {"input_ids": ids, "attention_mask": mask}
+    (got,) = run_function(out / "text_encoder.aimodel", "len512_b8", inputs, options).values()
+    want = _hugging_face_embeddings(snapshot, ids, lengths)
+    torch.testing.assert_close(got, want, atol=1e-4, rtol=1e-4)
 
 
 # --- CLI ---

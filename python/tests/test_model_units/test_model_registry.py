@@ -17,6 +17,7 @@ from coreai_models.model_registry import (
     _preset_to_export_args,
     _preset_to_output_name,
     _utility_to_export_args,
+    families,
     filter_presets,
     filter_utility_models,
     lookup_preset,
@@ -228,6 +229,17 @@ def test_embedding_utility_models_have_an_exporter() -> None:
         family = EXPORTERS[row.short_name].family
         assert family.hf_model_id == row.hf_id
         assert set(row.platforms) == set(family.precisions)
+
+
+def test_utility_families_do_not_reuse_llm_or_diffusion_families() -> None:
+    """A family name means one kind of model: ``qwen3`` is the Qwen3 LLMs only."""
+    others: set[str] = set()
+    for model_type in ("llm", "diffusion"):
+        others |= set(families(model_type, include_experimental=True))
+    assert not set(families("utility")) & others
+    assert [u.short_name for u in filter_utility_models(model_type="qwen3-embedding")] == [
+        "qwen3-embedding-0.6b"
+    ]
 
 
 def test_utility_export_args_for_console_scripts_and_recipes() -> None:

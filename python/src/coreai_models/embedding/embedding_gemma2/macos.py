@@ -33,7 +33,6 @@ from coreai_models.embedding.embedding_gemma2.common import (
     TOKEN_TABLE_INPUT_NAMES,
     TOKEN_TABLE_OUTPUT_NAME,
     EmbeddingGemma2Family,
-    FunctionSpec,
     ImageTowerFacts,
     TokenTableExportWrapper,
     encoder_functions,
@@ -42,7 +41,7 @@ from coreai_models.embedding.embedding_gemma2.common import (
     text_functions,
     token_table_trace,
 )
-from coreai_models.embedding.export_utils import TORCH_DTYPES, save_program
+from coreai_models.embedding.export_utils import TORCH_DTYPES, FunctionSpec, save_program
 
 if TYPE_CHECKING:
     from coreai.authoring import AIProgram

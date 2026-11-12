@@ -48,7 +48,7 @@ from coreai_models.embedding.embedding_gemma2.common import (
 )
 from coreai_models.embedding.embedding_gemma2.ios import export_ios_programs
 from coreai_models.embedding.embedding_gemma2.macos import export_macos_programs
-from coreai_models.embedding.export_utils import EmbeddingExporter
+from coreai_models.embedding.export_utils import EmbeddingExporter, fetch_weights, read_prompts
 
 IMAGE_STRATEGY = "aspect_ratio_preserving"
 
@@ -313,15 +313,6 @@ def embedding_block(
 # --- snapshot checks ---
 
 
-def read_prompts(snapshot: Path) -> tuple[dict[str, str], str | None]:
-    """Read ``prompts`` / ``default_prompt_name`` from ``config_sentence_transformers.json``."""
-    cfg_path = snapshot / "config_sentence_transformers.json"
-    if not cfg_path.exists():
-        return {}, None
-    cfg = json.loads(cfg_path.read_text())
-    return dict(cfg.get("prompts") or {}), cfg.get("default_prompt_name")
-
-
 def read_pooling_config(snapshot: Path, family: EmbeddingGemma2Family) -> int:
     """Return the embedding dimension in the snapshot's ``1_Pooling/config.json``.
 
@@ -391,22 +382,6 @@ def verify_image_config(snapshot: Path, family: EmbeddingGemma2Family) -> None:
             )
     if problems:
         raise ValueError(f"Snapshot image config disagrees with the family: {problems}")
-
-
-def fetch_weights(family: EmbeddingGemma2Family, snapshot: Path) -> None:
-    """Download the ``*.safetensors`` files of the snapshot's revision into its HF cache if it
-    has none.
-    """
-    if any(snapshot.glob("*.safetensors")):
-        return
-    from huggingface_hub import snapshot_download
-
-    snapshot_download(
-        family.hf_model_id,
-        revision=snapshot.name,
-        cache_dir=snapshot.parents[2],
-        allow_patterns=["*.safetensors"],
-    )
 
 
 # --- exporter ---
