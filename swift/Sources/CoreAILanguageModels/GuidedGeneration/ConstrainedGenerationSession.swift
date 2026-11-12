@@ -363,6 +363,8 @@ private func _applyBitmask<T: BinaryFloatingPoint>(
     negativeInfinity negInf: T
 ) {
     let count = min(logits.count, vocabularySize)
+    // Ids past the vocabulary (a padded output layer's) are no token the grammar could accept.
+    for i in count..<logits.count { logits[i] = negInf }
     for (wordIndex, mask) in bitmask.enumerated() {
         let base = wordIndex &* 32
         if base >= count { break }

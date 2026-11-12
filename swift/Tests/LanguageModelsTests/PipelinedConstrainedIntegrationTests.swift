@@ -79,7 +79,11 @@ final class MockConstrainedEngine: InferenceEngine, ConstrainedGenerationCapable
         getSessionCallCount += 1
         lastSchemaUsed = jsonSchema
 
-        if let handle = cached, handle.matches(schema: jsonSchema, maxWhitespaceCount: maxWhitespaceCount) {
+        if let handle = cached,
+            handle.matches(
+                schema: jsonSchema, maxWhitespaceCount: maxWhitespaceCount, stopTokenIds: stopTokenIds,
+                vocabularySize: vocabSize)
+        {
             cached = nil
             handle.reset()
             return handle
@@ -93,7 +97,7 @@ final class MockConstrainedEngine: InferenceEngine, ConstrainedGenerationCapable
             stopTokenIds: stopTokenIds,
             maxWhitespaceCount: maxWhitespaceCount
         )
-        return ConstrainedSessionHandle(session: session, tokenizer: tokenizer)
+        return ConstrainedSessionHandle(session: session, tokenizer: tokenizer, stopTokenIds: stopTokenIds)
     }
 
     func generateConstrained(
@@ -418,23 +422,41 @@ extension PipelinedConstrainedDecodingStrategy {
 struct ConstrainedSessionHandleIdentityTests {
     private static let schema = #"{"type": "object", "properties": {"a": {"type": "integer"}}}"#
 
-    private func handle(limit: Int?) throws -> ConstrainedSessionHandle {
+    private func handle(limit: Int?, stops: [Int32]? = [2]) throws -> ConstrainedSessionHandle {
         let tokenizer = MockTokenizer()
         let session = try ConstrainedGenerationSession(
             jsonSchema: Self.schema, tokenizer: tokenizer, vocabSize: 256, vocabType: .raw,
             maxWhitespaceCount: limit)
-        return ConstrainedSessionHandle(session: session, tokenizer: tokenizer)
+        return ConstrainedSessionHandle(session: session, tokenizer: tokenizer, stopTokenIds: stops)
     }
 
-    @Test("A handle matches only the schema and whitespace limit it was built with")
+    private func matches(
+        _ h: ConstrainedSessionHandle, schema: String = Self.schema, limit: Int?, stops: [Int32]? = [2],
+        vocab: Int = 256
+    ) -> Bool {
+        h.matches(schema: schema, maxWhitespaceCount: limit, stopTokenIds: stops, vocabularySize: vocab)
+    }
+
+    @Test("A handle matches only the schema, whitespace limit, stop tokens and vocabulary it was built with")
     func matchesSchemaAndLimit() throws {
         let h = try handle(limit: 32)
-        #expect(h.matches(schema: Self.schema, maxWhitespaceCount: 32))
-        #expect(!h.matches(schema: Self.schema, maxWhitespaceCount: 8))
-        #expect(!h.matches(schema: Self.schema, maxWhitespaceCount: nil))
-        #expect(!h.matches(schema: "{}", maxWhitespaceCount: 32))
+        #expect(matches(h, limit: 32))
+        #expect(!matches(h, limit: 8))
+        #expect(!matches(h, limit: nil))
+        #expect(!matches(h, schema: "{}", limit: 32))
         let unlimited = try handle(limit: nil)
-        #expect(unlimited.matches(schema: Self.schema, maxWhitespaceCount: nil))
-        #expect(!unlimited.matches(schema: Self.schema, maxWhitespaceCount: 32))
+        #expect(matches(unlimited, limit: nil))
+        #expect(!matches(unlimited, limit: 32))
+    }
+
+    @Test("Stop tokens decide the match, in any order, and so does the vocabulary")
+    func matchesStopTokensAndVocabulary() throws {
+        // A request's single-token `stop` strings are grammar stop tokens: a grammar built with "\n"
+        // (10) among them ends at a newline, one built without it allows a newline inside the JSON.
+        let withNewline = try handle(limit: 32, stops: [2, 10])
+        #expect(matches(withNewline, limit: 32, stops: [10, 2]))
+        #expect(!matches(withNewline, limit: 32, stops: [2]))
+        #expect(!matches(withNewline, limit: 32, stops: nil))
+        #expect(!matches(withNewline, limit: 32, stops: [2, 10], vocab: 300))
     }
 }

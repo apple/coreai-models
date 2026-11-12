@@ -468,7 +468,11 @@ extension CoreAIPipelinedEngine {
         maxWhitespaceCount: Int?
     ) throws -> ConstrainedSessionHandle {
         if let cached: ConstrainedSessionHandle = _constrainedSessionCache.withLock({ cache in
-            guard let box = cache, box.matches(schema: jsonSchema, maxWhitespaceCount: maxWhitespaceCount) else {
+            guard let box = cache,
+                box.matches(
+                    schema: jsonSchema, maxWhitespaceCount: maxWhitespaceCount, stopTokenIds: stopTokenIds,
+                    vocabularySize: vocabSize)
+            else {
                 cache = nil
                 return nil
             }
@@ -485,7 +489,7 @@ extension CoreAIPipelinedEngine {
             stopTokenIds: stopTokenIds,
             maxWhitespaceCount: maxWhitespaceCount
         )
-        return ConstrainedSessionHandle(session: session, tokenizer: tokenizer)
+        return ConstrainedSessionHandle(session: session, tokenizer: tokenizer, stopTokenIds: stopTokenIds)
     }
 
     /// Return a session box to the cache for reuse by the next call.

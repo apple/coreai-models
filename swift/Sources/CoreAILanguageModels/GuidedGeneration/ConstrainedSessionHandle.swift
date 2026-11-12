@@ -17,21 +17,33 @@ package final class ConstrainedSessionHandle: @unchecked Sendable {
     /// Whitespace limit the session enforces; nil when unlimited.
     let maxWhitespaceCount: Int?
 
+    /// Token ids the grammar takes as its end, sorted; nil for xgrammar's defaults.
+    let stopTokenIds: [Int32]?
+
+    /// Vocabulary size the grammar was built for.
+    let vocabularySize: Int
+
     /// Tokenizer used for jump-forward string encoding.
     private let tokenizer: any Tokenizer
 
     private var _session: ConstrainedGenerationSession
 
-    init(session: consuming ConstrainedGenerationSession, tokenizer: any Tokenizer) {
+    init(session: consuming ConstrainedGenerationSession, tokenizer: any Tokenizer, stopTokenIds: [Int32]?) {
         self.schema = session.schema
         self.maxWhitespaceCount = session.maxWhitespaceCount
+        self.stopTokenIds = stopTokenIds.map { Array(Set($0)).sorted() }
+        self.vocabularySize = session.vocabularySize
         self.tokenizer = tokenizer
         self._session = session
     }
 
-    /// Whether this session was built for the same schema and whitespace limit, so a reset can reuse it.
-    func matches(schema: String, maxWhitespaceCount: Int?) -> Bool {
+    /// Whether this session was built for the same schema, whitespace limit, stop tokens and
+    /// vocabulary, so a reset can reuse it. Stop tokens count: a request's single-token `stop` strings
+    /// are among them, and they decide where the grammar may end.
+    func matches(schema: String, maxWhitespaceCount: Int?, stopTokenIds: [Int32]?, vocabularySize: Int) -> Bool {
         self.schema == schema && self.maxWhitespaceCount == maxWhitespaceCount
+            && self.stopTokenIds == stopTokenIds.map({ Array(Set($0)).sorted() })
+            && self.vocabularySize == vocabularySize
     }
 
     var isTerminated: Bool { _session.isTerminated }
