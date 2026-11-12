@@ -76,6 +76,14 @@ def build_parser() -> argparse.ArgumentParser:
         "the half img2img reference grid; macOS defaults to 1024 and the full grid.",
     )
     parser.add_argument(
+        "--compute-unit",
+        default=None,
+        choices=["gpu", "neural-engine"],
+        help="Compute unit the bundle targets (default: gpu). neural-engine exports the float16 "
+        "components re-authored for the Neural Engine (Sana Sprint) to <model>_neural_engine/; "
+        "registry presets ending in -neural-engine select it.",
+    )
+    parser.add_argument(
         "--resolution",
         default=None,
         type=int,
@@ -174,9 +182,13 @@ def main() -> None:
                 "Run `uv run coreai.model.registry --list-models --type diffusion` to see options."
             )
     else:
-        preset = try_lookup_preset_by_hf_id(args.model, model_type="diffusion")
+        variant = "neural-engine" if args.compute_unit == "neural-engine" else None
+        preset = try_lookup_preset_by_hf_id(args.model, model_type="diffusion", variant=variant)
 
+    compute_unit = args.compute_unit
     if preset is not None:
+        if compute_unit is None and preset.variant == "neural-engine":
+            compute_unit = "neural-engine"
         hf_model_id = preset.hf_id
         if compression is None and preset.compression:
             compression = preset.compression
@@ -333,6 +345,7 @@ def main() -> None:
         components=args.components or target_components,
         compute_precision=compute_precision,
         compression=compression,
+        compute_unit=compute_unit or "gpu",
         overwrite=args.overwrite,
         include_debug_info=args.include_debug_info,
         multifunction=multifunction,
@@ -351,6 +364,7 @@ def main() -> None:
             print("  components:        all")
         print(f"  multifunction:     {config.multifunction}")
         print(f"  dynamic:           {config.dynamic}")
+        print(f"  compute_unit:      {config.compute_unit}")
         print(f"  overwrite:         {config.overwrite}")
         print(f"  include_debug_info: {config.include_debug_info}")
         return

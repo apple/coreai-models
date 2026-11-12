@@ -32,6 +32,7 @@ from coreai_models._constants import DEFAULT_INCLUDE_DEBUG_INFO
 from coreai_models.converter import export_stateless
 from coreai_models.diffusion.components import (
     MultiFunctionComponentSpec,
+    NeuralEngineComponentSpec,
     get_component_registry,
     quant_weight_owner,
 )
@@ -66,6 +67,8 @@ class DiffusionExportConfig:
     multifunction: bool = True
     # FLUX.2 only: one symbolic "main" per asset. Takes precedence over multifunction if True.
     dynamic: bool = False
+    # "gpu", or "neural-engine" for the re-authored float16 Neural Engine components.
+    compute_unit: str = "gpu"
 
 
 def export_diffusion(config: DiffusionExportConfig) -> dict[str, str]:
@@ -78,18 +81,24 @@ def export_diffusion(config: DiffusionExportConfig) -> dict[str, str]:
         Dict mapping component name to its .aimodel path.
     """
     model_dtype = _PRECISIONS.get(config.compute_precision, torch.float32)
+    neural_engine = config.compute_unit == "neural-engine"
+    if neural_engine and config.compression != "none":
+        raise ValueError("--compute-unit neural-engine supports --compression none only")
 
     # 1. Determine pipeline type and load HF pipeline
     pipeline_type = get_pipeline_type(config.hf_model_id)
     if config.dynamic and pipeline_type != "flux2":
         raise ValueError(f"dynamic export is only supported for FLUX.2, not {pipeline_type}.")
-    hf_pipe = _load_hf_pipeline(config.hf_model_id, pipeline_type, model_dtype)
+    # Neural Engine components fold constants into float32 weights, then set their own dtypes.
+    load_dtype = torch.float32 if neural_engine else model_dtype
+    hf_pipe = _load_hf_pipeline(config.hf_model_id, pipeline_type, load_dtype)
 
     registry = get_component_registry(
         hf_pipe,
         pipeline_type=pipeline_type,
         multifunction=config.multifunction,
         dynamic=config.dynamic,
+        compute_unit=config.compute_unit,
     )
     component_names = config.components or list(registry.keys())
     logger.info(f"Pipeline type: {pipeline_type}, components: {component_names}")
@@ -104,7 +113,7 @@ def export_diffusion(config: DiffusionExportConfig) -> dict[str, str]:
     if any(c is not None for c in quant_configs.values()):
         for name in component_names:
             spec = registry.get(name)
-            if spec is None or not spec.quantizable:
+            if spec is None or isinstance(spec, NeuralEngineComponentSpec) or not spec.quantizable:
                 continue
             owner = quant_weight_owner(spec.wrapper_fn(hf_pipe))
             component = _pipeline_component_name(hf_pipe, owner)
@@ -114,10 +123,13 @@ def export_diffusion(config: DiffusionExportConfig) -> dict[str, str]:
                 spec_configs[name] = component_config
 
     # Output goes to <output_dir>/<model-name>/. A dynamic export reuses the static asset
-    # names, so it gets its own directory rather than overwriting the static bundle.
+    # names, so it gets its own directory rather than overwriting the static bundle; so does
+    # a Neural Engine export (<model-name>_neural_engine/).
     model_subdir = config.hf_model_id.split("/")[-1]
     if config.dynamic:
         model_subdir += "-dynamic"
+    if neural_engine:
+        model_subdir += "_neural_engine"
     output_path = Path(config.output_dir) / model_subdir
     output_path.mkdir(parents=True, exist_ok=True)
 
@@ -138,6 +150,26 @@ def export_diffusion(config: DiffusionExportConfig) -> dict[str, str]:
 
         if asset_path.exists() and not config.overwrite:
             logger.info(f"Skipping {name}: {asset_path} exists (use --overwrite)")
+            results[name] = str(asset_path)
+            continue
+
+        if isinstance(spec, NeuralEngineComponentSpec):
+            from coreai_models.embedding.embedding_gemma2.ios import convert_ane_functions
+
+            logger.info(f"Exporting {name} -> {spec.asset_name}.aimodel (Neural Engine)")
+            program = convert_ane_functions(
+                [
+                    (
+                        "main",
+                        spec.build_fn(hf_pipe),
+                        spec.dummy_fn(hf_pipe),
+                        spec.input_names,
+                        spec.output_names,
+                    )
+                ],
+                include_debug_info=config.include_debug_info,
+            )
+            _save_program(program, asset_path, output_path, config.hf_model_id, spec.asset_name)
             results[name] = str(asset_path)
             continue
 
@@ -185,20 +217,9 @@ def export_diffusion(config: DiffusionExportConfig) -> dict[str, str]:
                 include_debug_info=config.include_debug_info,
             )
 
-        if asset_path.exists():
-            shutil.rmtree(asset_path)
-        logger.info(f"Saving {name} to {asset_path}...")
-        metadata = build_aimodel_metadata(config.hf_model_id, component=spec.asset_name)
-        program.save_asset(asset_path, metadata)
+        _save_program(program, asset_path, output_path, config.hf_model_id, spec.asset_name)
         del program
-
-        # Clean up leftover .mlirb from older export runs
-        mlirb_path = output_path / f"{spec.asset_name}.mlirb"
-        if mlirb_path.exists():
-            mlirb_path.unlink()
-
         results[name] = str(asset_path)
-        logger.info(f"Exported {name} -> {asset_path}")
 
     # 3. Save sidecar assets (tokenizer, BN stats, etc.)
     if pipeline_type == "flux2":
@@ -218,6 +239,9 @@ def export_diffusion(config: DiffusionExportConfig) -> dict[str, str]:
         results,
         vae_tile_size=config.vae_tile_size,
         dynamic=config.dynamic,
+        neural_engine_components=[
+            name for name in results if isinstance(registry[name], NeuralEngineComponentSpec)
+        ],
     )
 
     # Summary
@@ -226,6 +250,21 @@ def export_diffusion(config: DiffusionExportConfig) -> dict[str, str]:
         logger.info(f"  {name}: {path}")
 
     return results
+
+
+def _save_program(
+    program: Any, asset_path: Path, output_path: Path, model_id: str, asset_name: str
+) -> None:
+    if asset_path.exists():
+        shutil.rmtree(asset_path)
+    logger.info(f"Saving {asset_name} to {asset_path}...")
+    program.save_asset(asset_path, build_aimodel_metadata(model_id, component=asset_name))
+
+    # Clean up leftover .mlirb from older export runs
+    mlirb_path = output_path / f"{asset_name}.mlirb"
+    if mlirb_path.exists():
+        mlirb_path.unlink()
+    logger.info(f"Exported {asset_name} -> {asset_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -389,6 +428,25 @@ def _prepare_assets(json_path: Path, exported_assets: dict[str, str]) -> dict[st
     return assets
 
 
+def _prepare_compute_units(
+    json_path: Path, exported_assets: dict[str, str], neural_engine_components: list[str]
+) -> dict[str, str]:
+    """``compute_units`` for the manifest: this run's components over the previous export's."""
+    units: dict[str, str] = {}
+    if json_path.exists():
+        try:
+            with open(json_path) as f:
+                prior = json.load(f).get("diffusion", {}).get("compute_units")
+        except (OSError, json.JSONDecodeError, AttributeError):
+            prior = None
+        if isinstance(prior, dict):
+            units = {k: v for k, v in prior.items() if k not in exported_assets}
+    for name in exported_assets:
+        if name in neural_engine_components:
+            units[name] = "neural_engine"
+    return units
+
+
 def _write_metadata_json(
     hf_pipe: Any,
     model_id: str,
@@ -399,8 +457,14 @@ def _write_metadata_json(
     *,
     vae_tile_size: int | None = None,
     dynamic: bool = False,
+    neural_engine_components: list[str] | None = None,
 ) -> None:
-    """Write metadata.json with the v0.2 bundle schema for diffusion models."""
+    """Write metadata.json with the v0.2 bundle schema for diffusion models.
+
+    ``diffusion.compute_units`` maps each Neural Engine component to ``"neural_engine"``; the
+    runtime loads components it does not list on the GPU. Entries from a previous partial
+    export of the same bundle are kept while their asset still exists.
+    """
     from datetime import datetime
 
     if pipeline_type == "flux2":
@@ -413,7 +477,12 @@ def _write_metadata_json(
         raise unknown_pipeline_type_error(pipeline_type)
 
     json_path = output_path / "metadata.json"
+    compute_units = _prepare_compute_units(
+        json_path, exported_assets, neural_engine_components or []
+    )
     assets = _prepare_assets(json_path, exported_assets)
+    if compute_units:
+        diffusion_config["compute_units"] = compute_units
 
     metadata = {
         "metadata_version": METADATA_VERSION,

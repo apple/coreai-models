@@ -164,7 +164,9 @@ extension FlowTransformerPipeline {
         func component(_ name: String, _ path: String?) throws -> CoreAIDiffusionModelFunction {
             guard let path else { throw PipelineLoadError.missingComponent(name) }
             let assetURL = try resolveExistingPipelineAsset(path, in: url, component: name)
-            return CoreAIDiffusionModelFunction(modelURL: assetURL)
+            let unit: ComputeUnitKind =
+                bundle.config.computeUnits?[name] == "neural_engine" ? .neuralEngine : .gpu
+            return CoreAIDiffusionModelFunction(modelURL: assetURL, computeUnit: unit)
         }
 
         return Self(

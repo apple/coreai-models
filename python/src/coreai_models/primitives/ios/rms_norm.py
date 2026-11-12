@@ -69,16 +69,30 @@ class MaxAbsRMSNormNoScale(nn.Module):
     """RMSNorm without a learnable scale, reducing over ``axis`` (counted from the end).
 
     Float16-overflow-safe and exact; see the comment above. :class:`MaxAbsRMSNorm` adds the scale.
+
+    ``floor="add"`` divides by ``max|x| + 1e-4`` instead of ``max(max|x|, 1e-4)``; the identity
+    holds for any positive divisor. The Neural Engine compiler rejects a clamp or reciprocal of an
+    ``amax`` on some graphs (e.g. Sana Sprint's 1152-channel norms), but not this form.
     """
 
-    def __init__(self, eps: float = 1e-6, axis: int = -1) -> None:
+    _eps_sqrt: torch.Tensor
+    _floor: torch.Tensor
+
+    def __init__(self, eps: float = 1e-6, axis: int = -1, floor: str = "clamp") -> None:
         super().__init__()
+        if floor not in ("clamp", "add"):
+            raise ValueError(f"floor must be 'clamp' or 'add', got {floor!r}")
         self.axis = axis
+        self.floor = floor
         self.register_buffer("_eps_sqrt", torch.tensor(eps**0.5), persistent=False)
+        self.register_buffer("_floor", torch.tensor(1e-4), persistent=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Max magnitude along ``axis``; the floor keeps an all-zero row at zero instead of NaN.
-        m = torch.clamp(x.abs().amax(self.axis, keepdim=True), min=1e-4)
+        if self.floor == "add":
+            m = x.abs().amax(self.axis, keepdim=True) + self._floor.to(dtype=x.dtype)
+        else:
+            m = torch.clamp(x.abs().amax(self.axis, keepdim=True), min=1e-4)
         xn = x / m
         eps_sqrt = self._eps_sqrt.to(dtype=x.dtype)
         eps_term = (eps_sqrt / m) * (eps_sqrt / m)  # eps/m^2, no m^2 overflow
@@ -93,8 +107,8 @@ class MaxAbsRMSNorm(MaxAbsRMSNormNoScale):
     after ``axis``.
     """
 
-    def __init__(self, dim: int, eps: float = 1e-6, axis: int = -1) -> None:
-        super().__init__(eps, axis)
+    def __init__(self, dim: int, eps: float = 1e-6, axis: int = -1, floor: str = "clamp") -> None:
+        super().__init__(eps, axis, floor)
         with torch.device("cpu"):
             self.weight = nn.Parameter(torch.ones((dim,) + (1,) * (-axis - 1)))
 

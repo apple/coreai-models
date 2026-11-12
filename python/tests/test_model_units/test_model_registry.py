@@ -24,6 +24,7 @@ from coreai_models.model_registry import (
     lookup_utility_model,
     presets_for_type,
     try_lookup_preset,
+    try_lookup_preset_by_hf_id,
 )
 
 
@@ -36,9 +37,20 @@ def test_no_duplicate_short_name_variant_pairs() -> None:
             seen.add(key)
 
 
-def test_diffusion_presets_have_no_variant() -> None:
+def test_diffusion_presets_have_no_variant_or_neural_engine() -> None:
     for p in DIFFUSION_PRESETS:
-        assert p.variant is None, f"{p.short_name} should have variant=None"
+        assert p.variant in (None, "neural-engine"), f"{p.short_name}: unexpected {p.variant=}"
+
+
+def test_neural_engine_preset_keeps_hf_id_lookup_on_the_default() -> None:
+    """A ``-neural-engine`` preset shares its hf_id; lookup without a variant keeps the default."""
+    hf_id = "Efficient-Large-Model/Sana_Sprint_0.6B_1024px_diffusers"
+    default = try_lookup_preset_by_hf_id(hf_id, model_type="diffusion")
+    assert default is not None and default.short_name == "sana-sprint-0.6b"
+    ne = try_lookup_preset_by_hf_id(hf_id, model_type="diffusion", variant="neural-engine")
+    assert ne is not None and ne.short_name == "sana-sprint-0.6b-neural-engine"
+    assert _preset_to_export_args(ne)[-2:] == ["--compute-unit", "neural-engine"]
+    assert _preset_to_output_name(ne) == "Sana_Sprint_0.6B_1024px_diffusers_neural_engine"
 
 
 def test_diffusion_presets_name_a_known_compression_preset() -> None:

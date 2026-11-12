@@ -13,7 +13,7 @@ torch.nn.Module wrapper that normalises the HF output, and a factory for
 dummy inputs.
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from typing import Any, cast
 
@@ -196,6 +196,22 @@ class MultiFunctionComponentSpec:
         Weights are shared, so just grab the first one.
         """
         return self.quant_dummy_fn or self.functions[0].dummy_fn
+
+
+@dataclass(frozen=True)
+class NeuralEngineComponentSpec:
+    """A component re-authored for the Neural Engine, exported as one static function ``main``.
+
+    ``build_fn(hf_pipe)`` returns the module with its export dtypes already set; the pipeline is
+    loaded in float32 so the build can fold constants into weights before casting.
+    """
+
+    asset_name: str
+    input_names: tuple[str, ...]
+    output_names: tuple[str, ...]
+    build_fn: Callable
+    dummy_fn: Callable
+    quantizable: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -511,7 +527,8 @@ def get_component_registry(
     pipeline_type: str,
     multifunction: bool = False,
     dynamic: bool = False,
-) -> dict[str, ComponentSpec | MultiFunctionComponentSpec]:
+    compute_unit: str = "gpu",
+) -> Mapping[str, ComponentSpec | MultiFunctionComponentSpec | NeuralEngineComponentSpec]:
     """Return the component registry for the given pipeline type.
 
     Args:
@@ -522,7 +539,17 @@ def get_component_registry(
             (8 functions in one .aimodel: main, half, and six img2img variants).
         dynamic: If True, use the FLUX.2 dynamic registry: one symbolic "main" per
             asset. Takes precedence over ``multifunction`` if True.
+        compute_unit: "gpu", or "neural-engine" for the re-authored Neural Engine
+            components (Sana Sprint only).
     """
+    if compute_unit == "neural-engine":
+        if pipeline_type != "sana_sprint":
+            raise ValueError(f"--compute-unit neural-engine is not supported for {pipeline_type}")
+        from coreai_models.diffusion.sana_neural_engine import (
+            SANA_SPRINT_NEURAL_ENGINE_COMPONENTS,
+        )
+
+        return SANA_SPRINT_NEURAL_ENGINE_COMPONENTS
     if pipeline_type == "flux2":
         if dynamic:
             return FLUX2_DYNAMIC_COMPONENTS

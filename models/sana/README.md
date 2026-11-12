@@ -38,6 +38,36 @@ For the full-precision `bfloat16` export, pass `--compression none`:
 uv run coreai.diffusion.export sana-sprint-1.6b --compression none
 ```
 
+### Neural Engine (0.6B)
+
+```bash
+uv run coreai.diffusion.export sana-sprint-0.6b-neural-engine
+```
+
+This writes `exports/Sana_Sprint_0.6B_1024px_diffusers_neural_engine/` with all three components
+re-authored for the Neural Engine in `float16` (`python/src/coreai_models/models/ios/sana_*.py`),
+uncompressed. The bundle's `metadata.json` lists them under `diffusion.compute_units`, and the
+runtime loads those on the Neural Engine. Inputs, outputs and the Swift API are the same as for the
+GPU bundle.
+
+`float16` keeps 3 more mantissa bits than `bfloat16`, and each component holds its activations in range
+with exact rewrites, so it is closer to the `float32` reference than the GPU export (PSNR on 8 prompts,
+M4 Pro):
+
+| Component / output | Neural Engine | Dense `bfloat16` | Default GPU bundle |
+| ------------------ | ------------- | ---------------- | ------------------ |
+| Transformer        | 54.7 dB       | 42.3 dB          | 40.3 dB (INT8)     |
+| Text encoder       | 58.2 dB       | 71.3 dB          | 46.7 dB (INT4)     |
+| VAE decoder        | 63.9 dB       | 49.1 dB          | 49.1 dB            |
+| Image (end to end) | 28.6 dB       | —                | 21.3 dB            |
+
+Compute per image is on par with the GPU (~2.1 s on an M4 Pro). Two costs remain:
+
+- The first load specializes for the Neural Engine, ~10 minutes for the three components; later
+  loads use the cache.
+- Loading uncompressed weights onto the Neural Engine takes ~2 s per GB, ~12 s per image with lazy
+  model loading, mostly the 4.9 GB text encoder.
+
 ## Components
 
 | Component      | Asset                 | Size (default)                | Size (`--compression none`)   | Description                                                   |

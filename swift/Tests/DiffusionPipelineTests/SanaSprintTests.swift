@@ -122,8 +122,20 @@ struct SanaSprintTests {
         #expect(descriptor.promptPrefix == "Prefix:\nUser Prompt: ")
         #expect(descriptor.textInputLength == 506)
         #expect(descriptor.textSequenceLength == 300)
+        #expect(descriptor.computeUnits == nil)
         #expect(bundle.transformerFilename == "Transformer.aimodel")
         #expect(bundle.textEncoderFilename == "TextEncoder.aimodel")
         #expect(bundle.vaeDecoderFilename == "VAEDecoder.aimodel")
+    }
+
+    @Test("Decodes per-component compute units of a Neural Engine bundle")
+    func decodesComputeUnits() throws {
+        let json = """
+            {"type": "sana-sprint", "compute_units": {"transformer": "neural_engine", "vae_decoder": "neural_engine"}}
+            """
+        let config = try JSONDecoder().decode(DiffusionConfig.self, from: Data(json.utf8))
+        #expect(config.computeUnits?[DiffusionComponentKey.transformer] == "neural_engine")
+        #expect(config.computeUnits?[DiffusionComponentKey.vaeDecoder] == "neural_engine")
+        #expect(config.computeUnits?[DiffusionComponentKey.textEncoder] == nil)
     }
 }

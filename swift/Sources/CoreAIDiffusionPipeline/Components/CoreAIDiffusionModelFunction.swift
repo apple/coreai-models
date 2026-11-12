@@ -19,10 +19,13 @@ public actor CoreAIDiffusionModelFunction {
     private var functionCache: [String: InferenceFunction] = [:]
     private var isLoaded = false
 
-    /// - Parameter expectFrequentReshapes: Set for an asset with symbolic shape axes.
-    public init(modelURL: URL, expectFrequentReshapes: Bool = false) {
+    /// - Parameters:
+    ///   - computeUnit: The preferred compute unit; `.neuralEngine` for assets
+    ///     exported for it (`compute_units` in the bundle's `metadata.json`).
+    ///   - expectFrequentReshapes: Set for an asset with symbolic shape axes.
+    public init(modelURL: URL, computeUnit: ComputeUnitKind = .gpu, expectFrequentReshapes: Bool = false) {
         self.modelURL = modelURL
-        var options = SpecializationOptions(preferredComputeUnitKind: .gpu)
+        var options = SpecializationOptions(preferredComputeUnitKind: computeUnit)
         options.expectFrequentReshapes = expectFrequentReshapes
         self.options = options
     }
