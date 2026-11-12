@@ -265,7 +265,8 @@ struct LLMBenchmark: AsyncParsableCommand {
                 warmupSeconds: warmupSeconds,
                 trials: trials,
                 averages: BenchmarkReport.Averages(
-                    promptTps: avgPrompt, generationTps: avgGen)
+                    promptTps: avgPrompt, generationTps: avgGen),
+                peakMemory: memory?.json
             )
             try writeJSON(report: report, path: path)
         }
@@ -396,6 +397,8 @@ struct BenchmarkReport: Codable {
     let warmupSeconds: Double
     let trials: [TrialResult]
     let averages: Averages
+    /// nil, and left out of the JSON, unless memory is measured.
+    let peakMemory: PeakMemoryJSON?
 
     /// With several requests at once, `promptTps` and `generationTps` are totals across them, as
     /// for `--batch-size`; `perRequestGenerationTps` is what one of them sees. See `TrialResult`.

@@ -268,6 +268,17 @@ extension MemoryReport {
         return lines
     }
 
+    /// The peak memory and its parts for `--output-json`: the numbers behind `summaryLines()`'s first line and
+    /// `detailedLines(cacheHit:)`'s `At peak` line.
+    package var json: PeakMemoryJSON {
+        PeakMemoryJSON(
+            peakMemoryMB: system.peakMB, peakPhase: peakMemoryPhase, peakSeconds: system.peakSeconds,
+            atPeak: PeakMemoryJSON.AtPeak(
+                inProcessMB: system.footprintMB, neuralEngineMB: system.neuralNotCountedMB,
+                modelFilesInUseMB: system.modelMappedFilesMB,
+                neuralEngineServicesMB: system.neuralEngineServicesGrowthMB))
+    }
+
     /// The phase of the peak memory: "prepare", "warmup", or `runPhase`.
     private var peakMemoryPhase: String {
         [("prepare", system.preparePeakMB), ("warmup", system.warmupPeakMB), (runPhase, system.runPeakMB)]
@@ -282,6 +293,33 @@ extension MemoryReport {
 
     /// The highest pressure level, "warning" or "critical", for the memory pressure caveat.
     private var pressureName: String { (peakPressureLevel ?? 1) >= 4 ? "critical" : "warning" }
+}
+
+/// `MemoryReport.json`, in MiB. Encoded with `.convertToSnakeCase`, `peakMemoryMB` becomes `peak_memory_mb`.
+package struct PeakMemoryJSON: Codable {
+    package let peakMemoryMB: Double
+    /// "prepare", "warmup", or the run phase, such as "trials".
+    package let peakPhase: String
+    package let peakSeconds: Double
+    package let atPeak: AtPeak
+
+    /// The highest poll's parts, at `peakSeconds`. They add up to `peakMemoryMB` unless an in-process spike
+    /// between polls set the peak.
+    package struct AtPeak: Codable {
+        package let inProcessMB: Double
+        package let neuralEngineMB: Double?
+        package let modelFilesInUseMB: Double
+        package let neuralEngineServicesMB: Double?
+
+        /// Writes unmeasured parts as null rather than leaving their keys out, so every run has the same keys.
+        package func encode(to encoder: any Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(inProcessMB, forKey: .inProcessMB)
+            try container.encode(neuralEngineMB, forKey: .neuralEngineMB)
+            try container.encode(modelFilesInUseMB, forKey: .modelFilesInUseMB)
+            try container.encode(neuralEngineServicesMB, forKey: .neuralEngineServicesMB)
+        }
+    }
 }
 
 private func pad(_ text: String, _ width: Int) -> String {
