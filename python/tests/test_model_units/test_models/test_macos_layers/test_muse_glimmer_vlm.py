@@ -16,6 +16,7 @@ All tests use small configs with random weights — no HF downloads.
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from coreai_models.models.macos.muse_glimmer import MuseGlimmerForCausalLMEmbeddings
@@ -53,6 +54,35 @@ def _make_glimmer_config(**overrides) -> SimpleNamespace:
 
 class TestMuseGlimmerForCausalLMEmbeddings:
     """Test the inputs_embeds variant of the Muse Glimmer text decoder."""
+
+    @pytest.mark.parametrize("layer_type", ["sliding_attention", "full_attention"])
+    def test_prefill_cannot_attend_to_future_embeddings(self, layer_type):
+        """Changing the final embedding must not change earlier prefill logits."""
+        torch.manual_seed(0)
+        config = _make_glimmer_config(
+            num_hidden_layers=1,
+            layer_types=[layer_type],
+            layer_rope_theta=[500000],
+        )
+        model = MuseGlimmerForCausalLMEmbeddings(config, model_device="cpu").float().eval()
+        for parameter in model.parameters():
+            torch.nn.init.normal_(parameter, std=0.2)
+
+        inputs_embeds = torch.randn(1, 6, config.hidden_size)
+        changed_embeds = inputs_embeds.clone()
+        changed_embeds[:, -1] += 5.0
+        position_ids = torch.arange(6, dtype=torch.int32).unsqueeze(0)
+
+        def prefill(embeds):
+            k_cache, v_cache = KVCache.create_cache_tensors(config, dtype=torch.float32)
+            with torch.no_grad():
+                return model(embeds, position_ids, k_cache, v_cache)
+
+        original = prefill(inputs_embeds)
+        changed = prefill(changed_embeds)
+
+        torch.testing.assert_close(original[:, :-1], changed[:, :-1], rtol=0, atol=1e-6)
+        assert not torch.allclose(original[:, -1], changed[:, -1])
 
     def test_forward_produces_finite_output(self):
         """Forward with random inputs_embeds should produce finite logits."""
