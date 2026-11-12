@@ -181,13 +181,11 @@ candidate-scan table permuted as in `draft_scan.bin`, the centroids, and every l
 the head's geometry, sliding window and RoPE parameters in its `__metadata__`.
 
 ```bash
-uv run export_draft_pack.py --model google/gemma-4-E2B-it [--int8-attention]
+uv run export_draft_pack.py --model google/gemma-4-E2B-it
 ```
 
-Weights are fp16. `--int8-attention` stores the attention projections as int8 with a scale per
-output row, which reads fewer bytes per draft step without lowering the share of accepted drafts;
-the MLP stays fp16, since quantizing it does lower that share. The pack is per variant, like the
-assistant: its `post_projection` is as wide as the target's hidden size.
+Weights are fp16. The pack is per variant, like the assistant: its `post_projection` is as wide as
+the target's hidden size.
 
 ### Runner side
 

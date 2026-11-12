@@ -7,7 +7,7 @@
 
 The recipe is not part of the installed package, so it is loaded by path, after ``export.py`` and
 ``export_drafter.py``, which it imports. Covered: the pack's tensors and metadata, the permuted
-output table, the int8 attention projections, and the checkpoint checks it shares with the drafter
+output table, and the checkpoint checks it shares with the drafter
 export.
 """
 
@@ -47,7 +47,6 @@ if _HAS_COREAI:
     _load("export_drafter")
     export_draft_pack = _load("export_draft_pack")
     pack = export_draft_pack.pack
-    int8_rows = export_draft_pack.int8_rows
 
 VOCAB, HIDDEN, CENTROIDS, HEADS, HEAD_DIM, FFN = 8, 8, 2, 2, 4, 16
 
@@ -143,30 +142,6 @@ def test_pack_permutes_the_untied_head(tmp_path):
     assert torch.equal(tensors["embed_perm_f16"], expected)
     order = tensors["token_ordering_i32"]
     assert torch.equal(order, t["masked_embedding.token_ordering"].to(torch.int32))
-
-
-def test_int8_attention_quantizes_only_the_attention_projections(tmp_path):
-    t = checkpoint()
-    tensors, _ = read(pack(write_checkpoint(tmp_path, t), tmp_path / "out", int8_attention=True))
-    for i in range(2):
-        p = f"model.layers.{i}."
-        for name in ("self_attn.q_proj.weight", "self_attn.o_proj.weight"):
-            q, scale = tensors[p + name], tensors[p + name + ".scale"]
-            assert q.dtype == torch.int8 and scale.shape == (q.shape[0],)
-            restored = q.float() * scale.float()[:, None]
-            assert torch.allclose(restored, t[p + name], atol=float(scale.max()) * 0.51)
-        for name in ("mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight"):
-            assert tensors[p + name].dtype == torch.float16
-            assert p + name + ".scale" not in tensors
-
-
-def test_int8_rows_scale_each_row_to_its_own_largest_magnitude():
-    w = torch.tensor([[1.0, -2.0, 0.5], [0.0, 0.0, 0.0], [127.0, 0.0, -127.0]])
-    q, scale = int8_rows(w)
-    assert q.dtype == torch.int8
-    assert q[0].tolist() == [64, -127, 32] and q[1].tolist() == [0, 0, 0]
-    assert q[2].tolist() == [127, 0, -127]
-    assert torch.allclose(scale.float(), torch.tensor([2 / 127, 1.0, 1.0]), rtol=1e-3)
 
 
 def test_rejects_vocab_not_divisible_by_centroids(tmp_path):

@@ -14,18 +14,13 @@ runtime maps and reads in place.
   is bit exact.
 - ``token_ordering`` is narrowed to int32.
 - ``__metadata__`` records the head's geometry, its sliding window and its RoPE parameters.
-- The centroids, projections and norms are fp16. With ``--int8-attention`` the attention
-  projections (``q_proj``, ``o_proj``) are symmetric int8 per output row with an fp16 scale. That
-  reads about an eighth fewer weight bytes per draft step and leaves the share of accepted drafts
-  where fp16 has it; quantizing the MLP as well costs acceptance, so it is not offered. The
-  drafter only proposes and the target verifies every token, so a coarser weight can cost speed,
-  never correctness.
+- The centroids, projections and norms are fp16; a runtime widens what it needs.
 
 The pack is per variant: the assistant reads the target's final hidden state, so its
 ``post_projection`` is as wide as the target's hidden size (1536 for E2B, 2560 for E4B).
 
     cd models/gemma4
-    uv run export_draft_pack.py --model google/gemma-4-E2B-it [--int8-attention]
+    uv run export_draft_pack.py --model google/gemma-4-E2B-it
 
 The assistant is the target's own (``<model>-assistant`` on the Hugging Face hub), downloaded on
 first use; ``--drafter`` takes another repo id or a local directory instead.
@@ -52,19 +47,9 @@ from safetensors.torch import save_file
 PACK_NAME = "draft_head.safetensors"
 # `__metadata__["format"]`, which tells this pack from another safetensors file.
 PACK_FORMAT = "gemma4_draft_head"
-# The projections `--int8-attention` quantizes.
-ATTENTION_PROJECTIONS = ("self_attn.q_proj.weight", "self_attn.o_proj.weight")
 
 
-def int8_rows(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """``w`` as symmetric int8 with one fp16 scale per output row: ``w ≈ q * scale[:, None]``."""
-    scale = w.float().abs().amax(dim=1, keepdim=True) / 127.0
-    scale[scale == 0] = 1.0  # an all-zero row stays zero under any scale; 1 keeps it finite in fp16
-    q = torch.round(w.float() / scale).clamp(-127, 127).to(torch.int8)
-    return q, scale.reshape(-1).to(torch.float16)
-
-
-def pack(drafter: Path, out_dir: Path, int8_attention: bool = False) -> Path:
+def pack(drafter: Path, out_dir: Path) -> Path:
     """Write ``draft_head.safetensors`` to ``out_dir`` and return its path."""
     t = load_drafter(drafter)
     config = json.loads((drafter / "config.json").read_text())
@@ -95,11 +80,7 @@ def pack(drafter: Path, out_dir: Path, int8_attention: bool = False) -> Path:
     for i in range(num_layers):
         for suffix in LAYER_TENSORS:
             name = f"model.layers.{i}.{suffix}"
-            if int8_attention and suffix in ATTENTION_PROJECTIONS:
-                q, scale = int8_rows(t[name])
-                tensors += [(name, q), (name + ".scale", scale)]
-            else:
-                tensors.append((name, t[name].to(torch.float16)))
+            tensors.append((name, t[name].to(torch.float16)))
 
     # The geometry travels with the tensors, so the runtime adopts it instead of assuming a
     # variant's. safetensors metadata values are strings.
@@ -144,17 +125,12 @@ def main() -> None:
         default=None,
         help="The assistant: a hub repo id or a local directory holding its safetensors",
     )
-    parser.add_argument(
-        "--int8-attention",
-        action="store_true",
-        help="Store the attention projections as int8 with a scale per output row",
-    )
     parser.add_argument("--output-dir", type=Path, default=REPO_ROOT / "exports" / "drafter")
     args = parser.parse_args()
     if args.model is None and args.drafter is None:
         parser.error("pass --model (for its default assistant) or --drafter")
     drafter = resolve_drafter(args.drafter, args.model)
-    pack(drafter, args.output_dir, args.int8_attention)
+    pack(drafter, args.output_dir)
 
 
 if __name__ == "__main__":
