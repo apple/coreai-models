@@ -42,6 +42,14 @@ public protocol InferenceOutputSequence: AsyncSequence<InferenceOutput, any Erro
     func setStopReason(_ reason: StopReason)
 }
 
+/// A token count a decoded stream's iterator writes and the stream reads back, for
+/// ``DecodeOutcomeReporting/tokensGenerated``.
+final class TokenCountStore: Sendable {
+    private let value = Mutex(0)
+    var count: Int { value.withLock { $0 } }
+    func set(_ count: Int) { value.withLock { $0 = count } }
+}
+
 /// Shared, thread-safe slot for a sequence's `StopReason`.
 ///
 /// `InferenceOutputSequence`s are value types, but the reason is written by the

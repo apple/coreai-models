@@ -39,6 +39,16 @@ struct LLMBenchmark: AsyncParsableCommand {
     @Option(name: .long, help: "Random seed for synthetic prompt")
     var seed: UInt64 = 0
 
+    @Option(
+        name: [.customShort("c"), .customLong("concurrency")],
+        help:
+            "Requests in flight at once through the continuous-batching scheduler, each with its own prompt. Up to the model's max batch size decode together; the rest queue for a free row, as on llm-server. Above 1, needs the coreai-sequential engine and a model exported with --attention-mask batched."
+    )
+    var concurrency: Int = 1
+
+    @Option(name: .customLong("kv-cache-initial-capacity"), help: "Initial KV cache capacity in tokens")
+    var kvCacheInitialCapacity: Int?
+
     @Option(name: .customLong("output-json"), help: "Write summary JSON to file")
     var outputJson: String?
 
@@ -79,6 +89,11 @@ struct LLMBenchmark: AsyncParsableCommand {
         if generationTokens < 1 { throw ValidationError("--generation-tokens must be >= 1") }
         if numTrials < 1 { throw ValidationError("--num-trials must be >= 1") }
         if let b = batchSize, b < 1 { throw ValidationError("--batch-size must be >= 1") }
+        if concurrency < 1 { throw ValidationError("--concurrency must be >= 1") }
+        if concurrency > 1, let b = batchSize, b > 1 {
+            throw ValidationError(
+                "--batch-size steps identical rows in lockstep and --concurrency runs separate requests; pick one")
+        }
         if !FileManager.default.fileExists(atPath: model) {
             throw ValidationError("Model path not found: \(model)")
         }
@@ -114,6 +129,7 @@ struct LLMBenchmark: AsyncParsableCommand {
         let resolvedChunkThreshold = chunkThreshold ?? bundle.language.prefillChunkThreshold
         let engineOptions = EngineOptions(
             variant: inferenceEngineVariant,
+            kvCacheSize: kvCacheInitialCapacity,
             prefillChunkSize: resolvedChunkSize,
             prefillChunkThreshold: resolvedChunkThreshold,
             tensorData: bundle.tensorData
@@ -127,6 +143,17 @@ struct LLMBenchmark: AsyncParsableCommand {
         let prepareSeconds = (SuspendingClock.now - prepareStart).inSeconds
         let cacheSuffix = cacheHit ? " (cache hit)" : ""
         print(" done in \(fmt(prepareSeconds))s\(cacheSuffix)")
+
+        if concurrency > 1 {
+            guard let seq = engine as? CoreAISequentialEngine, seq.supportsBatching else {
+                throw ValidationError(
+                    "--concurrency \(concurrency) needs the coreai-sequential engine and a model exported "
+                        + "with --attention-mask batched --dynamic-batch-size N")
+            }
+            try await runConcurrent(
+                engine: seq, bundle: bundle, prepareSeconds: prepareSeconds, cacheHit: cacheHit)
+            return
+        }
 
         let prompt = randomPrompt(vocabSize: vocabSize, count: promptTokens, seed: seed)
         let sampling = SamplingConfiguration(temperature: 0)
@@ -268,7 +295,7 @@ struct LLMBenchmark: AsyncParsableCommand {
 
     // MARK: - Helpers
 
-    private func randomPrompt(vocabSize: Int, count: Int, seed: UInt64) -> [Int32] {
+    func randomPrompt(vocabSize: Int, count: Int, seed: UInt64) -> [Int32] {
         var state = seed &+ 0x9E37_79B9_7F4A_7C15
         var out = [Int32]()
         out.reserveCapacity(count)
@@ -288,13 +315,13 @@ struct LLMBenchmark: AsyncParsableCommand {
         (end - start).inSeconds
     }
 
-    private func fmt(_ v: Double) -> String {
+    func fmt(_ v: Double) -> String {
         String(format: "%.3f", v)
     }
 
     // MARK: - JSON output
 
-    private func writeJSON(report: BenchmarkReport, path: String) throws {
+    func writeJSON(report: BenchmarkReport, path: String) throws {
         let encoder = JSONEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -309,9 +336,13 @@ struct LLMBenchmark: AsyncParsableCommand {
 
 // MARK: - Codable Report
 
+/// One trial. The optional fields are a `--concurrency` run's and are left out of the JSON otherwise.
 struct TrialResult: Codable {
     let promptTps: Double
     let genTps: Double
+    var perRequestGenTps: Double?
+    var endToEndTps: Double?
+    var meanTtftSeconds: Double?
 }
 
 struct BenchmarkReport: Codable {
@@ -319,15 +350,25 @@ struct BenchmarkReport: Codable {
     let promptTokens: Int
     let generationTokens: Int
     let numTrials: Int
+    /// Rows decoded in lockstep (`--batch-size`); 1 for a `--concurrency` run, which has none.
     let batchSize: Int
+    /// Requests in flight at once, for a `--concurrency` run.
+    var concurrency: Int?
+    /// Of `concurrency`, how many the scheduler decodes at once; the rest queue.
+    var residentRows: Int?
     let prepareSeconds: Double
     let cacheHit: Bool
     let warmupSeconds: Double
     let trials: [TrialResult]
     let averages: Averages
 
+    /// With several requests at once, `promptTps` and `generationTps` are totals across them, as
+    /// for `--batch-size`; `perRequestGenerationTps` is what one of them sees. See `TrialResult`.
     struct Averages: Codable {
         let promptTps: Double
         let generationTps: Double
+        var perRequestGenerationTps: Double?
+        var endToEndTps: Double?
+        var meanTtftSeconds: Double?
     }
 }

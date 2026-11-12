@@ -135,6 +135,11 @@ final class ServerState: @unchecked Sendable {
     /// `SchedulerSession`. Nil when batched serving is off.
     private let batchServing: (scheduler: BatchScheduler, modelConfig: ModelConfig)?
     private var batchScheduler: BatchScheduler? { batchServing?.scheduler }
+
+    /// What the process holds against the device's recommendation: reported in /ready, and checked
+    /// whenever a request is granted its access, so a request that queued before the process went
+    /// past the line is refused too.
+    private let memoryGuard: DeviceMemoryGuard?
     private let _state = Mutex<InternalState>(InternalState())
 
     private struct InternalState {
@@ -150,8 +155,10 @@ final class ServerState: @unchecked Sendable {
         engine: any InferenceEngine,
         tokenizer: any Tokenizer,
         config: ServerConfig,
-        batchServing: (scheduler: BatchScheduler, modelConfig: ModelConfig)? = nil
+        batchServing: (scheduler: BatchScheduler, modelConfig: ModelConfig)? = nil,
+        memoryGuard: DeviceMemoryGuard? = nil
     ) {
+        self.memoryGuard = memoryGuard
         self.engine = engine
         self.tokenizer = tokenizer
         self.config = config
@@ -197,8 +204,9 @@ final class ServerState: @unchecked Sendable {
     /// - `ExclusiveEngineLease`: on `.fallbackBatchOne` when `batchScheduler` is set. The batch
     ///   does not step while the lease is held.
     ///
-    /// Throws `ServerError.queueFull` when the queue is full, and `CancellationError` when the task
-    /// is cancelled while waiting for the permit.
+    /// Throws `ServerError.queueFull` when the queue is full, `CancellationError` when the task
+    /// is cancelled while waiting for the permit, and ``MemoryRefusal`` when the process is past the
+    /// device's memory recommendation once the access is granted, having released it.
     ///
     /// Pass the same lane here and to `engineForRequest(lane:)`, and release the access when the
     /// request is done:
@@ -212,17 +220,25 @@ final class ServerState: @unchecked Sendable {
     func acquireAccess(lane: BatchServingLane) async throws -> RequestAccess {
         let permit = needsServerPermit(lane: lane) ? try await queue.acquire() : nil
         let lease = lane == .fallbackBatchOne ? await batchScheduler?.acquireExclusiveAccess() : nil
-        return RequestAccess(permit: permit, lease: lease)
+        return try admittedForMemory(RequestAccess(permit: permit, lease: lease))
     }
 
     /// Scheduler that scores completion prompts in batches, or nil when batched serving is off.
     var scoringScheduler: BatchScheduler? { batchScheduler }
 
     /// Waits for and returns the single-slot permit for a scoring request, with no engine lease.
-    /// Throws `ServerError.queueFull` when the queue is full, and `CancellationError` when the task
-    /// is cancelled while waiting.
+    /// Throws `ServerError.queueFull` when the queue is full, `CancellationError` when the task
+    /// is cancelled while waiting, and ``MemoryRefusal`` as ``acquireAccess(lane:)`` does.
     func acquireScoringAccess() async throws -> RequestAccess {
-        RequestAccess(permit: try await queue.acquire(), lease: nil)
+        try admittedForMemory(RequestAccess(permit: try await queue.acquire(), lease: nil))
+    }
+
+    /// `access`, unless the process is past the device's memory recommendation: then releases it and
+    /// throws ``MemoryRefusal``.
+    private func admittedForMemory(_ access: RequestAccess) throws -> RequestAccess {
+        guard let reason = memoryGuard?.refusalReason() else { return access }
+        access.release()
+        throw MemoryRefusal(reason: reason)
     }
 
     /// True when a request on `lane` needs the single-slot permit: every lane except `.batched`
@@ -364,14 +380,18 @@ final class ServerState: @unchecked Sendable {
     }
 
     /// Readiness snapshot for /ready endpoint.
+    ///
+    /// `status` is `"refusing"` while new requests get 503 for memory, `"ready"` otherwise;
+    /// `deviceMemory` reports the figures and the refusal from one measurement.
     func readySnapshot() -> ReadyResponse {
+        let memory = memoryGuard?.check()
         let occupancy = batchScheduler?.occupancy
         let busy = queue.isActive || (occupancy?.active ?? 0) > 0
         let usedTokens = engine.processedTokenCount
         let maxTokens = config.maxContextLength
         let utilization = maxTokens > 0 ? Double(usedTokens) / Double(maxTokens) : 0
         return ReadyResponse(
-            status: "ready",
+            status: memory?.refusal == nil ? "ready" : "refusing",
             model: config.modelName,
             maxContextLength: maxTokens,
             busy: busy,
@@ -382,6 +402,15 @@ final class ServerState: @unchecked Sendable {
             ),
             toolCalling: supportsToolCalling,
             estimatedMemory: estimatedMemory(),
+            deviceMemory: memory.map { memory in
+                let megabyte = 1024.0 * 1024.0
+                return .init(
+                    metalAllocatedMB: Double(memory.snapshot.allocated) / megabyte,
+                    recommendedMB: Double(memory.snapshot.recommended) / megabyte,
+                    footprintMB: Double(memory.snapshot.footprint) / megabyte,
+                    mappedMB: Double(memory.snapshot.mapped) / megabyte,
+                    refusing: memory.refusal)
+            },
             batching: batchScheduler.map { scheduler in
                 .init(
                     concurrentRequests: scheduler.maxConcurrent, active: occupancy?.active ?? 0,
@@ -449,6 +478,13 @@ enum RequestID {
 
 /// Single-slot permit and engine lease a request holds while it uses the engine. Either can be nil.
 /// `release()` can be called more than once, and the permit and lease also release on deinit.
+/// A request refused because the process is past the device's memory recommendation. The server
+/// answers 503 `out_of_memory` with `Retry-After`; the refusal clears once the process is back under.
+struct MemoryRefusal: Error, CustomStringConvertible {
+    let reason: String
+    var description: String { reason }
+}
+
 final class RequestAccess: Sendable {
     private let permit: QueuePermit?
     private let lease: ExclusiveEngineLease?
