@@ -4,6 +4,7 @@
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
 import CoreAILanguageModels
+import CoreAIMemoryMeasurement
 import CoreAIShared
 import Foundation
 
@@ -17,7 +18,8 @@ extension LLMBenchmark {
         engine: CoreAISequentialEngine,
         bundle: LanguageModelBundle,
         prepareSeconds: Double,
-        cacheHit: Bool
+        cacheHit: Bool,
+        measurement: MemoryMeasurement?
     ) async throws {
         let cacheSuffix = cacheHit ? " (cache hit)" : ""
         let width = Swift.min(concurrency, bundle.maxBatchSize)
@@ -29,18 +31,20 @@ extension LLMBenchmark {
         let scheduler = try BatchScheduler(engine: engine, maxConcurrent: width)
 
         var promptIndex: UInt64 = 0
-        func requests() -> [BatchRequest] {
+        func requests(maxTokens: Int? = nil) -> [BatchRequest] {
             (0..<concurrency).map { _ in
                 defer { promptIndex += 1 }
-                // No stop tokens, so every request generates exactly `--generation-tokens`.
+                // No stop tokens, so every request generates exactly `maxTokens`, `--generation-tokens` by default.
                 return BatchRequest(
                     promptTokens: randomPrompt(
                         vocabSize: bundle.vocabSize, count: promptTokens, seed: seed &+ promptIndex),
-                    sampling: SamplingConfiguration(temperature: 0), eosTokenIds: [], maxTokens: generationTokens)
+                    sampling: SamplingConfiguration(temperature: 0), eosTokenIds: [],
+                    maxTokens: maxTokens ?? generationTokens)
             }
         }
 
         // Warmup at the timed shape, so every decode width the trials reach is compiled.
+        measurement?.begin("warmup")
         print("\n⚙️  Warming up engine...", terminator: "")
         fflush(stdout)
         let warmupStart = SuspendingClock.now
@@ -53,6 +57,7 @@ extension LLMBenchmark {
                 + "tokens, \(concurrency) requests at once\n")
         var trials: [TrialResult] = []
         for i in 0..<numTrials {
+            measurement?.begin("trial \(i + 1)")
             let trial = TrialResult(metrics: try await scheduler.generateBatch(requests()).metrics)
             trials.append(trial)
             if i > 0 { print() }
@@ -61,6 +66,12 @@ extension LLMBenchmark {
             print("⏱️  TTFT:       \(fmt(trial.meanTtftSeconds ?? 0))s mean")
             print("🏃 Generation: \(fmt(trial.perRequestGenTps ?? 0)) tokens/sec per request")
             print("📈 Aggregate:  \(fmt(trial.genTps)) tokens/sec decode")
+        }
+
+        // As in the single-request path: a short untimed batch at the trials' shape, after the memory check drops
+        // the mapped model files, shows which of them the model needs.
+        let memory = try await measurement?.finish {
+            _ = try await scheduler.generateBatch(requests(maxTokens: 16))
         }
 
         let n = Double(trials.count)
@@ -84,7 +95,13 @@ extension LLMBenchmark {
         print("Generation: \(fmt(averages.perRequestGenerationTps ?? 0)) tokens/sec per request")
         print("Aggregate:  \(fmt(averages.generationTps)) tokens/sec decode")
         print("End-to-end: \(fmt(averages.endToEndTps ?? 0)) tokens/sec, wall clock")
+        if let memory {
+            for line in memory.summaryLines() { print(line) }
+        }
         print(String(repeating: "=", count: 50))
+
+        if let memory { measurement?.chart(memory: memory, cacheHit: cacheHit) }
+        try measurement?.writeCSVIfRequested()
 
         if let path = outputJson {
             let report = BenchmarkReport(
@@ -100,7 +117,8 @@ extension LLMBenchmark {
                 cacheHit: cacheHit,
                 warmupSeconds: warmupSeconds,
                 trials: trials,
-                averages: averages
+                averages: averages,
+                peakMemory: memory?.json
             )
             try writeJSON(report: report, path: path)
         }
