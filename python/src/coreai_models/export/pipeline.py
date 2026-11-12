@@ -412,7 +412,9 @@ def build_model(
             and model.config.tie_word_embeddings
         ):
             logger.info("Untying lm_head from word embeddings for quantization")
-            model.lm_head.weight = torch.nn.Parameter(model.lm_head.weight.clone())
+            model.lm_head.weight = torch.nn.Parameter(
+                model.lm_head.weight.detach().clone(), requires_grad=False
+            )
             model.config.tie_word_embeddings = False
 
         # The preset or YAML is the source of truth; `--quantization-mode` overrides

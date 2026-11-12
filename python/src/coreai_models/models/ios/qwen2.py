@@ -12,7 +12,7 @@ from transformers.models.qwen2.modeling_qwen2 import (
     Qwen2ForCausalLM as HFQwen2ForCausalLM,
 )
 
-from coreai_models._hf import resolve_rope_theta
+from coreai_models._hf import is_default_rope_scaling, resolve_rope_theta
 from coreai_models.models.base import BaseForCausalLMForiOS
 from coreai_models.primitives.ios.cache import KVCacheHandler
 from coreai_models.primitives.ios.mlp import MLP
@@ -194,6 +194,7 @@ class Qwen2Extend(nn.Module):
         self.kv_cache = KVCacheHandler(config.num_hidden_layers, config.hidden_size)
 
         head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        assert is_default_rope_scaling(config), f"unsupported rope_scaling: {config.rope_scaling}"
         rope_theta = resolve_rope_theta(config)
         self.rope = RoPECache(head_dim, config.max_position_embeddings, rope_theta)
 

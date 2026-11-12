@@ -90,6 +90,52 @@ class TestModelRegistry:
 
         torch.testing.assert_close(logits, want, atol=1e-5, rtol=1e-5)
 
+    @pytest.mark.parametrize("no_rope_layer_interval", [2, 1000])  # NoPE at layers 1, 3 / none
+    def test_smollm3_matches_hugging_face_ios(self, no_rope_layer_interval):
+        """SmolLM3 iOS logits must match Hugging Face (NoPE layers skip RoPE)."""
+        from coreai_models.primitives.ios.cache import KVCacheHandler
+
+        config = SmolLM3Config(
+            hidden_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            num_hidden_layers=4,
+            intermediate_size=128,
+            vocab_size=100,
+            max_position_embeddings=64,
+            no_rope_layer_interval=no_rope_layer_interval,
+            pad_token_id=0,
+            bos_token_id=1,
+            eos_token_id=2,
+        )
+        torch.manual_seed(0)
+        hf_model = HFSmolLM3ForCausalLM(config).to(torch.float32).eval()
+        model = (
+            get_model_entry("smollm3")
+            .ios_class(config, model_device="cpu", disable_embedding_quantization=True)
+            .to(torch.float32)
+            .eval()
+        )
+        state_dict = dict(hf_model.state_dict())
+        model._mutate_state_dict(state_dict)
+        model.load_state_dict(state_dict, assign=True, strict=True)
+
+        seq_len = 4
+        # The iOS KV cache spans max_position_embeddings; the mask must cover it.
+        max_seq = config.max_position_embeddings
+        input_ids = torch.randint(0, config.vocab_size, (1, seq_len))
+        position_ids = torch.arange(seq_len, dtype=torch.int32).unsqueeze(0)
+        in_step = torch.tensor([0], dtype=torch.int32)
+        causal_mask = torch.zeros(1, max_seq, 1, seq_len, dtype=torch.float32)
+        for i in range(seq_len):
+            causal_mask[0, i + 1 :, 0, i] = float("-inf")
+        k_cache, v_cache = KVCacheHandler.get_kv_cache_from_hf(config, dtype=torch.float32)
+        with torch.no_grad():
+            logits = model(input_ids, position_ids, in_step, causal_mask, k_cache, v_cache)
+            want = hf_model(input_ids=input_ids, position_ids=position_ids.long()).logits
+
+        torch.testing.assert_close(logits.squeeze(1), want, atol=1e-5, rtol=1e-5)
+
     def test_unknown_model_raises_key_error(self):
         """Requesting a nonexistent model should raise KeyError."""
         with pytest.raises(KeyError, match="nonexistent_model"):
