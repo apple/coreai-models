@@ -219,6 +219,7 @@ func runChatCompletion(chatRequest: ChatCompletionRequest, state: ServerState, s
         chatRequest.messages, tools: chatRequest.tools, reasoningEffort: reasoningEffort,
         tokenizer: state.tokenizer, toolCallDetection: state.toolCallDetection)
     let stopSequences = buildStopSequences(from: chatRequest, state: state)
+    try requireSchemaSupport(chatRequest, state: state)
     let input: Input = .tokens(promptTokens)
 
     guard promptTokens.count < state.config.maxContextLength else {
@@ -267,6 +268,7 @@ func runChatCompletion(chatRequest: ChatCompletionRequest, state: ServerState, s
         parts.append(result.text)
         genTokenCount += 1
     }
+    genTokenCount = reportedTokenCount(of: stream, results: genTokenCount)
     let text = parts.joined()
 
     let elapsed = SuspendingClock().now - t0
@@ -277,7 +279,7 @@ func runChatCompletion(chatRequest: ChatCompletionRequest, state: ServerState, s
     var responseContent: String? = text
     var responseReasoningContent: String? = nil
     var responseToolCalls: [ToolCall]? = nil
-    var finishReason = genTokenCount >= requestMaxTokens ? "length" : "stop"
+    var finishReason = try reportedFinishReason(of: stream, generated: genTokenCount, maxTokens: requestMaxTokens)
 
     if chatRequest.raw != true {
         // Separate reasoning from text using the streaming parser on the full output
@@ -442,6 +444,7 @@ func prepareStreaming(chatRequest: ChatCompletionRequest, state: ServerState, se
         chatRequest.messages, tools: chatRequest.tools, reasoningEffort: reasoningEffort,
         tokenizer: state.tokenizer, toolCallDetection: state.toolCallDetection)
     let stopSequences = buildStopSequences(from: chatRequest, state: state)
+    try requireSchemaSupport(chatRequest, state: state)
     let input: Input = .tokens(promptTokens)
 
     guard promptTokens.count < state.config.maxContextLength else {
@@ -592,7 +595,9 @@ func runStreamingLoop(
         }
     }
 
-    let finishReason = tokenCount >= prepared.requestMaxTokens ? "length" : (hasToolCalls ? "tool_calls" : "stop")
+    tokenCount = reportedTokenCount(of: tokenStream, results: tokenCount)
+    let ended = try reportedFinishReason(of: tokenStream, generated: tokenCount, maxTokens: prepared.requestMaxTokens)
+    let finishReason = hasToolCalls && ended == "stop" ? "tool_calls" : ended
 
     let elapsed = SuspendingClock().now - genStart
     let totalSeconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
@@ -667,6 +672,7 @@ private func handleStreamingRequest(
             try await writer.finish(nil)
         } catch {
             print("\(ts()) [\(prepared.requestID)] stream error: \(error)")
+            try? await writer.write(ByteBuffer(string: streamErrorFrame(error)))
             try? await writer.write(ByteBuffer(string: "data: [DONE]\n\n"))
             try? await writer.finish(nil)
         }
@@ -780,6 +786,59 @@ func outOfMemoryResponse(_ reason: String) throws -> Response {
 /// Seconds a client refused for memory is told to wait, long enough for a running request to finish
 /// a few hundred tokens.
 let outOfMemoryRetryAfterSeconds = "5"
+
+/// `usage.completion_tokens` for a stream that has ended, given the `results` it yielded.
+///
+/// The stream's own count when it reports one: it includes the tokens that added no text and so
+/// yielded no result, and the token that ended the reply. A stream that doesn't is counted a result
+/// at a time.
+func reportedTokenCount(of stream: any AsyncSequence<GenerationResult, Error>, results: Int) -> Int {
+    guard let count = (stream as? any DecodeOutcomeReporting)?.tokensGenerated, count > 0 else { return results }
+    return count
+}
+
+/// `finish_reason` for a stream that has ended.
+///
+/// Taken from the stream's stop reason when it reports one, so a reply that ended on a stop sequence
+/// or the end of sequence says `stop` and one cut off by the limit says `length`, whatever the count.
+/// A stream that ended on an error or was cancelled without throwing throws here, rather than
+/// passing a truncated reply off as finished. A stream that reports nothing falls back to the count.
+func reportedFinishReason(
+    of stream: any AsyncSequence<GenerationResult, Error>, generated: Int, maxTokens: Int
+) throws -> String {
+    switch (stream as? any DecodeOutcomeReporting)?.stopReason {
+    case .maxTokens:
+        return "length"
+    case .eos, .stopSequence:
+        return "stop"
+    case .error:
+        throw InferenceRuntimeError.invalidState("generation ended on an error after \(generated) token(s)")
+    case .cancelled:
+        throw InferenceRuntimeError.invalidState("generation was cancelled after \(generated) token(s)")
+    case nil:
+        return generated >= maxTokens ? "length" : "stop"
+    }
+}
+
+/// Throws a 400 for a `json_schema` the engine can't serve: guided generation masks each step's
+/// logits, and an engine that samples on the GPU returns none. Checked before any generation, so a
+/// streaming request is refused before its response starts rather than after.
+func requireSchemaSupport(_ chatRequest: ChatCompletionRequest, state: ServerState) throws {
+    guard chatRequest.responseFormat?.extractedSchema != nil,
+        !state.engineForRequest(lane: .fallbackBatchOne).supportsLogits
+    else { return }
+    throw ServerError.badRequest(
+        "response_format json_schema needs an engine that returns logits, and this server's samples on the "
+            + "GPU; serve the model with --variant coreai-sequential for guided generation")
+}
+
+/// An SSE frame carrying `error`, for a stream that fails after its response has started, so the
+/// client sees the failure instead of a reply that just stops.
+func streamErrorFrame(_ error: any Error) -> String {
+    let err = ErrorResponse(error: .init(message: "\(error)", type: "server_error", code: nil))
+    let json = (try? JSONEncoder().encode(err)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+    return "data: \(json)\n\n"
+}
 
 private func buildStopSequences(from request: ChatCompletionRequest, state: ServerState) -> StopSequences {
     var additionalSequences: [[Int32]] = []

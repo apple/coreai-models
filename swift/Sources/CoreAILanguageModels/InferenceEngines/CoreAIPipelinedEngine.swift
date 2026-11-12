@@ -282,8 +282,14 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
         samplingConfiguration: SamplingConfiguration,
         maxTokens: Int,
         session: ConstrainedSessionHandle
-    ) throws -> InferenceTokenSequence {
+    ) async throws -> InferenceTokenSequence {
         try Self.rejectSeedIfUnsupported(samplingConfiguration)
+        // As in `generate`: a prior generation still winding down (its caller stopped reading) is
+        // cancelled and waited for, so it is not mistaken for one still in use.
+        if let priorTask = _generationTask.withLock({ $0 }) {
+            _activeToken.withLock { $0?.cancel() }
+            await priorTask.value
+        }
         if _generationTask.withLock({ $0 }) != nil || engineInUse.load(ordering: .acquiring) {
             throw InferenceRuntimeError.invalidState(
                 "generateConstrained called while a prior generation is still in flight — caller must drain first"
@@ -325,8 +331,12 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
                 )
                 continuation.finish()
             } catch is CancellationError {
+                // Cancelled from the engine side (a later generation, or `cancel()`): say so, so the
+                // reader doesn't take the early end for the grammar's.
+                stopReasonStore.setIfUnset(.cancelled)
                 continuation.finish()
             } catch {
+                stopReasonStore.setIfUnset(.error)
                 continuation.finish(throwing: error)
             }
         }

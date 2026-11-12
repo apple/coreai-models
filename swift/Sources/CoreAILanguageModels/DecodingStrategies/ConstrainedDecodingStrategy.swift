@@ -221,7 +221,7 @@ public struct ConstrainedDecodingStrategy: DecodingStrategy {
 
 extension ConstrainedDecodingStrategy {
     /// Async sequence of `GenerationResult` produced by `decode()`.
-    public struct ConstrainedDecodedSequence: AsyncSequence {
+    public struct ConstrainedDecodedSequence: AsyncSequence, DecodeOutcomeReporting {
         public typealias Element = GenerationResult
         public typealias Failure = Error
 
@@ -240,6 +240,10 @@ extension ConstrainedDecodingStrategy {
                 stopSequences: stopSequences
             )
         }
+
+        public var stopReason: StopReason? { prepared.outcome.stopReason }
+
+        public var tokensGenerated: Int { prepared.tokenCount.count }
     }
 }
 
@@ -249,6 +253,10 @@ extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
         var session: ConstrainedGenerationSession?
         let inputTokens: [Int32]
         let maxTokens: Int
+        /// Why the stream ended, for ``ConstrainedDecodedSequence/stopReason``.
+        let outcome = StopReasonStore()
+        /// Tokens sampled, the one that ended the reply included, for ``tokensGenerated``.
+        let tokenCount = TokenCountStore()
 
         init(
             session: consuming ConstrainedGenerationSession,
@@ -281,6 +289,8 @@ extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
         private var previousDecodedText: String = ""
         private var tokenStep: Int = 0
         private var finished: Bool = false
+        private let outcome: StopReasonStore
+        private let tokenCount: TokenCountStore
 
         fileprivate init(
             prepared: ConstrainedDecodingStrategy.ConstrainedDecodedSequence.Prepared,
@@ -293,6 +303,8 @@ extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
             self.session = prepared.session.take()
             self.inputTokens = prepared.inputTokens
             self.maxTokens = prepared.maxTokens
+            self.outcome = prepared.outcome
+            self.tokenCount = prepared.tokenCount
             self.tokenizer = tokenizer
             self.inferenceEngine = inferenceEngine
             self.samplingConfiguration = samplingConfiguration
@@ -309,10 +321,12 @@ extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
 
                 guard var session = self.session.take() else {
                     finished = true
+                    outcome.setIfUnset(.error)
                     return nil
                 }
                 if session.isTerminated {
                     finished = true
+                    outcome.setIfUnset(.eos)
                     return nil
                 }
 
@@ -328,6 +342,7 @@ extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
                     )
                 } catch {
                     finished = true
+                    outcome.setIfUnset(.error)
                     // Drop session — generation failed, no further use.
                     throw error
                 }
@@ -337,20 +352,26 @@ extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
 
                 guard let bestToken = result.0, let logits = result.1 else {
                     finished = true
+                    outcome.setIfUnset(.error)
                     return nil
                 }
 
                 if stopSequences.matches(recentTokens: [bestToken]) {
+                    // Sampled, and paid for, though not part of the reply.
+                    tokenCount.set(generatedTokens.count + 1)
                     finished = true
+                    outcome.setIfUnset(.stopSequence(tokenizer.decode(tokens: [Int(bestToken)])))
                     return nil
                 }
 
                 inputTokens.append(bestToken)
                 generatedTokens.append(bestToken)
+                tokenCount.set(generatedTokens.count)
                 tokenStep += 1
 
                 if terminatedAfterAccept {
                     finished = true
+                    outcome.setIfUnset(.eos)
                     return nil
                 }
 
@@ -365,6 +386,7 @@ extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
             }
 
             finished = true
+            outcome.setIfUnset(.maxTokens)
             return nil
         }
     }

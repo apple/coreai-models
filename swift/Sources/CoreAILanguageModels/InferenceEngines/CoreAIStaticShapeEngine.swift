@@ -1263,11 +1263,14 @@ extension StaticShapeEngine {
 }
 
 extension StaticShapeEngine.GenerationSequence {
-    public struct Iterator: AsyncIteratorProtocol {
+    /// A class, so that a caller who stops iterating early (a stop sequence, a dropped stream) still
+    /// gives back the engine's active token in `deinit`, as the loop's own finish does.
+    public final class Iterator: AsyncIteratorProtocol {
         public typealias Element = InferenceOutput
         public typealias Failure = Error
 
         private let engine: StaticShapeEngine
+        private let generationToken: GenerationToken
         private var loop: DecodeLoop
 
         init(
@@ -1279,6 +1282,7 @@ extension StaticShapeEngine.GenerationSequence {
             generationToken: GenerationToken
         ) {
             self.engine = engine
+            self.generationToken = generationToken
             self.loop = DecodeLoop(
                 input: input,
                 samplingConfiguration: samplingConfiguration,
@@ -1291,7 +1295,11 @@ extension StaticShapeEngine.GenerationSequence {
             )
         }
 
-        public mutating func next() async throws -> InferenceOutput? {
+        deinit {
+            engine.clearTokenIfActive(generationToken)
+        }
+
+        public func next() async throws -> InferenceOutput? {
             guard loop.shouldContinue() else { return nil }
             let engine = self.engine
             return try await loop.decodeStep { inputTokens in
