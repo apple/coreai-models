@@ -257,9 +257,10 @@ public struct CompositeSampler {
     /// When `topK` is set: partial sort via min-heap of size K (O(V log K)) — avoids the
     /// O(V log V) full sort and the V-sized [Int] allocation.
     ///
-    /// When only `topP` or `minP` is set: full sort (variable cutoff means a partial-sort window
-    /// would need a fallback path; deferred). Still wins over the previous code by
-    /// avoiding the downstream V-sized softmax + multinomial scan.
+    /// When only `topP` or `minP` is set: O(V) passes find the max logit and, for topP, the
+    /// logit bucket where the nucleus ends, so only that small prefix is sorted
+    /// (see `candidateIndicesAboveCutoff`). This avoids the O(V log V) full-vocabulary sort,
+    /// which dominates sampling time for large vocabularies.
     ///
     /// `minP` is applied first in logit space: tokens with logit < max_logit + log(minP)
     /// are excluded. This is equivalent to excluding tokens with probability < minP × max_prob.
@@ -276,10 +277,13 @@ public struct CompositeSampler {
         let vocabSize = logits.count
 
         let sortedIndices: [Int]
+        // Softmax denominator over the candidates, when the selection already computed it.
+        var candidateSumExp: Float?
         if let k = topK {
             sortedIndices = topIndicesByLogit(logits, k: min(k, vocabSize))
         } else {
-            sortedIndices = (0..<vocabSize).sorted { logits[$0] > logits[$1] }
+            (sortedIndices, candidateSumExp) = candidateIndicesAboveCutoff(
+                logits, topP: topP, minP: minP)
         }
 
         guard !sortedIndices.isEmpty else { return [] }
@@ -307,6 +311,8 @@ public struct CompositeSampler {
             expValues[i] = e
             sumExp += e
         }
+        // `filtered` may be a trimmed prefix; the denominator must cover every candidate.
+        if let total = candidateSumExp { sumExp = total }
         let invSumExp = 1.0 / max(sumExp, .leastNormalMagnitude)
 
         var cumProb: Float = 0
@@ -320,6 +326,88 @@ public struct CompositeSampler {
         }
 
         return Array(filtered.prefix(cutoff))
+    }
+
+    /// Logit distance below the maximum beyond which a token is ignored when `topP` is set.
+    /// `exp(-20)` is about 2e-9 of the best token's probability, so dropping everything below
+    /// it cannot change the nucleus in any realistic distribution.
+    private static let topPLogitWindow: Float = 20
+
+    /// Number of logit buckets used to locate the end of the nucleus.
+    private static let nucleusBucketCount = 2048
+
+    /// Returns the tokens that can survive minP / topP, sorted descending by logit, plus the
+    /// softmax denominator (relative to the max logit) over all candidates when topP is set.
+    ///
+    /// Candidates are tokens with logit >= `max - 20` (topP) and >= `max + log(minP)` (minP);
+    /// the tighter bound wins. With minP alone the candidates are sorted directly.
+    ///
+    /// With topP the candidate set can still be large (a flat distribution), so the end of the
+    /// nucleus is located without sorting: candidates are bucketed by logit, per-bucket softmax
+    /// mass is accumulated from the top bucket down until it reaches `topP`, and only tokens in
+    /// those buckets (plus one for rounding slack) are returned. The caller's exact cumulative
+    /// scan over the sorted prefix then picks the precise cutoff, so the result is independent
+    /// of the distribution's shape.
+    ///
+    /// Indices are collected in ascending order and the sort is stable, so ties resolve the same
+    /// way as sorting the whole vocabulary. -inf logits never pass the cutoff.
+    private static func candidateIndicesAboveCutoff(
+        _ logits: [Float],
+        topP: Float?,
+        minP: Float?
+    ) -> (indices: [Int], sumExp: Float?) {
+        guard !logits.isEmpty else { return ([], nil) }
+
+        var maxLogit: Float = 0
+        vDSP_maxv(logits, 1, &maxLogit, vDSP_Length(logits.count))
+        // All-masked degenerate input.
+        guard maxLogit > -.infinity else { return ([], nil) }
+
+        var cutoff = -Float.infinity
+        if topP != nil { cutoff = maxLogit - topPLogitWindow }
+        if let m = minP { cutoff = max(cutoff, maxLogit + logf(m)) }
+
+        guard let p = topP else {
+            var candidates: [Int] = []
+            for (i, v) in logits.enumerated() where v >= cutoff {
+                candidates.append(i)
+            }
+            return (candidates.sorted { logits[$0] > logits[$1] }, nil)
+        }
+
+        let bucketCount = nucleusBucketCount
+        // Bucket 0 holds the logits closest to the max. A zero span (minP == 1) maps to bucket 0.
+        let span = maxLogit - cutoff
+        let scale: Float = span > 0 ? Float(bucketCount) / span : 0
+        @inline(__always) func bucket(_ v: Float) -> Int {
+            min(bucketCount - 1, Int((maxLogit - v) * scale))
+        }
+
+        var mass = [Double](repeating: 0, count: bucketCount)
+        var total: Double = 0
+        for v in logits where v >= cutoff {
+            let e = Double(expf(v - maxLogit))
+            mass[bucket(v)] += e
+            total += e
+        }
+
+        // First bucket where the cumulative mass reaches topP, plus one bucket of slack.
+        let target = Double(p) * total
+        var cum: Double = 0
+        var lastBucket = bucketCount - 1
+        for b in 0..<bucketCount {
+            cum += mass[b]
+            if cum >= target {
+                lastBucket = min(b + 1, bucketCount - 1)
+                break
+            }
+        }
+
+        var candidates: [Int] = []
+        for (i, v) in logits.enumerated() where v >= cutoff && bucket(v) <= lastBucket {
+            candidates.append(i)
+        }
+        return (candidates.sorted { logits[$0] > logits[$1] }, Float(total))
     }
 
     /// Returns the K indices with the largest logit values, sorted descending by logit.
