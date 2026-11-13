@@ -62,7 +62,7 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
     private let _generationTask = Mutex<Task<Void, Never>?>(nil)
 
     // Cached across calls
-    private let _constrainedSessionCache = Mutex<ConstrainedSessionHandle?>(nil)
+    private let constrainedSessions = ConstrainedSessionSlot()
 
     var isBusy: Bool { _activeToken.withLock { $0 != nil } }
 
@@ -467,34 +467,24 @@ extension CoreAIPipelinedEngine {
         stopTokenIds: [Int32]?,
         maxWhitespaceCount: Int?
     ) throws -> ConstrainedSessionHandle {
-        if let cached: ConstrainedSessionHandle = _constrainedSessionCache.withLock({ cache in
-            guard let box = cache,
-                box.matches(
-                    schema: jsonSchema, maxWhitespaceCount: maxWhitespaceCount, stopTokenIds: stopTokenIds,
-                    vocabularySize: vocabSize)
-            else {
-                cache = nil
-                return nil
-            }
-            cache = nil
-            return box
-        }) {
-            cached.reset()
-            return cached
+        let key = ConstrainedSessionKey(
+            schema: jsonSchema, maxWhitespaceCount: maxWhitespaceCount, stopTokenIds: stopTokenIds,
+            vocabularySize: vocabSize)
+        return try constrainedSessions.checkOut(key) {
+            let session = try ConstrainedGenerationSession(
+                jsonSchema: jsonSchema,
+                tokenizer: tokenizer,
+                vocabSize: vocabSize,
+                stopTokenIds: stopTokenIds,
+                maxWhitespaceCount: maxWhitespaceCount
+            )
+            return ConstrainedSessionHandle(session: session, tokenizer: tokenizer)
         }
-        let session = try ConstrainedGenerationSession(
-            jsonSchema: jsonSchema,
-            tokenizer: tokenizer,
-            vocabSize: vocabSize,
-            stopTokenIds: stopTokenIds,
-            maxWhitespaceCount: maxWhitespaceCount
-        )
-        return ConstrainedSessionHandle(session: session, tokenizer: tokenizer, stopTokenIds: stopTokenIds)
     }
 
     /// Return a session box to the cache for reuse by the next call.
     func storeConstrainedSessionForReuse(_ box: ConstrainedSessionHandle) {
-        _constrainedSessionCache.withLock { $0 = box }
+        constrainedSessions.checkIn(box)
     }
 }
 
