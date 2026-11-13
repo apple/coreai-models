@@ -114,15 +114,7 @@ public struct EngineFactory: Sendable {
         }
 
         // The bundle knows its own sidecars; assets passed explicitly still win.
-        let options = EngineOptions(
-            variant: options.variant,
-            kvCacheStrategy: options.kvCacheStrategy,
-            kvCacheSize: options.kvCacheSize,
-            prefillChunkSize: options.prefillChunkSize,
-            prefillChunkThreshold: options.prefillChunkThreshold,
-            tensorData: bundle.tensorData.merging(options.tensorData) { _, explicit in
-                explicit
-            })
+        let options = options.mergingTensorData(bundle.tensorData)
 
         // Standard single-asset LLM: build the config and delegate to the asset/URL path.
         let engineConfig = ModelConfig(bundle: bundle)
@@ -422,7 +414,7 @@ public struct EngineOptions: Sendable {
     ///
     /// When `nil`, the factory selects a variant from the model's structure. Set this to
     /// `"coreai-sequential"`, `"coreai-pipelined"`, or `"static-shape"` to bypass auto-detection.
-    public let variant: String?
+    public var variant: String?
 
     /// The strategy that determines how the engine sizes the KV cache.
     ///
@@ -432,7 +424,7 @@ public struct EngineOptions: Sendable {
     /// - Important: Avoid `.fixedSize` unless you need a known upper bound. It pre-allocates the
     ///   cache at the full `maxContextLength`, which can consume several gigabytes on long-context
     ///   models and slows each decoding step because every iteration operates on the full-size KV.
-    public let kvCacheStrategy: KVCacheStrategy
+    public var kvCacheStrategy: KVCacheStrategy
 
     /// The KV cache size in tokens that overrides the strategy's default.
     ///
@@ -442,20 +434,20 @@ public struct EngineOptions: Sendable {
     /// - `.fixedSize`: the total capacity, capped at `maxContextLength`.
     /// - `.growing`: the initial capacity, which grows up to `maxContextLength`.
     /// - `.chunked`: the window size.
-    public let kvCacheSize: Int?
+    public var kvCacheSize: Int?
 
     /// Override for the prefill chunk size (tokens per chunk).
     /// When set, takes precedence over model metadata and engine defaults.
-    public let prefillChunkSize: Int?
+    public var prefillChunkSize: Int?
 
     /// Override for the chunk threshold (minimum prompt tokens to trigger chunking).
     /// When set, takes precedence over model metadata and engine defaults.
-    public let prefillChunkThreshold: Int?
+    public var prefillChunkThreshold: Int?
 
     /// Tensor data the bundle ships alongside the model, for weights too large to bake
     /// into the graph, keyed by the role name under `auxiliary_assets` in `metadata.json` (see
     /// ``TensorDataKey``). A role absent here is data the bundle does not ship.
-    public let tensorData: [String: URL]
+    public var tensorData: [String: URL]
 
     /// Well-known `assets` roles for tensor data.
     public enum TensorDataKey {
@@ -504,6 +496,14 @@ public struct EngineOptions: Sendable {
             return explicitSize
         }
         return kvCacheStrategy.defaultSize(maxContextLength: maxContextLength)
+    }
+
+    /// These options over a bundle's own tensor data: an entry given here wins over the bundle's,
+    /// and every other option carries over unchanged.
+    public func mergingTensorData(_ base: [String: URL]) -> EngineOptions {
+        var merged = self
+        merged.tensorData = base.merging(tensorData) { _, explicit in explicit }
+        return merged
     }
 }
 
