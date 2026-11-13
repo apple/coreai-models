@@ -28,12 +28,22 @@ extension FlowTransformerPipeline {
             return
         }
 
+        if config.dynamicShapes == true {
+            self = try await Self.loadDynamicFlux2(from: url, bundle: bundle, mode: mode)
+            return
+        }
+
         // Resolve .auto → best available mode
         let resolvedMode: DecodeResolution
         if mode == .auto {
             resolvedMode = try Self.bestAvailableMode(bundle: bundle)
         } else {
             resolvedMode = mode
+        }
+        if resolvedMode == .tiled, try Self.optionalAsset(AssetKey.transformer, in: bundle) == nil {
+            throw PipelineLoadError.unsupportedConfiguration(
+                "tiled decode needs the full-size transformer, which this bundle doesn't have. "
+                    + "Decode at half size, or export the transformer component.")
         }
 
         let textEncoderURL = try resolveDeclaredPipelineAsset(AssetKey.textEncoder, in: bundle)
@@ -168,6 +178,30 @@ extension FlowTransformerPipeline {
             batchNormMean: nil,
             batchNormVar: nil,
             batchNormEps: 0)
+    }
+
+    /// A `--dynamic` FLUX.2 bundle: one symbolic `main` per asset, so every mode loads the
+    /// same assets. The mode only sets the default output size (`.half` → half the
+    /// bundle's size) and whether the decoder runs in tiles; `imageSize` overrides the size.
+    private static func loadDynamicFlux2(
+        from url: URL, bundle: DiffusionBundle, mode: DecodeResolution
+    ) async throws -> Self {
+        func function(_ url: URL) -> CoreAIDiffusionModelFunction {
+            CoreAIDiffusionModelFunction(modelURL: url, expectFrequentReshapes: true)
+        }
+        return Self(
+            config: bundle.config,
+            mode: mode == .auto ? .full : mode,
+            transformer: function(try resolveDeclaredPipelineAsset(AssetKey.transformer, in: bundle)),
+            // The text encoder stays fixed-shape under --dynamic.
+            textEncoder: CoreAIDiffusionModelFunction(
+                modelURL: try resolveDeclaredPipelineAsset(AssetKey.textEncoder, in: bundle)),
+            decoder: function(try resolveDeclaredPipelineAsset(AssetKey.vaeDecoder, in: bundle)),
+            encoder: try optionalAsset(AssetKey.vaeEncoder, in: bundle).map(function),
+            tokenizer: try await AutoTokenizer.from(modelFolder: url.appendingPathComponent("tokenizer")),
+            batchNormMean: loadNpyFloat32(url.appendingPathComponent("vae_bn_mean.npy")),
+            batchNormVar: loadNpyFloat32(url.appendingPathComponent("vae_bn_var.npy")),
+            batchNormEps: bundle.config.batchNormEps ?? DiffusionDefaults.Image.batchNormEps)
     }
 
     /// `metadata.json` asset keys for FLUX.2. The manifest is the only source of asset
