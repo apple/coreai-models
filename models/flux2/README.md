@@ -213,8 +213,8 @@ swift run -c release diffusion-runner --model path/to/exported_model_folder --pr
 swift run -c release diffusion-runner --model path/to/exported_model_folder --prompt "a cat wearing a hat" --steps 4 --guidance-scale 1.0 \
     --input-image cat.png --reference-size half
 
-# Multiple references at a custom size (--dynamic bundle)
+# Multiple references at a custom size (--dynamic bundle); repeating --input-image also works
 swift run -c release diffusion-runner --model path/to/FLUX.2-klein-4B-dynamic \
     --prompt "Put the cat from image 1 onto the rock in the street from image 2, replacing the bird" \
-    --input-image cat.png --input-image street.png --image-size 768 --reference-size 384
+    --input-image cat.png street.png --image-size 768 --reference-size 384
 ```

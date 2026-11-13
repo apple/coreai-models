@@ -62,8 +62,10 @@ struct DiffusionRunner: AsyncParsableCommand {
     var output: String = "output.png"
 
     @Option(
-        help:
-            "Path to an input image for image-to-image generation. Repeat for multiple FLUX.2 reference images (dynamic bundles only), referred to in the prompt as image 1, image 2, ... in order."
+        parsing: .upToNextOption,
+        help: ArgumentHelp(
+            "Input image(s) for image-to-image generation. Pass several paths after one flag (or repeat the flag) for multiple FLUX.2 reference images (dynamic bundles only), referred to in the prompt as image 1, image 2, ... in order.",
+            valueName: "path")
     )
     var inputImage: [String] = []
 
