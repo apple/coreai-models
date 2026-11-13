@@ -125,4 +125,41 @@ struct Flux2TokenMathTests {
         // slice bound would show up as a mismatch here.
         #expect(destination == Array(full[0..<half]))
     }
+
+    // MARK: - Image position ids
+
+    /// Row `token` of a flattened `[tokens, axisCount]` id table.
+    private func row(_ ids: [Float], _ token: Int, axisCount: Int) -> [Float] {
+        Array(ids[(token * axisCount)..<((token + 1) * axisCount)])
+    }
+
+    @Test("txt2img ids are the noise grid alone at T=0, row-major")
+    func imageIdsNoiseOnly() {
+        let ids = FlowTransformerPipeline.buildImageIds(noiseSide: 3, refSides: [], axisCount: 4)
+        #expect(ids.count == 9 * 4)
+        #expect(row(ids, 0, axisCount: 4) == [0, 0, 0, 0])
+        #expect(row(ids, 5, axisCount: 4) == [0, 1, 2, 0])  // h=1, w=2
+    }
+
+    /// Each reference needs its own T, or two references at the same H/W would get
+    /// identical rotary phases and the model could not tell them apart.
+    @Test("Each reference gets T=10·(i+1) and restarts H/W at 0")
+    func imageIdsMultipleReferences() {
+        let axisCount = 4
+        let offset = FlowTransformerPipeline.referenceTokenTimeOffset
+        let ids = FlowTransformerPipeline.buildImageIds(
+            noiseSide: 4, refSides: [2, 3], axisCount: axisCount)
+        #expect(ids.count == (16 + 4 + 9) * axisCount)
+
+        let times = (0..<29).map { row(ids, $0, axisCount: axisCount)[0] }
+        #expect(times[0..<16].allSatisfy { $0 == 0 })
+        #expect(times[16..<20].allSatisfy { $0 == offset })
+        #expect(times[20..<29].allSatisfy { $0 == 2 * offset })
+
+        // First and last token of each reference grid.
+        #expect(row(ids, 16, axisCount: axisCount) == [offset, 0, 0, 0])
+        #expect(row(ids, 19, axisCount: axisCount) == [offset, 1, 1, 0])
+        #expect(row(ids, 20, axisCount: axisCount) == [2 * offset, 0, 0, 0])
+        #expect(row(ids, 28, axisCount: axisCount) == [2 * offset, 2, 2, 0])
+    }
 }
