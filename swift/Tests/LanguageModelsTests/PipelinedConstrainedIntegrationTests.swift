@@ -79,7 +79,10 @@ final class MockConstrainedEngine: InferenceEngine, ConstrainedGenerationCapable
         getSessionCallCount += 1
         lastSchemaUsed = jsonSchema
 
-        if let handle = cached, handle.matches(schema: jsonSchema, maxWhitespaceCount: maxWhitespaceCount) {
+        let key = ConstrainedSessionKey(
+            schema: jsonSchema, maxWhitespaceCount: maxWhitespaceCount, stopTokenIds: stopTokenIds,
+            vocabularySize: vocabSize)
+        if let handle = cached, handle.key == key {
             cached = nil
             handle.reset()
             return handle
@@ -418,23 +421,75 @@ extension PipelinedConstrainedDecodingStrategy {
 struct ConstrainedSessionHandleIdentityTests {
     private static let schema = #"{"type": "object", "properties": {"a": {"type": "integer"}}}"#
 
-    private func handle(limit: Int?) throws -> ConstrainedSessionHandle {
+    private static func handle(limit: Int?, stops: [Int32]? = [2]) throws -> ConstrainedSessionHandle {
         let tokenizer = MockTokenizer()
         let session = try ConstrainedGenerationSession(
-            jsonSchema: Self.schema, tokenizer: tokenizer, vocabSize: 256, vocabType: .raw,
+            jsonSchema: schema, tokenizer: tokenizer, vocabSize: 256, vocabType: .raw, stopTokenIds: stops,
             maxWhitespaceCount: limit)
         return ConstrainedSessionHandle(session: session, tokenizer: tokenizer)
     }
 
-    @Test("A handle matches only the schema and whitespace limit it was built with")
-    func matchesSchemaAndLimit() throws {
-        let h = try handle(limit: 32)
-        #expect(h.matches(schema: Self.schema, maxWhitespaceCount: 32))
-        #expect(!h.matches(schema: Self.schema, maxWhitespaceCount: 8))
-        #expect(!h.matches(schema: Self.schema, maxWhitespaceCount: nil))
-        #expect(!h.matches(schema: "{}", maxWhitespaceCount: 32))
-        let unlimited = try handle(limit: nil)
-        #expect(unlimited.matches(schema: Self.schema, maxWhitespaceCount: nil))
-        #expect(!unlimited.matches(schema: Self.schema, maxWhitespaceCount: 32))
+    private static func key(
+        schema: String = schema, limit: Int?, stops: [Int32]? = [2], vocab: Int = 256
+    ) -> ConstrainedSessionKey {
+        ConstrainedSessionKey(schema: schema, maxWhitespaceCount: limit, stopTokenIds: stops, vocabularySize: vocab)
+    }
+
+    @Test("A handle's key is what its session was built with: schema, whitespace limit, stops and vocabulary")
+    func keyComesFromTheSession() throws {
+        let h = try Self.handle(limit: 32)
+        #expect(h.key == Self.key(limit: 32))
+        #expect(h.key != Self.key(limit: 8))
+        #expect(h.key != Self.key(limit: nil))
+        #expect(h.key != Self.key(schema: "{}", limit: 32))
+        #expect(try Self.handle(limit: nil).key == Self.key(limit: nil))
+    }
+
+    @Test("Stop tokens decide the key, as a set, and so does the vocabulary")
+    func keyStopTokensAndVocabulary() throws {
+        // A request's single-token `stop` strings are grammar stop tokens: a grammar built with "\n"
+        // (10) among them ends at a newline, one built without it allows a newline inside the JSON.
+        let withNewline = try Self.handle(limit: 32, stops: [2, 10])
+        #expect(withNewline.key == Self.key(limit: 32, stops: [10, 2, 10]))
+        #expect(withNewline.key != Self.key(limit: 32, stops: [2]))
+        #expect(withNewline.key != Self.key(limit: 32, stops: nil))
+        #expect(withNewline.key != Self.key(limit: 32, stops: [2, 10], vocab: 300))
+    }
+}
+
+/// The one-session cache the pipelined engine keeps (`ConstrainedSessionSlot`), where a session was
+/// once handed to a request with other stop tokens.
+@Suite("Constrained session slot")
+struct ConstrainedSessionSlotTests {
+    private static let schema = #"{"type": "integer"}"#
+
+    private static func checkOut(_ slot: ConstrainedSessionSlot, stops: [Int32]) throws -> ConstrainedSessionHandle {
+        let key = ConstrainedSessionKey(
+            schema: schema, maxWhitespaceCount: 32, stopTokenIds: stops, vocabularySize: 256)
+        return try slot.checkOut(key) {
+            let tokenizer = MockTokenizer()
+            let session = try ConstrainedGenerationSession(
+                jsonSchema: schema, tokenizer: tokenizer, vocabSize: 256, stopTokenIds: stops, maxWhitespaceCount: 32)
+            return ConstrainedSessionHandle(session: session, tokenizer: tokenizer)
+        }
+    }
+
+    @Test("A request with other stop tokens gets a fresh session; one with the same stops reuses it")
+    func reuseOnlyForTheSameStops() throws {
+        let slot = ConstrainedSessionSlot()
+        let withNewline = try Self.checkOut(slot, stops: [2, 10])
+        slot.checkIn(withNewline)
+        #expect(try Self.checkOut(slot, stops: [2]) !== withNewline)
+        slot.checkIn(withNewline)
+        #expect(try Self.checkOut(slot, stops: [10, 2]) === withNewline)
+    }
+
+    @Test("Taking the session empties the slot, so two requests never share one")
+    func checkOutEmptiesTheSlot() throws {
+        let slot = ConstrainedSessionSlot()
+        let first = try Self.checkOut(slot, stops: [2])
+        slot.checkIn(first)
+        #expect(try Self.checkOut(slot, stops: [2]) === first)
+        #expect(try Self.checkOut(slot, stops: [2]) !== first)
     }
 }

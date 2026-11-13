@@ -11,11 +11,9 @@ import Tokenizers
 /// active generation task via the checkout/checkin pattern. Only one task
 /// holds the handle at a time; concurrent access is a programming error.
 package final class ConstrainedSessionHandle: @unchecked Sendable {
-    /// Schema string is immutable after init — cached to avoid repeated access.
-    let schema: String
-
-    /// Whitespace limit the session enforces; nil when unlimited.
-    let maxWhitespaceCount: Int?
+    /// What the session was built for, read from the session itself. A cached handle is reused only
+    /// for a request with an equal key.
+    let key: ConstrainedSessionKey
 
     /// Tokenizer used for jump-forward string encoding.
     private let tokenizer: any Tokenizer
@@ -23,15 +21,11 @@ package final class ConstrainedSessionHandle: @unchecked Sendable {
     private var _session: ConstrainedGenerationSession
 
     init(session: consuming ConstrainedGenerationSession, tokenizer: any Tokenizer) {
-        self.schema = session.schema
-        self.maxWhitespaceCount = session.maxWhitespaceCount
+        self.key = ConstrainedSessionKey(
+            schema: session.schema, maxWhitespaceCount: session.maxWhitespaceCount,
+            stopTokenIds: session.stopTokenIds, vocabularySize: session.vocabularySize)
         self.tokenizer = tokenizer
         self._session = session
-    }
-
-    /// Whether this session was built for the same schema and whitespace limit, so a reset can reuse it.
-    func matches(schema: String, maxWhitespaceCount: Int?) -> Bool {
-        self.schema == schema && self.maxWhitespaceCount == maxWhitespaceCount
     }
 
     var isTerminated: Bool { _session.isTerminated }
@@ -62,5 +56,25 @@ package final class ConstrainedSessionHandle: @unchecked Sendable {
     /// without adding special tokens.
     func tokenizeForJumpForward(_ string: String) -> [Int32] {
         tokenizer.encode(text: string).map(Int32.init)
+    }
+}
+
+/// Everything a grammar session is built from. Sessions with equal keys accept the same tokens, so one
+/// can be reset and reused for the other's request.
+///
+/// Stop tokens count: a request's single-token `stop` strings are among them, and they decide where
+/// the grammar may end. They compare as a set.
+package struct ConstrainedSessionKey: Hashable, Sendable {
+    let schema: String
+    let maxWhitespaceCount: Int?
+    /// Sorted, without repeats; nil for xgrammar's defaults.
+    let stopTokenIds: [Int32]?
+    let vocabularySize: Int
+
+    package init(schema: String, maxWhitespaceCount: Int?, stopTokenIds: [Int32]?, vocabularySize: Int) {
+        self.schema = schema
+        self.maxWhitespaceCount = maxWhitespaceCount
+        self.stopTokenIds = stopTokenIds.map { Array(Set($0)).sorted() }
+        self.vocabularySize = vocabularySize
     }
 }
