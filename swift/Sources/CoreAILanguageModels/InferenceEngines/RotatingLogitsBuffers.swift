@@ -15,22 +15,18 @@ import Metal
 /// outstanding the GPU may be writing the step the CPU has already moved past, so writing the next
 /// call's logits into the same buffer would corrupt submitted work.
 ///
-/// Sized `rows × vocab`. One row is a single sequence's step, which is every call the pipelined
-/// engine makes. A prefill call produces no logits at all.
+/// Each holds one row of `vocab` logits: a decode step's. Calls that produce logits for several
+/// positions, such as a prefill on the main graph, write them to the engine's `GrowingLogitsBuffer`
+/// instead.
 struct RotatingLogitsBuffers {
     private let buffers: [MTLBuffer]
-    let rowCapacity: Int
 
-    init(device: MTLDevice, vocabSize: Int, depth: Int, initialRows: Int) throws {
-        self.rowCapacity = max(1, initialRows)
-        self.buffers = try Self.allocate(
-            device: device, vocabSize: vocabSize, depth: max(1, depth), rows: self.rowCapacity)
+    init(device: MTLDevice, vocabSize: Int, depth: Int) throws {
+        self.buffers = try Self.allocate(device: device, vocabSize: vocabSize, depth: max(1, depth))
     }
 
-    private static func allocate(
-        device: MTLDevice, vocabSize: Int, depth: Int, rows: Int
-    ) throws -> [MTLBuffer] {
-        let byteCount = rows * vocabSize * MemoryLayout<UInt16>.size
+    private static func allocate(device: MTLDevice, vocabSize: Int, depth: Int) throws -> [MTLBuffer] {
+        let byteCount = vocabSize * MemoryLayout<UInt16>.size
         var made: [MTLBuffer] = []
         for _ in 0..<depth {
             guard let buffer = device.makeBuffer(length: max(64, byteCount), options: .storageModeShared)

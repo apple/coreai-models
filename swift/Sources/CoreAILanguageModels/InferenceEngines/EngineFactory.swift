@@ -169,7 +169,7 @@ public struct EngineFactory: Sendable {
         return try await StaticShapeEngine(
             configuration: ModelConfig(bundle: bundle),
             modelURL: languageModelURL,
-            tensorData: bundle.tensorData.merging(options.tensorData) { _, explicit in explicit },
+            tensorData: options.mergingTensorData(bundle.tensorData).tensorData,
             visionModelURL: visionModelURL,
             visionConfig: visionConfig
         )

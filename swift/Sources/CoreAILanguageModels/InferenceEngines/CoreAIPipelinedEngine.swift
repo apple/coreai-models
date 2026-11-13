@@ -775,7 +775,7 @@ private struct EngineImpl: ~Copyable {
         // Pipeline-depth-matched decode logits buffers (inference writes logits for decode). One row:
         // this engine advances a single sequence.
         let decodeLogBufs = try RotatingLogitsBuffers(
-            device: device, vocabSize: config.vocabSize, depth: pipelineDepth, initialRows: 1)
+            device: device, vocabSize: config.vocabSize, depth: pipelineDepth)
 
         // Create KV cache using factory — pass original descriptors (with -1 dynamic dims intact)
         // so the factory can correctly detect growing vs static support via isDynamicKVCache().
@@ -1973,8 +1973,9 @@ private struct EngineImpl: ~Copyable {
                 logitsStrides: try resolvedStrides(descriptor: logitsBaseDesc, shape: lShape),
                 computeStream: computeStream)
 
-            // Warm up argmax kernel using pipeline-matched decode buffers
-            let warmupLogitsBuffer = decodeLogitsBuffers[step]
+            // Warm up the argmax kernel on the logits the call above wrote. A wide shape wrote
+            // several rows there, more than a one-row decode buffer holds.
+            let warmupLogitsBuffer = logits.metalBuffer
             let warmupOutputBuffer = decodeOutputBuffers[step % pipelineDepth]
             let logitsOffset = (shape - 1) * vocabSize * MemoryLayout<UInt16>.size
 
