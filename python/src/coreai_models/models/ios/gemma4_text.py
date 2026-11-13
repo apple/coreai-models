@@ -1743,7 +1743,17 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
             entry = scales.get(name[len(root) :])
             if entry is None:
                 raise ValueError(f"No activation scales in the checkpoint for {name}")
-            module.input_activation_scale, module.output_activation_scale = entry
+            input_scale, output_scale = entry
+            if name.endswith(".self_attn.o_proj"):
+                # Its input comes straight from the attention composite, and the static-shape
+                # engine's compiler fails ("internal error in Quant Hoisting logic") when a
+                # quantize follows that composite; the whole function then falls back off the
+                # engine. Left unquantized until the compiler handles it.
+                input_scale = 0.0
+            module.input_activation_scale, module.output_activation_scale = (
+                input_scale,
+                output_scale,
+            )
             applied += 1
         logger.info(f"Applied static INT8 activation quantization to {applied} projections.")
 
