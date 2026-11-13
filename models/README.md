@@ -231,6 +231,7 @@ uv run coreai.embedding.export clap-htsat --platform iOS    # text + audio tower
 uv run coreai.embedding.export clip-vit-b32 --fused         # a single fused asset, including a `main`
 uv run coreai.embedding.export embeddinggemma-2                 # text + image (macOS)
 uv run coreai.embedding.export embeddinggemma-2 --platform iOS  # Neural Engine
+uv run coreai.embedding.export qwen3-embedding-0.6b             # text (macOS)
 ```
 
 Each export writes a bundle directory `exports/<name>/` with:
@@ -248,8 +249,9 @@ text vector and an image or audio vector is their similarity.
 - `--text-only` exports the text tower alone.
 - `--compute-precision` picks the compute precision; `--list-models` shows each model's options.
 
-Details are in the [CLIP](clip), [CLAP](clap) and [EmbeddingGemma 2](embedding_gemma2) model
-cards. To add a model, register an `EmbeddingExporter` in `EXPORTERS`
+Details are in the [CLIP](clip), [CLAP](clap), [EmbeddingGemma 2](embedding_gemma2) and
+[Qwen3-Embedding](qwen3_embedding) model cards. To add a model, register an
+`EmbeddingExporter` in `EXPORTERS`
 ([`embedding/export.py`](../python/src/coreai_models/embedding/export.py)) and
 add a `UtilityModel` row with `export_script="coreai.embedding.export"` to
 `UTILITY_PRESETS`.
@@ -313,6 +315,7 @@ uv run models/<name>/export.py --include-debug-info   # embed debug information 
 - [CLAP](clap)
 - [CLIP](clip)
 - [EmbeddingGemma 2](embedding_gemma2)
+- [Qwen3-Embedding](qwen3_embedding)
 
 ## Adding a Model
 

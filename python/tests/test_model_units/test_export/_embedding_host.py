@@ -6,8 +6,9 @@
 """A reference host for ``kind: "embedding"`` bundles, and tiny test snapshots.
 
 ``Bundle`` reads only ``metadata.json``, ``tokenizer/`` and the assets of a bundle directory and
-follows the ``coreai_models.embedding.contract`` rules: tokenization (R6), image preprocessing
-with PIL (R7), the audio front end in numpy (R8) and function calls through the Core AI runtime.
+follows the ``coreai_models.embedding.contract`` rules: the function for a batch (R3, R4),
+tokenization (R6), image preprocessing with PIL (R7), the audio front end in numpy (R8) and
+function calls through the Core AI runtime.
 """
 
 from __future__ import annotations
@@ -71,6 +72,11 @@ def runtime_type(spec: str, length: int | None) -> str:
     return f"NDArray ({names[dtype]}, {shape})"
 
 
+def _span(value: int | dict[str, int]) -> tuple[int, int]:
+    """``(min, max)`` of a function's ``batch`` or ``length``, an int or ``{min, max}`` (R3)."""
+    return (value, value) if isinstance(value, int) else (value["min"], value["max"])
+
+
 class Bundle:
     """A bundle directory, used through its metadata alone."""
 
@@ -80,44 +86,68 @@ class Bundle:
         self.block = self.metadata["embedding"]
         self.options = options
 
-    def function(self, component: str) -> dict[str, Any]:
-        (entry,) = self.block["components"][component]["functions"]
-        return entry
+    def function(self, component: str, rows: int, length: int | None = None) -> dict[str, Any]:
+        """The function of ``component`` for ``rows`` inputs (R3, R4): for text, the shortest
+        that holds ``length`` tokens; then the smallest ``batch.max`` that holds ``rows``, or the
+        largest when none does (``run`` splits the rows).
+        """
+        entries = self.block["components"][component]["functions"]
+        if length is not None:
+            entries = [e for e in entries if _span(e["length"])[1] >= length]
+            width = min(max(_span(e["length"])[0], length) for e in entries)
+            entries = [e for e in entries if max(_span(e["length"])[0], length) == width]
+        holding = [e for e in entries if _span(e["batch"])[1] >= rows]
+        if holding:
+            return min(holding, key=lambda e: _span(e["batch"])[1])
+        return max(entries, key=lambda e: _span(e["batch"])[1])
 
     def run(self, component: str, inputs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        """Run ``component`` on ``n`` rows, split into batches of at most ``batch.max``."""
+        """Run ``component`` on ``n`` rows (R4): split into batches of at most ``batch.max``; a
+        batch below ``batch.min`` is padded with copies of its last row.
+        """
         spec = self.block["components"][component]
         file = self.path / self.metadata["assets"][spec["asset"]]
-        entry = self.function(component)
         n = len(next(iter(inputs.values())))
-        step = entry["batch"]["max"]
-        parts = [
-            run_function(
-                file,
-                entry["function"],
-                {k: v[i : i + step] for k, v in inputs.items()},
-                self.options,
-            )
-            for i in range(0, n, step)
-        ]
+        length = inputs["input_ids"].shape[1] if "input_ids" in inputs else None
+        entry = self.function(component, n, length)
+        low, high = _span(entry["batch"])
+        parts = []
+        for i in range(0, n, high):
+            rows = {k: v[i : i + high] for k, v in inputs.items()}
+            m = len(next(iter(rows.values())))
+            if m >= low:
+                parts.append(run_function(file, entry["function"], rows, self.options))
+                continue
+            fill = low - m
+            rows = {k: torch.cat([v, v[-1:].expand(fill, *v.shape[1:])]) for k, v in rows.items()}
+            outputs = run_function(file, entry["function"], rows, self.options)
+            parts.append({k: v[:m] for k, v in outputs.items()})
         return {k: torch.cat([p[k] for p in parts]) for k in parts[0]}
 
     def tokenize(self, texts: list[str]) -> tuple[torch.Tensor, torch.Tensor]:
-        """R6: the embedded tokenizer adds bos/eos; truncate keeping eos; pad right."""
+        """R6: the embedded tokenizer adds bos (when ``add_bos_token``) and eos; truncate keeping
+        eos; pad right to the function that holds the longest text.
+        """
         from tokenizers import Tokenizer
 
         text = self.block["text"]
         tokenizer = Tokenizer.from_file(str(self.path / "tokenizer" / "tokenizer.json"))
         assert tokenizer.padding is None and tokenizer.truncation is None
         max_tokens = text["truncation"]["max_tokens"]
-        length = self.function("text_encoder")["length"]
-        ids = torch.full((len(texts), length), text["pad_token_id"], dtype=torch.int32)
-        mask = torch.zeros((len(texts), length), dtype=torch.int32)
-        for row, encoding in enumerate(tokenizer.encode_batch(texts)):
+        bos = [text["bos_token_id"]] if text["add_bos_token"] else []
+        rows = []
+        for encoding in tokenizer.encode_batch(texts):
             tokens = encoding.ids
-            assert tokens[0] == text["bos_token_id"] and tokens[-1] == text["eos_token_id"]
+            assert tokens[: len(bos)] == bos and tokens[-1] == text["eos_token_id"]
             if len(tokens) > max_tokens:
                 tokens = tokens[: max_tokens - 1] + [text["eos_token_id"]]
+            rows.append(tokens)
+        longest = max(len(tokens) for tokens in rows)
+        entry = self.function("text_encoder", len(rows), longest)
+        length = max(_span(entry["length"])[0], longest)
+        ids = torch.full((len(rows), length), text["pad_token_id"], dtype=torch.int32)
+        mask = torch.zeros((len(rows), length), dtype=torch.int32)
+        for row, tokens in enumerate(rows):
             ids[row, : len(tokens)] = torch.tensor(tokens)
             mask[row, : len(tokens)] = 1
         return ids, mask
@@ -202,29 +232,41 @@ def slaney_mel_filters(sr: int, n_fft: int, n_mels: int, f_min: float, f_max: fl
 def save_tiny_tokenizer(
     snapshot: Path,
     words: list[str],
-    bos: int,
+    bos: int | None,
     eos: int,
     pad: int,
     model_max_length: int | None = None,
+    named_eos: int | None = None,
 ) -> None:
-    """A word-level tokenizer with ``<s> A </s>`` post-processing: bos/eos/pad take the given ids
-    (pad may equal eos), ``words`` the lowest free ids in order.
+    """A word-level tokenizer with ``<s> A </s>`` post-processing (``A </s>`` when ``bos`` is
+    None): bos/eos/pad take the given ids (pad may equal eos), ``words`` the lowest free ids in
+    order. With ``named_eos``, the tokenizer's ``eos_token`` is a separate ``<|im_end|>`` with
+    that id while it still appends ``</s>``, as Qwen3-Embedding's does.
     """
     from tokenizers import Tokenizer, models, pre_tokenizers, processors
     from transformers import PreTrainedTokenizerFast
 
-    free = (i for i in range(len(words) + 3) if i not in (bos, eos, pad))
+    free = (i for i in range(len(words) + 4) if i not in (bos, eos, pad, named_eos))
     vocab = dict(zip(words, free, strict=False))
-    vocab.update({"<s>": bos, "</s>": eos})
+    vocab["</s>"] = eos
+    if named_eos is not None:
+        vocab["<|im_end|>"] = named_eos
+    if bos is not None:
+        vocab["<s>"] = bos
     if pad != eos:
         vocab["<pad>"] = pad
     tokenizer = Tokenizer(models.WordLevel(vocab, unk_token=words[0]))
     tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
-    tokenizer.post_processor = processors.RobertaProcessing(sep=("</s>", eos), cls=("<s>", bos))
+    if bos is None:
+        tokenizer.post_processor = processors.TemplateProcessing(
+            single="$A </s>", special_tokens=[("</s>", eos)]
+        )
+    else:
+        tokenizer.post_processor = processors.RobertaProcessing(sep=("</s>", eos), cls=("<s>", bos))
     PreTrainedTokenizerFast(
         tokenizer_object=tokenizer,
-        bos_token="<s>",
-        eos_token="</s>",
+        bos_token=None if bos is None else "<s>",
+        eos_token="</s>" if named_eos is None else "<|im_end|>",
         pad_token="</s>" if pad == eos else "<pad>",
         unk_token=words[0],
         model_max_length=model_max_length,

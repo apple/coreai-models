@@ -39,6 +39,7 @@ from coreai_models.embedding.export_utils import (
     resolve_snapshot,
     save_tokenizer,
 )
+from coreai_models.embedding.qwen3_embedding import QWEN3_EMBEDDING_EXPORTER
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,7 @@ EXPORTERS: dict[str, EmbeddingExporter] = {
         CLAP_EXPORTER,
         CLIP_EXPORTER,
         EMBEDDINGGEMMA2_EXPORTER,
+        QWEN3_EMBEDDING_EXPORTER,
     )
 }
 

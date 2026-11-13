@@ -42,12 +42,18 @@ R5. A reader refuses a bundle with a tower, component key or enum value it does 
 R6. ``text``: how to tokenize.
     - ``embedded_tokenizer``: true when the tokenizer files are in ``tokenizer/``.
     - ``add_bos_token``, ``add_eos_token``: the tokenizer adds these tokens; the host does not.
-    - ``bos_token_id``, ``eos_token_id``, ``pad_token_id`` (may equal ``eos_token_id``)
+    - ``bos_token_id``: the first token, or null when the tokenizer adds no bos
+      (``add_bos_token`` false).
+    - ``eos_token_id``: the last token, the one the tokenizer appends. It can differ from the
+      tokenizer's ``eos_token``: Qwen3-Embedding appends ``<|endoftext|>`` and names
+      ``<|im_end|>``.
+    - ``pad_token_id`` (may equal ``eos_token_id``)
     - ``padding_side``, ``truncation {max_tokens, keep_eos}``
 
     ``tokenizer.json`` has padding and truncation off. The host truncates to ``max_tokens``
-    with ``eos`` kept last, pads to the function's ``length`` with ``pad_token_id`` and sends the
-    tokenizer's ``attention_mask``.
+    with ``eos_token_id`` kept last, pads to the ``length`` of the function it calls (one that
+    holds the longest text, R3) with ``pad_token_id`` and sends the tokenizer's
+    ``attention_mask``.
 
 R7. ``image``: preprocessing, with Swift ``VisionConfig`` names: ``image_strategy``,
     ``image_size``, ``image_mean``, ``image_std``.
@@ -136,10 +142,11 @@ class EmbeddingFamily:
 @dataclass(frozen=True)
 class CheckpointFacts:
     """What an exporter reads from the checkpoint: the embedding dimension, token ids, text length
-    and media preprocessing."""
+    and media preprocessing. ``bos_token_id`` is None when the tokenizer adds no bos;
+    ``eos_token_id`` is the token it appends (R6)."""
 
     dimension: int
-    bos_token_id: int
+    bos_token_id: int | None
     eos_token_id: int
     pad_token_id: int
     max_tokens: int
@@ -183,7 +190,7 @@ def text_block(facts: CheckpointFacts) -> dict[str, Any]:
     """The ``text`` block (R6)."""
     return {
         "embedded_tokenizer": True,
-        "add_bos_token": True,
+        "add_bos_token": facts.bos_token_id is not None,
         "add_eos_token": True,
         "bos_token_id": facts.bos_token_id,
         "eos_token_id": facts.eos_token_id,

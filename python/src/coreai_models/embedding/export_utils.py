@@ -7,6 +7,9 @@
 
 - ``EmbeddingExporter``: what a model provides to ``coreai.embedding.export``.
 - ``resolve_snapshot``, ``save_tokenizer``: get the checkpoint and write ``tokenizer/``.
+- ``read_prompts``, ``fetch_weights``: read the sentence-transformers prompts and download the
+  ``*.safetensors`` weights of a snapshot.
+- ``FunctionSpec``, ``bucket_plan``: static ``len{L}_b{B}`` text functions.
 - ``export_program``, ``save_program``: convert tower modules and save them as an ``.aimodel``.
 """
 
@@ -23,7 +26,7 @@ import torch
 import torch.nn as nn
 
 from coreai_models._constants import DEFAULT_INCLUDE_DEBUG_INFO
-from coreai_models.embedding.contract import CheckpointFacts, EmbeddingFamily
+from coreai_models.embedding.contract import CheckpointFacts, EmbeddingFamily, function_entry
 
 if TYPE_CHECKING:
     from coreai.authoring import AIProgram
@@ -57,29 +60,97 @@ def resolve_snapshot(hf_model_id: str, model_dir: str | None = None) -> tuple[Pa
     return path, sha
 
 
+def read_prompts(snapshot: Path) -> tuple[dict[str, str], str | None]:
+    """Read ``prompts`` / ``default_prompt_name`` from ``config_sentence_transformers.json``."""
+    cfg_path = snapshot / "config_sentence_transformers.json"
+    if not cfg_path.exists():
+        return {}, None
+    cfg = json.loads(cfg_path.read_text())
+    return dict(cfg.get("prompts") or {}), cfg.get("default_prompt_name")
+
+
+def fetch_weights(family: EmbeddingFamily, snapshot: Path) -> None:
+    """Download the ``*.safetensors`` files of the snapshot's revision into its HF cache if it
+    has none.
+    """
+    if any(snapshot.glob("*.safetensors")):
+        return
+    from huggingface_hub import snapshot_download
+
+    snapshot_download(
+        family.hf_model_id,
+        revision=snapshot.name,
+        cache_dir=snapshot.parents[2],
+        allow_patterns=["*.safetensors"],
+    )
+
+
 def save_tokenizer(snapshot: Path, dest: Path, facts: CheckpointFacts) -> None:
     """Write the snapshot's tokenizer to ``dest`` with padding and truncation off.
 
     BPE merges are written as pairs, the form Swift ``CLIPTokenizer`` reads. Raises
-    ``ValueError`` if the special tokens disagree with ``facts`` or the tokenizer does not add
-    bos and eos.
+    ``ValueError`` unless the tokenizer's ``bos_token_id`` and ``pad_token_id`` equal the facts'
+    and it encodes a text as bos (none when ``facts.bos_token_id`` is None), the text, then
+    ``facts.eos_token_id``. Its ``eos_token`` attribute is not compared: Qwen3-Embedding's is
+    ``<|im_end|>`` while it appends ``<|endoftext|>`` (R6).
     """
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(snapshot)
-    ids = tokenizer("a")["input_ids"]
-    got = (tokenizer.bos_token_id, tokenizer.eos_token_id, tokenizer.pad_token_id, ids[0], ids[-1])
     bos, eos = facts.bos_token_id, facts.eos_token_id
-    want = (bos, eos, facts.pad_token_id, bos, eos)
+    text = tokenizer("a", add_special_tokens=False)["input_ids"]
+    got = (tokenizer.bos_token_id, tokenizer.pad_token_id, tokenizer("a")["input_ids"])
+    want = (bos, facts.pad_token_id, ([] if bos is None else [bos]) + text + [eos])
     if got != want:
-        raise ValueError(
-            f"tokenizer (bos, eos, pad, first, last) {got} disagrees with the facts {want}"
-        )
+        raise ValueError(f"tokenizer (bos, pad, ids of 'a') {got} disagrees with the facts {want}")
     tokenizer.save_pretrained(dest)
     path = dest / "tokenizer.json"
     spec = json.loads(path.read_text())
     spec["padding"] = spec["truncation"] = None
     path.write_text(json.dumps(spec, ensure_ascii=False, indent=2) + "\n")
+
+
+@dataclass(frozen=True)
+class FunctionSpec:
+    """One static function; text inputs are ``int32[batch, length]``."""
+
+    name: str
+    batch: int
+    length: int
+
+    def as_dict(self) -> dict[str, Any]:
+        return function_entry(self.name, self.batch, self.length)
+
+
+def function_name(length: int, batch: int, prefix: str = "") -> str:
+    return f"{prefix}len{length}_b{batch}"
+
+
+def bucket_plan(
+    length_buckets: list[int] | tuple[int, ...],
+    batch_sizes: list[int] | tuple[int, ...],
+    max_batch_tokens: int,
+) -> list[FunctionSpec]:
+    """Cross length buckets with batch sizes, dropping pairs above ``max_batch_tokens``.
+
+    Batch 1 is always kept for every length. Functions are named ``len{L}_b{B}``.
+
+    Raises:
+        ValueError: if ``length_buckets`` is empty or holds a length below 2, or a batch size is
+            below 1.
+    """
+    lengths = sorted(set(int(x) for x in length_buckets))
+    batches = sorted(set(int(x) for x in batch_sizes) | {1})
+    if not lengths or lengths[0] < 2:
+        raise ValueError(f"length_buckets must be >= 2 (BOS + EOS), got {length_buckets}")
+    if batches[0] < 1:
+        raise ValueError(f"batch_sizes must be >= 1, got {batch_sizes}")
+    return [
+        FunctionSpec(function_name(length, batch), batch, length)
+        for length in lengths
+        for batch in batches
+        if batch == 1 or batch * length <= max_batch_tokens
+    ]
 
 
 _SPEC = re.compile(r"^(\w+)\[([\w,]+)\]$")

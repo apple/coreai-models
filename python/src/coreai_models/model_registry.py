@@ -631,6 +631,14 @@ UTILITY_PRESETS: list[UtilityModel] = [
         "embedding",
         "coreai.embedding.export",
     ),
+    UtilityModel(
+        "qwen3-embedding-0.6b",
+        "Qwen/Qwen3-Embedding-0.6B",
+        "qwen3-embedding",
+        "embedding",
+        "coreai.embedding.export",
+        platforms=("macOS",),
+    ),
     # --- ASR ---
     UtilityModel(
         "whisper-large-v3-turbo",
