@@ -39,11 +39,13 @@ package protocol ConstrainedGenerationCapable: InferenceEngine {
     /// a semi-pipelined loop: inference overlaps bitmask computation, but sampling
     /// waits per token (grammar state is inherently sequential).
     ///
-    /// The handle is returned to the engine's cache automatically when the Task completes.
+    /// The handle is returned to the engine's cache automatically when the Task completes. A prior
+    /// generation still winding down, such as one whose caller stopped reading at a stop sequence,
+    /// is waited for first.
     func generateConstrained(
         with input: [TokenId],
         samplingConfiguration: SamplingConfiguration,
         maxTokens: Int,
         session: ConstrainedSessionHandle
-    ) throws -> InferenceTokenSequence
+    ) async throws -> InferenceTokenSequence
 }

@@ -9,6 +9,7 @@ import CoreAILanguageModels
 import CoreAIShared
 import Foundation
 import Hummingbird
+import Metal
 import Tokenizers
 
 @main
@@ -113,6 +114,14 @@ struct LLMServer: AsyncParsableCommand {
     var maxQueueDepth: Int = 16
 
     @Option(
+        name: .customLong("batch-prefill-chunk"),
+        help: ArgumentHelp(
+            "With --concurrent-requests above 1, the most prompt tokens of a new request to prefill between "
+                + "decode steps. Smaller values keep pauses in running streams shorter; larger values give the new "
+                + "request its first token sooner. When nothing is decoding, the model's prefill chunk size is used."))
+    var batchPrefillChunk: Int = BatchScheduler.defaultPrefillChunk
+
+    @Option(
         name: .customLong("concurrent-requests"),
         help: ArgumentHelp(
             "Max requests decoded together in one batch: a number, or auto for the model's max batch size. "
@@ -145,6 +154,9 @@ struct LLMServer: AsyncParsableCommand {
     func validate() throws {
         guard maxQueueDepth >= 0 else {
             throw ValidationError("--max-queue-depth must be >= 0 (got \(maxQueueDepth))")
+        }
+        guard batchPrefillChunk >= 1 else {
+            throw ValidationError("--batch-prefill-chunk must be >= 1 (got \(batchPrefillChunk))")
         }
         guard ConcurrentRequests(concurrentRequests) != nil else {
             throw ValidationError("--concurrent-requests must be auto or a number >= 1 (got \(concurrentRequests))")
@@ -266,6 +278,8 @@ struct LLMServer: AsyncParsableCommand {
 
         // The scheduler holds up to --concurrent-requests plus --max-queue-depth requests, then rejects.
         var batchScheduler: BatchScheduler? = nil
+        // Refuses new requests while the process is past the device's memory recommendation.
+        let memoryGuard = MTLCreateSystemDefaultDevice().map { DeviceMemoryGuard(device: $0) }
         let requested = ConcurrentRequests(concurrentRequests) ?? .count(1)
         let sequentialEngine = engine as? CoreAISequentialEngine
         let supportsBatching = sequentialEngine?.supportsBatching ?? false
@@ -282,9 +296,14 @@ struct LLMServer: AsyncParsableCommand {
             }
         }
         if rows > 1, let sequentialEngine {
-            batchScheduler = try BatchScheduler(
-                engine: sequentialEngine, maxConcurrent: rows, maxQueued: maxQueueDepth)
-            print("Batched serving: \(rows) concurrent requests (asset max batch \(bundle.maxBatchSize))")
+            if let reason = sequentialEngine.batchedPrefillUnsupportedReason {
+                print("⚠️  --concurrent-requests \(concurrentRequests): serving one request at a time: \(reason)")
+            } else {
+                batchScheduler = try BatchScheduler(
+                    engine: sequentialEngine, maxConcurrent: rows, maxQueued: maxQueueDepth,
+                    prefillChunk: batchPrefillChunk)
+                print("Batched serving: \(rows) concurrent requests (asset max batch \(bundle.maxBatchSize))")
+            }
         } else if requested != .count(1), !supportsBatching {
             print(
                 "⚠️  --concurrent-requests \(concurrentRequests): serving one request at a time. Batched serving needs "
@@ -295,8 +314,14 @@ struct LLMServer: AsyncParsableCommand {
             engine: engine,
             tokenizer: tokenizer,
             config: config,
-            batchServing: batchScheduler.map { (scheduler: $0, modelConfig: engineConfig) }
+            batchServing: batchScheduler.map { (scheduler: $0, modelConfig: engineConfig) },
+            memoryGuard: memoryGuard
         )
+        // Loaded and warmed, with the batch session allocated: where the process stands from here on.
+        memoryGuard?.report(
+            after: "load",
+            advice: "Lower --concurrent-requests, --kv-cache-initial-capacity or --chunk-size to give memory back.")
+        memoryGuard?.arm()
 
         if let replayPath {
             try await ReplayRunner.run(

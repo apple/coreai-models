@@ -30,6 +30,9 @@ Key differences from other iOS models (Qwen3, Llama):
 
 from typing import Any
 
+# Registers `torch.ops.coreai.lut_to_dense` and `torch.ops.coreai.constexpr_blockwise_shift_scale`,
+# used by the native quantized weight modules.
+import coreai_torch._compression.custom_layers  # noqa: F401
 import torch
 import torch.nn as nn
 from coreai.authoring.types import AllocationType, HardwareConstraints
@@ -54,6 +57,8 @@ from coreai_models._constants import (
 from coreai_models.models.base import BaseForCausalLMForiOS, TraceSpec
 from coreai_models.primitives.ios.cache import KVCacheHandler
 from coreai_models.primitives.ios.quantization import (
+    dequantize_native,
+    dequantize_native_dense,
     dequantize_per_tensor,
     quantize_per_tensor,
 )
@@ -113,6 +118,144 @@ class RMSNormNoScale(nn.Module):
         mean_square = square.mean(-1, keepdim=True)
         inv_rms = torch.rsqrt(mean_square + eps)
         return x * inv_rms
+
+
+class NativeQuantConv1x1(nn.Module):
+    """1x1-Conv2d-shaped weight held in CoreAI's native quantized format.
+
+    Drop-in replacement for a plain ``nn.Conv2d(..., kernel_size=1, bias=False)`` weight,
+    used in place of it for quantization-aware-trained (QAT) checkpoints.
+    ``quantized_data`` holds the checkpoint's literal signed per-element integers and
+    ``scale`` its literal per-output-channel scale -- dequantized at forward time via
+    ``dequantize_native``, which the converter lowers straight to CoreAI's native
+    ``coreai.blockwise_shift_scale``, carrying those exact values into the exported graph
+    with no dequantize/requantize round-trip.
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, nbits: int) -> None:
+        super().__init__()
+        self.nbits = nbits
+        self.register_buffer(
+            "quantized_data", torch.zeros(out_channels, in_channels, 1, 1, dtype=torch.int8)
+        )
+        self.register_buffer("scale", torch.ones(out_channels, 1, 1, 1, dtype=torch.float16))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        weight = dequantize_native(self.quantized_data, self.scale, self.nbits, x.dtype)
+        return nn.functional.conv2d(x, weight)
+
+
+class NativeLutQuantConv1x1(nn.Module):
+    """1x1-Conv2d-shaped weight held via CoreAI's native LUT (palettization) format.
+
+    ``NativeQuantConv1x1``'s affine ``blockwise_shift_scale`` has no execution path on the
+    static-shape engine below INT4. Google's own QAT recipe ships some Gemma4 E2B MLP
+    projections at genuine 2 bits though -- the double-wide, shared-KV layers (see
+    ``TransformerBlock``) -- and rather than clamp those to INT4 like the affine path
+    would (losing density Google already trained for), this decodes through
+    ``coreai.lut_to_dense`` with a *canonical* (not clustered) LUT that reproduces the
+    checkpoint's exact uniformly-spaced levels bit-for-bit -- e.g. ``[-2, -1, 0, 1]`` for
+    2 bits -- then applies the real per-output-channel scale via the same
+    ``constexpr_blockwise_shift_scale`` op the affine path already uses (validated
+    running on the static-shape engine there). ``indices`` gets promoted to a genuine
+    packed sub-byte constant the same way affine weights do (see ``coreai_torch``'s
+    ``inject_subbyte_tensors``), so this is bit-exact *and* genuinely dense on disk -- not a
+    re-quantization tradeoff.
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, nbits: int) -> None:
+        super().__init__()
+        self.nbits = nbits
+        self.register_buffer(
+            "indices", torch.zeros(out_channels, in_channels, 1, 1, dtype=torch.uint8)
+        )
+        self.register_buffer("scale", torch.ones(out_channels, 1, 1, 1, dtype=torch.float16))
+        # Canonical identity levels (not learned, not checkpoint data) -- persistent=False
+        # keeps it out of the state dict entirely; every instance gets the same one. Built
+        # under an explicit CPU device: `from_hf` constructs this module under
+        # `model_device="meta"`, and a non-persistent buffer is never rescued by
+        # `load_state_dict` afterward the way `indices`/`scale` are, so without this it
+        # would stay a meta (no real data) tensor forever -- the same fix
+        # `Gemma4CombinedRoPE` already applies to its cos/sin cache for the same reason.
+        with torch.device("cpu"):
+            bias = 1 << (nbits - 1)
+            levels = torch.arange(2**nbits, dtype=torch.int8) - bias
+            lut = levels.reshape(1, 1, 1, 1, 2**nbits, 1)
+        self.register_buffer("lut", lut, persistent=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        dense = torch.ops.coreai.lut_to_dense(self.indices, self.lut, 0)
+        weight = dequantize_native_dense(dense, self.scale, x.dtype)
+        return nn.functional.conv2d(x, weight)
+
+
+class NativeQuantLinear(nn.Module):
+    """``nn.Linear``-shaped weight held in CoreAI's native quantized format.
+
+    See ``NativeQuantConv1x1``; used for ``lm_head``, which is a plain matmul rather than
+    a 1x1 conv. ``lm_head``'s output dimension is the vocab size (262144), which exceeds
+    the static-shape engine's per-op tensor size limit for a single dequantize+matmul: left
+    whole, the untied lm_head's dequantize and the matmul consuming it fall back off the
+    engine, the only ops of the decode graph to do so. ``block_size`` chunks the
+    dequantize+matmul over output blocks so each stays under that limit, unrolled at trace
+    time -- the same fix ``BlockedSDPA`` (see its docstring) already applies to the
+    attention side for the same kind of per-dimension ceiling.
+
+    Each block gets its own ``quantized_data``/``scale`` buffer pair (a
+    ``NativeQuantLinearBlock``) rather than slicing one big buffer per block: the
+    automatic promotion to a genuine packed sub-byte constant (see
+    ``coreai_torch``'s ``inject_subbyte_tensors``) only fires when the tensor feeding
+    ``constexpr_blockwise_shift_scale`` is a direct, unsliced placeholder -- slicing a
+    single shared buffer at forward time defeats that, silently widening every block
+    back out to a full-byte-per-element container.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        nbits: int,
+        block_size: int | None = None,
+    ) -> None:
+        super().__init__()
+        self.nbits = nbits
+        self.out_features = out_features
+        self.block_size = block_size
+        if block_size is None or out_features <= block_size:
+            self.register_buffer(
+                "quantized_data", torch.zeros(out_features, in_features, dtype=torch.int8)
+            )
+            self.register_buffer("scale", torch.ones(out_features, 1, dtype=torch.float16))
+            self.blocks: nn.ModuleList | None = None
+        else:
+            self.quantized_data = None
+            self.scale = None
+            self.blocks = nn.ModuleList(
+                NativeQuantLinearBlock(in_features, min(block_size, out_features - lo), nbits)
+                for lo in range(0, out_features, block_size)
+            )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.blocks is None:
+            weight = dequantize_native(self.quantized_data, self.scale, self.nbits, x.dtype)
+            return nn.functional.linear(x, weight)
+        return torch.cat([block(x) for block in self.blocks], dim=-1)
+
+
+class NativeQuantLinearBlock(nn.Module):
+    """One output-channel block of a blocked ``NativeQuantLinear`` (see there for why)."""
+
+    def __init__(self, in_features: int, out_features: int, nbits: int) -> None:
+        super().__init__()
+        self.nbits = nbits
+        self.register_buffer(
+            "quantized_data", torch.zeros(out_features, in_features, dtype=torch.int8)
+        )
+        self.register_buffer("scale", torch.ones(out_features, 1, dtype=torch.float16))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        weight = dequantize_native(self.quantized_data, self.scale, self.nbits, x.dtype)
+        return nn.functional.linear(x, weight)
 
 
 class GeGLUMLP(nn.Module):

@@ -664,15 +664,20 @@ public struct ReadyResponse: Codable, Sendable {
     public let busy: Bool
     public let cache: CacheStatus
     public let toolCalling: Bool
-    /// Memory held by the server's sessions, estimated from their arrays' shapes and element sizes.
+    /// Memory the server's sessions were sized for at load, computed from their arrays' shapes and
+    /// element sizes. It does not follow the caches as they grow; ``deviceMemory`` does.
     public let estimatedMemory: EstimatedMemory?
+    /// Memory measured at the time of the call: what Metal has allocated and what the kernel charges
+    /// the process, against what the device recommends, and whether new requests are being refused.
+    public let deviceMemory: DeviceMemoryStatus?
     /// Batch scheduler occupancy, present when the server decodes requests in batches.
     public let batching: BatchingStatus?
 
     public init(
         status: String, model: String, maxContextLength: Int,
         busy: Bool, cache: CacheStatus, toolCalling: Bool,
-        estimatedMemory: EstimatedMemory? = nil, batching: BatchingStatus? = nil
+        estimatedMemory: EstimatedMemory? = nil, deviceMemory: DeviceMemoryStatus? = nil,
+        batching: BatchingStatus? = nil
     ) {
         self.status = status
         self.model = model
@@ -681,7 +686,43 @@ public struct ReadyResponse: Codable, Sendable {
         self.cache = cache
         self.toolCalling = toolCalling
         self.estimatedMemory = estimatedMemory
+        self.deviceMemory = deviceMemory
         self.batching = batching
+    }
+
+    /// Device memory in megabytes, measured rather than estimated.
+    public struct DeviceMemoryStatus: Codable, Sendable, Equatable {
+        /// What Metal has allocated on the device: weights, sessions and the framework's scratch.
+        public let metalAllocatedMB: Double
+        /// What the device recommends this process stay under; zero when it gives no figure.
+        public let recommendedMB: Double
+        /// What the kernel charges this process, which leaves out clean file-backed pages.
+        public let footprintMB: Double
+        /// This process's resident memory-mapped file pages, such as the model's weights. Requests are
+        /// refused while the footprint and these together reach the recommendation.
+        public let mappedMB: Double
+        /// Why new requests are being refused with 503 `out_of_memory`, or nil while they are not. It
+        /// clears once the process is back under the line. While it is set, `/ready` answers 503 and
+        /// `status` is `"refusing"`.
+        public let refusing: String?
+
+        public init(
+            metalAllocatedMB: Double, recommendedMB: Double, footprintMB: Double, mappedMB: Double, refusing: String?
+        ) {
+            self.metalAllocatedMB = metalAllocatedMB
+            self.recommendedMB = recommendedMB
+            self.footprintMB = footprintMB
+            self.mappedMB = mappedMB
+            self.refusing = refusing
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case metalAllocatedMB = "metal_allocated_mb"
+            case recommendedMB = "recommended_mb"
+            case footprintMB = "footprint_mb"
+            case mappedMB = "mapped_mb"
+            case refusing
+        }
     }
 
     /// Memory held by the server's sessions in megabytes, estimated from their arrays' shapes and
@@ -752,6 +793,7 @@ public struct ReadyResponse: Codable, Sendable {
         case busy, cache
         case toolCalling = "tool_calling"
         case estimatedMemory = "estimated_memory"
+        case deviceMemory = "device_memory"
         case batching
     }
 }
