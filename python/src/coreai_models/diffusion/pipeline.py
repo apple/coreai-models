@@ -22,7 +22,7 @@ import logging
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -82,8 +82,7 @@ def export_diffusion(config: DiffusionExportConfig) -> dict[str, str]:
     """
     model_dtype = _PRECISIONS.get(config.compute_precision, torch.float32)
     neural_engine = config.compute_unit == "neural-engine"
-    if neural_engine and config.compression != "none":
-        raise ValueError("--compute-unit neural-engine supports --compression none only")
+    palettization = _resolve_palettization(config.compression, neural_engine)
 
     # 1. Determine pipeline type and load HF pipeline
     pipeline_type = get_pipeline_type(config.hf_model_id)
@@ -157,16 +156,13 @@ def export_diffusion(config: DiffusionExportConfig) -> dict[str, str]:
             from coreai_models.embedding.embedding_gemma2.ios import convert_ane_functions
 
             logger.info(f"Exporting {name} -> {spec.asset_name}.aimodel (Neural Engine)")
+            module = spec.build_fn(hf_pipe)
+            dummy_inputs = spec.dummy_fn(hf_pipe)
+            if name in palettization:
+                logger.info(f"Palettizing {name}...")
+                module = _palettize_weights(module, palettization[name], dummy_inputs)
             program = convert_ane_functions(
-                [
-                    (
-                        "main",
-                        spec.build_fn(hf_pipe),
-                        spec.dummy_fn(hf_pipe),
-                        spec.input_names,
-                        spec.output_names,
-                    )
-                ],
+                [("main", spec.cast_fn(module), dummy_inputs, spec.input_names, spec.output_names)],
                 include_debug_info=config.include_debug_info,
             )
             _save_program(program, asset_path, output_path, config.hf_model_id, spec.asset_name)
@@ -651,6 +647,43 @@ def _resolve_compression(compression: str, component_names: list[str]) -> dict[s
             f"Valid: {sorted(component_names)}."
         )
     return {name: per_component.get(name) for name in component_names}
+
+
+def _resolve_palettization(compression: str, neural_engine: bool) -> dict[str, dict]:
+    """A preset's ``component_palettization``, which only the Neural Engine export applies.
+
+    The Neural Engine export takes ``none`` or a palettization preset; the GPU export rejects
+    palettization presets rather than exporting dense.
+    """
+    palettization: dict[str, dict] = PRESETS.get(compression, {}).get("component_palettization", {})
+    if neural_engine and compression != "none" and not palettization:
+        names = [n for n, p in PRESETS.items() if "component_palettization" in p]
+        raise ValueError(
+            f"--compute-unit neural-engine takes --compression none or a palettization preset "
+            f"({', '.join(names)}); got '{compression}'."
+        )
+    if palettization and not neural_engine:
+        raise ValueError(
+            f"'{compression}' palettizes for the Neural Engine; pass --compute-unit neural-engine."
+        )
+    return palettization
+
+
+def _palettize_weights(
+    module: torch.nn.Module, config: dict, example_inputs: tuple[torch.Tensor, ...]
+) -> torch.nn.Module:
+    """k-means palettize ``module``'s weights (coreai-opt, Core AI export backend).
+
+    ``module`` is float32; floating ``example_inputs`` are traced in float32 to match it.
+    """
+    from coreai_opt.base_model_compressor import ExportBackend
+    from coreai_opt.palettization import KMeansPalettizer, KMeansPalettizerConfig
+
+    cfg = KMeansPalettizerConfig.from_dict({"kmeans_palettization_config": copy.deepcopy(config)})
+    palettizer = KMeansPalettizer(module, cfg)
+    args = tuple(a.float() if a.is_floating_point() else a for a in example_inputs)
+    palettizer.prepare(example_inputs=args)
+    return cast(torch.nn.Module, palettizer.finalize(backend=ExportBackend.CoreAI))
 
 
 def _resolve_component_precision(compression: str, component_names: list[str]) -> dict[str, str]:

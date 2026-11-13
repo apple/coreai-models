@@ -16,6 +16,10 @@ component, or ``component_configs`` keyed by diffusers component name (e.g.
 ``transformer``, ``text_encoder``); unlisted components stay dense. An optional
 ``component_precision`` overrides the export's compute precision per component.
 
+Neural Engine presets (``--compute-unit neural-engine``) instead hold
+``component_palettization``: coreai-opt ``kmeans_palettization_config`` dicts keyed by
+component name, applied to the re-authored float32 module before it is cast to float16.
+
 Usage::
 
     from coreai_models.diffusion.presets import get_preset, list_presets
@@ -90,6 +94,20 @@ def _weight_only(weight_spec: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# 6-bit k-means palettization with one lookup table per 16 output channels. The Neural Engine
+# runs palettized weights natively; unlike int4 per-block, it keeps the graph on the Neural Engine.
+_PALETTE_6BIT_GS16 = {
+    "global_config": {
+        "op_state_spec": {
+            "weight": {
+                "n_bits": 6,
+                "granularity": {"type": "per_grouped_channel", "axis": 0, "group_size": 16},
+            }
+        }
+    }
+}
+
+
 PRESETS: dict[str, dict[str, Any]] = {
     "none": {
         "description": "Full precision (no quantization)",
@@ -118,6 +136,12 @@ PRESETS: dict[str, dict[str, Any]] = {
         # Int scales take the weight dtype, and the Core AI GPU int4 dequant kernel rejects
         # bf16 ones. Sana's Gemma2 peaks at ~6% of the fp16 range, so fp16 is safe there.
         "component_precision": {"text_encoder": "float16"},
+    },
+    # Sana Sprint's dense float16 Gemma-2 loads onto the Neural Engine at ~0.5 GB/s; 6-bit halves
+    # the asset (4.9 -> 2.7 GB, the token table stays float16) for ~4 dB on the 58 dB output.
+    "te6bit-pal": {
+        "description": "Neural Engine: 6-bit palettized text encoder (k-means, group size 16)",
+        "component_palettization": {"text_encoder": _PALETTE_6BIT_GS16},
     },
 }
 

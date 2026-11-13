@@ -38,6 +38,7 @@ from coreai_models.diffusion.pipeline import (
     _quantize_component_weights,
     _resolve_component_precision,
     _resolve_compression,
+    _resolve_palettization,
     _uses_int4,
 )
 from coreai_models.diffusion.presets import _EMBEDDING_SUBCLASSES, _MODULE_TYPE_EXCLUSIONS, PRESETS
@@ -186,9 +187,38 @@ def test_presets_satisfy_the_coreai_opt_schema(label: str, config: dict) -> None
 
 
 def test_every_preset_has_exactly_one_config_shape() -> None:
-    """``config`` and ``component_configs`` are alternatives; the resolver reads only one."""
+    """``config``, ``component_configs`` and ``component_palettization`` are alternatives."""
+    shapes = ("config", "component_configs", "component_palettization")
     for name, preset in PRESETS.items():
-        assert ("config" in preset) != ("component_configs" in preset), name
+        assert sum(shape in preset for shape in shapes) == 1, name
+
+
+_PALETTIZATION_PRESETS = [n for n, p in PRESETS.items() if "component_palettization" in p]
+
+
+@pytest.mark.parametrize("name", _PALETTIZATION_PRESETS)
+def test_palettization_presets_satisfy_the_coreai_opt_schema(name: str) -> None:
+    from coreai_opt.palettization import KMeansPalettizerConfig
+
+    for config in PRESETS[name]["component_palettization"].values():
+        KMeansPalettizerConfig.from_dict({"kmeans_palettization_config": copy.deepcopy(config)})
+
+
+def test_palettization_presets_are_neural_engine_only() -> None:
+    """The GPU export would otherwise drop the palettization and export dense."""
+    with pytest.raises(ValueError, match="neural-engine"):
+        _resolve_palettization("te6bit-pal", neural_engine=False)
+    assert set(_resolve_palettization("te6bit-pal", neural_engine=True)) == {"text_encoder"}
+
+
+@pytest.mark.parametrize("compression", ["8bit", "t8bit-te4bit-asym"])
+def test_neural_engine_export_rejects_quantization_presets(compression: str) -> None:
+    with pytest.raises(ValueError, match="palettization preset"):
+        _resolve_palettization(compression, neural_engine=True)
+
+
+def test_neural_engine_export_accepts_none() -> None:
+    assert _resolve_palettization("none", neural_engine=True) == {}
 
 
 def test_int_scales_take_the_dtype_the_weights_are_quantized_in() -> None:

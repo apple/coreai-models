@@ -45,10 +45,12 @@ uv run coreai.diffusion.export sana-sprint-0.6b-neural-engine
 ```
 
 This writes `exports/Sana_Sprint_0.6B_1024px_diffusers_neural_engine/` with all three components
-re-authored for the Neural Engine in `float16` (`python/src/coreai_models/models/ios/sana_*.py`),
-uncompressed. The bundle's `metadata.json` lists them under `diffusion.compute_units`, and the
-runtime loads those on the Neural Engine. Inputs, outputs and the Swift API are the same as for the
-GPU bundle.
+re-authored for the Neural Engine in `float16` (`python/src/coreai_models/models/ios/sana_*.py`).
+The preset's `te6bit-pal` compression palettizes the text encoder to 6 bits (k-means, one lookup
+table per 16 output channels; the token table stays `float16`), and the transformer and VAE decoder
+stay uncompressed. Pass `--compression none` for a dense text encoder. The bundle's `metadata.json`
+lists the components under `diffusion.compute_units`, and the runtime loads those on the Neural
+Engine. Inputs, outputs and the Swift API are the same as for the GPU bundle.
 
 `float16` keeps 3 more mantissa bits than `bfloat16`, and each component holds its activations in range
 with exact rewrites, so it is closer to the `float32` reference than the GPU export (PSNR on 8 prompts,
@@ -57,16 +59,22 @@ M4 Pro):
 | Component / output | Neural Engine | Dense `bfloat16` | Default GPU bundle |
 | ------------------ | ------------- | ---------------- | ------------------ |
 | Transformer        | 54.7 dB       | 42.3 dB          | 40.3 dB (INT8)     |
-| Text encoder       | 58.2 dB       | 71.3 dB          | 46.7 dB (INT4)     |
+| Text encoder       | 54.1 dB       | 71.3 dB          | 46.7 dB (INT4)     |
 | VAE decoder        | 63.9 dB       | 49.1 dB          | 49.1 dB            |
-| Image (end to end) | 28.6 dB       | —                | 21.3 dB            |
+| Image (end to end) | 26.1 dB       | —                | 21.3 dB            |
 
-Compute per image is on par with the GPU (~2.1 s on an M4 Pro). Two costs remain:
+The text encoder is 58.2 dB with `--compression none`, and the image 28.6 dB.
 
-- The first load specializes for the Neural Engine, ~10 minutes for the three components; later
-  loads use the cache.
-- Loading uncompressed weights onto the Neural Engine takes ~2 s per GB, ~12 s per image with lazy
-  model loading, mostly the 4.9 GB text encoder.
+| Asset              | Neural Engine | Default GPU bundle |
+| ------------------ | ------------- | ------------------ |
+| Transformer        | 1.1 GB        | 570 MB             |
+| Text encoder       | 2.5 GB        | 1.4 GB             |
+| VAE decoder        | 466 MB        | 304 MB             |
+
+Compute per image is on par with the GPU (~2.1 s on an M4 Pro). Loading weights onto the Neural
+Engine runs at ~0.5 GB/s, so with lazy model loading an image takes ~4 s against ~3 s on the GPU
+(~12 s more with the dense text encoder). The first load specializes for the Neural Engine, ~10
+minutes for the three components; later loads use the cache.
 
 ## Components
 

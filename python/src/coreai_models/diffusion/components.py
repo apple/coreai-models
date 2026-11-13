@@ -198,12 +198,17 @@ class MultiFunctionComponentSpec:
         return self.quant_dummy_fn or self.functions[0].dummy_fn
 
 
+def _to_float16(module: torch.nn.Module) -> torch.nn.Module:
+    return module.half()
+
+
 @dataclass(frozen=True)
 class NeuralEngineComponentSpec:
     """A component re-authored for the Neural Engine, exported as one static function ``main``.
 
-    ``build_fn(hf_pipe)`` returns the module with its export dtypes already set; the pipeline is
-    loaded in float32 so the build can fold constants into weights before casting.
+    ``build_fn(hf_pipe)`` returns the module in float32, with constants folded into its weights
+    (the pipeline is loaded in float32). The export palettizes it if the compression preset says
+    so, then ``cast_fn`` sets its export dtypes.
     """
 
     asset_name: str
@@ -211,6 +216,7 @@ class NeuralEngineComponentSpec:
     output_names: tuple[str, ...]
     build_fn: Callable
     dummy_fn: Callable
+    cast_fn: Callable[[torch.nn.Module], torch.nn.Module] = _to_float16
     quantizable: bool = False
 
 

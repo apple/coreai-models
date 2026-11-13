@@ -144,7 +144,7 @@ def test_dc_ae_decoder_matches_diffusers() -> None:
     assert _psnr(got, want) > 70
 
 
-def test_gemma2_encoder_matches_transformers_sdpa() -> None:
+def _tiny_gemma2() -> torch.nn.Module:
     from transformers import Gemma2Config, Gemma2Model
 
     torch.manual_seed(0)
@@ -162,10 +162,22 @@ def test_gemma2_encoder_matches_transformers_sdpa() -> None:
     )
     src = Gemma2Model(cfg).eval()
     _randomize(src, seed=3)
+    return src
+
+
+def _tiny_gemma2_inputs(vocab_size: int) -> tuple[torch.Tensor, torch.Tensor]:
     length = TEXT_SEQUENCE_LENGTH + 10
-    ids = torch.randint(1, cfg.vocab_size, (1, length))
+    ids = torch.randint(1, vocab_size, (1, length), generator=torch.Generator().manual_seed(4))
     mask = torch.ones(1, length, dtype=torch.long)
     mask[:, 200:] = 0  # right padding, as the runtime pads
+    return ids, mask
+
+
+def test_gemma2_encoder_matches_transformers_sdpa() -> None:
+    src = _tiny_gemma2()
+    cfg = src.config
+    length = TEXT_SEQUENCE_LENGTH + 10
+    ids, mask = _tiny_gemma2_inputs(cfg.vocab_size)
     m = SanaGemma2Encoder.from_source_model(src, length)
     with torch.no_grad():
         want = SanaTextEncoderWrapper(src)(ids, mask)
@@ -173,3 +185,26 @@ def test_gemma2_encoder_matches_transformers_sdpa() -> None:
     keep = torch.cat([mask[:, :1], mask[:, -(TEXT_SEQUENCE_LENGTH - 1) :]], 1)[0].bool()
     assert got.shape == want.shape
     assert _psnr(got[:, keep], want[:, keep]) > 70
+
+
+def test_gemma2_encoder_palettizes_with_the_neural_engine_preset() -> None:
+    """``te6bit-pal`` palettizes every conv, leaves the token table dense, and still encodes."""
+    from coreai_models.diffusion.pipeline import _palettize_weights
+    from coreai_models.diffusion.presets import PRESETS
+
+    src = _tiny_gemma2()
+    ids, mask = _tiny_gemma2_inputs(src.config.vocab_size)
+    m = SanaGemma2Encoder.from_source_model(src, ids.shape[1])
+    with torch.no_grad():
+        dense = m(ids, mask)
+    config = PRESETS["te6bit-pal"]["component_palettization"]["text_encoder"]
+    m = _palettize_weights(m, config, (ids, mask))
+    state = m.state_dict()
+    convs = [n for n, mod in m.named_modules() if isinstance(mod, torch.nn.Conv2d)]
+    assert convs and all(f"{n}.parametrizations.weight.0.lut" in state for n in convs)
+    assert "embed_tokens.weight" in state
+    with torch.no_grad():
+        got = m.half()(ids, mask).float()
+    keep = torch.cat([mask[:, :1], mask[:, -(TEXT_SEQUENCE_LENGTH - 1) :]], 1)[0].bool()
+    assert torch.isfinite(got).all()
+    assert _psnr(got[:, keep], dense[:, keep]) > 25

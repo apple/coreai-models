@@ -690,7 +690,7 @@ DIFFUSION_PRESETS: list[ModelPreset] = [
         "sana-sprint",
         "diffusion",
         "neural-engine",
-        "none",
+        "te6bit-pal",
         "float16",
         None,
         notes="Neural Engine float16 build (--compute-unit neural-engine)",

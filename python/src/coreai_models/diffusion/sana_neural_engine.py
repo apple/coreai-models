@@ -9,7 +9,7 @@ Each has the same asset name, input and output names and positional order as the
 in ``components.py``, so the runtime binds them the same way; only the declared dtypes differ.
 """
 
-from typing import Any
+from typing import Any, cast
 
 import torch
 
@@ -20,7 +20,11 @@ from coreai_models.diffusion.sana import TEXT_SEQUENCE_LENGTH, sana_text_input_l
 def build_transformer(pipe: Any) -> torch.nn.Module:
     from coreai_models.models.ios.sana_transformer import SanaTransformer
 
-    return SanaTransformer.from_source_model(pipe.transformer).to_neural_engine_dtypes()
+    return SanaTransformer.from_source_model(pipe.transformer)
+
+
+def cast_transformer(module: torch.nn.Module) -> torch.nn.Module:
+    return cast(Any, module).to_neural_engine_dtypes()
 
 
 def dummy_transformer(pipe: Any) -> tuple[torch.Tensor, ...]:
@@ -42,8 +46,7 @@ def dummy_transformer(pipe: Any) -> tuple[torch.Tensor, ...]:
 def build_text_encoder(pipe: Any) -> torch.nn.Module:
     from coreai_models.models.ios.sana_gemma2_encoder import SanaGemma2Encoder
 
-    length = sana_text_input_length(pipe)
-    return SanaGemma2Encoder.from_source_model(pipe.text_encoder, length).half()
+    return SanaGemma2Encoder.from_source_model(pipe.text_encoder, sana_text_input_length(pipe))
 
 
 def dummy_text_encoder(pipe: Any) -> tuple[torch.Tensor, ...]:
@@ -55,7 +58,7 @@ def build_vae_decoder(pipe: Any) -> torch.nn.Module:
     from coreai_models.models.ios.sana_dc_ae_decoder import SanaDCAEDecoder
 
     size = pipe.transformer.config.sample_size
-    return SanaDCAEDecoder.from_source_model(pipe.vae.decoder, latent_size=size).half()
+    return SanaDCAEDecoder.from_source_model(pipe.vae.decoder, latent_size=size)
 
 
 def dummy_vae_decoder(pipe: Any) -> tuple[torch.Tensor, ...]:
@@ -63,7 +66,7 @@ def dummy_vae_decoder(pipe: Any) -> tuple[torch.Tensor, ...]:
     return (torch.randn(1, pipe.vae.config.latent_channels, size, size, dtype=torch.float16),)
 
 
-def _spec(name: str, build_fn: Any, dummy_fn: Any) -> NeuralEngineComponentSpec:
+def _spec(name: str, build_fn: Any, dummy_fn: Any, **kwargs: Any) -> NeuralEngineComponentSpec:
     gpu = SANA_SPRINT_COMPONENTS[name]
     return NeuralEngineComponentSpec(
         asset_name=gpu.asset_name,
@@ -71,11 +74,14 @@ def _spec(name: str, build_fn: Any, dummy_fn: Any) -> NeuralEngineComponentSpec:
         output_names=gpu.output_names,
         build_fn=build_fn,
         dummy_fn=dummy_fn,
+        **kwargs,
     )
 
 
 SANA_SPRINT_NEURAL_ENGINE_COMPONENTS: dict[str, NeuralEngineComponentSpec] = {
-    "transformer": _spec("transformer", build_transformer, dummy_transformer),
+    "transformer": _spec(
+        "transformer", build_transformer, dummy_transformer, cast_fn=cast_transformer
+    ),
     "text_encoder": _spec("text_encoder", build_text_encoder, dummy_text_encoder),
     "vae_decoder": _spec("vae_decoder", build_vae_decoder, dummy_vae_decoder),
 }
