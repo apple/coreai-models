@@ -193,6 +193,13 @@ def test_every_preset_has_exactly_one_config_shape() -> None:
         assert sum(shape in preset for shape in shapes) == 1, name
 
 
+def test_neural_engine_quantization_only_accompanies_palettization() -> None:
+    """The GPU export rejects palettization presets, so it never sees this key."""
+    for name, preset in PRESETS.items():
+        if "component_quantization" in preset:
+            assert "component_palettization" in preset, name
+
+
 _PALETTIZATION_PRESETS = [n for n, p in PRESETS.items() if "component_palettization" in p]
 
 
@@ -202,6 +209,12 @@ def test_palettization_presets_satisfy_the_coreai_opt_schema(name: str) -> None:
 
     for config in PRESETS[name]["component_palettization"].values():
         KMeansPalettizerConfig.from_dict({"kmeans_palettization_config": copy.deepcopy(config)})
+
+
+@pytest.mark.parametrize("name", [n for n, p in PRESETS.items() if "component_quantization" in p])
+def test_neural_engine_quantization_satisfies_the_coreai_opt_schema(name: str) -> None:
+    for config in PRESETS[name]["component_quantization"].values():
+        QuantizerConfig.from_dict({"quantization_config": copy.deepcopy(config)})
 
 
 def test_palettization_presets_are_neural_engine_only() -> None:
@@ -219,6 +232,28 @@ def test_neural_engine_export_rejects_quantization_presets(compression: str) -> 
 
 def test_neural_engine_export_accepts_none() -> None:
     assert _resolve_palettization("none", neural_engine=True) == {}
+
+
+def test_neural_engine_preset_selects_the_neural_engine_registry(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from coreai_models.diffusion import export
+
+    monkeypatch.setattr("sys.argv", ["export", "sana-sprint-0.6b-neural-engine", "--dry-run"])
+    export.main()
+    assert "neural_engine:     True" in capsys.readouterr().out
+
+
+def test_neural_engine_export_rejects_other_pipelines(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from coreai_models.diffusion import export
+
+    argv = ["export", "flux2-klein-4b", "--compute-unit", "neural-engine", "--dry-run"]
+    monkeypatch.setattr("sys.argv", argv)
+    with pytest.raises(SystemExit):
+        export.main()
+    assert "only supported for Sana Sprint, not flux2" in capsys.readouterr().err
 
 
 def test_int_scales_take_the_dtype_the_weights_are_quantized_in() -> None:

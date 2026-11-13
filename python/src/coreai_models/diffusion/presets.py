@@ -19,6 +19,8 @@ component, or ``component_configs`` keyed by diffusers component name (e.g.
 Neural Engine presets (``--compute-unit neural-engine``) instead hold
 ``component_palettization``: coreai-opt ``kmeans_palettization_config`` dicts keyed by
 component name, applied to the re-authored float32 module before it is cast to float16.
+An optional ``component_quantization`` holds coreai-opt ``quantization_config`` dicts keyed
+the same way, applied before palettization to weights k-means skips (embeddings).
 
 Usage::
 
@@ -107,6 +109,37 @@ _PALETTE_6BIT_GS16 = {
     }
 }
 
+# 8-bit k-means, one lookup table per tensor, for the Neural Engine transformer (SanaTransformer).
+# Its timestep/guidance conditioning (float32), caption projection and I/O projections stay
+# dense: they modulate or feed every block. The depthwise convs are tiny.
+_TRANSFORMER_PALETTE_8BIT = {
+    "global_config": {
+        "op_state_spec": {"weight": {"n_bits": 8, "granularity": {"type": "per_tensor"}}}
+    },
+    "module_name_configs": {
+        r"(time_embedder|guidance_embedder)\..*": None,
+        "time_linear": None,
+        "caption_linear_[12]": None,
+        "patch_embed": None,
+        "proj_out": None,
+        r"blocks\.\d+\.ff\.conv_depth": None,
+    },
+}
+
+# int8 with one scale per vocabulary row, for the Neural Engine text encoder's token table. The
+# lookup runs on the GPU (the Neural Engine takes no int32 ids) and k-means skips embeddings.
+_TOKEN_TABLE_INT8 = {
+    "execution_mode": "eager",
+    "global_config": None,
+    "module_name_configs": {
+        "embed_tokens": {
+            "op_state_spec": {
+                "weight": {**_INT8_PER_CHANNEL, "granularity": {"type": "per_channel", "axis": 0}}
+            },
+            **_WEIGHT_ONLY,
+        }
+    },
+}
 
 PRESETS: dict[str, dict[str, Any]] = {
     "none": {
@@ -142,6 +175,16 @@ PRESETS: dict[str, dict[str, Any]] = {
     "te6bit-pal": {
         "description": "Neural Engine: 6-bit palettized text encoder (k-means, group size 16)",
         "component_palettization": {"text_encoder": _PALETTE_6BIT_GS16},
+    },
+    # The int8 token table saves 0.6 GB for 0.2 dB on the text encoder, none on the image.
+    "te6bit-tok8-tx8bit-pal": {
+        "description": "Neural Engine: 6-bit text encoder (k-means, group size 16) with an int8 "
+        "token table, 8-bit transformer (k-means, per tensor)",
+        "component_quantization": {"text_encoder": _TOKEN_TABLE_INT8},
+        "component_palettization": {
+            "text_encoder": _PALETTE_6BIT_GS16,
+            "transformer": _TRANSFORMER_PALETTE_8BIT,
+        },
     },
 }
 

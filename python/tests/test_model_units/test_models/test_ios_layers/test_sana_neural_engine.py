@@ -65,7 +65,7 @@ def test_shuffle_shortcut_matches_pixel_shuffle(cin: int, cout: int) -> None:
     assert torch.equal(_shuffle_shortcut(cin, cout)(x), want)
 
 
-def test_transformer_matches_diffusers() -> None:
+def _tiny_sana_transformer():
     from diffusers import SanaTransformer2DModel
 
     torch.manual_seed(0)
@@ -89,12 +89,21 @@ def test_transformer_matches_diffusers() -> None:
         interpolation_scale=None,
     ).eval()
     _randomize(src, seed=1)
-    m = SanaTransformer.from_source_model(src)
-    latent = torch.randn(1, 4, 8, 8)
-    text = torch.randn(1, TEXT_SEQUENCE_LENGTH, 48)
+    return src
+
+
+def _tiny_sana_transformer_inputs() -> tuple[torch.Tensor, ...]:
+    """Latent, text, mask, σ and the raw guidance scale."""
     mask = torch.ones(1, TEXT_SEQUENCE_LENGTH)
     mask[:, 20:] = 0
-    sigma, guidance = torch.tensor([0.8]), torch.tensor([4.5])
+    text = torch.randn(1, TEXT_SEQUENCE_LENGTH, 48)
+    return torch.randn(1, 4, 8, 8), text, mask, torch.tensor([0.8]), torch.tensor([4.5])
+
+
+def test_transformer_matches_diffusers() -> None:
+    src = _tiny_sana_transformer()
+    m = SanaTransformer.from_source_model(src)
+    latent, text, mask, sigma, guidance = _tiny_sana_transformer_inputs()
     with torch.no_grad():
         want = src(
             latent,
@@ -208,3 +217,54 @@ def test_gemma2_encoder_palettizes_with_the_neural_engine_preset() -> None:
     keep = torch.cat([mask[:, :1], mask[:, -(TEXT_SEQUENCE_LENGTH - 1) :]], 1)[0].bool()
     assert torch.isfinite(got).all()
     assert _psnr(got[:, keep], dense[:, keep]) > 25
+
+
+def test_gemma2_encoder_takes_an_int8_token_table() -> None:
+    """``te6bit-tok8-tx8bit-pal`` stores the token table as int8 rows and still encodes."""
+    from coreai_models.diffusion.pipeline import _palettize_weights, _quantize_component_weights
+    from coreai_models.diffusion.presets import PRESETS
+
+    src = _tiny_gemma2()
+    ids, mask = _tiny_gemma2_inputs(src.config.vocab_size)
+    m = SanaGemma2Encoder.from_source_model(src, ids.shape[1])
+    with torch.no_grad():
+        dense = m(ids, mask)
+    preset = PRESETS["te6bit-tok8-tx8bit-pal"]
+    _quantize_component_weights(
+        m, m, (ids, mask), preset["component_quantization"]["text_encoder"], set()
+    )
+    m = _palettize_weights(m, preset["component_palettization"]["text_encoder"], (ids, mask))
+    state = m.state_dict()
+    table = state["embed_tokens.parametrizations.weight.0.quantized_data"]
+    assert table.dtype == torch.int8
+    assert state["embed_tokens.parametrizations.weight.0.scale"].shape == (table.shape[0], 1)
+    with torch.no_grad():
+        got = m.half()(ids, mask).float()
+    keep = torch.cat([mask[:, :1], mask[:, -(TEXT_SEQUENCE_LENGTH - 1) :]], 1)[0].bool()
+    assert torch.isfinite(got).all()
+    assert _psnr(got[:, keep], dense[:, keep]) > 25
+
+
+def test_transformer_palettizes_with_the_neural_engine_preset() -> None:
+    """The preset palettizes the block convs and keeps the conditioning path dense."""
+    from coreai_models.diffusion.pipeline import _palettize_weights
+    from coreai_models.diffusion.presets import PRESETS
+
+    m = SanaTransformer.from_source_model(_tiny_sana_transformer())
+    inputs = _tiny_sana_transformer_inputs()
+    with torch.no_grad():
+        dense = m(*inputs)
+    config = PRESETS["te6bit-tok8-tx8bit-pal"]["component_palettization"]["transformer"]
+    m = _palettize_weights(m, config, inputs)
+    state = m.state_dict()
+    convs = [n for n, mod in m.named_modules() if isinstance(mod, torch.nn.Conv2d)]
+    palettized = {n for n in convs if f"{n}.parametrizations.weight.0.lut" in state}
+    kept = {"time_linear", "caption_linear_1", "caption_linear_2", "patch_embed", "proj_out"}
+    kept |= {n for n in convs if "embedder." in n or n.endswith("ff.conv_depth")}
+    assert palettized == set(convs) - kept
+    assert any(n.startswith("blocks.1.") for n in palettized)
+    latent, text, mask, sigma, guidance = inputs
+    with torch.no_grad():
+        got = m.to_neural_engine_dtypes()(latent.half(), text.half(), mask.half(), sigma, guidance)
+    assert torch.isfinite(got).all()
+    assert _psnr(got.float(), dense) > 25

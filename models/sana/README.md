@@ -46,11 +46,14 @@ uv run coreai.diffusion.export sana-sprint-0.6b-neural-engine
 
 This writes `exports/Sana_Sprint_0.6B_1024px_diffusers_neural_engine/` with all three components
 re-authored for the Neural Engine in `float16` (`python/src/coreai_models/models/ios/sana_*.py`).
-The preset's `te6bit-pal` compression palettizes the text encoder to 6 bits (k-means, one lookup
-table per 16 output channels; the token table stays `float16`), and the transformer and VAE decoder
-stay uncompressed. Pass `--compression none` for a dense text encoder. The bundle's `metadata.json`
-lists the components under `diffusion.compute_units`, and the runtime loads those on the Neural
-Engine. Inputs, outputs and the Swift API are the same as for the GPU bundle.
+The preset's `te6bit-tok8-tx8bit-pal` compression palettizes the text encoder to 6 bits (k-means,
+one lookup table per 16 output channels) with its token table in `int8` (one scale per row), and the
+transformer to 8 bits (k-means, one lookup table per tensor; the timestep, guidance, caption and
+input/output projections stay `float16`). The VAE decoder stays uncompressed. Pass
+`--compression te6bit-pal` for a `float16` token table and dense transformer, or `--compression none`
+for no compression. The bundle's `metadata.json` maps each component to `["neural_engine"]` under
+`diffusion.compute_units`, and the runtime loads those on the Neural Engine; the token lookup runs
+on the GPU. Inputs, outputs and the Swift API are the same as for the GPU bundle.
 
 `float16` keeps 3 more mantissa bits than `bfloat16`, and each component holds its activations in range
 with exact rewrites, so it is closer to the `float32` reference than the GPU export (PSNR on 8 prompts,
@@ -58,23 +61,26 @@ M4 Pro):
 
 | Component / output | Neural Engine | Dense `bfloat16` | Default GPU bundle |
 | ------------------ | ------------- | ---------------- | ------------------ |
-| Transformer        | 54.7 dB       | 42.3 dB          | 40.3 dB (INT8)     |
-| Text encoder       | 54.1 dB       | 71.3 dB          | 46.7 dB (INT4)     |
+| Transformer        | 45.9 dB       | 42.3 dB          | 40.3 dB (INT8)     |
+| Text encoder       | 53.9 dB       | 71.3 dB          | 46.7 dB (INT4)     |
 | VAE decoder        | 63.9 dB       | 49.1 dB          | 49.1 dB            |
 | Image (end to end) | 26.1 dB       | —                | 21.3 dB            |
 
-The text encoder is 58.2 dB with `--compression none`, and the image 28.6 dB.
+The 8-bit transformer and the `int8` token table cost their components 8.8 and 0.2 dB (dense
+transformer 54.7 dB, `float16` table 54.1 dB) but leave the image within 0.1 dB of `te6bit-pal`. With
+`--compression none` the text encoder is 58.2 dB and the image 28.6 dB.
 
 | Asset              | Neural Engine | Default GPU bundle |
 | ------------------ | ------------- | ------------------ |
-| Transformer        | 1.1 GB        | 570 MB             |
-| Text encoder       | 2.5 GB        | 1.4 GB             |
+| Transformer        | 605 MB        | 570 MB             |
+| Text encoder       | 2.0 GB        | 1.4 GB             |
 | VAE decoder        | 466 MB        | 304 MB             |
 
 Compute per image is on par with the GPU (~2.1 s on an M4 Pro). Loading weights onto the Neural
 Engine runs at ~0.5 GB/s, so with lazy model loading an image takes ~4 s against ~3 s on the GPU
-(~12 s more with the dense text encoder). The first load specializes for the Neural Engine, ~10
-minutes for the three components; later loads use the cache.
+(~12 s more with the dense text encoder). A transformer step takes 195 ms (209 ms dense). The first
+load specializes for the Neural Engine, ~10 minutes for the three components; later loads use the
+cache.
 
 ## Components
 

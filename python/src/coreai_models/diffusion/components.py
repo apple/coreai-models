@@ -533,7 +533,7 @@ def get_component_registry(
     pipeline_type: str,
     multifunction: bool = False,
     dynamic: bool = False,
-    compute_unit: str = "gpu",
+    neural_engine: bool = False,
 ) -> Mapping[str, ComponentSpec | MultiFunctionComponentSpec | NeuralEngineComponentSpec]:
     """Return the component registry for the given pipeline type.
 
@@ -545,17 +545,9 @@ def get_component_registry(
             (8 functions in one .aimodel: main, half, and six img2img variants).
         dynamic: If True, use the FLUX.2 dynamic registry: one symbolic "main" per
             asset. Takes precedence over ``multifunction`` if True.
-        compute_unit: "gpu", or "neural-engine" for the re-authored Neural Engine
-            components (Sana Sprint only).
+        neural_engine: If True, use the Sana Sprint components re-authored for the
+            Neural Engine.
     """
-    if compute_unit == "neural-engine":
-        if pipeline_type != "sana_sprint":
-            raise ValueError(f"--compute-unit neural-engine is not supported for {pipeline_type}")
-        from coreai_models.diffusion.sana_neural_engine import (
-            SANA_SPRINT_NEURAL_ENGINE_COMPONENTS,
-        )
-
-        return SANA_SPRINT_NEURAL_ENGINE_COMPONENTS
     if pipeline_type == "flux2":
         if dynamic:
             return FLUX2_DYNAMIC_COMPONENTS
@@ -565,6 +557,12 @@ def get_component_registry(
     if pipeline_type == "wan":
         return WAN_COMPONENTS
     if pipeline_type == "sana_sprint":
+        if neural_engine:
+            from coreai_models.diffusion.sana_neural_engine import (
+                SANA_SPRINT_NEURAL_ENGINE_COMPONENTS,
+            )
+
+            return SANA_SPRINT_NEURAL_ENGINE_COMPONENTS
         return SANA_SPRINT_COMPONENTS
     raise unknown_pipeline_type_error(pipeline_type)
 

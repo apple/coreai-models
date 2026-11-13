@@ -60,9 +60,9 @@ public struct DiffusionConfig: Codable, Sendable, Equatable {
 
     // MARK: Compute units
 
-    /// Component name (`transformer`, `text_encoder`, ...) to the compute unit its asset was
-    /// built for, e.g. `"neural_engine"`. Unlisted components run on the GPU.
-    public let computeUnits: [String: String]?
+    /// Component name (`transformer`, `text_encoder`, ...) to the compute units its asset was
+    /// built for, preferred first, e.g. `["neural_engine"]`. Unlisted components run on the GPU.
+    public let computeUnits: [String: [String]]?
 
     // MARK: Video (Wan)
 
@@ -97,7 +97,7 @@ public struct DiffusionConfig: Codable, Sendable, Equatable {
         promptPrefix: String? = nil,
         textInputLength: Int? = nil,
         textSequenceLength: Int? = nil,
-        computeUnits: [String: String]? = nil,
+        computeUnits: [String: [String]]? = nil,
         textDim: Int? = nil,
         latentChannels: Int? = nil,
         schedulerShift: Float? = nil,
@@ -187,7 +187,7 @@ public struct DiffusionConfig: Codable, Sendable, Equatable {
         self.promptPrefix = try c.decodeIfPresent(String.self, forKey: .promptPrefix)
         self.textInputLength = try c.decodeIfPresent(Int.self, forKey: .textInputLength)
         self.textSequenceLength = try c.decodeIfPresent(Int.self, forKey: .textSequenceLength)
-        self.computeUnits = try c.decodeIfPresent([String: String].self, forKey: .computeUnits)
+        self.computeUnits = try c.decodeIfPresent([String: [String]].self, forKey: .computeUnits)
         self.textDim = try c.decodeIfPresent(Int.self, forKey: .textDim)
         self.latentChannels = try c.decodeIfPresent(Int.self, forKey: .latentChannels)
         self.schedulerShift = try c.decodeIfPresent(Float.self, forKey: .schedulerShift)

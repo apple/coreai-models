@@ -214,6 +214,13 @@ def main() -> None:
 
     pipeline_type = get_pipeline_type(hf_model_id)
 
+    # --dynamic is FLUX.2-only, so this also rules out combining the two.
+    neural_engine = compute_unit == "neural-engine"
+    if neural_engine and pipeline_type != "sana_sprint":
+        parser.error(
+            f"--compute-unit neural-engine is only supported for Sana Sprint, not {pipeline_type}."
+        )
+
     if args.components and args.platform:
         parser.error("Cannot specify both --components and --platform. Use only one.")
 
@@ -345,7 +352,7 @@ def main() -> None:
         components=args.components or target_components,
         compute_precision=compute_precision,
         compression=compression,
-        compute_unit=compute_unit or "gpu",
+        neural_engine=neural_engine,
         overwrite=args.overwrite,
         include_debug_info=args.include_debug_info,
         multifunction=multifunction,
@@ -364,7 +371,7 @@ def main() -> None:
             print("  components:        all")
         print(f"  multifunction:     {config.multifunction}")
         print(f"  dynamic:           {config.dynamic}")
-        print(f"  compute_unit:      {config.compute_unit}")
+        print(f"  neural_engine:     {config.neural_engine}")
         print(f"  overwrite:         {config.overwrite}")
         print(f"  include_debug_info: {config.include_debug_info}")
         return

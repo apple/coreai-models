@@ -67,8 +67,8 @@ class DiffusionExportConfig:
     multifunction: bool = True
     # FLUX.2 only: one symbolic "main" per asset. Takes precedence over multifunction if True.
     dynamic: bool = False
-    # "gpu", or "neural-engine" for the re-authored float16 Neural Engine components.
-    compute_unit: str = "gpu"
+    # Sana Sprint only: the float16 components re-authored for the Neural Engine.
+    neural_engine: bool = False
 
 
 def export_diffusion(config: DiffusionExportConfig) -> dict[str, str]:
@@ -81,13 +81,18 @@ def export_diffusion(config: DiffusionExportConfig) -> dict[str, str]:
         Dict mapping component name to its .aimodel path.
     """
     model_dtype = _PRECISIONS.get(config.compute_precision, torch.float32)
-    neural_engine = config.compute_unit == "neural-engine"
+    neural_engine = config.neural_engine
     palettization = _resolve_palettization(config.compression, neural_engine)
+    neural_engine_quantization = _resolve_neural_engine_quantization(config.compression)
 
     # 1. Determine pipeline type and load HF pipeline
     pipeline_type = get_pipeline_type(config.hf_model_id)
     if config.dynamic and pipeline_type != "flux2":
         raise ValueError(f"dynamic export is only supported for FLUX.2, not {pipeline_type}.")
+    if neural_engine and pipeline_type != "sana_sprint":
+        raise ValueError(
+            f"Neural Engine export is only supported for Sana Sprint, not {pipeline_type}."
+        )
     # Neural Engine components fold constants into float32 weights, then set their own dtypes.
     load_dtype = torch.float32 if neural_engine else model_dtype
     hf_pipe = _load_hf_pipeline(config.hf_model_id, pipeline_type, load_dtype)
@@ -97,7 +102,7 @@ def export_diffusion(config: DiffusionExportConfig) -> dict[str, str]:
         pipeline_type=pipeline_type,
         multifunction=config.multifunction,
         dynamic=config.dynamic,
-        compute_unit=config.compute_unit,
+        neural_engine=neural_engine,
     )
     component_names = config.components or list(registry.keys())
     logger.info(f"Pipeline type: {pipeline_type}, components: {component_names}")
@@ -158,6 +163,12 @@ def export_diffusion(config: DiffusionExportConfig) -> dict[str, str]:
             logger.info(f"Exporting {name} -> {spec.asset_name}.aimodel (Neural Engine)")
             module = spec.build_fn(hf_pipe)
             dummy_inputs = spec.dummy_fn(hf_pipe)
+            if name in neural_engine_quantization:
+                logger.info(f"Quantizing {name}...")
+                floats = tuple(a.float() if a.is_floating_point() else a for a in dummy_inputs)
+                _quantize_component_weights(
+                    module, module, floats, neural_engine_quantization[name], quantized_modules
+                )
             if name in palettization:
                 logger.info(f"Palettizing {name}...")
                 module = _palettize_weights(module, palettization[name], dummy_inputs)
@@ -235,9 +246,7 @@ def export_diffusion(config: DiffusionExportConfig) -> dict[str, str]:
         results,
         vae_tile_size=config.vae_tile_size,
         dynamic=config.dynamic,
-        neural_engine_components=[
-            name for name in results if isinstance(registry[name], NeuralEngineComponentSpec)
-        ],
+        neural_engine=neural_engine,
     )
 
     # Summary
@@ -424,25 +433,6 @@ def _prepare_assets(json_path: Path, exported_assets: dict[str, str]) -> dict[st
     return assets
 
 
-def _prepare_compute_units(
-    json_path: Path, exported_assets: dict[str, str], neural_engine_components: list[str]
-) -> dict[str, str]:
-    """``compute_units`` for the manifest: this run's components over the previous export's."""
-    units: dict[str, str] = {}
-    if json_path.exists():
-        try:
-            with open(json_path) as f:
-                prior = json.load(f).get("diffusion", {}).get("compute_units")
-        except (OSError, json.JSONDecodeError, AttributeError):
-            prior = None
-        if isinstance(prior, dict):
-            units = {k: v for k, v in prior.items() if k not in exported_assets}
-    for name in exported_assets:
-        if name in neural_engine_components:
-            units[name] = "neural_engine"
-    return units
-
-
 def _write_metadata_json(
     hf_pipe: Any,
     model_id: str,
@@ -453,13 +443,11 @@ def _write_metadata_json(
     *,
     vae_tile_size: int | None = None,
     dynamic: bool = False,
-    neural_engine_components: list[str] | None = None,
+    neural_engine: bool = False,
 ) -> None:
     """Write metadata.json with the v0.2 bundle schema for diffusion models.
 
-    ``diffusion.compute_units`` maps each Neural Engine component to ``"neural_engine"``; the
-    runtime loads components it does not list on the GPU. Entries from a previous partial
-    export of the same bundle are kept while their asset still exists.
+    ``diffusion.compute_units`` lists each asset's compute units, as in the embedding bundle.
     """
     from datetime import datetime
 
@@ -473,12 +461,10 @@ def _write_metadata_json(
         raise unknown_pipeline_type_error(pipeline_type)
 
     json_path = output_path / "metadata.json"
-    compute_units = _prepare_compute_units(
-        json_path, exported_assets, neural_engine_components or []
-    )
     assets = _prepare_assets(json_path, exported_assets)
-    if compute_units:
-        diffusion_config["compute_units"] = compute_units
+    # A bundle directory holds one registry's assets, so all share the export's compute unit.
+    unit = "neural_engine" if neural_engine else "gpu"
+    diffusion_config["compute_units"] = {name: [unit] for name in assets}
 
     metadata = {
         "metadata_version": METADATA_VERSION,
@@ -669,6 +655,14 @@ def _resolve_palettization(compression: str, neural_engine: bool) -> dict[str, d
     return palettization
 
 
+def _resolve_neural_engine_quantization(compression: str) -> dict[str, dict]:
+    """A Neural Engine preset's ``component_quantization``, applied before palettization.
+
+    Only palettization presets carry it, and the GPU export rejects those.
+    """
+    return PRESETS.get(compression, {}).get("component_quantization", {})
+
+
 def _palettize_weights(
     module: torch.nn.Module, config: dict, example_inputs: tuple[torch.Tensor, ...]
 ) -> torch.nn.Module:
@@ -680,7 +674,7 @@ def _palettize_weights(
     from coreai_opt.palettization import KMeansPalettizer, KMeansPalettizerConfig
 
     cfg = KMeansPalettizerConfig.from_dict({"kmeans_palettization_config": copy.deepcopy(config)})
-    palettizer = KMeansPalettizer(module, cfg)
+    palettizer = KMeansPalettizer(module, cast(KMeansPalettizerConfig, cfg))
     args = tuple(a.float() if a.is_floating_point() else a for a in example_inputs)
     palettizer.prepare(example_inputs=args)
     return cast(torch.nn.Module, palettizer.finalize(backend=ExportBackend.CoreAI))

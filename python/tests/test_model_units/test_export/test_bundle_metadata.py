@@ -57,3 +57,41 @@ def test_other_bundle_kinds_stay_on_0_2() -> None:
     from coreai_models.diffusion.pipeline import METADATA_VERSION as DIFFUSION_VERSION
 
     assert DIFFUSION_VERSION == "0.2"
+
+
+def _write_diffusion_metadata(out: Path, assets: list[str], *, neural_engine: bool) -> dict:
+    """Write a FLUX.2-shaped diffusion manifest for empty ``<name>.aimodel`` assets."""
+    from coreai_models.diffusion.pipeline import _write_metadata_json
+
+    exported = {}
+    for name in assets:
+        (out / f"{name}.aimodel").mkdir(exist_ok=True)
+        exported[name] = str(out / f"{name}.aimodel")
+    pipe = SimpleNamespace(
+        vae=SimpleNamespace(config=SimpleNamespace(block_out_channels=[1, 2, 3, 4])),
+        transformer=SimpleNamespace(config=SimpleNamespace()),
+    )
+    _write_metadata_json(pipe, "m", "flux2", out, "none", exported, neural_engine=neural_engine)
+    return json.loads((out / "metadata.json").read_text())["diffusion"]
+
+
+def test_diffusion_lists_the_compute_unit_of_every_asset(tmp_path: Path) -> None:
+    gpu = _write_diffusion_metadata(tmp_path, ["transformer", "text_encoder"], neural_engine=False)
+    assert gpu["compute_units"] == {"transformer": ["gpu"], "text_encoder": ["gpu"]}
+
+    ne = tmp_path / "ne"
+    ne.mkdir()
+    units = _write_diffusion_metadata(ne, ["transformer", "vae_decoder"], neural_engine=True)
+    assert units["compute_units"] == {
+        "transformer": ["neural_engine"],
+        "vae_decoder": ["neural_engine"],
+    }
+
+
+def test_partial_diffusion_export_keeps_the_other_assets_compute_units(tmp_path: Path) -> None:
+    _write_diffusion_metadata(tmp_path, ["transformer", "vae_decoder"], neural_engine=True)
+    units = _write_diffusion_metadata(tmp_path, ["transformer"], neural_engine=True)
+    assert units["compute_units"] == {
+        "transformer": ["neural_engine"],
+        "vae_decoder": ["neural_engine"],
+    }
