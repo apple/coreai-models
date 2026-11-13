@@ -12,14 +12,19 @@ import Foundation
 /// for stateless model evaluation (text encoder, denoiser, VAE).
 public actor CoreAIDiffusionModelFunction {
     private let modelURL: URL
+    private let options: SpecializationOptions
     private var model: AIModel?
     /// Cached InferenceFunctions keyed by name. Reusing loaded functions (rather
     /// than reloading per call) avoids a GPU memory leak — see PR #110.
     private var functionCache: [String: InferenceFunction] = [:]
     private var isLoaded = false
 
-    public init(modelURL: URL) {
+    /// - Parameter expectFrequentReshapes: Set for an asset with symbolic shape axes.
+    public init(modelURL: URL, expectFrequentReshapes: Bool = false) {
         self.modelURL = modelURL
+        var options = SpecializationOptions(preferredComputeUnitKind: .gpu)
+        options.expectFrequentReshapes = expectFrequentReshapes
+        self.options = options
     }
 
     // MARK: - ResourceManaging
@@ -31,7 +36,6 @@ public actor CoreAIDiffusionModelFunction {
         guard FileManager.default.fileExists(atPath: modelURL.path) else {
             throw CoreAIDiffusionError.modelFileNotFound(modelURL)
         }
-        let options = SpecializationOptions(preferredComputeUnitKind: .gpu)
         let loadedModel = try await AIModel(contentsOf: modelURL, options: options)
         guard let fn = try loadedModel.loadFunction(named: "main") else {
             throw CoreAIDiffusionError.functionNotFound("main", modelURL)
@@ -59,7 +63,6 @@ public actor CoreAIDiffusionModelFunction {
         guard FileManager.default.fileExists(atPath: modelURL.path) else {
             throw CoreAIDiffusionError.modelFileNotFound(modelURL)
         }
-        let options = SpecializationOptions(preferredComputeUnitKind: .gpu)
         let probe = try await AIModel(contentsOf: modelURL, options: options)
         return probe.functionNames.contains(name)
     }
