@@ -454,12 +454,11 @@ def export(model_id: str, drafter: Path, window: int, max_context: int, out_dir:
     return aimodel
 
 
-def write_scan_table(t: dict[str, torch.Tensor], num_layers: int, path: Path) -> None:
-    """The masked embedder's candidate-scan inputs: a flat blob and a JSON index of its sections.
+def scan_tensors(t: dict[str, torch.Tensor]) -> tuple[int, int, list[tuple[str, torch.Tensor]]]:
+    """The masked embedder's candidate-scan tensors, shared by ``draft_scan.bin`` and the CPU pack.
 
-    Only what stays on the CPU: the output table permuted so each centroid's tokens are contiguous,
-    and the permutation to map a slot back to a token. The layer weights and centroids are already
-    in the program.
+    The output table permuted so each centroid's tokens are contiguous, and the permutation to map a
+    slot back to a token. Returns the vocabulary size, the centroid count and the named tensors.
     """
     order = t["masked_embedding.token_ordering"].to(torch.int64)
     head = output_table(t)
@@ -470,10 +469,22 @@ def write_scan_table(t: dict[str, torch.Tensor], num_layers: int, path: Path) ->
             f"vocabulary {vocab} is not divisible by the {centroids} centroids: the tokens past "
             f"{vocab // max(centroids, 1) * max(centroids, 1)} would never be scored"
         )
+    if not torch.equal(order.sort().values, torch.arange(vocab)):
+        raise SystemExit("masked_embedding.token_ordering is not a permutation of the vocabulary")
     tensors = [
         ("embed_perm_f16", head[order].to(torch.float16)),
         ("token_ordering_i32", order.to(torch.int32)),
     ]
+    return vocab, centroids, tensors
+
+
+def write_scan_table(t: dict[str, torch.Tensor], num_layers: int, path: Path) -> None:
+    """The masked embedder's candidate-scan inputs: a flat blob and a JSON index of its sections.
+
+    Only what stays on the CPU (``scan_tensors``). The layer weights and centroids are already in
+    the program.
+    """
+    vocab, centroids, tensors = scan_tensors(t)
     index, offset = {}, 0
     with open(path, "wb") as f:
         for name, x in tensors:

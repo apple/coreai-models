@@ -295,6 +295,7 @@ uv run models/<name>/export.py --include-debug-info   # embed debug information 
 - [EfficientSAM](efficient-sam)
 - [PVT v2](pvt)
 - [SAM 3](sam3)
+- [SAM 3 Video](sam3_video)
 - [YOLOS](yolo)
 
 ### Audio Models

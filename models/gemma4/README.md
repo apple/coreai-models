@@ -181,6 +181,23 @@ drafts can differ, which can lower acceptance but never changes the output.
 The run summary reports the share of drafts accepted and the tokens committed per target pass, then
 the same timing summary as a plain run.
 
+#### Draft head pack for the CPU
+
+`export_draft_pack.py` packs the same assistant for a runtime that runs the whole head on the CPU
+instead of as a Core AI program. It writes one safetensors file, `draft_head.safetensors`: the
+candidate-scan table permuted as in `draft_scan.bin`, the centroids, and every layer's weights, with
+the head's geometry, sliding window and RoPE parameters in its `__metadata__`.
+
+```bash
+uv run export_draft_pack.py --model google/gemma-4-E2B-it
+```
+
+Weights are fp16. The pack is per variant, like the assistant: its `post_projection` is as wide as
+the target's hidden size, so the script refuses an assistant whose width does not match `--model`.
+It writes `exports/draft_head/<model>/draft_head.safetensors`, one directory per variant;
+`--output-dir` writes elsewhere. As with `export_drafter.py`, the assistant is `<model>-assistant`
+by default, and `--drafter` takes another hub repo id or a local directory.
+
 ### Runner side
 
 There is no Gemma-specific engine. The generic static-shape engine drives these
