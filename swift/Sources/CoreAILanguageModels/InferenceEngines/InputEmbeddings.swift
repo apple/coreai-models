@@ -31,4 +31,53 @@ public struct InputEmbeddings: Sendable {
 
     /// Number of embedding tokens (seq_len dimension).
     public var tokenCount: Int { embeddings.shape[1] }
+
+    /// `parts` joined along the sequence dimension, in order: the input for a prompt with one
+    /// image placeholder run per part. The parts must have batch size 1 and the same hidden size and
+    /// scalar type.
+    package static func concatenating(_ parts: [InputEmbeddings]) throws -> InputEmbeddings {
+        guard let first = parts.first else {
+            throw InferenceRuntimeError.invalidArgument("InputEmbeddings.concatenating needs at least one part")
+        }
+        if parts.count == 1 { return first }
+        let hiddenDim = first.embeddings.shape[2]
+        let scalarType = first.embeddings.scalarType
+        for part in parts {
+            let shape = part.embeddings.shape
+            guard shape[0] == 1, shape[2] == hiddenDim, part.embeddings.scalarType == scalarType else {
+                throw InferenceRuntimeError.invalidArgument(
+                    "InputEmbeddings.concatenating: part of shape \(shape) and type \(part.embeddings.scalarType) "
+                        + "does not match [1, _, \(hiddenDim)] \(scalarType)")
+            }
+        }
+        let totalTokens = parts.reduce(0) { $0 + $1.tokenCount }
+        var joined = NDArray(shape: [1, totalTokens, hiddenDim], scalarType: scalarType)
+        switch scalarType {
+        case .float16, .bfloat16:
+            copy(parts, into: &joined, as: Float16.self)
+        case .float32:
+            copy(parts, into: &joined, as: Float.self)
+        default:
+            throw InferenceRuntimeError.invalidInputType(
+                "InputEmbeddings.concatenating: unsupported embedding scalar type \(scalarType)")
+        }
+        return try InputEmbeddings(embeddings: joined, embeddingPositions: 0..<totalTokens)
+    }
+
+    /// Copies each part's elements into `destination`, one part after another.
+    private static func copy<Scalar: BitwiseCopyable>(
+        _ parts: [InputEmbeddings], into destination: inout NDArray, as _: Scalar.Type
+    ) {
+        var destinationView = destination.mutableView(as: Scalar.self)
+        destinationView.withUnsafeMutablePointer { destinationPointer, _, _ in
+            var offset = 0
+            for part in parts {
+                let count = part.tokenCount * part.embeddings.shape[2]
+                part.embeddings.view(as: Scalar.self).withUnsafePointer { sourcePointer, _, _ in
+                    (destinationPointer + offset).update(from: sourcePointer, count: count)
+                }
+                offset += count
+            }
+        }
+    }
 }

@@ -1843,7 +1843,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         let w = Int(ciImage.extent.width)
         let h = Int(ciImage.extent.height)
         CLILogger.log("Injected image info: \(w)x\(h)", component: "VLM")
-        return "Image: \(w)x\(h)\n\(displayPrompt)"
+        return ImagePlaceholders.imageInfoText(width: w, height: h) + displayPrompt
     }
 
     /// Prompt tokens for an image prompt: the tokenizer's chat template with the image placeholder
@@ -1874,38 +1874,17 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         imageTokenId: Int32,
         tokenizer: any Tokenizer
     ) throws -> [Int32]? {
-        // Use the tokenizer's applyChatTemplate with a multimodal message.
-        // The template should emit a single <image> token that we expand.
-        let imageToken = tokenizer.convertIdToToken(Int(imageTokenId)) ?? "<image>"
-        let templatedPrompt = "\(imageToken)\n\(prompt)"
+        // The template should emit the single image token, which is expanded to the image's tokens.
+        let imageToken = ImagePlaceholders.text(imageTokenId: imageTokenId, tokenizer: tokenizer)
         guard
             let tokens = try? PromptUtils.maybeApplyTokenizerChatTemplate(
-                .prompt(templatedPrompt), tokenizer: tokenizer
+                .prompt("\(imageToken)\n\(prompt)"), tokenizer: tokenizer
             )
         else {
             return nil
         }
-
-        // Expand the single image placeholder to imageTokenCount copies
-        var result: [Int32] = []
-        result.reserveCapacity(tokens.count + imageTokenCount - 1)
-        var foundPlaceholder = false
-        for tokenInt in tokens {
-            let token = Int32(tokenInt)
-            if token == imageTokenId && !foundPlaceholder {
-                result.append(contentsOf: [Int32](repeating: imageTokenId, count: imageTokenCount))
-                foundPlaceholder = true
-            } else if token == imageTokenId {
-                // Skip additional single image tokens (already expanded the first one)
-                continue
-            } else {
-                result.append(token)
-            }
-        }
-
-        // If we never found the placeholder, the template didn't produce it — fall back
-        guard foundPlaceholder else { return nil }
-        return result
+        return ImagePlaceholders.expand(
+            tokens.map { Int32($0) }, imageTokenId: imageTokenId, tokenCounts: [imageTokenCount])
     }
 
     // MARK: - Warmup

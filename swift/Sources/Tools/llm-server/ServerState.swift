@@ -131,6 +131,9 @@ final class ServerState: @unchecked Sendable {
     /// batch size is part of it because batched decoding sums in a different order, so the same
     /// seed can give slightly different logits.
     let systemFingerprint: String
+    /// The shared engine as a multimodal engine and the model's vision config, nil for a model that
+    /// does not accept image input. Requests with images run on it on the `.fallbackBatchOne` lane.
+    let vision: (engine: any MultimodalInferenceEngine, config: VisionConfig)?
     /// Scheduler for the batched lane and completions scoring, and the model config for each
     /// `SchedulerSession`. Nil when batched serving is off.
     private let batchServing: (scheduler: BatchScheduler, modelConfig: ModelConfig)?
@@ -149,17 +152,28 @@ final class ServerState: @unchecked Sendable {
         var prefixMisses: Int = 0
         var toolCallCounts: [String: Int] = [:]
         var totalToolCalls: Int = 0
+        // TODO: Keep image embeddings in an in-memory content-addressed store that sessions share.
+        /// Embeddings of the images of a session's last completed request.
+        var sessionImages: (sessionID: String, embeddings: [ImageKey: InputEmbeddings])? = nil
     }
 
     init(
         engine: any InferenceEngine,
         tokenizer: any Tokenizer,
         config: ServerConfig,
+        visionConfig: VisionConfig? = nil,
         batchServing: (scheduler: BatchScheduler, modelConfig: ModelConfig)? = nil,
         memoryGuard: DeviceMemoryGuard? = nil
     ) {
         self.memoryGuard = memoryGuard
         self.engine = engine
+        if let visionConfig, let multimodal = engine as? any MultimodalInferenceEngine,
+            multimodal.acceptsMultimodalInput
+        {
+            self.vision = (multimodal, visionConfig)
+        } else {
+            self.vision = nil
+        }
         self.tokenizer = tokenizer
         self.config = config
         self.queue = RequestQueue(maxDepth: config.maxQueueDepth)
@@ -212,7 +226,7 @@ final class ServerState: @unchecked Sendable {
     /// request is done:
     ///
     /// ```swift
-    /// let lane = BatchServingRouter.lane(hasResponseSchema: schema != nil)
+    /// let lane = BatchServingRouter.lane(hasResponseSchema: schema != nil, hasImages: hasImages)
     /// let access = try await state.acquireAccess(lane: lane)
     /// defer { access.release() }
     /// let engine = state.engineForRequest(lane: lane)
@@ -278,6 +292,9 @@ final class ServerState: @unchecked Sendable {
 
     var supportsToolCalling: Bool { toolCallDetection != nil }
 
+    /// Input modalities the model accepts besides text.
+    var modalities: Modalities { Modalities(vision: vision != nil) }
+
     func makeToolCallParser() -> ToolCallParser? {
         guard let detection = toolCallDetection else { return nil }
         return ToolCallParser(
@@ -332,6 +349,23 @@ final class ServerState: @unchecked Sendable {
     /// Record the tokens that were processed (call after generate completes).
     func recordPromptTokens(_ tokens: [Int32]) {
         _state.withLock { $0.lastPromptTokens = tokens }
+    }
+
+    /// Image embeddings cached for `sessionID`; empty for a request with no session ID or of
+    /// another session, whose embeddings this drops.
+    func cachedImageEmbeddings(sessionID: String?) -> [ImageKey: InputEmbeddings] {
+        _state.withLock { s in
+            guard let sessionID, s.sessionImages?.sessionID == sessionID else {
+                s.sessionImages = nil
+                return [:]
+            }
+            return s.sessionImages?.embeddings ?? [:]
+        }
+    }
+
+    /// Replaces the cached image embeddings with those of `sessionID`'s completed request.
+    func recordImageEmbeddings(_ embeddings: [ImageKey: InputEmbeddings], sessionID: String?) {
+        _state.withLock { $0.sessionImages = sessionID.map { ($0, embeddings) } }
     }
 
     /// Record tool calls made in a response.
@@ -401,6 +435,7 @@ final class ServerState: @unchecked Sendable {
                 utilization: utilization
             ),
             toolCalling: supportsToolCalling,
+            modalities: modalities,
             estimatedMemory: estimatedMemory(),
             deviceMemory: memory.map { memory in
                 let megabyte = 1024.0 * 1024.0

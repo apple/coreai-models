@@ -10,9 +10,10 @@ import Testing
 @Suite("BatchServingRouter")
 struct BatchServingRouterTests {
     @Test(
-        "Plain chat batches and a response schema takes the batch=1 lane",
+        "Plain chat batches; a response schema or image input takes the batch=1 lane",
         arguments: [(false, BatchServingLane.batched), (true, .fallbackBatchOne)])
     func lane(hasResponseSchema: Bool, expected: BatchServingLane) {
-        #expect(BatchServingRouter.lane(hasResponseSchema: hasResponseSchema) == expected)
+        #expect(BatchServingRouter.lane(hasResponseSchema: hasResponseSchema, hasImages: false) == expected)
+        #expect(BatchServingRouter.lane(hasResponseSchema: hasResponseSchema, hasImages: true) == .fallbackBatchOne)
     }
 }

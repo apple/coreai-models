@@ -72,7 +72,8 @@ enum ReplayRunner {
         async throws -> ReplayResult
     {
         let sessionID = req.session ?? "default"
-        let lane = BatchServingRouter.lane(hasResponseSchema: chatRequest.responseFormat?.extractedSchema != nil)
+        let lane = BatchServingRouter.lane(
+            hasResponseSchema: chatRequest.responseFormat?.extractedSchema != nil, hasImages: chatRequest.hasImageInput)
         let access = try await state.acquireAccess(lane: lane)
         defer { access.release() }
 

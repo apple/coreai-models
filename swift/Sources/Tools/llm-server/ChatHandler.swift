@@ -6,6 +6,7 @@
 import CoreAILMCommon
 import CoreAILanguageModels
 import CoreAIShared
+import CoreGraphics
 import Foundation
 import HTTPTypes
 import Hummingbird
@@ -17,10 +18,11 @@ func startServer(state: ServerState, port: Int) async throws {
     let router = Router()
 
     router.get("/health") { _, _ in
-        Response(
+        let data = try JSONEncoder().encode(HealthResponse(status: "ok", modalities: state.modalities))
+        return Response(
             status: .ok,
             headers: [.contentType: "application/json"],
-            body: .init(byteBuffer: ByteBuffer(string: #"{"status":"ok"}"#))
+            body: .init(byteBuffer: ByteBuffer(data: data))
         )
     }
 
@@ -30,7 +32,8 @@ func startServer(state: ServerState, port: Int) async throws {
                 ModelsResponse.ModelInfo(
                     id: state.config.modelName,
                     created: Int(Date().timeIntervalSince1970),
-                    ownedBy: "coreai"
+                    ownedBy: "coreai",
+                    capabilities: ModelsResponse.ModelInfo.capabilities(vision: state.modalities.vision)
                 )
             ]
         )
@@ -116,7 +119,7 @@ private func handleChatCompletionsFromBody(body: ByteBuffer, state: ServerState,
     }
 
     let lane = BatchServingRouter.lane(
-        hasResponseSchema: chatRequest.responseFormat?.extractedSchema != nil)
+        hasResponseSchema: chatRequest.responseFormat?.extractedSchema != nil, hasImages: chatRequest.hasImageInput)
     let access: RequestAccess
     do {
         access = try await state.acquireAccess(lane: lane)
@@ -198,64 +201,16 @@ struct ChatCompletionOutcome {
 func runChatCompletion(chatRequest: ChatCompletionRequest, state: ServerState, sessionID: String? = nil)
     async throws -> ChatCompletionOutcome
 {
-    let requestMaxTokens = chatRequest.maxCompletionTokens ?? chatRequest.maxTokens ?? state.config.defaultMaxTokens
-    guard requestMaxTokens > 0 else {
-        throw ServerError.badRequest("max_tokens must be positive")
-    }
-    let requestID = RequestID.next()
+    let prepared = try await prepareStreaming(
+        chatRequest: chatRequest, state: state, sessionID: sessionID, streaming: false)
+    let requestID = prepared.requestID
+    let requestMaxTokens = prepared.requestMaxTokens
+    let promptTokens = prepared.promptTokensInt32
+    let prefixReused = prepared.prefixReuseTokens
     let created = Int(Date().timeIntervalSince1970)
-
-    let samplingConfig = try state.makeSamplingConfig(
-        temperature: chatRequest.temperature,
-        topP: chatRequest.topP,
-        topK: chatRequest.topK,
-        minP: nil,
-        seed: chatRequest.seed
-    )
-
-    let reasoningEffort = ReasoningEffort.resolve(
-        request: chatRequest.reasoningEffort, default: state.config.defaultReasoningEffort)
-    let promptTokens = tokenizeMessages(
-        chatRequest.messages, tools: chatRequest.tools, reasoningEffort: reasoningEffort,
-        tokenizer: state.tokenizer, toolCallDetection: state.toolCallDetection)
-    let stopSequences = buildStopSequences(from: chatRequest, state: state)
-    try requireSchemaSupport(chatRequest, state: state)
-    let input: Input = .tokens(promptTokens)
-
-    guard promptTokens.count < state.config.maxContextLength else {
-        throw ServerError.badRequest(
-            "Prompt (\(promptTokens.count) tokens) exceeds context length (\(state.config.maxContextLength))")
-    }
-
-    CLILogger.log(
-        "[\(requestID)] messages: \(chatRequest.messages.count), tokens: \(promptTokens.count), max_tokens: \(requestMaxTokens)",
-        component: "Server")
-
-    let promptTokensInt32 = promptTokens.map { Int32($0) }
-    let prefixReused = await state.prepareForRequest(sessionID: sessionID, promptTokens: promptTokensInt32)
-    if prefixReused > 0 {
-        CLILogger.log("[\(requestID)] prefix reuse: \(prefixReused) tokens cached", component: "Server")
-    }
-    let t0 = SuspendingClock().now
-
-    let strategy: any DecodingStrategy
-    let schema = chatRequest.responseFormat?.extractedSchema
-    if let schema {
-        CLILogger.log("[\(requestID)] constrained generation (json_schema)", component: "Server")
-        strategy = jsonSchemaStrategy(schema, state: state)
-    } else {
-        strategy = VanillaDecodingStrategy()
-    }
-
-    let lane = BatchServingRouter.lane(hasResponseSchema: schema != nil)
-    let stream = try await strategy.decode(
-        from: input,
-        tokenizer: state.tokenizer,
-        inferenceEngine: state.engineForRequest(lane: lane),
-        samplingConfiguration: samplingConfig,
-        options: InferenceOptions(maxTokens: requestMaxTokens),
-        stopSequences: stopSequences
-    )
+    let started = try await startStreamingDecode(prepared: prepared, chatRequest: chatRequest, state: state)
+    let t0 = started.start
+    let stream = started.tokens
 
     var genTokenCount = 0
     var parts: [String] = []
@@ -284,9 +239,7 @@ func runChatCompletion(chatRequest: ChatCompletionRequest, state: ServerState, s
     if chatRequest.raw != true {
         // Separate reasoning from text using the streaming parser on the full output
         var thinkParser = ThinkTagParser(
-            format: state.thinkingFormat,
-            startsInReasoning: ThinkTagParser.promptOpensReasoning(
-                promptTokens, tokenizer: state.tokenizer, format: state.thinkingFormat))
+            format: state.thinkingFormat, startsInReasoning: prepared.promptOpensReasoning)
         let events = thinkParser.consume(text) + thinkParser.flush()
         var textParts: [String] = []
         var reasoningParts: [String] = []
@@ -342,7 +295,8 @@ func runChatCompletion(chatRequest: ChatCompletionRequest, state: ServerState, s
     state.stats.record(
         promptTokens: promptTokens.count, genTokens: genTokenCount, promptSeconds: promptSeconds,
         genSeconds: genSeconds, totalSeconds: totalSeconds, toolCalls: responseToolCalls?.count ?? 0)
-    state.recordPromptTokens(promptTokensInt32)
+    state.recordPromptTokens(promptTokens)
+    state.recordImageEmbeddings(prepared.images?.byKey ?? [:], sessionID: sessionID)
 
     let response = ChatCompletionResponse(
         id: requestID,
@@ -392,13 +346,16 @@ private func handleNonStreamingRequest(chatRequest: ChatCompletionRequest, state
 
 // MARK: - Streaming (SSE)
 
-/// Inputs prepared for a streaming generation. Split out so bad-request guards throw before
+/// Inputs prepared for a chat generation. Split out so bad-request guards throw before
 /// any SSE framing is emitted (and reused by `--replay`).
 struct PreparedStream {
     let requestID: String
+    let sessionID: String?
     let promptTokenCount: Int
     let promptTokensInt32: [Int32]
     let input: Input
+    /// Nil for a request without images.
+    let images: PromptImages?
     let samplingConfig: SamplingConfiguration
     let stopSequences: StopSequences
     let requestMaxTokens: Int
@@ -418,12 +375,13 @@ struct StreamingOutcome {
     let systemFingerprint: String?
 }
 
-/// Preflight for the streaming path: tokenize, validate, and prime the prefix cache. Throws
-/// `ServerError.badRequest` for oversized prompts, non-positive max_tokens and out-of-range
-/// sampling values so callers can map to HTTP 400 before opening the stream.
-func prepareStreaming(chatRequest: ChatCompletionRequest, state: ServerState, sessionID: String? = nil) async throws
-    -> PreparedStream
-{
+/// Preflight for a chat generation, streaming or not: tokenize, encode images, validate, and prime the
+/// prefix cache. Throws `ServerError.badRequest` for oversized prompts, non-positive max_tokens,
+/// out-of-range sampling values and unacceptable images so callers can map to HTTP 400 before
+/// opening the stream.
+func prepareStreaming(
+    chatRequest: ChatCompletionRequest, state: ServerState, sessionID: String? = nil, streaming: Bool = true
+) async throws -> PreparedStream {
     let requestMaxTokens = chatRequest.maxCompletionTokens ?? chatRequest.maxTokens ?? state.config.defaultMaxTokens
     guard requestMaxTokens > 0 else {
         throw ServerError.badRequest("max_tokens must be positive")
@@ -440,9 +398,9 @@ func prepareStreaming(chatRequest: ChatCompletionRequest, state: ServerState, se
 
     let reasoningEffort = ReasoningEffort.resolve(
         request: chatRequest.reasoningEffort, default: state.config.defaultReasoningEffort)
-    let promptTokens = tokenizeMessages(
-        chatRequest.messages, tools: chatRequest.tools, reasoningEffort: reasoningEffort,
-        tokenizer: state.tokenizer, toolCallDetection: state.toolCallDetection)
+    let prompt = try await makeChatPrompt(
+        chatRequest, reasoningEffort: reasoningEffort, state: state, sessionID: sessionID)
+    let promptTokens = prompt.tokens
     let stopSequences = buildStopSequences(from: chatRequest, state: state)
     try requireSchemaSupport(chatRequest, state: state)
     let input: Input = .tokens(promptTokens)
@@ -453,7 +411,7 @@ func prepareStreaming(chatRequest: ChatCompletionRequest, state: ServerState, se
     }
 
     CLILogger.log(
-        "[\(requestID)] stream, messages: \(chatRequest.messages.count), tokens: \(promptTokens.count), max_tokens: \(requestMaxTokens)",
+        "[\(requestID)] \(streaming ? "stream, " : "")messages: \(chatRequest.messages.count), tokens: \(promptTokens.count), max_tokens: \(requestMaxTokens)",
         component: "Server")
 
     let promptTokensInt32 = promptTokens.map { Int32($0) }
@@ -463,8 +421,9 @@ func prepareStreaming(chatRequest: ChatCompletionRequest, state: ServerState, se
     }
 
     return PreparedStream(
-        requestID: requestID, promptTokenCount: promptTokens.count, promptTokensInt32: promptTokensInt32,
-        input: input, samplingConfig: samplingConfig, stopSequences: stopSequences,
+        requestID: requestID, sessionID: sessionID, promptTokenCount: promptTokens.count,
+        promptTokensInt32: promptTokensInt32, input: input, images: prompt.images, samplingConfig: samplingConfig,
+        stopSequences: stopSequences,
         requestMaxTokens: requestMaxTokens, prefixReuseTokens: prefixReused,
         promptOpensReasoning: ThinkTagParser.promptOpensReasoning(
             promptTokens, tokenizer: state.tokenizer, format: state.thinkingFormat))
@@ -478,21 +437,31 @@ struct StartedDecode: @unchecked Sendable {
 }
 
 /// Starts decoding `prepared` on the engine for the request's lane, with constrained decoding when
-/// `chatRequest` has a JSON schema. Throws `InferenceRuntimeError.queueFull` when the batch
-/// scheduler is full.
+/// `chatRequest` has a JSON schema. A prompt with images decodes with their embeddings on the
+/// multimodal engine (the `.fallbackBatchOne` lane), which reuses the prefix in front of the first
+/// image. Throws `InferenceRuntimeError.queueFull` when the batch scheduler is full.
 func startStreamingDecode(
     prepared: PreparedStream, chatRequest: ChatCompletionRequest, state: ServerState
 ) async throws -> StartedDecode {
     let start = SuspendingClock().now
+    if let images = prepared.images, let vision = state.vision {
+        let tokens = try await VanillaDecodingStrategy().decode(
+            embeddings: images.joined, tokens: prepared.promptTokensInt32, tokenizer: state.tokenizer,
+            inferenceEngine: vision.engine, samplingConfiguration: prepared.samplingConfig,
+            options: InferenceOptions(maxTokens: prepared.requestMaxTokens), stopSequences: prepared.stopSequences)
+        return StartedDecode(tokens: tokens, start: start)
+    }
+
     let strategy: any DecodingStrategy
     let schema = chatRequest.responseFormat?.extractedSchema
     if let schema {
+        CLILogger.log("[\(prepared.requestID)] constrained generation (json_schema)", component: "Server")
         strategy = jsonSchemaStrategy(schema, state: state)
     } else {
         strategy = VanillaDecodingStrategy()
     }
 
-    let lane = BatchServingRouter.lane(hasResponseSchema: schema != nil)
+    let lane = BatchServingRouter.lane(hasResponseSchema: schema != nil, hasImages: chatRequest.hasImageInput)
     let tokens = try await strategy.decode(
         from: prepared.input,
         tokenizer: state.tokenizer,
@@ -617,6 +586,7 @@ func runStreamingLoop(
         promptTokens: prepared.promptTokenCount, genTokens: tokenCount, promptSeconds: promptSeconds,
         genSeconds: genSeconds, totalSeconds: totalSeconds, toolCalls: toolCallNames.count)
     state.recordPromptTokens(prepared.promptTokensInt32)
+    state.recordImageEmbeddings(prepared.images?.byKey ?? [:], sessionID: prepared.sessionID)
     if !toolCallNames.isEmpty {
         state.recordToolCalls(toolCallNames)
     }
@@ -691,13 +661,137 @@ private func handleStreamingRequest(
 
 // MARK: - Helpers
 
-/// A chat request's messages and tools rendered through the model's chat template, as tokens.
+/// A chat request's prompt tokens and the images in them.
+struct ChatPrompt {
+    let tokens: [Int]
+    /// Nil for a request without images.
+    let images: PromptImages?
+}
+
+/// The embeddings of a prompt's images.
+struct PromptImages {
+    /// The embeddings of every image placeholder in the prompt, in order.
+    let joined: InputEmbeddings
+    /// The embeddings of each image of the prompt.
+    let byKey: [ImageKey: InputEmbeddings]
+}
+
+/// Renders `chatRequest` through the chat template. For a request with images, encodes each image
+/// that `sessionID` has not cached and expands its placeholder to the image's tokens. Throws
+/// `ServerError.badRequest` for images the model does not accept or the server cannot read.
+func makeChatPrompt(
+    _ chatRequest: ChatCompletionRequest, reasoningEffort: String?, state: ServerState, sessionID: String?
+) async throws -> ChatPrompt {
+    func render(_ images: ImagePartRendering) -> [Int] {
+        tokenizeMessages(
+            chatRequest.messages, tools: chatRequest.tools, reasoningEffort: reasoningEffort,
+            tokenizer: state.tokenizer, toolCallDetection: state.toolCallDetection, images: images)
+    }
+    if let vision = state.vision {
+        let placeholder = ImagePlaceholders.text(imageTokenId: vision.config.imageTokenId, tokenizer: state.tokenizer)
+        guard !chatRequest.messages.contains(where: { $0.content.textContent.contains(placeholder) }) else {
+            throw ServerError.badRequest("message text must not contain the image token \(placeholder)")
+        }
+    }
+    guard chatRequest.hasImageInput else { return ChatPrompt(tokens: render(.omitted), images: nil) }
+    guard let vision = state.vision else {
+        throw ServerError.badRequest("model \(state.config.modelName) does not accept image input")
+    }
+    guard chatRequest.responseFormat?.extractedSchema == nil else {
+        throw ServerError.badRequest("response_format json_schema is not supported with image input")
+    }
+    let imageTokenId = vision.config.imageTokenId
+    let placeholder = ImagePlaceholders.text(imageTokenId: imageTokenId, tokenizer: state.tokenizer)
+
+    let images = try ImageInput.images(in: chatRequest.messages)
+    var embeddings = state.cachedImageEmbeddings(sessionID: sessionID).filter { key, _ in
+        images.contains { $0.key == key }
+    }
+    for image in images where embeddings[image.key] == nil {
+        embeddings[image.key] = try await vision.engine.encodeImage(cgImage: image.image)
+    }
+    let ordered = images.compactMap { embeddings[$0.key] }
+
+    let infos = images.map {
+        vision.config.includeImageInfo
+            ? ImagePlaceholders.imageInfoText(width: $0.image.width, height: $0.image.height) : ""
+    }
+    // The template's own image parts first, then the image token in the message text.
+    let renderings: [ImagePartRendering] = [.parts(infos: infos), .text(infos.map { placeholder + "\n" + $0 })]
+    let expanded = renderings.lazy.compactMap {
+        ImagePlaceholders.expand(
+            render($0).map { Int32($0) }, imageTokenId: imageTokenId, tokenCounts: ordered.map(\.tokenCount))
+    }.first
+    guard let expanded else {
+        throw InferenceRuntimeError.invalidState("The chat template did not place one \(placeholder) per image")
+    }
+    return ChatPrompt(
+        tokens: expanded.map { Int($0) },
+        images: PromptImages(joined: try InputEmbeddings.concatenating(ordered), byKey: embeddings))
+}
+
+/// How `tokenizeMessages` passes image content parts to the chat template.
+enum ImagePartRendering {
+    /// Image parts are left out.
+    case omitted
+    /// Every message's content is a list of `{"type": "text", "text": ...}` and `{"type": "image"}`
+    /// parts, as vision-language chat templates take it, with `infos[i]` as a text part after the
+    /// i-th image when not empty.
+    case parts(infos: [String])
+    /// The i-th image part is replaced by `texts[i]` in the message text.
+    case text([String])
+}
+
+/// A chat request's messages and tools rendered through the model's chat template, as tokens, with
+/// image parts passed as `images` says.
 ///
 /// Internal, not private, so tests can render a request through a real template.
 func tokenizeMessages(
     _ messages: [ChatMessage], tools: [ToolDefinition]? = nil,
-    reasoningEffort: String? = nil, tokenizer: any Tokenizer, toolCallDetection: ToolCallDetection?
+    reasoningEffort: String? = nil, tokenizer: any Tokenizer, toolCallDetection: ToolCallDetection?,
+    images: ImagePartRendering = .omitted
 ) -> [Int] {
+    var imageIndex = 0
+    /// The template value of `content` followed by `suffix`.
+    func render(_ content: MessageContent, appending suffix: String = "") -> any Sendable {
+        guard case .parts(let parts) = content else {
+            if case .parts = images { return [["type": "text", "text": content.textContent + suffix]] }
+            return content.textContent + suffix
+        }
+        switch images {
+        case .omitted:
+            return content.textContent + suffix
+        case .parts(let infos):
+            var rendered: [[String: any Sendable]] = []
+            for part in parts {
+                guard case .text(let text) = part else {
+                    rendered.append(["type": "image"])
+                    if imageIndex < infos.count, !infos[imageIndex].isEmpty {
+                        rendered.append(["type": "text", "text": infos[imageIndex]])
+                    }
+                    imageIndex += 1
+                    continue
+                }
+                rendered.append(["type": "text", "text": text])
+            }
+            return suffix.isEmpty ? rendered : rendered + [["type": "text", "text": suffix]]
+        case .text(let texts):
+            var text = ""
+            var previousIsText = false
+            for part in parts {
+                if case .text(let t) = part {
+                    text += (previousIsText ? " " : "") + t
+                    previousIsText = true
+                } else if imageIndex < texts.count {
+                    text += (previousIsText ? "\n" : "") + texts[imageIndex]
+                    imageIndex += 1
+                    previousIsText = false
+                }
+            }
+            return text + suffix
+        }
+    }
+
     var templateMessages: [[String: any Sendable]] = []
     // Resolved effort is the single source of truth: `none` also injects the legacy `/no_think`
     // literal for models (e.g. Qwen3) that honor it in the system prompt.
@@ -706,19 +800,15 @@ func tokenizeMessages(
         var dict: [String: any Sendable] = ["role": msg.role]
 
         if msg.role == "tool" {
-            dict["content"] = msg.content.textContent
+            dict["content"] = render(msg.content)
             if let id = msg.toolCallId { dict["tool_call_id"] = id }
         } else if msg.role == "assistant", let calls = msg.toolCalls, !calls.isEmpty {
             dict["tool_calls"] = calls.map { call in
                 TemplateValues.toolCall(id: call.id, name: call.function.name, arguments: call.function.arguments)
             }
-            dict["content"] = msg.content.textContent
+            dict["content"] = render(msg.content)
         } else {
-            var content = msg.content.textContent
-            if msg.role == "system" && noThink {
-                content += "\n/no_think"
-            }
-            dict["content"] = content
+            dict["content"] = render(msg.content, appending: msg.role == "system" && noThink ? "\n/no_think" : "")
         }
         templateMessages.append(dict)
     }
@@ -755,6 +845,8 @@ func tokenizeMessages(
             additionalContext: additionalContext.isEmpty ? nil : additionalContext)
         return tokens
     } catch {
+        // `makeChatPrompt` renders the request again with the image token in the text.
+        if case .parts = images { return [] }
         // Shown without --verbose, once per kind of failure: the plain-text prompt below is not what
         // the model was trained on.
         CLILogger.warnOnce(

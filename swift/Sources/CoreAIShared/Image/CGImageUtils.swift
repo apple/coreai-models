@@ -29,6 +29,18 @@ public enum CGImageUtils {
         return image
     }
 
+    /// Decode the first image in `data` (any format ImageIO reads) into a `CGImage`.
+    ///
+    /// Throws `ImagePreprocessorError.decodeFailed` when the data cannot be decoded.
+    public static func load(data: Data) throws -> CGImage {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+            let image = CGImageSourceCreateImageAtIndex(source, 0, nil)
+        else {
+            throw ImagePreprocessorError.decodeFailed
+        }
+        return image
+    }
+
     /// Resize a CGImage to `side × side` using CGContext with high-quality interpolation.
     public static func resize(_ image: CGImage, to side: Int) -> CGImage? {
         guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
