@@ -7,6 +7,7 @@ import Foundation
 import Testing
 
 @testable import CoreAILanguageModels
+@testable import CoreAIShared
 
 /// The CPU draft head: its kernels against plain references, its pack validation, and a whole draft
 /// step on a small random head against a straightforward Double implementation of the same layers.
@@ -70,7 +71,7 @@ struct CPUDrafterTests {
     @Test("Partial rotary turns the leading pairs and leaves the rest in place")
     func partialRotary() {
         let hd = 16
-        let inv = CPUDraftHead.inverseFrequencies(headDim: hd, theta: 1_000_000, partial: 0.25)
+        let inv = DraftScan.inverseFrequencies(headDim: hd, theta: 1_000_000, partial: 0.25)
         #expect(inv.count == 8 && inv[0] == 1 && inv[1] > 0 && inv[2...].allSatisfy { $0 == 0 })
         let (cos, sin) = CPUDraftHead.rope(position: 9, invFreq: inv)
         let q0 = (0..<(2 * hd)).map { Float($0 % 7) - 3 }
@@ -417,98 +418,243 @@ struct CPUDrafterTests {
         for i in a.indices { #expect(close(a[i], Double(b[i]), rel: 1e-5, abs: 1e-6)) }
     }
 
-    /// A stand-in for the target's shared caches: one K/V head per cache, channel-major, the full
-    /// cache addressed by position and the sliding cache a ring. A value encodes its position and a
-    /// version, so a test can tell which write a mirrored row came from.
+    /// A stand-in for the target's shared caches, laid out as the engine lays them out: channel `d`
+    /// of slot `r` at `base[(d / factor) * ctx * factor + r * factor + d % factor]`. The full cache is
+    /// addressed by position and the sliding cache is a ring. A value encodes its position, channel,
+    /// cache and version, so a test can tell which write a mirrored row came from.
     private final class FakeCaches: @unchecked Sendable {
-        static let fullDepth = 2048
-        static let slidingDepth = 4
-        var full: [LogitsScalarType]
-        var sliding: [LogitsScalarType]
+        let fullDepth: Int
+        let slidingDepth: Int
+        let fullChannels: Int
+        let slidingChannels: Int
+        let factor: Int
+        var fullK: [LogitsScalarType], fullV: [LogitsScalarType]
+        var slidingK: [LogitsScalarType], slidingV: [LogitsScalarType]
 
-        init() {
-            full = [LogitsScalarType](repeating: 0, count: G.fullHeadDim * Self.fullDepth)
-            sliding = [LogitsScalarType](repeating: 0, count: G.headDim * Self.slidingDepth)
+        init(
+            fullDepth: Int = 2048, slidingDepth: Int = 4, fullChannels: Int = G.fullHeadDim,
+            slidingChannels: Int = G.headDim, factor: Int = 1
+        ) {
+            (self.fullDepth, self.slidingDepth, self.fullChannels, self.slidingChannels, self.factor) =
+                (fullDepth, slidingDepth, fullChannels, slidingChannels, factor)
+            fullK = [LogitsScalarType](repeating: 0, count: fullChannels * fullDepth)
+            fullV = fullK
+            slidingK = [LogitsScalarType](repeating: 0, count: slidingChannels * slidingDepth)
+            slidingV = slidingK
         }
 
-        static func value(position: Int, channel: Int, version: Int) -> Float {
-            Float(position % 997) / 997 + Float(channel) / 64 + Float(version)
+        static func value(position: Int, channel: Int, version: Int, value: Bool = false, sliding: Bool = false)
+            -> Float
+        {
+            Float(position % 97) / 97 + Float(channel) / 64 + Float(version) + (value ? 0.25 : 0) + (sliding ? 0.5 : 0)
+        }
+
+        func index(channel d: Int, slot r: Int, ctx: Int) -> Int {
+            (d / factor) * ctx * factor + r * factor + d % factor
         }
 
         func write(_ positions: Range<Int>, version: Int) {
             for p in positions {
-                for d in 0..<G.fullHeadDim {
-                    full[d * Self.fullDepth + p] = LogitsScalarType(
+                for d in 0..<fullChannels where p < fullDepth {
+                    fullK[index(channel: d, slot: p, ctx: fullDepth)] = LogitsScalarType(
                         Self.value(position: p, channel: d, version: version))
+                    fullV[index(channel: d, slot: p, ctx: fullDepth)] = LogitsScalarType(
+                        Self.value(position: p, channel: d, version: version, value: true))
                 }
-                for d in 0..<G.headDim {
-                    sliding[d * Self.slidingDepth + p % Self.slidingDepth] = LogitsScalarType(
-                        Self.value(position: p, channel: d, version: version))
+                for d in 0..<slidingChannels {
+                    let i = index(channel: d, slot: p % slidingDepth, ctx: slidingDepth)
+                    slidingK[i] = LogitsScalarType(Self.value(position: p, channel: d, version: version, sliding: true))
+                    slidingV[i] = LogitsScalarType(
+                        Self.value(position: p, channel: d, version: version, value: true, sliding: true))
                 }
             }
         }
 
         func provide(_ kind: StaticShapeEngine.SharedKVCacheKind, _ body: (StaticShapeEngine.SharedKVCache) -> Void) {
+            let (array, channels, ctx): ([LogitsScalarType], Int, Int)
             switch kind {
-            case .fullK, .fullV:
-                full.withUnsafeBufferPointer {
-                    body(.init(base: $0.baseAddress!, channels: G.fullHeadDim, ctx: Self.fullDepth, factor: 1))
-                }
-            case .slidingK, .slidingV:
-                sliding.withUnsafeBufferPointer {
-                    body(.init(base: $0.baseAddress!, channels: G.headDim, ctx: Self.slidingDepth, factor: 1))
-                }
+            case .fullK: (array, channels, ctx) = (fullK, fullChannels, fullDepth)
+            case .fullV: (array, channels, ctx) = (fullV, fullChannels, fullDepth)
+            case .slidingK: (array, channels, ctx) = (slidingK, slidingChannels, slidingDepth)
+            case .slidingV: (array, channels, ctx) = (slidingV, slidingChannels, slidingDepth)
+            }
+            array.withUnsafeBufferPointer {
+                body(.init(base: $0.baseAddress!, channels: channels, ctx: ctx, factor: factor))
             }
         }
     }
 
-    /// Whether the drafter's mirrored key for `position` is the one written at `version`.
-    private func mirrors(_ drafter: CPUDrafter, _ position: Int, version: Int) -> Bool {
-        guard let row = drafter.mirroredKey(at: position) else { return false }
-        return row.enumerated().allSatisfy { d, value in
-            let expected = Float(LogitsScalarType(FakeCaches.value(position: position, channel: d, version: version)))
-            return value == expected
+    /// Whether `row` holds the values written at `version` for `position`.
+    private func holds(
+        _ row: ArraySlice<Float>?, _ position: Int, version: Int, value: Bool = false, sliding: Bool = false
+    ) -> Bool {
+        guard let row else { return false }
+        return row.enumerated().allSatisfy { d, x in
+            x
+                == Float(
+                    LogitsScalarType(
+                        FakeCaches.value(
+                            position: position, channel: d, version: version, value: value, sliding: sliding)))
         }
     }
 
-    @Test("Past the full-attention window, the drafter keeps only the window and re-reads after a rollback")
-    func fullCacheRing() async throws {
+    private func connected(_ caches: FakeCaches, fullAttentionWindow: Int = CPUDrafter.defaultFullAttentionWindow)
+        throws -> CPUDrafter
+    {
         let (url, _) = try headPack()
-        let drafter = try CPUDrafter(pack: url, backboneHiddenSize: G.backbone, maxContextLength: 2048)
-        let window = CPUDrafter.defaultFullAttentionWindow
-        let caches = FakeCaches()
+        let drafter = try CPUDrafter(
+            pack: url, backboneHiddenSize: G.backbone, maxContextLength: 4096, fullAttentionWindow: fullAttentionWindow)
         drafter.sharedKVProvider = { kind, body in caches.provide(kind, body) }
         drafter.embeddingProvider = { _ in [Float](repeating: 0.1, count: G.backbone) }
+        return drafter
+    }
+
+    private func draft(_ drafter: CPUDrafter, _ prefix: [Int32]) async throws {
         let seed = DrafterFeatures(
             values: [Float](repeating: 0.2, count: G.backbone), positionCount: 1, hiddenDim: G.backbone,
             startPosition: 0)
+        try await drafter.commit(confirmedLength: prefix.count, features: seed)
         var rng = SystemRandomNumberGenerator()
-        func draft(_ prefix: [Int32]) async throws {
-            try await drafter.commit(confirmedLength: prefix.count, features: seed)
-            _ = try await drafter.draftAll(confirmedPrefix: prefix, count: 1, policy: .greedy, using: &rng)
-        }
+        _ = try await drafter.draftAll(confirmedPrefix: prefix, count: 1, policy: .greedy, using: &rng)
+    }
+
+    @Test(
+        "Past the full-attention window, the drafter keeps only the window and re-reads after a rollback",
+        arguments: [1, 2])
+    func fullCacheRing(factor: Int) async throws {
+        let window = CPUDrafter.defaultFullAttentionWindow
+        let caches = FakeCaches(factor: factor)
+        let drafter = try connected(caches)
 
         // 1,100 cached positions: only the last 1,024 are held, whatever the context length.
         var tokens = (0..<1101).map { Int32($0 % 13) }
         caches.write(0..<1100, version: 0)
-        try await draft(tokens)
+        try await draft(drafter, tokens)
         #expect(drafter.mirroredKey(at: 1100 - window - 1) == nil)
-        #expect(mirrors(drafter, 1100 - window, version: 0) && mirrors(drafter, 1099, version: 0))
+        #expect(holds(drafter.mirroredKey(at: 1100 - window), 1100 - window, version: 0))
+        #expect(holds(drafter.mirroredKey(at: 1099), 1099, version: 0))
+        #expect(holds(drafter.mirroredValue(at: 1099), 1099, version: 0, value: true))
+        // The sliding window is the last `sliding_window` (4) positions, oldest first.
+        for (row, p) in (1096..<1100).enumerated() {
+            #expect(holds(drafter.slidingKey(row: row), p, version: 0, sliding: true), "sliding row \(row)")
+        }
 
         // The target rolls back to 1,050 and caches other tokens from there on, up to 1,080.
         tokens = Array(tokens[..<1050]) + (1050..<1081).map { Int32(($0 + 5) % 13) }
         caches.write(1050..<1080, version: 1)
-        try await draft(tokens)
-        #expect(mirrors(drafter, 1049, version: 0) && mirrors(drafter, 1050, version: 1))
-        #expect(mirrors(drafter, 1079, version: 1) && drafter.mirroredKey(at: 1080) == nil)
+        try await draft(drafter, tokens)
+        #expect(holds(drafter.mirroredKey(at: 1049), 1049, version: 0))
+        #expect(holds(drafter.mirroredKey(at: 1050), 1050, version: 1))
+        #expect(holds(drafter.mirroredValue(at: 1079), 1079, version: 1, value: true))
+        #expect(drafter.mirroredKey(at: 1080) == nil)
         // The window now starts below the rows kept before; they are read from the target again.
-        #expect(mirrors(drafter, 1080 - window, version: 0))
+        #expect(holds(drafter.mirroredKey(at: 1080 - window), 1080 - window, version: 0))
+        for (row, p) in (1076..<1080).enumerated() {
+            #expect(holds(drafter.slidingKey(row: row), p, version: 1, sliding: true), "sliding row \(row)")
+        }
 
         // A rollback to 100 positions: the window is everything, read anew.
         try await drafter.reset(to: 101)
         tokens = Array(tokens[..<201])
-        try await draft(tokens)
-        #expect(mirrors(drafter, 0, version: 0) && mirrors(drafter, 199, version: 0))
+        try await draft(drafter, tokens)
+        #expect(
+            holds(drafter.mirroredKey(at: 0), 0, version: 0) && holds(drafter.mirroredKey(at: 199), 199, version: 0))
         #expect(drafter.mirroredKey(at: 200) == nil)
+    }
+
+    @Test("A full cache shorter than the context fails the round, and the next round recovers")
+    func shortFullCacheRecovers() async throws {
+        let caches = FakeCaches(fullDepth: 64)
+        caches.write(0..<64, version: 0)
+        let drafter = try connected(caches, fullAttentionWindow: 32)
+        await #expect(throws: (any Error).self) { try await draft(drafter, (0..<101).map { Int32($0 % 7) }) }
+        // The failed round left nothing kept; a round that fits reads its window afresh.
+        try await draft(drafter, (0..<41).map { Int32($0 % 7) })
+        #expect(holds(drafter.mirroredKey(at: 39), 39, version: 0) && holds(drafter.mirroredKey(at: 8), 8, version: 0))
+        #expect(drafter.mirroredKey(at: 7) == nil)
+    }
+
+    @Test(
+        "A target cache that does not fit the head is rejected before the first draft",
+        arguments: [
+            (G.fullHeadDim + 1, "whole"),  // not a whole number of K/V heads
+            (3 * G.fullHeadDim, "split"),  // more K/V heads than the head's 2 query heads
+        ])
+    func layoutMismatch(fullChannels: Int, expected: String) throws {
+        let caches = FakeCaches(fullChannels: fullChannels)
+        let (url, _) = try headPack()
+        let drafter = try CPUDrafter(pack: url, backboneHiddenSize: G.backbone, maxContextLength: 64)
+        let message = loadError { try drafter.checkTarget { kind, body in caches.provide(kind, body) } }
+        #expect(message.contains(expected) && message.contains("full"))
+    }
+
+    @Test("A sliding window deeper than the target's sliding ring is rejected before the first draft")
+    func slidingWindowTooDeep() throws {
+        let caches = FakeCaches(slidingDepth: 2)
+        let (url, _) = try headPack()
+        let drafter = try CPUDrafter(pack: url, backboneHiddenSize: G.backbone, maxContextLength: 64)
+        #expect(
+            loadError { try drafter.checkTarget { kind, body in caches.provide(kind, body) } }.contains("sliding ring"))
+        try drafter.checkTarget { kind, body in FakeCaches().provide(kind, body) }
+    }
+
+    @Test("The drafter refuses a pack for another vocabulary")
+    func wrongVocabulary() throws {
+        let (url, _) = try headPack()
+        let message = loadError {
+            _ = try CPUDrafter(pack: url, backboneHiddenSize: G.backbone, maxContextLength: 64, vocabSize: G.vocab + 1)
+        }
+        #expect(message.contains("vocabulary of \(G.vocab)"))
+    }
+
+    // MARK: - Factory
+
+    private static func bundle() throws -> LanguageModelBundle {
+        let dir = FileManager.default.temporaryDirectory.appending(path: "CPUDrafterTests-\(UUID().uuidString)/gemma")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let metadata = """
+            {"metadata_version": "0.2", "kind": "llm", "name": "gemma", "assets": {"main": "model.aimodel"},
+             "language": {"tokenizer": "x/y", "vocab_size": \(G.vocab), "max_context_length": 512}}
+            """
+        try metadata.write(to: dir.appending(path: "metadata.json"), atomically: true, encoding: .utf8)
+        return try LanguageModelBundle(at: dir)
+    }
+
+    @Test("A pack runs without a draft head in the bundle, connected to the target's caches")
+    func factoryConnectsAPack() async throws {
+        let (url, _) = try headPack()
+        let caches = FakeCaches()
+        caches.write(0..<8, version: 0)
+        let drafter = try EngineFactory.makeCPUDrafter(
+            pack: url, bundle: try Self.bundle(), targetEmitsHiddenStates: true, backboneHiddenSize: G.backbone,
+            topK: nil, sharedKV: { kind, body in caches.provide(kind, body) },
+            embedding: { _ in [Float](repeating: 0.1, count: G.backbone) })
+        // Connected: a draft reads the caches instead of throwing for a missing provider.
+        try await draft(drafter, (0..<9).map { Int32($0) })
+        #expect(holds(drafter.mirroredKey(at: 7), 7, version: 0))
+    }
+
+    @Test("A pack is refused for a target whose decode graphs emit no hidden states")
+    func factoryNeedsHiddenStates() throws {
+        let (url, _) = try headPack()
+        let message = loadError {
+            _ = try EngineFactory.makeCPUDrafter(
+                pack: url, bundle: try Self.bundle(), targetEmitsHiddenStates: false, backboneHiddenSize: G.backbone,
+                topK: nil, sharedKV: { kind, body in FakeCaches().provide(kind, body) },
+                embedding: { _ in [] })
+        }
+        #expect(message.contains("hidden_states"))
+    }
+
+    @Test("A pack whose head does not fit the target's caches is refused at creation")
+    func factoryChecksLayout() throws {
+        let (url, _) = try headPack()
+        let caches = FakeCaches(fullChannels: G.fullHeadDim + 1)
+        let message = loadError {
+            _ = try EngineFactory.makeCPUDrafter(
+                pack: url, bundle: try Self.bundle(), targetEmitsHiddenStates: true, backboneHiddenSize: G.backbone,
+                topK: nil, sharedKV: { kind, body in caches.provide(kind, body) }, embedding: { _ in [] })
+        }
+        #expect(message.contains("whole"))
     }
 }

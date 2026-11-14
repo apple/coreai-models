@@ -5,11 +5,13 @@
 
 import Foundation
 
-/// Reads one named tensor from a `.safetensors` file, memory-mapped.
+/// Reads a `.safetensors` file: one named tensor, memory-mapped, or with ``header(of:)`` every
+/// tensor's entry and the `__metadata__`.
 ///
-/// Layout: `[8-byte little-endian header length][JSON header][raw tensor bytes]`.
-/// Only the named tensor's header entry is read; other tensors in the file are
-/// ignored.
+/// Layout: `[8-byte little-endian header length][JSON header][raw tensor bytes]`. Both readers
+/// parse the header through ``header(of:)``, so a file is accepted or rejected alike: every
+/// dimension must be positive, `data_offsets` must lie inside the data region, and `__metadata__`
+/// must map strings to strings.
 struct SafeTensorsReader: Sendable {
     /// The mapped file contents.
     let data: Data
@@ -38,41 +40,19 @@ struct SafeTensorsReader: Sendable {
     }
 
     init(url: URL, singleTensor name: String) throws {
+        let header = try Self.header(of: url)
+        guard let entry = header.tensors[name] else { throw ReadError.missingTensor(name) }
         // Always map: `.mappedIfSafe` silently reads a multi-GB file into memory when
         // it judges mapping unsafe.
         let data = try Data(contentsOf: url, options: .alwaysMapped)
-        guard data.count >= 8 else { throw ReadError.tooSmall }
-
-        let length = UInt64(littleEndian: data.withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) })
-        guard let headerLength = Int(exactly: length), headerLength <= data.count - 8 else {
-            throw ReadError.tooSmall
-        }
-        let header = data.subdata(in: (data.startIndex + 8)..<(data.startIndex + 8 + headerLength))
-        guard
-            let json = try JSONSerialization.jsonObject(with: header) as? [String: Any],
-            let entry = json[name] as? [String: Any]
-        else {
-            throw ReadError.missingTensor(name)
-        }
-
-        // Both offsets are bounded by the data region, so a crafted header throws
-        // rather than trapping on overflow or reading past the mapping.
-        let dataRegion = data.count - 8 - headerLength
-        guard
-            let dtype = entry["dtype"] as? String,
-            let shape = entry["shape"] as? [Int], shape.allSatisfy({ $0 > 0 }),
-            let offsets = entry["data_offsets"] as? [Int], offsets.count == 2,
-            0 <= offsets[0], offsets[0] <= offsets[1], offsets[1] <= dataRegion
-        else {
-            throw ReadError.badHeader("missing or invalid dtype, shape or data_offsets for '\(name)'")
-        }
-
+        // The header was read from the same file; a size change means it changed in between.
+        guard data.count == header.fileSize else { throw ReadError.badHeader("the file changed while it was read") }
         self.data = data
-        self.dataStart = 8 + headerLength + offsets[0]
-        self.byteCount = offsets[1] - offsets[0]
-        self.dtype = dtype
-        self.shape = shape
-        self.metadata = json["__metadata__"] as? [String: String] ?? [:]
+        self.dataStart = entry.fileOffset
+        self.byteCount = entry.byteCount
+        self.dtype = entry.dtype
+        self.shape = entry.shape
+        self.metadata = header.metadata
     }
 
     /// Every tensor's entry and the `__metadata__` of a `.safetensors` file, read from its header
@@ -126,7 +106,7 @@ struct SafeTensorsReader: Sendable {
             guard
                 let entry = value as? [String: Any],
                 let dtype = entry["dtype"] as? String,
-                let shape = entry["shape"] as? [Int], shape.allSatisfy({ $0 >= 0 }),
+                let shape = entry["shape"] as? [Int], shape.allSatisfy({ $0 > 0 }),
                 let offsets = entry["data_offsets"] as? [Int], offsets.count == 2,
                 0 <= offsets[0], offsets[0] <= offsets[1], offsets[1] <= fileSize - dataStart
             else {

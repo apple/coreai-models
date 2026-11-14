@@ -77,6 +77,30 @@ extension EngineFactory {
         }
     }
 
+    /// The draft head in `pack` on the CPU, connected to a target through `sharedKV` and
+    /// `embedding`. The bundle need not declare a draft head.
+    ///
+    /// - Throws: When the target emits no hidden states, when the pack is malformed or sized for
+    ///   another target, or when the target's shared caches do not fit the head.
+    static func makeCPUDrafter(
+        pack: URL, bundle: LanguageModelBundle, targetEmitsHiddenStates: Bool, backboneHiddenSize: Int,
+        topK: Int?,
+        sharedKV:
+            @escaping (StaticShapeEngine.SharedKVCacheKind, (StaticShapeEngine.SharedKVCache) -> Void) throws ->
+            Void,
+        embedding: @escaping (Int32) async throws -> [Float]
+    ) throws -> CPUDrafter {
+        try requireHiddenStates(bundle: bundle, targetEmitsHiddenStates: targetEmitsHiddenStates)
+        let cpu = try CPUDrafter(
+            pack: pack, backboneHiddenSize: backboneHiddenSize, maxContextLength: bundle.maxContextLength,
+            vocabSize: bundle.vocabSize, topK: topK)
+        // A head that does not fit the target's caches fails here, not at the first draft.
+        try cpu.checkTarget(sharedKV)
+        cpu.sharedKVProvider = sharedKV
+        cpu.embeddingProvider = embedding
+        return cpu
+    }
+
     /// A speculative decoder that verifies on `target` and drafts with `bundle`'s draft head
     /// (``LanguageModelBundle/drafter``), or with the head in ``DraftHeadOptions/cpuPack`` on the CPU.
     ///
@@ -99,13 +123,10 @@ extension EngineFactory {
         }
         let drafter: any DrafterEngine
         if let pack = options.cpuPack {
-            try requireHiddenStates(bundle: bundle, targetEmitsHiddenStates: target.emitsHiddenStates)
-            let cpu = try CPUDrafter(
-                pack: pack, backboneHiddenSize: target.backboneHiddenSize,
-                maxContextLength: bundle.maxContextLength, vocabSize: bundle.vocabSize, topK: options.drafterTopK)
-            cpu.sharedKVProvider = sharedKV
-            cpu.embeddingProvider = embedding
-            drafter = cpu
+            drafter = try makeCPUDrafter(
+                pack: pack, bundle: bundle, targetEmitsHiddenStates: target.emitsHiddenStates,
+                backboneHiddenSize: target.backboneHiddenSize, topK: options.drafterTopK,
+                sharedKV: sharedKV, embedding: embedding)
         } else {
             let component = try requireDraftHead(bundle: bundle, targetEmitsHiddenStates: target.emitsHiddenStates)
             let head = try await StaticShapeDrafter.load(

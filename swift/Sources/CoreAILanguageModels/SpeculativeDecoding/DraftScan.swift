@@ -342,8 +342,14 @@ final class DraftPack: @unchecked Sendable {
         for layer in 0..<index.layers {
             let dim = layer == index.layers - 1 ? fullHeadDim : headDim
             let p = "model.layers.\(layer)."
-            try projection(p + "self_attn.q_proj.weight", rows: heads * dim, columns: hidden)
-            try projection(p + "self_attn.o_proj.weight", rows: hidden, columns: heads * dim)
+            // Read from the file, so a product past Int is reported rather than trapped on.
+            let (width, overflow) = heads.multipliedReportingOverflow(by: dim)
+            guard !overflow else {
+                throw DraftPackError.message(
+                    "\(name) declares \(heads) heads of width \(dim), more than fit in an Int; \(repack)")
+            }
+            try projection(p + "self_attn.q_proj.weight", rows: width, columns: hidden)
+            try projection(p + "self_attn.o_proj.weight", rows: hidden, columns: width)
             try projection(p + "mlp.gate_proj.weight", rows: ffn, columns: hidden)
             try projection(p + "mlp.up_proj.weight", rows: ffn, columns: hidden)
             try projection(p + "mlp.down_proj.weight", rows: hidden, columns: ffn)
@@ -360,6 +366,14 @@ final class DraftPack: @unchecked Sendable {
 }
 
 package enum DraftScan {
+    /// RoPE frequencies for one rotate-half head of width `headDim`: the first `partial` share of
+    /// the frequency pairs rotate and the rest have frequency 0, as in Gemma 4's full-attention
+    /// layer. Both draft heads build their rotary tables from this, so they rotate alike.
+    static func inverseFrequencies(headDim: Int, theta: Float, partial: Float) -> [Float] {
+        let rotated = Int(Float(headDim / 2) * partial)
+        return (0..<headDim / 2).map { $0 < rotated ? powf(theta, -2 * Float($0) / Float(headDim)) : 0 }
+    }
+
     /// Centroids whose candidates the masked embedder scores when no count is requested.
     package static let defaultTopK = 32
 

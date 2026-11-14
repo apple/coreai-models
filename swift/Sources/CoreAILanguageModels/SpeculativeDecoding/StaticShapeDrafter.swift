@@ -278,8 +278,7 @@ package final class StaticShapeDrafter: DrafterEngine, @unchecked Sendable {
         x = try Self.array(desc.outputDescriptor(of: "x"), "x")
         func invFreq(_ name: String, theta: Float, partial: Float) -> [Float] {
             guard case .ndArray(let d)? = desc.inputDescriptor(of: name), let hd = d.shape.last else { return [] }
-            let rotated = Int(Float(hd / 2) * partial)
-            return (0..<hd / 2).map { $0 < rotated ? powf(theta, -2 * Float($0) / Float(hd)) : 0 }
+            return DraftScan.inverseFrequencies(headDim: hd, theta: theta, partial: partial)
         }
         func lastDimension(_ name: String, output: Bool) -> Int? {
             let d = output ? desc.outputDescriptor(of: name) : desc.inputDescriptor(of: name)

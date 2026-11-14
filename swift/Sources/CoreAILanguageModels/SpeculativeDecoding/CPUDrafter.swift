@@ -113,16 +113,9 @@ struct CPUDraftHead {
         postProjection = try Projection("post_projection.weight", in: pack)
         centroids = try Projection("centroids_f16", in: pack)
         finalNorm = pack.f16("model.norm.weight")
-        invFreqSliding = Self.inverseFrequencies(headDim: headDim, theta: index.slidingTheta!, partial: 1)
-        invFreqFull = Self.inverseFrequencies(
+        invFreqSliding = DraftScan.inverseFrequencies(headDim: headDim, theta: index.slidingTheta!, partial: 1)
+        invFreqFull = DraftScan.inverseFrequencies(
             headDim: fullHeadDim, theta: index.fullTheta!, partial: index.fullPartialRotaryFactor!)
-    }
-
-    /// RoPE frequencies for one rotate-half head; the pairs past `partial` of them do not rotate
-    /// (frequency 0), as in the target's full-attention layer.
-    static func inverseFrequencies(headDim: Int, theta: Float, partial: Float) -> [Float] {
-        let rotated = Int(Float(headDim / 2) * partial)
-        return (0..<headDim / 2).map { $0 < rotated ? powf(theta, -2 * Float($0) / Float(headDim)) : 0 }
     }
 
     /// One draft step. `embeds` is `cat(embed(token), backbone_hidden)`, `2 * backboneHidden` wide.
@@ -328,6 +321,7 @@ package final class CPUDrafter: DrafterEngine, @unchecked Sendable {
     private var keptTokens = TokenHistory()
     /// The sliding cache's window for the current round, rebuilt every round: the ring moves.
     private var slidingK: [Float] = [], slidingV: [Float] = []
+    private var slidingChannels = 0
 
     /// - Parameters:
     ///   - pack: `draft_head.safetensors` from `models/gemma4/export_draft_pack.py`.
@@ -441,6 +435,66 @@ package final class CPUDrafter: DrafterEngine, @unchecked Sendable {
         return row
     }
 
+    /// Why a target cache `channels` wide cannot serve this head's `headWidth`-wide query heads, or
+    /// nil when it can: the cache must hold whole K/V heads, and they must split the query heads
+    /// evenly, as `attend` assumes.
+    static func layoutProblem(cache: String, channels: Int, headWidth: Int, queryHeads: Int) -> String? {
+        guard channels >= headWidth, channels % headWidth == 0 else {
+            return "the target's \(cache) cache is \(channels) channels wide, which does not hold whole "
+                + "\(headWidth)-wide heads; the pack was exported for a different model"
+        }
+        let kvHeads = channels / headWidth
+        guard kvHeads <= queryHeads, queryHeads % kvHeads == 0 else {
+            return "the target's \(cache) cache holds \(kvHeads) K/V heads, which do not split the draft head's "
+                + "\(queryHeads) query heads evenly; the pack was exported for a different model"
+        }
+        return nil
+    }
+
+    /// Checks, before the first draft, that the target's shared caches fit this head: whole K/V heads
+    /// that split its query heads evenly, and a sliding ring at least as deep as the head's window.
+    ///
+    /// - Throws: `invalidArgument` naming the mismatch.
+    package func checkTarget(
+        _ caches: (StaticShapeEngine.SharedKVCacheKind, (StaticShapeEngine.SharedKVCache) -> Void) throws -> Void
+    ) throws {
+        var problems: [String] = []
+        try caches(.slidingK) { c in
+            if let p = Self.layoutProblem(
+                cache: "sliding", channels: c.channels, headWidth: head.headDim, queryHeads: head.heads)
+            {
+                problems.append(p)
+            }
+            if slidingWindow > c.ctx {
+                problems.append(
+                    "the draft head attends to \(slidingWindow) sliding positions, but the target's sliding ring "
+                        + "holds \(c.ctx); the pack was exported for a different model")
+            }
+        }
+        try caches(.fullK) { c in
+            if let p = Self.layoutProblem(
+                cache: "full", channels: c.channels, headWidth: head.fullHeadDim, queryHeads: head.heads)
+            {
+                problems.append(p)
+            }
+        }
+        if let first = problems.first { throw InferenceRuntimeError.invalidArgument(first) }
+    }
+
+    /// The sliding-cache key row `row` of the last round, oldest position first, or nil past it.
+    func slidingKey(row: Int) -> ArraySlice<Float>? {
+        guard !slidingK.isEmpty, slidingChannels > 0, (row + 1) * slidingChannels <= slidingK.count else { return nil }
+        return slidingK[(row * slidingChannels)..<((row + 1) * slidingChannels)]
+    }
+
+    /// The mirrored full-cache value row of `position`, or nil when the ring does not hold it.
+    func mirroredValue(at position: Int) -> ArraySlice<Float>? {
+        guard (keptStart..<keptEnd).contains(position), !fullV.isEmpty else { return nil }
+        let channels = fullV.count / fullAttentionWindow
+        let row = position % fullAttentionWindow
+        return fullV[(row * channels)..<((row + 1) * channels)]
+    }
+
     /// The mirrored full-cache key row of `position`, or nil when the ring does not hold it.
     func mirroredKey(at position: Int) -> ArraySlice<Float>? {
         guard (keptStart..<keptEnd).contains(position), !fullK.isEmpty else { return nil }
@@ -525,6 +579,7 @@ package final class CPUDrafter: DrafterEngine, @unchecked Sendable {
 
         var slidingRows = 0
         var slidingChannels = 0
+        defer { self.slidingChannels = slidingChannels }
         slidingK.removeAll(keepingCapacity: true)
         slidingV.removeAll(keepingCapacity: true)
         for (kind, isKey) in [(StaticShapeEngine.SharedKVCacheKind.slidingK, true), (.slidingV, false)] {
@@ -540,10 +595,12 @@ package final class CPUDrafter: DrafterEngine, @unchecked Sendable {
         }
         for (name, channels, width) in [
             ("sliding", slidingChannels, head.headDim), ("full", fullChannels, head.fullHeadDim),
-        ] where channels % width != 0 || channels < width {
-            throw InferenceRuntimeError.invalidState(
-                "the target's \(name) cache is \(channels) channels wide, which does not hold whole "
-                    + "\(width)-wide heads; the pack was exported for a different model")
+        ] {
+            if let problem = Self.layoutProblem(
+                cache: name, channels: channels, headWidth: width, queryHeads: head.heads)
+            {
+                throw InferenceRuntimeError.invalidState(problem)
+            }
         }
         return (slidingRows, slidingChannels, fullChannels)
     }
