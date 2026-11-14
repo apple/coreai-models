@@ -45,6 +45,10 @@ public struct ConstrainedGenerationSession: ~Copyable {
     /// Most whitespace characters allowed between two JSON tokens; nil when unlimited.
     public let maxWhitespaceCount: Int?
 
+    /// Token ids the grammar takes as its end, as the session was built with; nil for xgrammar's
+    /// defaults.
+    public var stopTokenIds: [Int32]? { tokenizerInfo.stopTokenIds }
+
     /// Whether the grammar has reached a terminal state (valid JSON complete).
     ///
     /// Returns true either when xgrammar explicitly marks the matcher as terminated,
@@ -363,6 +367,8 @@ private func _applyBitmask<T: BinaryFloatingPoint>(
     negativeInfinity negInf: T
 ) {
     let count = min(logits.count, vocabularySize)
+    // Ids past the vocabulary (a padded output layer's) are no token the grammar could accept.
+    for i in count..<logits.count { logits[i] = negInf }
     for (wordIndex, mask) in bitmask.enumerated() {
         let base = wordIndex &* 32
         if base >= count { break }

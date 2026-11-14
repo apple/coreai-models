@@ -33,6 +33,19 @@ public struct DiffusionConfig: Codable, Sendable, Equatable {
     public let defaultGuidanceScale: Float?
     public let defaultSteps: Int?
 
+    /// Whether the assets carry symbolic shape axes (`--dynamic`), so one `main` serves
+    /// every resolution in `[minImageSize, maxImageSize]` and any reference count.
+    public let dynamicShapes: Bool?
+    public let minImageSize: Int?
+    public let maxImageSize: Int?
+    /// The token-grid side is `imageSize / imageSizeMultiple` (VAE ×8, patchify ×2).
+    public let imageSizeMultiple: Int?
+    /// Upper bound on image tokens: the noise grid plus every reference grid.
+    public let maxImageTokens: Int?
+    /// Smallest side the VAE encoder accepts; below `minImageSize` so small reference
+    /// grids can be encoded at their own size.
+    public let minReferenceSize: Int?
+
     // MARK: Sana Sprint
 
     /// TrigFlow angles for the SCM schedule; the pipeline maps them to flow sigmas.
@@ -67,6 +80,12 @@ public struct DiffusionConfig: Codable, Sendable, Equatable {
         ropeAxesDims: [Int]? = nil,
         defaultGuidanceScale: Float? = nil,
         defaultSteps: Int? = nil,
+        dynamicShapes: Bool? = nil,
+        minImageSize: Int? = nil,
+        maxImageSize: Int? = nil,
+        imageSizeMultiple: Int? = nil,
+        maxImageTokens: Int? = nil,
+        minReferenceSize: Int? = nil,
         maxTimesteps: Float? = nil,
         intermediateTimesteps: Float? = nil,
         promptPrefix: String? = nil,
@@ -87,6 +106,12 @@ public struct DiffusionConfig: Codable, Sendable, Equatable {
         self.ropeAxesDims = ropeAxesDims
         self.defaultGuidanceScale = defaultGuidanceScale
         self.defaultSteps = defaultSteps
+        self.dynamicShapes = dynamicShapes
+        self.minImageSize = minImageSize
+        self.maxImageSize = maxImageSize
+        self.imageSizeMultiple = imageSizeMultiple
+        self.maxImageTokens = maxImageTokens
+        self.minReferenceSize = minReferenceSize
         self.maxTimesteps = maxTimesteps
         self.intermediateTimesteps = intermediateTimesteps
         self.promptPrefix = promptPrefix
@@ -109,6 +134,12 @@ public struct DiffusionConfig: Codable, Sendable, Equatable {
         case ropeAxesDims = "rope_axes_dims"
         case defaultGuidanceScale = "default_guidance_scale"
         case defaultSteps = "default_steps"
+        case dynamicShapes = "dynamic_shapes"
+        case minImageSize = "min_image_size"
+        case maxImageSize = "max_image_size"
+        case imageSizeMultiple = "image_size_multiple"
+        case maxImageTokens = "max_image_tokens"
+        case minReferenceSize = "min_reference_size"
         case maxTimesteps = "max_timesteps"
         case intermediateTimesteps = "intermediate_timesteps"
         case promptPrefix = "prompt_prefix"
@@ -136,6 +167,12 @@ public struct DiffusionConfig: Codable, Sendable, Equatable {
         self.ropeAxesDims = try c.decodeIfPresent([Int].self, forKey: .ropeAxesDims)
         self.defaultGuidanceScale = try c.decodeIfPresent(Float.self, forKey: .defaultGuidanceScale)
         self.defaultSteps = try c.decodeIfPresent(Int.self, forKey: .defaultSteps)
+        self.dynamicShapes = try c.decodeIfPresent(Bool.self, forKey: .dynamicShapes)
+        self.minImageSize = try c.decodeIfPresent(Int.self, forKey: .minImageSize)
+        self.maxImageSize = try c.decodeIfPresent(Int.self, forKey: .maxImageSize)
+        self.imageSizeMultiple = try c.decodeIfPresent(Int.self, forKey: .imageSizeMultiple)
+        self.maxImageTokens = try c.decodeIfPresent(Int.self, forKey: .maxImageTokens)
+        self.minReferenceSize = try c.decodeIfPresent(Int.self, forKey: .minReferenceSize)
         self.maxTimesteps = try c.decodeIfPresent(Float.self, forKey: .maxTimesteps)
         self.intermediateTimesteps = try c.decodeIfPresent(Float.self, forKey: .intermediateTimesteps)
         self.promptPrefix = try c.decodeIfPresent(String.self, forKey: .promptPrefix)

@@ -358,8 +358,13 @@ public struct CoreAILanguageModel: LanguageModel {
             // to a top-level `.reasoning(...)` channel event so it lands as
             // its own `Transcript.Reasoning` entry, not mixed into the
             // user-facing `Transcript.Response`. Markers were resolved at
-            // model init from the tokenizer's known token ids.
-            var thinkParser = ThinkTagParser(format: model.thinkingFormat)
+            // model init from the tokenizer's known token ids. A chat template
+            // that writes the open marker itself leaves the prompt inside the
+            // block, so the stream starts as reasoning.
+            var thinkParser = ThinkTagParser(
+                format: model.thinkingFormat,
+                startsInReasoning: ThinkTagParser.promptOpensReasoning(
+                    promptTokens, tokenizer: tokenizer, format: model.thinkingFormat))
             // Routes tool call markup to .toolCalls(...) channel events.
             // nil when the model's tokenizer has no tool call tokens.
             var toolCallParser: ToolCallParser? = model.toolCallDetection.map {
