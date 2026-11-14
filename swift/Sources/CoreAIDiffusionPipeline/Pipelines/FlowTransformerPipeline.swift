@@ -64,6 +64,10 @@ public struct FlowTransformerPipeline: DiffusionPipeline {
         return (size, size)
     }
 
+    /// Whether the assets carry symbolic shape axes (per metadata.json), so one `main` serves
+    /// any supported size and reference count.
+    public var isDynamic: Bool { config.dynamicShapes == true }
+
     public var supportedSchedulers: [SchedulerType] {
         [.discreteFlow]
     }
@@ -147,6 +151,9 @@ public struct FlowTransformerPipeline: DiffusionPipeline {
         let denoiser: CoreAIDiffusionModelFunction
         let initialNoise: [Float]
         let noiseShape: [Int]
+        /// Square output size in pixels; on a dynamic bundle it can differ from
+        /// `defaultImageSize`.
+        let imageSize: Int
     }
 
     public func generateImages(
@@ -207,11 +214,11 @@ public struct FlowTransformerPipeline: DiffusionPipeline {
         }
 
         // VAE decode
-        // Note: self.decoder is mode-appropriate (loaded at init):
-        //   .full → VAEDecoder, .half/.tiled → VAEDecoder_half
+        // Note: self.decoder is mode-appropriate (loaded at init): .full → VAEDecoder,
+        // .half/.tiled → VAEDecoder_half. A dynamic bundle has one decoder for every mode.
         let vaeLatents = plan.vaeLatents(plan.latents)
         let vaeShape = plan.vaeShape
-        let imageSize = defaultImageSize.width
+        let imageSize = plan.imageSize
         let pixels: [Float]
 
         switch mode {

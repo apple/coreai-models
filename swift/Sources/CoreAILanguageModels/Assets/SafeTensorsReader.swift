@@ -5,11 +5,13 @@
 
 import Foundation
 
-/// Reads one named tensor from a `.safetensors` file, memory-mapped.
+/// Reads a `.safetensors` file: one named tensor, memory-mapped, or with ``header(of:)`` every
+/// tensor's entry and the `__metadata__`.
 ///
-/// Layout: `[8-byte little-endian header length][JSON header][raw tensor bytes]`.
-/// Only the named tensor's header entry is read; other tensors in the file are
-/// ignored.
+/// Layout: `[8-byte little-endian header length][JSON header][raw tensor bytes]`. Both readers
+/// parse the header through ``header(of:)``, so a file is accepted or rejected alike: every
+/// dimension must be positive, `data_offsets` must lie inside the data region, and `__metadata__`
+/// must map strings to strings.
 struct SafeTensorsReader: Sendable {
     /// The mapped file contents.
     let data: Data
@@ -38,40 +40,81 @@ struct SafeTensorsReader: Sendable {
     }
 
     init(url: URL, singleTensor name: String) throws {
+        let header = try Self.header(of: url)
+        guard let entry = header.tensors[name] else { throw ReadError.missingTensor(name) }
         // Always map: `.mappedIfSafe` silently reads a multi-GB file into memory when
         // it judges mapping unsafe.
         let data = try Data(contentsOf: url, options: .alwaysMapped)
-        guard data.count >= 8 else { throw ReadError.tooSmall }
+        // The header was read from the same file; a size change means it changed in between.
+        guard data.count == header.fileSize else { throw ReadError.badHeader("the file changed while it was read") }
+        self.data = data
+        self.dataStart = entry.fileOffset
+        self.byteCount = entry.byteCount
+        self.dtype = entry.dtype
+        self.shape = entry.shape
+        self.metadata = header.metadata
+    }
 
-        let length = UInt64(littleEndian: data.withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) })
-        guard let headerLength = Int(exactly: length), headerLength <= data.count - 8 else {
+    /// Every tensor's entry and the `__metadata__` of a `.safetensors` file, read from its header
+    /// alone.
+    struct Header {
+        struct Entry {
+            /// Safetensors dtype string, e.g. `"F16"`.
+            let dtype: String
+            let shape: [Int]
+            /// Byte offset of the tensor's first element from the start of the file.
+            let fileOffset: Int
+            let byteCount: Int
+        }
+        let tensors: [String: Entry]
+        /// The header's `__metadata__` strings; empty when it has none.
+        let metadata: [String: String]
+        /// Size of the whole file in bytes.
+        let fileSize: Int
+    }
+
+    /// Reads the header of the `.safetensors` file at `url`. Every entry's offsets are checked
+    /// against the data region, so a crafted header throws rather than pointing past the file.
+    static func header(of url: URL) throws -> Header {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        let fileSize = Int(try handle.seekToEnd())
+        try handle.seek(toOffset: 0)
+        guard fileSize >= 8, let prefix = try handle.read(upToCount: 8), prefix.count == 8 else {
             throw ReadError.tooSmall
         }
-        let header = data.subdata(in: (data.startIndex + 8)..<(data.startIndex + 8 + headerLength))
-        guard
-            let json = try JSONSerialization.jsonObject(with: header) as? [String: Any],
-            let entry = json[name] as? [String: Any]
+        let length = UInt64(littleEndian: prefix.withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) })
+        guard let headerLength = Int(exactly: length), headerLength <= fileSize - 8,
+            let headerData = try handle.read(upToCount: headerLength), headerData.count == headerLength
         else {
-            throw ReadError.missingTensor(name)
+            throw ReadError.tooSmall
         }
-
-        // Both offsets are bounded by the data region, so a crafted header throws
-        // rather than trapping on overflow or reading past the mapping.
-        let dataRegion = data.count - 8 - headerLength
-        guard
-            let dtype = entry["dtype"] as? String,
-            let shape = entry["shape"] as? [Int], shape.allSatisfy({ $0 > 0 }),
-            let offsets = entry["data_offsets"] as? [Int], offsets.count == 2,
-            0 <= offsets[0], offsets[0] <= offsets[1], offsets[1] <= dataRegion
-        else {
-            throw ReadError.badHeader("missing or invalid dtype, shape or data_offsets for '\(name)'")
+        guard let json = try JSONSerialization.jsonObject(with: headerData) as? [String: Any] else {
+            throw ReadError.badHeader("the header is not a JSON object")
         }
-
-        self.data = data
-        self.dataStart = 8 + headerLength + offsets[0]
-        self.byteCount = offsets[1] - offsets[0]
-        self.dtype = dtype
-        self.shape = shape
-        self.metadata = json["__metadata__"] as? [String: String] ?? [:]
+        let dataStart = 8 + headerLength
+        var tensors: [String: Header.Entry] = [:]
+        var metadata: [String: String] = [:]
+        for (name, value) in json {
+            if name == "__metadata__" {
+                guard let strings = value as? [String: String] else {
+                    throw ReadError.badHeader("__metadata__ must map strings to strings")
+                }
+                metadata = strings
+                continue
+            }
+            guard
+                let entry = value as? [String: Any],
+                let dtype = entry["dtype"] as? String,
+                let shape = entry["shape"] as? [Int], shape.allSatisfy({ $0 > 0 }),
+                let offsets = entry["data_offsets"] as? [Int], offsets.count == 2,
+                0 <= offsets[0], offsets[0] <= offsets[1], offsets[1] <= fileSize - dataStart
+            else {
+                throw ReadError.badHeader("missing or invalid dtype, shape or data_offsets for '\(name)'")
+            }
+            tensors[name] = Header.Entry(
+                dtype: dtype, shape: shape, fileOffset: dataStart + offsets[0], byteCount: offsets[1] - offsets[0])
+        }
+        return Header(tensors: tensors, metadata: metadata, fileSize: fileSize)
     }
 }
