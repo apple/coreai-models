@@ -164,65 +164,27 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
                     tokenContinuation.finish()
                 }
 
-                // Implicit prefix caching: resolve input against history
-                var (commonPrefix, resolvedNewTokens) = self.history.resolve(input: input)
+                // Implicit prefix caching: resolve input against KV-valid history.
+                let resolved = Self.resolvePrefix(
+                    input: input,
+                    history: &self.history,
+                    processedTokenCount: self.engine.processedTokenCount,
+                    hasNonTruncatableStates: self.engine.hasNonTruncatableStates,
+                    ringCapacity: self.engine.slidingRingCapacity
+                )
+                self.lastPrefixHitCount = resolved.prefixHitCount
 
-                // Detect TRUE divergence before backup (tokens actually differ)
-                let isDivergence = commonPrefix < input.count && commonPrefix < self.history.count
-
-                // Pipelined decode yields the last token without processing it; cap to KV-valid range.
-                if commonPrefix > self.engine.processedTokenCount {
-                    commonPrefix = self.engine.processedTokenCount
-                    resolvedNewTokens = input[commonPrefix...]
-                    self.history.truncate(to: commonPrefix)
-                }
-
-                self.lastPrefixHitCount = commonPrefix
-
-                // Ensure at least 1 token for prefill (seeds the decode loop).
-                // Back up by 1 if the entire input is cached.
-                if resolvedNewTokens.isEmpty && commonPrefix > 0 {
-                    commonPrefix -= 1
-                    resolvedNewTokens = input[commonPrefix...]
-                }
-
-                if isDivergence {
-                    // Tokens differ — full reset (partial rewind corrupts buffer rotation)
+                if let resetTo = resolved.resetTo {
                     await self.engine.computeStream.currentWorkCompleted()
-                    self.engine.reset()
-                    self.history.clear()
-                    resolvedNewTokens = input[...]
-                    commonPrefix = 0
-                } else if self.engine.hasNonTruncatableStates {
-                    // Hybrid model: recurrent state can't be partially rewound.
-                    // Full reset and replay the entire prompt.
-                    if commonPrefix < self.engine.processedTokenCount {
-                        await self.engine.computeStream.currentWorkCompleted()
+                    if resetTo == 0 {
                         self.engine.reset()
-                        self.history.clear()
-                        resolvedNewTokens = input[...]
-                        commonPrefix = 0
+                    } else {
+                        self.engine.processedTokenCount = resetTo
+                        self.engine.step = resetTo
                     }
-                } else if !StateHandlerFactory.ringRewindIsSafe(
-                    from: self.engine.processedTokenCount, to: commonPrefix,
-                    ringCapacity: self.engine.slidingRingCapacity)
-                {
-                    // The ring has overwritten slots the rewound position reads: replay.
-                    await self.engine.computeStream.currentWorkCompleted()
-                    self.engine.reset()
-                    self.history.clear()
-                    resolvedNewTokens = input[...]
-                    commonPrefix = 0
-                    self.lastPrefixHitCount = 0
-                } else if commonPrefix < self.engine.processedTokenCount {
-                    // Pure extension — partial rewind (buffer phase preserved)
-                    await self.engine.computeStream.currentWorkCompleted()
-                    self.engine.processedTokenCount = commonPrefix
-                    self.engine.step = commonPrefix
-                    self.history.truncate(to: commonPrefix)
                 }
 
-                let newTokens = Array(resolvedNewTokens)
+                let newTokens = resolved.newTokens
 
                 async let forwarding: Void = {
                     do {
@@ -446,6 +408,39 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
                     + "Use a sequential or static-shape engine for reproducible generation."
             )
         }
+    }
+
+    /// Resolve `input` against `history` and the KV-valid `processedTokenCount`, trimming
+    /// `history` to the resume cursor and returning the reset target (`nil` when continuing
+    /// in place), the uncached suffix to prefill, and the prefix hit count.
+    static func resolvePrefix(
+        input: [TokenId],
+        history: inout TokenHistory,
+        processedTokenCount: Int,
+        hasNonTruncatableStates: Bool,
+        ringCapacity: Int? = nil
+    ) -> (resetTo: Int?, newTokens: [TokenId], prefixHitCount: Int) {
+        // Pipelined decode yields the final sampled token without feeding it back into the model,
+        // so cap history to the KV-valid range before matching.
+        history.truncate(to: processedTokenCount)
+        let (commonPrefix, _) = history.resolve(input: input)
+        let plan = CoreAISequentialEngine.prefixResetPlan(
+            commonPrefix: commonPrefix,
+            historyCount: history.count,
+            processedTokenCount: processedTokenCount,
+            inputCount: input.count,
+            hasNonTruncatableStates: hasNonTruncatableStates,
+            ringCapacity: ringCapacity
+        )
+        if let resetTo = plan.resetTo {
+            if resetTo == 0 {
+                history.clear()
+            } else {
+                history.truncate(to: resetTo)
+            }
+        }
+        let resumeAt = plan.resetTo ?? processedTokenCount
+        return (plan.resetTo, Array(input[resumeAt...]), plan.prefixHitCount)
     }
 
     func warmup(queryLength: Int, sampling: SamplingConfiguration?) async throws {

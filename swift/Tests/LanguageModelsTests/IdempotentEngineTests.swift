@@ -10,10 +10,9 @@ import Testing
 
 // MARK: - Prefix Reset Plan (model-free)
 
-/// `CoreAISequentialEngine.prefixResetPlan` is the pure decision extracted from
-/// `generate(with:sessionState:)`. It maps (commonPrefix, history/cursor, input,
-/// hybrid?) to a reset target and prefix hit count. These cases pin every branch of
-/// that routing so the extraction stays behavior-preserving.
+/// `CoreAISequentialEngine.prefixResetPlan` is the pure decision shared by the text
+/// engines' implicit prefix-cache routing. It maps (commonPrefix, history/cursor,
+/// input, hybrid?) to a reset target and prefix hit count.
 @Suite("Prefix reset plan routing")
 struct PrefixResetPlanTests {
     private struct Case {
@@ -35,6 +34,10 @@ struct PrefixResetPlanTests {
                 commonPrefix: 0, historyCount: 0, processedTokenCount: 0, inputCount: 3,
                 hasNonTruncatableStates: false, expectedResetTo: nil, expectedHitCount: 0),
             Case(
+                name: "empty history with empty input needs no reset",
+                commonPrefix: 0, historyCount: 0, processedTokenCount: 0, inputCount: 0,
+                hasNonTruncatableStates: false, expectedResetTo: nil, expectedHitCount: 0),
+            Case(
                 name: "exact re-submission rewinds one token to reseed",
                 commonPrefix: 3, historyCount: 3, processedTokenCount: 3, inputCount: 3,
                 hasNonTruncatableStates: false, expectedResetTo: 2, expectedHitCount: 3),
@@ -43,9 +46,13 @@ struct PrefixResetPlanTests {
                 commonPrefix: 3, historyCount: 3, processedTokenCount: 3, inputCount: 5,
                 hasNonTruncatableStates: false, expectedResetTo: nil, expectedHitCount: 3),
             Case(
-                name: "mid-sequence divergence triggers a full reset",
+                name: "mid-sequence divergence rewinds to common prefix",
                 commonPrefix: 2, historyCount: 4, processedTokenCount: 4, inputCount: 4,
-                hasNonTruncatableStates: false, expectedResetTo: 0, expectedHitCount: 2),
+                hasNonTruncatableStates: false, expectedResetTo: 2, expectedHitCount: 2),
+            Case(
+                name: "mid-sequence divergence with longer suffix rewinds to common prefix",
+                commonPrefix: 3, historyCount: 5, processedTokenCount: 5, inputCount: 8,
+                hasNonTruncatableStates: false, expectedResetTo: 3, expectedHitCount: 3),
             Case(
                 name: "first-token divergence triggers a full reset",
                 commonPrefix: 0, historyCount: 3, processedTokenCount: 3, inputCount: 3,
@@ -55,8 +62,16 @@ struct PrefixResetPlanTests {
                 commonPrefix: 3, historyCount: 5, processedTokenCount: 5, inputCount: 3,
                 hasNonTruncatableStates: false, expectedResetTo: 2, expectedHitCount: 3),
             Case(
+                name: "unrecorded trailing steps rewind to common prefix on extension",
+                commonPrefix: 4, historyCount: 4, processedTokenCount: 5, inputCount: 6,
+                hasNonTruncatableStates: false, expectedResetTo: 4, expectedHitCount: 4),
+            Case(
                 name: "hybrid full-resets on rewind (commonPrefix < history)",
                 commonPrefix: 2, historyCount: 4, processedTokenCount: 4, inputCount: 5,
+                hasNonTruncatableStates: true, expectedResetTo: 0, expectedHitCount: 0),
+            Case(
+                name: "hybrid full-resets when processed exceeds history",
+                commonPrefix: 4, historyCount: 4, processedTokenCount: 5, inputCount: 6,
                 hasNonTruncatableStates: true, expectedResetTo: 0, expectedHitCount: 0),
             Case(
                 name: "hybrid full-resets on re-submission (processed >= input)",
@@ -89,18 +104,148 @@ struct PrefixResetPlanTests {
         #expect(wrapped.resetTo == 0)
         #expect(wrapped.prefixHitCount == 0)
 
-        // Before the ring wraps, the same rewind is safe.
+        // Divergence into overwritten sliding-ring slots also replays from scratch.
+        let wrappedDivergence = CoreAISequentialEngine.prefixResetPlan(
+            commonPrefix: 2100, historyCount: 2600, processedTokenCount: 2600, inputCount: 2250,
+            hasNonTruncatableStates: false, ringCapacity: 2048)
+        #expect(wrappedDivergence.resetTo == 0)
+        #expect(wrappedDivergence.prefixHitCount == 0)
+
+        // Before the ring wraps, both shorter-prefix and divergent rewinds are safe.
         let unwrapped = CoreAISequentialEngine.prefixResetPlan(
             commonPrefix: 1500, historyCount: 2000, processedTokenCount: 2000, inputCount: 1500,
             hasNonTruncatableStates: false, ringCapacity: 2048)
         #expect(unwrapped.resetTo == 1499)
         #expect(unwrapped.prefixHitCount == 1500)
 
-        // Exact re-submission past the ring rewinds one token, which is safe.
+        let unwrappedDivergence = CoreAISequentialEngine.prefixResetPlan(
+            commonPrefix: 1500, historyCount: 2000, processedTokenCount: 2000, inputCount: 1650,
+            hasNonTruncatableStates: false, ringCapacity: 2048)
+        #expect(unwrappedDivergence.resetTo == 1500)
+        #expect(unwrappedDivergence.prefixHitCount == 1500)
+
+        // Single-token rewind past the ring (reseed or final-token divergence) is safe.
         let reseed = CoreAISequentialEngine.prefixResetPlan(
             commonPrefix: 3000, historyCount: 3000, processedTokenCount: 3000, inputCount: 3000,
             hasNonTruncatableStates: false, ringCapacity: 2048)
         #expect(reseed.resetTo == 2999)
+        #expect(reseed.prefixHitCount == 3000)
+
+        let oneTokenDivergence = CoreAISequentialEngine.prefixResetPlan(
+            commonPrefix: 2999, historyCount: 3000, processedTokenCount: 3000, inputCount: 3010,
+            hasNonTruncatableStates: false, ringCapacity: 2048)
+        #expect(oneTokenDivergence.resetTo == 2999)
+        #expect(oneTokenDivergence.prefixHitCount == 2999)
+    }
+}
+
+// MARK: - Pipelined Prefix Resolution (model-free)
+
+@Suite("Pipelined prefix resolution")
+struct PipelinedPrefixResolutionTests {
+    @Test("re-rendered multi-turn prompt rewinds to shared prefix instead of resetting")
+    func multiTurnDivergenceRewinds() {
+        var history = TokenHistory()
+        // Turn 1: prompt [1, 2, 3], model generated <think> 10 </think> 20, plus final yielded 30.
+        // Pipelined decode leaves the final sampled token (30) out of the KV cache.
+        history.append(contentsOf: [1, 2, 3, 10, 20, 30][...])
+        let processedAfterTurn1 = 5  // [1, 2, 3, 10, 20] in KV cache
+
+        // Turn 2: re-rendered chat template strips <think> 10 </think>, diverging at index 3.
+        let turn2Input: [Int32] = [1, 2, 3, 20, 30, 77, 78]
+        let resolved = CoreAIPipelinedEngine.resolvePrefix(
+            input: turn2Input,
+            history: &history,
+            processedTokenCount: processedAfterTurn1,
+            hasNonTruncatableStates: false)
+
+        #expect(resolved.resetTo == 3)
+        #expect(resolved.prefixHitCount == 3)
+        #expect(resolved.newTokens == [20, 30, 77, 78])
+        #expect(history.tokens == [1, 2, 3])
+    }
+
+    @Test("pure extension re-includes the unprocessed trailing pipelined token without resetting")
+    func extensionWithPipelinedTrailingToken() {
+        var history = TokenHistory()
+        history.append(contentsOf: [1, 2, 3, 10, 20, 30][...])
+        let processed = 5  // 30 was yielded, not fed back
+
+        let resolved = CoreAIPipelinedEngine.resolvePrefix(
+            input: [1, 2, 3, 10, 20, 30, 77, 78],
+            history: &history,
+            processedTokenCount: processed,
+            hasNonTruncatableStates: false)
+
+        #expect(resolved.resetTo == nil)
+        #expect(resolved.prefixHitCount == 5)
+        #expect(resolved.newTokens == [30, 77, 78])
+        #expect(history.tokens == [1, 2, 3, 10, 20])
+    }
+
+    @Test("divergence only at the unprocessed trailing token keeps state even on hybrid models")
+    func divergenceAtUnprocessedTrailingTokenNeedsNoReset() {
+        var history = TokenHistory()
+        history.append(contentsOf: [1, 2, 3, 10, 20][...])
+        let processed = 4  // 20 was never written to KV or recurrent state
+
+        let resolved = CoreAIPipelinedEngine.resolvePrefix(
+            input: [1, 2, 3, 10, 99],
+            history: &history,
+            processedTokenCount: processed,
+            hasNonTruncatableStates: true)
+
+        #expect(resolved.resetTo == nil)
+        #expect(resolved.prefixHitCount == 0)
+        #expect(resolved.newTokens == [99])
+        #expect(history.tokens == [1, 2, 3, 10])
+    }
+
+    @Test("hybrid and wrapped-ring divergences fall back to a full reset")
+    func unsafeDivergencesFullReset() {
+        var hybridHistory = TokenHistory()
+        hybridHistory.append(contentsOf: [1, 2, 3, 10, 20][...])
+        let hybridResolved = CoreAIPipelinedEngine.resolvePrefix(
+            input: [1, 2, 99, 100],
+            history: &hybridHistory,
+            processedTokenCount: 4,
+            hasNonTruncatableStates: true)
+        #expect(hybridResolved.resetTo == 0)
+        #expect(hybridResolved.prefixHitCount == 0)
+        #expect(hybridResolved.newTokens == [1, 2, 99, 100])
+        #expect(hybridHistory.tokens.isEmpty)
+
+        var ringHistory = TokenHistory()
+        let pastRing = Array(0..<Int32(2601))
+        ringHistory.append(contentsOf: pastRing[...])
+        let diverged = Array(pastRing.prefix(2100)) + [9999, 10000]
+        let ringResolved = CoreAIPipelinedEngine.resolvePrefix(
+            input: diverged,
+            history: &ringHistory,
+            processedTokenCount: 2600,
+            hasNonTruncatableStates: false,
+            ringCapacity: 2048)
+        #expect(ringResolved.resetTo == 0)
+        #expect(ringResolved.prefixHitCount == 0)
+        #expect(ringResolved.newTokens == diverged)
+        #expect(ringHistory.tokens.isEmpty)
+    }
+
+    @Test("shorter prefix rewinds one token to reseed sampling")
+    func shorterPrefixReseeds() {
+        var history = TokenHistory()
+        history.append(contentsOf: [1, 2, 3, 10, 20][...])
+
+        let resolved = CoreAIPipelinedEngine.resolvePrefix(
+            input: [1, 2, 3],
+            history: &history,
+            processedTokenCount: 4,
+            hasNonTruncatableStates: false)
+
+        #expect(resolved.resetTo == 2)
+        #expect(resolved.prefixHitCount == 3)
+        #expect(resolved.newTokens == [3])
+        #expect(history.tokens == [1, 2])
     }
 }
 
@@ -353,5 +498,47 @@ struct IdempotentEngineParityTests {
             try await engine.reset(to: 0)
             #expect(engine.processedTokenCount == 0)
         }
+    }
+
+    @Test("divergent follow-up matches a fresh session")
+    func divergentFollowUpMatchesFreshSession() async throws {
+        let engine = try await makeSequentialEngine()
+        let options = InferenceOptions(maxTokens: ParityFixture.halfTokens)
+
+        // Warm a session on `prompt` + `halfTokens` generated tokens.
+        let reusedSession = try engine.makeSessionState()
+        _ = try await collect(
+            engine.generate(
+                with: ParityFixture.prompt,
+                sessionState: reusedSession,
+                samplingConfiguration: .greedy,
+                inferenceOptions: options))
+
+        // Divergent follow-up shares the first half of `prompt`, then takes a different suffix
+        // drawn from the same in-vocabulary token set.
+        let sharedCount = ParityFixture.prompt.count / 2
+        let divergentPrompt = Array(ParityFixture.prompt.prefix(sharedCount)) + [8, 7, 6, 5]
+
+        let reusedTokens = try await collect(
+            engine.generate(
+                with: divergentPrompt,
+                sessionState: reusedSession,
+                samplingConfiguration: .greedy,
+                inferenceOptions: options))
+
+        let expectedHitCount = engine.hasRecurrentState ? 0 : sharedCount
+        #expect(reusedSession.lastPrefixHitCount == expectedHitCount)
+        #expect(engine.lastPrefixHitCount == expectedHitCount)
+
+        // Compare against a freshly minted session with no cached history.
+        let freshSession = try engine.makeSessionState()
+        let freshTokens = try await collect(
+            engine.generate(
+                with: divergentPrompt,
+                sessionState: freshSession,
+                samplingConfiguration: .greedy,
+                inferenceOptions: options))
+
+        #expect(reusedTokens == freshTokens)
     }
 }
