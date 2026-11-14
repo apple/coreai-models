@@ -64,6 +64,8 @@ class DiffusionExportConfig:
     vae_tile_size: int | None = None
     include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO
     multifunction: bool = True
+    # FLUX.2 only: one symbolic "main" per asset. Takes precedence over multifunction if True.
+    dynamic: bool = False
 
 
 def export_diffusion(config: DiffusionExportConfig) -> dict[str, str]:
@@ -79,10 +81,15 @@ def export_diffusion(config: DiffusionExportConfig) -> dict[str, str]:
 
     # 1. Determine pipeline type and load HF pipeline
     pipeline_type = get_pipeline_type(config.hf_model_id)
+    if config.dynamic and pipeline_type != "flux2":
+        raise ValueError(f"dynamic export is only supported for FLUX.2, not {pipeline_type}.")
     hf_pipe = _load_hf_pipeline(config.hf_model_id, pipeline_type, model_dtype)
 
     registry = get_component_registry(
-        hf_pipe, pipeline_type=pipeline_type, multifunction=config.multifunction
+        hf_pipe,
+        pipeline_type=pipeline_type,
+        multifunction=config.multifunction,
+        dynamic=config.dynamic,
     )
     component_names = config.components or list(registry.keys())
     logger.info(f"Pipeline type: {pipeline_type}, components: {component_names}")
@@ -106,8 +113,11 @@ def export_diffusion(config: DiffusionExportConfig) -> dict[str, str]:
                 _check_quantization_precision(component_config, owner, component)
                 spec_configs[name] = component_config
 
-    # Output goes to <output_dir>/<model-name>/
+    # Output goes to <output_dir>/<model-name>/. A dynamic export reuses the static asset
+    # names, so it gets its own directory rather than overwriting the static bundle.
     model_subdir = config.hf_model_id.split("/")[-1]
+    if config.dynamic:
+        model_subdir += "-dynamic"
     output_path = Path(config.output_dir) / model_subdir
     output_path.mkdir(parents=True, exist_ok=True)
 
@@ -207,6 +217,7 @@ def export_diffusion(config: DiffusionExportConfig) -> dict[str, str]:
         config.compression,
         results,
         vae_tile_size=config.vae_tile_size,
+        dynamic=config.dynamic,
     )
 
     # Summary
@@ -387,12 +398,13 @@ def _write_metadata_json(
     exported_assets: dict[str, str],
     *,
     vae_tile_size: int | None = None,
+    dynamic: bool = False,
 ) -> None:
     """Write metadata.json with the v0.2 bundle schema for diffusion models."""
     from datetime import datetime
 
     if pipeline_type == "flux2":
-        diffusion_config = _build_flux2_config(hf_pipe, model_id)
+        diffusion_config = _build_flux2_config(hf_pipe, model_id, dynamic=dynamic)
     elif pipeline_type == "sana_sprint":
         diffusion_config = _build_sana_sprint_config(hf_pipe)
     elif pipeline_type == "wan":
@@ -425,7 +437,7 @@ def _write_metadata_json(
     logger.info(f"Saved metadata.json to {json_path}")
 
 
-def _build_flux2_config(hf_pipe: Any, model_id: str) -> dict:
+def _build_flux2_config(hf_pipe: Any, model_id: str, *, dynamic: bool = False) -> dict:
     vae_config = hf_pipe.vae.config
     transformer_config = hf_pipe.transformer.config
 
@@ -441,7 +453,7 @@ def _build_flux2_config(hf_pipe: Any, model_id: str) -> dict:
     axes_dims_rope = list(getattr(transformer_config, "axes_dims_rope", [32, 32, 32, 32]))
     rope_theta = getattr(transformer_config, "rope_theta", 2000.0)
 
-    return {
+    config = {
         "type": "flux2",
         "prediction_type": "flow_matching",
         "encoder_scale_factor": scaling_factor,
@@ -455,6 +467,24 @@ def _build_flux2_config(hf_pipe: Any, model_id: str) -> dict:
         "rope_axes_dims": axes_dims_rope,
         "rope_theta": rope_theta,
     }
+    if dynamic:
+        # Read from the Dim bounds so the runtime can reject an unsupported size or
+        # reference count up front instead of failing inside the graph.
+        from coreai_models.diffusion.flux2 import (
+            FLUX2_IMAGE_SIZE_MULTIPLE,
+            FLUX2_IMG_SEQ_MAX,
+            FLUX2_MAX_IMAGE_SIZE,
+            FLUX2_MIN_IMAGE_SIZE,
+            FLUX2_MIN_REFERENCE_SIZE,
+        )
+
+        config["dynamic_shapes"] = True
+        config["min_image_size"] = FLUX2_MIN_IMAGE_SIZE
+        config["max_image_size"] = FLUX2_MAX_IMAGE_SIZE
+        config["image_size_multiple"] = FLUX2_IMAGE_SIZE_MULTIPLE
+        config["max_image_tokens"] = FLUX2_IMG_SEQ_MAX
+        config["min_reference_size"] = FLUX2_MIN_REFERENCE_SIZE
+    return config
 
 
 def _build_sana_sprint_config(hf_pipe: Any) -> dict:

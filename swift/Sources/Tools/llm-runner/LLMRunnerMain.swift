@@ -6,6 +6,7 @@
 import ArgumentParser
 import CoreAI
 import CoreAILanguageModels
+import CoreAIMemoryMeasurement
 import CoreAIShared
 import CoreImage
 import Darwin
@@ -63,6 +64,17 @@ extension FrameSamplingStrategy: ExpressibleByArgument {
 @main
 struct Main {
     static func main() async throws {
+        #if os(macOS)
+        // llm-runner relaunches itself under sudo as the helper that reads the Neural Engine services' memory.
+        let arguments = CommandLine.arguments
+        if arguments.count == 3, arguments[1] == RootMemoryHelper.argument, let clientPid = pid_t(arguments[2]) {
+            RootMemoryHelper.run(clientPid: clientPid)
+            return
+        }
+        if arguments.count > 3, arguments[1] == RootMemoryHelper.terminalArgument {
+            RootMemoryHelper.runOnTerminal(arguments[2], command: Array(arguments[3...]))
+        }
+        #endif
         await LLMRunner.main()
     }
 }
@@ -300,6 +312,20 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     var batchPrototypeRows: Int?
 
     @Option(
+        name: .customLong("prompt-list"),
+        help:
+            "Run each non-blank line of this file as its own prompt, several at once through the continuous-batching scheduler, and report per-request and aggregate tokens/sec. Needs the coreai-sequential engine and a model exported with --attention-mask batched --dynamic-batch-size N."
+    )
+    var promptList: String?
+
+    @Option(
+        name: .customLong("concurrent-requests"),
+        help:
+            "With --prompt-list: rows that decode at once, a number up to the model's max batch size (default: every prompt, up to that size; unlike llm-server's, no 'auto'). The other prompts wait for a free row."
+    )
+    var concurrentRequests: Int?
+
+    @Option(
         name: .customLong("draft-model"),
         help:
             "Path to a draft model bundle to enable speculative decoding. Must share the tokenizer/vocabulary with --model. The static-shape engine verifies and drafts."
@@ -346,7 +372,37 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     )
     var promptLookupMinNgram: Int = SpeculativeDefaults.lookupMinNgram
 
+    @OptionGroup var memoryOptions: MemoryOptions
+
     func validate() throws {
+        if let n = concurrentRequests {
+            if n < 1 { throw ValidationError("--concurrent-requests must be >= 1") }
+            if promptList == nil { throw ValidationError("--concurrent-requests applies to --prompt-list") }
+        }
+        if promptList != nil {
+            let conflicting = [
+                prompt != nil ? "--prompt" : nil,
+                promptFile != nil ? "--prompt-file" : nil,
+                rawTokens != nil ? "--raw-tokens" : nil,
+                jsonSchema != nil ? "--json-schema" : nil,
+                continuation != nil ? "--continuation" : nil,
+                rawContinuation != nil ? "--raw-continuation" : nil,
+                saveLogits != nil ? "--save-logits" : nil,
+                printLogits ? "--print-logits" : nil,
+                imagePath != nil ? "--image" : nil,
+                videoPath != nil ? "--video" : nil,
+                batchPrototypeRows != nil ? "--batch-prototype" : nil,
+                draftModel != nil ? "--draft-model" : nil,
+                promptLookup ? "--prompt-lookup" : nil,
+                speculative ? "--speculative" : nil,
+            ].compactMap { $0 }
+            if !conflicting.isEmpty {
+                throw ValidationError("--prompt-list cannot be used with \(conflicting.joined(separator: ", "))")
+            }
+            if !["default", "auto", "coreai-sequential"].contains(inferenceEngineVariant) {
+                throw ValidationError("--prompt-list runs on the coreai-sequential engine")
+            }
+        }
         if let rows = batchPrototypeRows {
             if rows < 1 { throw ValidationError("--batch-prototype must be >= 1") }
             if !["default", "auto", "coreai-sequential"].contains(inferenceEngineVariant) {
@@ -370,6 +426,9 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         }
         if imagePath != nil && videoPath != nil {
             throw ValidationError("--image and --video cannot be used together")
+        }
+        if memoryOptions.measuresMemory && (imagePath != nil || videoPath != nil || batchPrototypeRows != nil) {
+            throw ValidationError("Memory measurement doesn't support --image, --video, or --batch-prototype")
         }
         if videoFrames < 1 {
             throw ValidationError("--video-frames must be >= 1")
@@ -871,6 +930,13 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             try RawTokenScoring.checkFits(
                 rawScoring, vocabSize: bundle.vocabSize, maxContextLength: bundle.maxContextLength)
         }
+        // Read and size a prompt list before the model loads, so a bad file or width fails fast.
+        let promptBatch = try promptList.map { path in
+            let prompts = try Self.readPromptList(path)
+            let width = try Self.batchWidth(
+                requested: concurrentRequests, promptCount: prompts.count, maxBatchSize: bundle.maxBatchSize)
+            return (prompts: prompts, width: width)
+        }
 
         // Resolve component model URLs once; reused for the cache check and model loading below.
         // An LLM bundle has only `main`; VLM bundles also have `vision`, plus `embedding` unless the
@@ -903,6 +969,13 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             cacheHit = PreparedModel.isCached(at: languageModelURL)
         }
 
+        // Initialize memory measurement, if activated by memoryOptions flag(s)
+        // Do this before starting "Preparing..."
+        let measurement = MemoryMeasurement(
+            options: memoryOptions, modelPath: bundle.bundlePath.path, runPhase: "inference")
+        // Restart the overall timer so Total Time and Overall Throughput leave out the sudo prompt.
+        if measurement != nil { await PerformanceMetrics.shared.startOverallTiming() }
+
         if !CLILogger.isVerbose {
             print("\n⏳ Preparing AI asset from \(languageModelURL.lastPathComponent)...", terminator: "")
             fflush(stdout)
@@ -929,6 +1002,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             tensorData: bundle.tensorData
         )
 
+        measurement?.begin("prepare")
         // Parallel loading: engine compilation + tokenizer are independent.
         let modelLoadSpan = InstrumentsProfiler.beginModelLoad(name: bundle.name)
         let tokenizerLoadSpan = InstrumentsProfiler.beginTokenizerLoad(id: modelFile)
@@ -964,6 +1038,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         try inferenceEngine.validateSamplingStrategy(samplingConfiguration)
 
         // Warmup: trigger kernel compilation before first inference
+        if warmup != .off { measurement?.begin("warmup") }
         try await performWarmup(
             mode: warmup,
             warmupLength: warmupLength,
@@ -975,6 +1050,17 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             let prepareElapsed = await PerformanceMetrics.shared.modelLoadTime
             let cacheSuffix = cacheHit ? " (cache hit)" : ""
             print(" done in \(String(format: "%.3f", prepareElapsed))s\(cacheSuffix)\n")
+        }
+
+        if let promptBatch {
+            try await runBatchGeneration(
+                prompts: promptBatch.prompts,
+                width: promptBatch.width,
+                inferenceEngine: inferenceEngine,
+                tokenizer: tokenizer,
+                samplingConfiguration: samplingConfiguration,
+                additionalEosTokenIds: additionalEosTokenIds)
+            return
         }
 
         // Resolve prompt input and tokenize
@@ -1059,6 +1145,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         }
 
         // Build text generator with preloaded inference engine
+        measurement?.begin("inference")
         CLILogger.log("Building text generator...", component: "Main")
 
         let generator = try await TextGeneratorBuilder()
@@ -1111,6 +1198,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
                 saveJsonPath: saveLogits,
                 printToConsole: printLogits
             )
+            try await reportMemory(measurement, generator: generator, input: input, cacheHit: cacheHit)
             return
         }
 
@@ -1246,11 +1334,37 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             await StatsReporter(storage: .shared).printVerboseTable()
         }
 
+        try await reportMemory(measurement, generator: generator, input: input, cacheHit: cacheHit)
+
         // Log final memory usage
         InstrumentsProfiler.logMemoryUsage(phase: "ModelFinal")
 
         // Cleanup
         CLILogger.log("Resources cleaned up", component: "Main")
+    }
+
+    // MARK: - Memory Measurement
+
+    /// Ends the memory measurement and prints what `--measure-peak-memory` and the other memory flags ask for; does
+    /// nothing without them. Generates a few tokens after dropping the mapped model files, to see which the
+    /// model needs, with logging off so the engine's per-token logs don't repeat. `--print-memory-chart` adds each
+    /// phase's peak and what peak memory is made of.
+    private func reportMemory(
+        _ measurement: MemoryMeasurement?, generator: TextGenerator, input: Input, cacheHit: Bool
+    ) async throws {
+        guard let measurement else { return }
+        let memory = await measurement.finish {
+            let logLevel = CLILogger.level
+            CLILogger.level = 0
+            defer { CLILogger.level = logLevel }
+            _ = try? await generator.generate(input: input, maxTokens: 16, stopSequences: StopSequences(sequences: []))
+        }
+        print("\n📊 Memory Summary:")
+        print(String(repeating: "=", count: 50))
+        for line in memory.summaryLines() { print(line) }
+        print(String(repeating: "=", count: 50))
+        measurement.chart(memory: memory, cacheHit: cacheHit)
+        try measurement.writeCSVIfRequested()
     }
 
     // MARK: - Constrained Generation Helper

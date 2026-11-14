@@ -3,6 +3,7 @@
 // Use of this source code is governed by a BSD-3-clause license that can
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
+import CoreGraphics
 import Foundation
 import Testing
 
@@ -19,6 +20,66 @@ struct DiffusionPipelineTests {
         #expect(config.guidanceScale == 7.5)
         #expect(config.schedulerType == .discreteFlow)
         #expect(!config.isImageToImage)
+    }
+
+    @Test("startingImage is reference 1, followed by referenceImages in order")
+    func referenceImageOrder() throws {
+        func image(width: Int) throws -> CGImage {
+            try DiffusionUtilities.pixelsToCGImage(
+                [Float](repeating: 0.5, count: 3 * width), height: 1, width: width)
+        }
+        let config = PipelineConfiguration(
+            prompt: "a cat", startingImage: try image(width: 1),
+            referenceImages: [try image(width: 2), try image(width: 3)])
+        #expect(config.allReferenceImages.map(\.width) == [1, 2, 3])
+        #expect(config.isImageToImage)
+
+        // A reference list without startingImage is still img2img.
+        let listOnly = PipelineConfiguration(prompt: "a cat", referenceImages: [try image(width: 2)])
+        #expect(listOnly.allReferenceImages.map(\.width) == [2])
+        #expect(listOnly.isImageToImage)
+
+        // Equality counts every reference (images themselves aren't Hashable): img2img
+        // differs from txt2img, and both spellings of a single reference agree.
+        let startingOnly = PipelineConfiguration(prompt: "a cat", startingImage: try image(width: 2))
+        #expect(startingOnly == listOnly)
+        #expect(startingOnly != PipelineConfiguration(prompt: "a cat"))
+    }
+
+    @Test("ReferenceSize parses presets and pixel sizes, and round-trips")
+    func referenceSizeParsing() {
+        #expect(ReferenceSize("half") == .relative(.half))
+        #expect(ReferenceSize("384") == .pixels(384))
+        for bad in ["0", "-16", "Half", "384px", ""] {
+            #expect(ReferenceSize(bad) == nil, "\(bad) should not parse")
+        }
+        for size: ReferenceSize in [.relative(.full), .relative(.quarter), .pixels(128)] {
+            #expect(ReferenceSize(size.description) == size)
+        }
+    }
+
+    /// Presets round down to whole 16-pixel tokens, so the reported size is what is encoded.
+    /// A pixel size comes back unchanged, so an invalid one is reported as given.
+    @Test("Reference sizes resolve to pixels at an output size")
+    func referenceSizePixels() {
+        #expect(ReferenceSize.full.pixelSize(outputSize: 1024) == 1024)
+        #expect(ReferenceSize.half.pixelSize(outputSize: 400) == 192)  // 25 tokens → 12
+        #expect(ReferenceSize.pixels(384).pixelSize(outputSize: 1024) == 384)
+        #expect(ReferenceSize.pixels(100).pixelSize(outputSize: 1024) == 100)
+        #expect(ReferenceSize.half == .relative(.half))
+    }
+
+    /// Callers written against `referenceGrid` must keep compiling and behaving the same.
+    @available(*, deprecated)
+    @Test("Pre-referenceSize API still works")
+    func legacyReferenceGrid() {
+        var config = PipelineConfiguration(prompt: "a cat", referenceGrid: .quarter)
+        #expect(config.referenceSize == .quarter)
+        #expect(config.referenceGrid == .quarter)
+        config.referenceGrid = .half
+        #expect(config.referenceSize == .half)
+        config.referenceSize = .pixels(384)
+        #expect(config.referenceGrid == .full)
     }
 
     @Test("Scheduler type raw values match the metadata.json diffusion block")
