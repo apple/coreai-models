@@ -45,10 +45,14 @@ def _load(name: str):
 if _HAS_COREAI:
     _load("export")
     _load("export_drafter")
+    export_drafter = _load("export_drafter")
     export_draft_pack = _load("export_draft_pack")
     pack = export_draft_pack.pack
+    default_output_dir = export_draft_pack.default_output_dir
 
 VOCAB, HIDDEN, CENTROIDS, HEADS, HEAD_DIM, FFN = 8, 8, 2, 2, 4, 16
+# The full-attention layer is wider than the sliding ones, as in Gemma 4.
+FULL_HEAD_DIM = 2 * HEAD_DIM
 
 
 def checkpoint(layers=2, untied=False, vocab=VOCAB):
@@ -76,17 +80,18 @@ def checkpoint(layers=2, untied=False, vocab=VOCAB):
             "post_feedforward_layernorm",
         ):
             t[p + name + ".weight"] = r(HIDDEN)
-        t[p + "self_attn.q_norm.weight"] = r(HEAD_DIM)
+        dim = FULL_HEAD_DIM if i == layers - 1 else HEAD_DIM
+        t[p + "self_attn.q_norm.weight"] = r(dim)
         t[p + "layer_scalar"] = r(1)
-        t[p + "self_attn.q_proj.weight"] = r(HEADS * HEAD_DIM, HIDDEN)
-        t[p + "self_attn.o_proj.weight"] = r(HIDDEN, HEADS * HEAD_DIM)
+        t[p + "self_attn.q_proj.weight"] = r(HEADS * dim, HIDDEN)
+        t[p + "self_attn.o_proj.weight"] = r(HIDDEN, HEADS * dim)
         t[p + "mlp.gate_proj.weight"] = r(FFN, HIDDEN)
         t[p + "mlp.up_proj.weight"] = r(FFN, HIDDEN)
         t[p + "mlp.down_proj.weight"] = r(HIDDEN, FFN)
     return t
 
 
-def write_checkpoint(tmp_path, t, layers=2):
+def write_checkpoint(tmp_path, t, layers=2, global_head_dim=FULL_HEAD_DIM):
     drafter = tmp_path / "assistant"
     drafter.mkdir()
     save_file(t, str(drafter / "model.safetensors"))
@@ -95,7 +100,6 @@ def write_checkpoint(tmp_path, t, layers=2):
         "hidden_size": HIDDEN,
         "num_attention_heads": HEADS,
         "head_dim": HEAD_DIM,
-        "global_head_dim": HEAD_DIM,
         "intermediate_size": FFN,
         "layer_types": ["sliding_attention"] * (layers - 1) + ["full_attention"],
         "sliding_window": 512,
@@ -104,6 +108,8 @@ def write_checkpoint(tmp_path, t, layers=2):
             "full_attention": {"rope_theta": 1000000.0, "partial_rotary_factor": 0.25},
         },
     }
+    if global_head_dim is not None:
+        text["global_head_dim"] = global_head_dim
     (drafter / "config.json").write_text(json.dumps({"text_config": text}))
     return drafter
 
@@ -124,15 +130,52 @@ def test_pack_metadata_describes_the_geometry(tmp_path):
     assert (meta["layers"], meta["hidden"], meta["heads"]) == ("2", str(HIDDEN), str(HEADS))
     assert (meta["head_dim"], meta["full_head_dim"], meta["ffn"]) == (
         str(HEAD_DIM),
-        str(HEAD_DIM),
+        str(FULL_HEAD_DIM),
         str(FFN),
     )
     assert meta["sliding_window"] == "512"
     assert float(meta["sliding_theta"]) == 10000.0 and float(meta["full_theta"]) == 1000000.0
     assert float(meta["full_partial_rotary_factor"]) == 0.25
-    for name in ("pre_projection.weight", "model.layers.1.mlp.down_proj.weight"):
-        assert tensors[name].dtype == torch.float16
-        assert torch.equal(tensors[name], t[name].to(torch.float16))
+
+
+def test_pack_holds_exactly_the_heads_tensors_in_fp16(tmp_path):
+    t = checkpoint()
+    tensors, _ = read(pack(write_checkpoint(tmp_path, t), tmp_path / "out"))
+    layer_names = [f"model.layers.{i}.{s}" for i in range(2) for s in export_drafter.LAYER_TENSORS]
+    copied = ["pre_projection.weight", "post_projection.weight", "model.norm.weight", *layer_names]
+    assert set(tensors) == {"embed_perm_f16", "token_ordering_i32", "centroids_f16", *copied}
+    for name in copied:
+        assert tensors[name].dtype == torch.float16, name
+        assert torch.equal(tensors[name], t[name].to(torch.float16)), name
+    centroids = t["masked_embedding.centroids.weight"].to(torch.float16)
+    assert torch.equal(tensors["centroids_f16"], centroids)
+
+
+def test_full_head_dim_falls_back_to_head_dim(tmp_path):
+    t = checkpoint()
+    path = pack(write_checkpoint(tmp_path, t, global_head_dim=None), tmp_path / "out")
+    assert read(path)[1]["full_head_dim"] == str(HEAD_DIM)
+
+
+def test_refuses_an_assistant_for_another_target(tmp_path):
+    drafter = write_checkpoint(tmp_path, checkpoint())
+    with pytest.raises(SystemExit, match="different target"):
+        pack(drafter, tmp_path / "out", backbone_hidden_size=HIDDEN + 1)
+    assert pack(drafter, tmp_path / "ok", backbone_hidden_size=HIDDEN).exists()
+
+
+def test_default_output_dir_is_per_variant(tmp_path):
+    e2b = default_output_dir("google/gemma-4-E2B-it", tmp_path)
+    e4b = default_output_dir("google/gemma-4-E4B-it", tmp_path)
+    assert e2b.name == "gemma-4-E2B-it" and e4b.name == "gemma-4-E4B-it" and e2b != e4b
+    assert default_output_dir(None, tmp_path / "my-assistant").name == "my-assistant"
+
+
+def test_scan_table_shares_the_permutation_check(tmp_path):
+    t = checkpoint()
+    t["masked_embedding.token_ordering"] = torch.zeros(VOCAB, dtype=torch.int64)
+    with pytest.raises(SystemExit, match="not a permutation"):
+        export_drafter.write_scan_table(t, 2, tmp_path / "draft_scan.bin")
 
 
 def test_pack_permutes_the_untied_head(tmp_path):

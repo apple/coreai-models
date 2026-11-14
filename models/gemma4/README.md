@@ -185,7 +185,10 @@ uv run export_draft_pack.py --model google/gemma-4-E2B-it
 ```
 
 Weights are fp16. The pack is per variant, like the assistant: its `post_projection` is as wide as
-the target's hidden size.
+the target's hidden size, so the script refuses an assistant whose width does not match `--model`.
+It writes `exports/draft_head/<model>/draft_head.safetensors`, one directory per variant;
+`--output-dir` writes elsewhere. As with `export_drafter.py`, the assistant is `<model>-assistant`
+by default, and `--drafter` takes another hub repo id or a local directory.
 
 ### Runner side
 

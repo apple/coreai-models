@@ -22,6 +22,9 @@ The pack is per variant: the assistant reads the target's final hidden state, so
     cd models/gemma4
     uv run export_draft_pack.py --model google/gemma-4-E2B-it
 
+It writes ``exports/draft_head/<model>/draft_head.safetensors`` unless ``--output-dir`` says
+otherwise. With ``--model``, the assistant must match that target's hidden size.
+
 The assistant is the target's own (``<model>-assistant`` on the Hugging Face hub), downloaded on
 first use; ``--drafter`` takes another repo id or a local directory instead.
 """
@@ -39,42 +42,38 @@ from export_drafter import (
     SIDECAR_VERSION,
     check_checkpoint,
     load_drafter,
-    output_table,
     resolve_drafter,
+    scan_tensors,
 )
 from safetensors.torch import save_file
+from transformers import AutoConfig
 
 PACK_NAME = "draft_head.safetensors"
 # `__metadata__["format"]`, which tells this pack from another safetensors file.
 PACK_FORMAT = "gemma4_draft_head"
 
 
-def pack(drafter: Path, out_dir: Path) -> Path:
-    """Write ``draft_head.safetensors`` to ``out_dir`` and return its path."""
+def default_output_dir(model: str | None, drafter: Path) -> Path:
+    """``exports/draft_head/<name>``: one directory per variant, named for the target when given."""
+    name = model.rsplit("/", 1)[-1] if model else drafter.name
+    return REPO_ROOT / "exports" / "draft_head" / name
+
+
+def pack(drafter: Path, out_dir: Path, backbone_hidden_size: int | None = None) -> Path:
+    """Write ``draft_head.safetensors`` to ``out_dir`` and return its path.
+
+    ``backbone_hidden_size`` is the target's hidden size; when given, an assistant trained for
+    another target is refused.
+    """
     t = load_drafter(drafter)
     config = json.loads((drafter / "config.json").read_text())
     text = config["text_config"]
-    check_checkpoint(t, text)
+    check_checkpoint(t, text, backbone_hidden_size)
     num_layers = text["num_hidden_layers"]
     rope = text["rope_parameters"]
 
-    table = output_table(t)
-    vocab = table.shape[0]
-    centroids = t["masked_embedding.centroids.weight"].shape[0]
-    if centroids <= 0 or vocab % centroids != 0:
-        raise SystemExit(
-            f"vocabulary {vocab} is not divisible by the {centroids} centroids: the tokens past "
-            f"{vocab // max(centroids, 1) * max(centroids, 1)} would never be scored"
-        )
-    order = t["masked_embedding.token_ordering"].to(torch.int64)
-    if not torch.equal(order.sort().values, torch.arange(vocab)):
-        raise SystemExit("masked_embedding.token_ordering is not a permutation of the vocabulary")
-
-    tensors: list[tuple[str, torch.Tensor]] = [
-        ("embed_perm_f16", table[order].to(torch.float16)),
-        ("token_ordering_i32", order.to(torch.int32)),
-        ("centroids_f16", t["masked_embedding.centroids.weight"].to(torch.float16)),
-    ]
+    vocab, centroids, tensors = scan_tensors(t)
+    tensors.append(("centroids_f16", t["masked_embedding.centroids.weight"].to(torch.float16)))
     for name in ("pre_projection.weight", "post_projection.weight", "model.norm.weight"):
         tensors.append((name, t[name].to(torch.float16)))
     for i in range(num_layers):
@@ -125,12 +124,23 @@ def main() -> None:
         default=None,
         help="The assistant: a hub repo id or a local directory holding its safetensors",
     )
-    parser.add_argument("--output-dir", type=Path, default=REPO_ROOT / "exports" / "drafter")
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Where to write draft_head.safetensors (default: exports/draft_head/<model or "
+        "assistant name>, one directory per variant, since the pack is per variant)",
+    )
     args = parser.parse_args()
     if args.model is None and args.drafter is None:
         parser.error("pass --model (for its default assistant) or --drafter")
     drafter = resolve_drafter(args.drafter, args.model)
-    pack(drafter, args.output_dir)
+    out_dir = args.output_dir or default_output_dir(args.model, drafter)
+    # With a target named, an assistant trained for another target is refused here.
+    target_hidden = None
+    if args.model:
+        target_hidden = AutoConfig.from_pretrained(args.model).text_config.hidden_size
+    pack(drafter, out_dir, target_hidden)
 
 
 if __name__ == "__main__":
