@@ -221,13 +221,7 @@ struct LLMServer: AsyncParsableCommand {
 
         let tokenizer = try await bundle.loadTokenizer()
 
-        var additionalEosTokenIds: Set<Int32>
-        if let tokenizerDir = bundle.tokenizerPath {
-            additionalEosTokenIds = LanguageConfig.additionalStopTokenIds(
-                from: tokenizerDir, tokenizer: tokenizer)
-        } else {
-            additionalEosTokenIds = []
-        }
+        var additionalEosTokenIds = bundle.additionalStopTokenIds(tokenizer: tokenizer)
 
         // Agentic models use <|eot|> as a turn boundary. It may not appear in
         // tokenizer_config.json, so add it explicitly (skipping the main EOS).

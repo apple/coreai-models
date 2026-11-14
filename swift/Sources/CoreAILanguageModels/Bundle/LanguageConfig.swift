@@ -131,6 +131,11 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
     /// Model-specific runtime settings (`overrides`); nil for most models.
     public let overrides: LanguageOverrides?
 
+    /// Token IDs that end generation, as the export records them (`eos_token_ids`). They can
+    /// include IDs the tokenizer files don't mark as turn-ending, such as Gemma 4's
+    /// `<|tool_response>` (50). Empty when the bundle declares none.
+    public let eosTokenIds: [Int32]
+
     public init(
         tokenizer: String,
         vocabSize: Int,
@@ -141,7 +146,8 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
         states: [String: StateKind]? = nil,
         prefillChunkSize: Int? = nil,
         prefillChunkThreshold: Int? = nil,
-        overrides: LanguageOverrides? = nil
+        overrides: LanguageOverrides? = nil,
+        eosTokenIds: [Int32] = []
     ) {
         self.tokenizer = tokenizer
         self.vocabSize = vocabSize
@@ -153,6 +159,7 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
         self.prefillChunkSize = prefillChunkSize
         self.prefillChunkThreshold = prefillChunkThreshold
         self.overrides = overrides
+        self.eosTokenIds = eosTokenIds
         self.maxBatchSize = 1
     }
 
@@ -168,6 +175,7 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
         case prefillChunkThreshold = "prefill_chunk_threshold"
         case overrides
         case maxBatchSize = "max_batch_size"
+        case eosTokenIds = "eos_token_ids"
     }
 
     public init(from decoder: Swift.Decoder) throws {
@@ -192,6 +200,7 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
         self.prefillChunkThreshold = try c.decodeIfPresent(Int.self, forKey: .prefillChunkThreshold)
         self.overrides = try c.decodeIfPresent(LanguageOverrides.self, forKey: .overrides)
         self.maxBatchSize = try c.decodeIfPresent(Int.self, forKey: .maxBatchSize) ?? 1
+        self.eosTokenIds = try c.decodeIfPresent([Int32].self, forKey: .eosTokenIds) ?? []
     }
 
     // MARK: - Additional Stop Tokens
