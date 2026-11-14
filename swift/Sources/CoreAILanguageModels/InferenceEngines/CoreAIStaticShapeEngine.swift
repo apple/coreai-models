@@ -633,28 +633,29 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
 
             CLILogger.log("Graph: \(graphName), batch=\(batchSize), step=\(batchStartToken), tokens=\(tokensInBatch)")
 
-            let prepareSpan = InstrumentsProfiler.beginPrepareStep(
-                operation: "buildInputs", engine: "StaticShape")
-            let inputs = try await buildInputs(
-                graphName: graphName,
-                batchTokens: inputTokens[batchStartToken...batchEndToken],
-                batchSize: batchSize,
-                alignedStep: batchStartToken,
-                contextBucket: contextBucket
-            )
-            prepareSpan.end()
+            // `profile` ends each span when its body throws too, so a failed step leaves no span open.
+            let inputs = try await InstrumentsProfiler.profile(
+                InstrumentsProfiler.beginPrepareStep(operation: "buildInputs", engine: "StaticShape")
+            ) {
+                try await buildInputs(
+                    graphName: graphName,
+                    batchTokens: inputTokens[batchStartToken...batchEndToken],
+                    batchSize: batchSize,
+                    alignedStep: batchStartToken,
+                    contextBucket: contextBucket
+                )
+            }
 
-            let logitsSpan = InstrumentsProfiler.beginLogitsInference(
-                step: batchStartToken, tokens: tokensInBatch, engine: "StaticShape")
-
-            let fn = try loadFunction(named: graphName)
-            let desc = try functionDescriptor(for: graphName)
-
-            var outputs = try await runStaticStep(
-                function: fn, descriptor: desc, inputs: inputs, states: states)
-
-            let logitsArray = outputs.remove(Self.logitsOutputName)?.ndArray
-            logitsSpan.end()
+            let logitsArray = try await InstrumentsProfiler.profile(
+                InstrumentsProfiler.beginLogitsInference(
+                    step: batchStartToken, tokens: tokensInBatch, engine: "StaticShape")
+            ) {
+                let fn = try loadFunction(named: graphName)
+                let desc = try functionDescriptor(for: graphName)
+                var outputs = try await runStaticStep(
+                    function: fn, descriptor: desc, inputs: inputs, states: states)
+                return outputs.remove(Self.logitsOutputName)?.ndArray
+            }
 
             // Extract logits from the last token position.
             if !usePrefill, let logitsArray {
@@ -1085,9 +1086,9 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
                 throw InferenceRuntimeError.invalidState(
                     "No gather function '\(gatherName)' for batch size \(batchSize)")
             }
-            let gatherSpan = InstrumentsProfiler.beginGatherEmbeddings()
-            let gatherResult = try await runGather(tokenIDs: Array(batchTokens), batchSize: batchSize)
-            gatherSpan.end()
+            let gatherResult = try await InstrumentsProfiler.profile(InstrumentsProfiler.beginGatherEmbeddings()) {
+                try await runGather(tokenIDs: Array(batchTokens), batchSize: batchSize)
+            }
             guard var gathered = gatherResult else {
                 throw InferenceRuntimeError.invalidState("Gather '\(gatherName)' returned no output")
             }
