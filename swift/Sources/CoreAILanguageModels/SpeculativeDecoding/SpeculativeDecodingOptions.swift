@@ -50,6 +50,11 @@ package enum SpeculativeDecodingOptions {
         return drafterTopK >= 1 ? nil : "--drafter-top-k must be >= 1 (got \(drafterTopK))"
     }
 
+    /// A message when a draft-head pack is given without the draft head it runs.
+    package static func draftHeadPackProblem(hasPack: Bool, draftHead: Bool) -> String? {
+        hasPack && !draftHead ? "--draft-head-pack applies to --speculative" : nil
+    }
+
     /// Grammar-masked acceptance is defined for the argmax only, so a schema needs greedy decoding.
     package static func grammarSamplingProblem(greedy: Bool, hasSchema: Bool) -> String? {
         guard hasSchema, !greedy else { return nil }
