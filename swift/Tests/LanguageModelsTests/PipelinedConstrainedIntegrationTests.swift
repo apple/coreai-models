@@ -36,11 +36,13 @@ final class MockConstrainedEngine: InferenceEngine, ConstrainedGenerationCapable
     /// Track session lifecycle
     private(set) var getSessionCallCount = 0
     private(set) var storeSessionCallCount = 0
+    /// Sessions built because the slot held none for the request's key.
+    private(set) var sessionsCreated = 0
     private(set) var generateCallCount = 0
     private(set) var lastSchemaUsed: String?
 
-    /// The cached session handle (simulating the real cache)
-    private var cached: ConstrainedSessionHandle?
+    /// The session kept between requests, as the real engine keeps it.
+    private let sessions = ConstrainedSessionSlot()
 
     init(scriptedTokens: [Int32]) {
         self.scriptedTokens = scriptedTokens
@@ -82,21 +84,17 @@ final class MockConstrainedEngine: InferenceEngine, ConstrainedGenerationCapable
         let key = ConstrainedSessionKey(
             schema: jsonSchema, maxWhitespaceCount: maxWhitespaceCount, stopTokenIds: stopTokenIds,
             vocabularySize: vocabSize)
-        if let handle = cached, handle.key == key {
-            cached = nil
-            handle.reset()
-            return handle
+        return try sessions.checkOut(key) {
+            sessionsCreated += 1
+            let session = try ConstrainedGenerationSession(
+                jsonSchema: jsonSchema,
+                tokenizer: tokenizer,
+                vocabSize: vocabSize,
+                stopTokenIds: stopTokenIds,
+                maxWhitespaceCount: maxWhitespaceCount
+            )
+            return ConstrainedSessionHandle(session: session, tokenizer: tokenizer)
         }
-        cached = nil
-
-        let session = try ConstrainedGenerationSession(
-            jsonSchema: jsonSchema,
-            tokenizer: tokenizer,
-            vocabSize: vocabSize,
-            stopTokenIds: stopTokenIds,
-            maxWhitespaceCount: maxWhitespaceCount
-        )
-        return ConstrainedSessionHandle(session: session, tokenizer: tokenizer)
     }
 
     func generateConstrained(
@@ -134,7 +132,7 @@ final class MockConstrainedEngine: InferenceEngine, ConstrainedGenerationCapable
 
     func storeConstrainedSessionForReuse(_ handle: ConstrainedSessionHandle) {
         storeSessionCallCount += 1
-        cached = handle
+        sessions.checkIn(handle)
     }
 
     // MARK: - Mock output sequence (unused but required)
@@ -206,6 +204,7 @@ struct PipelinedConstrainedIntegrationTests {
 
         #expect(engine.getSessionCallCount == 1)
         #expect(engine.storeSessionCallCount == 1)
+        #expect(engine.sessionsCreated == 1)
 
         // Second call with same schema — should reuse cached session
         let stream2 = try await strategy.decode(
@@ -217,6 +216,7 @@ struct PipelinedConstrainedIntegrationTests {
 
         #expect(engine.getSessionCallCount == 2)
         #expect(engine.storeSessionCallCount == 2)
+        #expect(engine.sessionsCreated == 1, "the second call reuses the first call's session")
     }
 
     @Test("Schema change invalidates cache")
@@ -245,6 +245,7 @@ struct PipelinedConstrainedIntegrationTests {
         for try await _ in stream2 {}
 
         #expect(engine.getSessionCallCount == 2)
+        #expect(engine.sessionsCreated == 2, "a different schema builds its own session")
         #expect(engine.lastSchemaUsed == #"{"type": "string"}"#)
     }
 
@@ -474,14 +475,38 @@ struct ConstrainedSessionSlotTests {
         }
     }
 
-    @Test("A request with other stop tokens gets a fresh session; one with the same stops reuses it")
-    func reuseOnlyForTheSameStops() throws {
+    @Test("A request with the same stop tokens, in any order, reuses the held session")
+    func reuseForTheSameStops() throws {
+        let slot = ConstrainedSessionSlot()
+        let withNewline = try Self.checkOut(slot, stops: [2, 10])
+        slot.checkIn(withNewline)
+        #expect(try Self.checkOut(slot, stops: [10, 2]) === withNewline)
+    }
+
+    @Test("A request with other stop tokens gets a fresh session, and the held one is dropped")
+    func otherStopsEmptyTheSlot() throws {
         let slot = ConstrainedSessionSlot()
         let withNewline = try Self.checkOut(slot, stops: [2, 10])
         slot.checkIn(withNewline)
         #expect(try Self.checkOut(slot, stops: [2]) !== withNewline)
-        slot.checkIn(withNewline)
-        #expect(try Self.checkOut(slot, stops: [10, 2]) === withNewline)
+        // Nothing was checked back in, so the original stops find the slot empty too.
+        #expect(try Self.checkOut(slot, stops: [10, 2]) !== withNewline)
+    }
+
+    @Test("A matching request is handed the held session without making a new one")
+    func reuseMakesNothing() throws {
+        let slot = ConstrainedSessionSlot()
+        let held = try Self.checkOut(slot, stops: [2])
+        slot.checkIn(held)
+        let key = ConstrainedSessionKey(
+            schema: Self.schema, maxWhitespaceCount: 32, stopTokenIds: [2], vocabularySize: 256)
+        var made = false
+        let reused = try slot.checkOut(key) {
+            made = true
+            return held
+        }
+        #expect(reused === held)
+        #expect(!made)
     }
 
     @Test("Taking the session empties the slot, so two requests never share one")
