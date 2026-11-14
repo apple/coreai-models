@@ -425,6 +425,16 @@ struct ConstrainedGenerationSessionTests {
         #expect(logits[Int(TestConstants.closeBraceToken)] == -.infinity, "'}' logit should be -inf")
     }
 
+    @Test("Logits past the grammar's vocabulary, as a padded output layer has, are masked too")
+    func applyMaskMasksPaddedLogits() throws {
+        var session = try createTestSession()
+        var logits = [Float](repeating: 1.0, count: sharedToyVocab.count + 3)
+        let applied = session.applyMask(to: &logits)
+        #expect(applied)
+        #expect(logits[Int(TestConstants.openBraceToken)] == 1.0, "'{' logit should be unchanged")
+        #expect(logits[sharedToyVocab.count...].allSatisfy { $0 == -.infinity }, "padded logits should be -inf")
+    }
+
     @Test func applyMaskReturnsFalseWhenTerminated() throws {
         var session = try createTestSession()
 

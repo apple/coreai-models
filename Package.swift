@@ -175,12 +175,26 @@ let package = Package(
             publicHeadersPath: "include"
         ),
 
+        // Memory measurement shared by the CLI tools (not itself a tool)
+        .target(
+            name: "CoreAIMemoryMeasurement",
+            dependencies: [
+                "CoreAIShared",
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+            ],
+            path: "swift/Sources/Tools/CoreAIMemoryMeasurement",
+            swiftSettings: [
+                .enableUpcomingFeature("MemberImportVisibility")
+            ]
+        ),
+
         // MARK: Executable targets
 
         .executableTarget(
             name: "llm-runner",
             dependencies: [
                 "CoreAILanguageModels",
+                "CoreAIMemoryMeasurement",
                 "CoreAIShared",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ],
@@ -281,6 +295,7 @@ let package = Package(
             name: "llm-benchmark",
             dependencies: [
                 "CoreAILanguageModels",
+                "CoreAIMemoryMeasurement",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ],
             path: "swift/Sources/Tools/benchmark",

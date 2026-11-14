@@ -163,6 +163,21 @@ public struct StopSequences: Sendable {
 
 // MARK: - Decoding Strategy Protocol
 
+/// A decoded stream that reports, once it has ended, why it ended and how many tokens it took.
+///
+/// A server maps these to `finish_reason` and `usage.completion_tokens`, which it cannot infer from
+/// the results it read: a token that adds no visible text (a byte-level piece mid-character, a
+/// marker the detokenizer holds back) yields no result, and a reply cut short by a failure or a
+/// limit looks the same as one that finished.
+public protocol DecodeOutcomeReporting {
+    /// Why the stream ended: set once it returns nil or throws, nil before then.
+    var stopReason: StopReason? { get }
+
+    /// Tokens the model produced for this reply, including the one that ended it (an end-of-sequence
+    /// token or the last token of a stop sequence), which costs a forward pass like any other.
+    var tokensGenerated: Int { get }
+}
+
 /// Decoding strategies produce text + optional enrichments (logits, token IDs)
 /// from an inference engine.
 public protocol DecodingStrategy: Sendable {
