@@ -36,6 +36,8 @@ final class MockConstrainedEngine: InferenceEngine, ConstrainedGenerationCapable
     /// Track session lifecycle
     private(set) var getSessionCallCount = 0
     private(set) var storeSessionCallCount = 0
+    /// Sessions built because the slot held none for the request's key.
+    private(set) var sessionsCreated = 0
     private(set) var generateCallCount = 0
     private(set) var lastSchemaUsed: String?
 
@@ -83,6 +85,7 @@ final class MockConstrainedEngine: InferenceEngine, ConstrainedGenerationCapable
             schema: jsonSchema, maxWhitespaceCount: maxWhitespaceCount, stopTokenIds: stopTokenIds,
             vocabularySize: vocabSize)
         return try sessions.checkOut(key) {
+            sessionsCreated += 1
             let session = try ConstrainedGenerationSession(
                 jsonSchema: jsonSchema,
                 tokenizer: tokenizer,
@@ -201,6 +204,7 @@ struct PipelinedConstrainedIntegrationTests {
 
         #expect(engine.getSessionCallCount == 1)
         #expect(engine.storeSessionCallCount == 1)
+        #expect(engine.sessionsCreated == 1)
 
         // Second call with same schema — should reuse cached session
         let stream2 = try await strategy.decode(
@@ -212,6 +216,7 @@ struct PipelinedConstrainedIntegrationTests {
 
         #expect(engine.getSessionCallCount == 2)
         #expect(engine.storeSessionCallCount == 2)
+        #expect(engine.sessionsCreated == 1, "the second call reuses the first call's session")
     }
 
     @Test("Schema change invalidates cache")
@@ -240,6 +245,7 @@ struct PipelinedConstrainedIntegrationTests {
         for try await _ in stream2 {}
 
         #expect(engine.getSessionCallCount == 2)
+        #expect(engine.sessionsCreated == 2, "a different schema builds its own session")
         #expect(engine.lastSchemaUsed == #"{"type": "string"}"#)
     }
 
