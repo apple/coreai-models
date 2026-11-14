@@ -148,16 +148,18 @@ final class ModelResources: ResourceManaging {
     private static func loadEngine(
         _ configuration: CoreAILanguageModel.CoreAIExecutor.Configuration
     ) async throws -> any InferenceEngine {
-        let modelLoadSpan = InstrumentsProfiler.beginModelLoad(name: configuration.modelIdentifier)
-        let runner = try CoreAIRunner(
-            contentsOf: configuration.url,
-            variant: configuration.variant,
-            kvCacheStrategy: configuration.kvCacheStrategy,
-            prefillChunkSize: configuration.prefillChunkSize,
-            prefillChunkThreshold: configuration.prefillChunkThreshold
-        )
-        let engine = try await runner.makeInferenceEngine()
-        modelLoadSpan.end()
+        let engine = try await InstrumentsProfiler.profile(
+            InstrumentsProfiler.beginModelLoad(name: configuration.modelIdentifier)
+        ) {
+            let runner = try CoreAIRunner(
+                contentsOf: configuration.url,
+                variant: configuration.variant,
+                kvCacheStrategy: configuration.kvCacheStrategy,
+                prefillChunkSize: configuration.prefillChunkSize,
+                prefillChunkThreshold: configuration.prefillChunkThreshold
+            )
+            return try await runner.makeInferenceEngine()
+        }
 
         try await engine.warmup(queryLength: 1, sampling: nil)
         return engine
