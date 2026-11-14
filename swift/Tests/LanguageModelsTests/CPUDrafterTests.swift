@@ -26,32 +26,22 @@ struct CPUDrafterTests {
 
     // MARK: - Kernels
 
-    @Test("An fp16 projection matches a Double matrix-vector product", arguments: [(5, 11), (3, 64), (1024, 300)])
-    func fp16Projection(m: Int, n: Int) {
-        let w = (0..<(m * n)).map { Float16(Self.value($0, 1)) }
-        let x = (0..<n).map { Self.value($0, 2) }
-        var y = [Float](repeating: 0, count: m)
-        w.withUnsafeBufferPointer { CPUDraftHead.mv(.f16($0.baseAddress!), x, m: m, n: n, into: &y) }
-        for r in 0..<m {
-            let ref = (0..<n).reduce(0.0) { $0 + Double(w[r * n + $1]) * Double(x[$1]) }
-            #expect(close(y[r], ref), "row \(r)")
-        }
-    }
-
-    @Test("An int8 projection applies each row's scale", arguments: [(4, 9), (1024, 256)])
-    func int8Projection(m: Int, n: Int) {
-        let q = (0..<(m * n)).map { Int8(truncatingIfNeeded: ($0 * 37) % 255 - 127) }
-        let scale = (0..<m).map { Float16(0.01 * Float($0 % 7 + 1)) }
-        let x = (0..<n).map { Self.value($0, 3) }
-        var y = [Float](repeating: 0, count: m)
-        q.withUnsafeBufferPointer { qp in
-            scale.withUnsafeBufferPointer { sp in
-                CPUDraftHead.mv(.i8(qp.baseAddress!, scale: sp.baseAddress!), x, m: m, n: n, into: &y)
+    @Test("A projection matches a Double matrix-vector product")
+    func projection() throws {
+        let (url, p) = try headPack()
+        let pack = try DraftPack(safetensors: url, role: .head)
+        for name in ["model.layers.0.self_attn.q_proj.weight", "model.layers.2.mlp.down_proj.weight"] {
+            let entry = p.tensors.first { $0.name == name }!
+            let (m, n) = (entry.shape[0], entry.shape[1])
+            let projection = try CPUDraftHead.Projection(name, in: pack)
+            let x = (0..<n).map { Self.value($0, 2) }
+            var y = [Float](repeating: 0, count: m)
+            projection.apply(x, into: &y)
+            let w = entry.values.map { Double(Float16($0)) }
+            for r in 0..<m {
+                let ref = (0..<n).reduce(0.0) { $0 + w[r * n + $1] * Double(x[$1]) }
+                #expect(close(y[r], ref), "\(name) row \(r)")
             }
-        }
-        for r in 0..<m {
-            let dot = (0..<n).reduce(0.0) { $0 + Double(q[r * n + $1]) * Double(x[$1]) }
-            #expect(close(y[r], dot * Double(scale[r])), "row \(r)")
         }
     }
 
@@ -226,16 +216,11 @@ struct CPUDrafterTests {
     /// (rounded to the stored type), for comparison with ``CPUDraftHead/step(embeds:kv:position:)``.
     private func referenceStep(
         _ p: Pack, embeds: [Double], sliding: (k: [Double], v: [Double], rows: Int),
-        full: (k: [Double], v: [Double], rows: Int), position: Int, int8Attention: Bool
+        full: (k: [Double], v: [Double], rows: Int), position: Int
     ) -> (x: [Double], logits: [Double], hidden: [Double]) {
         func t(_ name: String) -> [Double] {
             let e = p.tensors.first { $0.name == name }!
-            switch e.dtype {
-            case "int8":
-                let scale = Double(Float16(0.004))
-                return e.values.map { Double(Int8(clamping: Int(($0 * 250).rounded()))) * scale }
-            default: return e.values.map { Double(Float16($0)) }
-            }
+            return e.values.map { Double(Float16($0)) }
         }
         func mv(_ name: String, _ x: [Double]) -> [Double] {
             let w = t(name)
@@ -298,11 +283,11 @@ struct CPUDrafterTests {
         return (x, mv("centroids_f16", x), mv("post_projection.weight", x))
     }
 
-    @Test("A draft step matches the reference layers, with fp16 or int8 attention", arguments: [false, true])
-    func stepMatchesReference(int8Attention: Bool) throws {
-        let (url, p) = try headPack(int8Attention: int8Attention)
+    @Test("A draft step matches the reference layers")
+    func stepMatchesReference() throws {
+        let (url, p) = try headPack()
         let pack = try DraftPack(safetensors: url, role: .head)
-        let head = CPUDraftHead(pack: pack, backboneHidden: G.backbone)
+        let head = try CPUDraftHead(pack: pack, backboneHidden: G.backbone)
         let embeds = (0..<(2 * G.backbone)).map { Self.value($0, 7) }
         // One K/V head each: the sliding cache's rows are `headDim` wide, the full cache's `fullHeadDim`.
         let sliding = (
@@ -330,7 +315,7 @@ struct CPUDrafterTests {
         let ref = referenceStep(
             p, embeds: embeds.map(Double.init),
             sliding: (sliding.k.map(Double.init), sliding.v.map(Double.init), 3),
-            full: (full.k.map(Double.init), full.v.map(Double.init), 5), position: 6, int8Attention: int8Attention)
+            full: (full.k.map(Double.init), full.v.map(Double.init), 5), position: 6)
         for i in 0..<G.hidden { #expect(close(got.x[i], ref.x[i]), "x[\(i)]") }
         for i in 0..<G.centroids { #expect(close(got.centroidLogits[i], ref.logits[i]), "centroid \(i)") }
         for i in 0..<G.backbone { #expect(close(got.hidden[i], ref.hidden[i]), "hidden[\(i)]") }
@@ -359,6 +344,13 @@ struct CPUDrafterTests {
         let (url, _) = try headPack(dropping: "model.layers.1.mlp.up_proj.weight")
         let message = loadError { _ = try DraftPack(safetensors: url, role: .head) }
         #expect(message.contains("model.layers.1.mlp.up_proj.weight") && message.contains("export_draft_pack.py"))
+    }
+
+    @Test("A head pack with int8 projections is rejected: the runtime reads fp16 weights")
+    func int8Rejected() throws {
+        let (url, _) = try headPack(int8Attention: true)
+        let message = loadError { _ = try DraftPack(safetensors: url, role: .head) }
+        #expect(message.contains("q_proj.weight") && message.contains("float16"))
     }
 
     @Test("A head pack without its RoPE parameters is rejected")

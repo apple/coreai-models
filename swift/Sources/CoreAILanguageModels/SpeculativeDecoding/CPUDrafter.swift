@@ -6,26 +6,55 @@
 import Accelerate
 import CoreAIShared
 import Foundation
-import simd
 
 // The Gemma 4 MTP/EAGLE draft head run entirely on the CPU, from the pack
 // `models/gemma4/export_draft_pack.py` writes. It computes what `StaticShapeDrafter` runs as a
 // static-shape program, and drafts the same tokens up to rounding, so the target's accelerator is
 // left to the target alone.
 
-/// The draft head's arithmetic over a ``DraftPack`` loaded with ``DraftPack/Role/head``: fp16 or
-/// int8 weights, fp32 activations and accumulators.
+/// The draft head's arithmetic over a ``DraftPack`` loaded with ``DraftPack/Role/head``: each
+/// projection is a BNNSGraph, the attention, norms and rotary tables are Accelerate (BLAS and vDSP)
+/// over fp32 activations.
 struct CPUDraftHead {
-    /// A projection's weights, resolved once at load: fp16, or int8 with an fp16 scale per row.
-    enum Projection {
-        case f16(UnsafePointer<Float16>)
-        case i8(UnsafePointer<Int8>, scale: UnsafePointer<Float16>)
+    /// One projection `y = W · x` as a BNNSGraph, built once at load. BNNSGraph takes fp32
+    /// weights only, so the pack's fp16 weights are widened here.
+    final class Projection {
+        let rows: Int
+        let columns: Int
+        private let context: BNNSGraph.Context
+        /// Argument positions of the output and the input.
+        private let outputPosition: Int
+        private let inputPosition: Int
 
-        init(_ name: String, in pack: DraftPack) {
-            if let q = pack.i8(name) {
-                self = .i8(q, scale: pack.f16(name + ".scale"))
-            } else {
-                self = .f16(pack.f16(name))
+        init(_ name: String, in pack: DraftPack) throws {
+            let shape = pack.shape(name)
+            precondition(shape.count == 2, "projection '\(name)' is not a matrix")
+            let (m, n) = (shape[0], shape[1])
+            let w = pack.f16(name)
+            let weights = (0..<(m * n)).map { Float(w[$0]) }
+            context = try BNNSGraph.makeContext { builder in
+                let x = builder.argument(name: "x", dataType: Float.self, shape: [1, n])
+                return [x.matmul(other: builder.constant(values: weights, shape: [m, n]), transposeOther: true)]
+            }
+            inputPosition = context.argumentPosition(argument: "x")
+            outputPosition = 1 - inputPosition
+            rows = m
+            columns = n
+        }
+
+        /// `y = W · x`; `x` holds `columns` values and `y` receives `rows`.
+        func apply(_ x: [Float], into y: inout [Float]) {
+            precondition(x.count >= columns && y.count >= rows, "projection reads \(columns) values into \(rows)")
+            var input = x
+            input.withUnsafeMutableBufferPointer { xp in
+                y.withUnsafeMutableBufferPointer { yp in
+                    var arguments = [xp, xp]
+                    arguments[outputPosition] = yp
+                    arguments[inputPosition] = xp
+                    // The graph's shapes are fixed at build and its buffers are the caller's, so
+                    // execution cannot fail for a reason the caller could act on.
+                    try! context.executeFunction(arguments: arguments)
+                }
             }
         }
     }
@@ -55,7 +84,7 @@ struct CPUDraftHead {
     let invFreqSliding, invFreqFull: [Float]
     let centroidCount: Int
 
-    init(pack: DraftPack, backboneHidden: Int) {
+    init(pack: DraftPack, backboneHidden: Int) throws {
         let index = pack.index
         // `DraftPack.require(.head, ...)` has checked that every value is present and positive.
         hidden = index.hidden!
@@ -65,7 +94,7 @@ struct CPUDraftHead {
         ffn = index.ffn!
         centroidCount = index.centroids
         self.backboneHidden = backboneHidden
-        layers = (0..<index.layers).map { layer in
+        layers = try (0..<index.layers).map { layer in
             let p = "model.layers.\(layer)."
             return Layer(
                 inputNorm: pack.f16(p + "input_layernorm.weight"),
@@ -73,16 +102,16 @@ struct CPUDraftHead {
                 postAttentionNorm: pack.f16(p + "post_attention_layernorm.weight"),
                 preFeedforwardNorm: pack.f16(p + "pre_feedforward_layernorm.weight"),
                 postFeedforwardNorm: pack.f16(p + "post_feedforward_layernorm.weight"),
-                q: Projection(p + "self_attn.q_proj.weight", in: pack),
-                o: Projection(p + "self_attn.o_proj.weight", in: pack),
-                gate: Projection(p + "mlp.gate_proj.weight", in: pack),
-                up: Projection(p + "mlp.up_proj.weight", in: pack),
-                down: Projection(p + "mlp.down_proj.weight", in: pack),
+                q: try Projection(p + "self_attn.q_proj.weight", in: pack),
+                o: try Projection(p + "self_attn.o_proj.weight", in: pack),
+                gate: try Projection(p + "mlp.gate_proj.weight", in: pack),
+                up: try Projection(p + "mlp.up_proj.weight", in: pack),
+                down: try Projection(p + "mlp.down_proj.weight", in: pack),
                 scalar: Float(pack.f16(p + "layer_scalar")[0]))
         }
-        preProjection = Projection("pre_projection.weight", in: pack)
-        postProjection = Projection("post_projection.weight", in: pack)
-        centroids = Projection("centroids_f16", in: pack)
+        preProjection = try Projection("pre_projection.weight", in: pack)
+        postProjection = try Projection("post_projection.weight", in: pack)
+        centroids = try Projection("centroids_f16", in: pack)
         finalNorm = pack.f16("model.norm.weight")
         invFreqSliding = Self.inverseFrequencies(headDim: headDim, theta: index.slidingTheta!, partial: 1)
         invFreqFull = Self.inverseFrequencies(
@@ -160,113 +189,10 @@ struct CPUDraftHead {
 
     // MARK: - Kernels
 
-    /// `y = W · x` for `W` of `m` rows by `n` columns, fp32 accumulators.
+    /// `y = W · x` for `W` of `m` rows by `n` columns.
     static func mv(_ w: Projection, _ x: [Float], m: Int, n: Int, into y: inout [Float]) {
-        precondition(x.count >= n && y.count >= m, "mv reads \(n) values into \(m)")
-        x.withUnsafeBufferPointer { xp in
-            y.withUnsafeMutableBufferPointer { yp in
-                let xb = xp.baseAddress!
-                let out = yp.baseAddress!
-                switch w {
-                case .f16(let weights):
-                    forRows(m, n) { rows in
-                        for r in rows { out[r] = dotF16(UnsafeRawPointer(weights + r * n), xb, n: n) }
-                    }
-                case .i8(let weights, let scale):
-                    forRows(m, n) { rows in
-                        for r in rows { out[r] = dotI8(UnsafeRawPointer(weights + r * n), xb, n: n) * Float(scale[r]) }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Threads a large matrix-vector product is split across. A phone has two performance cores;
-    /// splitting further puts rows on efficiency cores, and the product waits for the slowest.
-    static let rowThreads = 2
-
-    /// Runs `body` over `0..<m`, in ``rowThreads`` contiguous chunks when the matrix is large enough
-    /// for the split to pay for its dispatch.
-    @inline(__always)
-    static func forRows(_ m: Int, _ n: Int, _ body: (Range<Int>) -> Void) {
-        guard m * n >= 1 << 18, m >= rowThreads else {
-            body(0..<m)
-            return
-        }
-        let chunk = (m + rowThreads - 1) / rowThreads
-        DispatchQueue.concurrentPerform(iterations: rowThreads) { c in
-            let rows = (c * chunk)..<min(m, (c + 1) * chunk)
-            if !rows.isEmpty { body(rows) }
-        }
-    }
-
-    /// `n` fp16 weights at `row` dotted with `x`. Four independent accumulators keep each fused
-    /// multiply-add from waiting on the one before it. The weights widen through `simd_float`: the
-    /// generic `SIMD8<Float>(_:)` initializer converts lane by lane and made a step about ten times
-    /// slower on a Mac.
-    @inline(__always)
-    static func dotF16(_ row: UnsafeRawPointer, _ x: UnsafePointer<Float>, n: Int) -> Float {
-        var a0 = SIMD8<Float>()
-        var a1 = SIMD8<Float>()
-        var a2 = SIMD8<Float>()
-        var a3 = SIMD8<Float>()
-        let xr = UnsafeRawPointer(x)
-        var i = 0
-        while i + 32 <= n {
-            a0 +=
-                simd_float(row.loadUnaligned(fromByteOffset: i * 2, as: SIMD8<Float16>.self))
-                * xr.loadUnaligned(fromByteOffset: i * 4, as: SIMD8<Float>.self)
-            a1 +=
-                simd_float(row.loadUnaligned(fromByteOffset: i * 2 + 16, as: SIMD8<Float16>.self))
-                * xr.loadUnaligned(fromByteOffset: i * 4 + 32, as: SIMD8<Float>.self)
-            a2 +=
-                simd_float(row.loadUnaligned(fromByteOffset: i * 2 + 32, as: SIMD8<Float16>.self))
-                * xr.loadUnaligned(fromByteOffset: i * 4 + 64, as: SIMD8<Float>.self)
-            a3 +=
-                simd_float(row.loadUnaligned(fromByteOffset: i * 2 + 48, as: SIMD8<Float16>.self))
-                * xr.loadUnaligned(fromByteOffset: i * 4 + 96, as: SIMD8<Float>.self)
-            i += 32
-        }
-        var acc = ((a0 + a1) + (a2 + a3)).sum()
-        let w = row.assumingMemoryBound(to: Float16.self)
-        while i < n {
-            acc += Float(w[i]) * x[i]
-            i += 1
-        }
-        return acc
-    }
-
-    /// `n` int8 weights at `row` dotted with `x`, before the row's scale.
-    @inline(__always)
-    static func dotI8(_ row: UnsafeRawPointer, _ x: UnsafePointer<Float>, n: Int) -> Float {
-        var a0 = SIMD8<Float>()
-        var a1 = SIMD8<Float>()
-        var a2 = SIMD8<Float>()
-        var a3 = SIMD8<Float>()
-        let xr = UnsafeRawPointer(x)
-        var i = 0
-        while i + 32 <= n {
-            a0 +=
-                simd_float(row.loadUnaligned(fromByteOffset: i, as: SIMD8<Int8>.self))
-                * xr.loadUnaligned(fromByteOffset: i * 4, as: SIMD8<Float>.self)
-            a1 +=
-                simd_float(row.loadUnaligned(fromByteOffset: i + 8, as: SIMD8<Int8>.self))
-                * xr.loadUnaligned(fromByteOffset: i * 4 + 32, as: SIMD8<Float>.self)
-            a2 +=
-                simd_float(row.loadUnaligned(fromByteOffset: i + 16, as: SIMD8<Int8>.self))
-                * xr.loadUnaligned(fromByteOffset: i * 4 + 64, as: SIMD8<Float>.self)
-            a3 +=
-                simd_float(row.loadUnaligned(fromByteOffset: i + 24, as: SIMD8<Int8>.self))
-                * xr.loadUnaligned(fromByteOffset: i * 4 + 96, as: SIMD8<Float>.self)
-            i += 32
-        }
-        var acc = ((a0 + a1) + (a2 + a3)).sum()
-        let w = row.assumingMemoryBound(to: Int8.self)
-        while i < n {
-            acc += Float(w[i]) * x[i]
-            i += 1
-        }
-        return acc
+        precondition(w.rows == m && w.columns == n, "projection is \(w.rows)x\(w.columns), not \(m)x\(n)")
+        w.apply(x, into: &y)
     }
 
     /// RMS-normalizes `n` values at `x` in place and applies the fp16 gain `g`.
@@ -428,7 +354,7 @@ package final class CPUDrafter: DrafterEngine, @unchecked Sendable {
                 "\(url.lastPathComponent) covers a vocabulary of \(index.vocab), but the target's is \(vocabSize)")
         }
         self.pack = pack
-        head = CPUDraftHead(pack: pack, backboneHidden: backboneHiddenSize)
+        head = try CPUDraftHead(pack: pack, backboneHidden: backboneHiddenSize)
         scanner = DraftScan.Scanner(pack: pack, topK: try DraftScan.topK(requested: topK, centroids: index.centroids))
         slidingWindow = index.slidingWindow!
         self.fullAttentionWindow = fullAttentionWindow

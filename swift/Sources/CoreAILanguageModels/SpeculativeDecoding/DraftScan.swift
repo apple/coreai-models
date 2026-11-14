@@ -335,14 +335,8 @@ final class DraftPack: @unchecked Sendable {
         try tensor("pre_projection.weight", "float16", shape: [hidden, nil])
         try tensor("post_projection.weight", "float16", shape: [nil, hidden])
         try tensor("model.norm.weight", "float16", shape: [hidden])
-        // A projection is fp16, or int8 with an fp16 scale per output row.
         func projection(_ tensorName: String, rows: Int, columns: Int) throws {
-            if index.tensors[tensorName]?.dtype == "int8" {
-                try tensor(tensorName, "int8", shape: [rows, columns])
-                try tensor(tensorName + ".scale", "float16", shape: [rows])
-            } else {
-                try tensor(tensorName, "float16", shape: [rows, columns])
-            }
+            try tensor(tensorName, "float16", shape: [rows, columns])
         }
         // The last layer attends to the full cache, the others to the sliding one.
         for layer in 0..<index.layers {
