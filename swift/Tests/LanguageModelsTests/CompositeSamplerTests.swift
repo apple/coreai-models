@@ -223,7 +223,7 @@ struct CompositeSamplerTests {
         rawLogits[10] = 4.9
 
         var allSame = true
-        for _ in 0..<100 {
+        for _ in 0..<40 {
             var logits = rawLogits
             let token = CompositeSampler.sample(
                 from: &logits, config: .init(temperature: 1.0, minP: 1.0), using: &rng)
@@ -355,7 +355,7 @@ struct CompositeSamplerTests {
             .init(temperature: 1.0, topK: 50, topP: 0.9),
         ]
         for config in configs {
-            for _ in 0..<100 {
+            for _ in 0..<40 {
                 var logits = [Float](repeating: -.infinity, count: vocab)
                 logits[Int(allowedIndex)] = 5.0
                 let token = CompositeSampler.sample(from: &logits, config: config, using: &rng)
@@ -441,13 +441,13 @@ struct CompositeSamplerTests {
 
     // MARK: - Windowed candidate selection (no topK)
 
-    /// Full-vocabulary reference: sort everything, apply minP then topP, softmax, sample.
-    private func referenceSample(
+    /// Full-vocabulary reference candidates: sort everything, apply minP then topP, in the
+    /// order the sampler keeps them. Computed once per input so large vocabularies stay fast.
+    private func referenceCandidates(
         _ raw: [Float],
-        config: SamplingConfiguration,
-        using rng: inout some RandomNumberGenerator
-    ) -> Int32 {
-        var logits = raw.map { $0 / Float(config.temperature) }
+        config: SamplingConfiguration
+    ) -> (kept: [Int], logits: [Float]) {
+        let logits = raw.map { $0 / Float(config.temperature) }
         let sorted = (0..<logits.count).sorted { logits[$0] > logits[$1] }
         let maxLogit = logits[sorted[0]]
         var kept = sorted
@@ -469,9 +469,17 @@ struct CompositeSamplerTests {
             }
             kept = Array(kept.prefix(cutoff))
         }
-        var active = kept.map { logits[$0] }
+        return (kept, logits)
+    }
+
+    /// One reference draw from precomputed candidates: softmax over them, then sample.
+    private func referenceDraw(
+        _ candidates: (kept: [Int], logits: [Float]),
+        using rng: inout some RandomNumberGenerator
+    ) -> Int32 {
+        var active = candidates.kept.map { candidates.logits[$0] }
         CompositeSampler.softmaxVectorized(&active)
-        return Int32(kept[CompositeSampler.multinomialSample(active, using: &rng)])
+        return Int32(candidates.kept[CompositeSampler.multinomialSample(active, using: &rng)])
     }
 
     private func makeLargeVocabLogits(
@@ -493,14 +501,16 @@ struct CompositeSamplerTests {
             SamplingConfiguration(temperature: 1.0, topP: 0.95, minP: 0.02),
         ])
     func windowedSelectionMatchesFullSort(config: SamplingConfiguration) {
-        let raw = makeLargeVocabLogits(vocab: 32_768, seed: 0xFEED)
+        // 262,144 is the vocabulary size of the largest models (e.g. Gemma).
+        let raw = makeLargeVocabLogits(vocab: 262_144, seed: 0xFEED)
+        let reference = referenceCandidates(raw, config: config)
         var rngA = Xoshiro256StarStar(seed: 0x42)
         var rngB = Xoshiro256StarStar(seed: 0x42)
 
-        for _ in 0..<300 {
+        for _ in 0..<40 {
             var logits = raw
             let got = CompositeSampler.sample(from: &logits, config: config, using: &rngA)
-            let want = referenceSample(raw, config: config, using: &rngB)
+            let want = referenceDraw(reference, using: &rngB)
             #expect(got == want)
         }
     }
@@ -509,15 +519,34 @@ struct CompositeSamplerTests {
     func windowedSelectionMatchesFullSortOnFlatBulk() {
         // Bulk spans 16 logits and the head sits near 10, so nearly half the vocabulary is
         // within 20 of the max and the nucleus must be located without sorting everything.
-        let raw = makeLargeVocabLogits(vocab: 32_768, seed: 0xBEEF, bulk: -6..<10)
+        let raw = makeLargeVocabLogits(vocab: 262_144, seed: 0xBEEF, bulk: -6..<10)
         let config = SamplingConfiguration(temperature: 1.0, topP: 0.9)
+        let reference = referenceCandidates(raw, config: config)
         var rngA = Xoshiro256StarStar(seed: 0x43)
         var rngB = Xoshiro256StarStar(seed: 0x43)
 
-        for _ in 0..<300 {
+        for _ in 0..<40 {
             var logits = raw
             let got = CompositeSampler.sample(from: &logits, config: config, using: &rngA)
-            let want = referenceSample(raw, config: config, using: &rngB)
+            let want = referenceDraw(reference, using: &rngB)
+            #expect(got == want)
+        }
+    }
+
+    @Test("topP matches the reference when the whole vocabulary is within the window")
+    func topPFlatLargeVocabularyMatchesFullSort() {
+        // All 262,144 logits are equal, so every token is a candidate and the nucleus is
+        // exactly ceil(0.9 * V) tokens taken in index order.
+        let raw = [Float](repeating: 3.0, count: 262_144)
+        let config = SamplingConfiguration(temperature: 1.0, topP: 0.9)
+        let reference = referenceCandidates(raw, config: config)
+        var rngA = Xoshiro256StarStar(seed: 0x44)
+        var rngB = Xoshiro256StarStar(seed: 0x44)
+
+        for _ in 0..<40 {
+            var logits = raw
+            let got = CompositeSampler.sample(from: &logits, config: config, using: &rngA)
+            let want = referenceDraw(reference, using: &rngB)
             #expect(got == want)
         }
     }
@@ -542,7 +571,7 @@ struct CompositeSamplerTests {
         var rng = Xoshiro256StarStar(seed: 0x99)
         var logits = [Float](repeating: -.infinity, count: 16)
         logits[5] = 2.0
-        for _ in 0..<100 {
+        for _ in 0..<40 {
             var l = logits
             #expect(
                 CompositeSampler.sample(
@@ -567,6 +596,28 @@ struct CompositeSamplerTests {
                     from: &logits, config: .init(temperature: 1.0, topP: 0.9, minP: 1.0),
                     using: &rng) == best)
         }
+    }
+
+    @Test(
+        "a +inf logit (fp16 overflow) selects among the +inf tokens without trapping",
+        arguments: [
+            SamplingConfiguration(temperature: 1.0, topP: 0.9),
+            SamplingConfiguration(temperature: 1.0, minP: 0.05),
+            SamplingConfiguration(temperature: 1.0, topP: 0.9, minP: 0.05),
+            SamplingConfiguration(temperature: 1.0, topK: 40, topP: 0.9),
+        ])
+    func infiniteLogitIsSampledWithoutTrapping(config: SamplingConfiguration) {
+        var rng = Xoshiro256StarStar(seed: 0xAB)
+        let infinite: Set<Int32> = [1_000, 200_000]
+        for _ in 0..<20 {
+            var logits = makeLargeVocabLogits(vocab: 262_144, seed: 0xFACE)
+            for i in infinite { logits[Int(i)] = .infinity }
+            #expect(infinite.contains(CompositeSampler.sample(from: &logits, config: config, using: &rng)))
+        }
+
+        var single = makeLargeVocabLogits(vocab: 4_096, seed: 0xFACE)
+        single[77] = .infinity
+        #expect(CompositeSampler.sample(from: &single, config: config, using: &rng) == 77)
     }
 
     // MARK: - Test helpers

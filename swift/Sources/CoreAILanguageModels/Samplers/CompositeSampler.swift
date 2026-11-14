@@ -278,7 +278,7 @@ public struct CompositeSampler {
 
         let sortedIndices: [Int]
         // Softmax denominator over the candidates, when the selection already computed it.
-        var candidateSumExp: Float?
+        var candidateSumExp: Double?
         if let k = topK {
             sortedIndices = topIndicesByLogit(logits, k: min(k, vocabSize))
         } else {
@@ -291,6 +291,11 @@ public struct CompositeSampler {
         let maxLogit = logits[sortedIndices[0]]
         // All-masked degenerate input.
         guard maxLogit > -.infinity else { return [] }
+        // A +inf logit (e.g. fp16 overflow) dominates every finite one, so only the +inf tokens
+        // can be sampled. The exp(logit - max) arithmetic below would be NaN.
+        guard maxLogit < .infinity else {
+            return Array(sortedIndices.prefix { logits[$0] == .infinity })
+        }
 
         // Apply minP in logit space: keep tokens where logit >= maxLogit + log(minP).
         // This is equivalent to P(token) >= minP * P(best) in probability space.
@@ -305,21 +310,23 @@ public struct CompositeSampler {
 
         // Compute exp(logit - max) per candidate (only K entries, not V).
         var expValues = [Float](repeating: 0, count: filtered.count)
-        var sumExp: Float = 0
+        // Accumulate in Double: over a large nucleus the Float sum drifts by about 1e-3, which
+        // moves the cutoff by tens of tokens.
+        var sumExp: Double = 0
         for (i, idx) in filtered.enumerated() {
             let e = expf(logits[idx] - maxLogit)
             expValues[i] = e
-            sumExp += e
+            sumExp += Double(e)
         }
         // `filtered` may be a trimmed prefix; the denominator must cover every candidate.
         if let total = candidateSumExp { sumExp = total }
         let invSumExp = 1.0 / max(sumExp, .leastNormalMagnitude)
 
-        var cumProb: Float = 0
+        var cumProb: Double = 0
         var cutoff = filtered.count
         for i in 0..<filtered.count {
-            cumProb += expValues[i] * invSumExp
-            if cumProb >= p {
+            cumProb += Double(expValues[i]) * invSumExp
+            if cumProb >= Double(p) {
                 cutoff = i + 1
                 break
             }
@@ -328,10 +335,15 @@ public struct CompositeSampler {
         return Array(filtered.prefix(cutoff))
     }
 
-    /// Logit distance below the maximum beyond which a token is ignored when `topP` is set.
-    /// `exp(-20)` is about 2e-9 of the best token's probability, so dropping everything below
-    /// it cannot change the nucleus in any realistic distribution.
-    private static let topPLogitWindow: Float = 20
+    /// Margin added to `ln(vocabSize)` to get the logit distance below the maximum beyond which
+    /// a token is ignored when `topP` is set.
+    ///
+    /// Each ignored token has at most `exp(-(ln V + margin))` of the best token's mass, so all
+    /// of them together carry at most `exp(-margin)`: about 1.5e-8 for a margin of 18, below the
+    /// Float32 resolution of the cumulative sum (2^-24, about 6e-8). The bound holds for any
+    /// vocabulary size and any distribution; a fixed distance would not, because the ignored
+    /// tail grows with the vocabulary.
+    private static let topPTailMargin: Float = 18
 
     /// Number of logit buckets used to locate the end of the nucleus.
     private static let nucleusBucketCount = 2048
@@ -339,7 +351,7 @@ public struct CompositeSampler {
     /// Returns the tokens that can survive minP / topP, sorted descending by logit, plus the
     /// softmax denominator (relative to the max logit) over all candidates when topP is set.
     ///
-    /// Candidates are tokens with logit >= `max - 20` (topP) and >= `max + log(minP)` (minP);
+    /// Candidates are tokens with logit >= `max - (ln V + 18)` (topP) and >= `max + log(minP)` (minP);
     /// the tighter bound wins. With minP alone the candidates are sorted directly.
     ///
     /// With topP the candidate set can still be large (a flat distribution), so the end of the
@@ -355,16 +367,22 @@ public struct CompositeSampler {
         _ logits: [Float],
         topP: Float?,
         minP: Float?
-    ) -> (indices: [Int], sumExp: Float?) {
+    ) -> (indices: [Int], sumExp: Double?) {
         guard !logits.isEmpty else { return ([], nil) }
 
         var maxLogit: Float = 0
         vDSP_maxv(logits, 1, &maxLogit, vDSP_Length(logits.count))
         // All-masked degenerate input.
         guard maxLogit > -.infinity else { return ([], nil) }
+        // +inf (e.g. fp16 overflow): only the +inf tokens can be sampled. Returning here also
+        // keeps `inf - inf` out of the bucket arithmetic, where it would trap in `Int(_:)`.
+        guard maxLogit < .infinity else {
+            let infinite = logits.indices.filter { logits[$0] == .infinity }
+            return (infinite, nil)
+        }
 
         var cutoff = -Float.infinity
-        if topP != nil { cutoff = maxLogit - topPLogitWindow }
+        if topP != nil { cutoff = maxLogit - (logf(Float(logits.count)) + topPTailMargin) }
         if let m = minP { cutoff = max(cutoff, maxLogit + logf(m)) }
 
         guard let p = topP else {
@@ -407,7 +425,7 @@ public struct CompositeSampler {
         for (i, v) in logits.enumerated() where v >= cutoff && bucket(v) <= lastBucket {
             candidates.append(i)
         }
-        return (candidates.sorted { logits[$0] > logits[$1] }, Float(total))
+        return (candidates.sorted { logits[$0] > logits[$1] }, total)
     }
 
     /// Returns the K indices with the largest logit values, sorted descending by logit.
