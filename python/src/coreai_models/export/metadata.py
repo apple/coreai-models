@@ -296,6 +296,26 @@ _METADATA: dict[str, AIModelMetadataFields] = {
             "Source: https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct"
         ),
     ),
+    "HuggingFaceTB/SmolLM3-3B": AIModelMetadataFields(
+        author="HuggingFace",
+        license="Apache-2.0",
+        model_description=(
+            "SmolLM3-3B is a 3B-parameter instruction-tuned causal language model "
+            "from HuggingFace, featuring hybrid NoPE/RoPE attention and "
+            "long-context support. "
+            "Source: https://huggingface.co/HuggingFaceTB/SmolLM3-3B"
+        ),
+    ),
+    "HuggingFaceTB/SmolLM3-3B-Base": AIModelMetadataFields(
+        author="HuggingFace",
+        license="Apache-2.0",
+        model_description=(
+            "SmolLM3-3B-Base is a 3B-parameter base causal language model from "
+            "HuggingFace, featuring hybrid NoPE/RoPE attention and long-context "
+            "support. "
+            "Source: https://huggingface.co/HuggingFaceTB/SmolLM3-3B-Base"
+        ),
+    ),
     "openai/gpt-oss-20b": AIModelMetadataFields(
         author="OpenAI",
         license="Apache-2.0",

@@ -68,3 +68,16 @@ def test_preset_names_are_deterministic_and_sorted() -> None:
     expected = sorted(set(MACOS_PRESETS) | set(IOS_PRESETS))
     assert list_presets() == expected
     assert list_presets() == ALL_PRESET_NAMES
+
+
+def test_smollm3_mixed_compression_yaml_loads_untie_word_embeddings() -> None:
+    preset = lookup_preset("smollm3-3b", model_type="llm", variant="macOS")
+    assert preset is not None
+    assert preset.compression_config == "models/smollm3/smollm3_mixed_4bit_8bit.yaml"
+    compression, config_obj = resolve_compression(
+        "macOS", registry_compression_config=preset.compression_config
+    )
+    assert compression == "smollm3_mixed_4bit_8bit"
+    assert isinstance(config_obj, dict)
+    assert config_obj.get("untie_word_embeddings") is True
+    assert "lm_head" in config_obj["module_name_configs"]

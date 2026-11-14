@@ -46,6 +46,15 @@ class Attention(nn.Module):
         assert is_default_rope_scaling(config), f"unsupported rope_scaling: {config.rope_scaling}"
         self.rope = initialize_rope(base=resolve_rope_theta(config))
 
+        no_rope_layers = getattr(config, "no_rope_layers", None)
+        no_rope_interval = getattr(config, "no_rope_layer_interval", None)
+        if no_rope_layers is not None and layer_idx < len(no_rope_layers):
+            self.use_rope = bool(no_rope_layers[layer_idx])
+        elif no_rope_interval is not None and no_rope_interval > 0:
+            self.use_rope = (layer_idx + 1) % no_rope_interval != 0
+        else:
+            self.use_rope = True
+
     def forward(
         self,
         x: torch.Tensor,
@@ -77,12 +86,14 @@ class Attention(nn.Module):
         rope_positions = position_ids.narrow(-1, offset, query_len)
 
         if USE_FUSED_KV:
-            query_key = self.rope(query_key, position_ids=rope_positions)
+            if self.use_rope:
+                query_key = self.rope(query_key, position_ids=rope_positions)
             query = query_key.narrow(1, 0, n_heads)
             key = query_key.narrow(1, n_heads, n_kv_heads)
         else:
-            query = self.rope(query, position_ids=rope_positions)
-            key = self.rope(key, position_ids=rope_positions)
+            if self.use_rope:
+                query = self.rope(query, position_ids=rope_positions)
+                key = self.rope(key, position_ids=rope_positions)
 
         if cache is not None:
             key, value = cache.update_and_fetch(
