@@ -178,6 +178,13 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     var drafterTopK: Int?
 
     @Option(
+        name: .customLong("draft-head-pack"),
+        help:
+            "With --speculative: run the draft head on the CPU from this pack (draft_head.safetensors from models/gemma4/export_draft_pack.py) instead of the bundle's draft head program, which the bundle then need not ship. The target still needs --emit-hidden-states."
+    )
+    var draftHeadPack: String?
+
+    @Option(
         name: .customLong("grammar-proposal-max"),
         help:
             "With --json-schema and speculative decoding: most tokens the grammar may propose in one verify block when it fully determines the next span (0 disables; default \(GrammarConstraint.defaultForcedRunLimit), at most \(GrammarConstraint.maxForcedRunLimit), the grammar's rollback budget less the anchor)."
@@ -458,6 +465,14 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         {
             throw ValidationError(problem)
         }
+        if let problem = SpeculativeDecodingOptions.draftHeadPackProblem(
+            hasPack: draftHeadPack != nil, draftHead: speculative)
+        {
+            throw ValidationError(problem)
+        }
+        if let draftHeadPack, !FileManager.default.fileExists(atPath: draftHeadPack) {
+            throw ValidationError("--draft-head-pack \(draftHeadPack) does not exist")
+        }
         let speculating = draftModel != nil || promptLookup || speculative
         if seed != nil && !speculating {
             throw ValidationError("--seed applies to speculative decoding (--draft-model or --prompt-lookup)")
@@ -733,8 +748,9 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
                     draftTokens: numDraftTokens, alignDraftsToVerifyTile: !noAlignProposals,
                     adaptiveDraftCount: adaptive,
                     promptLookupMinNgram: promptLookup ? promptLookupMinNgram : nil,
-                    drafterTopK: drafterTopK))
-            drafterLabel = promptLookup ? "draft head + prompt-lookup" : "draft head"
+                    drafterTopK: drafterTopK, cpuPack: draftHeadPack.map { URL(fileURLWithPath: $0) }))
+            let head = draftHeadPack == nil ? "draft head" : "draft head (CPU)"
+            drafterLabel = promptLookup ? "\(head) + prompt-lookup" : head
         } else if let draftEngine {
             decoder = SpeculativeDecoder(
                 draft: draftEngine, target: targetEngine,
