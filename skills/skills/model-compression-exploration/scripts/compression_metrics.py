@@ -69,10 +69,20 @@ def check_divisibility(model, axis: int, block_size: int) -> dict[str, tuple[int
     """
     incompatible: dict[str, tuple[int, int]] = {}
     for name, module in model.named_modules():
-        if hasattr(module, "weight") and module.weight is not None:
-            dim = module.weight.shape[axis]
-            if dim % block_size != 0:
-                incompatible[name] = (dim, block_size)
+        weight = getattr(module, "weight", None)
+        if not isinstance(weight, torch.Tensor):
+            continue
+        if axis >= weight.ndim or axis < -weight.ndim:
+            # The requested axis does not exist on this weight (e.g. axis=1
+            # on a 1-D LayerNorm/RMSNorm/BatchNorm weight), so there is no
+            # dimension to block along and divisibility does not apply. Note
+            # axis=0 exists on 1-D weights and is checked normally: grouped
+            # palettization groups along axis 0 (see coreai_opt's
+            # kmeans_palettizer_config presets) and can target them.
+            continue
+        dim = weight.shape[axis]
+        if dim % block_size != 0:
+            incompatible[name] = (dim, block_size)
     return incompatible
 
 
