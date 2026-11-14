@@ -65,10 +65,7 @@ public struct CoreAIVisionLanguageModel: LanguageModel {
 
         let tokenizer = try await tokenizerResult
 
-        let additionalStopTokenIds: Set<Int32> =
-            bundle.tokenizerPath.map {
-                LanguageConfig.additionalStopTokenIds(from: $0, tokenizer: tokenizer)
-            } ?? []
+        let additionalStopTokenIds = bundle.additionalStopTokenIds(tokenizer: tokenizer)
 
         self.executorConfiguration = CoreAIVLMExecutor.Configuration(
             bundleURL: url,

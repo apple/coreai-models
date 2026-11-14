@@ -618,8 +618,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         // decoding stops at those that are one token; see `SpeculativeDecodingOptions.stopTokenIds`.
         let stopSequences = try validateAndEncodeStopTokens(
             stopTokens: stopTokens, tokenizer: tokenizer,
-            additionalEosTokenIds: RunnerPrompting.additionalStopTokenIds(
-                tokenizerDirectory: targetBundle.tokenizerPath, tokenizer: tokenizer))
+            additionalEosTokenIds: RunnerPrompting.additionalStopTokenIds(bundle: targetBundle, tokenizer: tokenizer))
         let stops = SpeculativeDecodingOptions.stopTokenIds(stopSequences)
         if let warning = SpeculativeDecodingOptions.multiTokenStopWarning(
             stops.ignored.map { tokenizer.decode(tokens: $0.map(Int.init)) })
@@ -1020,10 +1019,9 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             "Tokenizer loaded from \(bundle.hasEmbeddedTokenizer ? "embedded bundle" : "HuggingFace")",
             component: "Main")
 
-        // Read additional stop token IDs from tokenizer_config.json (e.g. <end_of_turn> for Gemma)
-        // and, for agentic models, the end-of-turn token.
-        let additionalEosTokenIds = RunnerPrompting.additionalStopTokenIds(
-            tokenizerDirectory: bundle.tokenizerPath, tokenizer: tokenizer)
+        // Additional stop token IDs: from tokenizer_config.json (e.g. <end_of_turn> for Gemma), the
+        // bundle's eos_token_ids, and, for agentic models, the end-of-turn token.
+        let additionalEosTokenIds = RunnerPrompting.additionalStopTokenIds(bundle: bundle, tokenizer: tokenizer)
         if !additionalEosTokenIds.isEmpty {
             CLILogger.log(
                 "Found \(additionalEosTokenIds.count) additional stop token(s): \(additionalEosTokenIds.sorted())",

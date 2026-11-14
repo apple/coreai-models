@@ -176,10 +176,7 @@ public struct CoreAILanguageModel: LanguageModel {
         self.resources = resources
         // Config-derived turn-end IDs. The base-vocab <|im_end|> baseline is
         // folded in at runtime by runtimeStopTokens.
-        var additional: Set<Int32> =
-            bundle.tokenizerPath.map {
-                LanguageConfig.additionalStopTokenIds(from: $0, tokenizer: tokenizer)
-            } ?? []
+        var additional = bundle.additionalStopTokenIds(tokenizer: tokenizer)
         // Agentic models stop on <|eot|> so the runner doesn't loop self->user
         // turns. This is text-adapter-specific, so it is folded in here rather
         // than in the shared resolver.
