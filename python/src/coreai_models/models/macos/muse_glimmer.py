@@ -763,8 +763,13 @@ class MuseGlimmerModelEmbeddings(nn.Module):
         self.norm = RMSNorm(hidden_size, eps=config.rms_norm_eps)
 
         for idx, layer in enumerate(self.layers):
-            layer.self_attn.cache_slot_idx = idx
-            layer.self_attn.is_sliding = False
+            attention = layer.self_attn
+            attention.cache_slot_idx = idx
+            if attention.is_sliding:
+                # This variant uses the global cache without a sliding mask. Keep
+                # multi-token prefill causal after disabling the sliding path.
+                attention.sdpa = SDPA(is_causal=True)
+                attention.is_sliding = False
 
     def forward(
         self,
