@@ -37,6 +37,15 @@ func prefillHeldBackTokens(hasPrefillGraph: Bool) -> Int {
     hasPrefillGraph ? 1 : 0
 }
 
+/// Whether a prefill chunk of `queryLength` tokens runs on the prefill graph.
+///
+/// A one-token chunk runs on `main` instead, the graph every decode step runs on, and its
+/// logits go unused: past position 0 a one-token query on the prefill graph can abort in
+/// MPSGraph with "Failed to resolve dynamic dimensions for memref.alloc".
+func chunkRunsOnPrefillGraph(queryLength: Int) -> Bool {
+    queryLength > 1
+}
+
 /// Initial size of the logits buffer, in token rows.
 ///
 /// With a prefill graph `main` only ever sees the one held-back token, so a prompt-sized
