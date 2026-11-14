@@ -615,7 +615,8 @@ private struct EngineImpl: ~Copyable {
     var inputTokensBuffer: MTLBuffer
     var cachePositionBuffers: [MTLBuffer]
     var decodeOutputBuffers: [MTLBuffer]
-    var decodeLogitsBuffers: [MTLBuffer]
+    /// Where a decode step's logits land, rotating by `pipelineDepth` (`RotatingLogitsBuffers.swift`).
+    var decodeLogitsBuffers: RotatingLogitsBuffers
 
     // KV cache — reuses CoreAIKVCache protocol from KVCache+CoreAI.swift
     var kvCache: any CoreAIKVCache
@@ -771,15 +772,10 @@ private struct EngineImpl: ~Copyable {
             decodeOutBuffers.append(buf)
         }
 
-        // Allocate pipeline-depth-matched decode logits buffers (inference writes logits for decode)
-        let decodeLogitsSize = config.vocabSize * MemoryLayout<UInt16>.size
-        var decodeLogBufs: [MTLBuffer] = []
-        for _ in 0..<pipelineDepth {
-            guard let buf = device.makeBuffer(length: decodeLogitsSize, options: .storageModeShared) else {
-                throw InferenceRuntimeError.bufferAllocationFailed("decodeLogitsBuffer (\(decodeLogitsSize) bytes)")
-            }
-            decodeLogBufs.append(buf)
-        }
+        // Pipeline-depth-matched decode logits buffers (inference writes logits for decode). One row:
+        // this engine advances a single sequence.
+        let decodeLogBufs = try RotatingLogitsBuffers(
+            device: device, vocabSize: config.vocabSize, depth: pipelineDepth)
 
         // Create KV cache using factory — pass original descriptors (with -1 dynamic dims intact)
         // so the factory can correctly detect growing vs static support via isDynamicKVCache().
@@ -1059,7 +1055,7 @@ private struct EngineImpl: ~Copyable {
 
         // Build Output as AsyncMutableValue (logits)
         // Decode uses per-step rotating buffer; prefill uses the shared growing buffer.
-        let logitsOutputBuffer = tokens.isEmpty ? decodeLogitsBuffers[step % pipelineDepth] : logits.metalBuffer
+        let logitsOutputBuffer = tokens.isEmpty ? decodeLogitsBuffers[step] : logits.metalBuffer
         let logitsShape = [1, queryLength, vocabSize]
         let logitsStrides = try resolvedStrides(descriptor: logitsBaseDesc, shape: logitsShape)
 
@@ -1088,7 +1084,7 @@ private struct EngineImpl: ~Copyable {
         // GPU sampling via Metal queue
         let localGPUSampler = gpuSampler
         let outputBuffer = decodeOutputBuffers[step % pipelineDepth]
-        let samplerLogitsBuffer = tokens.isEmpty ? decodeLogitsBuffers[step % pipelineDepth] : logits.metalBuffer
+        let samplerLogitsBuffer = tokens.isEmpty ? decodeLogitsBuffers[step] : logits.metalBuffer
         let logitsOffset = (actualTokenCount - 1) * vocabSize * MemoryLayout<UInt16>.size
         let samplerStrategy = gpuSampler is MPSGraphArgmaxSampler ? "GPU-argmax" : "GPU-composite"
         let samplerTemperature = cachedSamplerTemperature ?? 0.0
@@ -1977,8 +1973,9 @@ private struct EngineImpl: ~Copyable {
                 logitsStrides: try resolvedStrides(descriptor: logitsBaseDesc, shape: lShape),
                 computeStream: computeStream)
 
-            // Warm up argmax kernel using pipeline-matched decode buffers
-            let warmupLogitsBuffer = decodeLogitsBuffers[step % pipelineDepth]
+            // Warm up the argmax kernel on the logits the call above wrote. A wide shape wrote
+            // several rows there, more than a one-row decode buffer holds.
+            let warmupLogitsBuffer = logits.metalBuffer
             let warmupOutputBuffer = decodeOutputBuffers[step % pipelineDepth]
             let logitsOffset = (shape - 1) * vocabSize * MemoryLayout<UInt16>.size
 
