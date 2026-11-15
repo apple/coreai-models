@@ -62,7 +62,7 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
     private let _generationTask = Mutex<Task<Void, Never>?>(nil)
 
     // Cached across calls
-    private let _constrainedSessionCache = Mutex<ConstrainedSessionHandle?>(nil)
+    private let constrainedSessions = ConstrainedSessionSlot()
 
     var isBusy: Bool { _activeToken.withLock { $0 != nil } }
 
@@ -282,8 +282,14 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
         samplingConfiguration: SamplingConfiguration,
         maxTokens: Int,
         session: ConstrainedSessionHandle
-    ) throws -> InferenceTokenSequence {
+    ) async throws -> InferenceTokenSequence {
         try Self.rejectSeedIfUnsupported(samplingConfiguration)
+        // As in `generate`: a prior generation still winding down (its caller stopped reading) is
+        // cancelled and waited for, so it is not mistaken for one still in use.
+        if let priorTask = _generationTask.withLock({ $0 }) {
+            _activeToken.withLock { $0?.cancel() }
+            await priorTask.value
+        }
         if _generationTask.withLock({ $0 }) != nil || engineInUse.load(ordering: .acquiring) {
             throw InferenceRuntimeError.invalidState(
                 "generateConstrained called while a prior generation is still in flight — caller must drain first"
@@ -325,8 +331,12 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
                 )
                 continuation.finish()
             } catch is CancellationError {
+                // Cancelled from the engine side (a later generation, or `cancel()`): say so, so the
+                // reader doesn't take the early end for the grammar's.
+                stopReasonStore.setIfUnset(.cancelled)
                 continuation.finish()
             } catch {
+                stopReasonStore.setIfUnset(.error)
                 continuation.finish(throwing: error)
             }
         }
@@ -457,30 +467,24 @@ extension CoreAIPipelinedEngine {
         stopTokenIds: [Int32]?,
         maxWhitespaceCount: Int?
     ) throws -> ConstrainedSessionHandle {
-        if let cached: ConstrainedSessionHandle = _constrainedSessionCache.withLock({ cache in
-            guard let box = cache, box.matches(schema: jsonSchema, maxWhitespaceCount: maxWhitespaceCount) else {
-                cache = nil
-                return nil
-            }
-            cache = nil
-            return box
-        }) {
-            cached.reset()
-            return cached
+        let key = ConstrainedSessionKey(
+            schema: jsonSchema, maxWhitespaceCount: maxWhitespaceCount, stopTokenIds: stopTokenIds,
+            vocabularySize: vocabSize)
+        return try constrainedSessions.checkOut(key) {
+            let session = try ConstrainedGenerationSession(
+                jsonSchema: jsonSchema,
+                tokenizer: tokenizer,
+                vocabSize: vocabSize,
+                stopTokenIds: stopTokenIds,
+                maxWhitespaceCount: maxWhitespaceCount
+            )
+            return ConstrainedSessionHandle(session: session, tokenizer: tokenizer)
         }
-        let session = try ConstrainedGenerationSession(
-            jsonSchema: jsonSchema,
-            tokenizer: tokenizer,
-            vocabSize: vocabSize,
-            stopTokenIds: stopTokenIds,
-            maxWhitespaceCount: maxWhitespaceCount
-        )
-        return ConstrainedSessionHandle(session: session, tokenizer: tokenizer)
     }
 
     /// Return a session box to the cache for reuse by the next call.
     func storeConstrainedSessionForReuse(_ box: ConstrainedSessionHandle) {
-        _constrainedSessionCache.withLock { $0 = box }
+        constrainedSessions.checkIn(box)
     }
 }
 

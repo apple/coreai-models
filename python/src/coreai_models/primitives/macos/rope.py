@@ -76,6 +76,8 @@ class DecomposedRoPE(torch.nn.Module):
         input: torch.Tensor,
         position_ids: torch.Tensor | None = None,
         offset: torch.Tensor | None = None,
+        cos: torch.Tensor | None = None,
+        sin: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         """Apply rotary positional embedding.
@@ -84,6 +86,9 @@ class DecomposedRoPE(torch.nn.Module):
             input: Tensor of shape (..., num_heads, seq_len, head_dim).
             position_ids: Tensor of shape (batch, seq_len) with position indices.
             offset: Scalar or tensor offset when position_ids is None.
+            cos, sin: Precomputed half-dim cos/sin broadcastable against
+                ``input[..., :dims // 2]``, as ``RoPE`` takes them. When both are given,
+                positions are not used.
 
         Returns:
             Tensor with RoPE applied to the first `dims` elements of head_dim.
@@ -95,34 +100,39 @@ class DecomposedRoPE(torch.nn.Module):
             rotation_dims = embedding_dim
         half_dim = rotation_dims // 2
 
-        # Compute position_ids if not provided
-        if position_ids is not None:
-            # position_ids: (batch, seq_len) -> (batch, 1, seq_len) for head broadcasting
-            pos = position_ids.unsqueeze(1)
-        else:
-            q_len = input.shape[-2]
-            if offset is not None and isinstance(offset, torch.Tensor):
-                pos = offset.unsqueeze(-1).unsqueeze(-1) + torch.arange(q_len, device=input.device)
+        if cos is None or sin is None:
+            # Compute position_ids if not provided
+            if position_ids is not None:
+                # position_ids: (batch, seq_len) -> (batch, 1, seq_len) for head broadcasting
+                pos = position_ids.unsqueeze(1)
             else:
-                int_offset = offset if offset is not None else 0
-                pos = int_offset + torch.arange(q_len, device=input.device)
+                q_len = input.shape[-2]
+                if offset is not None and isinstance(offset, torch.Tensor):
+                    pos = offset.unsqueeze(-1).unsqueeze(-1) + torch.arange(
+                        q_len, device=input.device
+                    )
+                else:
+                    int_offset = offset if offset is not None else 0
+                    pos = int_offset + torch.arange(q_len, device=input.device)
 
-        pos = pos.float()
+            pos = pos.float()
 
-        # Inverse frequencies in f32. Use the precomputed per-dimension freqs
-        # when provided (e.g. LongRoPE), else the plain 1/base^(i/half_dim).
-        if self._inv_freq is not None:
-            inv_freq = self._inv_freq.to(device=input.device, dtype=torch.float32)
-        else:
-            exponent = torch.arange(half_dim, dtype=torch.float32, device=input.device) / half_dim
-            inv_freq = 1.0 / torch.pow(self.base, exponent)
+            # Inverse frequencies in f32. Use the precomputed per-dimension freqs
+            # when provided (e.g. LongRoPE), else the plain 1/base^(i/half_dim).
+            if self._inv_freq is not None:
+                inv_freq = self._inv_freq.to(device=input.device, dtype=torch.float32)
+            else:
+                exponent = (
+                    torch.arange(half_dim, dtype=torch.float32, device=input.device) / half_dim
+                )
+                inv_freq = 1.0 / torch.pow(self.base, exponent)
 
-        # Compute angles: (batch, 1, seq_len, 1) * (half_dim,) -> (batch, 1, seq_len, half_dim)
-        angle = pos.unsqueeze(-1) * inv_freq
+            # Angles: (batch, 1, seq_len, 1) * (half_dim,) -> (batch, 1, seq_len, half_dim)
+            angle = pos.unsqueeze(-1) * inv_freq
 
-        # Compute cos/sin in input dtype
-        cos = angle.cos().to(input.dtype)
-        sin = angle.sin().to(input.dtype)
+            # Compute cos/sin in input dtype
+            cos = angle.cos().to(input.dtype)
+            sin = angle.sin().to(input.dtype)
 
         # Split input into two halves (non-interleaved)
         x1 = input[..., :half_dim]
