@@ -162,16 +162,41 @@ llm-runner --model <bundle> --sampling-strategy greedy --speculative --prompt ".
 
 The head and the target live in the same bundle, so `--speculative` takes no separate path. The
 output is token for token what greedy decoding of the target alone produces; the head only changes
-how many tokens one verify pass of the target commits. The runner needs greedy decoding, a bundle
-with a `drafter` of kind `mtp`, and a target exported with `--emit-hidden-states`, and it says which
-of the three is missing. `--speculative` combines with `--prompt-lookup` (a block whose recent
+how many tokens one verify pass of the target commits. The runner needs greedy decoding, a target
+exported with `--emit-hidden-states`, and either a bundle with a `drafter` of kind `mtp` or
+`--draft-head-pack`, and it says which is missing. `--speculative` combines with `--prompt-lookup` (a block whose recent
 tokens recur in the context is proposed by lookup, any other by the head) and with `--json-schema`.
 `--num-draft-tokens` sets the drafts per round; by default a round drafts one less than the target's
 verify tile is wide, and `--no-align-proposals` drops that limit. `--drafter-top-k` sets how many
 centroids the head's candidate scan scores.
 
+`--draft-head-pack <draft_head.safetensors>` runs the same head on the CPU instead of as a program,
+from the pack `export_draft_pack.py` writes (see [Draft head pack for the CPU](#draft-head-pack-for-the-cpu)),
+and leaves the target's accelerator to the target. The bundle then need not declare a `drafter`.
+One difference from the program: the CPU head's full-attention layer attends to the most recent
+1024 positions rather than the whole context, which keeps a draft step's cost and memory flat at
+long context. Up to 1024 positions it drafts what the program drafts, up to rounding; past that its
+drafts can differ, which can lower acceptance but never changes the output.
+
 The run summary reports the share of drafts accepted and the tokens committed per target pass, then
 the same timing summary as a plain run.
+
+#### Draft head pack for the CPU
+
+`export_draft_pack.py` packs the same assistant for a runtime that runs the whole head on the CPU
+instead of as a Core AI program. It writes one safetensors file, `draft_head.safetensors`: the
+candidate-scan table permuted as in `draft_scan.bin`, the centroids, and every layer's weights, with
+the head's geometry, sliding window and RoPE parameters in its `__metadata__`.
+
+```bash
+uv run export_draft_pack.py --model google/gemma-4-E2B-it
+```
+
+Weights are fp16. The pack is per variant, like the assistant: its `post_projection` is as wide as
+the target's hidden size, so the script refuses an assistant whose width does not match `--model`.
+It writes `exports/draft_head/<model>/draft_head.safetensors`, one directory per variant;
+`--output-dir` writes elsewhere. As with `export_drafter.py`, the assistant is `<model>-assistant`
+by default, and `--drafter` takes another hub repo id or a local directory.
 
 ### Runner side
 

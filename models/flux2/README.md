@@ -38,7 +38,7 @@ uv run coreai.diffusion.export flux2-klein-4b
 
 ### Transformer Packaging
 
-There are two ways to export the transformer. By default you get a single asset (`.aimodel`)
+There are two ways to export a static transformer. By default you get a single asset (`.aimodel`)
 covering every supported resolution and reference grid, chosen at runtime. Pass `--single-function`
 to get one asset per resolution/grid instead.
 
@@ -49,8 +49,8 @@ to get one asset per resolution/grid instead.
 | Peak memory     | higher                       | lower                         |
 | Reference grids | all three, chosen at runtime | only the one you exported     |
 
-The default packages the five variants (`main`, `half`, `img2img_quarter/half/full`) as
-entrypoints in one multi-function `.aimodel` that shares one set of weights.
+The default packages eight variants (`main`, `half`, and `img2img_quarter/half/full` at both
+1024 and 512) as entrypoints in one multi-function `.aimodel` that shares one set of weights.
 The multi-function transformer saves on disk space by sharing weights, but has a larger
 peak memory footprint during runtime.
 
@@ -61,10 +61,25 @@ Note that `--resolution` and `--low-memory` only apply to `--single-function` ex
 The multi-function asset covers both resolutions and always includes the half VAEs, so the
 flags are irrelevant and will produce a warning if passed without `--single-function`.
 
+### Dynamic Shapes
+
+`--dynamic` exports each asset as a single `main` with symbolic shape axes (the text encoder
+stays fixed), written to `<output-dir>/FLUX.2-klein-4B-dynamic/`:
+
+```bash
+uv run coreai.diffusion.export flux2-klein-4b --dynamic
+```
+
+One transformer then serves any square output size from 256 to 1024 and any reference size
+from 128 to 1024 px (both multiples of 16), and **multiple reference images**, so it can replace
+both the multi-function variants and `--single-function`. Those bounds go into `metadata.json`,
+and the pipeline checks requests against them before generating. Not available with
+`--platform iOS`.
+
 ### Image-to-image
 
 Needs a VAE encoder plus an img2img transformer. Reference tokens from your input image
-are concatenated onto the noise sequence, so adherence comes from `--reference-grid`,
+are concatenated onto the noise sequence, so adherence comes from `--reference-size`,
 not from noise blending (`--strength` is ignored).
 
 The default already includes every grid. `--single-function` needs one chosen at export:
@@ -143,7 +158,9 @@ let result = try await pipeline.generateImages(
 let image = result.images.first!
 ```
 
-For image-to-image, set `startingImage` and pick a grid the bundle has:
+For image-to-image, pass the input as a reference image and pick a reference size the bundle
+supports. FLUX.2 conditions on its references rather than starting from them, so `strength`
+has no effect; `startingImage` is still accepted and counts as the first reference.
 
 ```swift
 let config = PipelineConfiguration(
@@ -151,13 +168,34 @@ let config = PipelineConfiguration(
     stepCount: 4,
     guidanceScale: 1.0,
     schedulerType: .discreteFlow,
-    startingImage: inputCGImage,
-    referenceGrid: .half            // .full | .half | .quarter
+    referenceImages: [inputCGImage],
+    referenceSize: .half            // .full | .half | .quarter of the output, or .pixels(384)
 )
 ```
 
-Asking for a grid the bundle doesn't have throws and lists what it does have. img2img is
+Static bundles only serve the `full`/`half`/`quarter` presets they were traced for; asking for
+one the bundle doesn't have throws and lists what it does have. A `.pixels` size needs a
+`--dynamic` bundle unless it equals one of those presets. On static bundles img2img is
 unsupported with `.tiled` decode.
+
+A `--dynamic` bundle also takes several reference images, referred to in the prompt as image
+1, image 2, ... in order, and any output size. `imageSize` overrides the size the pipeline was
+loaded for (`.half` loads it as 512):
+
+```swift
+let config = PipelineConfiguration(
+    prompt: "Put the cat from image 1 onto the rock in the street from image 2, replacing the bird",
+    stepCount: 4,
+    guidanceScale: 1.0,
+    schedulerType: .discreteFlow,
+    referenceImages: [catImage, streetImage],
+    referenceSize: .pixels(384),
+    imageSize: 768
+)
+```
+
+The output grid plus every reference grid must fit the bundle's `max_image_tokens` (16384): at
+1024 output that is three full-size references.
 
 ### On your Mac using built-in Command Line Tool
 
@@ -165,7 +203,18 @@ unsupported with `.tiled` decode.
 # Text-to-image
 swift run -c release diffusion-runner --model path/to/exported_model_folder --prompt "a photo of a cat" --steps 4 --guidance-scale 1.0
 
+# Output size: auto (default), full, half, or pixels (any multiple of 16 on a --dynamic bundle)
+swift run -c release diffusion-runner --model path/to/exported_model_folder --prompt "a photo of a cat" --image-size half
+
+# Decode in tiles to lower peak memory (static bundles with the half VAEs)
+swift run -c release diffusion-runner --model path/to/exported_model_folder --prompt "a photo of a cat" --tiled-decode
+
 # Image-to-image
 swift run -c release diffusion-runner --model path/to/exported_model_folder --prompt "a cat wearing a hat" --steps 4 --guidance-scale 1.0 \
-    --input-image cat.png --reference-grid half
+    --input-image cat.png --reference-size half
+
+# Multiple references at a custom size (--dynamic bundle); repeating --input-image also works
+swift run -c release diffusion-runner --model path/to/FLUX.2-klein-4B-dynamic \
+    --prompt "Put the cat from image 1 onto the rock in the street from image 2, replacing the bird" \
+    --input-image cat.png street.png --image-size 768 --reference-size 384
 ```

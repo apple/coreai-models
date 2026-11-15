@@ -65,6 +65,11 @@ public struct ChatCompletionRequest: Decodable, Sendable {
             stop = nil
         }
     }
+
+    /// Whether any message has an `image_url` content part.
+    public var hasImageInput: Bool {
+        messages.contains { !$0.content.imageDataURLs.isEmpty }
+    }
 }
 
 // MARK: - Response Format (Guided Generation)
@@ -250,9 +255,12 @@ public enum ContentPart: Decodable, Sendable {
             let text = try container.decode(String.self, forKey: .text)
             self = .text(text)
         case "image_url":
-            let imageContainer = try container.nestedContainer(keyedBy: ImageURLKeys.self, forKey: .imageURL)
-            let url = try imageContainer.decode(String.self, forKey: .url)
-            self = .imageURL(url)
+            if let url = try? container.decode(String.self, forKey: .imageURL) {
+                self = .imageURL(url)
+            } else {
+                let imageContainer = try container.nestedContainer(keyedBy: ImageURLKeys.self, forKey: .imageURL)
+                self = .imageURL(try imageContainer.decode(String.self, forKey: .url))
+            }
         default:
             self = .text("")
         }
@@ -437,16 +445,25 @@ public struct ModelsResponse: Encodable, Sendable {
         public let object: String
         public let created: Int
         public let ownedBy: String
+        /// What the model can do, in Ollama's vocabulary: `completion`, plus `vision` when it accepts
+        /// image input.
+        public let capabilities: [String]
 
-        public init(id: String, created: Int, ownedBy: String) {
+        public init(id: String, created: Int, ownedBy: String, capabilities: [String] = ["completion"]) {
             self.id = id
             self.object = "model"
             self.created = created
             self.ownedBy = ownedBy
+            self.capabilities = capabilities
+        }
+
+        /// `["completion"]`, plus `"vision"` for a model that accepts image input.
+        public static func capabilities(vision: Bool) -> [String] {
+            vision ? ["completion", "vision"] : ["completion"]
         }
 
         enum CodingKeys: String, CodingKey {
-            case id, object, created
+            case id, object, created, capabilities
             case ownedBy = "owned_by"
         }
     }
@@ -456,7 +473,22 @@ public struct ModelsResponse: Encodable, Sendable {
 
 public struct HealthResponse: Encodable, Sendable {
     public let status: String
-    public init(status: String) { self.status = status }
+    public let modalities: Modalities
+
+    public init(status: String, modalities: Modalities) {
+        self.status = status
+        self.modalities = modalities
+    }
+}
+
+/// Input modalities the served model accepts besides text, in the shape of llama.cpp's `/props`.
+public struct Modalities: Codable, Sendable, Equatable {
+    /// Whether chat requests can carry `image_url` content parts.
+    public let vision: Bool
+
+    public init(vision: Bool) {
+        self.vision = vision
+    }
 }
 
 // MARK: - Error Response
@@ -664,15 +696,22 @@ public struct ReadyResponse: Codable, Sendable {
     public let busy: Bool
     public let cache: CacheStatus
     public let toolCalling: Bool
-    /// Memory held by the server's sessions, estimated from their arrays' shapes and element sizes.
+    /// Input modalities the model accepts besides text.
+    public let modalities: Modalities?
+    /// Memory the server's sessions were sized for at load, computed from their arrays' shapes and
+    /// element sizes. It does not follow the caches as they grow; ``deviceMemory`` does.
     public let estimatedMemory: EstimatedMemory?
+    /// Memory measured at the time of the call: what Metal has allocated and what the kernel charges
+    /// the process, against what the device recommends, and whether new requests are being refused.
+    public let deviceMemory: DeviceMemoryStatus?
     /// Batch scheduler occupancy, present when the server decodes requests in batches.
     public let batching: BatchingStatus?
 
     public init(
         status: String, model: String, maxContextLength: Int,
-        busy: Bool, cache: CacheStatus, toolCalling: Bool,
-        estimatedMemory: EstimatedMemory? = nil, batching: BatchingStatus? = nil
+        busy: Bool, cache: CacheStatus, toolCalling: Bool, modalities: Modalities? = nil,
+        estimatedMemory: EstimatedMemory? = nil, deviceMemory: DeviceMemoryStatus? = nil,
+        batching: BatchingStatus? = nil
     ) {
         self.status = status
         self.model = model
@@ -680,8 +719,45 @@ public struct ReadyResponse: Codable, Sendable {
         self.busy = busy
         self.cache = cache
         self.toolCalling = toolCalling
+        self.modalities = modalities
         self.estimatedMemory = estimatedMemory
+        self.deviceMemory = deviceMemory
         self.batching = batching
+    }
+
+    /// Device memory in megabytes, measured rather than estimated.
+    public struct DeviceMemoryStatus: Codable, Sendable, Equatable {
+        /// What Metal has allocated on the device: weights, sessions and the framework's scratch.
+        public let metalAllocatedMB: Double
+        /// What the device recommends this process stay under; zero when it gives no figure.
+        public let recommendedMB: Double
+        /// What the kernel charges this process, which leaves out clean file-backed pages.
+        public let footprintMB: Double
+        /// This process's resident memory-mapped file pages, such as the model's weights. Requests are
+        /// refused while the footprint and these together reach the recommendation.
+        public let mappedMB: Double
+        /// Why new requests are being refused with 503 `out_of_memory`, or nil while they are not. It
+        /// clears once the process is back under the line. While it is set, `/ready` answers 503 and
+        /// `status` is `"refusing"`.
+        public let refusing: String?
+
+        public init(
+            metalAllocatedMB: Double, recommendedMB: Double, footprintMB: Double, mappedMB: Double, refusing: String?
+        ) {
+            self.metalAllocatedMB = metalAllocatedMB
+            self.recommendedMB = recommendedMB
+            self.footprintMB = footprintMB
+            self.mappedMB = mappedMB
+            self.refusing = refusing
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case metalAllocatedMB = "metal_allocated_mb"
+            case recommendedMB = "recommended_mb"
+            case footprintMB = "footprint_mb"
+            case mappedMB = "mapped_mb"
+            case refusing
+        }
     }
 
     /// Memory held by the server's sessions in megabytes, estimated from their arrays' shapes and
@@ -751,7 +827,9 @@ public struct ReadyResponse: Codable, Sendable {
         case maxContextLength = "max_context_length"
         case busy, cache
         case toolCalling = "tool_calling"
+        case modalities
         case estimatedMemory = "estimated_memory"
+        case deviceMemory = "device_memory"
         case batching
     }
 }

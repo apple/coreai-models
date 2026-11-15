@@ -115,6 +115,27 @@ struct ServerAPITypesTests {
         #expect(models[0]["id"] as? String == "qwen3_4b")
     }
 
+    @Test("ModelInfo lists vision only for a model that accepts image input", arguments: [false, true])
+    func modelCapabilities(vision: Bool) throws {
+        let info = ModelsResponse.ModelInfo(
+            id: "m", created: 0, ownedBy: "coreai", capabilities: ModelsResponse.ModelInfo.capabilities(vision: vision))
+        let obj = try JSONSerialization.jsonObject(with: JSONEncoder().encode(info)) as! [String: Any]
+        #expect(obj["capabilities"] as? [String] == (vision ? ["completion", "vision"] : ["completion"]))
+    }
+
+    @Test("HealthResponse and ReadyResponse encode modalities")
+    func modalities() throws {
+        let health = HealthResponse(status: "ok", modalities: Modalities(vision: true))
+        let ready = ReadyResponse(
+            status: "ready", model: "m", maxContextLength: 4096, busy: false,
+            cache: .init(usedTokens: 0, maxTokens: 4096, utilization: 0), toolCalling: false,
+            modalities: Modalities(vision: true))
+        for data in [try JSONEncoder().encode(health), try JSONEncoder().encode(ready)] {
+            let obj = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+            #expect(obj["modalities"] as? [String: Bool] == ["vision": true])
+        }
+    }
+
     @Test("ErrorResponse encodes")
     func errorResponse() throws {
         let response = ErrorResponse(error: ErrorResponse.ErrorDetail(message: "bad request", type: "invalid_request"))
@@ -218,6 +239,27 @@ struct ServerAPITypesTests {
         let bareObj = try JSONSerialization.jsonObject(with: JSONEncoder().encode(bare)) as! [String: Any]
         #expect(bareObj["estimated_memory"] == nil)
         #expect(bareObj["batching"] == nil)
+    }
+
+    @Test("ReadyResponse encodes measured memory, and its refusal only while refusing")
+    func readyResponseMemory() throws {
+        let cache = ReadyResponse.CacheStatus(usedTokens: 0, maxTokens: 4096, utilization: 0)
+        func encoded(refusing: String?) throws -> [String: Any]? {
+            let ready = ReadyResponse(
+                status: "ready", model: "m", maxContextLength: 4096, busy: false, cache: cache, toolCalling: false,
+                deviceMemory: .init(
+                    metalAllocatedMB: 9000, recommendedMB: 12000, footprintMB: 8000, mappedMB: 3000,
+                    refusing: refusing))
+            let obj = try JSONSerialization.jsonObject(with: JSONEncoder().encode(ready)) as! [String: Any]
+            return obj["device_memory"] as? [String: Any]
+        }
+        let serving = try encoded(refusing: nil)
+        #expect(serving?["metal_allocated_mb"] as? Double == 9000)
+        #expect(serving?["recommended_mb"] as? Double == 12000)
+        #expect(serving?["footprint_mb"] as? Double == 8000)
+        #expect(serving?["mapped_mb"] as? Double == 3000)
+        #expect(serving?["refusing"] == nil)
+        #expect(try encoded(refusing: "past the line")?["refusing"] as? String == "past the line")
     }
 
     @Test("ReadyResponse round-trips through JSON")
