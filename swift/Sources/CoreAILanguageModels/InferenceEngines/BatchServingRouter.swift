@@ -7,15 +7,16 @@
 package enum BatchServingLane: Equatable, Sendable {
     /// Requests that share the batch scheduler through a `SchedulerSession`.
     case batched
-    /// Requests that run one at a time on their own engine session, such as guided generation.
+    /// Requests that run one at a time on their own engine session, such as guided generation and
+    /// image input.
     case fallbackBatchOne
 }
 
 /// Lane selection for chat requests under a batched server.
 package enum BatchServingRouter {
-    /// Returns `.fallbackBatchOne` for a request with a `response_format` JSON schema, otherwise
-    /// `.batched`.
-    package static func lane(hasResponseSchema: Bool) -> BatchServingLane {
-        hasResponseSchema ? .fallbackBatchOne : .batched
+    /// Returns `.fallbackBatchOne` for a request with a `response_format` JSON schema or with image
+    /// input, otherwise `.batched`.
+    package static func lane(hasResponseSchema: Bool, hasImages: Bool) -> BatchServingLane {
+        hasResponseSchema || hasImages ? .fallbackBatchOne : .batched
     }
 }

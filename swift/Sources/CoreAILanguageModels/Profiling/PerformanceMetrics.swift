@@ -224,12 +224,6 @@ public final class PerformanceMetrics {
             print("   ⚠️  Slow generation speed (<10 tokens/sec)")
         }
 
-        // Memory
-        let mem = getProcessMemoryMB()
-        print("\n📊 Memory Usage:")
-        print("   Current: \(Int(mem.current))MB")
-        print("   Peak: \(Int(mem.peak))MB")
-
         print("=" * 50)
     }
 
@@ -240,26 +234,6 @@ public final class PerformanceMetrics {
         generatedTokenCount = 0
         // Also reset StatsStorage since this is a full reset
         StatsStorage.shared.reset()
-    }
-
-    // MARK: - Memory Utilities
-
-    /// Get current and peak memory usage in MB using Mach kernel API
-    private func getProcessMemoryMB() -> (current: Double, peak: Double) {
-        var info = mach_task_basic_info()
-        var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size) / 4
-
-        let result = withUnsafeMutablePointer(to: &info) {
-            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
-                task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count)
-            }
-        }
-
-        guard result == KERN_SUCCESS else { return (0, 0) }
-        return (
-            current: Double(info.resident_size) / (1024 * 1024),
-            peak: Double(info.resident_size_max) / (1024 * 1024)
-        )
     }
 }
 

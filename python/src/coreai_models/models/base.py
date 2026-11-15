@@ -847,7 +847,7 @@ class BaseForCausalLM(torch.nn.Module):
     @classmethod
     def from_hf_memory_efficient(
         cls: type[T],
-        huggingface_model_id: str,
+        huggingface_model_id_or_path: str,
         max_context_length: int | None = None,
         target_dtype: torch.dtype = torch.float16,
         mmap_path: str | None = None,
@@ -865,7 +865,8 @@ class BaseForCausalLM(torch.nn.Module):
         the peak RAM is roughly *one layer + shared params*.
 
         Args:
-            huggingface_model_id: HuggingFace model identifier.
+            huggingface_model_id_or_path: HuggingFace model identifier, or the path of a
+                local checkpoint directory, which is read in place.
             max_context_length: Optional override for the model's context length.
             target_dtype: Target dtype for the model weights.
             mmap_path: Directory for per-layer mmap files. When provided each
@@ -888,10 +889,13 @@ class BaseForCausalLM(torch.nn.Module):
                 explicit additive ``attn_mask`` input (``is_causal`` off).
                 Ignored for iOS model classes.
         """
-        model_dir = snapshot_download(
-            huggingface_model_id,
-            allow_patterns=["*.safetensors", "*.safetensors.index.json", "config.json"],
-        )
+        if Path(huggingface_model_id_or_path).is_dir():
+            model_dir = huggingface_model_id_or_path
+        else:
+            model_dir = snapshot_download(
+                huggingface_model_id_or_path,
+                allow_patterns=["*.safetensors", "*.safetensors.index.json", "config.json"],
+            )
 
         raw_config = AutoConfig.from_pretrained(model_dir)
         hf_config = getattr(raw_config, hf_config_attr) if hf_config_attr else raw_config

@@ -8,12 +8,23 @@
 import ArgumentParser
 import CoreAI
 import CoreAILanguageModels
+import CoreAIMemoryMeasurement
 import CoreAIShared
 import Foundation
 
 @main
 struct Main {
     static func main() async throws {
+        #if os(macOS)
+        let arguments = CommandLine.arguments
+        if arguments.count == 3, arguments[1] == RootMemoryHelper.argument, let clientPid = pid_t(arguments[2]) {
+            RootMemoryHelper.run(clientPid: clientPid)
+            return
+        }
+        if arguments.count > 3, arguments[1] == RootMemoryHelper.terminalArgument {
+            RootMemoryHelper.runOnTerminal(arguments[2], command: Array(arguments[3...]))
+        }
+        #endif
         await LLMBenchmark.main()
     }
 }
@@ -38,6 +49,16 @@ struct LLMBenchmark: AsyncParsableCommand {
 
     @Option(name: .long, help: "Random seed for synthetic prompt")
     var seed: UInt64 = 0
+
+    @Option(
+        name: [.customShort("c"), .customLong("concurrency")],
+        help:
+            "Requests in flight at once through the continuous-batching scheduler, each with its own prompt. Up to the model's max batch size decode together; the rest queue for a free row, as on llm-server. Above 1, needs the coreai-sequential engine and a model exported with --attention-mask batched."
+    )
+    var concurrency: Int = 1
+
+    @Option(name: .customLong("kv-cache-initial-capacity"), help: "Initial KV cache capacity in tokens")
+    var kvCacheInitialCapacity: Int?
 
     @Option(name: .customLong("output-json"), help: "Write summary JSON to file")
     var outputJson: String?
@@ -74,11 +95,18 @@ struct LLMBenchmark: AsyncParsableCommand {
     )
     var batchSize: Int?
 
+    @OptionGroup var memoryOptions: MemoryOptions
+
     func validate() throws {
         if promptTokens < 1 { throw ValidationError("--prompt-tokens must be >= 1") }
         if generationTokens < 1 { throw ValidationError("--generation-tokens must be >= 1") }
         if numTrials < 1 { throw ValidationError("--num-trials must be >= 1") }
         if let b = batchSize, b < 1 { throw ValidationError("--batch-size must be >= 1") }
+        if concurrency < 1 { throw ValidationError("--concurrency must be >= 1") }
+        if concurrency > 1, let b = batchSize, b > 1 {
+            throw ValidationError(
+                "--batch-size steps identical rows in lockstep and --concurrency runs separate requests; pick one")
+        }
         if !FileManager.default.fileExists(atPath: model) {
             throw ValidationError("Model path not found: \(model)")
         }
@@ -104,6 +132,11 @@ struct LLMBenchmark: AsyncParsableCommand {
         // time below. This only inspects the cache; it never triggers specialization.
         let cacheHit = PreparedModel.isCached(at: modelURL)
 
+        // Initialize memory measurement, if activated by memoryOptions flag(s)
+        // Do this before starting "Preparing..."
+        let measurement = MemoryMeasurement(
+            options: memoryOptions, modelPath: bundle.bundlePath.path, runPhase: "trials")
+
         let engineConfig = ModelConfig(bundle: bundle)
         let configData = try JSONEncoder().encode(engineConfig)
         print("\n⏳ Preparing AI asset from \(modelURL.lastPathComponent)...", terminator: "")
@@ -114,10 +147,12 @@ struct LLMBenchmark: AsyncParsableCommand {
         let resolvedChunkThreshold = chunkThreshold ?? bundle.language.prefillChunkThreshold
         let engineOptions = EngineOptions(
             variant: inferenceEngineVariant,
+            kvCacheSize: kvCacheInitialCapacity,
             prefillChunkSize: resolvedChunkSize,
             prefillChunkThreshold: resolvedChunkThreshold,
             tensorData: bundle.tensorData
         )
+        measurement?.begin("prepare")
         let prepareStart = SuspendingClock.now
         let engine = try await EngineFactory.createEngine(
             config: configData,
@@ -125,8 +160,19 @@ struct LLMBenchmark: AsyncParsableCommand {
             options: engineOptions
         )
         let prepareSeconds = (SuspendingClock.now - prepareStart).inSeconds
-        let cacheSuffix = cacheHit ? " (cache hit)" : ""
-        print(" done in \(fmt(prepareSeconds))s\(cacheSuffix)")
+        print(" done in \(fmt(prepareSeconds))s")
+
+        if concurrency > 1 {
+            guard let seq = engine as? CoreAISequentialEngine, seq.supportsBatching else {
+                throw ValidationError(
+                    "--concurrency \(concurrency) needs the coreai-sequential engine and a model exported "
+                        + "with --attention-mask batched --dynamic-batch-size N")
+            }
+            try await runConcurrent(
+                engine: seq, bundle: bundle, prepareSeconds: prepareSeconds, cacheHit: cacheHit,
+                measurement: measurement)
+            return
+        }
 
         let prompt = randomPrompt(vocabSize: vocabSize, count: promptTokens, seed: seed)
         let sampling = SamplingConfiguration(temperature: 0)
@@ -158,6 +204,7 @@ struct LLMBenchmark: AsyncParsableCommand {
         }
 
         // Warmup
+        measurement?.begin("warmup")
         print("\n⚙️  Warming up engine...", terminator: "")
         fflush(stdout)
         let warmupStart = SuspendingClock.now
@@ -170,6 +217,7 @@ struct LLMBenchmark: AsyncParsableCommand {
         var trials: [TrialResult] = []
 
         for i in 0..<numTrials {
+            measurement?.begin("trial \(i + 1)")
             let r = try await oneTrial()
             trials.append(r)
             if i > 0 { print() }
@@ -178,19 +226,33 @@ struct LLMBenchmark: AsyncParsableCommand {
             print("🏃 Generation: \(fmt(r.genTps)) tokens/sec")
         }
 
+        // A short untimed run after the memory check drops the mapped model files, to see which the model needs.
+        // It prefills the trials' full prompt so it touches the same weights they did, such as every expert an
+        // MoE model routed to, and the same prefill functions; a few generated tokens cover decode.
+        let memory = try await measurement?.finish {
+            _ = try await runTrial(engine: engine, prompt: prompt, sampling: sampling, maxTokens: 16)
+        }
+
         let n = Double(trials.count)
         let avgPrompt = trials.map(\.promptTps).reduce(0, +) / n
         let avgGen = trials.map(\.genTps).reduce(0, +) / n
         print("\n📊 Benchmark Summary:")
         print(String(repeating: "=", count: 50))
-        print("Prepare:    \(fmt(prepareSeconds))s\(cacheSuffix)")
-        print("Warmup:     \(fmt(warmupSeconds))s")
+        let cacheSuffix = cacheHit ? " (cache hit)" : ""
+        print("Prepare:     \(fmt(prepareSeconds))s\(cacheSuffix)")
+        print("Warmup:      \(fmt(warmupSeconds))s")
         if effectiveBatch > 1 {
-            print("Batch:      \(effectiveBatch) rows (the prompt and generation rates below are totals across rows)")
+            print("Batch:       \(effectiveBatch) rows (the prompt and generation rates below are totals across rows)")
         }
-        print("Prompt:     \(fmt(avgPrompt)) tokens/sec")
-        print("Generation: \(fmt(avgGen)) tokens/sec")
+        print("Prompt:      \(fmt(avgPrompt)) tokens/sec")
+        print("Generation:  \(fmt(avgGen)) tokens/sec")
+        if let memory {
+            for line in memory.summaryLines() { print(line) }
+        }
         print(String(repeating: "=", count: 50))
+
+        if let memory { measurement?.chart(memory: memory, cacheHit: cacheHit) }
+        try measurement?.writeCSVIfRequested()
 
         if let path = outputJson {
             let report = BenchmarkReport(
@@ -204,7 +266,8 @@ struct LLMBenchmark: AsyncParsableCommand {
                 warmupSeconds: warmupSeconds,
                 trials: trials,
                 averages: BenchmarkReport.Averages(
-                    promptTps: avgPrompt, generationTps: avgGen)
+                    promptTps: avgPrompt, generationTps: avgGen),
+                peakMemory: memory?.json
             )
             try writeJSON(report: report, path: path)
         }
@@ -215,13 +278,14 @@ struct LLMBenchmark: AsyncParsableCommand {
     private func runTrial(
         engine: any InferenceEngine,
         prompt: [Int32],
-        sampling: SamplingConfiguration
+        sampling: SamplingConfiguration,
+        maxTokens: Int? = nil
     ) async throws -> TrialResult {
         // Brief pause for engine to finish prior async work before reset
         try? await Task.sleep(for: .milliseconds(50))
         try await engine.reset()
 
-        let options = InferenceOptions.extend(maxTokens: generationTokens)
+        let options = InferenceOptions.extend(maxTokens: maxTokens ?? generationTokens)
         let start = SuspendingClock.now
         let stream = try await engine.generate(
             with: prompt, samplingConfiguration: sampling, inferenceOptions: options
@@ -268,7 +332,7 @@ struct LLMBenchmark: AsyncParsableCommand {
 
     // MARK: - Helpers
 
-    private func randomPrompt(vocabSize: Int, count: Int, seed: UInt64) -> [Int32] {
+    func randomPrompt(vocabSize: Int, count: Int, seed: UInt64) -> [Int32] {
         var state = seed &+ 0x9E37_79B9_7F4A_7C15
         var out = [Int32]()
         out.reserveCapacity(count)
@@ -288,13 +352,13 @@ struct LLMBenchmark: AsyncParsableCommand {
         (end - start).inSeconds
     }
 
-    private func fmt(_ v: Double) -> String {
+    func fmt(_ v: Double) -> String {
         String(format: "%.3f", v)
     }
 
     // MARK: - JSON output
 
-    private func writeJSON(report: BenchmarkReport, path: String) throws {
+    func writeJSON(report: BenchmarkReport, path: String) throws {
         let encoder = JSONEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -309,9 +373,13 @@ struct LLMBenchmark: AsyncParsableCommand {
 
 // MARK: - Codable Report
 
+/// One trial. The optional fields are a `--concurrency` run's and are left out of the JSON otherwise.
 struct TrialResult: Codable {
     let promptTps: Double
     let genTps: Double
+    var perRequestGenTps: Double?
+    var endToEndTps: Double?
+    var meanTtftSeconds: Double?
 }
 
 struct BenchmarkReport: Codable {
@@ -319,15 +387,27 @@ struct BenchmarkReport: Codable {
     let promptTokens: Int
     let generationTokens: Int
     let numTrials: Int
+    /// Rows decoded in lockstep (`--batch-size`); 1 for a `--concurrency` run, which has none.
     let batchSize: Int
+    /// Requests in flight at once, for a `--concurrency` run.
+    var concurrency: Int?
+    /// Of `concurrency`, how many the scheduler decodes at once; the rest queue.
+    var residentRows: Int?
     let prepareSeconds: Double
     let cacheHit: Bool
     let warmupSeconds: Double
     let trials: [TrialResult]
     let averages: Averages
+    /// nil, and left out of the JSON, unless memory is measured.
+    let peakMemory: PeakMemoryJSON?
 
+    /// With several requests at once, `promptTps` and `generationTps` are totals across them, as
+    /// for `--batch-size`; `perRequestGenerationTps` is what one of them sees. See `TrialResult`.
     struct Averages: Codable {
         let promptTps: Double
         let generationTps: Double
+        var perRequestGenerationTps: Double?
+        var endToEndTps: Double?
+        var meanTtftSeconds: Double?
     }
 }
