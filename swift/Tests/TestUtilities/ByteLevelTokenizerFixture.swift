@@ -10,7 +10,9 @@ import Foundation
 public enum ByteLevelTokenizerFixture {
     /// Writes `tokenizer.json` and `tokenizer_config.json` (with `chatTemplate`) to a new temporary
     /// directory and returns it. The caller removes it.
-    public static func directory(chatTemplate: String) throws -> URL {
+    ///
+    /// `additionalSpecialTokens` get the ids after the byte tokens, from `firstAdditionalTokenId` on.
+    public static func directory(chatTemplate: String, additionalSpecialTokens: [String] = []) throws -> URL {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("byte-level-tokenizer-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -19,14 +21,15 @@ public enum ByteLevelTokenizerFixture {
         var vocab: [String: Int] = [:]
         for (id, token) in special.enumerated() { vocab[token] = id }
         for (offset, character) in byteCharacters.enumerated() { vocab[String(character)] = special.count + offset }
+        for (offset, token) in additionalSpecialTokens.enumerated() { vocab[token] = firstAdditionalTokenId + offset }
         let byteLevel: [String: Any] = [
             "type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": false,
         ]
         let tokenizer: [String: Any] = [
             "version": "1.0",
-            "added_tokens": special.enumerated().map { id, content in
+            "added_tokens": (special + additionalSpecialTokens).map { content in
                 [
-                    "id": id, "content": content, "single_word": false, "lstrip": false, "rstrip": false,
+                    "id": vocab[content]!, "content": content, "single_word": false, "lstrip": false, "rstrip": false,
                     "normalized": false, "special": true,
                 ] as [String: Any]
             },
@@ -48,6 +51,9 @@ public enum ByteLevelTokenizerFixture {
             .write(to: directory.appendingPathComponent("tokenizer_config.json"))
         return directory
     }
+
+    /// Id of the first of `directory`'s `additionalSpecialTokens`.
+    public static let firstAdditionalTokenId = 4 + 256
 
     /// The character byte-level BPE stands each byte for (GPT-2's `bytes_to_unicode`).
     private static let byteCharacters: [Character] = {

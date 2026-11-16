@@ -22,9 +22,9 @@ extension FlowTransformerPipeline {
     private static let textSeqLen = 512
     private static let qwen3PadTokenId = 151643
 
-    /// Reference tokens sit at T=10 on RoPE axis 0, separating them from the noise
-    /// grid (T=0) where H/W would otherwise collide. Matches the export-time dummies.
-    private static let referenceTokenTimeOffset: Float = 10
+    /// Reference *i* sits at T=10·(i+1) on RoPE axis 0, keeping references and the noise
+    /// grid (T=0) distinct where H/W coincide. Matches diffusers `_prepare_image_ids`.
+    static let referenceTokenTimeOffset: Float = 10
 
     /// FLUX.2 flow-matching timestep shift.
     ///
@@ -70,13 +70,23 @@ extension FlowTransformerPipeline {
         let steps = configuration.stepCount
         let guidanceScale = configuration.guidanceScale
 
+        // Reject a request this bundle can't serve before any model loads.
+        let imageSize = try Self.resolveImageSize(
+            configuration.imageSize, loadedSize: defaultImageSize.width, config: config)
+        let references = configuration.allReferenceImages
+        try Self.checkReferenceCount(references.count, config: config)
+        if mode == .tiled {
+            try Self.checkTiledDecode(imageSize: imageSize, isImageToImage: !references.isEmpty, config: config)
+        }
+        try Self.checkEncoder(
+            hasReferences: !references.isEmpty, hasEncoder: encoder != nil, mode: mode, config: config)
+
         // 1. Encode text
         let textEmbeddings = try await encodeText(configuration.prompt)
         if configuration.lazyModelLoading { await textEncoder.unloadResources() }
         let textSeqLen = textEmbeddings.count / hiddenDim(textEmbeddings)
 
         // 2. Determine latent dimensions from image size
-        let imageSize = defaultImageSize.width
         let spatialSide = imageSize / Self.patchSize
         let inChannels = Self.latentChannels
         let seqLen = spatialSide * spatialSide
@@ -86,16 +96,6 @@ extension FlowTransformerPipeline {
         // from the concatenated reference tokens, not from noise blending. txt2img
         // also uses [1.0 → 0]. So sigmaMax is 1.0 in both cases.
         let mu = Self.computeEmpiricalMu(imageSeqLen: seqLen, numSteps: steps)
-        let isActuallyImg2Img = configuration.isImageToImage && encoder != nil && configuration.startingImage != nil
-
-        // Reference-token img2img is incompatible with tiled decode: tiled uses the
-        // half-resolution VAE encoder (traced for 512×512), but the reference is
-        // encoded at the full image size — feeding it a 1024 image crashes on a
-        // shape mismatch. Fail early with a clear message instead.
-        if isActuallyImg2Img && mode == .tiled {
-            throw PipelineLoadError.unsupportedConfiguration(
-                "img2img is not supported with tiled decode. Use --decode-resolution full or half.")
-        }
 
         let sigmaMax: Float = 1.0
         let scheduler = DiscreteFlowScheduler(
@@ -115,32 +115,40 @@ extension FlowTransformerPipeline {
 
         // 5. Initialize reference tokens. Latents start from pure noise either way.
         var referenceTokens: [Float]?
-        var refSide: Int = 0
+        var refSides: [Int] = []
+        var staticPreset: ReferenceGrid?
 
-        if isActuallyImg2Img,
-            let enc = encoder,
-            let srcImage = configuration.startingImage
-        {
-            // Reference grid size based on the requested reference grid
-            switch configuration.referenceGrid {
-            case .full: refSide = spatialSide  // 64×64 = 4096 tokens
-            case .half: refSide = spatialSide / 2  // 32×32 = 1024 tokens
-            case .quarter: refSide = spatialSide / 4  // 16×16 = 256 tokens
-            }
+        if let enc = encoder, !references.isEmpty {
+            let (refSide, preset) = try Self.resolveReferenceSide(
+                configuration.referenceSize, spatialSide: spatialSide,
+                loadedSize: defaultImageSize.width, config: config)
+            staticPreset = preset
+            refSides = Array(repeating: refSide, count: references.count)
+            try Self.checkImageTokenBudget(noiseTokens: seqLen, refSides: refSides, config: config)
 
-            // Encode reference at full resolution, then subsample tokens if needed
-            let fullRefPacked = try await encodeReferenceImage(
-                encoder: enc, srcImage: srcImage, imageSize: imageSize,
-                spatialSide: spatialSide, inChannels: inChannels
-            )
-            let refPacked: [Float]
-            if refSide == spatialSide {
-                refPacked = fullRefPacked
-            } else {
-                refPacked = Self.subsampleTokens(
-                    fullRefPacked, fromSide: spatialSide, toSide: refSide, channels: inChannels)
+            var tokens: [Float] = []
+            tokens.reserveCapacity(references.count * refSide * refSide * inChannels)
+            for srcImage in references {
+                if isDynamic {
+                    // Encode at the reference's own size: skips a wasted full-size encode,
+                    // and resamples in image space rather than area-averaging latents.
+                    tokens += try await encodeReferenceImage(
+                        encoder: enc, srcImage: srcImage, imageSize: refSide * Self.patchSize,
+                        spatialSide: refSide, inChannels: inChannels)
+                } else {
+                    // The fixed-shape encoder only takes its traced size, so encode full and
+                    // reduce. `resolveReferenceSide` guarantees refSide divides spatialSide.
+                    let fullRefPacked = try await encodeReferenceImage(
+                        encoder: enc, srcImage: srcImage, imageSize: imageSize,
+                        spatialSide: spatialSide, inChannels: inChannels)
+                    tokens +=
+                        refSide == spatialSide
+                        ? fullRefPacked
+                        : Self.subsampleTokens(
+                            fullRefPacked, fromSide: spatialSide, toSide: refSide, channels: inChannels)
+                }
             }
-            referenceTokens = refPacked
+            referenceTokens = tokens
             if configuration.lazyModelLoading { await enc.unloadResources() }
 
             // FLUX.2 reference-token img2img: noise latents start from PURE NOISE.
@@ -157,28 +165,24 @@ extension FlowTransformerPipeline {
             throw PipelineLoadError.missingConfig(
                 "rope_axes_dims has \(axisCount) axes; FLUX.2 RoPE needs at least 3")
         }
-        let refSeqLen = refSide * refSide
-        // img2img appends reference tokens after the noise tokens, marked T=10 on axis 0
-        // so the transformer's in-graph RoPE separates them from the noise grid.
-        let imageIds: [Float]
-        if referenceTokens != nil {
-            imageIds = buildImageIdsWithReference(
-                noiseSide: spatialSide, refSide: refSide, axisCount: axisCount)
-        } else {
-            imageIds = buildImageIds(side: spatialSide, axisCount: axisCount)
-        }
+        let refSeqLen = refSides.reduce(0) { $0 + $1 * $1 }
+        // img2img appends each reference's tokens after the noise tokens, marked
+        // T=10·(i+1) on axis 0 so the in-graph RoPE separates them.
+        let imageIds = Self.buildImageIds(
+            noiseSide: spatialSide, refSides: refSides, axisCount: axisCount)
         let textIds = buildTextIds(textSeqLen: textSeqLen, axisCount: axisCount)
 
-        // 7. Pick the asset + entrypoint that serves this pass. img2img arrives one of two
+        // 7. Pick the asset + entrypoint that serves this pass. A dynamic bundle's `main`
+        // serves every sequence length. On a static bundle img2img arrives one of two
         // ways: as a named entrypoint on the multi-function transformer, or as its own
         // single-function asset. Which one is decided at load time by whether that asset
         // exists on disk.
         let denoiser: CoreAIDiffusionModelFunction
         let fnName: String
-        if referenceTokens != nil {
+        if referenceTokens != nil && !isDynamic, let preset = staticPreset {
             // Name what the bundle does have, not just what it lacks: re-exporting is the
             // only remedy, so the available set is the actionable part.
-            guard let route = img2imgRoutes[configuration.referenceGrid] else {
+            guard let route = img2imgRoutes[preset] else {
                 let available = img2imgRoutes.keys.map(\.rawValue).sorted()
                 throw PipelineLoadError.unsupportedConfiguration(
                     available.isEmpty
@@ -186,7 +190,7 @@ extension FlowTransformerPipeline {
                             + "components, or export without --single-function to get every "
                             + "grid from a single asset."
                         : "this bundle has no img2img transformer for the "
-                            + "\(configuration.referenceGrid) reference grid. Available: "
+                            + "\(preset) reference size. Available: "
                             + "\(available.joined(separator: ", ")).")
             }
             denoiser = route.function
@@ -318,7 +322,144 @@ extension FlowTransformerPipeline {
             vaeShape: [1, inChannels / 4, spatialSide * 2, spatialSide * 2],
             denoiser: denoiser,
             initialNoise: noise,
-            noiseShape: latentShape)
+            noiseShape: latentShape,
+            imageSize: imageSize)
+    }
+
+    // MARK: - Request Validation
+    //
+    // Static and parameterized by the bundle's `config`, so the rules can be tested without
+    // a bundle on disk.
+
+    /// Resolve the output size, validating a caller-requested one. A static bundle only
+    /// produces the size it was loaded for; a dynamic one accepts any aligned size within
+    /// its exported bounds (the token grid is `imageSize / 16`).
+    static func resolveImageSize(_ requested: Int?, loadedSize: Int, config: DiffusionConfig) throws -> Int {
+        guard let requested, requested != loadedSize else { return loadedSize }
+        guard config.dynamicShapes == true else {
+            throw PipelineLoadError.unsupportedConfiguration(
+                "imageSize \(requested) was requested but this bundle is statically shaped; "
+                    + "as loaded it only produces \(loadedSize)×\(loadedSize). Export with --dynamic "
+                    + "to vary resolution.")
+        }
+        let multiple = config.imageSizeMultiple ?? patchSize
+        let minSize = config.minImageSize ?? multiple
+        let maxSize = config.maxImageSize ?? loadedSize
+        guard requested >= minSize, requested <= maxSize else {
+            throw PipelineLoadError.unsupportedConfiguration(
+                "imageSize \(requested) is outside this bundle's exported range [\(minSize), \(maxSize)].")
+        }
+        guard requested % multiple == 0 else {
+            throw PipelineLoadError.unsupportedConfiguration(
+                "imageSize \(requested) must be a multiple of \(multiple): the VAE downsamples by 8 "
+                    + "and patchify folds a further 2×2, so the token grid side is imageSize / \(multiple).")
+        }
+        return requested
+    }
+
+    /// Each extra reference lengthens the concatenated sequence, and a static graph is traced
+    /// at exactly one length.
+    static func checkReferenceCount(_ count: Int, config: DiffusionConfig) throws {
+        guard count > 1, config.dynamicShapes != true else { return }
+        throw PipelineLoadError.unsupportedConfiguration(
+            "\(count) reference images were given but this bundle is statically shaped and takes "
+                + "one. Export with --dynamic for multiple references.")
+    }
+
+    /// Input images are only read through the VAE encoder, so without one they'd be silently
+    /// dropped and the run would quietly become txt2img.
+    static func checkEncoder(
+        hasReferences: Bool, hasEncoder: Bool, mode: DecodeResolution, config: DiffusionConfig
+    ) throws {
+        guard hasReferences, !hasEncoder else { return }
+        // A static half or tiled bundle loads the half-size encoder.
+        let asset = config.dynamicShapes != true && mode != .full ? "vae_encoder_half" : "vae_encoder"
+        throw PipelineLoadError.unsupportedConfiguration(
+            "input images need the \(asset) component, which this bundle doesn't have. Export it, "
+                + "or generate without input images.")
+    }
+
+    static func checkTiledDecode(imageSize: Int, isImageToImage: Bool, config: DiffusionConfig) throws {
+        if config.dynamicShapes == true {
+            // Tiles are half the output on a side, and the decoder's exported range has to
+            // cover them.
+            let minTile = config.minImageSize ?? 0
+            guard imageSize / 2 >= minTile else {
+                throw PipelineLoadError.unsupportedConfiguration(
+                    "tiled decode splits the output into \(imageSize / 2)px tiles, below this "
+                        + "bundle's \(minTile)px decoder minimum. Use an image size of at least "
+                        + "\(2 * minTile), or decode without tiling.")
+            }
+        } else if isImageToImage {
+            // A static tiled bundle loads the half-size encoder, which can't take the
+            // full-size reference.
+            throw PipelineLoadError.unsupportedConfiguration(
+                "img2img is not supported with tiled decode on a statically shaped bundle. "
+                    + "Decode without tiling, or export with --dynamic.")
+        }
+    }
+
+    /// Resolve the reference token-grid side shared by every reference, plus the preset
+    /// that serves it on a static bundle. A dynamic bundle takes any aligned size in its
+    /// encoder's range; a static one only its traced presets.
+    static func resolveReferenceSide(
+        _ size: ReferenceSize, spatialSide: Int, loadedSize: Int, config: DiffusionConfig
+    ) throws -> (side: Int, preset: ReferenceGrid?) {
+        let side = size.side(outputSide: spatialSide, patchSize: patchSize)
+        if case .pixels(let pixels) = size, pixels % patchSize != 0 {
+            throw PipelineLoadError.unsupportedConfiguration(
+                "reference size \(pixels) must be a multiple of \(patchSize): each reference "
+                    + "token covers \(patchSize)×\(patchSize) pixels.")
+        }
+        guard side >= 1 else {
+            throw PipelineLoadError.unsupportedConfiguration(
+                "the \(size) reference size resolves to \(side) tokens per side against a "
+                    + "\(spatialSide)-token output grid. Use a larger image size or a larger "
+                    + "reference size.")
+        }
+
+        guard config.dynamicShapes == true else {
+            let presets = ReferenceGrid.allCases.map {
+                "\($0)=\($0.side(outputSide: spatialSide) * patchSize)"
+            }
+            guard let preset = size.preset(outputSide: spatialSide, patchSize: patchSize) else {
+                throw PipelineLoadError.unsupportedConfiguration(
+                    "reference size \(size) is not one of this statically shaped bundle's presets "
+                        + "(\(presets.joined(separator: ", ")) px). Export with --dynamic for "
+                        + "arbitrary reference sizes.")
+            }
+            // `subsampleTokens` reduces by an integer stride, so a side that doesn't divide
+            // the output grid would condition on a cropped reference.
+            guard spatialSide % side == 0 else {
+                throw PipelineLoadError.unsupportedConfiguration(
+                    "reference side \(side) does not divide the \(spatialSide)-token output grid, "
+                        + "so reducing the reference would crop it.")
+            }
+            return (side, preset)
+        }
+
+        let minPixels = config.minReferenceSize ?? patchSize
+        let maxPixels = config.maxImageSize ?? loadedSize
+        let pixels = side * patchSize
+        guard pixels >= minPixels, pixels <= maxPixels else {
+            throw PipelineLoadError.unsupportedConfiguration(
+                "reference size \(size) encodes at \(pixels)px, outside this bundle's encoder "
+                    + "range [\(minPixels), \(maxPixels)].")
+        }
+        return (side, nil)
+    }
+
+    /// Noise plus every reference grid must fit the exported sequence `Dim`; past it the graph
+    /// fails inside the runtime.
+    static func checkImageTokenBudget(noiseTokens: Int, refSides: [Int], config: DiffusionConfig) throws {
+        guard config.dynamicShapes == true, let maxTokens = config.maxImageTokens else { return }
+        let refTokens = refSides.reduce(0) { $0 + $1 * $1 }
+        guard noiseTokens + refTokens > maxTokens else { return }
+        throw PipelineLoadError.unsupportedConfiguration(
+            "\(refSides.count) reference(s) at \(refSides.first ?? 0)×\(refSides.first ?? 0) tokens "
+                + "plus the \(noiseTokens)-token output grid is \(noiseTokens + refTokens) image "
+                + "tokens, over this bundle's limit of \(maxTokens). Use fewer references, a "
+                + "smaller reference size, or a smaller image size.")
     }
 
     // MARK: - Img2Img
@@ -414,47 +555,25 @@ extension FlowTransformerPipeline {
 
     // MARK: - RoPE Position IDs
 
-    /// `img_ids` for in-graph RoPE: `[1, side*side, axisCount]` flattened row-major,
-    /// one row per image token as [T, H, W, L].
-    private func buildImageIds(side: Int, axisCount: Int) -> [Float] {
-        var ids = [Float](repeating: 0, count: side * side * axisCount)
-        for h in 0..<side {
-            for w in 0..<side {
-                let idx = h * side + w
-                ids[idx * axisCount + 1] = Float(h)
-                ids[idx * axisCount + 2] = Float(w)
+    /// `img_ids` for in-graph RoPE: `[1, tokens, axisCount]` flattened row-major, one row
+    /// per image token as [T, H, W, L]. The noise grid comes first at T=0, then each
+    /// reference grid in order at T=10·(i+1), with H/W restarting at 0 per grid.
+    static func buildImageIds(noiseSide: Int, refSides: [Int], axisCount: Int) -> [Float] {
+        let grids =
+            [(side: noiseSide, t: Float(0))]
+            + refSides.enumerated().map { (side: $1, t: referenceTokenTimeOffset * Float($0 + 1)) }
+        var ids = [Float](repeating: 0, count: grids.reduce(0) { $0 + $1.side * $1.side } * axisCount)
+        var idx = 0
+        for grid in grids {
+            for h in 0..<grid.side {
+                for w in 0..<grid.side {
+                    ids[idx * axisCount + 0] = grid.t
+                    ids[idx * axisCount + 1] = Float(h)
+                    ids[idx * axisCount + 2] = Float(w)
+                    idx += 1
+                }
             }
         }
-        return ids
-    }
-
-    /// `img_ids` for img2img: noise tokens followed by reference tokens.
-    /// Reference rows carry T=10 on axis 0 so in-graph RoPE keeps them positionally
-    /// distinct from the noise grid even where H/W coincide.
-    private func buildImageIdsWithReference(
-        noiseSide: Int, refSide: Int, axisCount: Int
-    ) -> [Float] {
-        let noiseSeq = noiseSide * noiseSide
-        let refSeq = refSide * refSide
-        var ids = [Float](repeating: 0, count: (noiseSeq + refSeq) * axisCount)
-
-        for h in 0..<noiseSide {
-            for w in 0..<noiseSide {
-                let idx = h * noiseSide + w
-                ids[idx * axisCount + 1] = Float(h)
-                ids[idx * axisCount + 2] = Float(w)
-            }
-        }
-
-        for h in 0..<refSide {
-            for w in 0..<refSide {
-                let idx = noiseSeq + h * refSide + w
-                ids[idx * axisCount + 0] = Self.referenceTokenTimeOffset
-                ids[idx * axisCount + 1] = Float(h)
-                ids[idx * axisCount + 2] = Float(w)
-            }
-        }
-
         return ids
     }
 
