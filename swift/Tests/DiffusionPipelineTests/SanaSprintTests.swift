@@ -3,6 +3,7 @@
 // Use of this source code is governed by a BSD-3-clause license that can
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
+import CoreAIShared
 import Foundation
 import Testing
 
@@ -13,7 +14,7 @@ struct SanaSprintTests {
     @Test("Sequential torch draws match torch.randn with a shared generator (seed=42)")
     func torchStreamContinuesAcrossDraws() {
         // g = torch.Generator("cpu").manual_seed(42); torch.randn(1,32,32,32, generator=g) twice
-        var rng = TorchRandomSource(seed: 42)
+        var rng = CoreAIShared.TorchRandomSource(seed: 42)
         let first = rng.normalArray([32 * 32 * 32])
         let second = rng.normalArray([32 * 32 * 32])
         let expectedFirst: [Float] = [1.9269150, 1.4872842, 0.9007172, -2.1055214]

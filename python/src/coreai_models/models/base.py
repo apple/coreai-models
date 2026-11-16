@@ -20,7 +20,6 @@ from typing import Any, TypeVar, cast
 
 import torch
 from coreai.authoring.types import AllocationType, HardwareConstraints
-from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from safetensors.torch import save_file
 from transformers import AutoConfig
@@ -51,6 +50,7 @@ from coreai_models._constants import (
     VALUE_CACHE_NAME,
     VALUE_CACHE_OUTPUT_NAME,
 )
+from coreai_models.hub import BackendName, get_backend, resolve_download_id, resolve_local
 from coreai_models.primitives.ios.cache import KVCacheHandler, causal_mask
 from coreai_models.primitives.ios.embedding import GatherEmbeddings, LoadEmbeddings
 from coreai_models.primitives.macos.cache import KVCache
@@ -760,13 +760,14 @@ class BaseForCausalLM(torch.nn.Module):
     @classmethod
     def from_hf(
         cls: type[T],
-        huggingface_model_id: str,
+        huggingface_model_id_or_path: str,
         max_context_length: int | None = None,
         target_dtype: torch.dtype = torch.float16,
         mmap_path: str | None = None,
         num_layers: int | None = None,
         disable_embedding_quantization: bool = False,
         use_attention_mask: bool = False,
+        backend: BackendName = "huggingface",
     ) -> T:
         """Load model from HuggingFace model hub.
 
@@ -793,9 +794,20 @@ class BaseForCausalLM(torch.nn.Module):
         if cls._HF_MODEL_CLASS is None:
             raise ValueError(f"{cls.__name__} must define _HF_MODEL_CLASS class attribute")
 
-        # Load the HuggingFace model
+        # A pre-downloaded local directory is read in place; a hub id is
+        # resolved through the selected backend first.
+        load_id = resolve_local(
+            huggingface_model_id_or_path,
+            backend,
+            allow_patterns=[
+                "*.safetensors",
+                "*.safetensors.index.json",
+                "config.json",
+                "generation_config.json",
+            ],
+        )
         hf_model = cast(PreTrainedModel, cls._HF_MODEL_CLASS).from_pretrained(
-            huggingface_model_id, dtype=target_dtype
+            load_id, dtype=target_dtype
         )
 
         # Convert config using the hook method (default: pass-through with context length)
@@ -847,7 +859,7 @@ class BaseForCausalLM(torch.nn.Module):
     @classmethod
     def from_hf_memory_efficient(
         cls: type[T],
-        huggingface_model_id: str,
+        huggingface_model_id_or_path: str,
         max_context_length: int | None = None,
         target_dtype: torch.dtype = torch.float16,
         mmap_path: str | None = None,
@@ -856,6 +868,7 @@ class BaseForCausalLM(torch.nn.Module):
         hf_state_dict_prefix: str = "",
         disable_embedding_quantization: bool = False,
         use_attention_mask: bool = False,
+        backend: BackendName = "huggingface",
     ) -> T:
         """Load model from HuggingFace with layer-by-layer memory offloading.
 
@@ -865,7 +878,8 @@ class BaseForCausalLM(torch.nn.Module):
         the peak RAM is roughly *one layer + shared params*.
 
         Args:
-            huggingface_model_id: HuggingFace model identifier.
+            huggingface_model_id_or_path: HuggingFace model identifier, or the path of a
+                local checkpoint directory, which is read in place.
             max_context_length: Optional override for the model's context length.
             target_dtype: Target dtype for the model weights.
             mmap_path: Directory for per-layer mmap files. When provided each
@@ -888,10 +902,14 @@ class BaseForCausalLM(torch.nn.Module):
                 explicit additive ``attn_mask`` input (``is_causal`` off).
                 Ignored for iOS model classes.
         """
-        model_dir = snapshot_download(
-            huggingface_model_id,
-            allow_patterns=["*.safetensors", "*.safetensors.index.json", "config.json"],
-        )
+        if Path(huggingface_model_id_or_path).is_dir():
+            model_dir = huggingface_model_id_or_path
+        else:
+            download_id = resolve_download_id(huggingface_model_id_or_path, backend)
+            model_dir = get_backend(backend).snapshot(
+                download_id,
+                allow_patterns=["*.safetensors", "*.safetensors.index.json", "config.json"],
+            )
 
         raw_config = AutoConfig.from_pretrained(model_dir)
         hf_config = getattr(raw_config, hf_config_attr) if hf_config_attr else raw_config

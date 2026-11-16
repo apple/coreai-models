@@ -608,7 +608,7 @@ public struct WanPipeline: VideoPipeline {
     // MARK: - Utilities
 
     private func generateNoise(count: Int, seed: UInt32) -> [Float] {
-        var rng = TorchRandomSource(seed: seed)
+        var rng = CoreAIShared.TorchRandomSource(seed: seed)
         return rng.normalArray([count])
     }
 

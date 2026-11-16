@@ -98,9 +98,7 @@ package final class StaticShapeDrafter: DrafterEngine, @unchecked Sendable {
     private let invFreqFull: [Float]
     private var seedHidden: [Float]?
     private var embedCache = EmbeddingCache()
-    /// One centroid's candidate rows as fp32, and their scores.
-    private var candidateRows: [Float] = []
-    private var candidateScores: [Float] = []
+    private var scanner: DraftScan.Scanner
 
     /// - Parameters:
     ///   - component: the exported program and its sidecars.
@@ -280,8 +278,7 @@ package final class StaticShapeDrafter: DrafterEngine, @unchecked Sendable {
         x = try Self.array(desc.outputDescriptor(of: "x"), "x")
         func invFreq(_ name: String, theta: Float, partial: Float) -> [Float] {
             guard case .ndArray(let d)? = desc.inputDescriptor(of: name), let hd = d.shape.last else { return [] }
-            let rotated = Int(Float(hd / 2) * partial)
-            return (0..<hd / 2).map { $0 < rotated ? powf(theta, -2 * Float($0) / Float(hd)) : 0 }
+            return DraftScan.inverseFrequencies(headDim: hd, theta: theta, partial: partial)
         }
         func lastDimension(_ name: String, output: Bool) -> Int? {
             let d = output ? desc.outputDescriptor(of: name) : desc.inputDescriptor(of: name)
@@ -300,6 +297,7 @@ package final class StaticShapeDrafter: DrafterEngine, @unchecked Sendable {
         self.scan = scan
         self.backboneHidden = backboneHidden
         self.topK = try DraftScan.topK(requested: topK, centroids: scan.index.centroids)
+        self.scanner = DraftScan.Scanner(pack: scan, topK: self.topK)
         self.maxContextLength = maxContextLength
         try select(window: windows[0])
     }
@@ -405,75 +403,12 @@ package final class StaticShapeDrafter: DrafterEngine, @unchecked Sendable {
             outputs.insert(&x, for: "x")
             _ = try await function(for: window).run(inputs: inputs.borrowedInputs(), outputViews: consume outputs)
 
-            let token = scan(x: Self.read(&x), centroidLogits: Self.read(&centroidLogits))
+            let token = scanner.bestToken(x: Self.read(&x), centroidLogits: Self.read(&centroidLogits))
             tokens.append(token)
             lastToken = token
             lastHidden = Self.read(&hidden)
         }
         return DraftProposal(tokens: tokens)
-    }
-
-    /// The masked embedder: score only the tokens of the `topK` best centroids and take the best.
-    private func scan(x: [Float], centroidLogits cl: [Float]) -> Int32 {
-        let perCentroid = scan.index.perCentroid
-        let hidden = scan.shape("embed_perm_f16")[1]
-        var topV = [Float](repeating: -.greatestFiniteMagnitude, count: topK)
-        var topI = [Int](repeating: 0, count: topK)
-        for c in 0..<scan.index.centroids where cl[c] > topV[topK - 1] {
-            var j = topK - 1
-            while j > 0 && cl[c] > topV[j - 1] {
-                topV[j] = topV[j - 1]
-                topI[j] = topI[j - 1]
-                j -= 1
-            }
-            topV[j] = cl[c]
-            topI[j] = c
-        }
-        // A centroid's candidates are contiguous rows, so each is one fp16 -> fp32 conversion and one
-        // matrix-vector product. Scoring row by row through `DraftScan.dot` spent most of the scan
-        // in the runtime availability check `SIMD8<Float>(SIMD8<Float16>)` makes on every call.
-        let table = scan.f16("embed_perm_f16")
-        let block = perCentroid * hidden
-        if candidateRows.count != block { candidateRows = [Float](repeating: 0, count: block) }
-        if candidateScores.count != perCentroid { candidateScores = [Float](repeating: 0, count: perCentroid) }
-        var best = -Float.greatestFiniteMagnitude
-        var bestSlot = 0
-        x.withUnsafeBufferPointer { xp in
-            candidateRows.withUnsafeMutableBufferPointer { rows in
-                candidateScores.withUnsafeMutableBufferPointer { scores in
-                    for c in topI {
-                        var src = vImage_Buffer(
-                            data: UnsafeMutableRawPointer(mutating: table + c * block), height: 1,
-                            width: vImagePixelCount(block), rowBytes: block * 2)
-                        var dst = vImage_Buffer(
-                            data: rows.baseAddress, height: 1, width: vImagePixelCount(block), rowBytes: block * 4)
-                        guard vImageConvert_Planar16FtoPlanarF(&src, &dst, 0) == kvImageNoError else {
-                            // Unconverted rows would score stale data, so this centroid is scored row by row.
-                            for j in 0..<perCentroid {
-                                let slot = c * perCentroid + j
-                                let score = DraftScan.dot(x, table + slot * hidden, n: hidden)
-                                if score > best {
-                                    best = score
-                                    bestSlot = slot
-                                }
-                            }
-                            continue
-                        }
-                        vDSP_mmul(
-                            rows.baseAddress!, 1, xp.baseAddress!, 1, scores.baseAddress!, 1,
-                            vDSP_Length(perCentroid), 1, vDSP_Length(hidden))
-                        var score: Float = 0
-                        var j: vDSP_Length = 0
-                        vDSP_maxvi(scores.baseAddress!, 1, &score, &j, vDSP_Length(perCentroid))
-                        if score > best {
-                            best = score
-                            bestSlot = c * perCentroid + Int(j)
-                        }
-                    }
-                }
-            }
-        }
-        return scan.i32("token_ordering_i32")[bestSlot]
     }
 
     // MARK: - Inputs

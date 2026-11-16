@@ -29,7 +29,7 @@ dependencies = [
     "accelerate>=1.12,<2.0",
     "coreai-core==1.0.0b3",
     "coreai-torch==0.4.3",
-    "coreai-opt==0.4.0",
+    "coreai-opt[flash-kmeans]==0.4.0",
     "torch==2.9.0",
     "torchao<0.18.0",
     "setuptools>=42",

@@ -66,6 +66,8 @@ ______________________________________________________________________
 ## Export (Python — coreai-torch)
 
 ```python
+from pathlib import Path
+
 import torch
 from coreai_torch import TorchConverter, get_decomp_table
 
@@ -78,7 +80,7 @@ program = (
     .add_exported_program(ep, input_names=["image"], output_names=["logits"])
     .to_coreai()
 )
-program.save_asset("model.aimodel")
+program.save_asset(Path("model.aimodel"))
 ```
 
 This is the simplest export pattern. Real models often need more — consult the [coreai-torch docs](https://apple.github.io/coreai-torch/index.html) and explore the export code in the coreai-models repo for patterns around:

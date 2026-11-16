@@ -50,3 +50,21 @@ def test_a_preset_without_a_precision_needs_one_stated() -> None:
 def test_a_missing_compression_yaml_exits_with_the_flags_message() -> None:
     with pytest.raises(SystemExit, match="--compression-config: file not found"):
         resolve_compression("macOS", compression_config=Path("does/not/exist.yaml"))
+
+
+def test_preset_names_are_deterministic_and_sorted() -> None:
+    """list_presets() and the "Available:" error order must not vary per run.
+
+    ALL_PRESET_NAMES used to be built straight from a set, so the user-facing
+    preset list changed order with every process's hash seed.
+    """
+    from coreai_models.export.presets import (
+        ALL_PRESET_NAMES,
+        IOS_PRESETS,
+        MACOS_PRESETS,
+        list_presets,
+    )
+
+    expected = sorted(set(MACOS_PRESETS) | set(IOS_PRESETS))
+    assert list_presets() == expected
+    assert list_presets() == ALL_PRESET_NAMES

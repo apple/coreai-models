@@ -249,3 +249,59 @@ struct SamplingConfigurationTests {
         #expect(sampledTokens.contains(1))
     }
 }
+
+@Suite("SamplingConfiguration parameter validation")
+struct SamplingParameterValidationTests {
+    @Test("Each out-of-range value is reported with its parameter, requirement and value")
+    func reportsOutOfRangeValues() {
+        let cases: [(SamplingParameterError?, SamplingParameterError.Parameter, String, String)] = [
+            (SamplingConfiguration.parameterError(-1), .temperature, ">= 0", "-1.0"),
+            (SamplingConfiguration.parameterError(.nan), .temperature, ">= 0", "nan"),
+            (SamplingConfiguration.parameterError(1, 0), .topK, "> 0", "0"),
+            (SamplingConfiguration.parameterError(1, -5), .topK, "> 0", "-5"),
+            (SamplingConfiguration.parameterError(1, nil, 0), .topP, "in (0, 1]", "0.0"),
+            (SamplingConfiguration.parameterError(1, nil, 1.5), .topP, "in (0, 1]", "1.5"),
+            (SamplingConfiguration.parameterError(1, nil, nil, 0), .minP, "in (0, 1]", "0.0"),
+            (SamplingConfiguration.parameterError(1, nil, nil, 2), .minP, "in (0, 1]", "2.0"),
+            (
+                SamplingConfiguration.parameterError(1, nil, nil, nil, 0.5),
+                .repetitionPenalty, ">= 1", "0.5"
+            ),
+            (
+                SamplingConfiguration.parameterError(1, nil, nil, nil, nil, 0),
+                .repetitionPenaltyWindow, "> 0", "0"
+            ),
+        ]
+        for (error, parameter, requirement, value) in cases {
+            #expect(error == SamplingParameterError(parameter: parameter, requirement: requirement, value: value))
+        }
+    }
+
+    @Test("Boundary values are accepted")
+    func acceptsBoundaryValues() {
+        #expect(SamplingConfiguration.parameterError(0) == nil)
+        #expect(
+            SamplingConfiguration.parameterError(0.7, 1, 1, 1, 1, 1)
+                == nil)
+        #expect(SamplingConfiguration.parameterError(1, nil, .leastNonzeroMagnitude) == nil)
+    }
+
+    @Test("The first out-of-range parameter is reported")
+    func reportsFirstError() {
+        let error = SamplingConfiguration.parameterError(-1, 0, 0)
+        #expect(error?.parameter == .temperature)
+    }
+
+    @Test("Message uses the caller's name for the parameter")
+    func messageUsesCallerName() {
+        let error = SamplingConfiguration.parameterError(1, 0)
+        #expect(error?.message(naming: "top_k") == "top_k must be > 0, got 0")
+    }
+
+    @Test("The initializer still traps on an out-of-range value")
+    func initializerTraps() async {
+        await #expect(processExitsWith: .failure) {
+            _ = SamplingConfiguration(temperature: 1, topK: 0)
+        }
+    }
+}

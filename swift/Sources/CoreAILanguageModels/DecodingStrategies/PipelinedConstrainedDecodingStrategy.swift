@@ -106,9 +106,17 @@ public struct PipelinedConstrainedDecodingStrategy: DecodingStrategy {
 /// The engine's background Task owns session lifetime: it returns the session to
 /// cache in its `defer` block after generation completes (normal, error, or cancel).
 /// The iterator does not manage session lifecycle.
-public struct PipelinedConstrainedSequence: AsyncSequence {
+public struct PipelinedConstrainedSequence: AsyncSequence, DecodeOutcomeReporting {
     public typealias Element = GenerationResult
     public typealias Failure = Error
+
+    /// Why the stream ended and how many tokens it took, written by the iterator.
+    fileprivate let outcome = StopReasonStore()
+    fileprivate let tokenCount = TokenCountStore()
+
+    public var stopReason: StopReason? { outcome.stopReason }
+
+    public var tokensGenerated: Int { tokenCount.count }
 
     fileprivate let session: ConstrainedSessionHandle
     fileprivate let inputTokens: [Int32]
@@ -131,7 +139,9 @@ public struct PipelinedConstrainedSequence: AsyncSequence {
             tokenizer: tokenizer,
             engine: engine,
             samplingConfiguration: samplingConfiguration,
-            stopSequences: stopSequences
+            stopSequences: stopSequences,
+            outcome: outcome,
+            tokenCount: tokenCount
         )
     }
 }
@@ -151,10 +161,14 @@ extension PipelinedConstrainedSequence {
         private let maxTokens: Int
 
         private var innerIterator: AsyncThrowingStream<Int32, Error>.AsyncIterator?
+        /// The engine's stream, for why it ended when it ends without an error.
+        private var engineStream: InferenceTokenSequence?
         private var generatedTokens: [Int32] = []
         private var previousDecodedText: String = ""
         private var recentTokens: [Int32] = []
         private var finished: Bool = false
+        private let outcome: StopReasonStore
+        private let tokenCount: TokenCountStore
 
         fileprivate init(
             session: ConstrainedSessionHandle,
@@ -163,8 +177,12 @@ extension PipelinedConstrainedSequence {
             tokenizer: any Tokenizer,
             engine: any ConstrainedGenerationCapable,
             samplingConfiguration: SamplingConfiguration,
-            stopSequences: StopSequences
+            stopSequences: StopSequences,
+            outcome: StopReasonStore,
+            tokenCount: TokenCountStore
         ) {
+            self.outcome = outcome
+            self.tokenCount = tokenCount
             self.session = session
             self.inputTokens = inputTokens
             self.maxTokens = maxTokens
@@ -179,12 +197,13 @@ extension PipelinedConstrainedSequence {
 
             // Lazily start the engine stream on first iteration
             if innerIterator == nil {
-                let stream = try engine.generateConstrained(
+                let stream = try await engine.generateConstrained(
                     with: inputTokens,
                     samplingConfiguration: samplingConfiguration,
                     maxTokens: maxTokens,
                     session: session
                 )
+                self.engineStream = stream
                 self.innerIterator = stream.makeAsyncIterator()
             }
 
@@ -203,18 +222,24 @@ extension PipelinedConstrainedSequence {
                     guard let tokenId = try await iterator.next() else {
                         finished = true
                         self.innerIterator = nil
+                        // The engine says when it was cancelled. Otherwise it stopped at the limit, or once
+                        // the grammar accepted the end of sequence.
+                        outcome.setIfUnset(
+                            engineStream?.stopReason ?? (generatedTokens.count >= maxTokens ? .maxTokens : .eos))
                         return nil
                     }
                     self.innerIterator = iterator
+                    tokenCount.set(generatedTokens.count + 1)
 
                     // Check stop sequences
                     recentTokens.append(tokenId)
                     if recentTokens.count > stopSequences.maxLength {
                         recentTokens.removeFirst()
                     }
-                    if stopSequences.matches(recentTokens: recentTokens) {
+                    if let matched = stopSequences.matchedSequence(recentTokens: recentTokens) {
                         finished = true
                         self.innerIterator = nil
+                        outcome.setIfUnset(.stopSequence(tokenizer.decode(tokens: matched.map(Int.init))))
                         return nil
                     }
 
@@ -244,6 +269,7 @@ extension PipelinedConstrainedSequence {
             } catch {
                 finished = true
                 self.innerIterator = nil
+                outcome.setIfUnset(.error)
                 throw error
             }
         }

@@ -294,12 +294,15 @@ public struct ImagePreprocessor: Sendable {
 
 public enum ImagePreprocessorError: Error, LocalizedError {
     case loadFailed(URL)
+    case decodeFailed
     case renderFailed
 
     public var errorDescription: String? {
         switch self {
         case .loadFailed(let url):
             return "Failed to load image from: \(url.path)"
+        case .decodeFailed:
+            return "Failed to decode image data"
         case .renderFailed:
             return "Failed to render preprocessed image"
         }

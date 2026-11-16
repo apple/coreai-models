@@ -21,7 +21,7 @@
 /// advances the state, then two xor-shift/multiply rounds mix it. It is fast, has a
 /// full 2^64 period, and passes standard statistical tests — enough for a sampling
 /// determinism knob (it is not a cryptographic generator).
-public struct SeededRandomNumberGenerator: RandomNumberGenerator {
+public struct SeededRandomNumberGenerator: RandomNumberGenerator, Sendable {
     private var state: UInt64
 
     /// Creates a generator seeded with `seed`. Any 64-bit value is valid, including 0.

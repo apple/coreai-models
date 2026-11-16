@@ -95,8 +95,8 @@ public struct CoreAILanguageModel: LanguageModel {
     /// - Parameter url: URL to the model bundle directory.
     /// - Parameter mode: When to load the engine. Defaults to `.lazy`. With
     ///   `.eager`, the tokenizer and engine load concurrently
-    /// - Parameter variant: Engine variant override (e.g. "coreai-sequential",
-    ///   "ane"). Nil for auto-detect from model structure.
+    /// - Parameter variant: Engine variant override: "coreai-sequential", "coreai-pipelined" or
+    ///   "static-shape". Nil for auto-detect from model structure.
     /// - Parameter kvCacheStrategy: KV cache memory strategy. Defaults to
     ///   `.auto` (256-token initial size for dynamic models). Pass
     ///   `.fixedSize` to pre-allocate at full `maxContextLength`.
@@ -358,8 +358,13 @@ public struct CoreAILanguageModel: LanguageModel {
             // to a top-level `.reasoning(...)` channel event so it lands as
             // its own `Transcript.Reasoning` entry, not mixed into the
             // user-facing `Transcript.Response`. Markers were resolved at
-            // model init from the tokenizer's known token ids.
-            var thinkParser = ThinkTagParser(format: model.thinkingFormat)
+            // model init from the tokenizer's known token ids. A chat template
+            // that writes the open marker itself leaves the prompt inside the
+            // block, so the stream starts as reasoning.
+            var thinkParser = ThinkTagParser(
+                format: model.thinkingFormat,
+                startsInReasoning: ThinkTagParser.promptOpensReasoning(
+                    promptTokens, tokenizer: tokenizer, format: model.thinkingFormat))
             // Routes tool call markup to .toolCalls(...) channel events.
             // nil when the model's tokenizer has no tool call tokens.
             var toolCallParser: ToolCallParser? = model.toolCallDetection.map {

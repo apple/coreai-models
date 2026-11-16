@@ -27,7 +27,6 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from huggingface_hub import snapshot_download
 from typing_extensions import Self, override
 
 from coreai_models._constants import (
@@ -35,6 +34,7 @@ from coreai_models._constants import (
     SLIDING_KEY_CACHE_NAME,
     SLIDING_VALUE_CACHE_NAME,
 )
+from coreai_models.hub import BackendName, get_backend, resolve_download_id
 from coreai_models.models.base import (
     BaseForCausalLM,
     TraceSpec,
@@ -246,12 +246,13 @@ class MuseGlimmerDrafterForCausalLM(BaseForCausalLM):
     @override
     def from_hf(
         cls,
-        huggingface_model_id: str,
+        huggingface_model_id_or_path: str,
         max_context_length: int | None = None,
         target_dtype: torch.dtype = torch.float16,
         mmap_path: str | None = None,
         num_layers: int | None = None,
         disable_embedding_quantization: bool = False,
+        backend: BackendName = "huggingface",
         *,
         target_model_id: str = "meta-models/Muse-Glimmer-30B",
     ) -> Self:
@@ -263,17 +264,21 @@ class MuseGlimmerDrafterForCausalLM(BaseForCausalLM):
         from *target_model_id*.
 
         Args:
-            huggingface_model_id: Drafter checkpoint id
+            huggingface_model_id_or_path: Drafter checkpoint id or local path
                 (e.g. ``meta-models/Muse-Glimmer-30B-assistant``).
             target_model_id: Full target model id to borrow embeddings from.
+            backend: Model download backend (see ``coreai_models.hub``).
             Other args: see :meth:`BaseForCausalLM.from_hf`.
         """
         from safetensors import safe_open
 
         # ---- 1. Download both checkpoints (safetensors + config only) --------
         allow = ["*.safetensors", "*.safetensors.index.json", "config.json"]
-        drafter_dir = snapshot_download(huggingface_model_id, allow_patterns=allow)
-        target_dir = snapshot_download(target_model_id, allow_patterns=allow)
+        download = get_backend(backend).snapshot
+        drafter_id = resolve_download_id(huggingface_model_id_or_path, backend)
+        target_id = resolve_download_id(target_model_id, backend)
+        drafter_dir = download(drafter_id, allow_patterns=allow)
+        target_dir = download(target_id, allow_patterns=allow)
 
         # ---- 2. Build drafter config, inject vocab_size from target ----------
         with open(os.path.join(drafter_dir, "config.json")) as f:
@@ -358,19 +363,21 @@ class MuseGlimmerDrafterForCausalLM(BaseForCausalLM):
     @override
     def from_hf_memory_efficient(
         cls,
-        huggingface_model_id: str,
+        huggingface_model_id_or_path: str,
         max_context_length: int | None = None,
         target_dtype: torch.dtype = torch.float16,
         mmap_path: str | None = None,
         num_layers: int | None = None,
+        backend: BackendName = "huggingface",
         **kwargs: Any,
     ) -> Self:
         return cls.from_hf(
-            huggingface_model_id,
+            huggingface_model_id_or_path,
             max_context_length=max_context_length,
             target_dtype=target_dtype,
             mmap_path=mmap_path,
             num_layers=num_layers,
+            backend=backend,
         )
 
     # ------------------------------------------------------------------
