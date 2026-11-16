@@ -87,9 +87,8 @@ public struct ResponseFormat: Decodable, Sendable {
         public let name: String?
         public let schema: JSONValue
         /// The schema as the request wrote it, when the decoder had the request's text
-        /// (``JSONSourceText``). It keeps the order of `properties`, which `schema` can't. It is strict
-        /// JSON, and a whole number written with a fraction (`5.0`) is an integer, as `schema`
-        /// re-encodes it (``JSONSourceText/normalizedForGrammar(_:)``).
+        /// (``JSONSourceText``). It keeps the order of `properties`, which `schema` can't. The
+        /// grammar session makes it strict JSON, whatever leniency `JSONDecoder` allowed.
         public let schemaText: String?
 
         enum CodingKeys: String, CodingKey {
@@ -102,7 +101,6 @@ public struct ResponseFormat: Decodable, Sendable {
             schema = try container.decode(JSONValue.self, forKey: .schema)
             schemaText = (decoder.userInfo[JSONSourceText.userInfoKey] as? Data)
                 .flatMap { JSONSourceText.text(at: decoder.codingPath + [CodingKeys.schema], in: $0) }
-                .map(JSONSourceText.normalizedForGrammar)
         }
     }
 

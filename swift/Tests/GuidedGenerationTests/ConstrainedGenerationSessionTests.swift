@@ -31,6 +31,16 @@ struct ConstrainedGenerationSessionTests {
         }
     }
 
+    @Test("A schema with a trailing comma and a bound written 5.0 compiles, as strict JSON")
+    func initMakesALenientSchemaStrict() throws {
+        let session = try ConstrainedGenerationSession(
+            jsonSchema: #"{"type":"object","properties":{"name":{"type":"string","maxLength":5.0},},}"#,
+            vocabulary: sharedToyVocab,
+            vocabType: .raw
+        )
+        #expect(session.schema == #"{"type":"object","properties":{"name":{"type":"string","maxLength":5}}}"#)
+    }
+
     @Test func initWithTokenizerInfo() throws {
         let tokenizerInfo = TokenizerInfo(
             vocabulary: sharedToyVocab,

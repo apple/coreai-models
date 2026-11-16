@@ -48,6 +48,27 @@ struct GrammarSchemaJSONTests {
         #expect(ordered("{") == nil)
     }
 
+    @Test("Whole numbers written with a fraction or exponent become integers; strings and other numbers stay")
+    func wholeNumbers() {
+        #expect(
+            GrammarSchemaJSON.normalized(#"{"maxLength": 5.0, "m": 1e0, "x": 0.5, "n": -2.0E1, "s": "5.0"}"#)
+                == #"{"maxLength": 5, "m": 1, "x": 0.5, "n": -20, "s": "5.0"}"#)
+        #expect(GrammarSchemaJSON.normalized("[12345678901234567890, 7]") == "[12345678901234567890, 7]")
+        // Past what a Double holds exactly, or infinite, a number stays as written.
+        #expect(
+            GrammarSchemaJSON.normalized("[1e300, 1e400, 9.3e18, 2.0e15]")
+                == "[1e300, 1e400, 9.3e18, 2000000000000000]")
+    }
+
+    @Test("Trailing commas are dropped, and commas inside a string stay")
+    func trailingCommas() throws {
+        let schema = GrammarSchemaJSON.normalized(
+            #"{"type":"object","properties":{"a":{"type":"string"},"b":{"enum":[1, 2, ]},},}"#)
+        #expect(schema == #"{"type":"object","properties":{"a":{"type":"string"},"b":{"enum":[1, 2 ]}}}"#)
+        #expect((try? JSONSerialization.jsonObject(with: Data(schema.utf8))) != nil)
+        #expect(GrammarSchemaJSON.normalized(#"{"d": ", }"}"#) == #"{"d": ", }"}"#)
+    }
+
     @Test("A GenerationSchema comes out in its declared property order, nested types included, every time")
     func generationSchemaInDeclaredOrder() throws {
         let address = DynamicGenerationSchema(

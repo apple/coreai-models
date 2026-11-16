@@ -537,10 +537,9 @@ public struct CoreAILanguageModel: LanguageModel {
             let schemaData = try JSONEncoder().encode(schema)
 
             // The grammar generates properties in the order the schema lists them, which in
-            // GenerationSchema's own encoding changes from one process to the next. Its encoding is
-            // always JSON, so a schema that can't be reordered is a bug here, not a request's fault.
+            // GenerationSchema's own encoding changes from one process to the next.
             guard let jsonSchema = GrammarSchemaJSON.ordered(schemaData) else {
-                preconditionFailure("GenerationSchema's JSON encoding could not be put in its declared order")
+                throw ConstrainedGenerationError.invalidSchema(String(decoding: schemaData, as: UTF8.self))
             }
 
             let strategy: any DecodingStrategy

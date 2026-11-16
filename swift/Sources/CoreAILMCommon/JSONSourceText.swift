@@ -16,7 +16,7 @@ import Foundation
 /// text reads it with ``text(at:in:)`` and its own `codingPath`.
 public enum JSONSourceText {
     /// Where a `JSONDecoder` keeps the document it is decoding, as `Data`.
-    public static let userInfoKey = CodingUserInfoKey(rawValue: "CoreAILMCommon.JSONSourceText")!
+    package static let userInfoKey = CodingUserInfoKey(rawValue: "CoreAILMCommon.JSONSourceText")!
 
     /// Deepest nesting followed, the same as `JSONDecoder`'s.
     static let maxDepth = 512
@@ -46,60 +46,8 @@ public enum JSONSourceText {
         return decoder
     }
 
-    /// `json` as strict JSON a grammar compiler takes, and as re-encoding the decoded value would
-    /// write it where they differ: a trailing comma, which `JSONDecoder` accepts, is dropped, and a
-    /// whole number written with a fraction or an exponent (`5.0`, `1e0`) is written as an integer,
-    /// so a schema bound such as `"maxLength": 5.0` stays one a grammar takes as an integer. Every
-    /// other number, string and key is left as written, large integers included.
-    public static func normalizedForGrammar(_ json: String) -> String {
-        let bytes = Array(json.utf8)
-        var out: [UInt8] = []
-        out.reserveCapacity(bytes.count)
-        var index = 0
-        while index < bytes.count {
-            let byte = bytes[index]
-            if byte == UInt8(ascii: "\"") {
-                let start = index
-                index += 1
-                while index < bytes.count, bytes[index] != UInt8(ascii: "\"") {
-                    index += bytes[index] == UInt8(ascii: "\\") ? 2 : 1
-                }
-                index = min(index + 1, bytes.count)
-                out += bytes[start..<index]
-            } else if byte == UInt8(ascii: "-") || (UInt8(ascii: "0")...UInt8(ascii: "9")).contains(byte) {
-                let start = index
-                while index < bytes.count, Self.numberBytes.contains(bytes[index]) { index += 1 }
-                let token = bytes[start..<index]
-                out += integerForm(of: token) ?? Array(token)
-            } else if byte == UInt8(ascii: ","), Self.closes(bytes, after: index + 1) {
-                index += 1
-            } else {
-                out.append(byte)
-                index += 1
-            }
-        }
-        return String(decoding: out, as: UTF8.self)
-    }
-
-    private static let numberBytes = Set("0123456789+-.eE".utf8)
-
-    /// Whether the next byte from `start` that isn't whitespace closes an object or an array.
-    private static func closes(_ bytes: [UInt8], after start: Int) -> Bool {
-        var index = start
-        while index < bytes.count, [0x20, 0x09, 0x0A, 0x0D].contains(bytes[index]) { index += 1 }
-        return index < bytes.count && (bytes[index] == UInt8(ascii: "}") || bytes[index] == UInt8(ascii: "]"))
-    }
-
-    /// The integer `token` is, when it has a fraction or an exponent and is a whole number a `Double`
-    /// holds exactly.
-    private static func integerForm(of token: ArraySlice<UInt8>) -> [UInt8]? {
-        let marks: Set<UInt8> = [UInt8(ascii: "."), UInt8(ascii: "e"), UInt8(ascii: "E")]
-        guard token.contains(where: marks.contains),
-            let value = Double(String(decoding: token, as: UTF8.self)), value.rounded() == value,
-            abs(value) <= 9_007_199_254_740_992
-        else { return nil }
-        return Array(String(Int64(value)).utf8)
-    }
+    /// The bytes JSON counts as whitespace.
+    static let whitespace: Set<UInt8> = [0x20, 0x09, 0x0A, 0x0D]
 
     private struct Scanner {
         let bytes: [UInt8]
@@ -108,7 +56,7 @@ public enum JSONSourceText {
         init(bytes: [UInt8]) { self.bytes = bytes }
 
         mutating func skipWhitespace() {
-            while index < bytes.count, [0x20, 0x09, 0x0A, 0x0D].contains(bytes[index]) { index += 1 }
+            while index < bytes.count, JSONSourceText.whitespace.contains(bytes[index]) { index += 1 }
         }
 
         private func at(_ ascii: Unicode.Scalar) -> Bool {
@@ -148,6 +96,8 @@ public enum JSONSourceText {
                 guard at(":") else { return nil }
                 index += 1
                 skipWhitespace()
+                // Every member is read, not just up to the first match: a later one with the same
+                // name is the one `JSONDecoder` may have decoded instead.
                 if unescaped(keyRange) == name {
                     matches += 1
                     var inner = Scanner(bytes: bytes)
@@ -218,8 +168,12 @@ public enum JSONSourceText {
             }
             // A number, true, false or null: everything up to the next delimiter.
             let start = index
-            let delimiters: [UInt8] = [UInt8(ascii: ","), UInt8(ascii: "}"), UInt8(ascii: "]"), 0x20, 0x09, 0x0A, 0x0D]
-            while index < bytes.count, !delimiters.contains(bytes[index]) { index += 1 }
+            let delimiters: Set<UInt8> = [UInt8(ascii: ","), UInt8(ascii: "}"), UInt8(ascii: "]")]
+            while index < bytes.count, !delimiters.contains(bytes[index]),
+                !JSONSourceText.whitespace.contains(bytes[index])
+            {
+                index += 1
+            }
             return index > start
         }
 

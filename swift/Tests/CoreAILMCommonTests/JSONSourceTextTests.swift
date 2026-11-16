@@ -76,18 +76,6 @@ struct JSONSourceTextTests {
         #expect(text(#"{"a": "# + deep + #", "b": 1}"#, [Key("b")]) == nil)
     }
 
-    @Test("Whole numbers written with a fraction or exponent become integers; strings and other numbers stay")
-    func wholeNumbers() {
-        #expect(
-            JSONSourceText.normalizedForGrammar(#"{"maxLength": 5.0, "m": 1e0, "x": 0.5, "n": -2.0E1, "s": "5.0"}"#)
-                == #"{"maxLength": 5, "m": 1, "x": 0.5, "n": -20, "s": "5.0"}"#)
-        #expect(JSONSourceText.normalizedForGrammar("[12345678901234567890, 7]") == "[12345678901234567890, 7]")
-        // Past what a Double holds exactly, or infinite, a number stays as written.
-        #expect(
-            JSONSourceText.normalizedForGrammar("[1e300, 1e400, 9.3e18, 2.0e15]")
-                == "[1e300, 1e400, 9.3e18, 2000000000000000]")
-    }
-
     @Test("A missing key or malformed text gives nil")
     func missingOrMalformed() {
         #expect(text(#"{"a": 1}"#, [Key("b")]) == nil)
@@ -112,18 +100,14 @@ struct JSONSourceTextTests {
         #expect(request.responseFormat?.extractedSchema == Self.schema)
     }
 
-    @Test("A schema written with trailing commas reaches the grammar as strict JSON")
-    func trailingCommasAreDropped() throws {
+    @Test("A schema written with trailing commas comes back as written, for the grammar session to make strict")
+    func trailingCommasAreKept() throws {
         let body =
             #"{"messages":[],"response_format":{"type":"json_schema","json_schema":{"schema":"#
-            + #"{"type":"object","properties":{"a":{"type":"string"},"b":{"enum":[1, 2, ]},},}}}}"#
+            + #"{"type":"object","properties":{"a":{"type":"string"}},}}}}"#
         let data = Data(body.utf8)
         let request = try JSONSourceText.decoder(for: data).decode(ChatCompletionRequest.self, from: data)
-        let schema = try #require(request.responseFormat?.extractedSchema)
-        #expect(schema == #"{"type":"object","properties":{"a":{"type":"string"},"b":{"enum":[1, 2 ]}}}"#)
-        #expect((try? JSONSerialization.jsonObject(with: Data(schema.utf8))) != nil)
-        // Commas inside a string stay.
-        #expect(JSONSourceText.normalizedForGrammar(#"{"d": ", }"}"#) == #"{"d": ", }"}"#)
+        #expect(request.responseFormat?.extractedSchema == #"{"type":"object","properties":{"a":{"type":"string"}},}"#)
     }
 
     @Test("A schema with a repeated key is the decoded one, re-encoded, rather than another member's text")
