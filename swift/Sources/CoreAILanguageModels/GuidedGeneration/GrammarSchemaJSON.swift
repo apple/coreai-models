@@ -13,7 +13,8 @@ import Foundation
 /// that way, and records the declared order separately, in `x-order`.
 enum GrammarSchemaJSON {
     /// `json` rewritten with every object's `properties` in its `x-order`, then any not listed there
-    /// sorted, and every other key sorted. Values are unchanged. Nil when `json` isn't a JSON value.
+    /// sorted, and every other key sorted. Values keep their meaning, though `JSONSerialization` may
+    /// write a number or an escape differently. Nil when `json` isn't a JSON value.
     static func ordered(_ json: Data) -> String? {
         guard let value = try? JSONSerialization.jsonObject(with: json, options: [.fragmentsAllowed]) else {
             return nil
@@ -31,7 +32,8 @@ enum GrammarSchemaJSON {
             let order = object["x-order"] as? [String]
             var keys = object.keys.sorted()
             if let propertyOrder {
-                let listed = propertyOrder.filter { object[$0] != nil }
+                var seen = Set<String>()
+                let listed = propertyOrder.filter { object[$0] != nil && seen.insert($0).inserted }
                 keys = listed + keys.filter { !listed.contains($0) }
             }
             out += "{"

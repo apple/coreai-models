@@ -87,7 +87,8 @@ public struct ResponseFormat: Decodable, Sendable {
         public let name: String?
         public let schema: JSONValue
         /// The schema as the request wrote it, when the decoder had the request's text
-        /// (``JSONSourceText``). It keeps the order of `properties`, which `schema` can't.
+        /// (``JSONSourceText``). It keeps the order of `properties`, which `schema` can't. A whole
+        /// number written with a fraction (`5.0`) is written as an integer, as `schema` re-encodes it.
         public let schemaText: String?
 
         enum CodingKeys: String, CodingKey {
@@ -98,9 +99,9 @@ public struct ResponseFormat: Decodable, Sendable {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             name = try container.decodeIfPresent(String.self, forKey: .name)
             schema = try container.decode(JSONValue.self, forKey: .schema)
-            schemaText = (decoder.userInfo[JSONSourceText.userInfoKey] as? Data).flatMap {
-                JSONSourceText.text(at: decoder.codingPath + [CodingKeys.schema], in: $0)
-            }
+            schemaText = (decoder.userInfo[JSONSourceText.userInfoKey] as? Data)
+                .flatMap { JSONSourceText.text(at: decoder.codingPath + [CodingKeys.schema], in: $0) }
+                .map(JSONSourceText.wholeNumbersAsIntegers)
         }
     }
 

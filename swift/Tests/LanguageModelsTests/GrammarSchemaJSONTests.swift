@@ -32,6 +32,12 @@ struct GrammarSchemaJSONTests {
         #expect(ordered(json) == #"{"properties":{"b":{},"a":{"enum":["z","y"]},"c":{}},"x-order":["b"]}"#)
     }
 
+    @Test("A name x-order lists twice is written once")
+    func repeatedXOrderName() {
+        #expect(
+            ordered(#"{"x-order":["a","a"],"properties":{"a":1}}"#) == #"{"properties":{"a":1},"x-order":["a","a"]}"#)
+    }
+
     @Test("Without x-order, properties are sorted")
     func noXOrderSorts() {
         #expect(ordered(#"{"properties":{"b":1,"a":true,"c":null}}"#) == #"{"properties":{"a":true,"b":1,"c":null}}"#)

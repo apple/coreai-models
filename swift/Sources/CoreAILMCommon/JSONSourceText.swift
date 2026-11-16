@@ -18,16 +18,24 @@ public enum JSONSourceText {
     /// Where a `JSONDecoder` keeps the document it is decoding, as `Data`.
     public static let userInfoKey = CodingUserInfoKey(rawValue: "CoreAILMCommon.JSONSourceText")!
 
-    /// The text of the value at `path` in `json`, or nil when the path doesn't lead to a value or the
-    /// text along it isn't well-formed JSON.
+    /// Deepest nesting followed, the same as `JSONDecoder`'s.
+    static let maxDepth = 512
+
+    /// The text of the value at `path` in `json`, or nil when it can't be found as `JSONDecoder` would
+    /// find it.
     ///
-    /// A key in `path` matches an object member by its unescaped name. An integer key indexes an
-    /// array. When an object repeats a key, the last member wins, as with `JSONDecoder`.
+    /// `json` is a UTF-8 document that `JSONDecoder` has accepted, as it is when read from a decoder's
+    /// `userInfo`; this follows the document only as far as the path needs and does not validate it.
+    /// A key in `path` matches an object member by its unescaped name, and an integer key indexes an
+    /// array. Nil when a key on the path appears more than once in its object, since the value and the
+    /// text could then come from different members, and when the document nests deeper than
+    /// `JSONDecoder` reads.
     public static func text(at path: [any CodingKey], in json: Data) -> String? {
-        let bytes = [UInt8](json)
+        var bytes = [UInt8](json)
+        if bytes.starts(with: [0xEF, 0xBB, 0xBF]) { bytes.removeFirst(3) }
         var scanner = Scanner(bytes: bytes)
         scanner.skipWhitespace()
-        guard let range = scanner.find(path[...]) else { return nil }
+        guard let range = scanner.find(path[...], depth: 0) else { return nil }
         return String(decoding: bytes[range], as: UTF8.self)
     }
 
@@ -36,6 +44,51 @@ public enum JSONSourceText {
         let decoder = JSONDecoder()
         decoder.userInfo[userInfoKey] = json
         return decoder
+    }
+
+    /// `json` with each number that is a whole number but written with a fraction or an exponent
+    /// (`5.0`, `1e0`) written as an integer, as a decoded `Double` re-encodes it, so a schema bound such
+    /// as `"maxLength": 5.0` stays one a grammar takes as an integer. Every other number, string and
+    /// key is left as written, large integers included.
+    public static func wholeNumbersAsIntegers(_ json: String) -> String {
+        let bytes = Array(json.utf8)
+        var out: [UInt8] = []
+        out.reserveCapacity(bytes.count)
+        var index = 0
+        while index < bytes.count {
+            let byte = bytes[index]
+            if byte == UInt8(ascii: "\"") {
+                let start = index
+                index += 1
+                while index < bytes.count, bytes[index] != UInt8(ascii: "\"") {
+                    index += bytes[index] == UInt8(ascii: "\\") ? 2 : 1
+                }
+                index = min(index + 1, bytes.count)
+                out += bytes[start..<index]
+            } else if byte == UInt8(ascii: "-") || (UInt8(ascii: "0")...UInt8(ascii: "9")).contains(byte) {
+                let start = index
+                while index < bytes.count, Self.numberBytes.contains(bytes[index]) { index += 1 }
+                let token = bytes[start..<index]
+                out += integerForm(of: token) ?? Array(token)
+            } else {
+                out.append(byte)
+                index += 1
+            }
+        }
+        return String(decoding: out, as: UTF8.self)
+    }
+
+    private static let numberBytes = Set("0123456789+-.eE".utf8)
+
+    /// The integer `token` is, when it has a fraction or an exponent and is a whole number a `Double`
+    /// holds exactly.
+    private static func integerForm(of token: ArraySlice<UInt8>) -> [UInt8]? {
+        let marks: Set<UInt8> = [UInt8(ascii: "."), UInt8(ascii: "e"), UInt8(ascii: "E")]
+        guard token.contains(where: marks.contains),
+            let value = Double(String(decoding: token, as: UTF8.self)), value.rounded() == value,
+            abs(value) <= 9_007_199_254_740_992
+        else { return nil }
+        return Array(String(Int64(value)).utf8)
     }
 
     private struct Scanner {
@@ -48,124 +101,121 @@ public enum JSONSourceText {
             while index < bytes.count, [0x20, 0x09, 0x0A, 0x0D].contains(bytes[index]) { index += 1 }
         }
 
-        /// The range of the value at `path` below the value starting at `index`.
-        mutating func find(_ path: ArraySlice<any CodingKey>) -> Range<Int>? {
-            guard let key = path.first else {
-                let start = index
-                guard skipValue() else { return nil }
-                return start..<index
-            }
-            guard index < bytes.count else { return nil }
-            switch bytes[index] {
-            case UInt8(ascii: "{"):
-                return findMember(key.stringValue, rest: path.dropFirst())
-            case UInt8(ascii: "["):
-                guard let position = key.intValue else { return nil }
-                return findElement(position, rest: path.dropFirst())
-            default:
-                return nil
-            }
+        private func at(_ ascii: Unicode.Scalar) -> Bool {
+            index < bytes.count && bytes[index] == UInt8(ascii: ascii)
         }
 
-        private mutating func findMember(_ name: String, rest: ArraySlice<any CodingKey>) -> Range<Int>? {
+        /// The range of the value at `path` below the value starting at `index`.
+        mutating func find(_ path: ArraySlice<any CodingKey>, depth: Int) -> Range<Int>? {
+            guard let key = path.first else {
+                let start = index
+                guard skipValue(depth: depth) else { return nil }
+                return start..<index
+            }
+            guard depth < JSONSourceText.maxDepth, index < bytes.count else { return nil }
+            if at("{") { return findMember(key.stringValue, rest: path.dropFirst(), depth: depth + 1) }
+            if at("["), let position = key.intValue {
+                return findElement(position, rest: path.dropFirst(), depth: depth + 1)
+            }
+            return nil
+        }
+
+        private mutating func findMember(
+            _ name: String, rest: ArraySlice<any CodingKey>, depth: Int
+        ) -> Range<Int>? {
             index += 1
             var found: Range<Int>?
-            skipWhitespace()
-            if index < bytes.count, bytes[index] == UInt8(ascii: "}") {
-                index += 1
-                return nil
-            }
+            var matches = 0
             while true {
                 skipWhitespace()
+                if at("}") {
+                    index += 1
+                    // A repeated key: the decoded value and this text might not be the same member.
+                    return matches == 1 ? found : nil
+                }
                 guard let keyRange = stringRange() else { return nil }
                 skipWhitespace()
-                guard index < bytes.count, bytes[index] == UInt8(ascii: ":") else { return nil }
+                guard at(":") else { return nil }
                 index += 1
                 skipWhitespace()
                 if unescaped(keyRange) == name {
+                    matches += 1
                     var inner = Scanner(bytes: bytes)
                     inner.index = index
-                    found = inner.find(rest)
+                    found = inner.find(rest, depth: depth)
                 }
-                guard skipValue() else { return nil }
+                guard skipValue(depth: depth) else { return nil }
                 skipWhitespace()
-                guard index < bytes.count else { return nil }
-                if bytes[index] == UInt8(ascii: ",") {
+                if at(",") {
                     index += 1
-                    continue
+                } else if !at("}") {
+                    return nil
                 }
-                guard bytes[index] == UInt8(ascii: "}") else { return nil }
-                index += 1
-                return found
             }
         }
 
-        private mutating func findElement(_ position: Int, rest: ArraySlice<any CodingKey>) -> Range<Int>? {
+        private mutating func findElement(
+            _ position: Int, rest: ArraySlice<any CodingKey>, depth: Int
+        ) -> Range<Int>? {
             index += 1
-            skipWhitespace()
-            if index < bytes.count, bytes[index] == UInt8(ascii: "]") { return nil }
             var current = 0
             while true {
                 skipWhitespace()
-                if current == position { return find(rest) }
-                guard skipValue() else { return nil }
+                if at("]") { return nil }
+                if current == position { return find(rest, depth: depth) }
+                guard skipValue(depth: depth) else { return nil }
                 skipWhitespace()
-                guard index < bytes.count, bytes[index] == UInt8(ascii: ",") else { return nil }
-                index += 1
+                if at(",") {
+                    index += 1
+                } else if !at("]") {
+                    return nil
+                }
                 current += 1
             }
         }
 
-        /// Moves past one value. False when the text isn't a well-formed value.
-        private mutating func skipValue() -> Bool {
+        /// Moves past one value. False when it can't: the text ends, or nests too deep.
+        private mutating func skipValue(depth: Int) -> Bool {
             guard index < bytes.count else { return false }
-            switch bytes[index] {
-            case UInt8(ascii: "\""):
-                return stringRange() != nil
-            case UInt8(ascii: "{"), UInt8(ascii: "["):
-                let close = bytes[index] == UInt8(ascii: "{") ? UInt8(ascii: "}") : UInt8(ascii: "]")
+            if at("\"") { return stringRange() != nil }
+            if at("{") || at("[") {
+                guard depth < JSONSourceText.maxDepth else { return false }
+                let isObject = at("{")
+                let close = isObject ? UInt8(ascii: "}") : UInt8(ascii: "]")
                 index += 1
-                skipWhitespace()
-                if index < bytes.count, bytes[index] == close {
-                    index += 1
-                    return true
-                }
                 while true {
                     skipWhitespace()
-                    if close == UInt8(ascii: "}") {
+                    guard index < bytes.count else { return false }
+                    if bytes[index] == close {
+                        index += 1
+                        return true
+                    }
+                    if isObject {
                         guard stringRange() != nil else { return false }
                         skipWhitespace()
-                        guard index < bytes.count, bytes[index] == UInt8(ascii: ":") else { return false }
+                        guard at(":") else { return false }
                         index += 1
                         skipWhitespace()
                     }
-                    guard skipValue() else { return false }
+                    guard skipValue(depth: depth + 1) else { return false }
                     skipWhitespace()
-                    guard index < bytes.count else { return false }
-                    if bytes[index] == UInt8(ascii: ",") {
+                    if at(",") {
                         index += 1
-                        continue
+                    } else if !(index < bytes.count && bytes[index] == close) {
+                        return false
                     }
-                    guard bytes[index] == close else { return false }
-                    index += 1
-                    return true
                 }
-            default:
-                // A number, true, false or null: everything up to the next delimiter.
-                let start = index
-                while index < bytes.count,
-                    ![UInt8(ascii: ","), UInt8(ascii: "}"), UInt8(ascii: "]"), 0x20, 0x09, 0x0A, 0x0D].contains(
-                        bytes[index])
-                {
-                    index += 1
-                }
-                return index > start
             }
+            // A number, true, false or null: everything up to the next delimiter.
+            let start = index
+            let delimiters: [UInt8] = [UInt8(ascii: ","), UInt8(ascii: "}"), UInt8(ascii: "]"), 0x20, 0x09, 0x0A, 0x0D]
+            while index < bytes.count, !delimiters.contains(bytes[index]) { index += 1 }
+            return index > start
         }
 
         /// The range of the string starting at `index`, quotes included, and moves past it.
         private mutating func stringRange() -> Range<Int>? {
-            guard index < bytes.count, bytes[index] == UInt8(ascii: "\"") else { return nil }
+            guard at("\"") else { return nil }
             let start = index
             index += 1
             while index < bytes.count {
