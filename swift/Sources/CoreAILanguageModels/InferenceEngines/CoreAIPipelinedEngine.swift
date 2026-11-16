@@ -188,8 +188,7 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
 
                 if isDivergence {
                     // Tokens differ — full reset (partial rewind corrupts buffer rotation)
-                    await self.engine.computeStream.currentWorkCompleted()
-                    self.engine.reset()
+                    await self.engine.resetWhenIdle()
                     self.history.clear()
                     resolvedNewTokens = input[...]
                     commonPrefix = 0
@@ -197,8 +196,7 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
                     // Hybrid model: recurrent state can't be partially rewound.
                     // Full reset and replay the entire prompt.
                     if commonPrefix < self.engine.processedTokenCount {
-                        await self.engine.computeStream.currentWorkCompleted()
-                        self.engine.reset()
+                        await self.engine.resetWhenIdle()
                         self.history.clear()
                         resolvedNewTokens = input[...]
                         commonPrefix = 0
@@ -208,8 +206,7 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
                     ringCapacity: self.engine.slidingRingCapacity)
                 {
                     // The ring has overwritten slots the rewound position reads: replay.
-                    await self.engine.computeStream.currentWorkCompleted()
-                    self.engine.reset()
+                    await self.engine.resetWhenIdle()
                     self.history.clear()
                     resolvedNewTokens = input[...]
                     commonPrefix = 0
@@ -615,7 +612,8 @@ private struct EngineImpl: ~Copyable {
     var inputTokensBuffer: MTLBuffer
     var cachePositionBuffers: [MTLBuffer]
     var decodeOutputBuffers: [MTLBuffer]
-    var decodeLogitsBuffers: [MTLBuffer]
+    /// Where a decode step's logits land, rotating by `pipelineDepth` (`RotatingLogitsBuffers.swift`).
+    var decodeLogitsBuffers: RotatingLogitsBuffers
 
     // KV cache — reuses CoreAIKVCache protocol from KVCache+CoreAI.swift
     var kvCache: any CoreAIKVCache
@@ -771,15 +769,10 @@ private struct EngineImpl: ~Copyable {
             decodeOutBuffers.append(buf)
         }
 
-        // Allocate pipeline-depth-matched decode logits buffers (inference writes logits for decode)
-        let decodeLogitsSize = config.vocabSize * MemoryLayout<UInt16>.size
-        var decodeLogBufs: [MTLBuffer] = []
-        for _ in 0..<pipelineDepth {
-            guard let buf = device.makeBuffer(length: decodeLogitsSize, options: .storageModeShared) else {
-                throw InferenceRuntimeError.bufferAllocationFailed("decodeLogitsBuffer (\(decodeLogitsSize) bytes)")
-            }
-            decodeLogBufs.append(buf)
-        }
+        // Pipeline-depth-matched decode logits buffers (inference writes logits for decode). One row:
+        // this engine advances a single sequence.
+        let decodeLogBufs = try RotatingLogitsBuffers(
+            device: device, vocabSize: config.vocabSize, depth: pipelineDepth)
 
         // Create KV cache using factory — pass original descriptors (with -1 dynamic dims intact)
         // so the factory can correctly detect growing vs static support via isDynamicKVCache().
@@ -946,35 +939,21 @@ private struct EngineImpl: ~Copyable {
 
     // MARK: - Core Encode Step
 
-    /// Encodes inference + GPU sampling for one step.
-    ///
-    /// 1. Construct RawView/MutableRawView from MTLBuffers with current shapes
-    /// 2. Encode to ComputeStream (non-blocking)
-    /// 3. withMetal3Queue: encode GPU argmax/topK (writes to rotating decodeOutputBuffers)
-    /// 4. Callback yields token
-    private mutating func _encodeNextStepGPU(
-        tokens: some Collection<Int32>,
-        gpuSampler: any MPSGraphSampler,
-        yieldingTo continuation: AsyncThrowingStream<InferenceEngine.TokenId, Error>.Continuation
-    ) async throws {
-        let currentStep = processedTokenCount
-
-        let actualTokenCount = tokens.isEmpty ? 1 : tokens.count
-        let queryLength = actualTokenCount
-
-        try StateHandlerFactory.checkWriteFirstStep(
-            offset: processedTokenCount, queryLength: queryLength,
-            ringCapacity: slidingRingCapacity)
-
-        defer {
-            processedTokenCount += actualTokenCount
-            step += 1
-        }
-
-        let encodeStepID = InstrumentsProfiler.beginCustomInterval(
-            name: "CoreAIPipelinedEncodeNextStep",
-            details: "step=\(currentStep) qLen=\(queryLength)"
-        )
+    /// Writes a step's tokens, binds its inputs, the KV cache and its logits output, and encodes the
+    /// graph call, holding a slot of `inFlightGate` that the step's sampler releases, or this function
+    /// when the encode throws. Returns where the logits went and the byte offset of the row to sample:
+    /// a decode step's rotating buffer, or a prompt's last position in the shared growing buffer.
+    private mutating func encodeGraphStep(
+        tokens: some Collection<Int32>, queryLength: Int, currentStep: Int
+    ) async throws -> (logitsBuffer: MTLBuffer, logitsOffset: Int) {
+        // The strides first: they can throw, and nothing after them can until the encode.
+        let posLength = processedTokenCount + queryLength
+        let tokenShape = [1, queryLength]
+        let tokenStrides = try resolvedStrides(descriptor: inputIdsBaseDesc, shape: tokenShape)
+        let posShape = [1, posLength]
+        let posStrides = try resolvedStrides(descriptor: positionIdsBaseDesc, shape: posShape)
+        let logitsShape = [1, queryLength, vocabSize]
+        let logitsStrides = try resolvedStrides(descriptor: logitsBaseDesc, shape: logitsShape)
 
         // PrepareStep: write tokens + build views
         let prepareSpan = InstrumentsProfiler.beginPrepareStep(
@@ -995,11 +974,8 @@ private struct EngineImpl: ~Copyable {
 
         // Select cache position buffer for this step (pipeline-depth-matched rotation)
         let cachePosBuffer = cachePositionBuffers[step % pipelineDepth]
-        let posLength = processedTokenCount + queryLength
 
         // Build Inputs as AsyncValue (from MTLBuffers)
-        let tokenShape = [1, queryLength]
-        let tokenStrides = try resolvedStrides(descriptor: inputIdsBaseDesc, shape: tokenShape)
         let tokenValue: InferenceFunction.AsyncValue
         if tokens.isEmpty {
             // Decode: read input token from previous step's decode output buffer
@@ -1020,8 +996,6 @@ private struct EngineImpl: ~Copyable {
                 strides: tokenStrides
             )
         }
-        let posShape = [1, posLength]
-        let posStrides = try resolvedStrides(descriptor: positionIdsBaseDesc, shape: posShape)
         let posValue = unsafe InferenceFunction.AsyncValue(
             unsafeBuffer: cachePosBuffer,
             byteOffset: 0,
@@ -1059,9 +1033,7 @@ private struct EngineImpl: ~Copyable {
 
         // Build Output as AsyncMutableValue (logits)
         // Decode uses per-step rotating buffer; prefill uses the shared growing buffer.
-        let logitsOutputBuffer = tokens.isEmpty ? decodeLogitsBuffers[step % pipelineDepth] : logits.metalBuffer
-        let logitsShape = [1, queryLength, vocabSize]
-        let logitsStrides = try resolvedStrides(descriptor: logitsBaseDesc, shape: logitsShape)
+        let logitsOutputBuffer = tokens.isEmpty ? decodeLogitsBuffers[step] : logits.metalBuffer
 
         prepareSpan.end()
 
@@ -1075,21 +1047,67 @@ private struct EngineImpl: ~Copyable {
 
         // Swift 6 lifetime safety: AsyncMutableViews uses @lifetime(self: &mutableValue)
         // on insert(), so all inserts + consume must be in the same scope without branching.
-        try encodeWithStates(
-            function: function, inputs: asyncInputs,
-            keyState: &keyState, keyCacheName: keyCacheName,
-            valState: &valState, valueCacheName: valueCacheName,
-            additionalStates: additionalStates,
-            logitsBuffer: logitsOutputBuffer, logitsName: logitsOutputName,
-            logitsShape: logitsShape, logitsStrides: logitsStrides,
-            computeStream: computeStream)
+        do {
+            try encodeWithStates(
+                function: function, inputs: asyncInputs,
+                keyState: &keyState, keyCacheName: keyCacheName,
+                valState: &valState, valueCacheName: valueCacheName,
+                additionalStates: additionalStates,
+                logitsBuffer: logitsOutputBuffer, logitsName: logitsOutputName,
+                logitsShape: logitsShape, logitsStrides: logitsStrides,
+                computeStream: computeStream)
+        } catch {
+            // No sampler will run for this step to give the slot back.
+            inFlightGate.release()
+            logitsSpan.end()
+            throw error
+        }
         logitsSpan.end()
+
+        return (logitsOutputBuffer, (queryLength - 1) * vocabSize * MemoryLayout<UInt16>.size)
+    }
+
+    /// Encodes one step: the graph call through ``encodeGraphStep(tokens:queryLength:currentStep:)``,
+    /// then GPU sampling into the rotating `decodeOutputBuffers`. The sampler's completion releases the
+    /// gate slot and yields the token.
+    private mutating func _encodeNextStepGPU(
+        tokens: some Collection<Int32>,
+        gpuSampler: any MPSGraphSampler,
+        yieldingTo continuation: AsyncThrowingStream<InferenceEngine.TokenId, Error>.Continuation
+    ) async throws {
+        let currentStep = processedTokenCount
+
+        let actualTokenCount = tokens.isEmpty ? 1 : tokens.count
+        let queryLength = actualTokenCount
+
+        try StateHandlerFactory.checkWriteFirstStep(
+            offset: processedTokenCount, queryLength: queryLength,
+            ringCapacity: slidingRingCapacity)
+
+        defer {
+            processedTokenCount += actualTokenCount
+            step += 1
+        }
+
+        let encodeStepID = InstrumentsProfiler.beginCustomInterval(
+            name: "CoreAIPipelinedEncodeNextStep",
+            details: "step=\(currentStep) qLen=\(queryLength)"
+        )
+
+        let samplerLogitsBuffer: MTLBuffer
+        let logitsOffset: Int
+        do {
+            (samplerLogitsBuffer, logitsOffset) = try await encodeGraphStep(
+                tokens: tokens, queryLength: queryLength, currentStep: currentStep)
+        } catch {
+            InstrumentsProfiler.endCustomInterval(
+                name: "CoreAIPipelinedEncodeNextStep", signpostID: encodeStepID, details: "error")
+            throw error
+        }
 
         // GPU sampling via Metal queue
         let localGPUSampler = gpuSampler
         let outputBuffer = decodeOutputBuffers[step % pipelineDepth]
-        let samplerLogitsBuffer = tokens.isEmpty ? decodeLogitsBuffers[step % pipelineDepth] : logits.metalBuffer
-        let logitsOffset = (actualTokenCount - 1) * vocabSize * MemoryLayout<UInt16>.size
         let samplerStrategy = gpuSampler is MPSGraphArgmaxSampler ? "GPU-argmax" : "GPU-composite"
         let samplerTemperature = cachedSamplerTemperature ?? 0.0
 
@@ -1784,6 +1802,8 @@ private struct EngineImpl: ~Copyable {
             name: "CoreAIPipelinedChunk",
             details: "step=\(currentStep) qLen=\(queryLength) graph=\(graphName)"
         )
+        // Ended on every path, a throw included.
+        defer { InstrumentsProfiler.endCustomInterval(name: "CoreAIPipelinedChunk", signpostID: chunkID) }
 
         // Write at the chunk's natural position so each chunk occupies a disjoint
         // region of inputTokensBuffer. Encode holds a live MTLBuffer reference — writing
@@ -1853,7 +1873,12 @@ private struct EngineImpl: ~Copyable {
 
         processedTokenCount += queryLength
         step += 1
-        InstrumentsProfiler.endCustomInterval(name: "CoreAIPipelinedChunk", signpostID: chunkID)
+    }
+
+    /// Waits for the work queued on the compute stream, then resets.
+    mutating func resetWhenIdle() async {
+        await computeStream.currentWorkCompleted()
+        reset()
     }
 
     mutating func reset() {
@@ -1977,8 +2002,9 @@ private struct EngineImpl: ~Copyable {
                 logitsStrides: try resolvedStrides(descriptor: logitsBaseDesc, shape: lShape),
                 computeStream: computeStream)
 
-            // Warm up argmax kernel using pipeline-matched decode buffers
-            let warmupLogitsBuffer = decodeLogitsBuffers[step % pipelineDepth]
+            // Warm up the argmax kernel on the logits the call above wrote. A wide shape wrote
+            // several rows there, more than a one-row decode buffer holds.
+            let warmupLogitsBuffer = logits.metalBuffer
             let warmupOutputBuffer = decodeOutputBuffers[step % pipelineDepth]
             let logitsOffset = (shape - 1) * vocabSize * MemoryLayout<UInt16>.size
 
@@ -2003,8 +2029,7 @@ private struct EngineImpl: ~Copyable {
             step += 1
         }
 
-        await computeStream.currentWorkCompleted()
-        reset()
+        await resetWhenIdle()
 
         warmupSpan.end()
         let warmupElapsed = milliseconds(since: warmupStart)

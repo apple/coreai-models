@@ -15,7 +15,8 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from coreai_models.embedding.contract import EmbeddingFamily, function_entry
+from coreai_models.embedding.contract import EmbeddingFamily
+from coreai_models.embedding.export_utils import FunctionSpec, bucket_plan, function_name
 
 TOKEN_TABLE_INPUT_NAMES = ("input_ids",)
 TOKEN_TABLE_OUTPUT_NAME = "inputs_embeds"
@@ -83,49 +84,6 @@ class EmbeddingGemma2Family(EmbeddingFamily):
     batch_sizes: tuple[int, ...] = (1, 8, 32)
     max_batch_tokens: int = 16384
     ane_length_buckets: tuple[int, ...] = (128, 512, 1024)
-
-
-@dataclass(frozen=True)
-class FunctionSpec:
-    """One static function; text inputs are ``int32[batch, length]``."""
-
-    name: str
-    batch: int
-    length: int
-
-    def as_dict(self) -> dict[str, Any]:
-        return function_entry(self.name, self.batch, self.length)
-
-
-def function_name(length: int, batch: int, prefix: str = "") -> str:
-    return f"{prefix}len{length}_b{batch}"
-
-
-def bucket_plan(
-    length_buckets: list[int] | tuple[int, ...],
-    batch_sizes: list[int] | tuple[int, ...],
-    max_batch_tokens: int,
-) -> list[FunctionSpec]:
-    """Cross length buckets with batch sizes, dropping pairs above ``max_batch_tokens``.
-
-    Batch 1 is always kept for every length. Functions are named ``len{L}_b{B}``.
-
-    Raises:
-        ValueError: if ``length_buckets`` is empty or holds a length below 2, or a batch size is
-            below 1.
-    """
-    lengths = sorted(set(int(x) for x in length_buckets))
-    batches = sorted(set(int(x) for x in batch_sizes) | {1})
-    if not lengths or lengths[0] < 2:
-        raise ValueError(f"length_buckets must be >= 2 (BOS + EOS), got {length_buckets}")
-    if batches[0] < 1:
-        raise ValueError(f"batch_sizes must be >= 1, got {batch_sizes}")
-    return [
-        FunctionSpec(function_name(length, batch), batch, length)
-        for length in lengths
-        for batch in batches
-        if batch == 1 or batch * length <= max_batch_tokens
-    ]
 
 
 def text_functions(family: EmbeddingGemma2Family) -> list[FunctionSpec]:
