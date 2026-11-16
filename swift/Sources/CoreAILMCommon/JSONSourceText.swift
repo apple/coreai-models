@@ -13,10 +13,11 @@ import Foundation
 /// grammar generates them in, the value is taken from the source text instead.
 ///
 /// A decoder carries the source in its `userInfo` under ``userInfoKey``. A type that needs a value's
-/// text reads it with ``text(at:in:)`` and its own `codingPath`.
-public enum JSONSourceText {
+/// text reads it with ``text(at:in:)`` and its own `codingPath`. Outside this module, a request is
+/// decoded this way through ``ChatCompletionRequest/init(json:)``.
+enum JSONSourceText {
     /// Where a `JSONDecoder` keeps the document it is decoding, as `Data`.
-    package static let userInfoKey = CodingUserInfoKey(rawValue: "CoreAILMCommon.JSONSourceText")!
+    static let userInfoKey = CodingUserInfoKey(rawValue: "CoreAILMCommon.JSONSourceText")!
 
     /// Deepest nesting followed, the same as `JSONDecoder`'s.
     static let maxDepth = 512
@@ -26,11 +27,11 @@ public enum JSONSourceText {
     ///
     /// `json` is a UTF-8 document that `JSONDecoder` has accepted, as it is when read from a decoder's
     /// `userInfo`; this follows the document only as far as the path needs and does not validate it.
-    /// A key in `path` matches an object member by its unescaped name, and an integer key indexes an
-    /// array. Nil when a key on the path appears more than once in its object, since the value and the
-    /// text could then come from different members, and when the document nests deeper than
-    /// `JSONDecoder` reads.
-    public static func text(at path: [any CodingKey], in json: Data) -> String? {
+    /// A key in `path` matches an object member by its unescaped name; every coding path that reaches
+    /// here is made of object keys. Nil when a key on the path appears more than once in its object,
+    /// since the value and the text could then come from different members, and when the document
+    /// nests deeper than `JSONDecoder` reads.
+    static func text(at path: [any CodingKey], in json: Data) -> String? {
         var bytes = [UInt8](json)
         if bytes.starts(with: [0xEF, 0xBB, 0xBF]) { bytes.removeFirst(3) }
         var scanner = Scanner(bytes: bytes)
@@ -40,7 +41,7 @@ public enum JSONSourceText {
     }
 
     /// A JSON decoder whose decoding has `json` to hand as its source text.
-    public static func decoder(for json: Data) -> JSONDecoder {
+    static func decoder(for json: Data) -> JSONDecoder {
         let decoder = JSONDecoder()
         decoder.userInfo[userInfoKey] = json
         return decoder
@@ -72,9 +73,6 @@ public enum JSONSourceText {
             }
             guard depth < JSONSourceText.maxDepth, index < bytes.count else { return nil }
             if at("{") { return findMember(key.stringValue, rest: path.dropFirst(), depth: depth + 1) }
-            if at("["), let position = key.intValue {
-                return findElement(position, rest: path.dropFirst(), depth: depth + 1)
-            }
             return nil
         }
 
@@ -111,26 +109,6 @@ public enum JSONSourceText {
                 } else if !at("}") {
                     return nil
                 }
-            }
-        }
-
-        private mutating func findElement(
-            _ position: Int, rest: ArraySlice<any CodingKey>, depth: Int
-        ) -> Range<Int>? {
-            index += 1
-            var current = 0
-            while true {
-                skipWhitespace()
-                if at("]") { return nil }
-                if current == position { return find(rest, depth: depth) }
-                guard skipValue(depth: depth) else { return nil }
-                skipWhitespace()
-                if at(",") {
-                    index += 1
-                } else if !at("]") {
-                    return nil
-                }
-                current += 1
             }
         }
 
@@ -204,5 +182,12 @@ public enum JSONSourceText {
             }
             return try? JSONDecoder().decode(String.self, from: Data(raw))
         }
+    }
+}
+
+extension ChatCompletionRequest {
+    /// Decodes a request body, keeping each `json_schema`'s text as the client wrote it.
+    package init(json: Data) throws {
+        self = try JSONSourceText.decoder(for: json).decode(Self.self, from: json)
     }
 }

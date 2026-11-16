@@ -11,41 +11,31 @@ import Testing
 
 @Suite("GrammarSchemaJSON")
 struct GrammarSchemaJSONTests {
-    private func ordered(_ json: String) -> String? {
-        GrammarSchemaJSON.ordered(Data(json.utf8))
+    private func ordered(_ json: String) throws -> String {
+        try GrammarSchemaJSON.text(of: JSONSerialization.jsonObject(with: Data(json.utf8)), propertyOrder: nil)
     }
 
     @Test("Properties follow x-order, and every other key is sorted")
-    func propertiesFollowXOrder() {
+    func propertiesFollowXOrder() throws {
         let json =
             #"{"type":"object","x-order":["zeta","name","age"],"properties":{"age":{"type":"integer"},"#
             + #""zeta":{"type":"string"},"name":{"type":"string"}},"required":["zeta","name","age"]}"#
         #expect(
-            ordered(json)
+            try ordered(json)
                 == #"{"properties":{"zeta":{"type":"string"},"name":{"type":"string"},"age":{"type":"integer"}},"#
                 + #""required":["zeta","name","age"],"type":"object","x-order":["zeta","name","age"]}"#)
     }
 
     @Test("A property x-order leaves out goes after the listed ones, sorted, and arrays keep their order")
-    func unlistedPropertiesAndArrays() {
+    func unlistedPropertiesAndArrays() throws {
         let json = #"{"x-order":["b"],"properties":{"c":{},"b":{},"a":{"enum":["z","y"]}}}"#
-        #expect(ordered(json) == #"{"properties":{"b":{},"a":{"enum":["z","y"]},"c":{}},"x-order":["b"]}"#)
-    }
-
-    @Test("A name x-order lists twice is written once")
-    func repeatedXOrderName() {
-        #expect(
-            ordered(#"{"x-order":["a","a"],"properties":{"a":1}}"#) == #"{"properties":{"a":1},"x-order":["a","a"]}"#)
+        #expect(try ordered(json) == #"{"properties":{"b":{},"a":{"enum":["z","y"]},"c":{}},"x-order":["b"]}"#)
     }
 
     @Test("Without x-order, properties are sorted")
-    func noXOrderSorts() {
-        #expect(ordered(#"{"properties":{"b":1,"a":true,"c":null}}"#) == #"{"properties":{"a":true,"b":1,"c":null}}"#)
-    }
-
-    @Test("Text that isn't JSON gives nil")
-    func notJSON() {
-        #expect(ordered("{") == nil)
+    func noXOrderSorts() throws {
+        #expect(
+            try ordered(#"{"properties":{"b":1,"a":true,"c":null}}"#) == #"{"properties":{"a":true,"b":1,"c":null}}"#)
     }
 
     @Test("Whole numbers written with a fraction or exponent become integers; strings and other numbers stay")
@@ -66,7 +56,7 @@ struct GrammarSchemaJSONTests {
             #"{"type":"object","properties":{"a":{"type":"string"},"b":{"enum":[1, 2, ]},},}"#)
         #expect(schema == #"{"type":"object","properties":{"a":{"type":"string"},"b":{"enum":[1, 2 ]}}}"#)
         #expect((try? JSONSerialization.jsonObject(with: Data(schema.utf8))) != nil)
-        #expect(GrammarSchemaJSON.normalized(#"{"d": ", }"}"#) == #"{"d": ", }"}"#)
+        #expect(GrammarSchemaJSON.normalized(#"{"d": "x\", }"}"#) == #"{"d": "x\", }"}"#)
     }
 
     @Test("A GenerationSchema comes out in its declared property order, nested types included, every time")
@@ -86,7 +76,7 @@ struct GrammarSchemaJSONTests {
                 .init(name: "age", schema: .init(type: Int.self)),
             ])
         let schema = try GenerationSchema(root: person, dependencies: [address])
-        let text = try #require(GrammarSchemaJSON.ordered(try JSONEncoder().encode(schema)))
+        let text = try GrammarSchemaJSON.ordered(schema)
 
         // Property names appear in the text in declared order, at the top level and in $defs.
         let positions = ["\"zeta\":{", "\"name\":{", "\"home\":{", "\"age\":{", "\"street\":{", "\"city\":{"]
@@ -95,5 +85,7 @@ struct GrammarSchemaJSONTests {
         try #require(found.count == positions.count, "every property name is in the text")
         #expect(found[found.count - 2] < found[found.count - 1], "Address: street before city")
         #expect(Array(found.dropLast(2)) == found.dropLast(2).sorted(), "Person: zeta, name, home, age")
+        // The same text every time, as the grammar-session cache needs; a raw encoding varies even in-process.
+        #expect(Set(try (0..<200).map { _ in try GrammarSchemaJSON.ordered(schema) }).count == 1)
     }
 }

@@ -47,13 +47,6 @@ struct JSONSourceTextTests {
         #expect(text(#"{"na\u006de": [true, null]}"#, [Key("name")]) == "[true, null]")
     }
 
-    @Test("An integer key indexes an array")
-    func arrayIndex() {
-        let json = #"{"items": [{"k": 1}, {"k": 2}, {"k": 3}]}"#
-        #expect(text(json, [Key("items"), Key(index: 1)]) == #"{"k": 2}"#)
-        #expect(text(json, [Key("items"), Key(index: 3)]) == nil)
-    }
-
     @Test("A key repeated on the path gives nil, so the text can't disagree with the decoded value")
     func repeatedKeyOnThePath() {
         #expect(text(#"{"a": 1, "a": {"b": 2}}"#, [Key("a")]) == nil)
@@ -93,10 +86,9 @@ struct JSONSourceTextTests {
         #"{"messages":[{"role":"user","content":"Hi"}],"#
         + #""response_format":{"type":"json_schema","json_schema":{"name":"p","schema":"# + schema + "}}}"
 
-    @Test("A schema decoded with its source keeps the client's text, so its properties keep their order")
+    @Test("A request decoded as the server decodes it keeps the schema's text, so its properties keep their order")
     func schemaKeepsItsOrder() throws {
-        let data = Data(Self.body.utf8)
-        let request = try JSONSourceText.decoder(for: data).decode(ChatCompletionRequest.self, from: data)
+        let request = try ChatCompletionRequest(json: Data(Self.body.utf8))
         #expect(request.responseFormat?.extractedSchema == Self.schema)
     }
 
@@ -114,19 +106,22 @@ struct JSONSourceTextTests {
     func repeatedSchemaFallsBack() throws {
         let body =
             #"{"messages":[],"response_format":{"type":"json_schema","json_schema":{"#
-            + #""schema":{"a":1},"schema":{"b":2}}}}"#
+            + #""schema":{"b":1,"a":2},"schema":{"c":3}}}}"#
         let data = Data(body.utf8)
         let request = try JSONSourceText.decoder(for: data).decode(ChatCompletionRequest.self, from: data)
         #expect(request.responseFormat?.jsonSchema?.schemaText == nil)
-        let decoded = try JSONEncoder().encode(try #require(request.responseFormat?.jsonSchema?.schema))
-        #expect(request.responseFormat?.extractedSchema == String(decoding: decoded, as: UTF8.self))
+        // The first `schema`, as JSONDecoder keeps it, with its keys sorted.
+        #expect(request.responseFormat?.extractedSchema == #"{"a":2,"b":1}"#)
     }
 
     @Test("Without its source, a schema is re-encoded with sorted keys, the same every time")
     func schemaWithoutSourceIsSorted() throws {
         let request = try JSONDecoder().decode(ChatCompletionRequest.self, from: Data(Self.body.utf8))
         let schema = try #require(request.responseFormat?.extractedSchema)
-        #expect(schema.contains(#""properties":{"age":{"type":"integer"},"name":{"type":"string"},"zeta":"#))
+        #expect(
+            schema
+                == #"{"properties":{"age":{"type":"integer"},"name":{"type":"string"},"zeta":{"type":"string"}},"#
+                + #""required":["zeta","name","age"],"type":"object"}"#)
         #expect(request.responseFormat?.jsonSchema?.schemaText == nil)
     }
 

@@ -110,8 +110,7 @@ private func handleChatCompletionsFromBody(body: ByteBuffer, state: ServerState,
     let chatRequest: ChatCompletionRequest
     do {
         // The body's own text goes with it, so a schema keeps its property order.
-        let data = Data(buffer: body)
-        chatRequest = try JSONSourceText.decoder(for: data).decode(ChatCompletionRequest.self, from: data)
+        chatRequest = try ChatCompletionRequest(json: Data(buffer: body))
     } catch {
         let err = ErrorResponse(error: .init(message: "\(error)", type: "invalid_request_error", code: nil))
         let data = try JSONEncoder().encode(err)

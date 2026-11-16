@@ -121,9 +121,10 @@ public struct ConstrainedGenerationSession: ~Copyable {
         maxWhitespaceCount: Int?,
         validated: Bool
     ) throws {
-        // Whoever wrote the schema, a request, a file or `GenerationSchema`, the grammar gets it strict.
-        let jsonSchema = GrammarSchemaJSON.normalized(jsonSchema)
+        // `schema` keeps the caller's text: the pipelined engine's session cache compares it with the
+        // text of the next request. Whoever wrote it, the grammar gets it strict.
         self.schema = jsonSchema
+        let jsonSchema = GrammarSchemaJSON.normalized(jsonSchema)
         self.maxWhitespaceCount = maxWhitespaceCount
         self.tokenizerInfo = tokenizerInfo
         self.compiler = GrammarCompiler(tokenizerInfo: tokenizerInfo)
@@ -145,7 +146,7 @@ public struct ConstrainedGenerationSession: ~Copyable {
     }
 
     private static func validateJSONSchema(_ schema: String) throws {
-        guard let data = GrammarSchemaJSON.normalized(schema).data(using: .utf8),
+        guard let data = schema.data(using: .utf8),
             (try? JSONSerialization.jsonObject(with: data)) != nil
         else {
             throw ConstrainedGenerationError.invalidSchema(schema)

@@ -88,8 +88,10 @@ public struct ResponseFormat: Decodable, Sendable {
         public let schema: JSONValue
         /// The schema as the request wrote it, when the decoder had the request's text
         /// (``JSONSourceText``). It keeps the order of `properties`, which `schema` can't. The
-        /// grammar session makes it strict JSON, whatever leniency `JSONDecoder` allowed.
-        public let schemaText: String?
+        /// grammar session makes it strict JSON, whatever leniency `JSONDecoder` allowed. A key
+        /// repeated inside the schema stays as written, and the grammar compiler keeps its last
+        /// value where `schema` keeps the first.
+        let schemaText: String?
 
         enum CodingKeys: String, CodingKey {
             case name, schema

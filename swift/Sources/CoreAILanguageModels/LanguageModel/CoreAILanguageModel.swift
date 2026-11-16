@@ -534,13 +534,9 @@ public struct CoreAILanguageModel: LanguageModel {
             maxTokens: Int,
             channel: LanguageModelExecutorGenerationChannel
         ) async throws {
-            let schemaData = try JSONEncoder().encode(schema)
-
             // The grammar generates properties in the order the schema lists them, which in
             // GenerationSchema's own encoding changes from one process to the next.
-            guard let jsonSchema = GrammarSchemaJSON.ordered(schemaData) else {
-                throw ConstrainedGenerationError.invalidSchema(String(decoding: schemaData, as: UTF8.self))
-            }
+            let jsonSchema = try GrammarSchemaJSON.ordered(schema)
 
             let strategy: any DecodingStrategy
             if engine is any ConstrainedGenerationCapable {
