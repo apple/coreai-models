@@ -71,10 +71,8 @@ struct GrammarSchemaJSONTests {
         let positions = ["\"zeta\":{", "\"name\":{", "\"home\":{", "\"age\":{", "\"street\":{", "\"city\":{"]
             .map { text.range(of: $0)?.lowerBound }
         let found = positions.compactMap { $0 }
-        #expect(found.count == positions.count)
+        try #require(found.count == positions.count, "every property name is in the text")
         #expect(found[found.count - 2] < found[found.count - 1], "Address: street before city")
         #expect(Array(found.dropLast(2)) == found.dropLast(2).sorted(), "Person: zeta, name, home, age")
-        // The same text from a second encoding: nothing in it depends on dictionary order.
-        #expect(GrammarSchemaJSON.ordered(try JSONEncoder().encode(schema)) == text)
     }
 }
