@@ -14,7 +14,7 @@ CLI:
     uv run coreai.model.registry --model-info clip-vit-b32 --type utility --as-export-args
 
 `--type` selects the preset table (`llm`, `diffusion`, or `utility`).
-`--platform` (`macOS` / `iOS`) filters LLM variants and utility model platforms.
+`--platform` (`macOS` / `iOS`) filters LLM and diffusion variants and utility model platforms.
 """
 
 from __future__ import annotations
@@ -42,7 +42,7 @@ class ModelPreset:
     hf_id: str
     family: str
     type: str  # "llm" | "diffusion"
-    # "macOS" | "iOS" for llm; None, or "neural-engine" for a diffusion Neural Engine build
+    # "macOS" | "iOS" for llm and Sana Sprint; None for the other diffusion models
     variant: str | None = None
     compression: str = "none"
     compute_precision: str | None = None  # None = use export tool default
@@ -679,42 +679,42 @@ DIFFUSION_PRESETS: list[ModelPreset] = [
         "Efficient-Large-Model/Sana_Sprint_0.6B_1024px_diffusers",
         "sana-sprint",
         "diffusion",
-        None,
+        "macOS",
         "t8bit-te4bit-asym",
         "bfloat16",
         None,
     ),
     ModelPreset(
-        "sana-sprint-0.6b-neural-engine",
+        "sana-sprint-0.6b",
         "Efficient-Large-Model/Sana_Sprint_0.6B_1024px_diffusers",
         "sana-sprint",
         "diffusion",
-        "neural-engine",
+        "iOS",
         "te6bit-tok8-tx8bit-pal",
         "float16",
         None,
-        notes="Neural Engine float16 build (--compute-unit neural-engine)",
+        notes="Neural Engine float16 build (--platform iOS)",
     ),
     ModelPreset(
         "sana-sprint-1.6b",
         "Efficient-Large-Model/Sana_Sprint_1.6B_1024px_diffusers",
         "sana-sprint",
         "diffusion",
-        None,
+        "macOS",
         "t8bit-te4bit-asym",
         "bfloat16",
         None,
     ),
     ModelPreset(
-        "sana-sprint-1.6b-neural-engine",
+        "sana-sprint-1.6b",
         "Efficient-Large-Model/Sana_Sprint_1.6B_1024px_diffusers",
         "sana-sprint",
         "diffusion",
-        "neural-engine",
+        "iOS",
         "te6bit-tok8-tx8bit-pal",
         "float16",
         None,
-        notes="Neural Engine float16 build (--compute-unit neural-engine)",
+        notes="Neural Engine float16 build (--platform iOS)",
     ),
 ]
 
@@ -996,10 +996,6 @@ def try_lookup_preset_by_hf_id(
         macos = [p for p in candidates if p.variant == "macOS"]
         if macos:
             return macos[0]
-        # Diffusion: the default build has no variant; "-neural-engine" presets share its hf_id.
-        default = [p for p in candidates if p.variant is None]
-        if len(default) == 1:
-            return default[0]
         return None
     # A variant was requested but several presets share this hf_id+variant.
     # So prefer the first-registered preset.
@@ -1082,8 +1078,8 @@ def _preset_to_export_args(preset: ModelPreset) -> list[str]:
     # Skip the flag for the macOS default to match the batch scripts.
     if preset.type == "llm" and preset.variant and preset.variant != "macOS":
         args += ["--platform", preset.variant]
-    if preset.type == "diffusion" and preset.variant == "neural-engine":
-        args += ["--compute-unit", "neural-engine"]
+    if preset.type == "diffusion" and preset.variant == "iOS":
+        args += ["--platform", "iOS"]
     return args
 
 
@@ -1096,12 +1092,12 @@ def _preset_to_output_name(preset: ModelPreset) -> str:
     preset points at a YAML config, the YAML stem (which encodes model identity)
     replaces the `<hf_tail>_<compression>` segment to avoid duplication.
 
-    Diffusion: the HF id's tail (e.g. `FLUX.2-klein-4B`), plus `_neural_engine` for a
-    Neural Engine build; the export tool writes a directory of components there.
+    Diffusion: the HF id's tail (e.g. `FLUX.2-klein-4B`), plus `-ios` for an iOS preset; the
+    export tool writes a directory of components there.
     """
     tail = preset.hf_id.split("/")[-1]
     if preset.type == "diffusion":
-        return f"{tail}_neural_engine" if preset.variant == "neural-engine" else tail
+        return f"{tail}-ios" if preset.variant == "iOS" else tail
     if preset.variant == "macOS":
         variant_suffix = "_dynamic"
     elif preset.variant == "iOS":
@@ -1137,7 +1133,7 @@ def _compression_display(p: ModelPreset) -> str:
 def _format_text_preset_row(p: ModelPreset, *, show_type: bool = False) -> str:
     """Single line for --list-models --text output."""
     type_col = f"{p.type:11s} " if show_type else ""
-    variant_col = (p.variant or "-").ljust(13)
+    variant_col = (p.variant or "-").ljust(10)
     ctx_col = str(p.max_context_length or "-").rjust(8)
     compression_col = _compression_display(p)
     return f"{type_col}{p.short_name:32s} {variant_col} {compression_col:38s} {ctx_col}  {p.hf_id}"
@@ -1145,7 +1141,7 @@ def _format_text_preset_row(p: ModelPreset, *, show_type: bool = False) -> str:
 
 def _format_text_header(*, show_type: bool = False) -> str:
     type_col = "TYPE        " if show_type else ""
-    return f"{type_col}{'SHORT_NAME':32s} {'PLATFORM':13s} {'COMPRESSION':38s} {'CTX':>8s}  HF_ID"
+    return f"{type_col}{'SHORT_NAME':32s} {'PLATFORM':10s} {'COMPRESSION':38s} {'CTX':>8s}  HF_ID"
 
 
 def _format_diffusion_row(p: ModelPreset) -> str:

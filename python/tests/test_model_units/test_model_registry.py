@@ -37,22 +37,42 @@ def test_no_duplicate_short_name_variant_pairs() -> None:
             seen.add(key)
 
 
-def test_diffusion_presets_have_no_variant_or_neural_engine() -> None:
+def test_only_sana_diffusion_presets_have_a_platform() -> None:
     for p in DIFFUSION_PRESETS:
-        assert p.variant in (None, "neural-engine"), f"{p.short_name}: unexpected {p.variant=}"
+        allowed = ("macOS", "iOS") if p.family == "sana-sprint" else (None,)
+        assert p.variant in allowed, f"{p.short_name}: unexpected {p.variant=}"
 
 
 @pytest.mark.parametrize("size", ["0.6B", "1.6B"])
-def test_neural_engine_preset_keeps_hf_id_lookup_on_the_default(size: str) -> None:
-    """A ``-neural-engine`` preset shares its hf_id; lookup without a variant keeps the default."""
+def test_sana_presets_are_selected_by_platform(size: str) -> None:
+    """Like an LLM: macOS (GPU) unless iOS (Neural Engine) is asked for."""
     hf_id = f"Efficient-Large-Model/Sana_Sprint_{size}_1024px_diffusers"
     short = f"sana-sprint-{size.lower()}"
-    default = try_lookup_preset_by_hf_id(hf_id, model_type="diffusion")
-    assert default is not None and default.short_name == short
-    ne = try_lookup_preset_by_hf_id(hf_id, model_type="diffusion", variant="neural-engine")
-    assert ne is not None and ne.short_name == f"{short}-neural-engine"
-    assert _preset_to_export_args(ne)[-2:] == ["--compute-unit", "neural-engine"]
-    assert _preset_to_output_name(ne) == f"Sana_Sprint_{size}_1024px_diffusers_neural_engine"
+    for macos in (
+        try_lookup_preset(short, model_type="diffusion"),
+        try_lookup_preset_by_hf_id(hf_id, model_type="diffusion"),
+        lookup_preset(short, model_type="diffusion", variant="macOS"),
+    ):
+        assert macos is not None and macos.variant == "macOS"
+        assert macos.compression == "t8bit-te4bit-asym"
+        assert "--platform" not in _preset_to_export_args(macos)
+        assert _preset_to_output_name(macos) == f"Sana_Sprint_{size}_1024px_diffusers"
+    for ios in (
+        lookup_preset(short, model_type="diffusion", variant="iOS"),
+        try_lookup_preset_by_hf_id(hf_id, model_type="diffusion", variant="iOS"),
+    ):
+        assert ios.short_name == short and ios.variant == "iOS"
+        assert ios.compression == "te6bit-tok8-tx8bit-pal"
+        assert _preset_to_export_args(ios)[-2:] == ["--platform", "iOS"]
+        assert _preset_to_output_name(ios) == f"Sana_Sprint_{size}_1024px_diffusers-ios"
+    with pytest.raises(KeyError, match="Pass --platform"):
+        lookup_preset(short, model_type="diffusion")
+
+
+def test_flux2_has_no_ios_preset() -> None:
+    """FLUX.2's --platform only changes export flags, so its one preset serves every platform."""
+    assert try_lookup_preset("flux2-klein-4b", model_type="diffusion", variant="iOS") is None
+    assert try_lookup_preset("flux2-klein-4b", model_type="diffusion") is not None
 
 
 def test_diffusion_presets_name_a_known_compression_preset() -> None:

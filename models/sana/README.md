@@ -6,8 +6,8 @@ NVIDIA's Sana Sprint few-step text-to-image model for on-device image generation
 
 | Model            | Parameters                    | Resolution | Steps | macOS | iOS |
 | ---------------- | ----------------------------- | ---------- | ----- | ----- | --- |
-| Sana Sprint 0.6B | 0.6B DiT + 2.6B Gemma-2 + VAE | 1024x1024  | 1-4   | Yes   | No  |
-| Sana Sprint 1.6B | 1.6B DiT + 2.6B Gemma-2 + VAE | 1024x1024  | 1-4   | Yes   | No  |
+| Sana Sprint 0.6B | 0.6B DiT + 2.6B Gemma-2 + VAE | 1024x1024  | 1-4   | Yes   | Yes |
+| Sana Sprint 1.6B | 1.6B DiT + 2.6B Gemma-2 + VAE | 1024x1024  | 1-4   | Yes   | Yes |
 
 ## Setup
 
@@ -22,39 +22,27 @@ brew install uv
 ```bash
 uv run coreai.diffusion.export sana-sprint-0.6b
 uv run coreai.diffusion.export sana-sprint-1.6b
+uv run coreai.diffusion.export sana-sprint-0.6b --platform iOS # Neural Engine
+uv run coreai.diffusion.export sana-sprint-1.6b --platform iOS # Neural Engine
 ```
 
 These load `Efficient-Large-Model/Sana_Sprint_{0.6B,1.6B}_1024px_diffusers` with diffusers'
-`SanaSprintPipeline` and export in `bfloat16` with the `t8bit-te4bit-asym` compression preset:
+`SanaSprintPipeline`. By default they export in `bfloat16` with the `t8bit-te4bit-asym` compression
+preset:
 
 - **Transformer:** INT8 per-channel weights. INT4 here visibly degrades fine detail and text rendering.
 - **Text encoder:** INT4 asymmetric per-block weights, exported in `float16`, since the Core AI GPU
   INT4 kernels need `float16` scales. INT4 here shifts compositions without degrading them.
 - **VAE decoder:** not quantized.
 
+`--platform iOS` instead exports a `float16` build re-authored for the Neural Engine to
+`exports/Sana_Sprint_<size>_1024px_diffusers-ios/`.
+
 For the full-precision `bfloat16` export, pass `--compression none`:
 
 ```bash
 uv run coreai.diffusion.export sana-sprint-1.6b --compression none
 ```
-
-### Neural Engine
-
-```bash
-uv run coreai.diffusion.export sana-sprint-0.6b-neural-engine
-uv run coreai.diffusion.export sana-sprint-1.6b-neural-engine
-```
-
-This writes `exports/Sana_Sprint_0.6B_1024px_diffusers_neural_engine/` with all three components
-re-authored for the Neural Engine in `float16` (`python/src/coreai_models/models/ios/sana_*.py`).
-The preset's `te6bit-tok8-tx8bit-pal` compression palettizes the text encoder to 6 bits (k-means,
-one lookup table per 16 output channels) with its token table in `int8` (one scale per row), and the
-transformer to 8 bits (k-means, one lookup table per tensor; the timestep, guidance, caption and
-input/output projections stay `float16`). The VAE decoder stays uncompressed. Pass
-`--compression te6bit-pal` for a `float16` token table and dense transformer, or `--compression none`
-for no compression. The bundle's `metadata.json` maps each component to `["neural_engine"]` under
-`diffusion.compute_units`, and the runtime loads those on the Neural Engine; the token lookup runs
-on the GPU. Inputs, outputs and the Swift API are the same as for the GPU bundle.
 
 ## Components
 
@@ -99,7 +87,8 @@ swift run -c release diffusion-runner --model exports/Sana_Sprint_0.6B_1024px_di
     --prompt "a cyberpunk cat with a neon sign that says \"Sana\"" --seed 42
 ```
 
-For 1.6B, pass `--model exports/Sana_Sprint_1.6B_1024px_diffusers`.
+For 1.6B, pass `--model exports/Sana_Sprint_1.6B_1024px_diffusers`. For a `--platform iOS` export,
+add `-ios` to the folder name, e.g. `--model exports/Sana_Sprint_0.6B_1024px_diffusers-ios`.
 
 The defaults (2 steps, guidance 4.5) come from `metadata.json`. `--guidance-scale` feeds the
 transformer's guidance embedding; there is no classifier-free guidance pass. `--seed` matches

@@ -3,7 +3,7 @@
 # Use of this source code is governed by a BSD-3-clause license that can
 # be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
-"""Sana Sprint components re-authored for the Neural Engine (``--compute-unit neural-engine``).
+"""Sana Sprint components re-authored for the Neural Engine (``--platform iOS``).
 
 Each has the same asset name, input and output names and positional order as the GPU component
 in ``components.py``, so the runtime binds them the same way; only the declared dtypes differ.

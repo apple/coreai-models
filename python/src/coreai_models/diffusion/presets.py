@@ -16,7 +16,7 @@ component, or ``component_configs`` keyed by diffusers component name (e.g.
 ``transformer``, ``text_encoder``); unlisted components stay dense. An optional
 ``component_precision`` overrides the export's compute precision per component.
 
-Neural Engine presets (``--compute-unit neural-engine``) instead hold
+Neural Engine presets (Sana Sprint with ``--platform iOS``) instead hold
 ``component_palettization``: coreai-opt ``kmeans_palettization_config`` dicts keyed by
 component name, applied to the re-authored float32 module before it is cast to float16.
 An optional ``component_quantization`` holds coreai-opt ``quantization_config`` dicts keyed

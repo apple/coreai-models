@@ -73,15 +73,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         choices=["iOS", "macOS"],
         help="Target platform. iOS defaults to 512 resolution, --single-function, and "
-        "the half img2img reference grid; macOS defaults to 1024 and the full grid.",
-    )
-    parser.add_argument(
-        "--compute-unit",
-        default=None,
-        choices=["gpu", "neural-engine"],
-        help="Compute unit the bundle targets (default: gpu). neural-engine exports the float16 "
-        "components re-authored for the Neural Engine (Sana Sprint) to <model>_neural_engine/; "
-        "registry presets ending in -neural-engine select it.",
+        "the half img2img reference grid; macOS defaults to 1024 and the full grid. "
+        "Sana Sprint: iOS exports the float16 Neural Engine build to <model>-ios/.",
     )
     parser.add_argument(
         "--resolution",
@@ -182,13 +175,15 @@ def main() -> None:
                 "Run `uv run coreai.model.registry --list-models --type diffusion` to see options."
             )
     else:
-        variant = "neural-engine" if args.compute_unit == "neural-engine" else None
-        preset = try_lookup_preset_by_hf_id(args.model, model_type="diffusion", variant=variant)
+        preset = try_lookup_preset_by_hf_id(args.model, model_type="diffusion")
+    # A platform's own preset (Sana Sprint's iOS build) replaces the default one.
+    if preset is not None and args.platform is not None:
+        platform_preset = try_lookup_preset(
+            preset.short_name, model_type="diffusion", variant=args.platform
+        )
+        preset = platform_preset or preset
 
-    compute_unit = args.compute_unit
     if preset is not None:
-        if compute_unit is None and preset.variant == "neural-engine":
-            compute_unit = "neural-engine"
         hf_model_id = preset.hf_id
         if compression is None and preset.compression:
             compression = preset.compression
@@ -214,14 +209,11 @@ def main() -> None:
 
     pipeline_type = get_pipeline_type(hf_model_id)
 
-    # --dynamic is FLUX.2-only, so this also rules out combining the two.
-    neural_engine = compute_unit == "neural-engine"
-    if neural_engine and pipeline_type != "sana_sprint":
-        parser.error(
-            f"--compute-unit neural-engine is only supported for Sana Sprint, not {pipeline_type}."
-        )
+    # Sana Sprint's iOS build is the one re-authored for the Neural Engine.
+    neural_engine = args.platform == "iOS" and pipeline_type == "sana_sprint"
 
-    if args.components and args.platform:
+    # Sana Sprint's --platform only picks the build, so it combines with --components.
+    if args.components and args.platform and pipeline_type != "sana_sprint":
         parser.error("Cannot specify both --components and --platform. Use only one.")
 
     # iOS forces single-function: multi-function saves disk but raises peak memory.

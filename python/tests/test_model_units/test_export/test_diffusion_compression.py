@@ -219,7 +219,7 @@ def test_neural_engine_quantization_satisfies_the_coreai_opt_schema(name: str) -
 
 def test_palettization_presets_are_neural_engine_only() -> None:
     """The GPU export would otherwise drop the palettization and export dense."""
-    with pytest.raises(ValueError, match="neural-engine"):
+    with pytest.raises(ValueError, match="--platform iOS"):
         _resolve_palettization("te6bit-pal", neural_engine=False)
     assert set(_resolve_palettization("te6bit-pal", neural_engine=True)) == {"text_encoder"}
 
@@ -234,26 +234,64 @@ def test_neural_engine_export_accepts_none() -> None:
     assert _resolve_palettization("none", neural_engine=True) == {}
 
 
-def test_neural_engine_preset_selects_the_neural_engine_registry(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
+def _dry_run(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], *argv: str
+) -> str:
     from coreai_models.diffusion import export
 
-    monkeypatch.setattr("sys.argv", ["export", "sana-sprint-0.6b-neural-engine", "--dry-run"])
+    monkeypatch.setattr("sys.argv", ["export", *argv, "--dry-run"])
     export.main()
-    assert "neural_engine:     True" in capsys.readouterr().out
+    return capsys.readouterr().out
 
 
-def test_neural_engine_export_rejects_other_pipelines(
+@pytest.mark.parametrize(
+    "model", ["sana-sprint-0.6b", "Efficient-Large-Model/Sana_Sprint_0.6B_1024px_diffusers"]
+)
+def test_sana_platform_ios_selects_the_neural_engine_build(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], model: str
+) -> None:
+    out = _dry_run(monkeypatch, capsys, model, "--platform", "iOS")
+    assert "neural_engine:     True" in out
+    assert "te6bit-tok8-tx8bit-pal" in out
+
+
+def test_sana_without_a_platform_is_the_gpu_build(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out = _dry_run(monkeypatch, capsys, "sana-sprint-0.6b")
+    assert "neural_engine:     False" in out
+    assert "t8bit-te4bit-asym" in out
+
+
+def test_sana_platform_combines_with_components(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out = _dry_run(
+        monkeypatch, capsys, "sana-sprint-0.6b", "--platform", "iOS", "--components", "transformer"
+    )
+    assert "neural_engine:     True" in out
+    assert "components:         transformer" in out
+
+
+def test_flux2_platform_ios_stays_on_the_gpu(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out = _dry_run(monkeypatch, capsys, "flux2-klein-4b", "--platform", "iOS")
+    assert "neural_engine:     False" in out
+    assert "compression:        4bit" in out
+    assert "transformer_512" in out
+
+
+def test_flux2_still_rejects_platform_with_components(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     from coreai_models.diffusion import export
 
-    argv = ["export", "flux2-klein-4b", "--compute-unit", "neural-engine", "--dry-run"]
-    monkeypatch.setattr("sys.argv", argv)
+    argv = ["export", "flux2-klein-4b", "--platform", "iOS", "--components", "transformer"]
+    monkeypatch.setattr("sys.argv", [*argv, "--dry-run"])
     with pytest.raises(SystemExit):
         export.main()
-    assert "only supported for Sana Sprint, not flux2" in capsys.readouterr().err
+    assert "Cannot specify both --components and --platform" in capsys.readouterr().err
 
 
 def test_int_scales_take_the_dtype_the_weights_are_quantized_in() -> None:

@@ -128,12 +128,12 @@ def export_diffusion(config: DiffusionExportConfig) -> dict[str, str]:
 
     # Output goes to <output_dir>/<model-name>/. A dynamic export reuses the static asset
     # names, so it gets its own directory rather than overwriting the static bundle; so does
-    # a Neural Engine export (<model-name>_neural_engine/).
+    # Sana Sprint's iOS (Neural Engine) export (<model-name>-ios/).
     model_subdir = config.hf_model_id.split("/")[-1]
     if config.dynamic:
         model_subdir += "-dynamic"
     if neural_engine:
-        model_subdir += "_neural_engine"
+        model_subdir += "-ios"
     output_path = Path(config.output_dir) / model_subdir
     output_path.mkdir(parents=True, exist_ok=True)
 
@@ -645,12 +645,13 @@ def _resolve_palettization(compression: str, neural_engine: bool) -> dict[str, d
     if neural_engine and compression != "none" and not palettization:
         names = [n for n, p in PRESETS.items() if "component_palettization" in p]
         raise ValueError(
-            f"--compute-unit neural-engine takes --compression none or a palettization preset "
-            f"({', '.join(names)}); got '{compression}'."
+            "The Sana Sprint --platform iOS export takes --compression none or a palettization "
+            f"preset ({', '.join(names)}); got '{compression}'."
         )
     if palettization and not neural_engine:
         raise ValueError(
-            f"'{compression}' palettizes for the Neural Engine; pass --compute-unit neural-engine."
+            f"'{compression}' palettizes for the Neural Engine; use it with Sana Sprint and "
+            "--platform iOS."
         )
     return palettization
 
