@@ -946,6 +946,15 @@ private struct EngineImpl: ~Copyable {
     private mutating func encodeGraphStep(
         tokens: some Collection<Int32>, queryLength: Int, currentStep: Int
     ) async throws -> (logitsBuffer: MTLBuffer, logitsOffset: Int) {
+        // The strides first: they can throw, and nothing after them can until the encode.
+        let posLength = processedTokenCount + queryLength
+        let tokenShape = [1, queryLength]
+        let tokenStrides = try resolvedStrides(descriptor: inputIdsBaseDesc, shape: tokenShape)
+        let posShape = [1, posLength]
+        let posStrides = try resolvedStrides(descriptor: positionIdsBaseDesc, shape: posShape)
+        let logitsShape = [1, queryLength, vocabSize]
+        let logitsStrides = try resolvedStrides(descriptor: logitsBaseDesc, shape: logitsShape)
+
         // PrepareStep: write tokens + build views
         let prepareSpan = InstrumentsProfiler.beginPrepareStep(
             step: currentStep, operation: "write+build", engine: "CoreAI-Pipelined")
@@ -965,11 +974,8 @@ private struct EngineImpl: ~Copyable {
 
         // Select cache position buffer for this step (pipeline-depth-matched rotation)
         let cachePosBuffer = cachePositionBuffers[step % pipelineDepth]
-        let posLength = processedTokenCount + queryLength
 
         // Build Inputs as AsyncValue (from MTLBuffers)
-        let tokenShape = [1, queryLength]
-        let tokenStrides = try resolvedStrides(descriptor: inputIdsBaseDesc, shape: tokenShape)
         let tokenValue: InferenceFunction.AsyncValue
         if tokens.isEmpty {
             // Decode: read input token from previous step's decode output buffer
@@ -990,8 +996,6 @@ private struct EngineImpl: ~Copyable {
                 strides: tokenStrides
             )
         }
-        let posShape = [1, posLength]
-        let posStrides = try resolvedStrides(descriptor: positionIdsBaseDesc, shape: posShape)
         let posValue = unsafe InferenceFunction.AsyncValue(
             unsafeBuffer: cachePosBuffer,
             byteOffset: 0,
@@ -1030,8 +1034,6 @@ private struct EngineImpl: ~Copyable {
         // Build Output as AsyncMutableValue (logits)
         // Decode uses per-step rotating buffer; prefill uses the shared growing buffer.
         let logitsOutputBuffer = tokens.isEmpty ? decodeLogitsBuffers[step] : logits.metalBuffer
-        let logitsShape = [1, queryLength, vocabSize]
-        let logitsStrides = try resolvedStrides(descriptor: logitsBaseDesc, shape: logitsShape)
 
         prepareSpan.end()
 
@@ -1092,15 +1094,16 @@ private struct EngineImpl: ~Copyable {
             details: "step=\(currentStep) qLen=\(queryLength)"
         )
 
-        let graphStep: (logitsBuffer: MTLBuffer, logitsOffset: Int)
+        let samplerLogitsBuffer: MTLBuffer
+        let logitsOffset: Int
         do {
-            graphStep = try await encodeGraphStep(tokens: tokens, queryLength: queryLength, currentStep: currentStep)
+            (samplerLogitsBuffer, logitsOffset) = try await encodeGraphStep(
+                tokens: tokens, queryLength: queryLength, currentStep: currentStep)
         } catch {
             InstrumentsProfiler.endCustomInterval(
                 name: "CoreAIPipelinedEncodeNextStep", signpostID: encodeStepID, details: "error")
             throw error
         }
-        let (samplerLogitsBuffer, logitsOffset) = graphStep
 
         // GPU sampling via Metal queue
         let localGPUSampler = gpuSampler
@@ -1799,6 +1802,8 @@ private struct EngineImpl: ~Copyable {
             name: "CoreAIPipelinedChunk",
             details: "step=\(currentStep) qLen=\(queryLength) graph=\(graphName)"
         )
+        // Ended on every path, a throw included.
+        defer { InstrumentsProfiler.endCustomInterval(name: "CoreAIPipelinedChunk", signpostID: chunkID) }
 
         // Write at the chunk's natural position so each chunk occupies a disjoint
         // region of inputTokensBuffer. Encode holds a live MTLBuffer reference — writing
@@ -1868,7 +1873,6 @@ private struct EngineImpl: ~Copyable {
 
         processedTokenCount += queryLength
         step += 1
-        InstrumentsProfiler.endCustomInterval(name: "CoreAIPipelinedChunk", signpostID: chunkID)
     }
 
     /// Waits for the work queued on the compute stream, then resets.
