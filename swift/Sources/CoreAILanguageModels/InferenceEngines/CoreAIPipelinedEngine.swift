@@ -188,8 +188,7 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
 
                 if isDivergence {
                     // Tokens differ — full reset (partial rewind corrupts buffer rotation)
-                    await self.engine.computeStream.currentWorkCompleted()
-                    self.engine.reset()
+                    await self.engine.resetWhenIdle()
                     self.history.clear()
                     resolvedNewTokens = input[...]
                     commonPrefix = 0
@@ -197,8 +196,7 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
                     // Hybrid model: recurrent state can't be partially rewound.
                     // Full reset and replay the entire prompt.
                     if commonPrefix < self.engine.processedTokenCount {
-                        await self.engine.computeStream.currentWorkCompleted()
-                        self.engine.reset()
+                        await self.engine.resetWhenIdle()
                         self.history.clear()
                         resolvedNewTokens = input[...]
                         commonPrefix = 0
@@ -208,8 +206,7 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
                     ringCapacity: self.engine.slidingRingCapacity)
                 {
                     // The ring has overwritten slots the rewound position reads: replay.
-                    await self.engine.computeStream.currentWorkCompleted()
-                    self.engine.reset()
+                    await self.engine.resetWhenIdle()
                     self.history.clear()
                     resolvedNewTokens = input[...]
                     commonPrefix = 0
@@ -946,36 +943,13 @@ private struct EngineImpl: ~Copyable {
 
     // MARK: - Core Encode Step
 
-    /// Encodes inference + GPU sampling for one step.
-    ///
-    /// 1. Construct RawView/MutableRawView from MTLBuffers with current shapes
-    /// 2. Encode to ComputeStream (non-blocking)
-    /// 3. withMetal3Queue: encode GPU argmax/topK (writes to rotating decodeOutputBuffers)
-    /// 4. Callback yields token
-    private mutating func _encodeNextStepGPU(
-        tokens: some Collection<Int32>,
-        gpuSampler: any MPSGraphSampler,
-        yieldingTo continuation: AsyncThrowingStream<InferenceEngine.TokenId, Error>.Continuation
-    ) async throws {
-        let currentStep = processedTokenCount
-
-        let actualTokenCount = tokens.isEmpty ? 1 : tokens.count
-        let queryLength = actualTokenCount
-
-        try StateHandlerFactory.checkWriteFirstStep(
-            offset: processedTokenCount, queryLength: queryLength,
-            ringCapacity: slidingRingCapacity)
-
-        defer {
-            processedTokenCount += actualTokenCount
-            step += 1
-        }
-
-        let encodeStepID = InstrumentsProfiler.beginCustomInterval(
-            name: "CoreAIPipelinedEncodeNextStep",
-            details: "step=\(currentStep) qLen=\(queryLength)"
-        )
-
+    /// Writes a step's tokens, binds its inputs, the KV cache and its logits output, and encodes the
+    /// graph call, holding a slot of `inFlightGate` that the step's sampler releases. Returns where the
+    /// logits went and the byte offset of the row to sample: a decode step's rotating buffer, or a
+    /// prompt's last position in the shared growing buffer.
+    private mutating func encodeGraphStep(
+        tokens: some Collection<Int32>, queryLength: Int, currentStep: Int
+    ) async throws -> (logitsBuffer: MTLBuffer, logitsOffset: Int) {
         // PrepareStep: write tokens + build views
         let prepareSpan = InstrumentsProfiler.beginPrepareStep(
             step: currentStep, operation: "write+build", engine: "CoreAI-Pipelined")
@@ -1085,11 +1059,42 @@ private struct EngineImpl: ~Copyable {
             computeStream: computeStream)
         logitsSpan.end()
 
+        return (logitsOutputBuffer, (queryLength - 1) * vocabSize * MemoryLayout<UInt16>.size)
+    }
+
+    /// Encodes one step: the graph call through ``encodeGraphStep(tokens:queryLength:currentStep:)``,
+    /// then GPU sampling into the rotating `decodeOutputBuffers`. The sampler's completion releases the
+    /// gate slot and yields the token.
+    private mutating func _encodeNextStepGPU(
+        tokens: some Collection<Int32>,
+        gpuSampler: any MPSGraphSampler,
+        yieldingTo continuation: AsyncThrowingStream<InferenceEngine.TokenId, Error>.Continuation
+    ) async throws {
+        let currentStep = processedTokenCount
+
+        let actualTokenCount = tokens.isEmpty ? 1 : tokens.count
+        let queryLength = actualTokenCount
+
+        try StateHandlerFactory.checkWriteFirstStep(
+            offset: processedTokenCount, queryLength: queryLength,
+            ringCapacity: slidingRingCapacity)
+
+        defer {
+            processedTokenCount += actualTokenCount
+            step += 1
+        }
+
+        let encodeStepID = InstrumentsProfiler.beginCustomInterval(
+            name: "CoreAIPipelinedEncodeNextStep",
+            details: "step=\(currentStep) qLen=\(queryLength)"
+        )
+
+        let (samplerLogitsBuffer, logitsOffset) = try await encodeGraphStep(
+            tokens: tokens, queryLength: queryLength, currentStep: currentStep)
+
         // GPU sampling via Metal queue
         let localGPUSampler = gpuSampler
         let outputBuffer = decodeOutputBuffers[step % pipelineDepth]
-        let samplerLogitsBuffer = tokens.isEmpty ? decodeLogitsBuffers[step % pipelineDepth] : logits.metalBuffer
-        let logitsOffset = (actualTokenCount - 1) * vocabSize * MemoryLayout<UInt16>.size
         let samplerStrategy = gpuSampler is MPSGraphArgmaxSampler ? "GPU-argmax" : "GPU-composite"
         let samplerTemperature = cachedSamplerTemperature ?? 0.0
 
@@ -1856,6 +1861,12 @@ private struct EngineImpl: ~Copyable {
         InstrumentsProfiler.endCustomInterval(name: "CoreAIPipelinedChunk", signpostID: chunkID)
     }
 
+    /// Waits for the work queued on the compute stream, then resets.
+    mutating func resetWhenIdle() async {
+        await computeStream.currentWorkCompleted()
+        reset()
+    }
+
     mutating func reset() {
         let span = InstrumentsProfiler.beginReset(engine: "CoreAI-Pipelined")
         processedTokenCount = 0
@@ -2003,8 +2014,7 @@ private struct EngineImpl: ~Copyable {
             step += 1
         }
 
-        await computeStream.currentWorkCompleted()
-        reset()
+        await resetWhenIdle()
 
         warmupSpan.end()
         let warmupElapsed = milliseconds(since: warmupStart)
