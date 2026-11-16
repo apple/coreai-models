@@ -1,0 +1,84 @@
+{
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "This 5k-line PR adds EmbeddingGemma 2 encoders (GPU and Neural Engine) and an exporter. Tests pass. Before I write the PR, find existing helpers in the Python tree we should reuse, e.g. the RoPE and rotation helpers.",
+      "files": [],
+      "expected_output": "A reuse pass whose every applied change is an identity transform, proven by a before/after snapshot, with rejected near-misses listed",
+      "expectations": [
+        "Takes a before-snapshot of the committed code (graph_identity.py snapshot on a git archive copy) before editing",
+        "Inventories helper families beyond RoPE: layers (MLP, norms), loaders, export boilerplate (converter.py and diffusion/gpu.py export helpers), constants, test helpers",
+        "Rejects replacements that change the exported op sequence or outputs even when values match within a tolerance (e.g. iOS rotate_half on a BC1S tower, RoPECache, BidirectionalSDPA)",
+        "Does not accept tolerance-based or on-device-gated changes as part of the reuse pass",
+        "Runs graph_identity.py compare and requires 0 differences",
+        "Runs the full test suite including the HF/reference tier with the uv --with overlay instead of accepting skipped tests",
+        "Respects export -> models -> primitives and flags private cross-model or ios-from-macos imports",
+        "Takes the baseline in a detached worktree and compares per-test outcomes, accepting pre-existing failures only if they also fail on the base",
+        "Runs a control and a negative control per edited area",
+        "Promotes private helpers (e.g. muse_glimmer_vision._rotate_half, converter._decomp_empty_permuted) in their own commit instead of importing them",
+        "Keeps the GQA repeat_interleave and the original loaders"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "I replaced our axial RoPE with diffusion_gemma.apply_rotary_pos_emb applied per half; outputs match to 1e-6 and cosine is 0.99999. Good to include in the PR cleanup?",
+      "files": [],
+      "expected_output": "No: it changes the op sequence and outputs, so it is a model change, not a reuse cleanup",
+      "expectations": [
+        "Says the change is not an identity transform and does not belong in the reuse pass",
+        "Points to graph_identity.py compare reporting differences as the deciding check",
+        "Suggests keeping it as a separate, separately validated change if wanted"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "Small 120-line bug fix to the LLM exporter; should I run the helper reuse audit before opening the PR?",
+      "files": [],
+      "expected_output": "Not needed: the skill targets large model-export PRs (500+ added lines)",
+      "expectations": [
+        "Recognises the change is below the size threshold and skips the full audit"
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "Before the reuse audit, the suite shows 990 passed, 42 failed, 151 skipped; all failures are in unrelated models and the venv is older than the lock, PyPI is blocked. The author says the failures are on main too. Proceed?",
+      "files": [],
+      "expected_output": "Proceed only after confirming the same failures on the base in the same environment; invariant becomes identical per-test outcomes",
+      "expectations": [
+        "Runs the base in the same environment and compares failing test IDs",
+        "States the invariant as identical outcomes per test, not 'all pass'",
+        "Records the environment drift and any tier that cannot run as not run"
+      ]
+    },
+    {
+      "id": 5,
+      "prompt": "The PR has had two review rounds. You found two identity reuses. How do you land them?",
+      "files": [],
+      "expected_output": "New commits on top (promotion first), each proven; no rebase or force-push",
+      "expectations": [
+        "Does not rewrite history or force-push",
+        "Adds the reuses as new commits with compare 0 and matching test outcomes"
+      ]
+    },
+    {
+      "id": 6,
+      "prompt": "Reviewer: 'Use muse_glimmer_vision._rotate_half instead of your copy.' compare shows 0 differences after the swap. Apply as asked?",
+      "files": [],
+      "expected_output": "No private import: promote the helper unchanged to a public home in its own commit, switch every caller, prove each",
+      "expectations": [
+        "Refuses the private cross-model import",
+        "Promotes the helper and proves the original caller's graph unchanged"
+      ]
+    },
+    {
+      "id": 7,
+      "prompt": "compare reports one difference: the raw torch.export ops differ, but the decomposed ops, weights and outputs are identical. The author says only the decomposed graph is converted. Apply?",
+      "files": [],
+      "expected_output": "No: any difference fails; keep the original code and record the rejection",
+      "expectations": [
+        "Rejects the swap because compare is not 0",
+        "Cites the first differing op"
+      ]
+    }
+  ]
+}

@@ -235,6 +235,15 @@ struct CompletionTypesTests {
         #expect(request.messages[0].content.imageDataURLs == ["data:image/png;base64,AAA"])
     }
 
+    @Test("image_url also decodes as a plain string")
+    func messageContentImageURLString() throws {
+        let json = """
+            {"messages":[{"role":"user","content":[{"type":"image_url","image_url":"data:image/png;base64,AAA"}]}]}
+            """.data(using: .utf8)!
+        let request = try JSONDecoder().decode(ChatCompletionRequest.self, from: json)
+        #expect(request.messages[0].content.imageDataURLs == ["data:image/png;base64,AAA"])
+    }
+
     @Test("Empty content string decodes gracefully")
     func emptyContentString() throws {
         let json = """
