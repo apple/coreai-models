@@ -63,6 +63,7 @@ This repo includes a plugin with skills to enable coding agents to use Core AI l
 | `working‑with‑coreai` | End-to-end workflow for deploying PyTorch models on Apple silicon, covering export with `coreai-torch` and running with the Core AI runtime. |
 | `model‑authoring` | Empirical rules for authoring PyTorch models for on-device execution on Apple platforms, covering BC1S layout, op compatibility, KV cache patterns, precision rules, MoE, and common issues. |
 | `model‑compression‑exploration` | Systematically explore weight compression configurations (quantization and palettization) for a PyTorch model using `coreai-opt`. |
+| `auditing‑helper‑reuse` | Before a large model-export change becomes a PR, find helpers it re-implements (RoPE, norms, MLPs, attention and masks, loaders, export boilerplate) and reuse them only where the exported graph stays identical. |
 
 ### Install
 

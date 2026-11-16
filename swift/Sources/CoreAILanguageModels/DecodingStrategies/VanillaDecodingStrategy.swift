@@ -49,10 +49,48 @@ public struct VanillaDecodingStrategy: DecodingStrategy {
             samplingConfiguration: samplingConfiguration,
             inferenceOptions: options
         )
+        return decodedSequence(
+            of: stream, inputTokenCount: inputTokens.count, tokenizer: tokenizer, stopSequences: stopSequences)
+    }
 
-        return VanillaDecodedSequence(
+    /// Stream decoded text for a prompt with image placeholders.
+    ///
+    /// - Parameters:
+    ///   - embeddings: The embeddings of every image placeholder in `tokens`, in order
+    ///   - tokens: Prompt tokens, image placeholders included
+    ///   - tokenizer: Tokenizer for decoding
+    ///   - inferenceEngine: Engine that accepts multimodal input
+    ///   - samplingConfiguration: Sampling parameters (temperature, topK, etc.)
+    ///   - options: Inference options (maxTokens, tokens, logits)
+    ///   - stopSequences: Token sequences that halt generation
+    /// - Returns: Stream of `GenerationResult` (text + optional logits)
+    package func decode(
+        embeddings: InputEmbeddings,
+        tokens: [Int32],
+        tokenizer: any Tokenizer,
+        inferenceEngine: any MultimodalInferenceEngine,
+        samplingConfiguration: SamplingConfiguration,
+        options: InferenceOptions,
+        stopSequences: StopSequences
+    ) async throws -> VanillaDecodedSequence {
+        let stream = try await inferenceEngine.generate(
+            with: embeddings,
+            tokens: tokens,
+            samplingConfiguration: samplingConfiguration,
+            inferenceOptions: options
+        )
+        return decodedSequence(
+            of: stream, inputTokenCount: tokens.count, tokenizer: tokenizer, stopSequences: stopSequences)
+    }
+
+    /// The decoded text of the engine's `stream` for a prompt of `inputTokenCount` tokens.
+    private func decodedSequence(
+        of stream: any InferenceOutputSequence, inputTokenCount: Int, tokenizer: any Tokenizer,
+        stopSequences: StopSequences
+    ) -> VanillaDecodedSequence {
+        VanillaDecodedSequence(
             prepared: VanillaDecodedSequence.Prepared(
-                initialInputTokenCount: inputTokens.count,
+                initialInputTokenCount: inputTokenCount,
                 engineSequence: stream,
                 upstreamIterator: stream.makeAsyncIterator()
             ),

@@ -178,6 +178,13 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     var drafterTopK: Int?
 
     @Option(
+        name: .customLong("draft-head-pack"),
+        help:
+            "With --speculative: run the draft head on the CPU from this pack (draft_head.safetensors from models/gemma4/export_draft_pack.py) instead of the bundle's draft head program, which the bundle then need not ship. The target still needs --emit-hidden-states."
+    )
+    var draftHeadPack: String?
+
+    @Option(
         name: .customLong("grammar-proposal-max"),
         help:
             "With --json-schema and speculative decoding: most tokens the grammar may propose in one verify block when it fully determines the next span (0 disables; default \(GrammarConstraint.defaultForcedRunLimit), at most \(GrammarConstraint.maxForcedRunLimit), the grammar's rollback budget less the anchor)."
@@ -458,6 +465,14 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         {
             throw ValidationError(problem)
         }
+        if let problem = SpeculativeDecodingOptions.draftHeadPackProblem(
+            hasPack: draftHeadPack != nil, draftHead: speculative)
+        {
+            throw ValidationError(problem)
+        }
+        if let draftHeadPack, !FileManager.default.fileExists(atPath: draftHeadPack) {
+            throw ValidationError("--draft-head-pack \(draftHeadPack) does not exist")
+        }
         let speculating = draftModel != nil || promptLookup || speculative
         if seed != nil && !speculating {
             throw ValidationError("--seed applies to speculative decoding (--draft-model or --prompt-lookup)")
@@ -733,8 +748,9 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
                     draftTokens: numDraftTokens, alignDraftsToVerifyTile: !noAlignProposals,
                     adaptiveDraftCount: adaptive,
                     promptLookupMinNgram: promptLookup ? promptLookupMinNgram : nil,
-                    drafterTopK: drafterTopK))
-            drafterLabel = promptLookup ? "draft head + prompt-lookup" : "draft head"
+                    drafterTopK: drafterTopK, cpuPack: draftHeadPack.map { URL(fileURLWithPath: $0) }))
+            let head = draftHeadPack == nil ? "draft head" : "draft head (CPU)"
+            drafterLabel = promptLookup ? "\(head) + prompt-lookup" : head
         } else if let draftEngine {
             decoder = SpeculativeDecoder(
                 draft: draftEngine, target: targetEngine,
@@ -1827,7 +1843,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         let w = Int(ciImage.extent.width)
         let h = Int(ciImage.extent.height)
         CLILogger.log("Injected image info: \(w)x\(h)", component: "VLM")
-        return "Image: \(w)x\(h)\n\(displayPrompt)"
+        return ImagePlaceholders.imageInfoText(width: w, height: h) + displayPrompt
     }
 
     /// Prompt tokens for an image prompt: the tokenizer's chat template with the image placeholder
@@ -1858,38 +1874,17 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         imageTokenId: Int32,
         tokenizer: any Tokenizer
     ) throws -> [Int32]? {
-        // Use the tokenizer's applyChatTemplate with a multimodal message.
-        // The template should emit a single <image> token that we expand.
-        let imageToken = tokenizer.convertIdToToken(Int(imageTokenId)) ?? "<image>"
-        let templatedPrompt = "\(imageToken)\n\(prompt)"
+        // The template should emit the single image token, which is expanded to the image's tokens.
+        let imageToken = ImagePlaceholders.text(imageTokenId: imageTokenId, tokenizer: tokenizer)
         guard
             let tokens = try? PromptUtils.maybeApplyTokenizerChatTemplate(
-                .prompt(templatedPrompt), tokenizer: tokenizer
+                .prompt("\(imageToken)\n\(prompt)"), tokenizer: tokenizer
             )
         else {
             return nil
         }
-
-        // Expand the single image placeholder to imageTokenCount copies
-        var result: [Int32] = []
-        result.reserveCapacity(tokens.count + imageTokenCount - 1)
-        var foundPlaceholder = false
-        for tokenInt in tokens {
-            let token = Int32(tokenInt)
-            if token == imageTokenId && !foundPlaceholder {
-                result.append(contentsOf: [Int32](repeating: imageTokenId, count: imageTokenCount))
-                foundPlaceholder = true
-            } else if token == imageTokenId {
-                // Skip additional single image tokens (already expanded the first one)
-                continue
-            } else {
-                result.append(token)
-            }
-        }
-
-        // If we never found the placeholder, the template didn't produce it — fall back
-        guard foundPlaceholder else { return nil }
-        return result
+        return ImagePlaceholders.expand(
+            tokens.map { Int32($0) }, imageTokenId: imageTokenId, tokenCounts: [imageTokenCount])
     }
 
     // MARK: - Warmup
