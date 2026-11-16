@@ -12,7 +12,7 @@ from transformers.models.qwen2.modeling_qwen2 import (
     Qwen2ForCausalLM as HFQwen2ForCausalLM,
 )
 
-from coreai_models._hf import resolve_rope_theta
+from coreai_models._hf import is_default_rope_scaling, resolve_rope_theta
 from coreai_models.models.base import BaseForCausalLMForiOS
 from coreai_models.primitives.ios.cache import KVCacheHandler
 from coreai_models.primitives.ios.mlp import MLP
@@ -43,6 +43,15 @@ class Attention(nn.Module):
         self.o_proj = nn.Conv2d(n_heads * head_dim, dim, kernel_size=1, bias=False)
 
         self.sdpa = SDPA(head_dim=self.head_dim)
+
+        no_rope_layers = getattr(config, "no_rope_layers", None)
+        no_rope_interval = getattr(config, "no_rope_layer_interval", None)
+        if no_rope_layers is not None and layer_idx < len(no_rope_layers):
+            self.use_rope = bool(no_rope_layers[layer_idx])
+        elif no_rope_interval is not None and no_rope_interval > 0:
+            self.use_rope = (layer_idx + 1) % no_rope_interval != 0
+        else:
+            self.use_rope = True
 
     def forward(
         self,
@@ -76,8 +85,9 @@ class Attention(nn.Module):
         torch._check_is_size(query_len)
         torch._check_is_size(seq_len)
 
-        query = apply_rope(query, rope_cos, rope_sin)
-        key = apply_rope(key, rope_cos, rope_sin)
+        if self.use_rope:
+            query = apply_rope(query, rope_cos, rope_sin)
+            key = apply_rope(key, rope_cos, rope_sin)
 
         query = (
             query.transpose(-2, -3)
@@ -184,6 +194,7 @@ class Qwen2Extend(nn.Module):
         self.kv_cache = KVCacheHandler(config.num_hidden_layers, config.hidden_size)
 
         head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        assert is_default_rope_scaling(config), f"unsupported rope_scaling: {config.rope_scaling}"
         rope_theta = resolve_rope_theta(config)
         self.rope = RoPECache(head_dim, config.max_position_embeddings, rope_theta)
 
