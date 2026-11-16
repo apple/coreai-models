@@ -55,6 +55,11 @@ class ModelPreset:
     # config.json reports a type we don't want to register globally (e.g.
     # SmolLM2 reports "llama" but we use the qwen2 export path).
     _model_type_override: str | None = None
+    # ModelScope repo id for the download-backend override map. Defaults to
+    # the HF id — presets whose repo exists under the same org/name on both
+    # hubs leave this as None. Only namespace-differing models need an entry
+    # (currently just gpt-oss-20b).
+    modelscope_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -166,7 +171,15 @@ LLM_PRESETS: list[ModelPreset] = [
         32768,
     ),
     ModelPreset(
-        "gpt-oss-20b", "openai/gpt-oss-20b", "gpt-oss", "llm", "macOS", "none", "bfloat16", 32768
+        "gpt-oss-20b",
+        "openai/gpt-oss-20b",
+        "gpt-oss",
+        "llm",
+        "macOS",
+        "none",
+        "bfloat16",
+        32768,
+        modelscope_id="openai-mirror/gpt-oss-20b",
     ),
     ModelPreset(
         "phi-4-mini-instruct",
@@ -678,6 +691,14 @@ UTILITY_PRESETS: list[UtilityModel] = [
         "clap",
         "embedding",
         "coreai.embedding.export",
+    ),
+    UtilityModel(
+        "qwen3-embedding-0.6b",
+        "Qwen/Qwen3-Embedding-0.6B",
+        "qwen3-embedding",
+        "embedding",
+        "coreai.embedding.export",
+        platforms=("macOS",),
     ),
     # --- ASR ---
     UtilityModel(
