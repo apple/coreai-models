@@ -137,9 +137,11 @@ public struct CoreAILanguageModel: LanguageModel {
             if mode == .eager { try await resources.loadResources() }
         }()
 
-        let tokenizerLoadSpan = InstrumentsProfiler.beginTokenizerLoad(id: bundle.tokenizer)
-        let tokenizer = try await bundle.loadTokenizer()
-        tokenizerLoadSpan.end()
+        let tokenizer = try await InstrumentsProfiler.profile(
+            InstrumentsProfiler.beginTokenizerLoad(id: bundle.tokenizer)
+        ) {
+            try await bundle.loadTokenizer()
+        }
 
         try await engineLoad
         self.init(
