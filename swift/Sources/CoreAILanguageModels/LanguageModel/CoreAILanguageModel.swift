@@ -536,7 +536,12 @@ public struct CoreAILanguageModel: LanguageModel {
         ) async throws {
             let schemaData = try JSONEncoder().encode(schema)
 
-            guard let jsonSchema = String(data: schemaData, encoding: .utf8) else {
+            // The grammar generates properties in the order the schema lists them, which in
+            // GenerationSchema's own encoding changes from one process to the next.
+            guard
+                let jsonSchema = GrammarSchemaJSON.ordered(schemaData)
+                    ?? String(data: schemaData, encoding: .utf8)
+            else {
                 preconditionFailure("GenerationSchema JSON encoding produced invalid UTF-8")
             }
 
