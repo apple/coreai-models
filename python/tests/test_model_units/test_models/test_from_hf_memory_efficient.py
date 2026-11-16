@@ -41,8 +41,8 @@ class TestFromHfMemoryEfficient:
         """A local checkpoint directory is read in place, with no Hub download."""
         hf_model = _save_tiny_checkpoint(tmp_path)
         monkeypatch.setattr(
-            "coreai_models.models.base.snapshot_download",
-            lambda *args, **kwargs: pytest.fail("snapshot_download was called"),
+            "coreai_models.models.base.get_backend",
+            lambda *args, **kwargs: pytest.fail("get_backend was called"),
         )
 
         model = Qwen3ForCausalLM.from_hf_memory_efficient(

@@ -8,6 +8,7 @@
 import argparse
 import logging
 from pathlib import Path
+from typing import get_args
 
 import yaml
 from coreai_opt.palettization.config.palettization_config import KMeansPalettizerConfig
@@ -26,6 +27,7 @@ from coreai_models.export.presets import (
     DEFAULT_IOS_COMPRESSION_PRESET as IOS_DEFAULT,
 )
 from coreai_models.export.presets import DEFAULT_MACOS_COMPRESSION_PRESET as MACOS_DEFAULT
+from coreai_models.hub import BackendName, resolve_download_id
 from coreai_models.model_registry import (
     presets_for_type,
     try_lookup_preset,
@@ -204,6 +206,16 @@ def build_parser() -> argparse.ArgumentParser:
             "--attention-mask batched."
         ),
     )
+    parser.add_argument(
+        "--backend",
+        choices=get_args(BackendName),
+        default=None,
+        help=(
+            "Model download backend. 'huggingface' (default) keeps the exact "
+            "original download behavior; 'modelscope' downloads from modelscope.cn "
+            "(requires the optional 'modelscope' extra: uv run --extra modelscope)."
+        ),
+    )
     return parser
 
 
@@ -236,7 +248,7 @@ def _load_compression_config_object(yaml_path: Path, variant: str):  # type: ign
             f"{yaml_path}: 'coreai_models' must be a mapping, got "
             f"{type(pipeline_level_options).__name__}."
         )
-    allowed_pipeline_level_keys = {"calibrate_activations"}
+    allowed_pipeline_level_keys = {"calibrate_activations", "untie_word_embeddings"}
     unknown = set(pipeline_level_options) - allowed_pipeline_level_keys
     if unknown:
         raise SystemExit(
@@ -280,6 +292,8 @@ def _load_compression_config_object(yaml_path: Path, variant: str):  # type: ign
         merged = dict(inner)
         if "calibrate_activations" in pipeline_level_options:
             merged["calibrate_activations"] = pipeline_level_options["calibrate_activations"]
+        if "untie_word_embeddings" in pipeline_level_options:
+            merged["untie_word_embeddings"] = pipeline_level_options["untie_word_embeddings"]
         return merged
 
     raise SystemExit(
@@ -442,6 +456,7 @@ def _resolve_export_config(args: argparse.Namespace) -> ExportConfig:
         with_drafter=args.with_drafter,
         attention_mask_mode=attention_mask_mode,
         dynamic_max_batch_size=args.dynamic_batch_size,
+        backend=args.backend or "huggingface",
     )
 
 
@@ -477,9 +492,11 @@ def main() -> None:
     if args.list_models:
         print("LLM presets (use short name or HuggingFace ID):")
         print()
+        backend = args.backend or "huggingface"
         for p in presets_for_type("llm"):
             platform = p.variant or "macOS"
-            print(f"  {p.short_name:35s} {p.hf_id:45s} {platform}")
+            display_id = resolve_download_id(p.hf_id, backend)
+            print(f"  {p.short_name:35s} {display_id:45s} {platform}")
         print()
         print("Supported architectures:")
         print()
@@ -507,6 +524,8 @@ def main() -> None:
         print(f"  compute_precision:  {config.compute_precision}")
         if config.max_context_length:
             print(f"  max_context_length: {config.max_context_length}")
+        if config.backend != "huggingface":
+            print(f"  download_backend:   {config.backend}")
         print(f"  output_dir:         {config.output_dir}")
         if config.output_name:
             print(f"  output_name:        {config.output_name}")
