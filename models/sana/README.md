@@ -38,10 +38,11 @@ For the full-precision `bfloat16` export, pass `--compression none`:
 uv run coreai.diffusion.export sana-sprint-1.6b --compression none
 ```
 
-### Neural Engine (0.6B)
+### Neural Engine
 
 ```bash
 uv run coreai.diffusion.export sana-sprint-0.6b-neural-engine
+uv run coreai.diffusion.export sana-sprint-1.6b-neural-engine
 ```
 
 This writes `exports/Sana_Sprint_0.6B_1024px_diffusers_neural_engine/` with all three components
@@ -54,33 +55,6 @@ input/output projections stay `float16`). The VAE decoder stays uncompressed. Pa
 for no compression. The bundle's `metadata.json` maps each component to `["neural_engine"]` under
 `diffusion.compute_units`, and the runtime loads those on the Neural Engine; the token lookup runs
 on the GPU. Inputs, outputs and the Swift API are the same as for the GPU bundle.
-
-`float16` keeps 3 more mantissa bits than `bfloat16`, and each component holds its activations in range
-with exact rewrites, so it is closer to the `float32` reference than the GPU export (PSNR on 8 prompts,
-M4 Pro):
-
-| Component / output | Neural Engine | Dense `bfloat16` | Default GPU bundle |
-| ------------------ | ------------- | ---------------- | ------------------ |
-| Transformer        | 45.9 dB       | 42.3 dB          | 40.3 dB (INT8)     |
-| Text encoder       | 53.9 dB       | 71.3 dB          | 46.7 dB (INT4)     |
-| VAE decoder        | 63.9 dB       | 49.1 dB          | 49.1 dB            |
-| Image (end to end) | 26.1 dB       | —                | 21.3 dB            |
-
-The 8-bit transformer and the `int8` token table cost their components 8.8 and 0.2 dB (dense
-transformer 54.7 dB, `float16` table 54.1 dB) but leave the image within 0.1 dB of `te6bit-pal`. With
-`--compression none` the text encoder is 58.2 dB and the image 28.6 dB.
-
-| Asset              | Neural Engine | Default GPU bundle |
-| ------------------ | ------------- | ------------------ |
-| Transformer        | 605 MB        | 570 MB             |
-| Text encoder       | 2.0 GB        | 1.4 GB             |
-| VAE decoder        | 466 MB        | 304 MB             |
-
-Compute per image is on par with the GPU (~2.1 s on an M4 Pro). Loading weights onto the Neural
-Engine runs at ~0.5 GB/s, so with lazy model loading an image takes ~4 s against ~3 s on the GPU
-(~12 s more with the dense text encoder). A transformer step takes 195 ms (209 ms dense). The first
-load specializes for the Neural Engine, ~10 minutes for the three components; later loads use the
-cache.
 
 ## Components
 

@@ -14,6 +14,8 @@ range sweep over real prompts is removed with an exact rewrite:
   token's per-head ``q`` by its max. The output is a ratio in both, so both cancel; they keep
   ``Σ v kᵀ`` and ``(Σ v kᵀ) q`` in range (3.5e5 unscaled) and the denominator well above the
   float16-tiny floor.
+- Cross-attention scales ``to_q`` by ``_Q_SCALE`` and ``norm_q``'s eps by its square, which leaves
+  the RMSNorm unchanged; 1.6B's ``to_q`` peaks at 1.3e5.
 - SiLU is :class:`TanhSiLU`: the Neural Engine's fused SiLU costs the feed-forward ~25 dB, ~9 dB
   end to end.
 - ``x * (1 + scale)`` folds the ``1`` into ``scale_shift_table``, and the cross-attention
@@ -37,6 +39,8 @@ _FP16_TINY = torch.finfo(torch.float16).tiny
 # With normalized q and K / N the sweep's numerator peaks at 139 and the denominator's 0.1th
 # percentile is 4e-3; x32 keeps the numerator 14x below 65504 and the floor negligible.
 _K_SCALE = 32.0
+# A power of two, so the fold is exact: 1.6B's peak 1.3e5 -> 8e3.
+_Q_SCALE = 1 / 16
 _MASK_BIAS = -10000.0  # diffusers' cross-attention mask bias
 
 
@@ -126,7 +130,8 @@ class CrossAttention(nn.Module):
         self.to_q = conv1x1(dim, dim)
         self.to_k = conv1x1(dim, dim)
         self.to_v = conv1x1(dim, dim)
-        self.norm_q = MaxAbsRMSNorm(dim, eps, axis=-3, floor="add")
+        # RMSNorm(s * x) with eps * s^2 is RMSNorm(x), for ``to_q`` scaled by s = _Q_SCALE.
+        self.norm_q = MaxAbsRMSNorm(dim, eps * _Q_SCALE**2, axis=-3, floor="add")
         self.norm_k = MaxAbsRMSNorm(dim, eps, axis=-3, floor="add")
         self.to_out = conv1x1(dim, dim)
 
@@ -278,6 +283,8 @@ class SanaTransformer(nn.Module):
                 for name in ("to_q", "to_k", "to_v"):
                     _load_linear(getattr(dst.attn1, name), getattr(a1, name))
                     _load_linear(getattr(dst.attn2, name), getattr(a2, name))
+                dst.attn2.to_q.weight.mul_(_Q_SCALE)
+                dst.attn2.to_q.bias.mul_(_Q_SCALE)
                 _load_linear(dst.attn1.to_out, a1.to_out[0])
                 _load_linear(dst.attn2.to_out, a2.to_out[0])
                 dst.attn1.norm_q.weight.copy_(a1.norm_q.weight.float().reshape(-1, 1, 1))

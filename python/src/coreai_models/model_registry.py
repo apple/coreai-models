@@ -705,6 +705,17 @@ DIFFUSION_PRESETS: list[ModelPreset] = [
         "bfloat16",
         None,
     ),
+    ModelPreset(
+        "sana-sprint-1.6b-neural-engine",
+        "Efficient-Large-Model/Sana_Sprint_1.6B_1024px_diffusers",
+        "sana-sprint",
+        "diffusion",
+        "neural-engine",
+        "te6bit-tok8-tx8bit-pal",
+        "float16",
+        None,
+        notes="Neural Engine float16 build (--compute-unit neural-engine)",
+    ),
 ]
 
 # ---------------------------------------------------------------------------
