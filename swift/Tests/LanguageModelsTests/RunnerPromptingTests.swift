@@ -38,7 +38,8 @@ struct RunnerPromptingTests {
     @Test("Declared end-of-sequence IDs join the stop tokens, without the main end-of-sequence token")
     func declaredIdsIncluded() {
         let tokenizer = MockTokenizer(vocab: ["<eos>": 2, "<|tool_response>": 50, "<end_of_turn>": 106])
-        let ids = RunnerPrompting.additionalStopTokenIds(tokenizerDirectory: nil, tokenizer: tokenizer, declared: [2, 50, 106])
+        let ids = RunnerPrompting.additionalStopTokenIds(
+            tokenizerDirectory: nil, tokenizer: tokenizer, declared: [2, 50, 106])
         #expect(ids == [50, 106])
     }
 
