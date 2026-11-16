@@ -940,9 +940,9 @@ private struct EngineImpl: ~Copyable {
     // MARK: - Core Encode Step
 
     /// Writes a step's tokens, binds its inputs, the KV cache and its logits output, and encodes the
-    /// graph call, holding a slot of `inFlightGate` that the step's sampler releases. Returns where the
-    /// logits went and the byte offset of the row to sample: a decode step's rotating buffer, or a
-    /// prompt's last position in the shared growing buffer.
+    /// graph call, holding a slot of `inFlightGate` that the step's sampler releases, or this function
+    /// when the encode throws. Returns where the logits went and the byte offset of the row to sample:
+    /// a decode step's rotating buffer, or a prompt's last position in the shared growing buffer.
     private mutating func encodeGraphStep(
         tokens: some Collection<Int32>, queryLength: Int, currentStep: Int
     ) async throws -> (logitsBuffer: MTLBuffer, logitsOffset: Int) {
@@ -1045,14 +1045,21 @@ private struct EngineImpl: ~Copyable {
 
         // Swift 6 lifetime safety: AsyncMutableViews uses @lifetime(self: &mutableValue)
         // on insert(), so all inserts + consume must be in the same scope without branching.
-        try encodeWithStates(
-            function: function, inputs: asyncInputs,
-            keyState: &keyState, keyCacheName: keyCacheName,
-            valState: &valState, valueCacheName: valueCacheName,
-            additionalStates: additionalStates,
-            logitsBuffer: logitsOutputBuffer, logitsName: logitsOutputName,
-            logitsShape: logitsShape, logitsStrides: logitsStrides,
-            computeStream: computeStream)
+        do {
+            try encodeWithStates(
+                function: function, inputs: asyncInputs,
+                keyState: &keyState, keyCacheName: keyCacheName,
+                valState: &valState, valueCacheName: valueCacheName,
+                additionalStates: additionalStates,
+                logitsBuffer: logitsOutputBuffer, logitsName: logitsOutputName,
+                logitsShape: logitsShape, logitsStrides: logitsStrides,
+                computeStream: computeStream)
+        } catch {
+            // No sampler will run for this step to give the slot back.
+            inFlightGate.release()
+            logitsSpan.end()
+            throw error
+        }
         logitsSpan.end()
 
         return (logitsOutputBuffer, (queryLength - 1) * vocabSize * MemoryLayout<UInt16>.size)
@@ -1085,8 +1092,15 @@ private struct EngineImpl: ~Copyable {
             details: "step=\(currentStep) qLen=\(queryLength)"
         )
 
-        let (samplerLogitsBuffer, logitsOffset) = try await encodeGraphStep(
-            tokens: tokens, queryLength: queryLength, currentStep: currentStep)
+        let graphStep: (logitsBuffer: MTLBuffer, logitsOffset: Int)
+        do {
+            graphStep = try await encodeGraphStep(tokens: tokens, queryLength: queryLength, currentStep: currentStep)
+        } catch {
+            InstrumentsProfiler.endCustomInterval(
+                name: "CoreAIPipelinedEncodeNextStep", signpostID: encodeStepID, details: "error")
+            throw error
+        }
+        let (samplerLogitsBuffer, logitsOffset) = graphStep
 
         // GPU sampling via Metal queue
         let localGPUSampler = gpuSampler
