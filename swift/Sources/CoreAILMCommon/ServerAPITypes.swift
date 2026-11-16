@@ -65,6 +65,11 @@ public struct ChatCompletionRequest: Decodable, Sendable {
             stop = nil
         }
     }
+
+    /// Whether any message has an `image_url` content part.
+    public var hasImageInput: Bool {
+        messages.contains { !$0.content.imageDataURLs.isEmpty }
+    }
 }
 
 // MARK: - Response Format (Guided Generation)
@@ -250,9 +255,12 @@ public enum ContentPart: Decodable, Sendable {
             let text = try container.decode(String.self, forKey: .text)
             self = .text(text)
         case "image_url":
-            let imageContainer = try container.nestedContainer(keyedBy: ImageURLKeys.self, forKey: .imageURL)
-            let url = try imageContainer.decode(String.self, forKey: .url)
-            self = .imageURL(url)
+            if let url = try? container.decode(String.self, forKey: .imageURL) {
+                self = .imageURL(url)
+            } else {
+                let imageContainer = try container.nestedContainer(keyedBy: ImageURLKeys.self, forKey: .imageURL)
+                self = .imageURL(try imageContainer.decode(String.self, forKey: .url))
+            }
         default:
             self = .text("")
         }
@@ -437,16 +445,25 @@ public struct ModelsResponse: Encodable, Sendable {
         public let object: String
         public let created: Int
         public let ownedBy: String
+        /// What the model can do, in Ollama's vocabulary: `completion`, plus `vision` when it accepts
+        /// image input.
+        public let capabilities: [String]
 
-        public init(id: String, created: Int, ownedBy: String) {
+        public init(id: String, created: Int, ownedBy: String, capabilities: [String] = ["completion"]) {
             self.id = id
             self.object = "model"
             self.created = created
             self.ownedBy = ownedBy
+            self.capabilities = capabilities
+        }
+
+        /// `["completion"]`, plus `"vision"` for a model that accepts image input.
+        public static func capabilities(vision: Bool) -> [String] {
+            vision ? ["completion", "vision"] : ["completion"]
         }
 
         enum CodingKeys: String, CodingKey {
-            case id, object, created
+            case id, object, created, capabilities
             case ownedBy = "owned_by"
         }
     }
@@ -456,7 +473,22 @@ public struct ModelsResponse: Encodable, Sendable {
 
 public struct HealthResponse: Encodable, Sendable {
     public let status: String
-    public init(status: String) { self.status = status }
+    public let modalities: Modalities
+
+    public init(status: String, modalities: Modalities) {
+        self.status = status
+        self.modalities = modalities
+    }
+}
+
+/// Input modalities the served model accepts besides text, in the shape of llama.cpp's `/props`.
+public struct Modalities: Codable, Sendable, Equatable {
+    /// Whether chat requests can carry `image_url` content parts.
+    public let vision: Bool
+
+    public init(vision: Bool) {
+        self.vision = vision
+    }
 }
 
 // MARK: - Error Response
@@ -664,6 +696,8 @@ public struct ReadyResponse: Codable, Sendable {
     public let busy: Bool
     public let cache: CacheStatus
     public let toolCalling: Bool
+    /// Input modalities the model accepts besides text.
+    public let modalities: Modalities?
     /// Memory the server's sessions were sized for at load, computed from their arrays' shapes and
     /// element sizes. It does not follow the caches as they grow; ``deviceMemory`` does.
     public let estimatedMemory: EstimatedMemory?
@@ -675,7 +709,7 @@ public struct ReadyResponse: Codable, Sendable {
 
     public init(
         status: String, model: String, maxContextLength: Int,
-        busy: Bool, cache: CacheStatus, toolCalling: Bool,
+        busy: Bool, cache: CacheStatus, toolCalling: Bool, modalities: Modalities? = nil,
         estimatedMemory: EstimatedMemory? = nil, deviceMemory: DeviceMemoryStatus? = nil,
         batching: BatchingStatus? = nil
     ) {
@@ -685,6 +719,7 @@ public struct ReadyResponse: Codable, Sendable {
         self.busy = busy
         self.cache = cache
         self.toolCalling = toolCalling
+        self.modalities = modalities
         self.estimatedMemory = estimatedMemory
         self.deviceMemory = deviceMemory
         self.batching = batching
@@ -792,6 +827,7 @@ public struct ReadyResponse: Codable, Sendable {
         case maxContextLength = "max_context_length"
         case busy, cache
         case toolCalling = "tool_calling"
+        case modalities
         case estimatedMemory = "estimated_memory"
         case deviceMemory = "device_memory"
         case batching

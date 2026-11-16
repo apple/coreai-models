@@ -32,13 +32,17 @@ struct LLMServer: AsyncParsableCommand {
             /v1/chat/completions; log-likelihood scoring uses /v1/completions with echo and logprobs. \
             --replay runs a JSONL file of chat ("request") and scoring ("completion") lines without HTTP.
 
+            Image input: on a vision-language bundle, chat messages take image_url content parts holding \
+            base64 data URLs (data:image/png;base64,...). /v1/models lists the "vision" capability and \
+            /health and /ready report modalities.vision when the model accepts images.
+
             Endpoints:
-              POST /v1/chat/completions  chat generation: streaming, tools, reasoning_effort
+              POST /v1/chat/completions  chat generation: streaming, tools, reasoning_effort, image input
               POST /v1/completions       prompt scoring: echo, logprobs
-              GET  /v1/models            the served model
-              GET  /ready                readiness, KV-cache memory estimates and batch occupancy
+              GET  /v1/models            the served model and its capabilities (completion, vision)
+              GET  /ready                readiness, modalities, KV-cache memory estimates and batch occupancy
               GET  /v1/stats             request and token counters
-              GET  /health               liveness
+              GET  /health               liveness and modalities
             """
     )
 
@@ -212,12 +216,8 @@ struct LLMServer: AsyncParsableCommand {
         let modelLoadSpan = InstrumentsProfiler.beginModelLoad(name: bundle.name)
 
         let engineConfig = ModelConfig(bundle: bundle)
-        let configData = try JSONEncoder().encode(engineConfig)
-        let engine = try await EngineFactory.createEngine(
-            config: configData,
-            modelURL: modelURL,
-            options: engineOptions
-        )
+        // A vision-language bundle builds an engine that also takes images.
+        let engine = try await EngineFactory.createEngine(bundle: bundle, options: engineOptions)
 
         let tokenizer = try await bundle.loadTokenizer()
 
@@ -314,6 +314,7 @@ struct LLMServer: AsyncParsableCommand {
             engine: engine,
             tokenizer: tokenizer,
             config: config,
+            visionConfig: bundle.visionConfig,
             batchServing: batchScheduler.map { (scheduler: $0, modelConfig: engineConfig) },
             memoryGuard: memoryGuard
         )
@@ -335,6 +336,7 @@ struct LLMServer: AsyncParsableCommand {
             print("  Engine: \(type(of: engine))")
             print("  Logprobs: \(supportsLogprobs ? "supported" : "not supported (use --variant coreai-sequential)")")
             print("  Context: \(bundle.maxContextLength) tokens")
+            print("  Image input: \(state.vision != nil ? "supported" : "not supported")")
             print("  Default reasoning effort: \(config.defaultReasoningEffort ?? "template default")")
             print("  Max queue depth: \(maxQueueDepth)")
             let topKStr = topK.map { "\($0)" } ?? "nil"
