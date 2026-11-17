@@ -211,7 +211,6 @@ public enum ReplayError: Error, CustomStringConvertible {
 /// equal or absent `t`).
 public enum ReplayIO {
     public static func parseRequests(_ text: String) throws -> [ReplayRequest] {
-        let decoder = JSONDecoder()
         var indexed: [(Int, ReplayRequest)] = []
         let text = text.hasPrefix("\u{FEFF}") ? String(text.dropFirst()) : text
         // `\r\n` is a single Swift Character, so split on any Unicode newline rather than "\n".
@@ -221,7 +220,9 @@ public enum ReplayIO {
             let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
             if line.isEmpty || line.hasPrefix("#") { continue }
             do {
-                indexed.append((i, try decoder.decode(ReplayRequest.self, from: Data(line.utf8))))
+                // The line's own text goes with it, so a schema keeps its property order.
+                let data = Data(line.utf8)
+                indexed.append((i, try JSONSourceText.decoder(for: data).decode(ReplayRequest.self, from: data)))
             } catch {
                 throw ReplayError.malformedLine(line: i + 1, underlying: error)
             }

@@ -31,6 +31,18 @@ struct ConstrainedGenerationSessionTests {
         }
     }
 
+    @Test("A schema with a trailing comma and a bound written 5.0 compiles, and keeps the caller's text")
+    func initMakesALenientSchemaStrict() throws {
+        let schema = #"{"type":"object","properties":{"name":{"type":"string","maxLength":5.0},},}"#
+        let session = try ConstrainedGenerationSession(
+            jsonSchema: schema,
+            vocabulary: sharedToyVocab,
+            vocabType: .raw
+        )
+        // The session cache compares `schema` with the next request's text, so it stays as written.
+        #expect(session.schema == schema)
+    }
+
     @Test func initWithTokenizerInfo() throws {
         let tokenizerInfo = TokenizerInfo(
             vocabulary: sharedToyVocab,
