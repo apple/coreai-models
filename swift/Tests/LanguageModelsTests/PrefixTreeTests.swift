@@ -237,28 +237,49 @@ struct PrefixTreeTests {
 
 @Suite("PrefixSnapshotPlan")
 struct PrefixSnapshotPlanTests {
-    @Test("The snapshot goes at the last chunk boundary before the held-back token, past the start")
-    func boundary() {
-        // Prompt [0, 10): the last token is held back, so 9 run; the boundary under 9 is 8.
-        #expect(PrefixSnapshotPlan.boundary(start: 0, promptTokens: 10, chunkTokens: 4) == 8)
-        // Prompt [0, 9): 8 run, exactly to the boundary.
-        #expect(PrefixSnapshotPlan.boundary(start: 0, promptTokens: 9, chunkTokens: 4) == 8)
-        // Prompt [0, 8): 7 run, so the last boundary reached is 4.
-        #expect(PrefixSnapshotPlan.boundary(start: 0, promptTokens: 8, chunkTokens: 4) == 4)
-        // Starting on a boundary with too little to reach the next: none.
-        #expect(PrefixSnapshotPlan.boundary(start: 8, promptTokens: 4, chunkTokens: 4) == nil)
-        #expect(PrefixSnapshotPlan.boundary(start: 5, promptTokens: 4, chunkTokens: 4) == 8)
-        #expect(PrefixSnapshotPlan.boundary(start: 0, promptTokens: 1, chunkTokens: 4) == nil)
+    @Test("Every chunk gets a snapshot at first, then every fourth")
+    func cadence() {
+        let depths = (0...16).filter { PrefixSnapshotPlan.belongs(atDepth: $0) }
+        #expect(depths == [1, 2, 3, 4, 8, 12, 16])
     }
 
-    @Test("The step crossing the target is cut there; one ending on it, or past it, is left alone")
+    @Test("A prompt snapshots at the cadence it reaches, and at its last boundary before the held-back token")
+    func boundaries() {
+        // Prompt [0, 10): the last token is held back, so 9 run, reaching boundaries 4 and 8.
+        #expect(PrefixSnapshotPlan.boundaries(start: 0, promptTokens: 10, chunkTokens: 4) == [4, 8])
+        // Prompt [0, 9): 8 run, exactly to the second boundary.
+        #expect(PrefixSnapshotPlan.boundaries(start: 0, promptTokens: 9, chunkTokens: 4) == [4, 8])
+        // Prompt [0, 8): 7 run, so only the first.
+        #expect(PrefixSnapshotPlan.boundaries(start: 0, promptTokens: 8, chunkTokens: 4) == [4])
+        // Starting on a boundary with too little to reach the next: none.
+        #expect(PrefixSnapshotPlan.boundaries(start: 8, promptTokens: 4, chunkTokens: 4) == [])
+        #expect(PrefixSnapshotPlan.boundaries(start: 5, promptTokens: 4, chunkTokens: 4) == [8])
+        #expect(PrefixSnapshotPlan.boundaries(start: 0, promptTokens: 1, chunkTokens: 4) == [])
+    }
+
+    @Test("Past the dense start, a long prompt snapshots every fourth chunk and at its end")
+    func longPrompt() {
+        // 49 run: chunks 1-4, then 8 and 12, the last.
+        #expect(PrefixSnapshotPlan.boundaries(start: 0, promptTokens: 50, chunkTokens: 4) == [4, 8, 12, 16, 32, 48])
+        // 45 run: the last boundary reached is chunk 11's end, off the cadence, so it is added.
+        #expect(PrefixSnapshotPlan.boundaries(start: 0, promptTokens: 46, chunkTokens: 4) == [4, 8, 12, 16, 32, 44])
+        // Resuming at 20, the depths stay where they were: chunk 8, and 12, the last.
+        #expect(PrefixSnapshotPlan.boundaries(start: 20, promptTokens: 30, chunkTokens: 4) == [32, 48])
+    }
+
+    @Test("Each step crossing a target is cut there; one ending on it, or past every target, is left alone")
     func split() {
-        #expect(PrefixSnapshotPlan.split([6, 6, 3], from: 0, at: 8) == [6, 2, 4, 3])
-        #expect(PrefixSnapshotPlan.split([6, 6, 3], from: 10, at: 16) == [6, 6, 3])
-        #expect(PrefixSnapshotPlan.split([6, 6], from: 0, at: 6) == [6, 6])
-        #expect(PrefixSnapshotPlan.split([6, 6], from: 0, at: 20) == [6, 6])
-        #expect(PrefixSnapshotPlan.split([5], from: 3, at: 4) == [1, 4])
-        #expect(PrefixSnapshotPlan.split([], from: 0, at: 4) == [])
+        #expect(PrefixSnapshotPlan.split([6, 6, 3], from: 0, at: [8]) == [6, 2, 4, 3])
+        #expect(PrefixSnapshotPlan.split([6, 6, 3], from: 10, at: [16]) == [6, 6, 3])
+        #expect(PrefixSnapshotPlan.split([6, 6], from: 0, at: [6]) == [6, 6])
+        #expect(PrefixSnapshotPlan.split([6, 6], from: 0, at: [20]) == [6, 6])
+        #expect(PrefixSnapshotPlan.split([5], from: 3, at: [4]) == [1, 4])
+        #expect(PrefixSnapshotPlan.split([], from: 0, at: [4]) == [])
+        // Several targets, in one step or across steps, in any order.
+        #expect(PrefixSnapshotPlan.split([10], from: 0, at: [4, 8]) == [4, 4, 2])
+        #expect(PrefixSnapshotPlan.split([6, 6], from: 0, at: [8, 4]) == [4, 2, 2, 4])
+        #expect(PrefixSnapshotPlan.split([12], from: 0, at: [4, 8, 12]) == [4, 4, 4])
+        #expect(PrefixSnapshotPlan.split([6], from: 0, at: []) == [6])
     }
 }
 

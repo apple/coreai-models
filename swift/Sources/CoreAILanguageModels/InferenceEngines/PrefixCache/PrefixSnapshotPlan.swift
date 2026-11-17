@@ -4,26 +4,53 @@
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
 /// Where prefill stops to snapshot a hybrid's recurrent state for the prefix cache.
+///
+/// A hybrid can only resume at a snapshot, so a prompt that shares a prefix with an earlier one reuses up
+/// to the deepest snapshot inside what they share. Snapshots go at a cadence that is a function of depth
+/// alone, so two prompts with the same start snapshot at the same places: every chunk at first, so a
+/// short shared prefix still has one, then every ``cadenceChunks`` chunks, so a long prompt does not
+/// stop for one at every chunk. The prompt's last boundary gets one too, so the same prompt again
+/// restores all but its tail.
+///
+/// ```
+/// chunk   1  2  3  4  5  6  7  8  9 10 11 12 ...
+///         ●  ●  ●  ●  ·  ·  ·  ●  ·  ·  ·  ●
+/// ```
 enum PrefixSnapshotPlan {
-    /// The chunk boundary to snapshot at for a prompt of `count` tokens starting at `start`: the last one
-    /// before the token prefill holds back, or nil when that is not past `start`.
-    static func boundary(start: Int, promptTokens count: Int, chunkTokens: Int) -> Int? {
-        guard count > 1 else { return nil }
-        let boundary = (start + count - 1) / chunkTokens * chunkTokens
-        return boundary > start ? boundary : nil
+    /// Chunks from the start that get a snapshot each.
+    static let denseChunks = 4
+
+    /// Past ``denseChunks``, chunks between snapshots.
+    static let cadenceChunks = 4
+
+    /// Whether a snapshot belongs at the end of chunk `depth`, one-based.
+    static func belongs(atDepth depth: Int) -> Bool {
+        depth > 0 && (depth <= denseChunks || depth % cadenceChunks == 0)
     }
 
-    /// `plan`, a prefill's step sizes from position `start`, with the step that crosses `target` cut in
-    /// two there, so one ends exactly at it.
-    static func split(_ plan: [Int], from start: Int, at target: Int) -> [Int] {
+    /// The chunk boundaries to snapshot at for a prompt of `count` tokens starting at `start`, in order:
+    /// every one past `start` that ``belongs(atDepth:)``, up to the last before the token prefill holds
+    /// back, and that last one.
+    static func boundaries(start: Int, promptTokens count: Int, chunkTokens: Int) -> [Int] {
+        guard count > 1 else { return [] }
+        let first = start / chunkTokens + 1
+        let last = (start + count - 1) / chunkTokens
+        guard first <= last else { return [] }
+        return (first...last).filter { belongs(atDepth: $0) || $0 == last }.map { $0 * chunkTokens }
+    }
+
+    /// `plan`, a prefill's step sizes from position `start`, with every step that crosses one of
+    /// `targets` cut there, so a step ends exactly at each.
+    static func split(_ plan: [Int], from start: Int, at targets: [Int]) -> [Int] {
         var out: [Int] = []
         var position = start
         for size in plan {
-            if position < target, target < position + size {
-                out += [target - position, position + size - target]
-            } else {
-                out.append(size)
+            var cut = position
+            for target in targets.sorted() where cut < target && target < position + size {
+                out.append(target - cut)
+                cut = target
             }
+            out.append(position + size - cut)
             position += size
         }
         return out

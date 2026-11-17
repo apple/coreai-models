@@ -60,13 +60,31 @@ public final class FixedMTLBufferState {
         }
     }
 
-    /// Every state buffer's bytes, in order, for putting back with ``restore(_:)``.
-    /// Caller must ensure no in-flight GPU work writes these.
-    package func snapshot() -> [Data] {
-        bindings.map { Data(bytes: $0.buffer.contents(), count: $0.buffer.length) }
+    /// Queues a copy of every state buffer, in order, into new buffers on `commandBuffer`.
+    ///
+    /// Once `commandBuffer` completes, the copies hold the states as the work queued before it left
+    /// them, so a snapshot needs no wait for the GPU. Nil when a copy can't be allocated.
+    package func encodeSnapshot(on commandBuffer: MTLCommandBuffer) -> [MTLBuffer]? {
+        var copies: [MTLBuffer] = []
+        for binding in bindings {
+            guard
+                let copy = binding.buffer.device.makeBuffer(
+                    length: binding.buffer.length, options: .storageModeShared)
+            else { return nil }
+            copies.append(copy)
+        }
+        guard let blit = commandBuffer.makeBlitCommandEncoder() else { return nil }
+        for (binding, copy) in zip(bindings, copies) {
+            blit.copy(
+                from: binding.buffer, sourceOffset: 0, to: copy, destinationOffset: 0,
+                size: binding.buffer.length)
+        }
+        blit.endEncoding()
+        return copies
     }
 
-    /// Overwrites every state buffer with a ``snapshot()`` of the same states.
+    /// Overwrites every state buffer with a copy of the same states, one blob per state, in order, as
+    /// ``encodeSnapshot(on:)`` makes.
     /// Caller must ensure no in-flight GPU work references these.
     package func restore(_ snapshot: [Data]) {
         precondition(snapshot.count == bindings.count, "snapshot is of other states")
