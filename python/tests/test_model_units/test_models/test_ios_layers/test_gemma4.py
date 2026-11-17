@@ -32,6 +32,7 @@ from coreai_models._constants import EXTEND_FUNCTION_NAME  # noqa: E402
 from coreai_models.models.base import TraceSpec, _is_layer_key_beyond  # noqa: E402
 from coreai_models.models.ios.gemma4_text import (  # noqa: E402
     DEFAULT_KV_BLOCK_SIZE,
+    GeGLUMLP,
     Gemma4Extend,
     Gemma4ForCausalLMForiOS,
     NativeLutQuantConv1x1,
@@ -978,3 +979,31 @@ def test_native_quant_conv1x1_activation_quant_matches_hf_srq():
     plain = mod(x)
     mod.input_activation_scale, mod.output_activation_scale = 0.05, 0.05
     assert not torch.allclose(mod(x), plain)
+
+
+def test_geglu_mlp_puts_tokens_in_the_conv_width():
+    """The MLP runs its 1x1 convs with the tokens in their width, (B, D, 1, S), and computes
+    exactly what the per-token batch layout, (B*S, D, 1, 1), computes, activation quantization
+    included."""
+    cfg = _make_config()
+    cfg.native_quantized = True
+    torch.manual_seed(0)
+    mlp = GeGLUMLP(cfg, cfg.hidden_size, cfg.intermediate_size, layer_idx=0).half().eval()
+    with torch.no_grad():
+        for conv in (mlp.gate_proj, mlp.up_proj, mlp.down_proj):
+            conv.quantized_data.copy_(torch.randint(-8, 8, conv.quantized_data.shape))
+            conv.scale.copy_(torch.rand_like(conv.scale) * 0.05)
+            conv.input_activation_scale, conv.output_activation_scale = 0.02, 0.03
+    shapes = []
+    mlp.gate_proj.register_forward_pre_hook(lambda _, args: shapes.append(tuple(args[0].shape)))
+    seq, dim = 7, cfg.hidden_size
+    x = torch.randn(1, seq, 1, dim, dtype=torch.float16)
+
+    with torch.no_grad():
+        out = mlp(x)
+        xb = x.reshape(seq, dim, 1, 1)
+        gate = torch.nn.functional.gelu(mlp.gate_proj(xb), approximate="tanh")
+        reference = mlp.down_proj(mlp.up_proj(xb) * gate).reshape(1, seq, 1, dim)
+
+    assert shapes[0] == (1, dim, 1, seq)
+    assert torch.equal(out, reference)
