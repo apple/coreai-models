@@ -3,17 +3,18 @@
 Model export recipes, Python primitives, and Swift runtime utilities for building on-device AI with [Core AI](https://developer.apple.com/documentation/coreai).
 
 The main components include:
+
 - **Model export** — Recipes to export popular open source models from Hugging Face and other sources to Core AI format.
 - **Reusable primitives** — Python building blocks for authoring custom Core AI models in PyTorch.
 - **Runtime utilities** — Swift package built on top of Core AI framework to run models on macOS and iOS.
 - **Skills** — Plugins to help coding agents leverage Core AI effectively.
 
-| Directory | What's inside                                                                                |
-| --------- | -------------------------------------------------------------------------------------------- |
-| `models/` | Model catalog with README and export recipes.                                                |
-| `python/` | Python primitives for authoring and utilities for exporting models. |
-| `swift/`  | Swift package (`coreai-models`): runtime utilities to integrate Core AI models in your app.  |
-| `skills/` | Pluggable skills that enable coding agents to leverage Core AI more effectively.             |
+| Directory | What's inside                                                                               |
+| --------- | ------------------------------------------------------------------------------------------- |
+| `models/` | Model catalog with README and export recipes.                                               |
+| `python/` | Python primitives for authoring and utilities for exporting models.                         |
+| `swift/`  | Swift package (`coreai-models`): runtime utilities to integrate Core AI models in your app. |
+| `skills/` | Pluggable skills that enable coding agents to leverage Core AI more effectively.            |
 
 ## Requirements
 
@@ -22,7 +23,9 @@ If you haven't installed `uv`, install it by
 ```bash
 brew install uv
 ```
+
 or
+
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
@@ -58,12 +61,12 @@ This repo includes a plugin with skills to enable coding agents to use Core AI l
 
 ### Available skills
 
-| Skill | Description |
-| --- | --- |
-| `working‑with‑coreai` | End-to-end workflow for deploying PyTorch models on Apple silicon, covering export with `coreai-torch` and running with the Core AI runtime. |
-| `model‑authoring` | Empirical rules for authoring PyTorch models for on-device execution on Apple platforms, covering BC1S layout, op compatibility, KV cache patterns, precision rules, MoE, and common issues. |
-| `model‑compression‑exploration` | Systematically explore weight compression configurations (quantization and palettization) for a PyTorch model using `coreai-opt`. |
-| `auditing‑helper‑reuse` | Before a large model-export change becomes a PR, find helpers it re-implements (RoPE, norms, MLPs, attention and masks, loaders, export boilerplate) and reuse them only where the exported graph stays identical. |
+| Skill                           | Description                                                                                                                                                                                                        |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `working-with-coreai`           | End-to-end workflow for deploying PyTorch models on Apple silicon, covering export with `coreai-torch` and running with the Core AI runtime.                                                                       |
+| `model-authoring`               | Empirical rules for authoring PyTorch models for on-device execution on Apple platforms, covering BC1S layout, op compatibility, KV cache patterns, precision rules, MoE, and common issues.                       |
+| `model-compression-exploration` | Systematically explore weight compression configurations (quantization and palettization) for a PyTorch model using `coreai-opt`.                                                                                  |
+| `auditing-helper-reuse`         | Before a large model-export change becomes a PR, find helpers it re-implements (RoPE, norms, MLPs, attention and masks, loaders, export boilerplate) and reuse them only where the exported graph stays identical. |
 
 ### Install
 
@@ -73,19 +76,19 @@ Installation differs depending on your coding agent of choice.
 
 Register the marketplace:
 
-```
+```shell
 /plugin marketplace add git@github.com:apple/coreai-models.git
 ```
 
 Alternatively, register the marketplace from a local git checkout:
 
-```
+```shell
 /plugin marketplace add /path/to/coreai-models
 ```
 
 Install the plugin:
 
-```
+```shell
 /plugin install coreai-skills@coreai-models
 ```
 
@@ -93,19 +96,19 @@ Install the plugin:
 
 Register the marketplace:
 
-```
+```shell
 codex plugin marketplace add https://github.com/apple/coreai-models
 ```
 
 Alternatively, register the marketplace from a local git checkout:
 
-```
+```shell
 codex plugin marketplace add /path/to/coreai-models
 ```
 
 Launch Codex in your workspace:
 
-```
+```shell
 codex
 ```
 
@@ -118,7 +121,7 @@ select `coreai-skills`, and choose Install.
 
 Install the extension from a local directory:
 
-```
+```shell
 gemini extensions install /path/to/coreai-models/skills
 ```
 
