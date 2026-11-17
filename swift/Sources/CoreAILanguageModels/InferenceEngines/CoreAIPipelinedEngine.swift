@@ -54,6 +54,17 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
     /// cancel-and-await contract is upheld.
     nonisolated(unsafe) private var history = TokenHistory()
     nonisolated(unsafe) private(set) var lastPrefixHitCount: Int = 0
+
+    /// Earlier prompts' state by the exact tokens before it, or nil when off
+    /// (``EngineOptions/prefixCacheBytes``). Serialized as ``history`` is.
+    nonisolated(unsafe) private var prefixTree: PrefixTree?
+    /// The tree's nodes for the current history's leading full chunks, in order: what is already
+    /// published, and the parent of the next chunk to publish.
+    nonisolated(unsafe) private var publishedKeys: [PrefixTree.Key] = []
+
+    /// Tokens per prefix-cache chunk: the granularity a later prompt can resume at.
+    static let prefixChunkTokens = 256
+
     private let engineInUse = Atomic<Bool>(false)
     let config: ModelConfig
 
@@ -77,8 +88,118 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
     ) async throws {
         let engine = try await EngineImpl(
             config: config, preparedModel: preparedModel, options: options)
+        let supported = engine.prefixCacheSupported
         self.engine = engine
         self.config = config
+        if options.prefixCacheBytes > 0, supported {
+            prefixTree = PrefixTree(
+                chunkTokens: Self.prefixChunkTokens, byteBudget: options.prefixCacheBytes)
+        }
+    }
+
+    // MARK: - Prefix cache
+
+    /// Publishes the current history's full chunks not yet in the tree, and the recurrent snapshot
+    /// its last prompt saved. Call holding the engine, before anything discards the history.
+    private func publishHistory() async {
+        guard prefixTree != nil else { return }
+        let chunk = Self.prefixChunkTokens
+        // The last sampled token is in the history but not yet in the KV cache.
+        let valid = min(history.count, engine.processedTokenCount)
+        let depth = valid / chunk
+        guard depth > publishedKeys.count || engine.capturedSnapshot != nil else { return }
+        await engine.computeStream.currentWorkCompleted()
+        let tokens = history.tokens
+        let chunkBytes = engine.kvChunkBytes(count: chunk)
+        while publishedKeys.count < depth {
+            let next = publishedKeys.count + 1
+            let start = (next - 1) * chunk
+            guard
+                let key = prefixTree?.insert(
+                    parent: publishedKeys.last, tokens: tokens[start..<(start + chunk)],
+                    depth: next, bytes: chunkBytes,
+                    chunk: self.engine.readKVChunk(start: start, count: chunk))
+            else { break }
+            publishedKeys.append(key)
+        }
+        if let snapshot = engine.capturedSnapshot {
+            engine.capturedSnapshot = nil
+            let at = snapshot.position / chunk
+            if snapshot.position % chunk == 0, at >= 1, at <= publishedKeys.count,
+                snapshot.position <= valid
+            {
+                prefixTree?.attach(
+                    snapshot: snapshot.states, to: publishedKeys[at - 1],
+                    keepingChainTo: publishedKeys.last)
+            }
+        }
+    }
+
+    /// Forgets what was published past the first `count` tokens of the history, which no longer
+    /// describe it.
+    private func forgetPublished(beyond count: Int) {
+        publishedKeys = Array(publishedKeys.prefix(count / Self.prefixChunkTokens))
+        if let position = engine.capturedSnapshot?.position, position > count {
+            engine.capturedSnapshot = nil
+        }
+    }
+
+    /// Restores the longest prefix of `input` the tree holds, when it is at least a chunk longer than
+    /// the `kept` tokens the engine is about to reuse anyway: less would save little prefill for the
+    /// cost of the copy. Returns the tokens now in place, or nil when the engine is untouched.
+    private func restoreLongestPrefix(of input: [TokenId], keeping kept: Int) async -> Int? {
+        let chunk = Self.prefixChunkTokens
+        // At least one prompt token has to run, for the first logits.
+        guard prefixTree != nil, (input.count - 1) / chunk * chunk >= kept + chunk else { return nil }
+        guard
+            let match = prefixTree?.match(
+                input, limit: input.count - 1, needsSnapshot: engine.hasNonTruncatableStates)
+        else { return nil }
+        guard match.reusedTokens >= kept + chunk else {
+            prefixTree?.record(match, restored: false)
+            return nil
+        }
+        let restored = match.reusedTokens
+        await engine.resetWhenIdle()
+        history.clear()
+        publishedKeys = []
+        do {
+            try engine.restorePrefix(
+                match, tokens: Array(input[..<restored]), chunkTokens: Self.prefixChunkTokens)
+        } catch {
+            CLILogger.log("prefix cache: could not restore \(restored) token(s): \(error)")
+            engine.reset()
+            return 0
+        }
+        prefixTree?.record(match, restored: true)
+        history.append(contentsOf: input[..<restored])
+        publishedKeys = match.keys
+        CLILogger.log(
+            "prefix cache: restored \(restored) of \(input.count) prompt token(s); "
+                + (prefixTree?.summary ?? ""))
+        return restored
+    }
+
+    /// Where prefill should snapshot a hybrid's recurrent state for `input`, of which the engine holds
+    /// the first `processedTokenCount`: the last chunk boundary it reaches before the token it holds
+    /// back, unless the tree already has a snapshot there.
+    private func planSnapshot(for input: [TokenId]) {
+        engine.snapshotPosition = nil
+        guard let tree = prefixTree, engine.hasNonTruncatableStates else { return }
+        let start = engine.processedTokenCount
+        let chunk = Self.prefixChunkTokens
+        guard
+            let boundary = PrefixSnapshotPlan.boundary(
+                start: start, promptTokens: input.count - start, chunkTokens: chunk)
+        else { return }
+        // Taking one waits on the GPU, so skip it when the node there already has one. Its key chains
+        // on from what is published.
+        let depth = boundary / chunk
+        var key = publishedKeys.prefix(depth).last ?? PrefixTree.rootKey
+        for next in min(publishedKeys.count, depth)..<depth {
+            key = PrefixTree.chain(key, input[(next * chunk)..<((next + 1) * chunk)])
+        }
+        if !tree.hasSnapshot(at: key) { engine.snapshotPosition = boundary }
     }
 
     /// Atomically claim exclusive use of `engine`.
@@ -164,6 +285,9 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
                     tokenContinuation.finish()
                 }
 
+                // Whatever this request discards, the prefix cache keeps.
+                await self.publishHistory()
+
                 // Implicit prefix caching: resolve input against history
                 var (commonPrefix, resolvedNewTokens) = self.history.resolve(input: input)
 
@@ -175,6 +299,7 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
                     commonPrefix = self.engine.processedTokenCount
                     resolvedNewTokens = input[commonPrefix...]
                     self.history.truncate(to: commonPrefix)
+                    self.forgetPublished(beyond: commonPrefix)
                 }
 
                 self.lastPrefixHitCount = commonPrefix
@@ -190,6 +315,7 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
                     // Tokens differ — full reset (partial rewind corrupts buffer rotation)
                     await self.engine.resetWhenIdle()
                     self.history.clear()
+                    self.forgetPublished(beyond: 0)
                     resolvedNewTokens = input[...]
                     commonPrefix = 0
                 } else if self.engine.hasNonTruncatableStates {
@@ -198,6 +324,7 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
                     if commonPrefix < self.engine.processedTokenCount {
                         await self.engine.resetWhenIdle()
                         self.history.clear()
+                        self.forgetPublished(beyond: 0)
                         resolvedNewTokens = input[...]
                         commonPrefix = 0
                     }
@@ -208,6 +335,7 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
                     // The ring has overwritten slots the rewound position reads: replay.
                     await self.engine.resetWhenIdle()
                     self.history.clear()
+                    self.forgetPublished(beyond: 0)
                     resolvedNewTokens = input[...]
                     commonPrefix = 0
                     self.lastPrefixHitCount = 0
@@ -217,9 +345,18 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
                     self.engine.processedTokenCount = commonPrefix
                     self.engine.step = commonPrefix
                     self.history.truncate(to: commonPrefix)
+                    self.forgetPublished(beyond: commonPrefix)
+                }
+
+                // A longer prefix in the cache beats what the history kept.
+                if let restored = await self.restoreLongestPrefix(of: input, keeping: commonPrefix) {
+                    commonPrefix = restored
+                    resolvedNewTokens = input[restored...]
+                    self.lastPrefixHitCount = restored
                 }
 
                 let newTokens = Array(resolvedNewTokens)
+                self.planSnapshot(for: input)
 
                 async let forwarding: Void = {
                     do {
@@ -257,6 +394,11 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
                 stopReasonStore.set(.cancelled)
                 outputContinuation.finish()
             } catch {
+                // A failed step still counts its tokens, so the cache may not hold what the history
+                // says: start over rather than reuse or publish any of it.
+                await self.engine.resetWhenIdle()
+                self.history.clear()
+                self.forgetPublished(beyond: 0)
                 stopReasonStore.set(.error)
                 outputContinuation.finish(throwing: error)
             }
@@ -315,8 +457,10 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
                     self._generationTask.withLock { $0 = nil }
                 }
             }
+            await self.publishHistory()
             self.engine.reset()
             self.history.clear()
+            self.forgetPublished(beyond: 0)
             do {
                 try await self.engine.runConstrainedCompletion(
                     prompt: input,
@@ -385,8 +529,10 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
             await engine.computeStream.currentWorkCompleted()
             guard tryAcquireEngine() else { return }
             defer { releaseEngine() }
+            await publishHistory()
             engine.reset()
             history.clear()
+            forgetPublished(beyond: 0)
         } else {
             // Partial reset: wait for generation to finish naturally, then rewind counter.
             // Do NOT cancel — cancelling corrupts the pipeline's double-buffer state.
@@ -412,6 +558,7 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
             engine.processedTokenCount = tokenIndex
             engine.step = tokenIndex
             history.truncate(to: tokenIndex)
+            forgetPublished(beyond: tokenIndex)
         }
     }
 
@@ -622,6 +769,8 @@ private struct EngineImpl: ~Copyable {
     // States 0/1 are KV cache; additional states handled by handler.
     var additionalStates: FixedMTLBufferState?
     var hasNonTruncatableStates: Bool
+    /// Whether KV pairs beyond the first live in ``additionalStates``, at full size.
+    let hasExtraGrowingStates: Bool
 
     // Slots in the sliding ring, if any. Guards write-first `main` steps, and prefill chunks
     // break at ring boundaries.
@@ -640,6 +789,12 @@ private struct EngineImpl: ~Copyable {
     // State
     var processedTokenCount: Int = 0
     var step: Int = 0
+
+    /// Where prefill should stop to snapshot the recurrent state, an absolute position, or nil.
+    /// Set before a prompt runs, for the prefix cache.
+    var snapshotPosition: Int?
+    /// The recurrent state prefill saved at ``snapshotPosition``.
+    var capturedSnapshot: (position: Int, states: [Data])?
 
     // Backpressure gate — see PipelineGate doc-comment for the failure mode it prevents.
     // Capacity matches pipeline depth: {encode logits + sampler commit + optional KV-cache grow} in flight.
@@ -885,6 +1040,7 @@ private struct EngineImpl: ~Copyable {
         self.kvCache = kvCacheLocal
         self.additionalStates = additionalStatesLocal
         self.hasNonTruncatableStates = classified.contains(where: { $0.kind == .fixed })
+        self.hasExtraGrowingStates = !extraGrowingNames.isEmpty
         self.slidingRingCapacity = StateHandlerFactory.slidingRingCapacity(
             classified: classified, descriptor: descriptor)
         self.logits = logitsRef
@@ -1724,13 +1880,14 @@ private struct EngineImpl: ~Copyable {
     private mutating func prefill(prompt: [Int32]) async throws -> ArraySlice<Int32> {
         if prefillFunction != nil {
             var head = prompt.dropLast()
-            for chunk in prefillChunkSizes(
+            let plan = prefillChunkSizes(
                 tokenCount: prompt.count, chunkSize: prefillMaxQueryLength,
                 heldBack: prefillHeldBackTokens(hasPrefillGraph: true),
                 startOffset: processedTokenCount, ringCapacity: slidingRingCapacity)
-            {
+            for chunk in splittingAtSnapshot(plan) {
                 try await _encodeChunk(tokens: Array(head.prefix(chunk)))
                 head = head.dropFirst(chunk)
+                await snapshotIfDue()
             }
             return prompt.suffix(1)
         }
@@ -1755,6 +1912,18 @@ private struct EngineImpl: ~Copyable {
             return try await processChunkedInput(tokens: prompt)
         }
 
+        // One step would carry the whole prompt; a snapshot inside it needs the head run first.
+        var prompt = prompt[...]
+        if let target = snapshotPosition, target > processedTokenCount,
+            target < processedTokenCount + prompt.count
+        {
+            let head = target - processedTokenCount
+            try logits.ensureCapacity(forContextLength: head)
+            try await _encodeChunk(tokens: Array(prompt.prefix(head)))
+            prompt = prompt.dropFirst(head)
+            await snapshotIfDue()
+        }
+
         if try logits.ensureCapacity(forContextLength: max(1, prompt.count)) {
             let fmt = ByteCountFormatter()
             fmt.countStyle = .memory
@@ -1762,7 +1931,7 @@ private struct EngineImpl: ~Copyable {
                 "Logits buffer grew to capacity \(logits.currentCapacity) (\(fmt.string(fromByteCount: Int64(logits.currentByteCount))))"
             )
         }
-        return prompt[...]
+        return prompt
     }
 
     /// Chunk size for prefill through `function`.
@@ -1778,12 +1947,14 @@ private struct EngineImpl: ~Copyable {
         try logits.ensureCapacity(forContextLength: chunkSize)
 
         // Every chunk but the last is encoded here; the last carries the logits.
-        let plan = prefillChunkSizes(
-            tokenCount: tokens.count, chunkSize: chunkSize, heldBack: 0,
-            startOffset: processedTokenCount, ringCapacity: slidingRingCapacity)
+        let plan = splittingAtSnapshot(
+            prefillChunkSizes(
+                tokenCount: tokens.count, chunkSize: chunkSize, heldBack: 0,
+                startOffset: processedTokenCount, ringCapacity: slidingRingCapacity))
         for size in plan.dropLast() {
             try await _encodeChunk(tokens: Array(remainingTokens.prefix(size)))
             remainingTokens = remainingTokens.dropFirst(size)
+            await snapshotIfDue()
         }
 
         return remainingTokens
@@ -1875,6 +2046,89 @@ private struct EngineImpl: ~Copyable {
         step += 1
     }
 
+    // MARK: - Prefix cache
+
+    /// Whether this engine's state can go into the prefix cache. A sliding-window ring holds
+    /// positions modulo its size, so its contents are no chunk of the sequence; a sub-byte KV cache
+    /// has no byte per element to copy by.
+    var prefixCacheSupported: Bool {
+        // A KV pair beyond the first sits in `additionalStates` and would not be restored with it;
+        // a fixed query length cannot take the split a snapshot needs.
+        guard slidingRingCapacity == nil, !hasExtraGrowingStates else { return false }
+        if case .fixed(let length) = inputLayout.queryPolicy, length > 1 { return false }
+        return Self.copiesWholeElements(kvCache.keyBinding.scalarType)
+            && Self.copiesWholeElements(kvCache.valueBinding.scalarType)
+    }
+
+    /// Whether elements of `type` take whole bytes, as ``KVChunk`` walks them; sub-byte types do not.
+    private static func copiesWholeElements(_ type: NDArray.ScalarType) -> Bool {
+        switch type {
+        case .float16, .bfloat16, .float32, .int8, .uint8, .float8e5m2, .float8e4m3fn: true
+        default: false
+        }
+    }
+
+    /// Bytes one chunk of `count` positions takes, keys and values, before any is read.
+    func kvChunkBytes(count: Int) -> Int {
+        KVChunk.Layout(kvCache.keyBinding).chunkBytes(count: count)
+            + KVChunk.Layout(kvCache.valueBinding).chunkBytes(count: count)
+    }
+
+    /// `plan`, its chunks cut where one crosses ``snapshotPosition``, so a chunk ends there.
+    private func splittingAtSnapshot(_ plan: [Int]) -> [Int] {
+        guard let target = snapshotPosition else { return plan }
+        return PrefixSnapshotPlan.split(plan, from: processedTokenCount, at: target)
+    }
+
+    /// Saves the recurrent state when prefill has just reached ``snapshotPosition``.
+    private mutating func snapshotIfDue() async {
+        guard let target = snapshotPosition, processedTokenCount == target,
+            let states = additionalStates
+        else { return }
+        await computeStream.currentWorkCompleted()
+        capturedSnapshot = (target, states.snapshot())
+        snapshotPosition = nil
+    }
+
+    /// Positions `[start, start + count)` of the key and value caches, as dense chunks.
+    /// Caller must ensure no in-flight GPU work writes them.
+    func readKVChunk(start: Int, count: Int) -> [Data] {
+        [kvCache.keyBinding, kvCache.valueBinding].map { binding in
+            KVChunk.read(
+                from: UnsafeRawPointer(binding.metalBuffer.contents()),
+                layout: KVChunk.Layout(binding), start: start, count: count)
+        }
+    }
+
+    /// Installs a cached prefix after ``reset()``: its chunks become the KV cache's first positions,
+    /// its snapshot the recurrent state, and its tokens the token buffer's, so prefill resumes after it.
+    /// Caller must ensure no in-flight GPU work references any of them.
+    mutating func restorePrefix(_ match: PrefixTree.Match, tokens: [Int32], chunkTokens: Int) throws {
+        let count = tokens.count
+        let needed = Swift.min(count + 1, config.maxContextLength)
+        if needed > kvCache.currentCapacity {
+            _ = try kvCache.ensureCapacity(forContextLength: needed, queue: pipelineQueue)
+            // Growth copies the old cache on this queue; it must land before these writes do.
+            if let fence = pipelineQueue.makeCommandBuffer() {
+                fence.commit()
+                fence.waitUntilCompleted()
+            }
+        }
+        let bindings = [kvCache.keyBinding, kvCache.valueBinding]
+        for (index, chunk) in match.chunks.enumerated() {
+            for (blob, binding) in zip(chunk, bindings) {
+                KVChunk.write(
+                    blob, to: binding.metalBuffer.contents(), layout: KVChunk.Layout(binding),
+                    start: index * chunkTokens, count: chunkTokens)
+            }
+        }
+        if let snapshot = match.snapshot { additionalStates?.restore(snapshot) }
+        let ids = inputTokensBuffer.contents().bindMemory(to: Int32.self, capacity: count)
+        for (index, token) in tokens.enumerated() { ids[index] = token }
+        processedTokenCount = count
+        step = count
+    }
+
     /// Waits for the work queued on the compute stream, then resets.
     mutating func resetWhenIdle() async {
         await computeStream.currentWorkCompleted()
@@ -1892,6 +2146,8 @@ private struct EngineImpl: ~Copyable {
         penaltyStateIdle = true
         // Zero SSM states so the next conversation starts from a clean slate.
         additionalStates?.reset()
+        snapshotPosition = nil
+        capturedSnapshot = nil
         span.end()
     }
 

@@ -59,4 +59,24 @@ public final class FixedMTLBufferState {
             memset(buffer.contents(), 0, buffer.length)
         }
     }
+
+    /// Every state buffer's bytes, in order, for putting back with ``restore(_:)``.
+    /// Caller must ensure no in-flight GPU work writes these.
+    package func snapshot() -> [Data] {
+        bindings.map { Data(bytes: $0.buffer.contents(), count: $0.buffer.length) }
+    }
+
+    /// Overwrites every state buffer with a ``snapshot()`` of the same states.
+    /// Caller must ensure no in-flight GPU work references these.
+    package func restore(_ snapshot: [Data]) {
+        precondition(snapshot.count == bindings.count, "snapshot is of other states")
+        for (blob, binding) in zip(snapshot, bindings) {
+            precondition(blob.count == binding.buffer.length, "snapshot is of other states")
+            blob.withUnsafeBytes { raw in
+                if let source = raw.baseAddress {
+                    binding.buffer.contents().copyMemory(from: source, byteCount: blob.count)
+                }
+            }
+        }
+    }
 }

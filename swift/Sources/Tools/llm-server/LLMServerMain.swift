@@ -99,6 +99,14 @@ struct LLMServer: AsyncParsableCommand {
     var kvCacheInitialCapacity: Int?
 
     @Option(
+        name: .customLong("prefix-cache-mb"),
+        help: ArgumentHelp(
+            "Megabytes of earlier prompts' state to keep, so a prompt that starts the same way restores "
+                + "that prefix instead of computing it (default: 1024; 0 turns it off; pipelined engine)")
+    )
+    var prefixCacheMB: Int = EngineOptions.suggestedPrefixCacheBytes >> 20
+
+    @Option(
         name: .customLong("chunk-size"),
         help: ArgumentHelp(
             "Prefill chunk size in tokens (default: 2048; 4096 on macOS with >=64GB memory)", visibility: .hidden
@@ -201,7 +209,8 @@ struct LLMServer: AsyncParsableCommand {
             kvCacheSize: kvCacheInitialCapacity,
             prefillChunkSize: resolvedChunkSize,
             prefillChunkThreshold: resolvedChunkThreshold,
-            tensorData: bundle.tensorData
+            tensorData: bundle.tensorData,
+            prefixCacheBytes: max(0, prefixCacheMB) << 20
         )
 
         let modelURL = try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.main)
