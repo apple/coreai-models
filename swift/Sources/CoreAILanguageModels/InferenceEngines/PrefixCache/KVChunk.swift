@@ -95,6 +95,9 @@ enum KVChunk {
     private static func copy(
         layout: Layout, start: Int, count: Int, move: (Int, Int, Int) -> Void
     ) {
+        precondition(
+            start >= 0 && count >= 0 && start + count <= layout.shape[layout.sequenceAxis],
+            "positions [\(start), \(start + count)) are outside the tensor's \(layout.shape[layout.sequenceAxis])")
         let element = layout.elementBytes
         let positionStride = layout.strides[layout.sequenceAxis] * element
         let dense = layout.innerIsDense

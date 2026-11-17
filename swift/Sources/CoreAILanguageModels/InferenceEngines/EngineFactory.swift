@@ -456,11 +456,15 @@ public struct EngineOptions: Sendable {
     /// tokens before it, and on a model with recurrent state a snapshot of that state at chunk
     /// boundaries, dropping the least recently used when the budget is spent. A second conversation
     /// sharing a system prompt, or a turn that edits an earlier one, then starts from the deepest chunk
-    /// it shares. Off by default; ``suggestedPrefixCacheBytes`` suits a server. The pipelined engine
-    /// honours it.
+    /// it shares. Off by default; ``suggestedPrefixCacheBytes`` suits a server.
+    ///
+    /// Only the pipelined engine keeps one, and only for a model whose state it can copy (not one with
+    /// a sliding-window ring); every other engine ignores this. ``InferenceEngine/prefixCacheEnabled``
+    /// says whether an engine took it. On a model with recurrent state, prefill also holds snapshots
+    /// it has taken until the next request, up to half this again.
     public var prefixCacheBytes: Int
 
-    /// 1 GiB, what llm-server and llm-runner keep unless told otherwise.
+    /// 1 GiB, what llm-server keeps unless told otherwise.
     public static let suggestedPrefixCacheBytes = 1 << 30
 
     /// Well-known `assets` roles for tensor data.

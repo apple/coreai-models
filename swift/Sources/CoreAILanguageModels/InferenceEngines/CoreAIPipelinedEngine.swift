@@ -88,14 +88,20 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
     ) async throws {
         let engine = try await EngineImpl(
             config: config, preparedModel: preparedModel, options: options)
-        let supported = engine.prefixCacheSupported
+        let unsupported = engine.prefixCacheUnsupportedReason
         self.engine = engine
         self.config = config
-        if options.prefixCacheBytes > 0, supported {
-            prefixTree = PrefixTree(
-                chunkTokens: Self.prefixChunkTokens, byteBudget: options.prefixCacheBytes)
+        if options.prefixCacheBytes > 0 {
+            if let unsupported {
+                CLILogger.log("prefix cache: off for this model: \(unsupported)")
+            } else {
+                prefixTree = PrefixTree(
+                    chunkTokens: Self.prefixChunkTokens, byteBudget: options.prefixCacheBytes)
+            }
         }
     }
+
+    var prefixCacheEnabled: Bool { prefixTree != nil }
 
     // MARK: - Prefix cache
 
@@ -188,8 +194,8 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
         let start = engine.processedTokenCount
         let boundaries = PrefixSnapshotPlan.boundaries(
             start: start, promptTokens: input.count - start, chunkTokens: chunk)
-        // Taking one waits on the GPU. The boundaries lie past what is published, so their keys
-        // chain on from its last.
+        // Each costs a copy of the recurrent state. The boundaries lie past what is published, so
+        // their keys chain on from its last.
         var key = publishedKeys.last ?? PrefixTree.rootKey
         var depth = publishedKeys.count
         var wanted: [Int] = []
@@ -199,6 +205,14 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
                 depth += 1
             }
             if !tree.hasSnapshot(at: key) { wanted.append(boundary) }
+        }
+        // Until the next publish, every copy is held outside the budget, so a long prompt takes no
+        // more than half the budget's worth: its last, for the same prompt again, then the
+        // shallowest, which the most prompts share.
+        let size = engine.additionalStates?.byteCount ?? 0
+        let most = size > 0 ? max(1, tree.byteBudget / 2 / size) : wanted.count
+        if wanted.count > most, let last = wanted.last {
+            wanted = Array(wanted.prefix(most - 1)) + [last]
         }
         engine.snapshotPositions = wanted
     }
@@ -278,6 +292,7 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
                     self._generationTask.withLock { $0 = nil }
                 }
             }
+            var resumeAt: Int?
             do {
                 let (tokenStream, tokenContinuation) =
                     AsyncThrowingStream<InferenceEngine.TokenId, any Error>.makeStream()
@@ -374,6 +389,9 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
                     }
                 }()
 
+                // Where this request found the engine, so a failure before it ran anything costs no reuse.
+                resumeAt = self.engine.processedTokenCount
+
                 // Track prefill tokens BEFORE runCompletion — the forwarding loop
                 // concurrently appends generated tokens, so prefill must come first.
                 if !newTokens.isEmpty {
@@ -395,11 +413,18 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
                 stopReasonStore.set(.cancelled)
                 outputContinuation.finish()
             } catch {
-                // A failed step still counts its tokens, so the cache may not hold what the history
-                // says: start over rather than reuse or publish any of it.
-                await self.engine.resetWhenIdle()
-                self.history.clear()
-                self.forgetPublished(beyond: 0)
+                if let resumeAt, self.engine.processedTokenCount == resumeAt {
+                    // Refused before any step ran, such as a prompt past the context: what the engine
+                    // held before this request is still good.
+                    self.history.truncate(to: resumeAt)
+                    self.forgetPublished(beyond: resumeAt)
+                } else {
+                    // A failed step still counts its tokens, so the cache may not hold what the history
+                    // says: start over rather than reuse or publish any of it.
+                    await self.engine.resetWhenIdle()
+                    self.history.clear()
+                    self.forgetPublished(beyond: 0)
+                }
                 stopReasonStore.set(.error)
                 outputContinuation.finish(throwing: error)
             }
@@ -2050,16 +2075,21 @@ private struct EngineImpl: ~Copyable {
 
     // MARK: - Prefix cache
 
-    /// Whether this engine's state can go into the prefix cache. A sliding-window ring holds
-    /// positions modulo its size, so its contents are no chunk of the sequence; a sub-byte KV cache
-    /// has no byte per element to copy by.
-    var prefixCacheSupported: Bool {
-        // A KV pair beyond the first sits in `additionalStates` and would not be restored with it;
-        // a fixed query length cannot take the split a snapshot needs.
-        guard slidingRingCapacity == nil, !hasExtraGrowingStates else { return false }
-        if case .fixed(let length) = inputLayout.queryPolicy, length > 1 { return false }
-        return Self.copiesWholeElements(kvCache.keyBinding.scalarType)
-            && Self.copiesWholeElements(kvCache.valueBinding.scalarType)
+    /// Why this engine's state can't go into the prefix cache, or nil when it can.
+    var prefixCacheUnsupportedReason: String? {
+        // A ring holds positions modulo its size, so its contents are no chunk of the sequence.
+        if slidingRingCapacity != nil { return "its sliding-window cache is a ring" }
+        // A KV pair beyond the first sits in `additionalStates` and would not be restored with it.
+        if hasExtraGrowingStates { return "it has a second growing KV cache" }
+        // A fixed query length cannot take the split a snapshot needs.
+        if case .fixed(let length) = inputLayout.queryPolicy, length > 1 {
+            return "its graph takes a fixed query length of \(length)"
+        }
+        guard
+            Self.copiesWholeElements(kvCache.keyBinding.scalarType)
+                && Self.copiesWholeElements(kvCache.valueBinding.scalarType)
+        else { return "its KV cache's element type is not a whole number of bytes" }
+        return nil
     }
 
     /// Whether elements of `type` take whole bytes, as ``KVChunk`` walks them; sub-byte types do not.

@@ -261,9 +261,9 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         name: .customLong("prefix-cache-mb"),
         help: ArgumentHelp(
             "Megabytes of earlier prompts' state to keep, so a prompt that starts the same way restores "
-                + "that prefix instead of computing it (default: 1024; 0 turns it off; pipelined engine)")
+                + "that prefix instead of computing it, across --prompt-list (default: 0, off; pipelined engine only)")
     )
-    var prefixCacheMB: Int = EngineOptions.suggestedPrefixCacheBytes >> 20
+    var prefixCacheMB: Int?
 
     @Option(
         name: .customLong("chunk-size"),
@@ -390,6 +390,9 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     @OptionGroup var memoryOptions: MemoryOptions
 
     func validate() throws {
+        if let mb = prefixCacheMB, !(0...(Int.max >> 20)).contains(mb) {
+            throw ValidationError("--prefix-cache-mb must be between 0 and \(Int.max >> 20) (got \(mb))")
+        }
         if let n = concurrentRequests {
             if n < 1 { throw ValidationError("--concurrent-requests must be >= 1") }
             if promptList == nil { throw ValidationError("--concurrent-requests applies to --prompt-list") }
@@ -722,6 +725,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             chunkSize != nil ? "--chunk-size" : nil,
             chunkThreshold != nil ? "--chunk-threshold" : nil,
             imageStrategy != nil ? "--image-strategy" : nil,
+            prefixCacheMB != nil ? "--prefix-cache-mb" : nil,
         ].compactMap { $0 }
         if let warning = SpeculativeDecodingOptions.ignoredWarning(ignored: ignoredOptions) {
             print(warning)
@@ -1023,7 +1027,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             prefillChunkSize: resolvedChunkSize,
             prefillChunkThreshold: resolvedChunkThreshold,
             tensorData: bundle.tensorData,
-            prefixCacheBytes: max(0, prefixCacheMB) << 20
+            prefixCacheBytes: (prefixCacheMB ?? 0) << 20
         )
 
         measurement?.begin("prepare")
@@ -1059,6 +1063,11 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
 
         // Validate that the sampling strategy is supported by this engine
         try inferenceEngine.validateSamplingStrategy(samplingConfiguration)
+        if let mb = prefixCacheMB, mb > 0, !inferenceEngine.prefixCacheEnabled {
+            print(
+                "⚠️  --prefix-cache-mb \(mb): no prefix cache here. Only the pipelined engine keeps one, and not "
+                    + "for every model (--verbose says why).")
+        }
 
         // Warmup: trigger kernel compilation before first inference
         if warmup != .off { measurement?.begin("warmup") }

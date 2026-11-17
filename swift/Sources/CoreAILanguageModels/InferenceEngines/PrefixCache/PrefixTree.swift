@@ -72,8 +72,9 @@ package struct PrefixTree: Sendable {
 
     package init(chunkTokens: Int, byteBudget: Int) {
         precondition(chunkTokens > 0, "a chunk holds at least one token")
+        precondition(byteBudget >= 0, "a byte budget is not negative")
         self.chunkTokens = chunkTokens
-        self.byteBudget = Swift.max(0, byteBudget)
+        self.byteBudget = byteBudget
     }
 
     /// Nodes held.
@@ -188,7 +189,9 @@ package struct PrefixTree: Sendable {
     ///   - bytes: What `chunk` will total, so a chunk that can't fit is never read.
     ///   - chunk: The chunk's KV rows, one blob per KV state.
     /// - Returns: The node's key, whether created here or already present, or nil when the chunk can't
-    ///   hang here: `parent` is not the node above it, or the budget can't make room for it.
+    ///   hang here: `depth` is not positive or `tokens` is not one whole chunk; `parent` is not the node
+    ///   at `depth - 1`; a node under the same key holds other tokens; or the budget can't make room
+    ///   for it beside its chain.
     @discardableResult
     package mutating func insert(
         parent: Key?, tokens: ArraySlice<Int32>, depth: Int, bytes size: Int,
@@ -204,8 +207,11 @@ package struct PrefixTree: Sendable {
 
         let key = Self.chain(parent ?? Self.rootKey, tokens)
         if let existing = nodes[key] {
-            // Another sequence published this span first; keep its chunk.
-            return existing.tokens.elementsEqual(tokens) ? key : nil
+            // Another sequence published this span first; keep its chunk, but this one just used it.
+            guard existing.tokens.elementsEqual(tokens) else { return nil }
+            clock += 1
+            nodes[key]?.lastUsed = clock
+            return key
         }
 
         // Read the chunk only once it is known to fit, since that is a copy out of the cache.
@@ -236,7 +242,9 @@ package struct PrefixTree: Sendable {
         let size = snapshot.reduce(0) { $0 + $1.count }
         let kept = ancestors(of: key).union(ancestors(of: tip))
         guard makeRoom(for: size, protecting: kept) else { return false }
+        clock += 1
         nodes[key]?.snapshot = snapshot
+        nodes[key]?.lastUsed = clock
         bytesHeld += size
         return true
     }

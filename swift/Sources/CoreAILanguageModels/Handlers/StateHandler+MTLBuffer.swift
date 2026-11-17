@@ -16,28 +16,47 @@ public final class FixedMTLBufferState {
     private var bindings:
         [(name: String, buffer: MTLBuffer, scalarType: NDArray.ScalarType, shape: [Int], strides: [Int])]
 
-    public init(
+    public convenience init(
         states: [(name: String, descriptor: NDArrayDescriptor)],
         device: MTLDevice
     ) throws {
+        try self.init(
+            layouts: states.map { name, desc in
+                guard !desc.shape.contains(where: { $0 < 0 }) else {
+                    throw InferenceRuntimeError.invalidOutputType(
+                        "FixedMTLBufferState '\(name)' has dynamic shape \(desc.shape)")
+                }
+                let resolved = desc.resolvingDynamicDimensions(desc.shape)
+                return (name, desc.scalarType, desc.shape, resolved.preferredStrides, resolved.minimumByteCount)
+            }, device: device)
+    }
+
+    /// States of the given shapes, laid out densely, for a caller with no model descriptor to hand.
+    package convenience init(
+        dense states: [(name: String, scalarType: NDArray.ScalarType, shape: [Int])], device: MTLDevice
+    ) throws {
+        try self.init(
+            layouts: states.map { name, type, shape in
+                let strides = shape.indices.map { shape[($0 + 1)...].reduce(1, *) }
+                return (name, type, shape, strides, shape.reduce(1, *) * type.byteSize)
+            }, device: device)
+    }
+
+    private init(
+        layouts: [(name: String, scalarType: NDArray.ScalarType, shape: [Int], strides: [Int], byteCount: Int)],
+        device: MTLDevice
+    ) throws {
         var bindings: [(String, MTLBuffer, NDArray.ScalarType, [Int], [Int])] = []
-        for (name, desc) in states {
-            guard !desc.shape.contains(where: { $0 < 0 }) else {
-                throw InferenceRuntimeError.invalidOutputType(
-                    "FixedMTLBufferState '\(name)' has dynamic shape \(desc.shape)")
-            }
-            let resolved = desc.resolvingDynamicDimensions(desc.shape)
-            let strides = resolved.preferredStrides
-            let byteCount = resolved.minimumByteCount
+        for (name, scalarType, shape, strides, byteCount) in layouts {
             guard let buffer = device.makeBuffer(length: max(byteCount, 64), options: .storageModeShared)
             else {
                 throw InferenceRuntimeError.bufferAllocationFailed("\(name) (\(byteCount) bytes)")
             }
             memset(buffer.contents(), 0, buffer.length)
-            bindings.append((name, buffer, desc.scalarType, desc.shape, strides))
+            bindings.append((name, buffer, scalarType, shape, strides))
         }
         self.bindings = bindings
-        self.stateNames = states.map(\.name)
+        self.stateNames = layouts.map(\.name)
     }
 
     /// Insert all managed states into async mutable views. MTLBuffer is a reference
@@ -60,20 +79,27 @@ public final class FixedMTLBufferState {
         }
     }
 
+    /// Bytes the state buffers take together, and so a copy of them all.
+    package var byteCount: Int { bindings.reduce(0) { $0 + $1.buffer.length } }
+
     /// Queues a copy of every state buffer, in order, into new buffers on `commandBuffer`.
     ///
-    /// Once `commandBuffer` completes, the copies hold the states as the work queued before it left
-    /// them, so a snapshot needs no wait for the GPU. Nil when a copy can't be allocated.
+    /// Encoding doesn't wait for the GPU. Read the copies only once `commandBuffer` completes: they
+    /// then hold the states as the work queued before it left them. Nil when the blit encoder or a
+    /// copy can't be made.
     package func encodeSnapshot(on commandBuffer: MTLCommandBuffer) -> [MTLBuffer]? {
+        guard let blit = commandBuffer.makeBlitCommandEncoder() else { return nil }
         var copies: [MTLBuffer] = []
         for binding in bindings {
             guard
                 let copy = binding.buffer.device.makeBuffer(
                     length: binding.buffer.length, options: .storageModeShared)
-            else { return nil }
+            else {
+                blit.endEncoding()
+                return nil
+            }
             copies.append(copy)
         }
-        guard let blit = commandBuffer.makeBlitCommandEncoder() else { return nil }
         for (binding, copy) in zip(bindings, copies) {
             blit.copy(
                 from: binding.buffer, sourceOffset: 0, to: copy, destinationOffset: 0,

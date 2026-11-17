@@ -237,6 +237,10 @@ public protocol InferenceEngine: Sendable {
     /// Defaults to `false`.
     var hasRecurrentState: Bool { get }
 
+    /// Whether the engine keeps a prefix cache, as ``EngineOptions/prefixCacheBytes`` asks: only the
+    /// pipelined engine does, and only for a model whose state it can copy. Defaults to `false`.
+    var prefixCacheEnabled: Bool { get }
+
     // MARK: - Configuration
 
     associatedtype ConfigType: Codable, InferenceConfiguration
@@ -299,6 +303,10 @@ extension InferenceEngine {
 
 extension InferenceEngine {
     public var hasRecurrentState: Bool { false }
+}
+
+extension InferenceEngine {
+    public var prefixCacheEnabled: Bool { false }
 }
 
 extension InferenceEngine {

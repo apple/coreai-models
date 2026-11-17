@@ -113,6 +113,11 @@ struct PrefixTreeTests {
         let attention = tree.match(prompt, limit: 16, needsSnapshot: false)
         #expect(attention.reusedTokens == 16)
         #expect(attention.snapshot == nil)
+        // Replayed tokens count on a miss and on a hit alike.
+        tree.record(unsnapshotted, restored: false)
+        tree.record(match, restored: true)
+        #expect(tree.matchedButReplayedTokens == 24)
+        #expect(tree.misses == 1 && tree.hits == 1)
     }
 
     @Test("A chunk only hangs from the node directly above it")
@@ -378,6 +383,26 @@ struct KVChunkTests {
         #expect(destination.values[2 * 3] == 0 && destination.values[7 * 3] == 0)
     }
 
+    @Test("A chunk read from a layout whose inner axes are not dense goes back into one of another capacity")
+    func stridedInnerAxisRoundTrip() {
+        // head_dim walked with stride 2, positions 8 apart, then 12 apart in a longer cache.
+        let source = KVChunk.Layout(
+            shape: [1, 1, 1, 4, 3], strides: [48, 48, 48, 8, 2], elementBytes: 4, sequenceAxis: 3)
+        var values = [Float](repeating: -1, count: 48)
+        for p in 0..<4 { for d in 0..<3 { values[p * 8 + d * 2] = Float(p * 10 + d) } }
+        let chunk = values.withUnsafeBytes { KVChunk.read(from: $0.baseAddress!, layout: source, start: 1, count: 2) }
+        let destination = KVChunk.Layout(
+            shape: [1, 1, 1, 6, 3], strides: [72, 72, 72, 12, 3], elementBytes: 4, sequenceAxis: 3)
+        var into = [Float](repeating: 0, count: 72)
+        into.withUnsafeMutableBytes {
+            KVChunk.write(chunk, to: $0.baseAddress!, layout: destination, start: 1, count: 2)
+        }
+        for p in 1..<3 {
+            for d in 0..<3 { #expect(into[p * 12 + d * 3] == Float(p * 10 + d)) }
+        }
+        #expect(into.filter { $0 != 0 }.count == 6)
+    }
+
     @Test("A layout whose inner axes are not dense is copied element by element, to the same result")
     func stridedInnerAxis() {
         // head_dim walked with stride 2: every other element.
@@ -413,5 +438,38 @@ struct KVChunkTests {
         #expect(KVChunk.read(from: buffer.contents(), layout: layout, start: 1, count: 2) == chunk)
         let probe = 1 * 48 + 2 * 8 + 3
         #expect(halves[probe] == UInt16(probe))
+    }
+}
+
+@Suite("FixedMTLBufferState snapshots")
+struct FixedMTLBufferStateSnapshotTests {
+    /// The copies `encodeSnapshot` queued, once the GPU has made them.
+    static func snapshot(of states: FixedMTLBufferState, on queue: MTLCommandQueue) throws -> [Data] {
+        let commandBuffer = try #require(queue.makeCommandBuffer())
+        let copies = try #require(states.encodeSnapshot(on: commandBuffer))
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        return copies.map { Data(bytes: $0.contents(), count: $0.length) }
+    }
+
+    @Test("A snapshot restores every state to its own buffer, in order, after a reset")
+    func roundTrip() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let queue = try #require(device.makeCommandQueue())
+        // Two states of different sizes, so a swapped order shows as a length mismatch or wrong bytes.
+        let states = try FixedMTLBufferState(
+            dense: [("conv", .float16, [1, 4, 40]), ("ssm", .float32, [1, 2, 8, 8])], device: device)
+        let empty = try Self.snapshot(of: states, on: queue)
+        #expect(empty.map(\.count) == [4 * 40 * 2, 2 * 8 * 8 * 4])
+        #expect(states.byteCount == empty.reduce(0) { $0 + $1.count })
+        let original = empty.enumerated().map { index, blob in
+            Data((0..<blob.count).map { UInt8(truncatingIfNeeded: $0 * 7 + index * 101 + 1) })
+        }
+        states.restore(original)
+        #expect(try Self.snapshot(of: states, on: queue) == original)
+        states.reset()
+        #expect(try Self.snapshot(of: states, on: queue) == empty)
+        states.restore(original)
+        #expect(try Self.snapshot(of: states, on: queue) == original)
     }
 }
