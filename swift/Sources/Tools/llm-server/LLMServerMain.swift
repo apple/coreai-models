@@ -221,22 +221,9 @@ struct LLMServer: AsyncParsableCommand {
 
         let tokenizer = try await bundle.loadTokenizer()
 
-        var additionalEosTokenIds: Set<Int32>
-        if let tokenizerDir = bundle.tokenizerPath {
-            additionalEosTokenIds = LanguageConfig.additionalStopTokenIds(
-                from: tokenizerDir, tokenizer: tokenizer)
-        } else {
-            additionalEosTokenIds = []
-        }
-
-        // Agentic models use <|eot|> as a turn boundary. It may not appear in
-        // tokenizer_config.json, so add it explicitly (skipping the main EOS).
-        let thinkingFormat = detectThinkingFormat(using: tokenizer)
-        if let eotId = agenticEndOfTurnTokenId(thinkingFormat: thinkingFormat, tokenizer: tokenizer),
-            eotId != tokenizer.eosTokenId.map({ Int32($0) })
-        {
-            additionalEosTokenIds.insert(eotId)
-        }
+        // Additional stop token IDs: from the tokenizer files, the bundle's eos_token_ids, and, for
+        // agentic models, <|eot|>. Shared with llm-runner so both tools stop on the same tokens.
+        let additionalEosTokenIds = RunnerPrompting.additionalStopTokenIds(bundle: bundle, tokenizer: tokenizer)
 
         let samplingConfig = SamplingConfiguration(
             temperature: temperature,
