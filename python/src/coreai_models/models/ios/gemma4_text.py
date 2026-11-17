@@ -397,14 +397,16 @@ class GeGLUMLP(nn.Module):
         self.down_proj = _make_proj_conv(config, hidden_dim, dim, nbits=nbits)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        batch_size, query_len, _, dim = x.shape
-        x = x.reshape(batch_size * query_len, dim, 1, 1)
+        # Tokens go in the 1x1 convs' width, (B, D, 1, S), as in `Attention`, not in their batch:
+        # on the Neural Engine a QAT checkpoint's activation quantize/dequantize on the gate/up
+        # outputs makes the batch layout several times slower in prefill, and costs nothing here.
+        x = x.transpose(-3, -1)
 
         up_tensor = self.up_proj(x)
         gate_tensor = nn.functional.gelu(self.gate_proj(x), approximate="tanh")
         down_tensor = self.down_proj(up_tensor * gate_tensor)
 
-        return down_tensor.reshape(batch_size, query_len, 1, dim)
+        return down_tensor.transpose(-3, -1)
 
 
 class Attention(nn.Module):
