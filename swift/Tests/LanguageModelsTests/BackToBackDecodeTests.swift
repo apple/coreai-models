@@ -14,7 +14,8 @@ import Tokenizers
 /// Requests back to back on one engine, each ending at a stop sequence: the strategy releases the
 /// engine's stream there rather than draining it, so the next request has to find the engine free
 /// and its cache consistent. Needs a text model bundle named by `COREAI_TEST_DECODE_BUNDLE`, exported
-/// without `--attention-mask batched` so the pipelined engine can load it.
+/// without `--attention-mask batched` so the pipelined engine can load it. One test also changes the
+/// sampling settings between requests.
 @Suite(
     "Back-to-back requests after a stop sequence", .serialized,
     .enabled(if: ProcessInfo.processInfo.environment["COREAI_TEST_DECODE_BUNDLE"] != nil))
@@ -30,12 +31,13 @@ struct BackToBackDecodeTests {
         return (engine, try await bundle.loadTokenizer())
     }
 
-    /// Greedy reply to `prompt`, up to `maxTokens`, ending at any of `stops`.
+    /// Reply to `prompt` (greedy unless `sampling` says otherwise), up to `maxTokens`, ending at any of `stops`.
     private func reply(
-        _ prompt: String, engine: any InferenceEngine, tokenizer: any Tokenizer, stops: [[Int32]], maxTokens: Int
+        _ prompt: String, engine: any InferenceEngine, tokenizer: any Tokenizer, stops: [[Int32]], maxTokens: Int,
+        sampling: SamplingConfiguration = .greedy
     ) async throws -> String {
         let stream = try await VanillaDecodingStrategy().decode(
-            from: .prompt(prompt), tokenizer: tokenizer, inferenceEngine: engine, samplingConfiguration: .greedy,
+            from: .prompt(prompt), tokenizer: tokenizer, inferenceEngine: engine, samplingConfiguration: sampling,
             options: InferenceOptions(maxTokens: maxTokens), stopSequences: StopSequences(sequences: stops))
         var text = ""
         for try await result in stream { text += result.text }
@@ -70,6 +72,21 @@ struct BackToBackDecodeTests {
         // The released generation gives the engine back once it winds down.
         for _ in 0..<50 where engine.isBusy { try await Task.sleep(for: .milliseconds(20)) }
         #expect(!engine.isBusy)
+    }
+
+    @Test("A request with different sampling settings reuses the engine without a reset")
+    func samplingChangeWithoutReset() async throws {
+        let (engine, tokenizer) = try await load("coreai-pipelined")
+        // Same prompt: a model without recurrent state rewinds to the cached prefix instead of resetting.
+        let configs: [SamplingConfiguration] = [
+            .greedy, SamplingConfiguration(temperature: 0.7), SamplingConfiguration(temperature: 0.3, topP: 0.9),
+            .greedy,
+        ]
+        for sampling in configs {
+            let text = try await reply(
+                Self.prompts[0], engine: engine, tokenizer: tokenizer, stops: [], maxTokens: 8, sampling: sampling)
+            #expect(!text.isEmpty)
+        }
     }
 }
 

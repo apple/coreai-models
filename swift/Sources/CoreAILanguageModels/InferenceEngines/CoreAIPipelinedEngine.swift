@@ -27,7 +27,6 @@ private func milliseconds(since start: ContinuousClock.Instant) -> Double {
 /// the same memory.
 private let pipelineDepth = 3
 private let averageExpectedPromptSize = 256
-private let temperatureTolerance: Double = 0.001
 
 /// MPSNDArray enforces 64-byte row-stride alignment on backing buffers.
 private let minimumMPSNDArrayBufferSize = 64
@@ -632,7 +631,7 @@ private struct EngineImpl: ~Copyable {
 
     // GPU sampler — reuses MPSGraphSampler from MPSGraphSamplers.swift
     var cachedSampler: (any MPSGraphSampler)?
-    var cachedSamplerTemperature: Double?
+    var cachedSamplerConfig: SamplingConfiguration?
     var penaltyState: RepetitionPenaltyGPUState?
     // No step using `penaltyState` is in flight; set by the end-of-generation sentinel and reset().
     var penaltyStateIdle = true
@@ -889,38 +888,22 @@ private struct EngineImpl: ~Copyable {
             classified: classified, descriptor: descriptor)
         self.logits = logitsRef
         self.cachedSampler = nil
-        self.cachedSamplerTemperature = nil
+        self.cachedSamplerConfig = nil
 
         CLILogger.log("CoreAI pipelined engine initialized — Vocab: \(config.vocabSize)")
     }
 
     // MARK: - Sampler
 
+    /// Returns the cached sampler when `config` matches the one it was built for, else builds a
+    /// new one. Steps already in flight keep the sampler they were given.
     private mutating func getOrCreateSampler(for config: SamplingConfiguration) throws -> any MPSGraphSampler {
         let config = config.normalized()
-        let temperature = config.temperature
-
-        if let existingSampler = cachedSampler, let existingTemp = cachedSamplerTemperature {
-            let existingIsGreedy = existingTemp == 0
-            let requestedIsGreedy = temperature == 0
-
-            if existingIsGreedy != requestedIsGreedy {
-                throw InferenceRuntimeError.genericError(
-                    "Sampling configuration changed mid-generation. Call reset() first.")
-            }
-            if !existingIsGreedy && !requestedIsGreedy
-                && abs(existingTemp - temperature) > temperatureTolerance
-            {
-                throw InferenceRuntimeError.genericError(
-                    "Temperature changed mid-generation (\(existingTemp) -> \(temperature)). Call reset() first.")
-            }
-            // The penalty stage is compiled into the graph; rebuild when this request needs it.
-            let cachedPenaltyEnabled = (existingSampler as? MPSGraphCompositeSampler)?.penaltyEnabled ?? false
-            if cachedPenaltyEnabled || !config.needsRepetitionPenalty {
-                return existingSampler
-            }
+        if let cachedSampler, cachedSamplerConfig == config {
+            return cachedSampler
         }
 
+        // The penalty stage is compiled into the composite graph; the argmax sampler has none.
         if config.needsRepetitionPenalty && config.temperature == 0 {
             throw InferenceRuntimeError.invalidArgument(
                 "Repetition penalty with greedy sampling is not supported on pipelined engine. "
@@ -933,7 +916,7 @@ private struct EngineImpl: ~Copyable {
             config: config
         )
         cachedSampler = newSampler
-        cachedSamplerTemperature = temperature
+        cachedSamplerConfig = config
         return newSampler
     }
 
@@ -1109,7 +1092,7 @@ private struct EngineImpl: ~Copyable {
         let localGPUSampler = gpuSampler
         let outputBuffer = decodeOutputBuffers[step % pipelineDepth]
         let samplerStrategy = gpuSampler is MPSGraphArgmaxSampler ? "GPU-argmax" : "GPU-composite"
-        let samplerTemperature = cachedSamplerTemperature ?? 0.0
+        let samplerTemperature = cachedSamplerConfig?.temperature ?? 0.0
 
         let sampleSpan = InstrumentsProfiler.beginSampleEncoding(
             step: currentStep, strategy: samplerStrategy, temperature: samplerTemperature)
@@ -1886,7 +1869,7 @@ private struct EngineImpl: ~Copyable {
         processedTokenCount = 0
         step = 0
         cachedSampler = nil
-        cachedSamplerTemperature = nil
+        cachedSamplerConfig = nil
         // Steps still in flight hold their own reference.
         penaltyState = nil
         penaltyStateIdle = true
