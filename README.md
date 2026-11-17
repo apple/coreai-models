@@ -122,6 +122,17 @@ Install the extension from a local directory:
 gemini extensions install /path/to/coreai-models/skills
 ```
 
+#### OpenCode
+
+Install the skills using the [Skills CLI](https://github.com/vercel-labs/skills)
+(requires Node.js 22.20+):
+
+```shell
+npx skills add apple/coreai-models --agent opencode --skill '*' --global
+```
+
+Omit `--global` to install in the current project.
+
 Once installed, the skills activate automatically based on your task context,
 or you can invoke them explicitly.
 
