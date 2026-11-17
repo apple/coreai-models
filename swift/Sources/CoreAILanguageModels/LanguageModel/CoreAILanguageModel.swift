@@ -50,9 +50,11 @@ public struct CoreAILanguageModel: LanguageModel {
     private let supportsToolCalling: Bool
     fileprivate let supportsReasoning: Bool
     fileprivate let resources: ModelResources
-    /// All EOS-like token IDs beyond the tokenizer's main `eosTokenId` — e.g.
-    /// Gemma's `<end_of_turn>`, read from tokenizer_config.json at init, plus a
-    /// base-vocab `<|im_end|>` and this model's agentic `<|eot|>` when present.
+    /// All EOS-like token IDs beyond the tokenizer's main `eosTokenId`, resolved at init: the
+    /// turn-ending IDs the tokenizer files mark (e.g. Gemma's `<end_of_turn>`), the bundle's
+    /// `eos_token_ids` minus the main `eosTokenId` (e.g. Gemma 4's `<|tool_response>`), and this
+    /// model's agentic `<|eot|>` when present. The base-vocab `<|im_end|>` is not stored here;
+    /// `runtimeStopTokens` adds it at generation time.
     fileprivate let additionalEosTokenIds: Set<Int32>
     /// Most whitespace characters allowed between two JSON tokens in schema-guided generation from
     /// this model; nil when unlimited.
@@ -176,7 +178,8 @@ public struct CoreAILanguageModel: LanguageModel {
             }
         }()
         self.resources = resources
-        // Config-derived turn-end IDs. The base-vocab <|im_end|> baseline is
+        // Config-derived turn-end IDs: the tokenizer files' turn-ending IDs and the
+        // bundle's eos_token_ids. The base-vocab <|im_end|> baseline is
         // folded in at runtime by runtimeStopTokens.
         var additional = bundle.additionalStopTokenIds(tokenizer: tokenizer)
         // Agentic models stop on <|eot|> so the runner doesn't loop self->user

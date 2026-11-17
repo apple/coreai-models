@@ -9,27 +9,30 @@ import Tokenizers
 /// Stop-token construction shared by the command-line runner's generation paths, kept apart from
 /// argument handling so the paths build identical inputs and the logic can be tested.
 package enum RunnerPrompting {
-    /// Stop tokens beyond the end-of-sequence token for `bundle`: those named in its tokenizer
-    /// configuration and in its `eos_token_ids`, plus, for agentic vocabularies, the end-of-turn token.
+    /// Stop tokens beyond the end-of-sequence token for `bundle`: those
+    /// `LanguageModelBundle.additionalStopTokenIds(tokenizer:)` returns plus, for agentic
+    /// vocabularies, the end-of-turn token.
     package static func additionalStopTokenIds(bundle: LanguageModelBundle, tokenizer: any Tokenizer) -> Set<Int32> {
-        additionalStopTokenIds(
-            tokenizerDirectory: bundle.tokenizerPath, tokenizer: tokenizer, declared: bundle.language.eosTokenIds)
+        addingAgenticEndOfTurn(to: bundle.additionalStopTokenIds(tokenizer: tokenizer), tokenizer: tokenizer)
     }
 
-    /// Stop tokens beyond the end-of-sequence token: those named in the tokenizer configuration,
-    /// the `declared` IDs (a bundle's `eos_token_ids`), and, for agentic vocabularies, the
-    /// end-of-turn token.
+    /// Stop tokens beyond the end-of-sequence token: those named in the tokenizer configuration
+    /// plus, for agentic vocabularies, the end-of-turn token.
     package static func additionalStopTokenIds(
         tokenizerDirectory: URL?,
-        tokenizer: any Tokenizer,
-        declared: [Int32] = []
+        tokenizer: any Tokenizer
     ) -> Set<Int32> {
         var ids: Set<Int32> = []
         if let tokenizerDirectory {
             ids = LanguageConfig.additionalStopTokenIds(from: tokenizerDirectory, tokenizer: tokenizer)
         }
-        ids.formUnion(declared)
-        if let eos = tokenizer.eosTokenId { ids.remove(Int32(eos)) }
+        return addingAgenticEndOfTurn(to: ids, tokenizer: tokenizer)
+    }
+
+    /// `ids` plus the agentic end-of-turn token, unless the vocabulary is not agentic or that token
+    /// is the main end-of-sequence token.
+    private static func addingAgenticEndOfTurn(to ids: Set<Int32>, tokenizer: any Tokenizer) -> Set<Int32> {
+        var ids = ids
         // The end-of-turn token may be absent from tokenizer_config.json.
         let format = detectThinkingFormat(using: tokenizer)
         if let eot = agenticEndOfTurnTokenId(thinkingFormat: format, tokenizer: tokenizer),
