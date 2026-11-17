@@ -246,7 +246,8 @@ Neural Engine supports palettization (also known as clustering) natively. Compre
 
 **Key points:**
 
-- Palettization and quantization are the primary compression schemes supported on Neural Engine.
+- Palettization is the compression scheme to use on Neural Engine. Linear per-block integer weight quantization (for example the `4bit` macOS preset, `block_size=32`) has produced wrong output with no error when the model runs on the Neural Engine: on an iPhone 16 Pro Max an 8-bit per-block vision encoder scored 0.367 cosine against its fp32 reference on the Neural Engine and 0.999 on the GPU, while the same weights palettized to 8 bits scored 0.9975 (see [issue #279](https://github.com/apple/coreai-models/issues/279)). That report did not test per-channel linear quantization.
+- A report on macOS found the same kind of error from a bare int4 per-block `Linear` under both GPU and Neural Engine preference, with an exact result only on the CPU, and found that casting around the matmul to fp32 removed it. Treat per-block linear quantization as unverified on any unit other than the CPU, and compare against an fp32 reference on the compute unit you ship before relying on it.
 - Lookup tables can cover multiple output channels rather than one per kernel, which may improve accuracy since the model experiences less compression.
 - Newer hardware generations support vector-valued lookup table entries rather than scalar values.
 - Compression is most effective for layers where weight transfer time dominates computation time. Layers that are already compute-bound will not see performance gains from compression alone.
