@@ -82,6 +82,11 @@ public final class FixedMTLBufferState {
     /// Bytes the state buffers take together, and so a copy of them all.
     package var byteCount: Int { bindings.reduce(0) { $0 + $1.buffer.length } }
 
+    /// Each state's name and the bytes a snapshot of it takes, in order.
+    package var snapshotLayout: [(name: String, bytes: Int)] {
+        bindings.map { ($0.name, $0.buffer.length) }
+    }
+
     /// Queues a copy of every state buffer, in order, into new buffers on `commandBuffer`.
     ///
     /// Encoding doesn't wait for the GPU. Read the copies only once `commandBuffer` completes: they

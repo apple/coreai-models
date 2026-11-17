@@ -107,6 +107,14 @@ struct LLMServer: AsyncParsableCommand {
     var prefixCacheMB: Int?
 
     @Option(
+        name: .customLong("prefix-cache-disk-mb"),
+        help: ArgumentHelp(
+            "Megabytes of disk the prefix cache may also use, under ~/Library/Caches/coreai-prefix-cache, so "
+                + "it can outgrow --prefix-cache-mb and is kept across restarts (default: 0, memory only)")
+    )
+    var prefixCacheDiskMB: Int = 0
+
+    @Option(
         name: .customLong("chunk-size"),
         help: ArgumentHelp(
             "Prefill chunk size in tokens (default: 2048; 4096 on macOS with >=64GB memory)", visibility: .hidden
@@ -167,6 +175,10 @@ struct LLMServer: AsyncParsableCommand {
         if let mb = prefixCacheMB, !(0...(Int.max >> 20)).contains(mb) {
             throw ValidationError("--prefix-cache-mb must be between 0 and \(Int.max >> 20) (got \(mb))")
         }
+        if !(0...(Int.max >> 20)).contains(prefixCacheDiskMB) {
+            throw ValidationError(
+                "--prefix-cache-disk-mb must be between 0 and \(Int.max >> 20) (got \(prefixCacheDiskMB))")
+        }
         guard maxQueueDepth >= 0 else {
             throw ValidationError("--max-queue-depth must be >= 0 (got \(maxQueueDepth))")
         }
@@ -213,7 +225,10 @@ struct LLMServer: AsyncParsableCommand {
             prefillChunkSize: resolvedChunkSize,
             prefillChunkThreshold: resolvedChunkThreshold,
             tensorData: bundle.tensorData,
-            prefixCacheBytes: (prefixCacheMB ?? EngineOptions.suggestedPrefixCacheBytes >> 20) << 20
+            prefixCacheBytes: (prefixCacheMB ?? EngineOptions.suggestedPrefixCacheBytes >> 20) << 20,
+            prefixCacheDiskBytes: prefixCacheDiskMB << 20,
+            prefixCacheDirectory: prefixCacheDiskMB > 0
+                ? EngineOptions.defaultPrefixCacheDirectory(forModelAt: bundle.bundlePath) : nil
         )
 
         let modelURL = try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.main)

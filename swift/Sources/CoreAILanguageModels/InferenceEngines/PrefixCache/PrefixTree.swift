@@ -226,6 +226,12 @@ package struct PrefixTree: Sendable {
         return key
     }
 
+    /// Whether `key` is a node.
+    package func contains(_ key: Key) -> Bool { nodes[key] != nil }
+
+    /// `key`'s chunk, for a caller writing it elsewhere.
+    package func chunk(of key: Key) -> [Data]? { nodes[key]?.chunk }
+
     /// Whether `key` is a node that already holds a snapshot, so taking another is wasted.
     package func hasSnapshot(at key: Key) -> Bool {
         nodes[key]?.snapshot != nil

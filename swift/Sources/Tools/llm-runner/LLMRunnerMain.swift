@@ -266,6 +266,14 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     var prefixCacheMB: Int?
 
     @Option(
+        name: .customLong("prefix-cache-disk-mb"),
+        help: ArgumentHelp(
+            "Megabytes of disk the prefix cache may also use, under ~/Library/Caches/coreai-prefix-cache, so "
+                + "it can outgrow --prefix-cache-mb and is kept across restarts (default: 0, memory only)")
+    )
+    var prefixCacheDiskMB: Int = 0
+
+    @Option(
         name: .customLong("chunk-size"),
         help: ArgumentHelp(
             "Prefill chunk size in tokens (default: 2048; 4096 on macOS with >=64GB memory)",
@@ -392,6 +400,10 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     func validate() throws {
         if let mb = prefixCacheMB, !(0...(Int.max >> 20)).contains(mb) {
             throw ValidationError("--prefix-cache-mb must be between 0 and \(Int.max >> 20) (got \(mb))")
+        }
+        if !(0...(Int.max >> 20)).contains(prefixCacheDiskMB) {
+            throw ValidationError(
+                "--prefix-cache-disk-mb must be between 0 and \(Int.max >> 20) (got \(prefixCacheDiskMB))")
         }
         if let n = concurrentRequests {
             if n < 1 { throw ValidationError("--concurrent-requests must be >= 1") }
@@ -1027,7 +1039,10 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             prefillChunkSize: resolvedChunkSize,
             prefillChunkThreshold: resolvedChunkThreshold,
             tensorData: bundle.tensorData,
-            prefixCacheBytes: (prefixCacheMB ?? 0) << 20
+            prefixCacheBytes: (prefixCacheMB ?? 0) << 20,
+            prefixCacheDiskBytes: prefixCacheDiskMB << 20,
+            prefixCacheDirectory: prefixCacheDiskMB > 0
+                ? EngineOptions.defaultPrefixCacheDirectory(forModelAt: bundle.bundlePath) : nil
         )
 
         measurement?.begin("prepare")

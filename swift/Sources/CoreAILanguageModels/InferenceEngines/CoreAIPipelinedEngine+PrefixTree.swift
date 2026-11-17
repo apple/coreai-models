@@ -45,13 +45,17 @@ extension CoreAIPipelinedEngine {
         while publishedKeys.count < depth {
             let next = publishedKeys.count + 1
             let start = (next - 1) * chunk
+            let parent = publishedKeys.last
             guard
                 let key = prefixTree?.insert(
-                    parent: publishedKeys.last, tokens: tokens[start..<(start + chunk)],
+                    parent: parent, tokens: tokens[start..<(start + chunk)],
                     depth: next, bytes: chunkBytes,
                     chunk: self.engine.readKVChunk(start: start, count: chunk))
             else { break }
             publishedKeys.append(key)
+            if let store = prefixStore, store.record(of: key) == nil, let bytes = prefixTree?.chunk(of: key) {
+                store.write(chunk: bytes, for: key, parent: parent, depth: next)
+            }
         }
         let snapshots = engine.capturedSnapshots
         engine.capturedSnapshots = []
@@ -62,6 +66,8 @@ extension CoreAIPipelinedEngine {
             {
                 prefixTree?.attach(
                     snapshot: states, to: publishedKeys[at - 1], keepingChainTo: publishedKeys.last)
+                // On disk even when memory had no room for it.
+                prefixStore?.write(snapshot: states, for: publishedKeys[at - 1])
             }
         }
     }
@@ -80,6 +86,7 @@ extension CoreAIPipelinedEngine {
         let chunk = Self.prefixChunkTokens
         // At least one prompt token has to run, for the first logits.
         guard prefixTree != nil, (input.count - 1) / chunk * chunk >= kept + chunk else { return nil }
+        let fromDisk = loadFromDisk(input, limit: input.count - 1, atLeast: kept + chunk)
         guard
             let match = prefixTree?.match(
                 input, limit: input.count - 1, needsSnapshot: engine.hasNonTruncatableStates)
@@ -101,12 +108,69 @@ extension CoreAIPipelinedEngine {
             return 0
         }
         prefixTree?.record(match, restored: true)
+        prefixStore?.touch(match.keys)
         history.append(contentsOf: input[..<restored])
         publishedKeys = match.keys
         CLILogger.log(
-            "prefix cache: restored \(restored) of \(input.count) prompt token(s); "
-                + (prefixTree?.summary ?? ""))
+            "prefix cache: restored \(restored) of \(input.count) prompt token(s)"
+                + (fromDisk > 0 ? ", \(fromDisk) chunk(s) of them from disk" : "") + "; "
+                + (prefixTree?.summary ?? "") + (prefixStore.map { "; " + $0.summary } ?? ""))
         return restored
+    }
+
+    /// Brings the chunks of `input` the tree lacks but the disk tier holds into the tree, so the match
+    /// after finds them. Reads only up to the deepest chunk a match could use, and nothing when that is
+    /// short of `minimum` tokens. Returns the chunks it brought.
+    private func loadFromDisk(_ input: [TokenId], limit: Int, atLeast minimum: Int) -> Int {
+        guard let store = prefixStore, prefixTree != nil else { return 0 }
+        let chunk = Self.prefixChunkTokens
+        let needsSnapshot = engine.hasNonTruncatableStates
+        // Name the chain first, reading nothing: where it stops, and the deepest a match could use.
+        var keys: [PrefixTree.Key] = []
+        var usable = 0
+        while (keys.count + 1) * chunk <= limit {
+            let span = input[(keys.count * chunk)..<((keys.count + 1) * chunk)]
+            let key = PrefixTree.chain(keys.last ?? PrefixTree.rootKey, span)
+            let inMemory = prefixTree?.contains(key) ?? false
+            let record = store.record(of: key)
+            guard inMemory || (record?.parent == keys.last && record?.depth == keys.count + 1) else { break }
+            keys.append(key)
+            if !needsSnapshot || prefixTree?.hasSnapshot(at: key) == true || (record?.snapshotBytes ?? 0) > 0 {
+                usable = keys.count
+            }
+        }
+        guard usable * chunk >= minimum else { return 0 }
+
+        var loaded = 0
+        for (offset, key) in keys.prefix(usable).enumerated() {
+            // A hybrid only needs the snapshot the match will stop at.
+            let wantsSnapshot = needsSnapshot && offset == usable - 1 && prefixTree?.hasSnapshot(at: key) != true
+            let inMemory = prefixTree?.contains(key) ?? false
+            guard !inMemory || wantsSnapshot else { continue }
+            guard let files = store.read(key, withSnapshot: wantsSnapshot) else { break }
+            if !inMemory {
+                guard engine.fitsKVChunk(files.chunk, count: chunk) else {
+                    store.remove(key)
+                    break
+                }
+                let parent = offset == 0 ? nil : keys[offset - 1]
+                guard
+                    prefixTree?.insert(
+                        parent: parent, tokens: input[(offset * chunk)..<((offset + 1) * chunk)],
+                        depth: offset + 1, bytes: files.chunk.reduce(0) { $0 + $1.count },
+                        chunk: files.chunk) != nil
+                else { break }
+                loaded += 1
+            }
+            if let snapshot = files.snapshot {
+                guard engine.fitsSnapshot(snapshot) else {
+                    store.remove(key)
+                    break
+                }
+                prefixTree?.attach(snapshot: snapshot, to: key, keepingChainTo: key)
+            }
+        }
+        return loaded
     }
 
     /// Where prefill should snapshot a hybrid's recurrent state for `input`, of which the engine holds
@@ -168,6 +232,35 @@ extension EngineImpl {
         case .float16, .bfloat16, .float32, .int8, .uint8, .float8e5m2, .float8e4m3fn: true
         default: false
         }
+    }
+
+    /// What the prefix cache's files depend on, besides the model: the chunk length, the KV's layout
+    /// without its capacity, and the recurrent states' sizes.
+    func prefixCacheGeometry(chunkTokens: Int) -> String {
+        func describe(_ binding: TensorBinding) -> String {
+            var shape = binding.shape.map(String.init)
+            shape[KVChunk.Layout(binding).sequenceAxis] = "*"
+            return "\(shape.joined(separator: "x")) \(binding.scalarType)"
+        }
+        let states = additionalStates?.snapshotLayout.map { "state \($0.name) \($0.bytes)" } ?? []
+        return
+            ([
+                "prefix cache 1", "chunk \(chunkTokens)", "key \(describe(kvCache.keyBinding))",
+                "value \(describe(kvCache.valueBinding))",
+            ] + states).joined(separator: "\n")
+    }
+
+    /// Whether `chunk` is the keys and values of `count` positions of this KV cache.
+    func fitsKVChunk(_ chunk: [Data], count: Int) -> Bool {
+        chunk.map(\.count) == [
+            KVChunk.Layout(kvCache.keyBinding).chunkBytes(count: count),
+            KVChunk.Layout(kvCache.valueBinding).chunkBytes(count: count),
+        ]
+    }
+
+    /// Whether `snapshot` is one of these recurrent states.
+    func fitsSnapshot(_ snapshot: [Data]) -> Bool {
+        additionalStates?.snapshotLayout.map(\.bytes) == snapshot.map(\.count)
     }
 
     /// Bytes one chunk of `count` positions takes, keys and values, before any is read.

@@ -467,6 +467,27 @@ public struct EngineOptions: Sendable {
     /// 1 GiB, what llm-server keeps unless told otherwise.
     public static let suggestedPrefixCacheBytes = 1 << 30
 
+    /// Bytes of disk the prefix cache may also use, in ``prefixCacheDirectory``; zero, the default,
+    /// keeps it in memory only.
+    ///
+    /// Every chunk the cache keeps in memory is also written to disk, in the background, and a prompt
+    /// that runs past what memory holds reads the next chunks back from there. So this may be larger
+    /// than ``prefixCacheBytes``, and a restarted engine reuses what an earlier one computed. Needs
+    /// ``prefixCacheBytes`` too: chunks reach the KV cache through memory.
+    public var prefixCacheDiskBytes: Int
+
+    /// Where the prefix cache keeps its files: a directory for this model alone, such as
+    /// ``defaultPrefixCacheDirectory(forModelAt:)``. Nil keeps the cache in memory only.
+    public var prefixCacheDirectory: URL?
+
+    /// A directory for the prefix cache of the model at `modelURL`, under the user's caches directory.
+    ///
+    /// Named by the model's folder and a digest of its path and its files' sizes and modification
+    /// dates, so a model exported again starts afresh rather than reuse another's state.
+    public static func defaultPrefixCacheDirectory(forModelAt modelURL: URL) -> URL? {
+        PrefixCacheStore.defaultDirectory(forModelAt: modelURL)
+    }
+
     /// Well-known `assets` roles for tensor data.
     public enum TensorDataKey {
         /// INT8 per-layer embeddings table (`*_ple.safetensors`).
@@ -485,6 +506,8 @@ public struct EngineOptions: Sendable {
     ///   - prefillChunkThreshold: Minimum prompt tokens to trigger chunking, or `nil` for default.
     ///   - tensorData: Tensor data URLs keyed by `auxiliary_assets` role. Defaults to empty.
     ///   - prefixCacheBytes: Bytes of earlier prompts' state to keep. Defaults to zero, off.
+    ///   - prefixCacheDiskBytes: Bytes of disk the prefix cache may also use. Defaults to zero, off.
+    ///   - prefixCacheDirectory: Where the prefix cache keeps its files. Defaults to nil, none.
     public init(
         variant: String? = nil,
         kvCacheStrategy: KVCacheStrategy = .auto,
@@ -492,7 +515,9 @@ public struct EngineOptions: Sendable {
         prefillChunkSize: Int? = nil,
         prefillChunkThreshold: Int? = nil,
         tensorData: [String: URL] = [:],
-        prefixCacheBytes: Int = 0
+        prefixCacheBytes: Int = 0,
+        prefixCacheDiskBytes: Int = 0,
+        prefixCacheDirectory: URL? = nil
     ) {
         self.variant = variant
         self.kvCacheStrategy = kvCacheStrategy
@@ -501,6 +526,8 @@ public struct EngineOptions: Sendable {
         self.prefillChunkThreshold = prefillChunkThreshold
         self.tensorData = tensorData
         self.prefixCacheBytes = prefixCacheBytes
+        self.prefixCacheDiskBytes = prefixCacheDiskBytes
+        self.prefixCacheDirectory = prefixCacheDirectory
     }
 
     /// Returns the KV cache size in tokens that the engine uses for a given context length.

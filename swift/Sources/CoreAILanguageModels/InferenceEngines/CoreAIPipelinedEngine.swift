@@ -61,6 +61,8 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
     /// The tree's nodes for the current history's leading full chunks, in order: what is already
     /// published, and the parent of the next chunk to publish.
     nonisolated(unsafe) var publishedKeys: [PrefixTree.Key] = []
+    /// The tree's disk tier, when the options give it a directory and a budget.
+    let prefixStore: PrefixCacheStore?
 
     private let engineInUse = Atomic<Bool>(false)
     let config: ModelConfig
@@ -86,6 +88,7 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
         let engine = try await EngineImpl(
             config: config, preparedModel: preparedModel, options: options)
         let unsupported = engine.prefixCacheUnsupportedReason
+        let geometry = engine.prefixCacheGeometry(chunkTokens: Self.prefixChunkTokens)
         self.engine = engine
         self.config = config
         if options.prefixCacheBytes > 0 {
@@ -95,6 +98,12 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
                 prefixTree = PrefixTree(
                     chunkTokens: Self.prefixChunkTokens, byteBudget: options.prefixCacheBytes)
             }
+        }
+        if prefixTree != nil, options.prefixCacheDiskBytes > 0, let directory = options.prefixCacheDirectory {
+            prefixStore = PrefixCacheStore(
+                directory: directory, byteBudget: options.prefixCacheDiskBytes, geometry: geometry)
+        } else {
+            prefixStore = nil
         }
     }
 
@@ -290,9 +299,13 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
                 await forwarding
                 stopReasonStore.setIfUnset(.maxTokens)
                 outputContinuation.finish()
+                // With the reply out, so the client doesn't wait: a server stopped before its next
+                // request still keeps this one on disk.
+                await self.publishHistory()
             } catch is CancellationError {
                 stopReasonStore.set(.cancelled)
                 outputContinuation.finish()
+                await self.publishHistory()
             } catch {
                 if let resumeAt, self.engine.processedTokenCount == resumeAt {
                     // Refused before any step ran, such as a prompt past the context: what the engine
