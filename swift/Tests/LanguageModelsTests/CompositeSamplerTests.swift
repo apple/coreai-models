@@ -620,6 +620,80 @@ struct CompositeSamplerTests {
         #expect(CompositeSampler.sample(from: &single, config: config, using: &rng) == 77)
     }
 
+    @Test(
+        "Every +inf logit is reachable",
+        arguments: [
+            SamplingConfiguration(temperature: 1.0, topP: 0.9),
+            SamplingConfiguration(temperature: 1.0, minP: 0.05),
+            SamplingConfiguration(temperature: 1.0, topK: 40, topP: 0.9),
+        ])
+    func infiniteLogitsAreAllReachable(config: SamplingConfiguration) {
+        var rng = Xoshiro256StarStar(seed: 0xAB)
+        let infinite: Set<Int32> = [1_000, 200_000]
+        var raw = makeLargeVocabLogits(vocab: 262_144, seed: 0xFACE)
+        for i in infinite { raw[Int(i)] = .infinity }
+        var seen = Set<Int32>()
+        for _ in 0..<64 {
+            var logits = raw
+            seen.insert(CompositeSampler.sample(from: &logits, config: config, using: &rng))
+        }
+        #expect(seen == infinite)
+    }
+
+    @Test(
+        "+inf logits are sampled uniformly, on every path",
+        arguments: [
+            SamplingConfiguration(temperature: 1.0),
+            SamplingConfiguration(temperature: 1.0, topK: 8),
+            SamplingConfiguration(temperature: 1.0, topP: 0.9),
+            SamplingConfiguration(temperature: 1.0, minP: 0.05),
+            SamplingConfiguration(temperature: 1.0, topP: 0.9, minP: 0.05),
+        ])
+    func infiniteLogitsAreSampledUniformly(config: SamplingConfiguration) {
+        var rng = Xoshiro256StarStar(seed: 0xC0DE)
+        let infinite: [Int] = [3, 500, 1_001, 4_000]
+        var raw = makeLargeVocabLogits(vocab: 4_096, seed: 0xD00D)
+        for i in infinite { raw[i] = .infinity }
+        var counts: [Int32: Int] = [:]
+        let draws = 4_000
+        for _ in 0..<draws {
+            var logits = raw
+            counts[CompositeSampler.sample(from: &logits, config: config, using: &rng), default: 0] += 1
+        }
+        #expect(Set(counts.keys) == Set(infinite.map(Int32.init)))
+        // Expected 1,000 each; 5 sigma of Binomial(4000, 0.25) is about 137.
+        for (_, c) in counts { #expect(abs(c - draws / infinite.count) < 150) }
+    }
+
+    @Test("Float16 overflow to +inf, with -inf masked positions, still samples the +inf tokens")
+    func float16InfiniteLogitsWithMask() {
+        var rng = Xoshiro256StarStar(seed: 0x16)
+        var raw = [Float16](repeating: -.infinity, count: 1_024)
+        raw[10] = .infinity
+        raw[900] = .infinity
+        raw[11] = 5
+        var seen = Set<Int32>()
+        for config in [
+            SamplingConfiguration(temperature: 1.0),
+            SamplingConfiguration(temperature: 1.0, topP: 0.9),
+            SamplingConfiguration(temperature: 1.0, minP: 0.1),
+            SamplingConfiguration(temperature: 1.0, topK: 4, topP: 0.9),
+        ] {
+            for _ in 0..<64 {
+                var logits = raw
+                seen.insert(CompositeSampler.sample(from: &logits, config: config, using: &rng))
+            }
+        }
+        #expect(seen == [10, 900])
+    }
+
+    @Test("softmax of a vector with +inf entries is a uniform distribution over them")
+    func softmaxWithInfiniteEntries() {
+        var v: [Float] = [1, .infinity, -.infinity, .infinity, 2]
+        CompositeSampler.softmaxVectorized(&v)
+        #expect(v == [0, 0.5, 0, 0.5, 0])
+    }
+
     // MARK: - Test helpers
 
     /// Build a Float32 logits array of `vocab` length where `allowed` indices hold `fill`

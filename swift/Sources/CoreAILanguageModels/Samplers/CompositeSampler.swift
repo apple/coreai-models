@@ -222,6 +222,20 @@ public struct CompositeSampler {
         var maxLogit: Float = 0
         vDSP_maxv(logits, 1, &maxLogit, n)
 
+        // A +inf logit (e.g. fp16 overflow) dominates every finite one, so the limit of the
+        // softmax is uniform over the +inf positions. Subtracting the max would give inf - inf = NaN.
+        if maxLogit == .infinity {
+            var infiniteCount: Float = 0
+            for i in logits.indices {
+                let isInfinite = logits[i] == .infinity
+                logits[i] = isInfinite ? 1 : 0
+                if isInfinite { infiniteCount += 1 }
+            }
+            var invCount = 1 / infiniteCount
+            vDSP_vsmul(logits, 1, &invCount, &logits, 1, n)
+            return
+        }
+
         var negMax = -maxLogit
         vDSP_vsadd(logits, 1, &negMax, &logits, 1, n)
 
