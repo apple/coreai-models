@@ -7,6 +7,7 @@ import Foundation
 import Testing
 
 @testable import CoreAILanguageModels
+@testable import CoreAIShared
 
 // MARK: - Mock Clock for Testing
 
