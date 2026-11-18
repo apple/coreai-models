@@ -52,7 +52,7 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional, cast
+from typing import Any, cast
 
 import torch
 import yaml
@@ -111,10 +111,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 # headers. Other checkpoints are accepted with a warning and need an explicit
 # --compression-config: they may trace and export, but nothing about the result is verified.
 IOS_COMPRESSION_CONFIGS = {
-    "Qwen/Qwen3.5-2B": Path(__file__).resolve().parent
-    / "qwen3_5_2b_4bit_palettized.yaml",
-    "Qwen/Qwen3.5-4B": Path(__file__).resolve().parent
-    / "qwen3_5_4b_4bit_palettized.yaml",
+    "Qwen/Qwen3.5-2B": Path(__file__).resolve().parent / "qwen3_5_2b_4bit_palettized.yaml",
+    "Qwen/Qwen3.5-4B": Path(__file__).resolve().parent / "qwen3_5_4b_4bit_palettized.yaml",
 }
 SUPPORTED_MODELS = tuple(IOS_COMPRESSION_CONFIGS)
 
@@ -219,17 +217,13 @@ def _default_output_name(hf_model_id: str, compression: str) -> str:
     return f"{compression if already_prefixed else f'{base}_{compression}'}_static"
 
 
-def _resolve_bundle_paths(
-    output_dir: str, output_name: str, overwrite: bool
-) -> tuple[Path, Path]:
+def _resolve_bundle_paths(output_dir: str, output_name: str, overwrite: bool) -> tuple[Path, Path]:
     """Create the bundle directory and clear a stale asset. Returns (bundle, asset)."""
     bundle_path = Path(output_dir) / output_name
     aimodel_path = bundle_path / f"{output_name}.aimodel"
     if aimodel_path.exists():
         if not overwrite:
-            raise SystemExit(
-                f"{aimodel_path} already exists. Use --overwrite to replace it."
-            )
+            raise SystemExit(f"{aimodel_path} already exists. Use --overwrite to replace it.")
         shutil.rmtree(aimodel_path)
     bundle_path.mkdir(parents=True, exist_ok=True)
     return bundle_path, aimodel_path
@@ -261,9 +255,7 @@ def _int_list(raw: str) -> tuple[int, ...]:
     try:
         values = tuple(int(x) for x in raw.split(",") if x.strip())
     except ValueError as exc:
-        raise argparse.ArgumentTypeError(
-            f"expected comma-separated integers, got {raw!r}"
-        ) from exc
+        raise argparse.ArgumentTypeError(f"expected comma-separated integers, got {raw!r}") from exc
     if not values:
         raise argparse.ArgumentTypeError("expected at least one integer")
     if any(v <= 0 for v in values):
@@ -275,9 +267,9 @@ def _int_list(raw: str) -> tuple[int, ...]:
 class DevOverrides:
     """Developer-only narrowing of the ladder via the ``--dev-*`` flags."""
 
-    extend_qlens: Optional[tuple[int, ...]] = None
-    prompt_qlens: Optional[tuple[int, ...]] = None
-    ladder_only: Optional[tuple[int, ...]] = None
+    extend_qlens: tuple[int, ...] | None = None
+    prompt_qlens: tuple[int, ...] | None = None
+    ladder_only: tuple[int, ...] | None = None
 
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> "DevOverrides":
@@ -298,7 +290,11 @@ class DevOverrides:
                 logger.warning(f"DEV OVERRIDE: {label} restricted to {list(value)}")
 
 
-def _extend_query_lengths(dev: DevOverrides = DevOverrides()) -> list[int]:
+# Shared default for the `dev` parameters: no narrowing. Safe to share since DevOverrides is frozen.
+NO_DEV_OVERRIDES = DevOverrides()
+
+
+def _extend_query_lengths(dev: DevOverrides = NO_DEV_OVERRIDES) -> list[int]:
     """Q-lengths to specialize the decode (``extend_*``) functions for.
 
     ``--dev-extend-qlens`` overrides; defaults to :data:`DECODE_QUERY_LEN`.
@@ -306,7 +302,7 @@ def _extend_query_lengths(dev: DevOverrides = DevOverrides()) -> list[int]:
     return list(dev.extend_qlens or (DECODE_QUERY_LEN,))
 
 
-def _prompt_query_lengths(dev: DevOverrides = DevOverrides()) -> list[int]:
+def _prompt_query_lengths(dev: DevOverrides = NO_DEV_OVERRIDES) -> list[int]:
     """Q-lengths to specialize the prefill (``prompt_opt_*``) functions for.
 
     ``--dev-prompt-qlens`` overrides; defaults to :data:`PREFILL_QUERY_LEN`.
@@ -326,9 +322,7 @@ def _flash_block_size(model: Qwen3_5ForCausalLMForiOS) -> int | None:
     return None
 
 
-def context_ladder(
-    max_context_length: int, dev: DevOverrides = DevOverrides()
-) -> list[int]:
+def context_ladder(max_context_length: int, dev: DevOverrides = NO_DEV_OVERRIDES) -> list[int]:
     """Context buckets: the :data:`SHIPPING_CONTEXT_LADDER` entries below the smallest power of
     two covering ``max_context_length``, then that power of two.
 
@@ -428,7 +422,7 @@ def _export_ladder_programs(
     model: Qwen3_5ForCausalLMForiOS,
     config: Any,
     buckets: list[int],
-    dev: DevOverrides = DevOverrides(),
+    dev: DevOverrides = NO_DEV_OVERRIDES,
 ) -> dict[str, torch.export.ExportedProgram]:
     """Trace the transformer once per ``(bucket, family)``, fully static.
 
@@ -470,9 +464,7 @@ def _export_aux_programs(
     program specialized over the query lengths serves the whole ladder.
     """
     embedding_table = model.load_embeddings.embedding_table
-    input_ids = torch.randint(
-        1, config.vocab_size, (1, DECODE_QUERY_LEN), dtype=torch.int32
-    )
+    input_ids = torch.randint(1, config.vocab_size, (1, DECODE_QUERY_LEN), dtype=torch.int32)
     seq_len_dim = torch.export.Dim("seq_len", max=max_context_length)
     with torch.no_grad():
         logger.info("Exporting gather_embeddings module...")
@@ -499,9 +491,7 @@ async def _convert_ladder_to_coreai(
     They do take hardware constraints, and those are per-bucket: see
     :func:`forward_constraints`. All entrypoints share one copy of the weights.
     """
-    mode = (
-        TorchConverter.Mode.DEBUG if include_debug_info else TorchConverter.Mode.RELEASE
-    )
+    mode = TorchConverter.Mode.DEBUG if include_debug_info else TorchConverter.Mode.RELEASE
     converter = TorchConverter(mode=mode)
     register_custom_torch_lowering(converter)
 
@@ -559,7 +549,7 @@ async def _export_ladder(
     config: Any,
     max_context_length: int,
     include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
-    dev: DevOverrides = DevOverrides(),
+    dev: DevOverrides = NO_DEV_OVERRIDES,
 ) -> AIProgram:
     """Export Qwen3.5 as a per-bucket static ladder ``AIProgram``."""
     buckets = context_ladder(max_context_length, dev)
@@ -571,9 +561,7 @@ async def _export_ladder(
     )
 
     ladder_programs = _export_ladder_programs(model, config, buckets, dev)
-    gather_program, load_program = _export_aux_programs(
-        model, config, max_context_length
-    )
+    gather_program, load_program = _export_aux_programs(model, config, max_context_length)
     logger.info(f"Traced {len(ladder_programs) + 2} functions.")
 
     return await _convert_ladder_to_coreai(
@@ -595,9 +583,7 @@ def _build_palettization_inputs(
     """
     ctx = min(SHIPPING_CONTEXT_LADDER[0], max_context_length)
     graph_inputs = _forward_inputs(model, config, ctx, DECODE_QUERY_LEN)
-    input_ids = torch.randint(
-        1, config.vocab_size, (1, DECODE_QUERY_LEN), dtype=torch.int32
-    )
+    input_ids = torch.randint(1, config.vocab_size, (1, DECODE_QUERY_LEN), dtype=torch.int32)
     return (
         input_ids,
         graph_inputs[POSITION_IDS_INPUT_NAME],
@@ -633,13 +619,9 @@ async def _export_ios(args: argparse.Namespace) -> str:
     else:
         compression = "none"
     output_name = args.output_name or _default_output_name(hf_model_id, compression)
-    bundle_path, aimodel_path = _resolve_bundle_paths(
-        args.output_dir, output_name, args.overwrite
-    )
+    bundle_path, aimodel_path = _resolve_bundle_paths(args.output_dir, output_name, args.overwrite)
 
-    logger.info(
-        f"Loading {hf_model_id} (iOS, dtype={target_dtype}, max_ctx={max_ctx})..."
-    )
+    logger.info(f"Loading {hf_model_id} (iOS, dtype={target_dtype}, max_ctx={max_ctx})...")
 
     # Move loaded weights to disk-backed mmap tensors so the OS can evict weight pages during
     # palettization and the long ladder conversion. The temp dir must outlive every read of the
@@ -649,9 +631,7 @@ async def _export_ios(args: argparse.Namespace) -> str:
 
         # The checkpoint is a VLM; report fields from its text config.
         text_config = (
-            hf_config.get_text_config()
-            if hasattr(hf_config, "get_text_config")
-            else hf_config
+            hf_config.get_text_config() if hasattr(hf_config, "get_text_config") else hf_config
         )
         native_max_ctx = getattr(text_config, "max_position_embeddings", None)
         if native_max_ctx is not None and max_ctx > native_max_ctx:
@@ -706,9 +686,7 @@ async def _export_ios(args: argparse.Namespace) -> str:
             compression=compression,
             name=output_name,
         )
-        _patch_language_metadata(
-            bundle_path, hf_model_id, text_config, _ios_metadata_extras()
-        )
+        _patch_language_metadata(bundle_path, hf_model_id, text_config, _ios_metadata_extras())
 
     logger.info(f"Export complete: {bundle_path}")
     return str(bundle_path)
@@ -778,9 +756,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Custom bundle name (without extension)",
     )
-    parser.add_argument(
-        "--overwrite", action="store_true", help="Overwrite an existing bundle"
-    )
+    parser.add_argument("--overwrite", action="store_true", help="Overwrite an existing bundle")
     parser.add_argument(
         "--include-debug-info",
         action="store_true",
@@ -788,9 +764,7 @@ def build_parser() -> argparse.ArgumentParser:
         "Default: off, which embeds minimum debug information and makes the exported asset "
         "smaller.",
     )
-    parser.add_argument(
-        "--verbose", "-v", action="store_true", help="Enable DEBUG logging"
-    )
+    parser.add_argument("--verbose", "-v", action="store_true", help="Enable DEBUG logging")
 
     # Developer-only narrowing. A full ladder traces every context bucket at every
     # query length; these cut that down so one rung can be debugged in minutes.
@@ -828,13 +802,9 @@ def _resolve_platform_defaults(args: argparse.Namespace) -> None:
 
     if args.compute_precision != "float16":
         raise SystemExit(
-            f"--platform iOS requires --compute-precision float16 "
-            f"(got '{args.compute_precision}')."
+            f"--platform iOS requires --compute-precision float16 (got '{args.compute_precision}')."
         )
-    if (
-        args.max_context_length is not None
-        and args.max_context_length > IOS_MAX_CONTEXT_LENGTH
-    ):
+    if args.max_context_length is not None and args.max_context_length > IOS_MAX_CONTEXT_LENGTH:
         raise SystemExit(
             f"--platform iOS supports at most {IOS_MAX_CONTEXT_LENGTH} tokens "
             f"(got {args.max_context_length}); `position_ids` is a uint16 input, so a larger "
@@ -866,9 +836,7 @@ def _resolve_platform_defaults(args: argparse.Namespace) -> None:
         args.compression_config = default
 
     if args.compression_config is not None and not args.compression_config.is_file():
-        raise SystemExit(
-            f"--compression-config: file not found: {args.compression_config}"
-        )
+        raise SystemExit(f"--compression-config: file not found: {args.compression_config}")
 
 
 def main() -> None:
