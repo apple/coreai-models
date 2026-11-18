@@ -249,6 +249,13 @@ package struct PrefixTree: Sendable {
         return true
     }
 
+    /// Drops every node, counting them as evicted, for a caller short of memory.
+    package mutating func removeAll() {
+        evictedNodes += nodes.count
+        nodes = [:]
+        bytesHeld = 0
+    }
+
     // MARK: - Eviction
 
     /// Evicts least-recently-used leaves until `bytes` more fit, never `keeping` or its ancestors.

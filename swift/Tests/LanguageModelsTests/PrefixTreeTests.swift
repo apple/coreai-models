@@ -83,10 +83,15 @@ struct PrefixTreeTests {
     @Test("A chunk's name depends on every token before it, so the same chunk after another prefix is a different node")
     func keysChain() {
         var tree = PrefixTree(chunkTokens: Self.chunk, byteBudget: 1 << 20)
+        // A then B, and C on its own: B's chunk is held, but only after A.
+        let chunkB = Array(Self.tokens(8)[4..<8])
         Self.publish(Self.tokens(8), into: &tree)
-        let other = Self.tokens(4, from: 50) + Array(Self.tokens(8)[4..<8])
-        let otherPrefix = tree.match(other, limit: other.count - 1, needsSnapshot: false)
-        #expect(otherPrefix.isEmpty)
+        Self.publish(Self.tokens(4, from: 50), into: &tree)
+        let afterC = Self.tokens(4, from: 50) + chunkB + [0]
+        let match = tree.match(afterC, limit: afterC.count - 1, needsSnapshot: false)
+        // C matches; B after C is another node, which no one published.
+        #expect(match.reusedTokens == 4)
+        #expect(match.chunks == [Self.kv(1)])
         #expect(
             PrefixTree.chain(PrefixTree.rootKey, Self.tokens(4)[...])
                 != PrefixTree.chain(PrefixTree.chain(PrefixTree.rootKey, Self.tokens(4)[...]), Self.tokens(4)[...]))
@@ -183,6 +188,18 @@ struct PrefixTreeTests {
         #expect(oversized == nil)
         #expect(!read)
         #expect(tree.nodeCount == 1)
+    }
+
+    @Test("Dropping everything for memory empties the tree and counts what went")
+    func removeAll() {
+        var tree = PrefixTree(chunkTokens: Self.chunk, byteBudget: 1 << 20)
+        Self.publish(Self.tokens(12), into: &tree)
+        tree.removeAll()
+        #expect(tree.nodeCount == 0 && tree.bytesHeld == 0 && tree.evictedNodes == 3)
+        let after = tree.match(Self.tokens(13), limit: 12, needsSnapshot: false)
+        #expect(after.isEmpty)
+        // It takes chunks again from the root.
+        #expect(Self.publish(Self.tokens(4), into: &tree).count == 1)
     }
 
     @Test("A chunk that can't fit beside the chain it extends evicts nothing")

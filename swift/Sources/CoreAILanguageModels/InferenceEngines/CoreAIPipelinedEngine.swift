@@ -103,6 +103,19 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
 
     var prefixCacheEnabled: Bool { prefixTree != nil }
 
+    func shedPrefixCache() -> Int {
+        guard prefixTree != nil, tryAcquireEngine() else { return 0 }
+        defer { releaseEngine() }
+        let freed =
+            (prefixTree?.bytesHeld ?? 0)
+            + engine.capturedSnapshots.reduce(0) { $0 + $1.copies.reduce(0) { $0 + $1.length } }
+        prefixTree?.removeAll()
+        publishedKeys = []
+        engine.capturedSnapshots = []
+        if freed > 0 { CLILogger.log("prefix cache: dropped \(freed >> 20) MB to give memory back") }
+        return freed
+    }
+
     // MARK: - Prefix cache
 
     /// Publishes the current history's full chunks not yet in the tree, and the recurrent snapshot
@@ -796,6 +809,9 @@ private struct EngineImpl: ~Copyable {
     var hasNonTruncatableStates: Bool
     /// Whether KV pairs beyond the first live in ``additionalStates``, at full size.
     let hasExtraGrowingStates: Bool
+    /// Whether a sliding-window state, other than a ring the KV cache keeps, lives in
+    /// ``additionalStates``.
+    let hasSlidingStates: Bool
 
     // Slots in the sliding ring, if any. Guards write-first `main` steps, and prefill chunks
     // break at ring boundaries.
@@ -1066,6 +1082,7 @@ private struct EngineImpl: ~Copyable {
         self.additionalStates = additionalStatesLocal
         self.hasNonTruncatableStates = classified.contains(where: { $0.kind == .fixed })
         self.hasExtraGrowingStates = !extraGrowingNames.isEmpty
+        self.hasSlidingStates = classified.contains(where: { $0.kind == .slidingCache })
         self.slidingRingCapacity = StateHandlerFactory.slidingRingCapacity(
             classified: classified, descriptor: descriptor)
         self.logits = logitsRef
@@ -1912,7 +1929,7 @@ private struct EngineImpl: ~Copyable {
             for chunk in splittingAtStops(plan, stepTokens: prefillMaxQueryLength) {
                 try await _encodeChunk(tokens: Array(head.prefix(chunk)))
                 head = head.dropFirst(chunk)
-                snapshotIfDue()
+                await snapshotIfDue()
             }
             return prompt.suffix(1)
         }
@@ -1948,7 +1965,7 @@ private struct EngineImpl: ~Copyable {
                 try logits.ensureCapacity(forContextLength: head)
                 try await _encodeChunk(tokens: Array(prompt.prefix(head)))
                 prompt = prompt.dropFirst(head)
-                snapshotIfDue()
+                await snapshotIfDue()
             }
         }
 
@@ -1983,7 +2000,7 @@ private struct EngineImpl: ~Copyable {
         for size in plan.dropLast() {
             try await _encodeChunk(tokens: Array(remainingTokens.prefix(size)))
             remainingTokens = remainingTokens.dropFirst(size)
-            snapshotIfDue()
+            await snapshotIfDue()
         }
 
         return remainingTokens
@@ -2083,6 +2100,8 @@ private struct EngineImpl: ~Copyable {
         if slidingRingCapacity != nil { return "its sliding-window cache is a ring" }
         // A KV pair beyond the first sits in `additionalStates` and would not be restored with it.
         if hasExtraGrowingStates { return "it has a second growing KV cache" }
+        // Only `.fixed` states are snapshotted; a sliding one would be left as zeros by a restore.
+        if hasSlidingStates { return "it keeps a sliding-window state outside its KV cache" }
         // A fixed query length cannot take the split a snapshot needs.
         if case .fixed(let length) = inputLayout.queryPolicy, length > 1 {
             return "its graph takes a fixed query length of \(length)"
@@ -2121,14 +2140,17 @@ private struct EngineImpl: ~Copyable {
 
     /// Saves the recurrent state when prefill has just reached the next of ``snapshotPositions``.
     ///
-    /// The copy is queued on the GPU after the step that got here, on the queue that step runs on, so
-    /// it holds what that step left and prefill does not wait for it.
-    private mutating func snapshotIfDue() {
+    /// A copy on the GPU, so nothing is read back here. It waits for the stream first: nothing promises
+    /// that the step which got here has reached the queue when its encode returns, and a copy queued
+    /// ahead of it would hold the state from before it.
+    private mutating func snapshotIfDue() async {
         // A position prefill went past without stopping can't be taken any more.
         snapshotPositions.removeAll { $0 < processedTokenCount }
         guard snapshotPositions.first == processedTokenCount else { return }
         snapshotPositions.removeFirst()
-        guard let states = additionalStates, let commandBuffer = pipelineQueue.makeCommandBuffer(),
+        guard let states = additionalStates else { return }
+        await computeStream.currentWorkCompleted()
+        guard let commandBuffer = pipelineQueue.makeCommandBuffer(),
             let copies = states.encodeSnapshot(on: commandBuffer)
         else { return }
         commandBuffer.commit()
