@@ -7,7 +7,7 @@
 ///
 /// Backs reproducible sampling: given the same seed, `next()` produces the same
 /// sequence of values on every run and every machine. Use it with
-/// `CompositeSampler.sample(from:config:using:)` (via `SamplingConfiguration.seed`)
+/// `ReferenceSampler.sample(from:config:using:)` (via `SamplingConfiguration.seed`)
 /// when a generation must be repeatable — determinism-under-load tests, evals, and
 /// bug reproduction. For ordinary generation, leave `seed` nil so the engine uses
 /// the system generator.

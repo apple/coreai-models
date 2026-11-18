@@ -371,7 +371,7 @@ package struct SamplingParameterError: Error, Equatable, Sendable {
 }
 
 extension SamplingConfiguration {
-    /// Samples the next token using CPU fallback samplers.
+    /// Samples the next token on the CPU.
     ///
     /// Routes to the appropriate sampler based on configuration:
     /// - Temperature == 0: Greedy (argmax)
@@ -382,10 +382,10 @@ extension SamplingConfiguration {
     ///   - step: Generation step index. Required when `seed` is set (each step derives its own
     ///     generator from `(seed, step)`); ignored otherwise.
     /// - Returns: The sampled token ID.
-    public func fallbackSampler(from logits: inout [LogitsScalarType], step: Int? = nil) -> Int32 {
+    public func cpuSampler(from logits: inout [LogitsScalarType], step: Int? = nil) -> Int32 {
         precondition(
             !needsRepetitionPenalty,
-            "Use fallbackSampler(from:tokenHistory:) when repetition penalty is configured"
+            "Use cpuSampler(from:tokenHistory:) when repetition penalty is configured"
         )
         return sampleToken(from: &logits, step: step)
     }
@@ -403,7 +403,7 @@ extension SamplingConfiguration {
     ///   - logitSoftcap: The model's final-logit soft cap, for models whose graph leaves it
     ///     out; see ``LogitSoftcapProcessor``.
     /// - Returns: The sampled token ID.
-    public func fallbackSampler(
+    public func cpuSampler(
         from logits: inout [LogitsScalarType],
         tokenHistory: some Collection<Int32>,
         step: Int? = nil,
@@ -430,7 +430,7 @@ extension SamplingConfiguration {
     /// With `seed` set, each step derives its own `SeededRandomNumberGenerator` from
     /// `(seed, step)`, so the sampled token is reproducible and independent of any running
     /// generator's stream position. With `seed` nil, the system generator is used. Greedy
-    /// (temperature 0) is argmax and ignores the generator. Used by both `fallbackSampler` and
+    /// (temperature 0) is argmax and ignores the generator. Used by both `cpuSampler` and
     /// the constrained-decoding path so seeded sampling is reproducible everywhere.
     ///
     /// - Parameters:
@@ -440,12 +440,29 @@ extension SamplingConfiguration {
     /// - Returns: The sampled token ID.
     public func sampleToken(from logits: inout [LogitsScalarType], step: Int?) -> Int32 {
         guard let seed else {
-            return CompositeSampler.sample(from: &logits, config: self)
+            return ReferenceSampler.sample(from: &logits, config: self)
         }
         guard let step else {
             preconditionFailure("A generation step index is required when a sampling seed is set.")
         }
         var rng = CoreAIShared.SeededRandomNumberGenerator(seed: seed &+ UInt64(bitPattern: Int64(step)))
-        return CompositeSampler.sample(from: &logits, config: self, using: &rng)
+        return ReferenceSampler.sample(from: &logits, config: self, using: &rng)
+    }
+
+    /// The former name of ``cpuSampler(from:step:)``.
+    @available(*, deprecated, renamed: "cpuSampler(from:step:)")
+    public func fallbackSampler(from logits: inout [LogitsScalarType], step: Int? = nil) -> Int32 {
+        cpuSampler(from: &logits, step: step)
+    }
+
+    /// The former name of ``cpuSampler(from:tokenHistory:step:logitSoftcap:)``.
+    @available(*, deprecated, renamed: "cpuSampler(from:tokenHistory:step:logitSoftcap:)")
+    public func fallbackSampler(
+        from logits: inout [LogitsScalarType],
+        tokenHistory: some Collection<Int32>,
+        step: Int? = nil,
+        logitSoftcap: Double? = nil
+    ) -> Int32 {
+        cpuSampler(from: &logits, tokenHistory: tokenHistory, step: step, logitSoftcap: logitSoftcap)
     }
 }
