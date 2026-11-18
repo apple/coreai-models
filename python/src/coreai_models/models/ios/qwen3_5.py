@@ -636,6 +636,9 @@ class Qwen3_5ForCausalLMForiOS(BaseForCausalLMForiOS):
     def _get_reauthored_config(cls, hf_config, max_context_length=None, num_layers=None):
         # Unwrap the text backbone from the multimodal config.
         tc = hf_config.get_text_config() if hasattr(hf_config, "get_text_config") else hf_config
+        if not getattr(tc, "tie_word_embeddings", True):
+            # The iOS graph computes logits from the int8 embedding table and drops lm_head.
+            raise ValueError("Qwen3.5 on iOS requires tied input/output embeddings.")
         if max_context_length is not None:
             tc.max_position_embeddings = max_context_length
         if num_layers is not None:

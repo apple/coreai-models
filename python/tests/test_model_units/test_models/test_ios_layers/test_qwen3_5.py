@@ -440,13 +440,15 @@ class TestConvRingWrap:
         the selector; the values must survive the wrap."""
         width = SSMStateHandler.ring_width(self.KERNEL, self.MAX_Q)
         conv_dim, kernel_window = 6, self.KERNEL - 1
-        ring = torch.zeros(1, conv_dim, 1, width)
+        handler = SSMStateHandler(1, conv_dim, width, num_v_heads=1, head_k_dim=1, head_v_dim=1)
+        handler.register_state(torch.zeros(1, conv_dim, 1, width), torch.zeros(1, 1, 1, 1))
 
-        # Walk past the end of the ring so at least one block wraps.
+        # Walk past the end of the ring so at least one block wraps. Each block goes through
+        # the model's write primitive, so its begin/end arithmetic is what is tested.
         for start in range(0, 2 * width, self.MAX_Q):
             block = torch.full((1, conv_dim, 1, self.MAX_Q), float(start + 1))
-            offset = start % width
-            ring[:, :, :, offset : offset + self.MAX_Q] = block
+            conv_step = torch.tensor([start % width], dtype=torch.int32)
+            ring = handler.conv_update_and_fetch(0, conv_step, block, self.MAX_Q)
 
             selector = SSMStateHandler.build_seed_selector(
                 width, kernel_window, start, self.MAX_Q, dtype=torch.float32
@@ -540,12 +542,30 @@ class TestExportRecipe:
                 f"expected {interleave * ctx} (its own ctx)"
             )
 
-    def test_caches_are_constrained_on_input_and_output(self):
-        """The mutated output aliases the input, so it needs the same layout."""
+    def test_registry_points_ios_export_at_the_recipe(self):
+        """`coreai.llm.export --variant iOS` must refuse Qwen3.5 up front and name the recipe,
+        so the registry entry has to point at a script that exists."""
+        from coreai_models.models.registry import get_model_entry
+
+        entry = get_model_entry("qwen3_5")
+        assert entry.ios_export_script == "models/qwen3_5/export.py"
+        repo_root = pathlib.Path(__file__).resolve().parents[5]
+        assert (repo_root / entry.ios_export_script).is_file()
+
+    def test_constraints_name_real_graph_io(self):
+        """Constraints are looked up by I/O name, so a name the graph does not have is
+        silently ignored. Every constrained name must be an input, state or state output."""
         recipe = _recipe()
+        cls = Qwen3_5ForCausalLMForiOS
+        io_names = (
+            set(cls.export_input_names()[EXTEND_FUNCTION_NAME])
+            | set(cls.export_state_names()[EXTEND_FUNCTION_NAME])
+            | set(cls.export_state_output_names()[EXTEND_FUNCTION_NAME])
+        )
         constraints = recipe.forward_constraints(1024)
-        for name in ("key_cache", "value_cache"):
-            assert constraints[name] == constraints[f"new_{name[0]}_cache"]
+        assert set(constraints) <= io_names, sorted(set(constraints) - io_names)
+        for name in ("key_cache", "value_cache", "conv_state", "recurrent_state"):
+            assert name in constraints, f"{name} has no layout constraint"
 
     def test_both_deltanet_states_interleave_the_channel_axis(self):
         """Rank 4, so the channel axis is index 1."""

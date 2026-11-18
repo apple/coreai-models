@@ -207,6 +207,9 @@ the query block.
 
 ### Runner side
 
+Running the iOS bundle needs the static-shape engine's DeltaNet support
+([apple/coreai-models#543](https://github.com/apple/coreai-models/pull/543)), described here.
+
 `InputHandler+DeltaNet.swift` fills the three extra graph inputs. `conv_step` and
 `conv_seed_selector` address the ring; `ssm_update_flag` marks which slots hold a real,
 not-yet-processed token.
@@ -216,9 +219,10 @@ length, so a decode call re-sends tokens the model has already seen. The KV cach
 position-addressed and idempotent under that; a recurrent state is not, and re-applying a
 token's update corrupts it. `metadata.json` pins `language.states` so the engine classifies the
 two DeltaNet states as `fixed`; they cannot be truncated, since a partial reset would leave a
-recurrent state matching no prefix. The engine reports this as `rollbackCapability == .startOnly`:
-any resume that would rewind restarts at 0 and replays the prompt, `reset(to:)` accepts only 0,
-and a bundle whose graph has DeltaNet inputs but no `fixed` states is rejected at load.
+recurrent state matching no prefix. The engine treats such a state set as start-only (and
+reports `hasRecurrentState`): any resume that would rewind restarts at 0 and replays the prompt,
+`reset(to:)` accepts only 0 or the current position, and a bundle whose graph has DeltaNet inputs
+but no `fixed` states is rejected at load.
 
 The checkpoint's multi-token-prediction (MTP) head is not exported.
 
@@ -226,8 +230,8 @@ The checkpoint's multi-token-prediction (MTP) head is not exported.
 
 The checkpoint ships no `generation_config.json`. The model card's non-thinking text recipe
 is `temperature=1.0, top_p=1.0, top_k=20, min_p=0.0, presence_penalty=2.0`. The
-`0.7 / 0.8 / 20` figures on the card are its VL recipe. `llm-runner` takes all of these,
-including `--presence-penalty`.
+`0.7 / 0.8 / 20` figures on the card are its VL recipe. `llm-runner` takes all of these;
+`--presence-penalty` comes with the runtime support above.
 
 The 2B's chat template is non-thinking by default. The 4B's default template opens a `<think>`
 block; for direct answers, render the prompt with `enable_thinking=False` and pass it with

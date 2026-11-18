@@ -103,6 +103,10 @@ class ModelEntry:
     # tokenizer (e.g. a drafter that shares one with its target model), set
     # this to the HF model ID that carries the tokenizer.
     tokenizer_model_id: str | None = None
+    # iOS models that export through their own script rather than `coreai.llm.export` (the
+    # `ios_class` then serves evaluation only). `coreai.llm.export --variant iOS` refuses
+    # them up front and points at the script.
+    ios_export_script: str | None = None
     # Speculative decoding: drafter model class, HF checkpoint, and runtime config.
     # When all three are set, ``--with-drafter`` exports the drafter alongside the
     # target into the same bundle.
@@ -199,8 +203,8 @@ def _get_registry() -> dict[str, ModelEntry]:
         # Both checkpoints wrap the decoder under `text_config` / `model.language_model.`.
         "qwen3_5": ModelEntry(
             macos_class=Qwen3_5ForCausalLM,
-            # iOS exports through models/qwen3_5/export.py; the entry serves evaluation.
             ios_class=Qwen3_5ForCausalLMForiOS,
+            ios_export_script="models/qwen3_5/export.py",
             hf_config_attr="text_config",
             hf_state_dict_prefix="model.language_model.",
         ),

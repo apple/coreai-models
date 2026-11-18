@@ -70,14 +70,12 @@ from coreai_models._constants import (
     GATHER_EMBEDDINGS_FUNCTION_NAME,
     IN_STEP_INPUT_NAME,
     KEY_CACHE_INPUT_NAME,
-    KEY_CACHE_OUTPUT_NAME,
     LOAD_EMBEDDINGS_FUNCTION_NAME,
     POSITION_IDS_INPUT_NAME,
     PROMPT_OPT_FUNCTION_NAME,
     TOKEN_IDS_INPUT_NAME,
     TRANSFORMER_INPUT_NAME,
     VALUE_CACHE_INPUT_NAME,
-    VALUE_CACHE_OUTPUT_NAME,
 )
 from coreai_models.export.bundle import bundle_llm_asset
 from coreai_models.export.compression import palettize_pytorch_model
@@ -149,21 +147,25 @@ def _resolve_eos_token_ids(hf_model_id: str, config: Any) -> list[int]:
         elif isinstance(value, int) and value not in ids:
             ids.append(value)
 
+    # A checkpoint without generation_config.json falls back to the tokenizer and model
+    # config; any other failure (network, a corrupt file) raises, so a bundle never ships
+    # missing the chat terminator.
     try:
         _add(GenerationConfig.from_pretrained(hf_model_id).eos_token_id)
-    except Exception as exc:  # noqa: BLE001
-        logger.info(
-            f"No generation config for eos tokens ({exc.__class__.__name__}); "
-            "falling back to the tokenizer and model config."
-        )
+    except OSError as exc:
+        if not _is_missing_file_error(exc):
+            raise
+        logger.info("No generation config; taking eos tokens from the tokenizer and model config.")
 
-    try:
-        _add(AutoTokenizer.from_pretrained(hf_model_id).eos_token_id)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(f"Could not load tokenizer for eos tokens: {exc}")
+    _add(AutoTokenizer.from_pretrained(hf_model_id).eos_token_id)
 
     _add(getattr(config, "eos_token_id", None))
     return ids
+
+
+def _is_missing_file_error(exc: OSError) -> bool:
+    """Whether ``exc`` is transformers reporting that the checkpoint lacks the file."""
+    return isinstance(exc, FileNotFoundError) or "does not appear to have a file named" in str(exc)
 
 
 def _ios_metadata_extras() -> dict[str, Any]:
@@ -218,13 +220,15 @@ def _default_output_name(hf_model_id: str, compression: str) -> str:
 
 
 def _resolve_bundle_paths(output_dir: str, output_name: str, overwrite: bool) -> tuple[Path, Path]:
-    """Create the bundle directory and clear a stale asset. Returns (bundle, asset)."""
+    """Create the bundle directory and check for an existing asset. Returns (bundle, asset).
+
+    An existing asset is only removed right before the new one is saved (see ``_export_ios``),
+    so a rejected flag or a failed export keeps the previous bundle.
+    """
     bundle_path = Path(output_dir) / output_name
     aimodel_path = bundle_path / f"{output_name}.aimodel"
-    if aimodel_path.exists():
-        if not overwrite:
-            raise SystemExit(f"{aimodel_path} already exists. Use --overwrite to replace it.")
-        shutil.rmtree(aimodel_path)
+    if aimodel_path.exists() and not overwrite:
+        raise SystemExit(f"{aimodel_path} already exists. Use --overwrite to replace it.")
     bundle_path.mkdir(parents=True, exist_ok=True)
     return bundle_path, aimodel_path
 
@@ -334,7 +338,7 @@ def context_ladder(max_context_length: int, dev: DevOverrides = NO_DEV_OVERRIDES
     buckets = sorted({b for b in SHIPPING_CONTEXT_LADDER if b < ctx_max} | {ctx_max})
 
     if dev.ladder_only:
-        buckets = [b for b in buckets if b in set(dev.ladder_only)] or [ctx_max]
+        buckets = [b for b in buckets if b in set(dev.ladder_only)]
     return buckets
 
 
@@ -410,9 +414,7 @@ def forward_constraints(ctx: int) -> dict[str, HardwareConstraints]:
     return {
         EMBEDDING_TABLE_INPUT_NAME: EMBEDDING_TABLE_CONSTRAINT,
         KEY_CACHE_INPUT_NAME: cache,
-        KEY_CACHE_OUTPUT_NAME: cache,
         VALUE_CACHE_INPUT_NAME: cache,
-        VALUE_CACHE_OUTPUT_NAME: cache,
         CONV_STATE_INPUT_NAME: DELTA_STATE_CONSTRAINT,
         RECURRENT_STATE_INPUT_NAME: DELTA_STATE_CONSTRAINT,
     }
@@ -618,6 +620,18 @@ async def _export_ios(args: argparse.Namespace) -> str:
         compression = args.compression_config.stem
     else:
         compression = "none"
+    hf_config = AutoConfig.from_pretrained(hf_model_id)
+    # The checkpoint is a VLM; report fields from its text config.
+    text_config = (
+        hf_config.get_text_config() if hasattr(hf_config, "get_text_config") else hf_config
+    )
+    native_max_ctx = getattr(text_config, "max_position_embeddings", None)
+    if native_max_ctx is not None and max_ctx > native_max_ctx:
+        raise SystemExit(
+            f"--max-context-length ({max_ctx}) exceeds the model's "
+            f"max_position_embeddings ({native_max_ctx}). Choose a value <= {native_max_ctx}."
+        )
+
     output_name = args.output_name or _default_output_name(hf_model_id, compression)
     bundle_path, aimodel_path = _resolve_bundle_paths(args.output_dir, output_name, args.overwrite)
 
@@ -627,19 +641,6 @@ async def _export_ios(args: argparse.Namespace) -> str:
     # palettization and the long ladder conversion. The temp dir must outlive every read of the
     # weights, so it wraps the whole model lifetime (through ``del model``).
     with tempfile.TemporaryDirectory(prefix="qwen3_5_export_") as temp_dir:
-        hf_config = AutoConfig.from_pretrained(hf_model_id)
-
-        # The checkpoint is a VLM; report fields from its text config.
-        text_config = (
-            hf_config.get_text_config() if hasattr(hf_config, "get_text_config") else hf_config
-        )
-        native_max_ctx = getattr(text_config, "max_position_embeddings", None)
-        if native_max_ctx is not None and max_ctx > native_max_ctx:
-            raise SystemExit(
-                f"--max-context-length ({max_ctx}) exceeds the model's "
-                f"max_position_embeddings ({native_max_ctx}). Choose a value <= {native_max_ctx}."
-            )
-
         model = Qwen3_5ForCausalLMForiOS.from_hf(
             hf_model_id,
             max_context_length=max_ctx,
@@ -648,7 +649,8 @@ async def _export_ios(args: argparse.Namespace) -> str:
             num_layers=args.num_layers,
         ).eval()
 
-        # The bundle advertises this as its max context, so match the largest bucket.
+        # The bundle advertises the requested max context. The top bucket is that value rounded
+        # up to a power of two (see `context_ladder`), so the runner never asks past a bucket.
         text_config.max_position_embeddings = max_ctx
 
         # All shapes are derived from the reauthored config (truncated by --num-layers).
@@ -674,6 +676,8 @@ async def _export_ios(args: argparse.Namespace) -> str:
 
         del model
 
+        if aimodel_path.exists():
+            shutil.rmtree(aimodel_path)
         logger.info(f"Saving model to {aimodel_path}...")
         await asyncio.to_thread(
             coreai_program.save_asset, aimodel_path, build_aimodel_metadata(hf_model_id)
@@ -729,7 +733,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--compute-precision",
-        choices=sorted(PRECISIONS),
+        choices=["float16"],
         default=None,
         help="Compute precision for the model weights (iOS requires float16)",
     )
@@ -788,9 +792,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--dev-ladder-only",
         type=_int_list,
         metavar="CTX[,CTX...]",
-        help="Emit only these context buckets. Buckets outside the ladder for the "
-        "requested --max-context-length are ignored; if none remain, the cap alone "
-        "is emitted.",
+        help="Emit only these context buckets. Each must be in the ladder for the "
+        "requested --max-context-length.",
     )
     return parser
 
@@ -812,6 +815,14 @@ def _resolve_platform_defaults(args: argparse.Namespace) -> None:
         )
 
     dev = DevOverrides.from_args(args)
+    if dev.ladder_only:
+        ladder = context_ladder(args.max_context_length or IOS_MAX_CONTEXT_LENGTH)
+        unknown = sorted(set(dev.ladder_only) - set(ladder))
+        if unknown:
+            raise SystemExit(
+                f"--dev-ladder-only {unknown} not in the context ladder {ladder} for "
+                "this --max-context-length."
+            )
     for flag, q_lens in (
         ("--dev-extend-qlens", _extend_query_lengths(dev)),
         ("--dev-prompt-qlens", _prompt_query_lengths(dev)),
