@@ -42,7 +42,7 @@ struct WhitespaceLimitSamplingTests {
                 return Self.whitespaceTokens.contains(Int32(id)) ? base + whitespaceBoost : base
             }
             guard session.applyMask(to: &logits) else { break }
-            let token = CompositeSampler.sample(from: &logits, config: config, using: &rng)
+            let token = ReferenceSampler.sample(from: &logits, config: config, using: &rng)
             guard session.acceptToken(token) else { break }
             tokens.append(token)
         }

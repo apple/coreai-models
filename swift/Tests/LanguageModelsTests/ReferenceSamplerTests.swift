@@ -10,42 +10,42 @@ import Testing
 
 @testable import CoreAILanguageModels
 
-/// Test coverage for `CompositeSampler` — pinning current behavior before the slow-path
+/// Test coverage for `ReferenceSampler` — pinning current behavior before the slow-path
 /// refactor (replace `[Bool]` mask with `-Float.infinity`, compact-then-sample after topK,
 /// partial sort, etc.).
 ///
 /// Most tests use a seeded `Xoshiro256StarStar` so multinomial sampling is deterministic.
-/// `@testable import` reaches `CompositeSampler.sample(from:config:using:)` — the
+/// `@testable import` reaches `ReferenceSampler.sample(from:config:using:)` — the
 /// production no-RNG overload is unchanged.
-@Suite("CompositeSampler", .serialized)
-struct CompositeSamplerTests {
+@Suite("ReferenceSampler", .serialized)
+struct ReferenceSamplerTests {
     // MARK: - Greedy (deterministic — no RNG needed)
 
     @Test("Greedy Float32 returns the argmax")
     func greedyFloat32ReturnsArgmax() {
         var logits: [Float] = [0.1, -0.5, 3.2, 1.7, 0.0, 2.9]
-        let token = CompositeSampler.sample(from: &logits, config: .greedy)
+        let token = ReferenceSampler.sample(from: &logits, config: .greedy)
         #expect(token == 2)
     }
 
     @Test("Greedy Float16 returns the argmax")
     func greedyFloat16ReturnsArgmax() {
         var logits: [Float16] = [0.1, -0.5, 3.2, 1.7, 0.0, 2.9]
-        let token = CompositeSampler.sample(from: &logits, config: .greedy)
+        let token = ReferenceSampler.sample(from: &logits, config: .greedy)
         #expect(token == 2)
     }
 
     @Test("Greedy tie-breaking returns first occurrence (vDSP_maxvi behavior)")
     func greedyTieBreaksToFirst() {
         var logits: [Float] = [1.0, 3.0, 3.0, 3.0, 2.0]
-        let token = CompositeSampler.sample(from: &logits, config: .greedy)
+        let token = ReferenceSampler.sample(from: &logits, config: .greedy)
         #expect(token == 1)
     }
 
     @Test("Greedy on single-element logits returns 0")
     func greedySingleElement() {
         var logits: [Float] = [42.0]
-        let token = CompositeSampler.sample(from: &logits, config: .greedy)
+        let token = ReferenceSampler.sample(from: &logits, config: .greedy)
         #expect(token == 0)
     }
 
@@ -60,7 +60,7 @@ struct CompositeSamplerTests {
         var counts = [Int](repeating: 0, count: vocab)
         for _ in 0..<10_000 {
             var logits = makeMaskedLogits(vocab: vocab, allowed: allowed, fill: 1.0, sentinel: -.infinity)
-            let token = CompositeSampler.sample(from: &logits, config: .init(temperature: 1.0), using: &rng)
+            let token = ReferenceSampler.sample(from: &logits, config: .init(temperature: 1.0), using: &rng)
             counts[Int(token)] += 1
         }
 
@@ -82,7 +82,7 @@ struct CompositeSamplerTests {
         for _ in 0..<10_000 {
             var logits = [Float16](repeating: sentinel, count: vocab)
             for i in allowed { logits[Int(i)] = 1.0 }
-            let token = CompositeSampler.sample(from: &logits, config: .init(temperature: 1.0), using: &rng)
+            let token = ReferenceSampler.sample(from: &logits, config: .init(temperature: 1.0), using: &rng)
             counts[Int(token)] += 1
         }
 
@@ -100,7 +100,7 @@ struct CompositeSamplerTests {
         let iterations = 10_000
         for _ in 0..<iterations {
             var logits = [Float](repeating: 1.0, count: vocab)
-            let token = CompositeSampler.sample(from: &logits, config: .init(temperature: 1.0), using: &rng)
+            let token = ReferenceSampler.sample(from: &logits, config: .init(temperature: 1.0), using: &rng)
             counts[Int(token)] += 1
         }
 
@@ -126,7 +126,7 @@ struct CompositeSamplerTests {
         var sampledIndices = Set<Int32>()
         for _ in 0..<2_000 {
             var logits = rawLogits
-            let token = CompositeSampler.sample(
+            let token = ReferenceSampler.sample(
                 from: &logits, config: .init(temperature: 1.0, topK: k), using: &rng)
             sampledIndices.insert(token)
         }
@@ -152,7 +152,7 @@ struct CompositeSamplerTests {
         var sampledIndices = Set<Int32>()
         for _ in 0..<2_000 {
             var logits = rawLogits
-            let token = CompositeSampler.sample(
+            let token = ReferenceSampler.sample(
                 from: &logits, config: .init(temperature: 1.0, topP: 0.9), using: &rng)
             sampledIndices.insert(token)
         }
@@ -172,7 +172,7 @@ struct CompositeSamplerTests {
         var sampledIndices = Set<Int32>()
         for _ in 0..<2_000 {
             var logits = rawLogits
-            let token = CompositeSampler.sample(
+            let token = ReferenceSampler.sample(
                 from: &logits, config: .init(temperature: 1.0, topK: 10, topP: 0.95), using: &rng)
             sampledIndices.insert(token)
         }
@@ -201,7 +201,7 @@ struct CompositeSamplerTests {
         var sampledIndices = Set<Int32>()
         for _ in 0..<2_000 {
             var logits = rawLogits
-            let token = CompositeSampler.sample(
+            let token = ReferenceSampler.sample(
                 from: &logits, config: .init(temperature: 1.0, minP: 0.1), using: &rng)
             sampledIndices.insert(token)
         }
@@ -225,7 +225,7 @@ struct CompositeSamplerTests {
         var allSame = true
         for _ in 0..<40 {
             var logits = rawLogits
-            let token = CompositeSampler.sample(
+            let token = ReferenceSampler.sample(
                 from: &logits, config: .init(temperature: 1.0, minP: 1.0), using: &rng)
             if token != 42 {
                 allSame = false
@@ -250,7 +250,7 @@ struct CompositeSamplerTests {
             var logits = rawLogits
             // topK=10 would include indices 90-99, but minP=0.3 should exclude
             // the medium ones since exp(2-5)/exp(0) = exp(-3) ≈ 0.05 < 0.3
-            let token = CompositeSampler.sample(
+            let token = ReferenceSampler.sample(
                 from: &logits, config: .init(temperature: 1.0, topK: 10, minP: 0.3), using: &rng)
             sampledIndices.insert(token)
         }
@@ -270,7 +270,7 @@ struct CompositeSamplerTests {
         var counts = [Int](repeating: 0, count: vocab)
         for _ in 0..<5_000 {
             var logits = makeMaskedLogits(vocab: vocab, allowed: allowed, fill: 2.0, sentinel: -.infinity)
-            let token = CompositeSampler.sample(
+            let token = ReferenceSampler.sample(
                 from: &logits, config: .init(temperature: 1.0, minP: 0.05), using: &rng)
             counts[Int(token)] += 1
         }
@@ -291,7 +291,7 @@ struct CompositeSamplerTests {
         var counts = [Int](repeating: 0, count: vocab)
         for _ in 0..<5_000 {
             var logits = makeMaskedLogits(vocab: vocab, allowed: allowed, fill: 2.0, sentinel: -.infinity)
-            let token = CompositeSampler.sample(
+            let token = ReferenceSampler.sample(
                 from: &logits, config: .init(temperature: 1.0, topK: 50), using: &rng)
             counts[Int(token)] += 1
         }
@@ -310,7 +310,7 @@ struct CompositeSamplerTests {
         var counts = [Int](repeating: 0, count: vocab)
         for _ in 0..<5_000 {
             var logits = makeMaskedLogits(vocab: vocab, allowed: allowed, fill: 2.0, sentinel: -.infinity)
-            let token = CompositeSampler.sample(
+            let token = ReferenceSampler.sample(
                 from: &logits, config: .init(temperature: 1.0, topP: 0.9), using: &rng)
             counts[Int(token)] += 1
         }
@@ -329,7 +329,7 @@ struct CompositeSamplerTests {
         var counts = [Int](repeating: 0, count: vocab)
         for _ in 0..<5_000 {
             var logits = makeMaskedLogits(vocab: vocab, allowed: allowed, fill: 2.0, sentinel: -.infinity)
-            let token = CompositeSampler.sample(
+            let token = ReferenceSampler.sample(
                 from: &logits,
                 config: .init(temperature: 1.0, topK: 50, topP: 0.9),
                 using: &rng)
@@ -358,7 +358,7 @@ struct CompositeSamplerTests {
             for _ in 0..<40 {
                 var logits = [Float](repeating: -.infinity, count: vocab)
                 logits[Int(allowedIndex)] = 5.0
-                let token = CompositeSampler.sample(from: &logits, config: config, using: &rng)
+                let token = ReferenceSampler.sample(from: &logits, config: config, using: &rng)
                 #expect(
                     token == allowedIndex,
                     "Single-allowed should always return \(allowedIndex), got \(token) with config \(config)")
@@ -380,7 +380,7 @@ struct CompositeSamplerTests {
         var hits = 0
         for _ in 0..<5_000 {
             var logits = rawLogits
-            let token = CompositeSampler.sample(from: &logits, config: .init(temperature: 1.0), using: &rng)
+            let token = ReferenceSampler.sample(from: &logits, config: .init(temperature: 1.0), using: &rng)
             if token == dominant { hits += 1 }
         }
         #expect(hits == 5_000, "Saturated logit should be sampled every time, got \(hits)/5000")
@@ -398,7 +398,7 @@ struct CompositeSamplerTests {
         var hitsArgmax = 0
         for _ in 0..<5_000 {
             var logits = rawLogits
-            let token = CompositeSampler.sample(from: &logits, config: .init(temperature: 0.01), using: &rng)
+            let token = ReferenceSampler.sample(from: &logits, config: .init(temperature: 0.01), using: &rng)
             if token == 42 { hitsArgmax += 1 }
         }
         #expect(hitsArgmax >= 4_950, "Low temp should pick argmax >99% of the time, got \(hitsArgmax)/5000")
@@ -411,10 +411,10 @@ struct CompositeSamplerTests {
         for i in 0..<vocab { rawLogits16[i] = Float16(Float(i) * 0.123) }
 
         var logits16 = rawLogits16
-        let token16 = CompositeSampler.sample(from: &logits16, config: .greedy)
+        let token16 = ReferenceSampler.sample(from: &logits16, config: .greedy)
 
         var logits32 = rawLogits16.map { Float($0) }
-        let token32 = CompositeSampler.sample(from: &logits32, config: .greedy)
+        let token32 = ReferenceSampler.sample(from: &logits32, config: .greedy)
 
         #expect(token16 == token32, "Float16 (\(token16)) and Float32 (\(token32)) greedy must agree")
     }
@@ -433,8 +433,8 @@ struct CompositeSamplerTests {
         for _ in 0..<200 {
             var l1 = logits1
             var l2 = logits2
-            let t1 = CompositeSampler.sample(from: &l1, config: config, using: &rng1)
-            let t2 = CompositeSampler.sample(from: &l2, config: config, using: &rng2)
+            let t1 = ReferenceSampler.sample(from: &l1, config: config, using: &rng1)
+            let t2 = ReferenceSampler.sample(from: &l2, config: config, using: &rng2)
             #expect(t1 == t2)
         }
     }
@@ -478,8 +478,8 @@ struct CompositeSamplerTests {
         using rng: inout some RandomNumberGenerator
     ) -> Int32 {
         var active = candidates.kept.map { candidates.logits[$0] }
-        CompositeSampler.softmaxVectorized(&active)
-        return Int32(candidates.kept[CompositeSampler.multinomialSample(active, using: &rng)])
+        ReferenceSampler.softmaxVectorized(&active)
+        return Int32(candidates.kept[ReferenceSampler.multinomialSample(active, using: &rng)])
     }
 
     private func makeLargeVocabLogits(
@@ -509,7 +509,7 @@ struct CompositeSamplerTests {
 
         for _ in 0..<40 {
             var logits = raw
-            let got = CompositeSampler.sample(from: &logits, config: config, using: &rngA)
+            let got = ReferenceSampler.sample(from: &logits, config: config, using: &rngA)
             let want = referenceDraw(reference, using: &rngB)
             #expect(got == want)
         }
@@ -527,7 +527,7 @@ struct CompositeSamplerTests {
 
         for _ in 0..<40 {
             var logits = raw
-            let got = CompositeSampler.sample(from: &logits, config: config, using: &rngA)
+            let got = ReferenceSampler.sample(from: &logits, config: config, using: &rngA)
             let want = referenceDraw(reference, using: &rngB)
             #expect(got == want)
         }
@@ -545,7 +545,7 @@ struct CompositeSamplerTests {
 
         for _ in 0..<40 {
             var logits = raw
-            let got = CompositeSampler.sample(from: &logits, config: config, using: &rngA)
+            let got = ReferenceSampler.sample(from: &logits, config: config, using: &rngA)
             let want = referenceDraw(reference, using: &rngB)
             #expect(got == want)
         }
@@ -559,7 +559,7 @@ struct CompositeSamplerTests {
         for _ in 0..<5_000 {
             var logits = [Float](repeating: 1.0, count: vocab)
             seen.insert(
-                CompositeSampler.sample(
+                ReferenceSampler.sample(
                     from: &logits, config: .init(temperature: 1.0, topP: 1.0 - 1e-6),
                     using: &rng))
         }
@@ -574,13 +574,13 @@ struct CompositeSamplerTests {
         for _ in 0..<40 {
             var l = logits
             #expect(
-                CompositeSampler.sample(
+                ReferenceSampler.sample(
                     from: &l, config: .init(temperature: 1.0, topP: 0.9), using: &rng) == 5)
         }
 
         var masked = [Float](repeating: -.infinity, count: 16)
         #expect(
-            CompositeSampler.sample(
+            ReferenceSampler.sample(
                 from: &masked, config: .init(temperature: 1.0, topP: 0.9), using: &rng) == 0)
     }
 
@@ -592,7 +592,7 @@ struct CompositeSamplerTests {
         for _ in 0..<200 {
             var logits = raw
             #expect(
-                CompositeSampler.sample(
+                ReferenceSampler.sample(
                     from: &logits, config: .init(temperature: 1.0, topP: 0.9, minP: 1.0),
                     using: &rng) == best)
         }
@@ -612,12 +612,12 @@ struct CompositeSamplerTests {
         for _ in 0..<20 {
             var logits = makeLargeVocabLogits(vocab: 262_144, seed: 0xFACE)
             for i in infinite { logits[Int(i)] = .infinity }
-            #expect(infinite.contains(CompositeSampler.sample(from: &logits, config: config, using: &rng)))
+            #expect(infinite.contains(ReferenceSampler.sample(from: &logits, config: config, using: &rng)))
         }
 
         var single = makeLargeVocabLogits(vocab: 4_096, seed: 0xFACE)
         single[77] = .infinity
-        #expect(CompositeSampler.sample(from: &single, config: config, using: &rng) == 77)
+        #expect(ReferenceSampler.sample(from: &single, config: config, using: &rng) == 77)
     }
 
     @Test(
@@ -635,7 +635,7 @@ struct CompositeSamplerTests {
         var seen = Set<Int32>()
         for _ in 0..<64 {
             var logits = raw
-            seen.insert(CompositeSampler.sample(from: &logits, config: config, using: &rng))
+            seen.insert(ReferenceSampler.sample(from: &logits, config: config, using: &rng))
         }
         #expect(seen == infinite)
     }
@@ -658,7 +658,7 @@ struct CompositeSamplerTests {
         let draws = 4_000
         for _ in 0..<draws {
             var logits = raw
-            counts[CompositeSampler.sample(from: &logits, config: config, using: &rng), default: 0] += 1
+            counts[ReferenceSampler.sample(from: &logits, config: config, using: &rng), default: 0] += 1
         }
         #expect(Set(counts.keys) == Set(infinite.map(Int32.init)))
         // Expected 1,000 each; 5 sigma of Binomial(4000, 0.25) is about 137.
@@ -681,7 +681,7 @@ struct CompositeSamplerTests {
         ] {
             for _ in 0..<64 {
                 var logits = raw
-                seen.insert(CompositeSampler.sample(from: &logits, config: config, using: &rng))
+                seen.insert(ReferenceSampler.sample(from: &logits, config: config, using: &rng))
             }
         }
         #expect(seen == [10, 900])
@@ -690,7 +690,7 @@ struct CompositeSamplerTests {
     @Test("softmax of a vector with +inf entries is a uniform distribution over them")
     func softmaxWithInfiniteEntries() {
         var v: [Float] = [1, .infinity, -.infinity, .infinity, 2]
-        CompositeSampler.softmaxVectorized(&v)
+        ReferenceSampler.softmaxVectorized(&v)
         #expect(v == [0, 0.5, 0, 0.5, 0])
     }
 

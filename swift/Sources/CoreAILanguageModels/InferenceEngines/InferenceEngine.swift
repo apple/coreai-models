@@ -345,7 +345,7 @@ extension InferenceEngine {
     /// Default implementation: accepts all sampling configurations.
     ///
     /// Engines that use CPU fallback samplers can accept all configurations
-    /// since CompositeSampler handles greedy, temperature, topK, and topP.
+    /// since ReferenceSampler handles greedy, temperature, topK, and topP.
     ///
     /// Override this in engines with GPU samplers that have limited support.
     public func validateSamplingStrategy(_ config: SamplingConfiguration) throws {
