@@ -229,23 +229,6 @@ def megabytes(bundle):  # an .aimodelc is a directory: sum its files
 
 ______________________________________________________________________
 
-## First load writes a compiled copy to `~/Library/Caches/coreai-cache`
-
-**Cause**: The first `AIModel.load` of an `.aimodel` writes a specialized copy, about the size of the weights, under `~/Library/Caches/coreai-cache` and leaves it there. Running an export script again, even with the same weights, adds another copy at its first load, so a development loop adds one per run.
-**Fix**: Budget twice the model size for the first load. Delete old copies during development.
-
-```python
-from pathlib import Path
-
-CACHE = Path.home() / "Library/Caches/coreai-cache"
-
-
-def cache_megabytes():
-    return sum(f.stat().st_size for f in CACHE.rglob("*") if f.is_file()) / 1e6
-```
-
-______________________________________________________________________
-
 ## Stateful transforms — KV cache resets between Python calls
 
 **Cause**: Stateful transform APIs mark buffers stateful within one invocation, but state resets between inference calls.
