@@ -214,26 +214,6 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
-## `.aimodelc` fails to load — `AIModelError error 0` or `error 1`
-
-**Cause**: `coreai-build compile --architecture` exits 0 for any known architecture, and the bundle loads only on that one. On an M4 Max, `h16c` loads, while `h16s` and `h17c` raise `error 0`. Swift names both sides: `incompatibleCompiledAssetArchitecture(device: "h16c", asset: ["h17c"])`. `cpu_only()` raises `error 1` on a bundle from any `--preferred-compute` value (Swift: `failedToSpecialize`).
-**Fix**: Compile for the device's architecture and load bundles with `SpecializationOptions.default()`. Use the `.aimodel` for CPU-only runs.
-
-```python
-import subprocess
-
-from coreai.runtime import AIModel, SpecializationOptions
-
-
-async def compile_and_load(asset, arch):  # arch: the loading device's, h16c on an M4 Max
-    command = ["xcrun", "coreai-build", "compile", str(asset), "--preferred-compute", "gpu"]
-    subprocess.run(command + ["--architecture", arch, "--output", str(asset.parent)], check=True)
-    bundle = asset.with_name(f"{asset.stem}.{arch}.aimodelc")
-    return await AIModel.load(bundle, specialization_options=SpecializationOptions.default())
-```
-
-______________________________________________________________________
-
 ## `.aimodelc` is larger than the `.aimodel`
 
 **Cause**: An `.aimodel` stores a shared weight once and keeps per-block int8. A `--preferred-compute gpu` bundle stores the weight once per function. With static shapes it also expands per-block int8 to the float size. A dynamic dimension keeps the int8 size, and per-block int4 stays small.
