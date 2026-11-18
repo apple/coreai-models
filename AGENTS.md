@@ -14,6 +14,25 @@ uv run pytest python/tests/test_model_units -x -q
 swift build && swift test --filter <the suites you touched>
 ```
 
+## Where things live
+
+- `python/src/coreai_models/` is the export library. `primitives/` holds the building blocks
+  (attention, norms, RoPE, caches); `models/` holds the architectures built from them (`base.py`
+  has the shared causal-LM base classes, `registry.py` the model list); `export/` turns a model
+  into an `.aimodel` (tracing, compression, bundle metadata). `llm/`, `vlm/`, `embedding/`,
+  `diffusion/` and `segmentation/` are the per-task entry points (`coreai.llm.export` and the like).
+- `primitives/` and `models/` each have a `macos/` and an `ios/` folder, and `export/` has
+  `macos.py` and `ios.py`. macOS exports target the GPU. iOS exports are written for the Neural
+  Engine, so their layers are reauthored: for example an int8 embedding table behind separate load
+  and gather entrypoints, and ops the Neural Engine compiler can fold. The same layer often exists
+  in both folders, so a fix to one usually belongs in the other too, and a look-alike across the
+  two is not automatically a duplicate.
+- `models/<name>/` at the repo root holds per-model READMEs and compression recipes, and a
+  standalone `export.py` for models that do not go through a shared export entry point.
+- `swift/Sources/` has one library per task (`CoreAILanguageModels`, `CoreAIDiffusionPipeline`,
+  `CoreAISpeech`, ...), shared code in `CoreAIShared` and `CoreAILMCommon`, and the command-line
+  tools (`llm-runner`, `llm-server`, ...) in `Tools/`.
+
 ## Reuse before you add
 
 A common review finding is a second copy of something the repo already has. Search first; extend the
@@ -28,9 +47,10 @@ existing one, or say in the PR why it cannot be reused.
 | Hugging Face download, config | `_hf.py`                                                                                              |
 | Constants, bundle metadata    | `_constants.py`, `export/metadata.py`                                                                 |
 
-Some look-alikes differ on purpose (for example the iOS `rotate_half` rotates a different axis, and the
-iOS `RMSNorm` has no float16 prescale). If two helpers look identical but you cannot tell why both exist,
-ask before merging them.
+The table names today's files. If one has moved, look in the `primitives/` or `models/` folder for
+your platform before writing a new helper. Some look-alikes differ on purpose: the iOS `rotate_half`
+rotates a different axis, and the iOS `RMSNorm` has no float16 prescale. If two helpers look identical
+but you cannot tell why both exist, ask before merging them.
 
 Dependency direction in the Python package: `export/` → `models/` → `primitives/`, never the reverse.
 `_hf.py` and `_constants.py` are leaf modules.
