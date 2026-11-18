@@ -246,7 +246,8 @@ class BlockedSDPA(nn.Module):
                         pv = (vraw @ p.squeeze(1).transpose(1, 2)).transpose(1, 2)
                     else:
                         pv = p.squeeze(1) @ vraw.transpose(1, 2)
-                    o = (o * prev.squeeze(1) + pv) / den.squeeze(1)
+                    # Equivalent to (o * prev + pv) / den, written as two scaled terms.
+                    o = o * (prev / den).squeeze(1) + pv / den.squeeze(1)
                     m = m_new
             # Un-fold the G·q_len rows to per-head channels with tensor_split (plain slices;
             # unflatten/reshape overflow the compiler's instruction-reorder window).

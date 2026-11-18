@@ -118,6 +118,7 @@ def _get_registry() -> dict[str, ModelEntry]:
     from coreai_models.models.ios.olmo2 import Olmo2ForCausalLMForiOS
     from coreai_models.models.ios.qwen2 import Qwen2ForCausalLMForiOS
     from coreai_models.models.ios.qwen3 import Qwen3ForCausalLMForiOS
+    from coreai_models.models.ios.qwen3_5 import Qwen3_5ForCausalLMForiOS
     from coreai_models.models.macos.diffusion_gemma import DiffusionGemmaEncoder
     from coreai_models.models.macos.gemma3_text import Gemma3ForCausalLM
     from coreai_models.models.macos.gemma3n import Gemma3nForCausalLM
@@ -198,6 +199,8 @@ def _get_registry() -> dict[str, ModelEntry]:
         # Both checkpoints wrap the decoder under `text_config` / `model.language_model.`.
         "qwen3_5": ModelEntry(
             macos_class=Qwen3_5ForCausalLM,
+            # iOS exports through models/qwen3_5/export.py; the entry serves evaluation.
+            ios_class=Qwen3_5ForCausalLMForiOS,
             hf_config_attr="text_config",
             hf_state_dict_prefix="model.language_model.",
         ),
