@@ -83,21 +83,24 @@ struct PrefixCacheEngineTests {
     }
 
     @Test(
-        "A hybrid model's second prompt resumes at a snapshot, and replies as a fresh engine does",
+        "A hybrid model's replies are the same with the cache off, on a miss, and resuming at a snapshot",
         .enabled(if: ProcessInfo.processInfo.environment["COREAI_TEST_HYBRID_BUNDLE"] != nil))
     func hybrid() async throws {
         let path = try #require(ProcessInfo.processInfo.environment["COREAI_TEST_HYBRID_BUNDLE"])
         let (cached, tokenizer) = try await load(path, prefixCacheBytes: 1 << 30)
         try #require(cached.prefixCacheEnabled)
         #expect(cached.hasRecurrentState)
+        // The first misses and snapshots; the second resumes at the snapshot inside the shared prompt.
         let withCache = try await replies([Self.first, Self.second], engine: cached, tokenizer: tokenizer)
-        #expect(withCache[1].restored >= 2 * 256)
+        #expect(withCache[1].restored >= PrefixSnapshotPlan.gridTokens)
 
-        // Snapshots split prefill, which can tip a near-tie, so the reference is a fresh engine with the
-        // cache on: it splits the second prompt's prefill at the same places.
-        let (fresh, _) = try await load(path, prefixCacheBytes: 1 << 30)
-        let reference = try await reply(Self.second, engine: fresh, tokenizer: tokenizer)
-        #expect(withCache[1].text == reference)
+        let (cold, _) = try await load(path, prefixCacheBytes: 0)
+        var withoutCache: [String] = []
+        for prompt in [Self.first, Self.second] {
+            try await cold.reset()
+            withoutCache.append(try await reply(prompt, engine: cold, tokenizer: tokenizer))
+        }
+        #expect(withCache.map(\.text) == withoutCache)
     }
 }
 

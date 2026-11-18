@@ -242,49 +242,59 @@ struct PrefixTreeTests {
 
 @Suite("PrefixSnapshotPlan")
 struct PrefixSnapshotPlanTests {
-    @Test("Every chunk gets a snapshot at first, then every fourth")
-    func cadence() {
-        let depths = (0...16).filter { PrefixSnapshotPlan.belongs(atDepth: $0) }
-        #expect(depths == [1, 2, 3, 4, 8, 12, 16])
+    @Test("Prefill stops at every grid point and every multiple of its step, counted from the start")
+    func stops() {
+        #expect(PrefixSnapshotPlan.stops(after: 0, before: 3000, stepTokens: 4096) == [1024, 2048])
+        #expect(PrefixSnapshotPlan.stops(after: 0, before: 3000, stepTokens: 768) == [768, 1024, 1536, 2048, 2304])
+        // Strictly between: a run starting on a stop, or ending on one, doesn't stop there again.
+        #expect(PrefixSnapshotPlan.stops(after: 1024, before: 2048, stepTokens: 4096) == [])
+        #expect(PrefixSnapshotPlan.stops(after: 1000, before: 2100, stepTokens: 512) == [1024, 1536, 2048])
+        #expect(PrefixSnapshotPlan.stops(after: 5, before: 6, stepTokens: 1) == [])
     }
 
-    @Test("A prompt snapshots at the cadence it reaches, and at its last boundary before the held-back token")
+    @Test("A run restored at any grid point steps as a cold run of the same prompt does from there")
+    func restoredStepsMatchCold() {
+        // The steps a recurrent prompt of `count` tokens takes from `start`, as positions reached.
+        func reached(from start: Int, count: Int, step: Int) -> [Int] {
+            let cut = PrefixSnapshotPlan.steps(from: start, to: count, stepTokens: step)
+            #expect(cut.allSatisfy { $0 > 0 && $0 <= step })
+            var position = start
+            return cut.map { size in
+                position += size
+                return position
+            }
+        }
+        for step in [256, 768, 2048, 4096] {
+            for count in [1500, 2363, 5000] {
+                let cold = reached(from: 0, count: count, step: step)
+                for restore in stride(from: PrefixSnapshotPlan.gridTokens, to: count, by: PrefixSnapshotPlan.gridTokens)
+                {
+                    #expect(reached(from: restore, count: count, step: step) == cold.filter { $0 > restore })
+                    #expect(cold.contains(restore))
+                }
+            }
+        }
+    }
+
+    @Test("A sliding ring's end is a stop too, so no step crosses it")
+    func ringStops() {
+        #expect(
+            PrefixSnapshotPlan.steps(from: 0, to: 2500, stepTokens: 4096, ringCapacity: 600) == [
+                600, 424, 176, 600, 248, 352, 100,
+            ])
+    }
+
+    @Test("A prompt snapshots at every grid point it reaches before the held-back token")
     func boundaries() {
-        // Prompt [0, 10): the last token is held back, so 9 run, reaching boundaries 4 and 8.
-        #expect(PrefixSnapshotPlan.boundaries(start: 0, promptTokens: 10, chunkTokens: 4) == [4, 8])
-        // Prompt [0, 9): 8 run, exactly to the second boundary.
-        #expect(PrefixSnapshotPlan.boundaries(start: 0, promptTokens: 9, chunkTokens: 4) == [4, 8])
-        // Prompt [0, 8): 7 run, so only the first.
-        #expect(PrefixSnapshotPlan.boundaries(start: 0, promptTokens: 8, chunkTokens: 4) == [4])
-        // Starting on a boundary with too little to reach the next: none.
-        #expect(PrefixSnapshotPlan.boundaries(start: 8, promptTokens: 4, chunkTokens: 4) == [])
-        #expect(PrefixSnapshotPlan.boundaries(start: 5, promptTokens: 4, chunkTokens: 4) == [8])
-        #expect(PrefixSnapshotPlan.boundaries(start: 0, promptTokens: 1, chunkTokens: 4) == [])
-    }
-
-    @Test("Past the dense start, a long prompt snapshots every fourth chunk and at its end")
-    func longPrompt() {
-        // 49 run: chunks 1-4, then 8 and 12, the last.
-        #expect(PrefixSnapshotPlan.boundaries(start: 0, promptTokens: 50, chunkTokens: 4) == [4, 8, 12, 16, 32, 48])
-        // 45 run: the last boundary reached is chunk 11's end, off the cadence, so it is added.
-        #expect(PrefixSnapshotPlan.boundaries(start: 0, promptTokens: 46, chunkTokens: 4) == [4, 8, 12, 16, 32, 44])
-        // Resuming at 20, the depths stay where they were: chunk 8, and 12, the last.
-        #expect(PrefixSnapshotPlan.boundaries(start: 20, promptTokens: 30, chunkTokens: 4) == [32, 48])
-    }
-
-    @Test("Each step crossing a target is cut there; one ending on it, or past every target, is left alone")
-    func split() {
-        #expect(PrefixSnapshotPlan.split([6, 6, 3], from: 0, at: [8]) == [6, 2, 4, 3])
-        #expect(PrefixSnapshotPlan.split([6, 6, 3], from: 10, at: [16]) == [6, 6, 3])
-        #expect(PrefixSnapshotPlan.split([6, 6], from: 0, at: [6]) == [6, 6])
-        #expect(PrefixSnapshotPlan.split([6, 6], from: 0, at: [20]) == [6, 6])
-        #expect(PrefixSnapshotPlan.split([5], from: 3, at: [4]) == [1, 4])
-        #expect(PrefixSnapshotPlan.split([], from: 0, at: [4]) == [])
-        // Several targets, in one step or across steps, in any order.
-        #expect(PrefixSnapshotPlan.split([10], from: 0, at: [4, 8]) == [4, 4, 2])
-        #expect(PrefixSnapshotPlan.split([6, 6], from: 0, at: [8, 4]) == [4, 2, 2, 4])
-        #expect(PrefixSnapshotPlan.split([12], from: 0, at: [4, 8, 12]) == [4, 4, 4])
-        #expect(PrefixSnapshotPlan.split([6], from: 0, at: []) == [6])
+        #expect(PrefixSnapshotPlan.boundaries(start: 0, promptTokens: 3000) == [1024, 2048])
+        // 2049 tokens: 2048 run before the held-back one, exactly to the second point.
+        #expect(PrefixSnapshotPlan.boundaries(start: 0, promptTokens: 2049) == [1024, 2048])
+        #expect(PrefixSnapshotPlan.boundaries(start: 0, promptTokens: 2048) == [1024])
+        #expect(PrefixSnapshotPlan.boundaries(start: 1024, promptTokens: 1500) == [2048])
+        #expect(PrefixSnapshotPlan.boundaries(start: 0, promptTokens: 1024) == [])
+        #expect(PrefixSnapshotPlan.boundaries(start: 0, promptTokens: 1) == [])
+        // Every one is a whole number of the cache's chunks, so it names a node.
+        #expect(PrefixSnapshotPlan.gridTokens % CoreAIPipelinedEngine.prefixChunkTokens == 0)
     }
 }
 

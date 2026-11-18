@@ -192,8 +192,7 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
         guard let tree = prefixTree, engine.hasNonTruncatableStates else { return }
         let chunk = Self.prefixChunkTokens
         let start = engine.processedTokenCount
-        let boundaries = PrefixSnapshotPlan.boundaries(
-            start: start, promptTokens: input.count - start, chunkTokens: chunk)
+        let boundaries = PrefixSnapshotPlan.boundaries(start: start, promptTokens: input.count - start)
         // Each costs a copy of the recurrent state. The boundaries lie past what is published, so
         // their keys chain on from its last.
         var key = publishedKeys.last ?? PrefixTree.rootKey
@@ -207,8 +206,8 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
             if !tree.hasSnapshot(at: key) { wanted.append(boundary) }
         }
         // Until the next publish, every copy is held outside the budget, so a long prompt takes no
-        // more than half the budget's worth: its last, for the same prompt again, then the
-        // shallowest, which the most prompts share.
+        // more than half the budget's worth: its deepest, for the same prompt again, then the
+        // shallowest, which the most prompts share. Prefill stops at the others all the same.
         let size = engine.additionalStates?.byteCount ?? 0
         let most = size > 0 ? max(1, tree.byteBudget / 2 / size) : wanted.count
         if wanted.count > most, let last = wanted.last {
@@ -1910,7 +1909,7 @@ private struct EngineImpl: ~Copyable {
                 tokenCount: prompt.count, chunkSize: prefillMaxQueryLength,
                 heldBack: prefillHeldBackTokens(hasPrefillGraph: true),
                 startOffset: processedTokenCount, ringCapacity: slidingRingCapacity)
-            for chunk in splittingAtSnapshots(plan) {
+            for chunk in splittingAtStops(plan, stepTokens: prefillMaxQueryLength) {
                 try await _encodeChunk(tokens: Array(head.prefix(chunk)))
                 head = head.dropFirst(chunk)
                 snapshotIfDue()
@@ -1938,17 +1937,19 @@ private struct EngineImpl: ~Copyable {
             return try await processChunkedInput(tokens: prompt)
         }
 
-        // One step would carry the whole prompt; a snapshot inside it needs what comes before it run
-        // first. Each turn reaches the next position, which `snapshotIfDue` then drops.
+        // One step would carry the whole prompt, but a recurrent model stops where every run of it does.
         var prompt = prompt[...]
-        while let target = snapshotPositions.first, target > processedTokenCount,
-            target < processedTokenCount + prompt.count
-        {
-            let head = target - processedTokenCount
-            try logits.ensureCapacity(forContextLength: head)
-            try await _encodeChunk(tokens: Array(prompt.prefix(head)))
-            prompt = prompt.dropFirst(head)
-            snapshotIfDue()
+        if hasNonTruncatableStates {
+            let start = processedTokenCount
+            for stop in PrefixSnapshotPlan.stops(
+                after: start, before: start + prompt.count, stepTokens: prefillChunkSize)
+            {
+                let head = stop - processedTokenCount
+                try logits.ensureCapacity(forContextLength: head)
+                try await _encodeChunk(tokens: Array(prompt.prefix(head)))
+                prompt = prompt.dropFirst(head)
+                snapshotIfDue()
+            }
         }
 
         if try logits.ensureCapacity(forContextLength: max(1, prompt.count)) {
@@ -1974,10 +1975,11 @@ private struct EngineImpl: ~Copyable {
         try logits.ensureCapacity(forContextLength: chunkSize)
 
         // Every chunk but the last is encoded here; the last carries the logits.
-        let plan = splittingAtSnapshots(
+        let plan = splittingAtStops(
             prefillChunkSizes(
                 tokenCount: tokens.count, chunkSize: chunkSize, heldBack: 0,
-                startOffset: processedTokenCount, ringCapacity: slidingRingCapacity))
+                startOffset: processedTokenCount, ringCapacity: slidingRingCapacity),
+            stepTokens: chunkSize)
         for size in plan.dropLast() {
             try await _encodeChunk(tokens: Array(remainingTokens.prefix(size)))
             remainingTokens = remainingTokens.dropFirst(size)
@@ -2106,10 +2108,15 @@ private struct EngineImpl: ~Copyable {
             + KVChunk.Layout(kvCache.valueBinding).chunkBytes(count: count)
     }
 
-    /// `plan`, its chunks cut wherever one crosses one of ``snapshotPositions``, so a chunk ends there.
-    private func splittingAtSnapshots(_ plan: [Int]) -> [Int] {
-        guard !snapshotPositions.isEmpty else { return plan }
-        return PrefixSnapshotPlan.split(plan, from: processedTokenCount, at: snapshotPositions)
+    /// `plan`, prefill steps of up to `stepTokens` from ``processedTokenCount``. A recurrent model takes
+    /// ``PrefixSnapshotPlan/steps(from:to:stepTokens:ringCapacity:)`` over the same span instead: steps
+    /// between the same absolute positions wherever it starts, so its output does not depend on what the
+    /// prefix cache restored, and every snapshot position is one of them. Other models run `plan`.
+    private func splittingAtStops(_ plan: [Int], stepTokens: Int) -> [Int] {
+        guard hasNonTruncatableStates else { return plan }
+        let start = processedTokenCount
+        return PrefixSnapshotPlan.steps(
+            from: start, to: start + plan.reduce(0, +), stepTokens: stepTokens, ringCapacity: slidingRingCapacity)
     }
 
     /// Saves the recurrent state when prefill has just reached the next of ``snapshotPositions``.
