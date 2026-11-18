@@ -449,6 +449,24 @@ public struct EngineOptions: Sendable {
     /// ``TensorDataKey``). A role absent here is data the bundle does not ship.
     public var tensorData: [String: URL]
 
+    /// Bytes the engine may keep of earlier prompts' state, so a later prompt that starts the same way
+    /// restores that prefix rather than computing it again; zero turns this off.
+    ///
+    /// The engine keeps the KV of every full chunk of tokens it has processed, keyed by the exact
+    /// tokens before it, and on a model with recurrent state a snapshot of that state at chunk
+    /// boundaries, dropping the least recently used when the budget is spent. A second conversation
+    /// sharing a system prompt, or a turn that edits an earlier one, then starts from the deepest chunk
+    /// it shares. Off by default; ``suggestedPrefixCacheBytes`` suits a server.
+    ///
+    /// Only the pipelined engine keeps one, and only for a model whose state it can copy (not one with
+    /// a sliding-window ring); every other engine ignores this. ``InferenceEngine/prefixCacheEnabled``
+    /// says whether an engine took it. On a model with recurrent state, prefill also holds snapshots
+    /// it has taken until the next request, up to half this again.
+    public var prefixCacheBytes: Int
+
+    /// 1 GiB, what llm-server keeps unless told otherwise.
+    public static let suggestedPrefixCacheBytes = 1 << 30
+
     /// Well-known `assets` roles for tensor data.
     public enum TensorDataKey {
         /// INT8 per-layer embeddings table (`*_ple.safetensors`).
@@ -466,13 +484,15 @@ public struct EngineOptions: Sendable {
     ///   - prefillChunkSize: Tokens per prefill chunk, or `nil` to use model/engine default.
     ///   - prefillChunkThreshold: Minimum prompt tokens to trigger chunking, or `nil` for default.
     ///   - tensorData: Tensor data URLs keyed by `auxiliary_assets` role. Defaults to empty.
+    ///   - prefixCacheBytes: Bytes of earlier prompts' state to keep. Defaults to zero, off.
     public init(
         variant: String? = nil,
         kvCacheStrategy: KVCacheStrategy = .auto,
         kvCacheSize: Int? = nil,
         prefillChunkSize: Int? = nil,
         prefillChunkThreshold: Int? = nil,
-        tensorData: [String: URL] = [:]
+        tensorData: [String: URL] = [:],
+        prefixCacheBytes: Int = 0
     ) {
         self.variant = variant
         self.kvCacheStrategy = kvCacheStrategy
@@ -480,6 +500,7 @@ public struct EngineOptions: Sendable {
         self.prefillChunkSize = prefillChunkSize
         self.prefillChunkThreshold = prefillChunkThreshold
         self.tensorData = tensorData
+        self.prefixCacheBytes = prefixCacheBytes
     }
 
     /// Returns the KV cache size in tokens that the engine uses for a given context length.
