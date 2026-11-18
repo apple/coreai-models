@@ -301,7 +301,7 @@ uv run models/<name>/export.py --include-debug-info   # embed debug information 
 - [Qwen2.5](qwen2)
 - [Qwen3](qwen3)
 - [Qwen3 MoE](qwen3_moe)
-- [Qwen3.5](qwen3_5) (macOS 0.8B–27B via `coreai.llm.export`; iOS 2B/4B via `uv run models/qwen3_5/export.py`)
+- [Qwen3.5](qwen3_5)
 - [SmolLM2](smollm2)
 - [SmolLM3](smollm3)
 
