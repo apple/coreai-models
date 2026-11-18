@@ -594,7 +594,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
             LogitSoftcapProcessor.apply(to: &actualLogits!, cap: Float(softcap))
         }
         let sampleSpan = InstrumentsProfiler.beginSample(strategy: "cpu-fallback")
-        let nextToken = samplingConfig.fallbackSampler(
+        let nextToken = samplingConfig.cpuSampler(
             from: &logitBuffer, tokenHistory: inputTokens[generationStartOffset...], step: step,
             logitSoftcap: softcap)
         sampleSpan.end()

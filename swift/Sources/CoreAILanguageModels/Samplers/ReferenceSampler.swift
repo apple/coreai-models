@@ -7,7 +7,9 @@ import Accelerate
 import Foundation
 import os.signpost
 
-/// Unified CPU sampler supporting greedy, temperature, topK, topP, and minP sampling.
+/// The reference CPU sampler, supporting greedy, temperature, topK, topP, and minP sampling.
+///
+/// Other sampler implementations are measured against its output distribution.
 ///
 /// This sampler uses Float32 internally for all non-greedy sampling to ensure
 /// numerical precision. The Float16 → Float32 conversion happens once at entry,
@@ -28,7 +30,7 @@ import os.signpost
 /// ```
 /// logits → [temperature scaling] → [minP filter] → [topP filter] → [topK filter] → [softmax] → [sample]
 /// ```
-public struct CompositeSampler {
+public struct ReferenceSampler {
     // MARK: - Public API (Float16 input - backward compatible)
 
     /// Samples the next token from Float16 logits.
@@ -544,3 +546,7 @@ public struct CompositeSampler {
         return parts.isEmpty ? "temperature" : parts.joined(separator: "+")
     }
 }
+
+/// The former name of ``ReferenceSampler``.
+@available(*, deprecated, renamed: "ReferenceSampler")
+public typealias CompositeSampler = ReferenceSampler
