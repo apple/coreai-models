@@ -1,6 +1,6 @@
 # coreai-models — guidance for agents and reviewers
 
-Core AI exports of ML models (Python, `python/src/coreai_models/`, `models/`) and the Swift runtime and
+Core AI exports of models (Python, `python/src/coreai_models/`, `models/`) and the Swift runtime and
 tools that run them (`swift/Sources/`).
 
 ## Check your change
