@@ -425,9 +425,7 @@ FLUX2_DYNAMIC_COMPONENTS: dict[str, ComponentSpec | MultiFunctionComponentSpec] 
     ),
     "text_encoder": FLUX2_COMPONENTS["text_encoder"],
     "vae_decoder": replace(
-        FLUX2_COMPONENTS["vae_decoder"],
-        wrapper_fn=lambda p: Flux2VAEDecoderWrapper(p.vae, dynamic=True),
-        dynamic_shapes_fn=flux2_vae_decoder_dynamic_shapes,
+        FLUX2_COMPONENTS["vae_decoder"], dynamic_shapes_fn=flux2_vae_decoder_dynamic_shapes
     ),
     "vae_encoder": replace(
         FLUX2_COMPONENTS["vae_encoder"], dynamic_shapes_fn=flux2_vae_encoder_dynamic_shapes
