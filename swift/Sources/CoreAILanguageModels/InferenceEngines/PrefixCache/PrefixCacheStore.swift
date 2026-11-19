@@ -9,8 +9,8 @@ import Synchronization
 
 /// The prefix cache's second tier: ``PrefixTree`` nodes as files, kept across restarts.
 ///
-/// Every chunk the tree takes is written here as well, off the engine's path, and a prompt that runs
-/// past what the tree holds in memory reads the next chunks back from here. So the disk budget can be
+/// Chunks the tree takes are written here as well, off the engine's path, as far as the budget allows,
+/// and a prompt that runs past what the tree holds in memory reads the next chunks back from here. So the disk budget can be
 /// larger than the memory one, and a restarted server reuses what the last run computed.
 ///
 /// A node's files are named by its key, the chained SHA-256 of its prefix, so no token ids are written:
@@ -99,7 +99,7 @@ package final class PrefixCacheStore: Sendable {
             CLILogger.log("prefix cache: no disk tier, cannot create \(directory.path): \(error)")
             return nil
         }
-        // Another process's store would delete the files this one writes, and this one its files.
+        // Two stores on one directory would each delete the files the other has written.
         let lock = open(directory.appendingPathComponent(Self.lockName).path, O_CREAT | O_RDWR, 0o644)
         guard lock >= 0, flock(lock, LOCK_EX | LOCK_NB) == 0 else {
             if lock >= 0 { close(lock) }
@@ -525,7 +525,7 @@ package final class PrefixCacheStore: Sendable {
         for (path, size, modified) in files.sorted(by: { $0.0 < $1.0 }) {
             hasher.update(data: Data("\(path)\t\(size)\t\(modified)\n".utf8))
         }
-        let digest = hasher.finalize().prefix(8).map { String(format: "%02x", $0) }.joined()
+        let digest = PrefixTree.hex(hasher.finalize().prefix(8))
         let name = root.lastPathComponent.map { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" ? $0 : "_" }
         return
             caches

@@ -176,6 +176,9 @@ package final class DeviceMemoryGuard: Sendable {
 
     /// Bytes this process would have to give back for every figure to be under its line, with
     /// ``pastArmMargin`` of the recommendation to spare; zero when none is over, or before ``arm()``.
+    ///
+    /// The larger of the two overages, Metal's or the resident one, so giving back heap memory may not
+    /// bring Metal's figure down: a caller re-checks ``refusalReason()`` after giving it back.
     package func excess() -> Int {
         let now = measure()
         guard let lines = watch.withLock({ $0.lines }) else { return 0 }

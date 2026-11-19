@@ -318,6 +318,82 @@ struct PrefixCacheStoreTests {
         }
     }
 
+    @Test("Making room for a chunk never evicts the chain it extends, even when that chain is the coldest")
+    func writeKeepsItsChain() throws {
+        try Self.withDirectory { directory in
+            let store = try #require(
+                PrefixCacheStore(directory: directory, byteBudget: 2 * Self.nodeBytes, geometry: Self.geometry))
+            let chain = Self.writeChain(1, from: 0, into: store)
+            let other = Self.writeChain(1, from: 50, into: store)
+            store.touch(other)
+            let child = PrefixTree.chain(chain[0], [4, 5, 6, 7][...])
+            store.write(chunk: Self.kv(2), for: child, parent: chain[0], depth: 2)
+            store.flush()
+            #expect(store.record(of: chain[0]) != nil)
+            #expect(store.record(of: child)?.parent == chain[0])
+            #expect(store.record(of: other[0]) == nil)
+        }
+    }
+
+    @Test("Writing a chunk or a snapshot the store already holds changes nothing it counts")
+    func repeatedWritesAreNoOps() throws {
+        try Self.withDirectory { directory in
+            // With room to spare, a second write of a chunk adds no bytes.
+            let roomy = try #require(
+                PrefixCacheStore(directory: directory, byteBudget: 1 << 20, geometry: Self.geometry))
+            let held = Self.writeChain(2, into: roomy)
+            roomy.write(chunk: Self.kv(2), for: held[1], parent: held[0], depth: 2)
+            roomy.flush()
+            #expect(roomy.bytesHeld == 2 * Self.nodeBytes && roomy.nodeCount == 2)
+        }
+        try Self.withDirectory { directory in
+            let first = [Data(repeating: 1, count: 8)]
+            // Room for the chain and its snapshot, and nothing more.
+            let budget = 2 * Self.nodeBytes + PrefixCacheStore.encodedSize(of: first)
+            let store = try #require(
+                PrefixCacheStore(directory: directory, byteBudget: budget, geometry: Self.geometry))
+            let chain = Self.writeChain(2, into: store)
+            store.write(chunk: Self.kv(2), for: chain[1], parent: chain[0], depth: 2)
+            store.write(snapshot: first, for: chain[0])
+            store.flush()
+            let held = store.bytesHeld
+            store.write(snapshot: [Data(repeating: 2, count: 16)], for: chain[0])
+            store.flush()
+            #expect(store.bytesHeld == held && store.nodeCount == 2)
+            #expect(store.read(chain[0], withSnapshot: true)?.snapshot == first)
+            // The parent counts one child, so once that child goes it is a leaf eviction can take.
+            store.remove(chain[1])
+            Self.writeChain(1, from: 50, into: store)
+            Self.writeChain(1, from: 90, into: store)
+            #expect(store.record(of: chain[0]) == nil)
+        }
+    }
+
+    @Test("The index a running store compacts keeps the recency order a restart evicts by")
+    func compactionKeepsRecency() throws {
+        try Self.withDirectory { directory in
+            let warm: [PrefixTree.Key]
+            let cold: [PrefixTree.Key]
+            do {
+                let store = try #require(
+                    PrefixCacheStore(directory: directory, byteBudget: 1 << 20, geometry: Self.geometry))
+                warm = Self.writeChain(1, from: 0, into: store)
+                cold = Self.writeChain(1, from: 50, into: store)
+                // Two lines for the writes, then uses up to the 256 lines that compact the index: the
+                // compacted file is the last thing written.
+                for _ in 0..<254 { store.touch(warm) }
+                store.flush()
+                let lines = try String(contentsOf: directory.appendingPathComponent("index.jsonl"), encoding: .utf8)
+                    .split(separator: "\n").count
+                #expect(lines == 2)
+            }
+            let reopened = try #require(
+                PrefixCacheStore(directory: directory, byteBudget: Self.nodeBytes, geometry: Self.geometry))
+            #expect(reopened.record(of: warm[0]) != nil)
+            #expect(reopened.record(of: cold[0]) == nil)
+        }
+    }
+
     @Test("A file's header is checked against its length")
     func decodeChecksHeaders() {
         let blobs = [Data([1, 2, 3]), Data(), Data([4])]
@@ -330,6 +406,10 @@ struct PrefixCacheStoreTests {
         huge.replaceSubrange(4..<12, with: [UInt8](repeating: 0xff, count: 8))
         #expect(PrefixCacheStore.decode(huge) == nil)
         #expect(PrefixCacheStore.decode(Data([0, 0, 0, 0])) == nil)
+        // Lengths that would overflow their sum are refused, not added up.
+        var lengths = Data([3, 0, 0, 0])
+        for _ in 0..<3 { lengths += withUnsafeBytes(of: UInt64(1 << 62).littleEndian) { Data($0) } }
+        #expect(PrefixCacheStore.decode(lengths) == nil)
     }
 
     @Test("A model's directory changes when one of its files does")
@@ -341,7 +421,12 @@ struct PrefixCacheStoreTests {
             let first = try #require(PrefixCacheStore.defaultDirectory(forModelAt: model))
             #expect(PrefixCacheStore.defaultDirectory(forModelAt: model) == first)
             try Data([1, 2, 3, 4]).write(to: weights)
-            #expect(PrefixCacheStore.defaultDirectory(forModelAt: model) != first)
+            let resized = PrefixCacheStore.defaultDirectory(forModelAt: model)
+            #expect(resized != first)
+            // Rewritten at the same size, as a re-export may be: the modification date tells them apart.
+            try FileManager.default.setAttributes(
+                [.modificationDate: Date(timeIntervalSince1970: 1_000_000)], ofItemAtPath: weights.path)
+            #expect(PrefixCacheStore.defaultDirectory(forModelAt: model) != resized)
         }
     }
 }

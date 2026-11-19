@@ -108,8 +108,10 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
             if options.prefixCacheDiskBytes > 0 {
                 CLILogger.log(
                     "prefix cache: no disk tier: "
-                        + (prefixTree == nil
-                            ? "it needs the memory cache, which is off" : "prefixCacheDirectory is not set"))
+                        + (options.prefixCacheBytes == 0
+                            ? "it needs the memory cache, which is off"
+                            : prefixTree == nil
+                                ? "the memory cache is off for this model" : "prefixCacheDirectory is not set"))
             }
         }
     }

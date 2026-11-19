@@ -127,6 +127,21 @@ struct DeviceMemoryGuardTests {
         figures.set(allocated: 1_000_000, footprint: 1_000_000)
         #expect(memoryGuard.refusalReason() == nil)
     }
+
+    @Test("Excess is what the larger overage takes to clear its line, with the margin, and zero otherwise")
+    func excess() {
+        let figures = Figures()
+        #expect(guarding(figures, armed: false).excess() == 0)
+        let memoryGuard = guarding(figures)
+        #expect(memoryGuard.excess() == 0)
+        // Lines: 98 for Metal's figure, 100 resident; the margin is 2% of 100.
+        figures.set(allocated: 110)
+        #expect(memoryGuard.excess() == 12 + 2)
+        figures.set(footprint: 120)
+        #expect(memoryGuard.excess() == 20 + 2)
+        figures.set(allocated: 10, footprint: 10)
+        #expect(memoryGuard.excess() == 0)
+    }
 }
 
 #endif

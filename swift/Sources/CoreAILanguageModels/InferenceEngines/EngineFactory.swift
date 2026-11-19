@@ -460,8 +460,8 @@ public struct EngineOptions: Sendable {
     ///
     /// Only the pipelined engine keeps one, and only for a model whose state it can copy (not one with
     /// a sliding-window ring); every other engine ignores this. ``InferenceEngine/prefixCacheEnabled``
-    /// says whether an engine took it. On a model with recurrent state, prefill also holds snapshots
-    /// it has taken until the next request, up to half this again.
+    /// says whether an engine took it. On a model with recurrent state, prefill also holds the snapshots
+    /// it has taken until the reply is out, up to half this again.
     public var prefixCacheBytes: Int
 
     /// 1 GiB, what llm-server keeps unless told otherwise.
@@ -470,8 +470,8 @@ public struct EngineOptions: Sendable {
     /// Bytes of disk the prefix cache may also use, in ``prefixCacheDirectory``; zero, the default,
     /// keeps it in memory only.
     ///
-    /// Every chunk the cache keeps in memory is also written to disk, in the background, and a prompt
-    /// that runs past what memory holds reads the next chunks back from there. So this may be larger
+    /// Chunks the cache takes in memory are also written to disk, in the background, as far as this
+    /// budget allows, and a prompt that runs past what memory holds reads the next chunks back from there. So this may be larger
     /// than ``prefixCacheBytes``, and a restarted engine reuses what an earlier one computed. Needs
     /// ``prefixCacheBytes`` and ``prefixCacheDirectory`` too: chunks reach the KV cache through memory.
     /// Without either, the engine logs why and keeps no disk tier.

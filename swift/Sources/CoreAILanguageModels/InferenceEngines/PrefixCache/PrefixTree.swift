@@ -92,9 +92,13 @@ package struct PrefixTree: Sendable {
         var hasher = SHA256()
         hasher.update(data: Data(parent.utf8))
         Array(tokens).withUnsafeBytes { hasher.update(bufferPointer: $0) }
+        return hex(hasher.finalize())
+    }
+
+    /// `bytes` as lowercase hex.
+    package static func hex(_ bytes: some Sequence<UInt8>) -> String {
         var hex = [UInt8]()
-        hex.reserveCapacity(SHA256.byteCount * 2)
-        for byte in hasher.finalize() {
+        for byte in bytes {
             hex.append(hexDigits[Int(byte >> 4)])
             hex.append(hexDigits[Int(byte & 0x0f)])
         }

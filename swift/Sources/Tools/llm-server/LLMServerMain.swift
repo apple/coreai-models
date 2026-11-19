@@ -101,6 +101,9 @@ struct LLMServer: AsyncParsableCommand {
 
     @OptionGroup var prefixCache: PrefixCacheOptions
 
+    /// Megabytes of prefix cache the server keeps when `--prefix-cache-mb` isn't given.
+    static let defaultPrefixCacheMB = EngineOptions.suggestedPrefixCacheBytes >> 20
+
     @Option(
         name: .customLong("chunk-size"),
         help: ArgumentHelp(
@@ -159,7 +162,7 @@ struct LLMServer: AsyncParsableCommand {
     var verbose: Bool = false
 
     func validate() throws {
-        try prefixCache.validate(defaultMB: EngineOptions.suggestedPrefixCacheBytes >> 20)
+        try prefixCache.validate(defaultMB: Self.defaultPrefixCacheMB)
         guard maxQueueDepth >= 0 else {
             throw ValidationError("--max-queue-depth must be >= 0 (got \(maxQueueDepth))")
         }
@@ -206,7 +209,7 @@ struct LLMServer: AsyncParsableCommand {
             prefillChunkSize: resolvedChunkSize,
             prefillChunkThreshold: resolvedChunkThreshold,
             tensorData: bundle.tensorData,
-            prefixCacheBytes: prefixCache.memoryBytes(defaultMB: EngineOptions.suggestedPrefixCacheBytes >> 20),
+            prefixCacheBytes: prefixCache.memoryBytes(defaultMB: Self.defaultPrefixCacheMB),
             prefixCacheDiskBytes: prefixCache.diskBytes,
             prefixCacheDirectory: prefixCache.diskBytes > 0
                 ? EngineOptions.defaultPrefixCacheDirectory(forModelAt: bundle.bundlePath) : nil

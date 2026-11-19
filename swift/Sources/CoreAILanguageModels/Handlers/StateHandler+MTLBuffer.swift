@@ -31,8 +31,9 @@ public final class FixedMTLBufferState {
             }, device: device)
     }
 
-    /// States of the given shapes, laid out densely, for a caller with no model descriptor to hand:
-    /// `NDArrayDescriptor` has no public initializer. For types a whole number of bytes wide.
+    /// States of the given shapes, laid out densely, for a caller with no model descriptor to hand
+    /// (`NDArrayDescriptor` has no public initializer). Throws on a dynamic shape; each scalar type must
+    /// be a whole number of bytes wide.
     package convenience init(
         dense states: [(name: String, scalarType: NDArray.ScalarType, shape: [Int])], device: MTLDevice
     ) throws {

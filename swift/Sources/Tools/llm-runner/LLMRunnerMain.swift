@@ -386,7 +386,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     func validate() throws {
         try prefixCache.validate(defaultMB: 0)
         if promptList != nil, !prefixCache.givenFlags.isEmpty {
-            // --prompt-list runs on the sequential engine, which keeps no prefix cache.
+            // --prompt-list batches on the sequential engine, which keeps no prefix cache.
             throw ValidationError(
                 "\(prefixCache.givenFlags.joined(separator: " and ")) can't be used with --prompt-list")
         }

@@ -58,10 +58,12 @@ package struct PrefixCacheOptions: ParsableArguments {
     /// Bytes of disk for the cache, zero for none.
     package var diskBytes: Int { prefixCacheDiskMB << 20 }
 
-    /// The flags given on the command line, for a path that ignores them all to name.
+    /// The flags that ask for a cache, for a path that can't keep one to list. A value of 0 asks for none.
     package var givenFlags: [String] {
-        [prefixCacheMB != nil ? "--prefix-cache-mb" : nil, prefixCacheDiskMB > 0 ? "--prefix-cache-disk-mb" : nil]
-            .compactMap { $0 }
+        [
+            (prefixCacheMB ?? 0) > 0 ? "--prefix-cache-mb" : nil,
+            prefixCacheDiskMB > 0 ? "--prefix-cache-disk-mb" : nil,
+        ].compactMap { $0 }
     }
 
     /// A warning naming the flags asked for that an engine keeping no prefix cache ignores, or nil when

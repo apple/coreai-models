@@ -79,4 +79,21 @@ struct PromptListTests {
                 .contains("runs on the coreai-sequential engine") == true)
         #expect(parseError(["--prompt-list", "p.txt", "--concurrent-requests", "2"]) == nil)
     }
+
+    @Test("Prefix-cache flags are range-checked, a disk budget needs a memory cache, and --prompt-list refuses a cache")
+    func prefixCacheFlags() {
+        #expect(parseError(["--prefix-cache-mb", "-1"])?.contains("--prefix-cache-mb must be between") == true)
+        #expect(
+            parseError(["--prefix-cache-disk-mb", "\(Int.max)"])?.contains("--prefix-cache-disk-mb must be between")
+                == true)
+        // llm-runner keeps no memory cache unless asked, and every chunk reaches disk through it.
+        #expect(parseError(["--prefix-cache-disk-mb", "64"])?.contains("needs --prefix-cache-mb above 0") == true)
+        #expect(parseError(["--prefix-cache-disk-mb", "64", "--prefix-cache-mb", "8"]) == nil)
+        // --prompt-list batches on the sequential engine, which keeps no cache; asking for none is fine.
+        #expect(
+            parseError(["--prompt-list", "p.txt", "--prefix-cache-mb", "8"])?.contains(
+                "can't be used with --prompt-list")
+                == true)
+        #expect(parseError(["--prompt-list", "p.txt", "--prefix-cache-mb", "0"]) == nil)
+    }
 }

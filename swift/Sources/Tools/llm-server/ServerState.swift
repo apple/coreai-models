@@ -251,7 +251,9 @@ final class ServerState: @unchecked Sendable {
     /// throws ``MemoryRefusal``. The engine's prefix cache goes first, since it is only a cache.
     private func admittedForMemory(_ access: RequestAccess) throws -> RequestAccess {
         guard var reason = memoryGuard?.refusalReason() else { return access }
-        if let excess = memoryGuard?.excess(), excess > 0, engine.shedPrefixCache(atLeast: excess) > 0 {
+        // A second reading under the line, or a cache that gave memory back, earns a fresh check.
+        let excess = memoryGuard?.excess() ?? 0
+        if excess == 0 || engine.shedPrefixCache(atLeast: excess) > 0 {
             guard let still = memoryGuard?.refusalReason() else { return access }
             reason = still
         }

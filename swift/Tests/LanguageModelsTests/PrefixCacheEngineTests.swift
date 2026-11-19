@@ -44,7 +44,8 @@ struct PrefixCacheEngineTests {
 
     /// Waits for `engine`'s last generation to give the engine back.
     private func settle(_ engine: any InferenceEngine) async throws {
-        for _ in 0..<100 where engine.isBusy { try await Task.sleep(for: .milliseconds(20)) }
+        for _ in 0..<250 where engine.isBusy { try await Task.sleep(for: .milliseconds(20)) }
+        #expect(!engine.isBusy, "the engine never gave itself back")
     }
 
     private func reply(_ prompt: String, engine: any InferenceEngine, tokenizer: any Tokenizer) async throws -> String {
@@ -161,6 +162,29 @@ struct PrefixCacheEngineTests {
         _ = try await reply(Self.second, engine: engine, tokenizer: tokenizer)
         try await settle(engine)
         #expect((pipelined.prefixTree?.nodeCount ?? 0) >= 2)
+    }
+
+    @Test(
+        "A hybrid model on a fresh engine resumes at a snapshot read from disk, and replies as a cold engine does",
+        .enabled(if: ProcessInfo.processInfo.environment["COREAI_TEST_HYBRID_BUNDLE"] != nil))
+    func hybridDiskAcrossEngines() async throws {
+        let path = try #require(ProcessInfo.processInfo.environment["COREAI_TEST_HYBRID_BUNDLE"])
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PrefixCacheEngineTests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        do {
+            let (first, tokenizer) = try await load(path, prefixCacheBytes: 1 << 30, diskDirectory: directory)
+            _ = try await reply(Self.first, engine: first, tokenizer: tokenizer)
+            try await settle(first)
+            try #require((first as? CoreAIPipelinedEngine)?.prefixStore).flush()
+        }
+        let (second, tokenizer) = try await load(path, prefixCacheBytes: 1 << 30, diskDirectory: directory)
+        let restored = try await replies([Self.second], engine: second, tokenizer: tokenizer)
+        #expect(restored[0].restored >= PrefixSnapshotPlan.gridTokens)
+        #expect(restored[0].restored % PrefixSnapshotPlan.gridTokens == 0)
+
+        let (cold, _) = try await load(path, prefixCacheBytes: 0)
+        #expect(restored[0].text == (try await reply(Self.second, engine: cold, tokenizer: tokenizer)))
     }
 }
 
