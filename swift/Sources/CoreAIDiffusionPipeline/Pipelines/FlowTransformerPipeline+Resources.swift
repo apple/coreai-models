@@ -164,9 +164,8 @@ extension FlowTransformerPipeline {
         func component(_ name: String, _ path: String?) throws -> CoreAIDiffusionModelFunction {
             guard let path else { throw PipelineLoadError.missingComponent(name) }
             let assetURL = try resolveExistingPipelineAsset(path, in: url, component: name)
-            let unit: ComputeUnitKind =
-                bundle.config.computeUnits?[name]?.first == "neural_engine" ? .neuralEngine : .gpu
-            return CoreAIDiffusionModelFunction(modelURL: assetURL, computeUnit: unit)
+            return CoreAIDiffusionModelFunction(
+                modelURL: assetURL, computeUnit: try bundle.config.computeUnit(for: name))
         }
 
         return Self(
@@ -265,6 +264,22 @@ extension FlowTransformerPipeline {
         let rawData = data[dataStart...]
         return rawData.withUnsafeBytes { ptr in
             Array(ptr.bindMemory(to: Float32.self))
+        }
+    }
+}
+
+extension DiffusionConfig {
+    /// The compute unit `component`'s asset was exported for: its first `compute_units` entry, or
+    /// the GPU if it has none. Throws on a unit this runtime does not know.
+    func computeUnit(for component: String) throws -> ComputeUnitKind {
+        switch computeUnits?[component]?.first {
+        case nil, "gpu":
+            return .gpu
+        case "neural_engine":
+            return .neuralEngine
+        case let unit?:
+            throw PipelineLoadError.unsupportedConfiguration(
+                "Unknown compute unit '\(unit)' for component '\(component)'.")
         }
     }
 }

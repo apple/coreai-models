@@ -211,6 +211,11 @@ def main() -> None:
 
     # Sana Sprint's iOS build is the one re-authored for the Neural Engine.
     neural_engine = args.platform == "iOS" and pipeline_type == "sana_sprint"
+    if neural_engine and args.compute_precision not in (None, "float16"):
+        parser.error(
+            f"Sana Sprint's --platform iOS build is float16; got --compute-precision "
+            f"{args.compute_precision}."
+        )
 
     # Sana Sprint's --platform only picks the build, so it combines with --components.
     if args.components and args.platform and pipeline_type != "sana_sprint":

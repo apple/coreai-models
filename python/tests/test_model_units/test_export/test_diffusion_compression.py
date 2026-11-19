@@ -273,6 +273,28 @@ def test_sana_platform_combines_with_components(
     assert "components:         transformer" in out
 
 
+def test_sana_platform_ios_takes_only_float16(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from coreai_models.diffusion import export
+
+    out = _dry_run(
+        monkeypatch,
+        capsys,
+        "sana-sprint-0.6b",
+        "--platform",
+        "iOS",
+        "--compute-precision",
+        "float16",
+    )
+    assert "neural_engine:     True" in out
+    argv = ["export", "sana-sprint-0.6b", "--platform", "iOS", "--compute-precision", "bfloat16"]
+    monkeypatch.setattr("sys.argv", [*argv, "--dry-run"])
+    with pytest.raises(SystemExit):
+        export.main()
+    assert "--platform iOS build is float16" in capsys.readouterr().err
+
+
 def test_flux2_platform_ios_stays_on_the_gpu(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

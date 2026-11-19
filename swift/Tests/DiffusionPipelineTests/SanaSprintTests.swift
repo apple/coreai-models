@@ -138,4 +138,17 @@ struct SanaSprintTests {
         #expect(config.computeUnits?[DiffusionComponentKey.vaeDecoder] == ["neural_engine"])
         #expect(config.computeUnits?[DiffusionComponentKey.textEncoder] == nil)
     }
+
+    @Test("Maps each component's compute units to the unit it loads on")
+    func mapsComputeUnits() throws {
+        let config = DiffusionConfig(
+            type: .sanaSprint,
+            computeUnits: ["transformer": ["neural_engine"], "text_encoder": ["gpu"], "vae_decoder": ["cpu"]])
+        #expect(try config.computeUnit(for: DiffusionComponentKey.transformer) == .neuralEngine)
+        #expect(try config.computeUnit(for: DiffusionComponentKey.textEncoder) == .gpu)
+        #expect(try DiffusionConfig(type: .sanaSprint).computeUnit(for: "transformer") == .gpu)
+        #expect(throws: PipelineLoadError.self) {
+            try config.computeUnit(for: DiffusionComponentKey.vaeDecoder)
+        }
+    }
 }
