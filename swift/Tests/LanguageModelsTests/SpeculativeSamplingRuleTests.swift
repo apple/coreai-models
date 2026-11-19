@@ -203,22 +203,49 @@ struct SpeculativeSamplingRuleTests {
         }
     }
 
-    @Test("Prompt lookup now samples, with a seed reproducing a run")
+    @Test("Prompt lookup now samples: a seed reproduces a run, other seeds change it, and it is not greedy")
     func promptLookupSamples() async throws {
         let t = Self.target
-        func run(seed: UInt64) async throws -> [Int32] {
+        let prompt: [Int32] = [0, 1, 0, 1, 0]
+        func makeDecoder() -> SpeculativeDecoder {
             let decoder = SpeculativeDecoder(
                 drafter: GuessDrafter(proposes: { $0 }), target: TableEngine(table: t), numDraftTokens: 3)
             decoder.promptLookup = PromptLookup(maxNgram: 2, minNgram: 1)
+            return decoder
+        }
+        func run(seed: UInt64) async throws -> [Int32] {
             var got: [Int32] = []
-            _ = try await decoder.generateSampling(
-                promptTokens: [0, 1, 0, 1, 0], maxNewTokens: 24, stopTokenIds: [], temperature: 0.8, seed: seed,
+            _ = try await makeDecoder().generateSampling(
+                promptTokens: prompt, maxNewTokens: 24, stopTokenIds: [], temperature: 0.8, seed: seed,
                 onToken: { got.append($0) })
             return got
         }
         let a = try await run(seed: 7)
         #expect(a.count == 24)
         #expect(try await run(seed: 7) == a)
+        // 24 tokens at temperature 0.8 over 6 tokens: a sampler repeats a sequence across seeds
+        // with negligible probability, while argmax decoding would give the same one every time.
+        for seed: UInt64 in [8, 9, 10] {
+            #expect(try await run(seed: seed) != a, "seed \(seed) reproduced seed 7's run")
+        }
+        var greedy: [Int32] = []
+        _ = try await makeDecoder().generateGreedy(
+            promptTokens: prompt, maxNewTokens: 24, stopTokenIds: [], onToken: { greedy.append($0) })
+        #expect(greedy.count == 24)
+        #expect(a != greedy)
+    }
+
+    @Test("A draft without a distribution outside the vocabulary throws instead of indexing past it")
+    func pointMassOutsideTheVocabulary() async throws {
+        // The engine can be fed token 9 (it has a row for it), but its distributions are 4 wide.
+        let target = TableEngine(table: Array(repeating: [0, 0, 0, 0], count: 16))
+        let decoder = SpeculativeDecoder(
+            drafter: GuessDrafter(proposes: { _ in 9 }), target: target, numDraftTokens: 1)
+        await #expect(throws: InferenceRuntimeError.self) {
+            _ = try await decoder.generateSampling(
+                promptTokens: [0], maxNewTokens: 4, stopTokenIds: [], temperature: 1, seed: 1,
+                onToken: { _ in })
+        }
     }
 }
 

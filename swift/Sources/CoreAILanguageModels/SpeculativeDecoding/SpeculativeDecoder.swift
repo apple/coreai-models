@@ -497,14 +497,24 @@ package final class SpeculativeDecoder: @unchecked Sendable {
         var next: Int32 = 0
         var haveNext = false
         while accepted < proposal.tokens.count {
-            let p = SpeculativeMath.temperatureSoftmax(targetLogits[accepted], temperature: temperature)
+            var p = SpeculativeMath.temperatureSoftmax(targetLogits[accepted], temperature: temperature)
             let x = Int(proposal.tokens[accepted])
-            let q: [Float]
-            if let draftLogits {
-                q = SpeculativeMath.temperatureSoftmax(draftLogits[accepted], temperature: temperature)
-            } else {
-                q = SpeculativeMath.pointMass(at: x, count: p.count)
+            guard let draftLogits else {
+                // Point mass at x: q(x) = 1, so x is accepted with probability p(x), and the residual
+                // norm(relu(p − q)) is p with x removed. Neither needs q itself.
+                guard x >= 0, x < p.count else {
+                    throw InferenceRuntimeError.invalidState(
+                        "draft token \(x) is outside the vocabulary (target \(p.count))")
+                }
+                if Double.random(in: 0..<1, using: &rng) < Double(p[x]) {
+                    accepted += 1
+                    continue
+                }
+                next = SpeculativeMath.sampleExcluding(x, from: &p, using: &rng)
+                haveNext = true
+                break
             }
+            let q = SpeculativeMath.temperatureSoftmax(draftLogits[accepted], temperature: temperature)
             guard x >= 0, x < p.count, x < q.count else {
                 throw InferenceRuntimeError.invalidState(
                     "draft token \(x) is outside the vocabulary (target \(p.count), draft \(q.count))")

@@ -59,13 +59,27 @@ enum SpeculativeMath {
         return Int32(ReferenceSampler.multinomialSample(probs, using: &rng))
     }
 
-    /// A distribution of `count` entries with all its mass on `index`; empty when `index` is outside
-    /// it, so a caller's range check reports the bad token.
-    static func pointMass(at index: Int, count: Int) -> [Float] {
-        guard index >= 0, index < count else { return [] }
-        var probs = [Float](repeating: 0, count: count)
-        probs[index] = 1
-        return probs
+    /// Sample from `p` with `token` removed: the residual `norm(relu(p − q))` when `q` has all its mass
+    /// on `token`, as for a draft that carries no distribution. Zeroes `p[token]` in place and draws by
+    /// inverse CDF over the remaining mass, so no vocabulary-sized buffer is allocated. Returns `token`
+    /// when no other token has mass (rejection cannot happen then, since `token` is accepted with
+    /// probability `p[token] = 1`).
+    static func sampleExcluding(
+        _ token: Int, from p: inout [Float], using rng: inout some RandomNumberGenerator
+    ) -> Int32 {
+        p[token] = 0
+        let total = vDSP.sum(p)
+        guard total > 0 else { return Int32(token) }
+        let r = Float.random(in: 0..<1, using: &rng) * total
+        var cum: Float = 0
+        var last = token
+        for i in p.indices where p[i] > 0 {
+            cum += p[i]
+            last = i
+            if r < cum { return Int32(i) }
+        }
+        // Rounding left `r` at or past the accumulated sum: take the last token with mass.
+        return Int32(last)
     }
 
     /// Sample from the normalized residual `norm(relu(p − q))` used on rejection.
