@@ -1007,3 +1007,36 @@ def test_geglu_mlp_puts_tokens_in_the_conv_width():
 
     assert shapes[0] == (1, dim, 1, seq)
     assert torch.equal(out, reference)
+
+
+def test_activation_scales_quantize_only_projection_inputs():
+    """The checkpoint's input scales are applied and its output scales are not, so no
+    quantize/dequantize sits between a conv and the op after it; o_proj's input stays
+    unquantized; a projection the checkpoint has no scales for is an error."""
+
+    def tree(names):
+        root = torch.nn.Module()
+        for name in names:
+            parent = root
+            *path, leaf = name.split(".")
+            for part in path:
+                if not hasattr(parent, part):
+                    parent.add_module(part, torch.nn.Module())
+                parent = getattr(parent, part)
+            parent.add_module(leaf, NativeQuantConv1x1(4, 4, nbits=4))
+        return root
+
+    names = ["layers.0.mlp.gate_proj", "layers.0.mlp.down_proj", "layers.0.self_attn.o_proj"]
+    root = tree([f"extend.model.{n}" for n in names])
+    scales = {n: (0.02 + i * 0.01, 0.5) for i, n in enumerate(names)}
+    Gemma4ForCausalLMForiOS._apply_activation_scales(root, scales)
+
+    modules = dict(root.named_modules())
+    for i, n in enumerate(names):
+        conv = modules[f"extend.model.{n}"]
+        assert conv.output_activation_scale == 0.0, n
+        expected = 0.0 if n.endswith("o_proj") else 0.02 + i * 0.01
+        assert conv.input_activation_scale == pytest.approx(expected), n
+
+    with pytest.raises(ValueError, match="No activation scales"):
+        Gemma4ForCausalLMForiOS._apply_activation_scales(root, {})

@@ -1732,9 +1732,15 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
         state_dict.pop("lm_head.weight", None)
 
     def _apply_activation_scales(self, scales: dict[str, tuple[float, float]]) -> None:
-        """Set each native quantized projection's static activation scales from ``scales``,
+        """Set each native quantized projection's static input activation scale from ``scales``,
         keyed by text-model module name (``layers.<i>.self_attn.q_proj`` and so on). Layers
-        this model does not build (the shared-KV layers' ``k_proj``/``v_proj``) are skipped."""
+        this model does not build (the shared-KV layers' ``k_proj``/``v_proj``) are skipped.
+
+        Only each projection's input is quantized; the checkpoint's output scales are not
+        applied. An output quantize/dequantize sits between a conv and the op after it (the
+        MLP's GELU, for one), which keeps the Neural Engine compiler from fusing the input
+        quantize into an integer convolution, and the next projection quantizes its own input
+        anyway."""
         root = "extend.model."
         applied = 0
         for name, module in self.named_modules():
@@ -1745,17 +1751,14 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
             entry = scales.get(name[len(root) :])
             if entry is None:
                 raise ValueError(f"No activation scales in the checkpoint for {name}")
-            input_scale, output_scale = entry
+            input_scale, _ = entry
             if name.endswith(".self_attn.o_proj"):
                 # Its input comes straight from the attention composite, and the static-shape
                 # engine's compiler fails ("internal error in Quant Hoisting logic") when a
                 # quantize follows that composite; the whole function then falls back off the
                 # engine. Left unquantized until the compiler handles it.
                 input_scale = 0.0
-            module.input_activation_scale, module.output_activation_scale = (
-                input_scale,
-                output_scale,
-            )
+            module.input_activation_scale, module.output_activation_scale = input_scale, 0.0
             applied += 1
         logger.info(f"Applied static INT8 activation quantization to {applied} projections.")
 
