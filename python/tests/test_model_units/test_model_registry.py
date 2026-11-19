@@ -165,6 +165,20 @@ def test_output_name_llm_iOS_prepends_hf_tail_when_yaml_stem_lacks_it() -> None:
     assert _preset_to_output_name(p) == "qwen3_0_6b_generic_4bit_static"
 
 
+def test_gemma4_qat_preset_names_the_bundle_the_export_writes() -> None:
+    """The QAT checkpoint is not palettized; its preset carries the compression name the
+    Gemma 4 export gives its bundle."""
+    from coreai_models.export.pipeline import ExportConfig, _generate_output_name
+
+    p = lookup_preset("gemma4-e2b-it-qat", model_type="llm", variant="iOS")
+    assert p.hf_id == "google/gemma-4-E2B-it-qat-mobile-transformers"
+    assert p.compression_config is None
+    expected = _generate_output_name(
+        ExportConfig(hf_model_id=p.hf_id, variant="iOS", compression="native_quantized")
+    )
+    assert _preset_to_output_name(p) == expected
+
+
 def test_output_name_diffusion_is_hf_tail() -> None:
     p = lookup_preset("flux2-klein-4b", model_type="diffusion")
     assert _preset_to_output_name(p) == "FLUX.2-klein-4B"

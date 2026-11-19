@@ -262,17 +262,6 @@ _METADATA: dict[str, AIModelMetadataFields] = {
             "Source: https://huggingface.co/google/gemma-4-E2B-it-qat-mobile-transformers"
         ),
     ),
-    "google/gemma-4-E4B-it-qat-mobile-transformers": AIModelMetadataFields(
-        author="Google DeepMind",
-        license="Apache-2.0",
-        model_description=(
-            "Gemma 4 E4B IT QAT is a ~8B-parameter instruction-tuned on-device model from "
-            "Google's Gemma 4 family using Per-Layer Embeddings, trained with quantization-aware "
-            "training; this export targets the text decoder and keeps the checkpoint's own "
-            "quantized weights. "
-            "Source: https://huggingface.co/google/gemma-4-E4B-it-qat-mobile-transformers"
-        ),
-    ),
     "mistralai/Mistral-7B-Instruct-v0.3": AIModelMetadataFields(
         author="Mistral AI",
         license="Apache-2.0",

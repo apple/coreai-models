@@ -172,6 +172,18 @@ def test_native_checkpoint_refuses_include_vision():
     export_g4._check_native_quantized_options(_cli_args(), native_quantized=True)
 
 
+def test_supported_models_match_the_registry_and_metadata():
+    """Every supported checkpoint has asset metadata, and every Gemma 4 registry preset and
+    metadata entry names a supported checkpoint."""
+    from coreai_models.export.metadata import _METADATA
+    from coreai_models.model_registry import LLM_PRESETS
+
+    supported = set(export_g4.SUPPORTED_MODELS)
+    assert supported <= set(_METADATA)
+    assert {p.hf_id for p in LLM_PRESETS if p.family == "gemma4"} == supported
+    assert {k for k in _METADATA if k.startswith("google/gemma-4-")} == supported
+
+
 def test_metadata_extras_require_what_the_runner_needs():
     cfg = _make_config()
     cfg.final_logit_softcapping = 30.0
