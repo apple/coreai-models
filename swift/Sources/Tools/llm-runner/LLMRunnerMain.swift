@@ -13,6 +13,8 @@ import Darwin
 import Foundation
 import Tokenizers
 
+extension SamplingConfiguration.Backend: ExpressibleByArgument {}
+
 /// Warmup mode for inference engines.
 ///
 /// - `default`: engine-specific default behavior
@@ -142,6 +144,13 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
 
     @Option(help: "Sampling strategy. Options: 'temperature' (default), 'greedy'")
     var samplingStrategy: String = "temperature"
+
+    @Option(
+        name: .customLong("sampler"),
+        help:
+            "Sampler backend: 'default' (the best known sampler; today 'reference'), 'reference', or 'bnns' (BNNSGraph, the same distribution; not with --seed). The GPU pipelined engine accepts only 'default'."
+    )
+    var sampler: SamplingConfiguration.Backend = .default
 
     @Flag(help: "Use synchronous sampling (disabled by default). Useful for isolating inference bottlenecks")
     var synchronousSampling: Bool = false
@@ -487,6 +496,14 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         let speculating = draftModel != nil || promptLookup || speculative
         if seed != nil && !speculating {
             throw ValidationError("--seed applies to speculative decoding (--draft-model or --prompt-lookup)")
+        }
+        // Speculative decoding samples with the reference sampler's math, and the
+        // --batch-prototype rows are greedy or seeded, which always use the reference sampler.
+        if sampler != .default && speculating {
+            throw ValidationError("--sampler doesn't apply to speculative decoding, which uses the reference sampler")
+        }
+        if sampler != .default && batchPrototypeRows != nil {
+            throw ValidationError("--sampler doesn't apply to --batch-prototype, whose rows use the reference sampler")
         }
         if let problem = SpeculativeDecodingOptions.grammarProposalProblem(
             grammarProposalMax, speculating: speculating, hasSchema: jsonSchema != nil)
@@ -1193,6 +1210,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         await PerformanceMetrics.shared.recordPromptTokens(promptTokens.count)
 
         CLILogger.log("Generating text...", component: "Main")
+        SamplerUsage.reset()
         CLILogger.log("Input: \(displayPrompt)", component: "Main")
         CLILogger.log("Max tokens: \(maxTokens)", component: "Main")
 
@@ -1364,6 +1382,10 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
 
         // Print performance summary
         await PerformanceMetrics.shared.printSummary(verbose: CLILogger.isVerbose)
+        // Which CPU sampler implementation sampled the tokens (a backend can hand rows to another).
+        if sampler != .default || verbose {
+            print(SamplerUsage.snapshot().summary)
+        }
 
         // Print detailed profiling statistics table when --verbose is enabled
         if verbose {
@@ -1507,7 +1529,8 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
                 minP: minP,
                 repetitionPenalty: repetitionPenalty,
                 repetitionPenaltyWindow: repetitionPenaltyWindow,
-                combined: !synchronousSampling
+                combined: !synchronousSampling,
+                backend: sampler
             )
         case "greedy":
             if topK != nil || topP != nil || minP != nil {
@@ -1519,7 +1542,8 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
                 temperature: 0,
                 repetitionPenalty: repetitionPenalty,
                 repetitionPenaltyWindow: repetitionPenaltyWindow,
-                combined: !synchronousSampling
+                combined: !synchronousSampling,
+                backend: sampler
             )
         default:
             print("Error: Unknown sampling strategy '\(samplingStrategy)'")

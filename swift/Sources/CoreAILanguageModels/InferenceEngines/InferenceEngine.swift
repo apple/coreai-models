@@ -237,6 +237,10 @@ public protocol InferenceEngine: Sendable {
     /// Defaults to `false`.
     var hasRecurrentState: Bool { get }
 
+    /// Throws when the engine can't serve `config` (for example a sampler backend it doesn't run).
+    /// A requirement, so engines that override it are reached through `any InferenceEngine`.
+    func validateSamplingStrategy(_ config: SamplingConfiguration) throws
+
     /// Whether the engine keeps a prefix cache, as ``EngineOptions/prefixCacheBytes`` asks: only the
     /// pipelined engine does, and only for a model whose state it can copy. Defaults to `false`.
     var prefixCacheEnabled: Bool { get }

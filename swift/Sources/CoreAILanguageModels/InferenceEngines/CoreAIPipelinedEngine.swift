@@ -147,6 +147,7 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
             )
         }
         try Self.rejectSeedIfUnsupported(samplingConfiguration)
+        try Self.rejectCPUBackend(samplingConfiguration)
 
         // Serialize: if a prior generation is still winding down (GPU drain),
         // cancel it and wait for the engine slot to be released.
@@ -330,6 +331,7 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
         session: ConstrainedSessionHandle
     ) async throws -> InferenceTokenSequence {
         try Self.rejectSeedIfUnsupported(samplingConfiguration)
+        try Self.rejectCPUBackend(samplingConfiguration)
         // As in `generate`: a prior generation still winding down (its caller stopped reading) is
         // cancelled and waited for, so it is not mistaken for one still in use.
         if let priorTask = _generationTask.withLock({ $0 }) {
@@ -481,7 +483,22 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
 
     func validateSamplingStrategy(_ config: SamplingConfiguration) throws {
         // All sampling configurations are now supported by the GPU sampler:
-        // greedy, temperature, topK, topP, and minP.
+        // greedy, temperature, topK, topP, and minP. A CPU sampler backend is rejected here too, so
+        // callers learn before generating.
+        try Self.rejectCPUBackend(config)
+    }
+
+    /// Reject a request that names a CPU sampler backend.
+    ///
+    /// The engine samples on the GPU, so it can't honor `.reference` or `.bnns`. Fail loudly
+    /// rather than silently sampling with a different implementation.
+    static func rejectCPUBackend(_ config: SamplingConfiguration) throws {
+        if config.backend != .default {
+            throw InferenceRuntimeError.invalidArgument(
+                "The '\(config.backend.rawValue)' sampler backend is not supported on the GPU pipelined engine "
+                    + "(sampling runs on-GPU). Use a sequential or static-shape engine, or the default backend."
+            )
+        }
     }
 
     /// Reject a seeded request that reaches the GPU pipelined engine.

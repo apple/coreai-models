@@ -799,7 +799,7 @@ public struct CoreAILanguageModel: LanguageModel {
             base: SamplingConfiguration
         ) -> SamplingConfiguration {
             if let temperature = options.temperature {
-                return SamplingConfiguration(temperature: temperature)
+                return SamplingConfiguration(temperature: temperature, backend: base.backend)
             }
             return base
         }
