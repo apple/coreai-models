@@ -86,13 +86,37 @@ public struct ResponseFormat: Decodable, Sendable {
     public struct JSONSchemaSpec: Decodable, Sendable {
         public let name: String?
         public let schema: JSONValue
+        /// The schema as the request wrote it, when the decoder had the request's text
+        /// (``JSONSourceText``). It keeps the order of `properties`, which `schema` can't. The
+        /// grammar session makes it strict JSON, whatever leniency `JSONDecoder` allowed. A key
+        /// repeated inside the schema stays as written, and the grammar compiler keeps its last
+        /// value where `schema` keeps the first.
+        let schemaText: String?
+
+        enum CodingKeys: String, CodingKey {
+            case name, schema
+        }
+
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            name = try container.decodeIfPresent(String.self, forKey: .name)
+            schema = try container.decode(JSONValue.self, forKey: .schema)
+            schemaText = (decoder.userInfo[JSONSourceText.userInfoKey] as? Data)
+                .flatMap { JSONSourceText.text(at: decoder.codingPath + [CodingKeys.schema], in: $0) }
+        }
     }
 
+    /// The schema to constrain generation with. A grammar generates an object's properties in the
+    /// order its schema lists them, so this is the request's own text where the decoder had it.
+    /// Otherwise it is `schema` re-encoded with sorted keys: a fixed order, though not the client's.
     public var extractedSchema: String? {
         switch type {
         case "json_schema":
             guard let spec = jsonSchema else { return nil }
-            if let data = try? JSONEncoder().encode(spec.schema),
+            if let text = spec.schemaText { return text }
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            if let data = try? encoder.encode(spec.schema),
                 let str = String(data: data, encoding: .utf8)
             {
                 return str

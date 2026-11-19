@@ -14,6 +14,7 @@ from typing import Any
 from transformers import AutoTokenizer
 
 from coreai_models._constants import METADATA_VERSION, METADATA_VERSION_BATCHED
+from coreai_models.hub import SNAPSHOT_PATTERNS, BackendName, resolve_local
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,7 @@ def bundle_llm_asset(
     drafter_name: str | None = None,
     speculative_config: dict[str, Any] | None = None,
     max_batch_size: int = 1,
+    backend: BackendName = "huggingface",
 ) -> None:
     """Add tokenizer and metadata.json to an LLM bundle.
 
@@ -47,9 +49,10 @@ def bundle_llm_asset(
             Written as the ``"speculative"`` key in metadata.json.
         max_batch_size: Upper bound on the request batch the graph serves;
             > 1 selects the 0.3 schema (adds the ``max_batch_size`` field).
+        backend: Model download backend (see ``coreai_models.hub``).
     """
     tok_id = tokenizer_model_id or hf_model_id
-    _write_tokenizer(bundle_path / "tokenizer", tok_id)
+    _write_tokenizer(bundle_path / "tokenizer", tok_id, backend=backend)
     _write_metadata(
         bundle_path,
         hf_model_id,
@@ -62,9 +65,11 @@ def bundle_llm_asset(
     )
 
 
-def _write_tokenizer(dest: Path, hf_model_id: str) -> None:
+def _write_tokenizer(dest: Path, hf_model_id: str, backend: BackendName = "huggingface") -> None:
     logger.info(f"Saving tokenizer from {hf_model_id}...")
-    tokenizer = AutoTokenizer.from_pretrained(hf_model_id)
+    tokenizer = AutoTokenizer.from_pretrained(
+        resolve_local(hf_model_id, backend, SNAPSHOT_PATTERNS)
+    )
     tokenizer.save_pretrained(str(dest))
 
 

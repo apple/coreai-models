@@ -9,7 +9,7 @@ import Foundation
 
 /// Selection and probability primitives shared by the speculative drafters and decoder.
 ///
-/// Argmax, softmax and the multinomial draw are `CompositeSampler`'s, so the drafter and the target
+/// Argmax, softmax and the multinomial draw are `ReferenceSampler`'s, so the drafter and the target
 /// select tokens the same way; the accept/reject step and its residual distribution (Chen et al., 2023,
 /// https://arxiv.org/abs/2302.01318) are the only parts with no sampler equivalent. Every function that draws takes the random
 /// number generator it draws from.
@@ -17,7 +17,7 @@ enum SpeculativeMath {
     /// Index of the largest logit, 0 for an empty array.
     static func argmax(_ logits: [LogitsScalarType]) -> Int32 {
         var logits = logits
-        return CompositeSampler.sample(from: &logits, config: .greedy)
+        return ReferenceSampler.sample(from: &logits, config: .greedy)
     }
 
     /// Numerically stable temperature-scaled softmax: `softmax(logits / temperature)`. Empty in, empty out.
@@ -49,14 +49,14 @@ enum SpeculativeMath {
             return oneHot
         }
         vDSP_vsdiv(probs, 1, &t, &probs, 1, vDSP_Length(probs.count))
-        CompositeSampler.softmaxVectorized(&probs)
+        ReferenceSampler.softmaxVectorized(&probs)
         return probs
     }
 
     /// Inverse-CDF sample from a normalized probability vector, 0 for an empty one.
     static func sampleFromProbs(_ probs: [Float], using rng: inout some RandomNumberGenerator) -> Int32 {
         guard !probs.isEmpty else { return 0 }
-        return Int32(CompositeSampler.multinomialSample(probs, using: &rng))
+        return Int32(ReferenceSampler.multinomialSample(probs, using: &rng))
     }
 
     /// Sample from the normalized residual `norm(relu(p − q))` used on rejection.
