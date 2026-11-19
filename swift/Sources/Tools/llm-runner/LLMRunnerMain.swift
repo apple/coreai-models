@@ -1333,6 +1333,10 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             // End overall timing now that core inference is complete
             await PerformanceMetrics.shared.endOverallTiming()
 
+            // A reply that ends at a stop sequence leaves the engine's generation task winding down.
+            // Wait for it, so it does not release the model while the process exits (#535).
+            try? await inferenceEngine.cancel()
+
             // Extract only the generated part (remove prompt from output)
             let formattedPrompt = tokenizer.decode(tokens: promptTokens)
             let generatedOnly =
