@@ -248,9 +248,13 @@ final class ServerState: @unchecked Sendable {
     }
 
     /// `access`, unless the process is past the device's memory recommendation: then releases it and
-    /// throws ``MemoryRefusal``.
+    /// throws ``MemoryRefusal``. The engine's prefix cache goes first, since it is only a cache.
     private func admittedForMemory(_ access: RequestAccess) throws -> RequestAccess {
-        guard let reason = memoryGuard?.refusalReason() else { return access }
+        guard var reason = memoryGuard?.refusalReason() else { return access }
+        if engine.shedPrefixCache() > 0 {
+            guard let still = memoryGuard?.refusalReason() else { return access }
+            reason = still
+        }
         access.release()
         throw MemoryRefusal(reason: reason)
     }

@@ -237,6 +237,14 @@ public protocol InferenceEngine: Sendable {
     /// Defaults to `false`.
     var hasRecurrentState: Bool { get }
 
+    /// Whether the engine keeps a prefix cache, as ``EngineOptions/prefixCacheBytes`` asks: only the
+    /// pipelined engine does, and only for a model whose state it can copy. Defaults to `false`.
+    var prefixCacheEnabled: Bool { get }
+
+    /// Drops what the prefix cache holds in memory, for a caller short of it, and returns the bytes
+    /// freed: zero when there is no cache, or the engine is in use. Defaults to zero.
+    func shedPrefixCache() -> Int
+
     // MARK: - Configuration
 
     associatedtype ConfigType: Codable, InferenceConfiguration
@@ -302,6 +310,11 @@ extension InferenceEngine {
 }
 
 extension InferenceEngine {
+    public var prefixCacheEnabled: Bool { false }
+    public func shedPrefixCache() -> Int { 0 }
+}
+
+extension InferenceEngine {
     /// Default: engine is not busy.
     public var isBusy: Bool { false }
 
@@ -332,7 +345,7 @@ extension InferenceEngine {
     /// Default implementation: accepts all sampling configurations.
     ///
     /// Engines that use CPU fallback samplers can accept all configurations
-    /// since CompositeSampler handles greedy, temperature, topK, and topP.
+    /// since ReferenceSampler handles greedy, temperature, topK, and topP.
     ///
     /// Override this in engines with GPU samplers that have limited support.
     public func validateSamplingStrategy(_ config: SamplingConfiguration) throws {

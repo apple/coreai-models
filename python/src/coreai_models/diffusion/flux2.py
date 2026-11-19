@@ -184,21 +184,21 @@ class Flux2TextEncoderWrapper(torch.nn.Module):
 class Flux2VAEDecoderWrapper(torch.nn.Module):
     """Wraps AutoencoderKLFlux2.decode: (latent) -> (image).
 
-    ``dynamic=True`` skips ``_patch_nearest_upsample``: its ``repeat_interleave`` fails ANE
-    region formation with a symbolic latent size, while stock ``F.interpolate`` works at
-    every size.
+    Static and dynamic exports both swap the decoder's nearest-neighbour ``F.interpolate``
+    for ``_patch_nearest_upsample``'s ``repeat_interleave``. With a symbolic latent size, the
+    stock interpolate crashes MPSGraph on macOS 27.0.x ("Failed to resolve dynamic dimensions
+    for memref.alloc", #479). The patched decoder runs on 27.0.x and on later releases.
     """
 
-    def __init__(self, vae: torch.nn.Module, dynamic: bool = False) -> None:
+    def __init__(self, vae: torch.nn.Module) -> None:
         super().__init__()
         self.vae: Any = vae
         # Ensure all parameters + buffers (including BN running stats) share the same dtype
         self.vae = self.vae.to(next(vae.parameters()).dtype)
-        if not dynamic:
-            from coreai_models.diffusion.components import _patch_nearest_upsample
+        from coreai_models.diffusion.components import _patch_nearest_upsample
 
-            # Mutates the shared VAE in place, so later wrappers of it see the patch too.
-            _patch_nearest_upsample(self.vae.decoder)
+        # Mutates the shared VAE in place, so later wrappers of it see the patch too.
+        _patch_nearest_upsample(self.vae.decoder)
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         return cast(torch.Tensor, self.vae.decode(z).sample)
