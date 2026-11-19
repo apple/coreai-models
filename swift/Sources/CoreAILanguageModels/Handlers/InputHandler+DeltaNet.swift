@@ -116,7 +116,7 @@ public struct DeltaNetInputHandler: StaticInputHandler {
 
     /// The conv ring's write offset for a block starting at `alignedStep`.
     ///
-    /// `ringWidth` is validated against the selector's descriptor in `fill`, so it is positive.
+    /// `ringWidth` comes from `ringGeometry(selectorShape:batchSize:)`, so it is positive.
     static func convStep(alignedStep: Int, ringWidth: Int) -> Int {
         alignedStep % ringWidth
     }
@@ -174,46 +174,67 @@ public struct DeltaNetInputHandler: StaticInputHandler {
 
     public func fill(_ context: InputContext, into buffers: inout InputBuffers) throws {
         let key = StaticBucketKey(batchSize: context.batchSize, contextBucket: context.contextBucket)
+        let inputs: [(String, BucketedInputDescriptors)] = [
+            (Self.updateFlagInputName, updateFlagDescriptors),
+            (Self.convStepInputName, convStepDescriptors),
+            (Self.seedSelectorInputName, seedSelectorDescriptors),
+        ]
+        for (name, descriptors) in inputs where !descriptors.isEmpty {
+            buffers.ensureCapacity(name: name, descriptor: try descriptors.require(key, input: name))
+        }
+        try Self.write(
+            context, into: &buffers,
+            updateFlag: !updateFlagDescriptors.isEmpty,
+            convStep: !convStepDescriptors.isEmpty,
+            seedSelector: !seedSelectorDescriptors.isEmpty)
+    }
+
+    /// Writes one step's values into the buffers `fill` has sized for the step's bucket, for
+    /// each input the graph declares. Ring geometry comes from the selector buffer's shape,
+    /// `(1, ringWidth, kernelWindow + batchSize)`. Internal for testing.
+    static func write(
+        _ context: InputContext, into buffers: inout InputBuffers,
+        updateFlag: Bool, convStep: Bool, seedSelector: Bool
+    ) throws {
         let alignedStep = context.alignedStep
         let batchSize = context.batchSize
 
-        // Shapes were checked at load by `validate(updateFlag:convStep:seedSelector:)`.
-        if !updateFlagDescriptors.isEmpty {
-            let descriptor = try updateFlagDescriptors.require(key, input: Self.updateFlagInputName)
-            buffers.ensureCapacity(name: Self.updateFlagInputName, descriptor: descriptor)
+        if updateFlag {
             let tokensInBatch = context.tokens.count
             let processedTokenCount = context.processedTokenCount
-            try buffers.withMutableBuffer(Self.updateFlagInputName) { array in
+            try buffers.withMutableBuffer(updateFlagInputName) { array in
                 fillNDArray(&array, as: Float16.self, count: batchSize) { slot in
-                    Self.isNewToken(
+                    isNewToken(
                         slot: slot, tokensInBatch: tokensInBatch, alignedStep: alignedStep,
                         processedTokenCount: processedTokenCount) ? 1.0 : 0.0
                 }
             }
         }
 
-        // Ring geometry comes from the selector's shape (1, ringWidth, kernelWindow + batchSize);
-        // conv_step requires it.
-        guard !seedSelectorDescriptors.isEmpty || !convStepDescriptors.isEmpty else { return }
-        let seedSelector = try seedSelectorDescriptors.require(
-            key, input: Self.seedSelectorInputName)
-        let (ringWidth, kernelWindow) = try Self.ringGeometry(
-            selectorShape: seedSelector.shape, batchSize: batchSize)
+        guard seedSelector else {
+            // Load-time validation rejects this; checked again so a step cannot skip conv_step.
+            if convStep {
+                throw InferenceRuntimeError.invalidState(
+                    "\(convStepInputName) is declared without \(seedSelectorInputName)")
+            }
+            return
+        }
 
-        if !convStepDescriptors.isEmpty {
-            let descriptor = try convStepDescriptors.require(key, input: Self.convStepInputName)
-            buffers.ensureCapacity(name: Self.convStepInputName, descriptor: descriptor)
-            try buffers.withMutableBuffer(Self.convStepInputName) { array in
+        var ringWidth = 0
+        try buffers.withMutableBuffer(seedSelectorInputName) { array in
+            let geometry = try ringGeometry(selectorShape: array.shape, batchSize: batchSize)
+            ringWidth = geometry.ringWidth
+            writeSeedSelector(
+                &array, alignedStep: alignedStep, kernelWindow: geometry.kernelWindow,
+                ringWidth: geometry.ringWidth)
+        }
+
+        if convStep {
+            try buffers.withMutableBuffer(convStepInputName) { array in
                 fillNDArray(&array, as: Int32.self, count: 1) { _ in
                     Int32(Self.convStep(alignedStep: alignedStep, ringWidth: ringWidth))
                 }
             }
-        }
-
-        buffers.ensureCapacity(name: Self.seedSelectorInputName, descriptor: seedSelector)
-        try buffers.withMutableBuffer(Self.seedSelectorInputName) { array in
-            Self.writeSeedSelector(
-                &array, alignedStep: alignedStep, kernelWindow: kernelWindow, ringWidth: ringWidth)
         }
     }
 }
