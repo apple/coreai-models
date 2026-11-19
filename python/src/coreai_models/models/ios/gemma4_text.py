@@ -286,6 +286,21 @@ class NativeQuantLinearBlock(nn.Module):
         return nn.functional.linear(x, weight)
 
 
+def _uses_native_quantization(config) -> bool:
+    """Whether ``config``, this model's reauthored text config, is for a native-quantized (QAT)
+    checkpoint.
+
+    Reads ``config.native_quantized``, which ``Gemma4ForCausalLMForiOS.from_hf`` sets once it
+    has loaded the checkpoint; it is the one flag every module and export hook reads after
+    load. A config that never went through ``from_hf`` (a test's) has no flag and is
+    standard. The checks before that point answer other questions:
+    ``is_native_quantized_config`` whether a Hugging Face config declares the quantization,
+    before anything is loaded, and ``_is_quantized_hf_model`` whether the loaded Hugging Face
+    model's text decoder actually came out quantized.
+    """
+    return bool(getattr(config, "native_quantized", False))
+
+
 def _make_proj_conv(config, in_channels: int, out_channels: int, nbits: int) -> nn.Module:
     """Build a 1x1-conv projection: plain float, or CoreAI-native quantized for QAT
     checkpoints (see ``config.native_quantized``, set in ``Gemma4ForCausalLMForiOS.from_hf``).
@@ -301,7 +316,7 @@ def _make_proj_conv(config, in_channels: int, out_channels: int, nbits: int) -> 
     ship; any other width is refused here, as the module is built, rather than when its
     weights are unpacked or traced.
     """
-    if getattr(config, "native_quantized", False):
+    if _uses_native_quantization(config):
         if nbits not in NATIVE_NBITS:
             raise ValueError(
                 f"A native-quantized projection is one of {NATIVE_NBITS} bits, got {nbits}."
@@ -743,7 +758,7 @@ class Gemma4Extend(nn.Module):
         # untied; `from_hf` refuses a tied one.
         self.lm_head: nn.Module | None = None
         if not config.tie_word_embeddings:
-            if not getattr(config, "native_quantized", False):
+            if not _uses_native_quantization(config):
                 raise NotImplementedError(
                     "Gemma 4 iOS supports an untied lm_head for native-quantized checkpoints only"
                 )
@@ -855,7 +870,13 @@ class Gemma4Extend(nn.Module):
 
 def is_native_quantized_config(hf_config) -> bool:
     """Whether a Hugging Face config declares Google's own quantization (the QAT
-    ``-qat-mobile-transformers`` checkpoints declare ``quant_method: gemma``)."""
+    ``-qat-mobile-transformers`` checkpoints declare ``quant_method: gemma``).
+
+    Answered from the config alone, before any weight is loaded: ``from_hf`` uses it to pick
+    the loader, and ``models/gemma4/export.py`` to resolve its options up front. After load,
+    read ``Gemma4ForCausalLMForiOS.native_quantized`` instead (see
+    ``_uses_native_quantization``).
+    """
     quantization = getattr(hf_config, "quantization_config", None)
     if isinstance(quantization, dict):
         return quantization.get("quant_method") == "gemma"
@@ -864,6 +885,10 @@ def is_native_quantized_config(hf_config) -> bool:
 
 def _is_quantized_hf_model(hf_model: nn.Module) -> bool:
     """Whether ``hf_model``'s text decoder was loaded through HF's Gemma QAT quantizer.
+
+    ``from_hf``'s check, once the Hugging Face model is loaded, that a config declaring the
+    quantization (``is_native_quantized_config``) really produced quantized modules: an
+    installed transformers without the quantizer loads the same checkpoint as float modules.
 
     Only the modules this loader reads count (the text decoder and ``lm_head``): a checkpoint
     that quantizes only its vision or audio tower has a float text decoder, which the native
@@ -1072,7 +1097,7 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
         super().__init__(
             config, model_device, disable_embedding_quantization=disable_embedding_quantization
         )
-        if getattr(config, "native_quantized", False):
+        if _uses_native_quantization(config):
             # Google's QAT recipe quantizes `embed_tokens` to 2 bits with a per-row
             # (not per-tensor) scale, so it needs its own load/gather pair -- see
             # `Gemma4NativeQuantGatherEmbeddings`. Held as INT8, not packed: the table is a
@@ -1098,9 +1123,13 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
     # ------------------------------------------------------------------
 
     @property
-    def _native_quantized(self) -> bool:
-        """Whether this model was built from a native-quantized (QAT) checkpoint."""
-        return bool(getattr(self.config, "native_quantized", False))
+    def native_quantized(self) -> bool:
+        """Whether this model was built from a native-quantized (QAT) checkpoint.
+
+        The flag ``from_hf`` records on the config (see ``_uses_native_quantization``), so a
+        built model and the modules it was built from answer the same way.
+        """
+        return _uses_native_quantization(self.config)
 
     @override
     def validate_export_contract(
@@ -1109,7 +1138,7 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
         # The name hooks are classmethods, so they describe the standard contract. A
         # native-quantized gather also takes the per-row embedding scale, which `export.py` adds
         # to the names it converts with; the rest of the contract is checked as it is.
-        if self._native_quantized:
+        if self.native_quantized:
             gather = GATHER_EMBEDDINGS_FUNCTION_NAME
             reference_inputs = {
                 **reference_inputs,
@@ -1181,7 +1210,7 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
         length: each (context bucket, query length) pair is its own program, with the
         caches at ``spec.cache_seq_len`` and ``spec.query_len`` query positions.
         """
-        native = self._native_quantized
+        native = self.native_quantized
         if self.disable_embedding_quantization and not native:
             raise ValueError(
                 "The iOS graph takes INT8 ple_embeddings; disable_embedding_quantization "
@@ -1271,7 +1300,7 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
             LOAD_EMBEDDINGS_FUNCTION_NAME: None,
             GATHER_EMBEDDINGS_FUNCTION_NAME: (
                 None
-                if self._native_quantized
+                if self.native_quantized
                 else super().build_dynamic_shapes(config, spec)[GATHER_EMBEDDINGS_FUNCTION_NAME]
             ),
             EXTEND_FUNCTION_NAME: None,

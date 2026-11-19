@@ -804,6 +804,19 @@ def test_native_quantized_state_dict_loads_strictly():
     assert torch.equal(torch.cat([b.scale for b in blocks]), hf_sd["lm_head.scale"])
 
 
+def test_native_quantized_reads_the_config_flag():
+    """A built model reports the flag its modules were built from; no flag is standard."""
+    cfg = _make_config()
+    assert not hasattr(cfg, "native_quantized")
+    standard = Gemma4ForCausalLMForiOS(cfg, model_device="meta")
+    assert not standard.native_quantized
+    assert isinstance(standard.extend.model.layers[0].self_attn.q_proj, torch.nn.Conv2d)
+
+    native = Gemma4ForCausalLMForiOS(_native_config([4] * 6), model_device="meta")
+    assert native.native_quantized
+    assert isinstance(native.extend.model.layers[0].self_attn.q_proj, NativeQuantConv1x1)
+
+
 def test_native_embedding_tables_follow_the_model_device():
     """The native embedding table and its scale are built on ``model_device``, so ``from_hf``
     (which builds on meta) does not allocate the table before loading it."""

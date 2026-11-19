@@ -214,7 +214,8 @@ def _text_config(hf_model_id: str) -> Any:
 
 def _native_quantized_checkpoint(hf_model_id: str) -> bool:
     """Whether the checkpoint ships Google's own quantization (the QAT ``-qat-mobile-transformers``
-    ones)."""
+    ones), from its config alone, so the export's options are resolved before any weight is
+    loaded. Once loaded, the model's ``native_quantized`` is read instead."""
     return is_native_quantized_config(AutoConfig.from_pretrained(hf_model_id))
 
 
@@ -366,7 +367,7 @@ def _export_programs(
     def trace(module, kwargs: dict, dynamic_shapes=None) -> torch.export.ExportedProgram:
         return torch.export.export(module, args=(), kwargs=kwargs, dynamic_shapes=dynamic_shapes)
 
-    native_quantized = getattr(config, "native_quantized", False)
+    native_quantized = model.native_quantized
     if gather_qlens is None:
         gather_qlens = set(SHIPPING_EXTEND_QLENS) | set(SHIPPING_PROMPT_QLENS)
     programs: list[tuple[str, str, int, torch.export.ExportedProgram]] = []
@@ -472,7 +473,7 @@ async def _convert_to_coreai(
     inputs = model.export_input_names()
     states = model.export_state_names()
     outputs = model.export_output_names()
-    native_quantized = getattr(config, "native_quantized", False)
+    native_quantized = model.native_quantized
     if native_quantized:
         # A native-quantized embedding table carries a per-row scale: a second output of
         # `load_embeddings` and a third input of `gather_embeddings`.
@@ -639,16 +640,15 @@ async def _export_ios(args: argparse.Namespace) -> str:
         ).eval()
         hf_config.max_position_embeddings = max_ctx
 
-        # `from_hf` detects a native-quantized checkpoint from the loaded modules and must agree
-        # with the config check above; the reauthored config it records is kept in sync here the
-        # same way `max_position_embeddings` is above.
-        if getattr(model.config, "native_quantized", False) != native_quantized:
+        # The options above were resolved from the Hugging Face config; from here on the loaded
+        # model's flag is the one read (`_export_programs`, `_convert_to_coreai`), so they must
+        # agree.
+        if model.native_quantized != native_quantized:
             raise SystemExit(
                 f"{hf_model_id} loaded as "
                 f"{'native-quantized' if not native_quantized else 'unquantized'}, but its "
                 "Hugging Face config says otherwise."
             )
-        hf_config.native_quantized = native_quantized
 
         # Write the PLE sidecar straight away and drop the table: it is multiple
         # gigabytes and not a module weight, so mmap can't evict it.
