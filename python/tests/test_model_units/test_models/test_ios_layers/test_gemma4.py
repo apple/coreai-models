@@ -919,6 +919,7 @@ def test_e2b_qat_native_quantization_dispatch_and_bit_exactness():
     ours_mods = dict(model.named_modules())
     hf_prefix = "model.language_model."
     covered = set()
+    quantized_inputs = 0
     for name, hf_mod in hf_mods.items():
         if not isinstance(hf_mod, QuantizedLinear) or not (
             name.startswith(hf_prefix) or name == "lm_head"
@@ -930,6 +931,17 @@ def test_e2b_qat_native_quantization_dispatch_and_bit_exactness():
             continue
         assert ours.nbits >= hf_mod.num_bits, name
         covered.add(name.rsplit(".", 1)[-1])
+        # `from_hf` carries each conv projection's input activation scale over (o_proj's
+        # stays 0, see `_apply_activation_scales`) and never its output scale.
+        if isinstance(ours, (NativeQuantConv1x1, NativeLutQuantConv1x1)):
+            if name.endswith(".self_attn.o_proj"):
+                assert ours.input_activation_scale == 0.0, name
+            else:
+                expected = float(hf_mod.input_activation_scale)
+                assert expected > 0, name
+                assert ours.input_activation_scale == pytest.approx(expected), name
+                quantized_inputs += 1
+            assert ours.output_activation_scale == 0.0, name
     assert {
         "q_proj",
         "o_proj",
@@ -937,6 +949,7 @@ def test_e2b_qat_native_quantization_dispatch_and_bit_exactness():
         "per_layer_projection",
         "lm_head",
     } <= covered
+    assert quantized_inputs > 0
     assert False in compared, "expected at least one 4-bit MLP layer in this checkpoint"
 
     del hf_model, model
@@ -1023,7 +1036,13 @@ def test_activation_scales_quantize_only_projection_inputs():
                 if not hasattr(parent, part):
                     parent.add_module(part, torch.nn.Module())
                 parent = getattr(parent, part)
-            parent.add_module(leaf, NativeQuantConv1x1(4, 4, nbits=4))
+            # The sub-4-bit MLP projections are LUT-decoded; they get their input scale too.
+            conv = (
+                NativeLutQuantConv1x1(4, 4, nbits=2)
+                if name.endswith("down_proj")
+                else NativeQuantConv1x1(4, 4, nbits=4)
+            )
+            parent.add_module(leaf, conv)
         return root
 
     names = ["layers.0.mlp.gate_proj", "layers.0.mlp.down_proj", "layers.0.self_attn.o_proj"]
@@ -1032,6 +1051,7 @@ def test_activation_scales_quantize_only_projection_inputs():
     Gemma4ForCausalLMForiOS._apply_activation_scales(root, scales)
 
     modules = dict(root.named_modules())
+    assert isinstance(modules["extend.model.layers.0.mlp.down_proj"], NativeLutQuantConv1x1)
     for i, n in enumerate(names):
         conv = modules[f"extend.model.{n}"]
         assert conv.output_activation_scale == 0.0, n
