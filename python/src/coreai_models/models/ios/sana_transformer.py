@@ -88,6 +88,16 @@ class TimestepEmbedding(nn.Module):
         return self.linear_2(self.silu(self.linear_1(emb)))
 
 
+def linear_attention(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, tiny: torch.Tensor
+) -> torch.Tensor:
+    """``(Σₙ v kᵀ) q / (Σₙ k · q + tiny)`` for non-negative ``q``, ``k``, all ``(B, H, d, N)``."""
+    kv = torch.einsum("bhdn,bhen->bhde", v, k)
+    num = torch.einsum("bhde,bhen->bhdn", kv, q)
+    den = (k.sum(-1, keepdim=True) * q).sum(-2, keepdim=True)
+    return num / (den + tiny)
+
+
 class LinearAttention(nn.Module):
     """ReLU linear self-attention with qk RMSNorm across heads; ``(1, C, 1, N)``."""
 
@@ -111,10 +121,7 @@ class LinearAttention(nn.Module):
         q = q / (q.amax(2, keepdim=True) + self.tiny)
         k = F.relu(self.norm_k(self.to_k(x))).reshape(b, self.heads, -1, n)
         v = self.to_v(x).reshape(b, self.heads, -1, n)
-        kv = torch.einsum("bhdn,bhen->bhde", v, k)
-        num = torch.einsum("bhde,bhen->bhdn", kv, q)
-        den = (k.sum(-1, keepdim=True) * q).sum(-2, keepdim=True)
-        out = num / (den + self.tiny)
+        out = linear_attention(q, k, v, self.tiny)
         return self.to_out(out.reshape(b, c, 1, n))
 
 

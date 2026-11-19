@@ -31,6 +31,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from coreai_models.models.ios.sana_transformer import linear_attention
 from coreai_models.primitives.ios.rms_norm import MaxAbsRMSNorm
 from coreai_models.primitives.ios.silu import TanhSiLU
 
@@ -164,10 +165,7 @@ class MultiscaleLinearAttention(nn.Module):
         q, k, v = qkv.chunk(3, dim=2)
         q, k = F.relu(q), F.relu(k)
         q = q / (q.amax(2, keepdim=True) + self.tiny)
-        kv = torch.einsum("bhdn,bhen->bhde", v, k)
-        num = torch.einsum("bhde,bhen->bhdn", kv, q)
-        den = (k.sum(-1, keepdim=True) * q).sum(-2, keepdim=True)
-        out = (num / (den + self.tiny)).reshape(b, -1, h, w)
+        out = linear_attention(q, k, v, self.tiny).reshape(b, -1, h, w)
         return x + self.norm_out(self.to_out(out))
 
 
