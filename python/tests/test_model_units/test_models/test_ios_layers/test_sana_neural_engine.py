@@ -187,7 +187,7 @@ def test_gemma2_encoder_matches_transformers_sdpa() -> None:
     cfg = src.config
     length = TEXT_SEQUENCE_LENGTH + 10
     ids, mask = _tiny_gemma2_inputs(cfg.vocab_size)
-    m = SanaGemma2Encoder.from_source_model(src, length)
+    m = SanaGemma2Encoder.from_source_model(src, length, TEXT_SEQUENCE_LENGTH)
     with torch.no_grad():
         want = SanaTextEncoderWrapper(src)(ids, mask)
         got = m(ids, mask)
@@ -203,7 +203,7 @@ def test_gemma2_encoder_palettizes_with_the_neural_engine_preset() -> None:
 
     src = _tiny_gemma2()
     ids, mask = _tiny_gemma2_inputs(src.config.vocab_size)
-    m = SanaGemma2Encoder.from_source_model(src, ids.shape[1])
+    m = SanaGemma2Encoder.from_source_model(src, ids.shape[1], TEXT_SEQUENCE_LENGTH)
     with torch.no_grad():
         dense = m(ids, mask)
     config = PRESETS["te6bit-pal"]["component_palettization"]["text_encoder"]
@@ -226,7 +226,7 @@ def test_gemma2_encoder_takes_an_int8_token_table() -> None:
 
     src = _tiny_gemma2()
     ids, mask = _tiny_gemma2_inputs(src.config.vocab_size)
-    m = SanaGemma2Encoder.from_source_model(src, ids.shape[1])
+    m = SanaGemma2Encoder.from_source_model(src, ids.shape[1], TEXT_SEQUENCE_LENGTH)
     with torch.no_grad():
         dense = m(ids, mask)
     preset = PRESETS["te6bit-tok8-tx8bit-pal"]
@@ -252,7 +252,7 @@ def test_gemma2_encoder_takes_a_4bit_preset_with_an_int4_token_table() -> None:
 
     src = _tiny_gemma2()
     ids, mask = _tiny_gemma2_inputs(src.config.vocab_size)
-    m = SanaGemma2Encoder.from_source_model(src, ids.shape[1])
+    m = SanaGemma2Encoder.from_source_model(src, ids.shape[1], TEXT_SEQUENCE_LENGTH)
     with torch.no_grad():
         dense = m(ids, mask)
     preset = PRESETS["te4bit-tok4-tx8bit-pal"]

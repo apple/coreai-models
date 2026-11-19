@@ -29,7 +29,7 @@ import torch
 from huggingface_hub import snapshot_download
 
 from coreai_models._constants import DEFAULT_INCLUDE_DEBUG_INFO
-from coreai_models.converter import export_stateless
+from coreai_models.converter import convert_ane_functions, export_stateless
 from coreai_models.diffusion.components import (
     MultiFunctionComponentSpec,
     NeuralEngineComponentSpec,
@@ -158,8 +158,6 @@ def export_diffusion(config: DiffusionExportConfig) -> dict[str, str]:
             continue
 
         if isinstance(spec, NeuralEngineComponentSpec):
-            from coreai_models.embedding.embedding_gemma2.ios import convert_ane_functions
-
             logger.info(f"Exporting {name} -> {spec.asset_name}.aimodel (Neural Engine)")
             module = spec.build_fn(hf_pipe)
             dummy_inputs = spec.dummy_fn(hf_pipe)

@@ -12,7 +12,11 @@ functions share weights, add each function to one converter::
     add_function(converter, "text_encoder", text_tower, args, input_names, output_names)
     add_function(converter, "image_encoder", image_tower, args, input_names, output_names)
     program = converter.to_coreai()
+
+``convert_ane_functions`` builds a Neural Engine program that way, with Core AI's custom lowerings.
 """
+
+from collections.abc import Sequence
 
 import coreai_torch
 import torch
@@ -128,3 +132,27 @@ def add_function(
         output_names=output_names,
         entrypoint_name=name,
     )
+
+
+def convert_ane_functions(
+    functions: Sequence[
+        tuple[str, torch.nn.Module, tuple[torch.Tensor, ...], tuple[str, ...], tuple[str, ...]]
+    ],
+    *,
+    include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
+) -> AIProgram:
+    """Convert ``(name, module, args, input_names, output_names)`` entries into one Neural Engine
+    program with one function per entry.
+
+    Uses ``torch.export.default_decompositions()`` and ``register_custom_torch_lowering``.
+    """
+    from coreai_models.export.mlir_ops import register_custom_torch_lowering
+
+    converter = make_converter(include_debug_info)
+    register_custom_torch_lowering(converter)
+    decompositions = torch.export.default_decompositions()
+    for name, module, args, input_names, output_names in functions:
+        add_function(
+            converter, name, module, args, input_names, output_names, decompositions=decompositions
+        )
+    return converter.to_coreai()

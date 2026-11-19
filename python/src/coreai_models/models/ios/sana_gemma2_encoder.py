@@ -6,8 +6,9 @@
 """Neural Engine float16 Gemma-2 text encoder for Sana Sprint, channels-first (BC1S) conv layout.
 
 Same inputs and outputs as ``SanaTextEncoderWrapper``: ``(input_ids, attention_mask) [1, L]`` ->
-``hidden_states [1, 300, D]`` (BOS plus the last 299 positions). Matches transformers' default
-SDPA attention, which ignores ``attn_logit_softcapping``, as the GPU bundle does.
+``hidden_states [1, S, D]`` (BOS plus the last ``S - 1`` positions; Sana uses ``S = 300``).
+Matches transformers' default SDPA attention, which ignores ``attn_logit_softcapping``, as the GPU
+bundle does.
 
 Weight folds, computed in float32: Gemma's ``(1 + w)`` norm scale, ``query_pre_attn_scalar^-0.5``
 into ``q_proj`` (a power of two) and ``sqrt(hidden_size)`` into the token table. Norms are
@@ -22,7 +23,6 @@ import torch
 import torch.nn as nn
 
 from coreai_models._constants import MASK_NEG
-from coreai_models.diffusion.sana import TEXT_SEQUENCE_LENGTH
 from coreai_models.primitives.ios.gelu import gelu_ane
 from coreai_models.primitives.ios.rms_norm import MaxAbsRMSNorm
 
@@ -112,7 +112,7 @@ class DecoderLayer(nn.Module):
 
 
 class SanaGemma2Encoder(nn.Module):
-    """``(input_ids [1, L], attention_mask [1, L]) -> hidden_states [1, 300, D]``, static ``L``."""
+    """``(input_ids [1, L], attention_mask [1, L]) -> hidden_states [1, S, D]``, static ``L``."""
 
     cos: torch.Tensor
     sin: torch.Tensor
@@ -120,9 +120,10 @@ class SanaGemma2Encoder(nn.Module):
     mask_neg: torch.Tensor
     one: torch.Tensor
 
-    def __init__(self, src: Any, length: int) -> None:
+    def __init__(self, src: Any, length: int, output_length: int) -> None:
         super().__init__()
         cfg = src.config
+        self.output_length = output_length
         assert cfg.hidden_activation == "gelu_pytorch_tanh"
         assert cfg.sliding_window >= length, "the sliding-window mask would differ from causal"
         d = cfg.hidden_size
@@ -155,10 +156,10 @@ class SanaGemma2Encoder(nn.Module):
         for layer in self.layers:
             x = layer(x, self.cos, self.sin, bias)
         x = self.norm(x)
-        x = torch.cat([x[..., :1], x[..., -(TEXT_SEQUENCE_LENGTH - 1) :]], dim=-1)
+        x = torch.cat([x[..., :1], x[..., -(self.output_length - 1) :]], dim=-1)
         return x.squeeze(2).transpose(1, 2)
 
     @classmethod
-    def from_source_model(cls, src: Any, length: int) -> SanaGemma2Encoder:
+    def from_source_model(cls, src: Any, length: int, output_length: int) -> SanaGemma2Encoder:
         """Build from a transformers ``Gemma2Model`` (any dtype); folds run in float32."""
-        return cls(src, length).float().eval()
+        return cls(src, length, output_length).float().eval()

@@ -46,7 +46,9 @@ def dummy_transformer(pipe: Any) -> tuple[torch.Tensor, ...]:
 def build_text_encoder(pipe: Any) -> torch.nn.Module:
     from coreai_models.models.ios.sana_gemma2_encoder import SanaGemma2Encoder
 
-    return SanaGemma2Encoder.from_source_model(pipe.text_encoder, sana_text_input_length(pipe))
+    return SanaGemma2Encoder.from_source_model(
+        pipe.text_encoder, sana_text_input_length(pipe), TEXT_SEQUENCE_LENGTH
+    )
 
 
 def dummy_text_encoder(pipe: Any) -> tuple[torch.Tensor, ...]:
