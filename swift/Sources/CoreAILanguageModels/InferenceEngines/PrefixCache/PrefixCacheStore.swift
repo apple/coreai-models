@@ -20,8 +20,8 @@ import Synchronization
 /// ```
 /// geometry      the layout the files were written for; a directory written for another is emptied
 /// index.jsonl   one record per line, appended to, and compacted when the store opens and as it grows
-/// <key>.kv      a chunk's KV, one blob per KV state
-/// <key>.state   the recurrent state at the chunk's end, one blob per state
+/// <key>.kv      a chunk's KV, one tensor per KV state, as SafeTensors
+/// <key>.state   the recurrent state at the chunk's end, one tensor per state, as SafeTensors
 /// lock          held while a store has the directory open
 /// ```
 ///
@@ -220,7 +220,8 @@ package final class PrefixCacheStore: Sendable {
         // Everything that changes the index runs on the queue, one at a time, so nothing moves between
         // making room and taking it.
         queue.async { [self] in
-            let size = Self.encodedSize(of: chunk)
+            guard let file = Self.encode(chunk) else { return }
+            let size = file.count
             let evicted = index.withLock { index -> [Key]? in
                 guard index.entries[key] == nil, depth > 0 else { return nil }
                 if let parent {
@@ -232,7 +233,7 @@ package final class PrefixCacheStore: Sendable {
             }
             guard let evicted else { return }
             for victim in evicted { deleteFiles(of: victim) }
-            guard (try? Self.encode(chunk).write(to: kvURL(key), options: .atomic)) != nil else {
+            guard (try? file.write(to: kvURL(key), options: .atomic)) != nil else {
                 CLILogger.log("prefix cache: could not write a chunk to \(directory.path)")
                 return
             }
@@ -252,14 +253,15 @@ package final class PrefixCacheStore: Sendable {
     /// gone or already has one, or the budget can't make room beside its chain.
     package func write(snapshot: [Data], for key: Key) {
         queue.async { [self] in
-            let size = Self.encodedSize(of: snapshot)
+            guard let file = Self.encode(snapshot) else { return }
+            let size = file.count
             let evicted = index.withLock { index -> [Key]? in
                 guard let entry = index.entries[key], entry.record.snapshotBytes == 0 else { return nil }
                 return makeRoom(for: size, keepingChainOf: key, in: &index)
             }
             guard let evicted else { return }
             for victim in evicted { deleteFiles(of: victim) }
-            guard (try? Self.encode(snapshot).write(to: stateURL(key), options: .atomic)) != nil else {
+            guard (try? file.write(to: stateURL(key), options: .atomic)) != nil else {
                 CLILogger.log("prefix cache: could not write a snapshot to \(directory.path)")
                 return
             }
@@ -437,23 +439,18 @@ package final class PrefixCacheStore: Sendable {
         index.withLock { $0.indexLines = records.count }
     }
 
-    /// A file's bytes: the blob count, each blob's length, then the blobs, all little-endian.
-    static func encode(_ blobs: [Data]) -> Data {
-        var out = Data()
-        out.reserveCapacity(encodedSize(of: blobs))
-        var count = UInt32(blobs.count).littleEndian
-        withUnsafeBytes(of: &count) { out.append(contentsOf: $0) }
-        for blob in blobs {
-            var length = UInt64(blob.count).littleEndian
-            withUnsafeBytes(of: &length) { out.append(contentsOf: $0) }
+    /// A file holding `blobs`, in order, as SafeTensors: one `U8` tensor per blob, named by its
+    /// position. Nil when a blob is empty, which the format can't hold.
+    static func encode(_ blobs: [Data]) -> Data? {
+        guard !blobs.isEmpty, blobs.allSatisfy({ !$0.isEmpty }) else { return nil }
+        let tensors = blobs.enumerated().map { index, blob in
+            SafeTensorsWriter.Tensor(name: "\(index)", dtype: "U8", shape: [blob.count], bytes: blob)
         }
-        for blob in blobs { out.append(blob) }
-        return out
+        return try? SafeTensorsWriter.file(tensors)
     }
 
-    static func encodedSize(of blobs: [Data]) -> Int {
-        4 + 8 * blobs.count + blobs.reduce(0) { $0 + $1.count }
-    }
+    /// Bytes ``encode(_:)`` makes of `blobs`.
+    static func encodedSize(of blobs: [Data]) -> Int { encode(blobs)?.count ?? 0 }
 
     /// The blobs in `url`, or nil when it is gone or does not parse.
     static func decode(contentsOf url: URL) -> [Data]? {
@@ -461,26 +458,18 @@ package final class PrefixCacheStore: Sendable {
         return decode(file)
     }
 
+    /// The blobs in an ``encode(_:)``d file, or nil unless it holds exactly tensors `0..<n` of `U8`,
+    /// filling its data region.
     static func decode(_ file: Data) -> [Data]? {
-        guard file.count >= 4 else { return nil }
-        let count = Int(file.withUnsafeBytes { $0.loadUnaligned(as: UInt32.self).littleEndian })
-        let header = 4 + 8 * count
-        guard count > 0, count < 1024, file.count >= header else { return nil }
-        // Each length is checked against what is left, so a damaged header can't overflow the sum.
-        var remaining = file.count - header
-        var lengths: [Int] = []
-        for blob in 0..<count {
-            let raw = file.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 4 + 8 * blob, as: UInt64.self) }
-            guard let length = Int(exactly: UInt64(littleEndian: raw)), length <= remaining else { return nil }
-            remaining -= length
-            lengths.append(length)
-        }
-        guard remaining == 0 else { return nil }
+        guard let header = try? SafeTensorsReader.header(in: file), header.metadata.isEmpty else { return nil }
+        let entries = (0..<header.tensors.count).compactMap { header.tensors["\($0)"] }
+        guard !entries.isEmpty, entries.count == header.tensors.count,
+            entries.allSatisfy({ $0.dtype == "U8" && $0.shape == [$0.byteCount] }),
+            let first = entries.first, entries.reduce(0, { $0 + $1.byteCount }) == file.count - first.fileOffset
+        else { return nil }
         // Slices of the one read, so the file's bytes are not copied again.
-        var cursor = file.startIndex + header
-        return lengths.map { length in
-            defer { cursor += length }
-            return file[cursor..<(cursor + length)]
+        return entries.map {
+            file[(file.startIndex + $0.fileOffset)..<(file.startIndex + $0.fileOffset + $0.byteCount)]
         }
     }
 

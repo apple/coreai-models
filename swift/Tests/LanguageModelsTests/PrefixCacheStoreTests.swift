@@ -12,7 +12,7 @@ import Testing
 struct PrefixCacheStoreTests {
     static let geometry = "test geometry"
 
-    /// A chunk as two recognisable blobs; 36 bytes on disk with its header.
+    /// A chunk as two recognisable blobs; ``nodeBytes`` on disk.
     static func kv(_ depth: Int) -> [Data] {
         [Data(repeating: UInt8(depth), count: 8), Data(repeating: UInt8(100 + depth), count: 8)]
     }
@@ -394,22 +394,30 @@ struct PrefixCacheStoreTests {
         }
     }
 
-    @Test("A file's header is checked against its length")
-    func decodeChecksHeaders() {
-        let blobs = [Data([1, 2, 3]), Data(), Data([4])]
-        let encoded = PrefixCacheStore.encode(blobs)
+    @Test("A file is SafeTensors that the repo's reader reads, and anything else is refused")
+    func filesAreSafeTensors() throws {
+        let blobs = [Data([1, 2, 3]), Data([4])]
+        let encoded = try #require(PrefixCacheStore.encode(blobs))
         #expect(encoded.count == PrefixCacheStore.encodedSize(of: blobs))
         #expect(PrefixCacheStore.decode(encoded) == blobs)
+        let header = try SafeTensorsReader.header(in: encoded)
+        #expect(header.tensors["0"]?.dtype == "U8" && header.tensors["0"]?.shape == [3])
+        #expect(header.tensors["1"]?.byteCount == 1)
+        // Cut short, padded, or not SafeTensors at all.
         #expect(PrefixCacheStore.decode(encoded.dropLast()) == nil)
         #expect(PrefixCacheStore.decode(encoded + Data([0])) == nil)
-        var huge = encoded
-        huge.replaceSubrange(4..<12, with: [UInt8](repeating: 0xff, count: 8))
-        #expect(PrefixCacheStore.decode(huge) == nil)
         #expect(PrefixCacheStore.decode(Data([0, 0, 0, 0])) == nil)
-        // Lengths that would overflow their sum are refused, not added up.
-        var lengths = Data([3, 0, 0, 0])
-        for _ in 0..<3 { lengths += withUnsafeBytes(of: UInt64(1 << 62).littleEndian) { Data($0) } }
-        #expect(PrefixCacheStore.decode(lengths) == nil)
+        // A tensor that isn't one of ours: another dtype, or a gap in the names.
+        let other = try SafeTensorsWriter.file([
+            SafeTensorsWriter.Tensor(name: "0", dtype: "F16", shape: [2], bytes: Data([1, 2, 3, 4]))
+        ])
+        #expect(PrefixCacheStore.decode(other) == nil)
+        let gap = try SafeTensorsWriter.file([
+            SafeTensorsWriter.Tensor(name: "1", dtype: "U8", shape: [1], bytes: Data([1]))
+        ])
+        #expect(PrefixCacheStore.decode(gap) == nil)
+        // An empty blob is refused before anything is written.
+        #expect(PrefixCacheStore.encode([Data()]) == nil)
     }
 
     @Test("A model's directory changes when one of its files does")

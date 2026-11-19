@@ -82,7 +82,8 @@ struct PromptListTests {
 
     @Test("Prefix-cache flags are range-checked, a disk budget needs a memory cache, and --prompt-list refuses a cache")
     func prefixCacheFlags() {
-        #expect(parseError(["--prefix-cache-mb", "-1"])?.contains("--prefix-cache-mb must be between") == true)
+        // `=` so ArgumentParser reads -1 as the value, not as a flag.
+        #expect(parseError(["--prefix-cache-mb=-1"])?.contains("--prefix-cache-mb must be between") == true)
         #expect(
             parseError(["--prefix-cache-disk-mb", "\(Int.max)"])?.contains("--prefix-cache-disk-mb must be between")
                 == true)

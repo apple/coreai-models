@@ -58,7 +58,7 @@ extension CoreAIPipelinedEngine {
                     chunk: self.engine.readKVChunk(start: start, count: chunk))
             else { break }
             publishedKeys.append(key)
-            if let store = prefixStore, store.record(of: key) == nil, let bytes = prefixTree?.chunk(of: key) {
+            if let store = prefixStore, store.record(of: key) == nil, let bytes = prefixTree?.chunk(for: key) {
                 store.write(chunk: bytes, for: key, parent: parent, depth: next)
             }
         }
@@ -250,7 +250,7 @@ extension EngineImpl {
         let states = additionalStates?.snapshotLayout.map { "state \($0.name) \($0.bytes)" } ?? []
         return
             ([
-                "prefix cache 1", "chunk \(chunkTokens)", "key \(describe(kvCache.keyBinding))",
+                "prefix cache 2", "chunk \(chunkTokens)", "key \(describe(kvCache.keyBinding))",
                 "value \(describe(kvCache.valueBinding))",
             ] + states).joined(separator: "\n")
     }
