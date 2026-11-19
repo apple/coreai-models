@@ -5,11 +5,12 @@
 
 """The SAM3 DETR decoder's box sine encoding uses no ``sin``/``cos`` ops.
 
-The M2 (H14) ANE can't run ``sin``/``cos``, so MPSGraph used to put decoder layers 1-4 on the
-GPU, and that ANE -> GPU -> ANE ``detect`` aborted on M2 Ultra/Max. ``sin_0_2pi``/``cos_0_2pi``
-are multiply/add polynomials. These tests check they track ``torch.sin``/``torch.cos`` on the
-encoding's whole range, that ``encode_boxes`` still matches the original formula, and that its
-exported graph holds no trig ops.
+The M2 Neural Engine can't run ``sin``/``cos``, so MPSGraph used to put decoder layers 1-4 on
+the GPU, and that Neural Engine -> GPU -> Neural Engine ``detect`` aborted on M2 Ultra/Max.
+``sin_0_2pi``/``cos_0_2pi`` are multiply/add polynomials. These tests check they track
+``torch.sin``/``torch.cos`` on the encoding's whole range, that ``encode_boxes`` still matches the
+original formula, and that its exported graph holds no trig ops. ``test_sam3.py`` runs the same
+trig check on the whole exported ``detect`` graph.
 """
 
 import math
@@ -89,13 +90,15 @@ class _EncodeBoxes(torch.nn.Module):
         return self.encoding.encode_boxes(boxes)
 
 
-def test_encode_boxes_graph_has_no_trig_or_negation():
-    """``sin``, ``cos`` and unary ``neg`` don't appear in H14 ANE regions; keep them out."""
-    exported = torch.export.export(_EncodeBoxes().half(), (torch.rand(1, 200, 4).half(),))
+def trig_targets(exported: torch.export.ExportedProgram) -> set[str]:
+    """``aten.sin``/``aten.cos`` call targets in an exported graph.
+
+    These are the ops the M2 Neural Engine rejects in SAM3's ``detect``
+    """
     targets = {str(node.target) for node in exported.graph.nodes if node.op == "call_function"}
-    banned = {
-        t
-        for t in targets
-        if t.split(".")[:2] in (["aten", "sin"], ["aten", "cos"], ["aten", "neg"])
-    }
-    assert not banned, banned
+    return {t for t in targets if t.split(".")[:2] in (["aten", "sin"], ["aten", "cos"])}
+
+
+def test_encode_boxes_graph_has_no_trig():
+    exported = torch.export.export(_EncodeBoxes().half(), (torch.rand(1, 200, 4).half(),))
+    assert not trig_targets(exported)

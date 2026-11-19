@@ -101,7 +101,7 @@ class SinePositionEmbeddingReauthored(nn.Module):
         """Encode (cx, cy, w, h) boxes to (B, num_queries, num_pos_feats * 4).
 
         Boxes come from a sigmoid, so every angle is in [0, 2*pi] and the multiply/add
-        ``sin_0_2pi``/``cos_0_2pi`` stand in for ``sin``/``cos``. The M2 (H14) ANE has no
+        ``sin_0_2pi``/``cos_0_2pi`` stand in for ``sin``/``cos``. The M2 Neural Engine has no
         sin/cos, and MPSGraph would otherwise run decoder layers 1-4 on the GPU.
         """
         scale = self._scale.to(dtype=boxes.dtype)

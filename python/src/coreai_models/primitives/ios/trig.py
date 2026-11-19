@@ -18,8 +18,8 @@ Max abs error against ``torch.sin``/``torch.cos`` on the same input is about ``2
 In fp16 it is about ``3e-3``, the same size as the fp16 rounding of the angle itself (half an
 ulp of ``x`` near ``2*pi`` is ``2e-3``). Coefficients are minimax fits, rounded to fp16 one at a
 time, refitting the rest after each rounding. Like ``gelu.py``, constants are fp16 tensors so no
-f32 literals land in the graph. Unary negation is avoided too (``cos`` uses negated
-coefficients), since ``mps.negative`` is not among the ops seen in M2-gen Neural Engine regions.
+f32 literals land in the graph. ``cos`` stores its coefficients negated, which folds the
+``-cos(x - pi)`` sign into them instead of spending an op on it.
 """
 
 import math
