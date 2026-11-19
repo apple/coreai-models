@@ -334,11 +334,28 @@ struct StaticStateSet {
     /// The sliding-window ring among the fixed states, when the asset has one.
     let slidingRing: SlidingRing?
 
+    /// How far back these states can be rewound. `.startOnly` when any state is declared
+    /// `fixed`: a conv or recurrent state that summarizes the whole prefix.
+    let rollback: RollbackCapability
+
+    init(
+        bucketed: BucketedStaticState?,
+        fixed: FixedStaticState?,
+        slidingRing: SlidingRing?,
+        rollback: RollbackCapability = .anyPosition
+    ) {
+        self.bucketed = bucketed
+        self.fixed = fixed
+        self.slidingRing = slidingRing
+        self.rollback = rollback
+    }
+
     /// Whether the states can be truncated from `processed` back to `target`
     /// positions. Flat caches always can; a sliding-window ring only while it still
-    /// holds the keys the next query needs.
+    /// holds the keys the next query needs; a `.startOnly` set only back to 0.
     func canTruncate(processed: Int, to target: Int, alignment: Int = 1) -> Bool {
-        slidingRing?.allowsRewind(processed: processed, to: target, alignment: alignment) ?? true
+        if rollback == .startOnly && target != 0 && target != processed { return false }
+        return slidingRing?.allowsRewind(processed: processed, to: target, alignment: alignment) ?? true
     }
 
     /// A state's backing array, from whichever handler owns it; nil when none does. Lets a draft
@@ -375,10 +392,12 @@ enum StaticStateFactory {
     ///     state names and to size fixed states.
     ///   - slidingWindow: The model's sliding-attention window, if it has one. With a
     ///     ``SlidingRing/keyCacheName`` state it describes the set's sliding ring.
+    ///   - stateKinds: The bundle's declared state kinds (`metadata.json` `states`), if any.
     static func makeStateSet(
         descriptorsByContext: [Int: InferenceFunctionDescriptor],
         referenceDescriptor: InferenceFunctionDescriptor,
-        slidingWindow: Int?
+        slidingWindow: Int?,
+        stateKinds: [String: StateKind]? = nil
     ) throws -> StaticStateSet {
         let names = referenceDescriptor.stateNames
 
@@ -431,7 +450,16 @@ enum StaticStateFactory {
             slidingRing = SlidingRing(depth: depth, window: slidingWindow)
         }
 
-        return StaticStateSet(bucketed: bucketed, fixed: fixed, slidingRing: slidingRing)
+        return StaticStateSet(
+            bucketed: bucketed, fixed: fixed, slidingRing: slidingRing,
+            rollback: rollback(stateNames: names, stateKinds: stateKinds))
+    }
+
+    /// `.startOnly` when any state is declared `fixed`. Internal for testing.
+    static func rollback(
+        stateNames: [String], stateKinds: [String: StateKind]?
+    ) -> RollbackCapability {
+        stateNames.contains { stateKinds?[$0] == .fixed } ? .startOnly : .anyPosition
     }
 
     /// Whether a state needs its own buffer per context bucket.

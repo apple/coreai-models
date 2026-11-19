@@ -107,6 +107,8 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     private var history = TokenHistory()
     public private(set) var lastPrefixHitCount: Int = 0
 
+    public var hasRecurrentState: Bool { states.rollback == .startOnly }
+
     // Track in-flight generation via token
     private let tokenBox = GenerationTokenBox()
 
@@ -214,7 +216,8 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         self.states = try StaticStateFactory.makeStateSet(
             descriptorsByContext: descriptorsByContext,
             referenceDescriptor: referenceDescriptor,
-            slidingWindow: configuration.overrides?.slidingWindow)
+            slidingWindow: configuration.overrides?.slidingWindow,
+            stateKinds: configuration.states)
 
         // Inputs: the standard filler, plus whichever optional handlers the graph asks for.
         var handlers: [any StaticInputHandler] = []
@@ -272,6 +275,24 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
                 try SlidingWindowInputHandler(
                     window: window, ringDepth: ringDepth,
                     maskDescriptors: slidingMask, stepDescriptors: slidingStep))
+        }
+
+        let deltaNetFlag = BucketedInputDescriptors.collect(
+            DeltaNetInputHandler.updateFlagInputName, from: functionsByKey)
+        let deltaNetConvStep = BucketedInputDescriptors.collect(
+            DeltaNetInputHandler.convStepInputName, from: functionsByKey)
+        let deltaNetSelector = BucketedInputDescriptors.collect(
+            DeltaNetInputHandler.seedSelectorInputName, from: functionsByKey)
+        if !deltaNetFlag.isEmpty || !deltaNetConvStep.isEmpty || !deltaNetSelector.isEmpty {
+            try DeltaNetInputHandler.validate(rollback: self.states.rollback)
+            try DeltaNetInputHandler.validate(
+                updateFlag: deltaNetFlag, convStep: deltaNetConvStep, seedSelector: deltaNetSelector)
+            CLILogger.log("Input handler: gated DeltaNet (recurrent state + conv ring)")
+            handlers.append(
+                DeltaNetInputHandler(
+                    updateFlagDescriptors: deltaNetFlag,
+                    convStepDescriptors: deltaNetConvStep,
+                    seedSelectorDescriptors: deltaNetSelector))
         }
 
         if referenceDescriptor.inputNames.contains(PerLayerEmbeddingsInputHandler.inputName) {
@@ -642,7 +663,8 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
                     batchTokens: inputTokens[batchStartToken...batchEndToken],
                     batchSize: batchSize,
                     alignedStep: batchStartToken,
-                    contextBucket: contextBucket
+                    contextBucket: contextBucket,
+                    processedTokenCount: currentPosition
                 )
             }
 
@@ -810,7 +832,8 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
                 batchTokens: batchTokens,
                 batchSize: batchSize,
                 alignedStep: batchStartToken,
-                contextBucket: contextBucket)
+                contextBucket: contextBucket,
+                processedTokenCount: processedTokenCount)
 
             let fn = try loadFunction(named: graphName)
             let desc = try functionDescriptor(for: graphName)
@@ -1033,7 +1056,8 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         batchTokens: Tokens,
         batchSize: Int,
         alignedStep: Int,
-        contextBucket: Int
+        contextBucket: Int,
+        processedTokenCount: Int
     ) async throws -> [String: NDArray] {
         let desc = try functionDescriptor(for: graphName)
 
@@ -1042,7 +1066,8 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
             alignedStep: alignedStep,
             batchSize: batchSize,
             slidingWindow: nil,
-            contextBucket: contextBucket)
+            contextBucket: contextBucket,
+            processedTokenCount: processedTokenCount)
 
         // Multimodal: HF masks image-placeholder positions to the pad token BEFORE the
         // per-layer-embedding gather (`llm_input_ids = where(image_mask, pad_token_id,
@@ -1060,7 +1085,8 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
                 alignedStep: alignedStep,
                 batchSize: batchSize,
                 slidingWindow: config.overrides?.slidingWindow,
-                contextBucket: contextBucket)
+                contextBucket: contextBucket,
+                processedTokenCount: processedTokenCount)
         } else {
             pleContext = context
         }
@@ -1165,13 +1191,18 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     }
 
     /// Rewinds to `tokenIndex` processed tokens. Throws, leaving the engine unchanged, when
-    /// the index is out of range or the sliding-window ring no longer holds the keys the
-    /// restarted forward needs.
+    /// the index is out of range or the states cannot rewind there: a start-only state set
+    /// (recurrent state) only to 0 or the current position, and a sliding-window ring only
+    /// while it still holds the keys the restarted forward needs.
     public func reset(to tokenIndex: Int) async throws {
         try Self.validateResetTarget(tokenIndex, processed: processedTokenCount)
         guard canRewind(to: tokenIndex, alignment: verifyTileWidth ?? 1) else {
+            let reason =
+                states.rollback == .startOnly
+                ? "the model's recurrent state summarizes the whole prefix"
+                : "it needs keys the sliding-window ring has overwritten"
             throw InferenceRuntimeError.invalidState(
-                "reset(to: \(tokenIndex)) needs keys the sliding-window ring has overwritten "
+                "reset(to: \(tokenIndex)) is not possible: \(reason) "
                     + "(\(processedTokenCount) tokens processed). Use reset(to: 0) and replay "
                     + "the prefix.")
         }

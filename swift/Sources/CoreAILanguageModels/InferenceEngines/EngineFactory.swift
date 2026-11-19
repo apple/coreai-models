@@ -369,7 +369,8 @@ public struct EngineFactory: Sendable {
             ),
             serializedModel: [modelURL.lastPathComponent],
             function: config.function,
-            overrides: config.overrides
+            overrides: config.overrides,
+            states: config.states
         )
         modelConfig.states = config.states
 
