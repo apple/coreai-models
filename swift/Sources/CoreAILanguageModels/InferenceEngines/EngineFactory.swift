@@ -372,7 +372,6 @@ public struct EngineFactory: Sendable {
             overrides: config.overrides,
             states: config.states
         )
-        modelConfig.states = config.states
 
         modelConfig.applyChunkingOverrides(
             prefillChunkSize: options.prefillChunkSize,
