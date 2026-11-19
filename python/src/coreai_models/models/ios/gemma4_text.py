@@ -397,9 +397,10 @@ class GeGLUMLP(nn.Module):
         self.down_proj = _make_proj_conv(config, hidden_dim, dim, nbits=nbits)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Tokens go in the 1x1 convs' width, (B, D, 1, S), as in `Attention`, not in their batch:
-        # on the Neural Engine a QAT checkpoint's activation quantize/dequantize on the gate/up
-        # outputs makes the batch layout several times slower in prefill, and costs nothing here.
+        # Tokens go in the 1x1 convs' width, (B, D, 1, S), as in `Attention`, not in their batch,
+        # (B*S, D, 1, 1): on the Neural Engine, a QAT checkpoint's activation quantize/dequantize
+        # around these convs makes the batch layout several times slower in prefill. The two
+        # layouts compute the same values, and the standard checkpoints use this layout too.
         x = x.transpose(-3, -1)
 
         up_tensor = self.up_proj(x)
