@@ -274,6 +274,9 @@ final class MPSGraphArgmaxSampler: @unchecked Sendable {
     private var constrainedBitmaskBuffer: MTLBuffer?
     private var constrainedBitmaskData: MPSGraphTensorData?
     private var constrainedAdditivePlaceholder: MPSGraphTensor?
+    // Feed role per constrained placeholder. Some MPSGraph versions return the executable's
+    // feed tensors with empty operation names, so the name alone cannot identify them.
+    private var constrainedFeedRoles: [ObjectIdentifier: String] = [:]
 
     /// Number of Int32 words in the bitmask.
     let bitmaskSize: Int
@@ -430,6 +433,8 @@ final class MPSGraphArgmaxSampler: @unchecked Sendable {
         let cBitmask = cGraph.placeholder(
             shape: [bitmaskSize as NSNumber], dataType: .int32, name: "bitmask")
 
+        constrainedFeedRoles = [ObjectIdentifier(cLogits): "logits", ObjectIdentifier(cBitmask): "bitmask"]
+
         let maskedLogits = buildBitmaskExpansionGraph(
             graph: cGraph, logits: cLogits, bitmaskPlaceholder: cBitmask,
             vocabSize: vocabSize, bitmaskSize: bitmaskSize)
@@ -440,6 +445,7 @@ final class MPSGraphArgmaxSampler: @unchecked Sendable {
             let cAdditive = cGraph.placeholder(
                 shape: [1, vocabSize as NSNumber], dataType: .float16, name: "additive")
             self.constrainedAdditivePlaceholder = cAdditive
+            constrainedFeedRoles[ObjectIdentifier(cAdditive)] = "additive"
             let maskedF32 = cGraph.cast(maskedLogits, to: .float32, name: "logits_f32")
             argmaxInput = applyAdditiveStage(
                 graph: cGraph, logits: maskedF32, additiveTensor: cAdditive, name: "additive")
@@ -474,7 +480,7 @@ final class MPSGraphArgmaxSampler: @unchecked Sendable {
     ) -> [MPSGraphTensorData] {
         let effectiveAdditive = additiveData ?? neutralAdditiveData
         return constrainedExecutable!.feedTensors!.map { tensor -> MPSGraphTensorData in
-            switch tensor.operation.name {
+            switch constrainedFeedRoles[ObjectIdentifier(tensor)] ?? tensor.operation.name {
             case "logits": return logitsData
             case "bitmask": return bitmaskData
             case "additive": return effectiveAdditive!
@@ -961,6 +967,9 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
     private var constrainedBitmaskBuffer: MTLBuffer?
     private var constrainedBitmaskData: MPSGraphTensorData?
     private var constrainedAdditivePlaceholder: MPSGraphTensor?
+    // Feed role per constrained placeholder. Some MPSGraph versions return the executable's
+    // feed tensors with empty operation names, so the name alone cannot identify them.
+    private var constrainedFeedRoles: [ObjectIdentifier: String] = [:]
 
     /// Number of Int32 words in the bitmask.
     let bitmaskSize: Int
@@ -1268,6 +1277,12 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
         let cMinP = cGraph.placeholder(shape: [1 as NSNumber], dataType: .float32, name: "minP")
         let cBitmask = cGraph.placeholder(shape: [bitmaskSize as NSNumber], dataType: .int32, name: "bitmask")
 
+        constrainedFeedRoles = [
+            ObjectIdentifier(cLogits): "logits", ObjectIdentifier(cTemp): "temperature",
+            ObjectIdentifier(cRandom): "random", ObjectIdentifier(cTopP): "topP",
+            ObjectIdentifier(cMinP): "minP", ObjectIdentifier(cBitmask): "bitmask",
+        ]
+
         let cMaskedLogits = buildBitmaskExpansionGraph(
             graph: cGraph, logits: cLogits, bitmaskPlaceholder: cBitmask,
             vocabSize: vocabSize, bitmaskSize: bitmaskSize)
@@ -1280,6 +1295,7 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
             let cAdditive = cGraph.placeholder(
                 shape: [1, vocabSize as NSNumber], dataType: .float16, name: "additive")
             self.constrainedAdditivePlaceholder = cAdditive
+            constrainedFeedRoles[ObjectIdentifier(cAdditive)] = "additive"
             cAdjusted = applyAdditiveStage(
                 graph: cGraph, logits: cLogitsF32, additiveTensor: cAdditive, name: "additive")
         } else {
@@ -1342,7 +1358,7 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
     ) -> [MPSGraphTensorData] {
         let effectiveAdditive = additiveData ?? neutralAdditiveData
         return constrainedExecutable!.feedTensors!.map { tensor -> MPSGraphTensorData in
-            switch tensor.operation.name {
+            switch constrainedFeedRoles[ObjectIdentifier(tensor)] ?? tensor.operation.name {
             case "logits": return logitsData
             case "bitmask": return bitmaskData
             case "additive": return effectiveAdditive!
