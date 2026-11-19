@@ -64,6 +64,7 @@ from coreai_models.models.base import (
 )
 from coreai_models.primitives.ios.cache import KVCacheHandler
 from coreai_models.primitives.ios.quantization import (
+    NATIVE_NBITS,
     dequantize_native,
     dequantize_native_dense,
     dequantize_per_tensor,
@@ -295,8 +296,16 @@ def _make_proj_conv(config, in_channels: int, out_channels: int, nbits: int) -> 
     below INT4 -- see ``NativeLutQuantConv1x1``'s docstring. Only Gemma4 E2B's shared-KV MLP layers
     actually ship below 4 bits (see ``_native_mlp_nbits``); every other caller passes 4
     or 8 and gets the existing affine path unchanged.
+
+    A native projection is 2, 4 or 8 bits (``NATIVE_NBITS``), the widths the QAT checkpoints
+    ship; any other width is refused here, as the module is built, rather than when its
+    weights are unpacked or traced.
     """
     if getattr(config, "native_quantized", False):
+        if nbits not in NATIVE_NBITS:
+            raise ValueError(
+                f"A native-quantized projection is one of {NATIVE_NBITS} bits, got {nbits}."
+            )
         if nbits < 4:
             return NativeLutQuantConv1x1(in_channels, out_channels, nbits)
         return NativeQuantConv1x1(in_channels, out_channels, nbits)
@@ -876,13 +885,33 @@ def _native_module_name(hf_name: str, hf_prefix: str) -> str:
     return f"extend.{hf_name}"
 
 
+def _check_native_nbits(checkpoint_nbits: dict[str, int]) -> None:
+    """Fail if a checkpoint module is quantized to a width other than 2, 4 or 8 bits.
+
+    Those are the widths the QAT checkpoints ship and the native modules, the sub-byte
+    unpacking and ``dequantize_native`` handle (``NATIVE_NBITS``). Checked before any packed
+    weight is unpacked, so the error names the module. ``_check_native_widths`` then checks
+    each supported width against the width the module tree declares for it.
+    """
+    unsupported = {
+        name: nbits for name, nbits in checkpoint_nbits.items() if nbits not in NATIVE_NBITS
+    }
+    if unsupported:
+        listed = ", ".join(f"{name} ({nbits} bits)" for name, nbits in sorted(unsupported.items()))
+        raise NotImplementedError(
+            f"Native-quantized modules are one of {NATIVE_NBITS} bits; the checkpoint quantizes "
+            f"{listed}."
+        )
+
+
 def _check_native_widths(model: nn.Module, checkpoint_nbits: dict[str, int]) -> None:
     """Fail if a native-quantized module declares fewer bits than its checkpoint module.
 
     The projection widths are fixed by the module tree (4 bits for attention, 8 for the PLE
     projections, the per-layer plan for the MLP), so a checkpoint quantized differently would
     otherwise load values that do not fit the declared width. A wider declaration is fine: the
-    ``lm_head`` is declared 4 bits for a 2-bit checkpoint (see ``Gemma4Extend``).
+    ``lm_head`` is declared 4 bits for a 2-bit checkpoint (see ``Gemma4Extend``). The widths
+    themselves are limited to the supported ones first, by ``_check_native_nbits``.
     """
     modules = dict(model.named_modules())
     for name, nbits in checkpoint_nbits.items():
@@ -1411,13 +1440,16 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
 
         modules_by_name = dict(hf_model.named_modules())
         hf_prefix = "model.language_model."
-        # The checkpoint's bit width of each quantized module, by its name in this model, so the
-        # widths the modules below declare can be checked against it once they exist.
+        # The checkpoint's bit width of each quantized text-decoder module, by its name in this
+        # model: checked against the supported widths now, and against the widths the modules
+        # below declare once they exist.
         checkpoint_nbits = {
             _native_module_name(name, hf_prefix): module.num_bits
             for name, module in modules_by_name.items()
             if isinstance(module, (QuantizedLinear, QuantizedEmbedding))
+            and (name.startswith(hf_prefix) or name == "lm_head")
         }
+        _check_native_nbits(checkpoint_nbits)
 
         # Per-layer MLP bit width, read off the checkpoint's quantized modules (see
         # `_native_mlp_nbits`). Set before `cls(config, ...)` builds the module tree.

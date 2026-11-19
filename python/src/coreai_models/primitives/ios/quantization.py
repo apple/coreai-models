@@ -134,6 +134,10 @@ def dequantize_per_tensor_meta(
 # happen.
 _NBITS_TO_TORCH_DTYPE: dict[int, torch.dtype] = {2: torch.int2, 4: torch.int4, 8: torch.int8}
 
+#: Bit widths of a CoreAI-native quantized tensor: the widths ``dequantize_native`` and
+#: ``unpack_signed_subbyte`` / ``unpack_unsigned_subbyte`` accept.
+NATIVE_NBITS: tuple[int, ...] = tuple(sorted(_NBITS_TO_TORCH_DTYPE))
+
 
 def dequantize_native(
     quantized_data: torch.Tensor,

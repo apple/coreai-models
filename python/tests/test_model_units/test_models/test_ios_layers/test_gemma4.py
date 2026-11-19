@@ -38,6 +38,7 @@ from coreai_models.models.ios.gemma4_text import (  # noqa: E402
     NativeQuantConv1x1,
     NativeQuantLinear,
     QuantizedLinear,
+    _check_native_nbits,
     _check_native_widths,
     _compute_kv_layout,
     _is_quantized_hf_model,
@@ -602,6 +603,27 @@ def test_native_quant_helpers_reject_unsupported_nbits(nbits):
         unpack_unsigned_subbyte(torch.zeros(1, 1, dtype=torch.uint8), nbits, 1)
     with pytest.raises(ValueError, match="nbits must be one of"):
         dequantize_native(torch.zeros(1, 1), torch.ones(1, 1), nbits, torch.float16)
+
+
+@pytest.mark.parametrize("nbits", [1, 3, 6, 16])
+def test_native_projections_reject_unsupported_nbits(nbits):
+    """A native projection is built at 2, 4 or 8 bits only; a standard one ignores the width."""
+    cfg = _make_config()
+    cfg.native_quantized = True
+    with pytest.raises(ValueError, match=r"one of \(2, 4, 8\) bits"):
+        _make_proj_conv(cfg, 4, 8, nbits=nbits)
+    cfg.native_quantized = False
+    assert isinstance(_make_proj_conv(cfg, 4, 8, nbits=nbits), torch.nn.Conv2d)
+
+
+def test_checkpoint_widths_must_be_supported():
+    """A checkpoint module at a width other than 2, 4 or 8 bits is refused, by name, before
+    anything is unpacked."""
+    ple = "extend.model.embed_tokens_per_layer"
+    q_proj = "extend.model.layers.0.self_attn.q_proj"
+    _check_native_nbits({q_proj: 4, ple: 2, "extend.lm_head": 2, "extend.model.embed_tokens": 8})
+    with pytest.raises(NotImplementedError, match=rf"{ple} \(3 bits\)"):
+        _check_native_nbits({q_proj: 4, ple: 3})
 
 
 def test_make_proj_conv_dispatches_on_nbits_and_native_flag():
