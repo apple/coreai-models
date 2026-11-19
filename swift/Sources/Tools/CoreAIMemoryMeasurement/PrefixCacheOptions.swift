@@ -25,7 +25,8 @@ package struct PrefixCacheOptions: ParsableArguments {
         help: ArgumentHelp(
             "Megabytes of disk the prefix cache may also use, under ~/Library/Caches/coreai-prefix-cache, so "
                 + "it can outgrow --prefix-cache-mb and is kept across restarts. Needs --prefix-cache-mb above "
-                + "0; one process per model at a time (default: 0, memory only)")
+                + "0; one process per model at a time. 0 leaves files an earlier run wrote where they are "
+                + "(default: 0, memory only)")
     )
     package var prefixCacheDiskMB: Int = 0
 

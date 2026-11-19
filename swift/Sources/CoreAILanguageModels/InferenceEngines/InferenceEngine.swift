@@ -249,6 +249,10 @@ public protocol InferenceEngine: Sendable {
     /// A disk tier keeps its copies, and a later prompt reads its own chain back into memory.
     func shedPrefixCache(atLeast bytes: Int) -> Int
 
+    /// Gives back everything the prefix cache holds in memory: ``shedPrefixCache(atLeast:)`` with no
+    /// limit. Defaults to forwarding there.
+    func shedPrefixCache() -> Int
+
     // MARK: - Configuration
 
     associatedtype ConfigType: Codable, InferenceConfiguration
@@ -316,6 +320,7 @@ extension InferenceEngine {
 extension InferenceEngine {
     public var prefixCacheEnabled: Bool { false }
     public func shedPrefixCache(atLeast bytes: Int) -> Int { 0 }
+    public func shedPrefixCache() -> Int { shedPrefixCache(atLeast: .max) }
 }
 
 extension InferenceEngine {

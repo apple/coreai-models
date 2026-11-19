@@ -85,6 +85,16 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
         preparedModel: PreparedModel,
         options: EngineOptions = EngineOptions()
     ) async throws {
+        // A disk budget with nowhere to go, or no memory cache to go through, is a mistake in the options.
+        if options.prefixCacheDiskBytes > 0 {
+            guard options.prefixCacheBytes > 0 else {
+                throw InferenceRuntimeError.invalidArgument(
+                    "prefixCacheDiskBytes needs prefixCacheBytes too: chunks reach disk through the memory cache")
+            }
+            guard options.prefixCacheDirectory != nil else {
+                throw InferenceRuntimeError.invalidArgument("prefixCacheDiskBytes needs prefixCacheDirectory")
+            }
+        }
         let engine = try await EngineImpl(
             config: config, preparedModel: preparedModel, options: options)
         let unsupported = engine.prefixCacheUnsupportedReason
@@ -103,16 +113,8 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
             prefixStore = PrefixCacheStore(
                 directory: directory, byteBudget: options.prefixCacheDiskBytes, geometry: geometry)
         } else {
+            // The model can't use the cache at all, which the memory tier has logged.
             prefixStore = nil
-            // A disk budget asked for and not used says why.
-            if options.prefixCacheDiskBytes > 0 {
-                CLILogger.log(
-                    "prefix cache: no disk tier: "
-                        + (options.prefixCacheBytes == 0
-                            ? "it needs the memory cache, which is off"
-                            : prefixTree == nil
-                                ? "the memory cache is off for this model" : "prefixCacheDirectory is not set"))
-            }
         }
     }
 

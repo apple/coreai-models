@@ -186,6 +186,27 @@ struct PrefixCacheEngineTests {
         let (cold, _) = try await load(path, prefixCacheBytes: 0)
         #expect(restored[0].text == (try await reply(Self.second, engine: cold, tokenizer: tokenizer)))
     }
+
+    @Test(
+        "A disk budget without a memory cache or a directory is refused when the engine is made",
+        .enabled(if: ProcessInfo.processInfo.environment["COREAI_TEST_DECODE_BUNDLE"] != nil))
+    func unusableDiskBudgetIsRefused() async throws {
+        let path = try #require(ProcessInfo.processInfo.environment["COREAI_TEST_DECODE_BUNDLE"])
+        let bundle = try LanguageModelBundle(from: path)
+        let directory = FileManager.default.temporaryDirectory
+        for options in [
+            EngineOptions(
+                variant: "coreai-pipelined", tensorData: bundle.tensorData, prefixCacheDiskBytes: 1 << 20,
+                prefixCacheDirectory: directory),
+            EngineOptions(
+                variant: "coreai-pipelined", tensorData: bundle.tensorData, prefixCacheBytes: 1 << 20,
+                prefixCacheDiskBytes: 1 << 20),
+        ] {
+            await #expect(throws: InferenceRuntimeError.self) {
+                _ = try await EngineFactory.createEngine(bundle: bundle, options: options)
+            }
+        }
+    }
 }
 
 #endif

@@ -474,7 +474,9 @@ public struct EngineOptions: Sendable {
     /// budget allows, and a prompt that runs past what memory holds reads the next chunks back from there. So this may be larger
     /// than ``prefixCacheBytes``, and a restarted engine reuses what an earlier one computed. Needs
     /// ``prefixCacheBytes`` and ``prefixCacheDirectory`` too: chunks reach the KV cache through memory.
-    /// Without either, the engine logs why and keeps no disk tier.
+    /// Without either, creating the engine throws. Setting this back to zero leaves the files in
+    /// ``prefixCacheDirectory`` where they are, for a later engine with a disk budget to use; nothing
+    /// deletes them but that engine's own eviction and the system's clearing of its caches directory.
     public var prefixCacheDiskBytes: Int
 
     /// Where the prefix cache keeps its files: a directory for this model alone, such as
