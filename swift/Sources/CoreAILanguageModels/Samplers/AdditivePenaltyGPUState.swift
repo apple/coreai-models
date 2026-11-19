@@ -18,19 +18,21 @@ import Metal
 ///
 /// Uses the same split design as ``RepetitionPenaltyGPUState`` to avoid races between GPU reads
 /// and CPU writes:
-/// - `recordToken()`: updates only the CPU-side ring buffer and queues per-slot delta increments
-/// - `buffer(forStep:)`: applies the queued increments to one buffer slot at encode time, when the
+/// - `recordToken()`: updates only the CPU-side ring buffer and queues, per slot, the exact new
+///   delta of each token whose count changed
+/// - `buffer(forStep:)`: writes the queued deltas to one buffer slot at encode time, when the
 ///   pipeline gate guarantees that slot is not being read by the GPU
 ///
 /// Unlike the multiplicative repetition penalty (whose neutral value is 1.0), the additive delta's
-/// neutral value is 0.0. Each buffer starts at the static `logitBias` baseline and accumulates the
-/// negative frequency/presence increments as tokens enter and leave the window.
+/// neutral value is 0.0. Each buffer starts at the static `logitBias` baseline. A token's delta is
+/// recomputed from its count on every change rather than accumulated in place, so the f16 buffer
+/// does not drift from the CPU result as counts grow.
 final class AdditivePenaltyGPUState: @unchecked Sendable {
     let deltaBuffers: [MTLBuffer]
     let vocabSize: Int
     let pipelineDepth: Int
-    let frequencyPenalty: Float
-    let presencePenalty: Float
+    let frequencyPenalty: Double
+    let presencePenalty: Double
     let windowSize: Int
 
     /// Static per-token bias baseline (applied to every buffer at init and on reset).
@@ -40,7 +42,7 @@ final class AdditivePenaltyGPUState: @unchecked Sendable {
     private var writeIndex: Int = 0
     private var count: Int = 0
     private var refCounts: [Int32: Int] = [:]
-    private var dirtyIncrements: [[(token: Int32, change: Float)]]
+    private var dirtyDeltas: [[(token: Int32, delta: Double)]]
 
     init(
         device: MTLDevice,
@@ -49,13 +51,16 @@ final class AdditivePenaltyGPUState: @unchecked Sendable {
         frequencyPenalty: Double = 0,
         presencePenalty: Double = 0,
         logitBias: [Int32: Float]? = nil,
-        windowSize: Int? = nil
+        windowSize: Int
     ) throws {
+        // No default window: callers pass the same window as the CPU path (the context length
+        // when the configuration's window is nil), so both engines penalize the same history.
+        precondition(windowSize > 0, "windowSize must be > 0")
         self.vocabSize = vocabSize
         self.pipelineDepth = pipelineDepth
-        self.frequencyPenalty = Float(frequencyPenalty)
-        self.presencePenalty = Float(presencePenalty)
-        self.windowSize = windowSize ?? 256
+        self.frequencyPenalty = frequencyPenalty
+        self.presencePenalty = presencePenalty
+        self.windowSize = windowSize
         self.logitBias = logitBias?.filter { $0.key >= 0 && Int($0.key) < vocabSize } ?? [:]
 
         let bufferSize = vocabSize * MemoryLayout<Float16>.size
@@ -68,7 +73,7 @@ final class AdditivePenaltyGPUState: @unchecked Sendable {
         }
         self.deltaBuffers = buffers
         self.ring = [Int32](repeating: -1, count: self.windowSize)
-        self.dirtyIncrements = Array(repeating: [], count: pipelineDepth)
+        self.dirtyDeltas = Array(repeating: [], count: pipelineDepth)
 
         // Initialize every slot to the static bias baseline (0.0 elsewhere).
         for buffer in buffers {
@@ -81,7 +86,7 @@ final class AdditivePenaltyGPUState: @unchecked Sendable {
         }
     }
 
-    /// Get the additive delta buffer for a given step after applying pending increments.
+    /// Get the additive delta buffer for a given step after writing pending deltas.
     ///
     /// Called at encode time. The gate guarantees this slot's previous GPU read has completed,
     /// so writing to it is safe.
@@ -90,12 +95,11 @@ final class AdditivePenaltyGPUState: @unchecked Sendable {
         let buf = deltaBuffers[slot]
         let ptr = buf.contents().assumingMemoryBound(to: Float16.self)
 
-        let applied = dirtyIncrements[slot]
-        for (token, change) in applied {
-            let idx = Int(token)
-            ptr[idx] = Float16(Float(ptr[idx]) + change)
+        // Queue order is event order, so the last write for a token is its current delta.
+        for (token, delta) in dirtyDeltas[slot] {
+            ptr[Int(token)] = Float16(delta)
         }
-        dirtyIncrements[slot].removeAll(keepingCapacity: true)
+        dirtyDeltas[slot].removeAll(keepingCapacity: true)
 
         return buf
     }
@@ -103,8 +107,8 @@ final class AdditivePenaltyGPUState: @unchecked Sendable {
     /// Record a newly generated token (CPU-side bookkeeping only).
     ///
     /// Called from the completion callback. Does NOT write to MTLBuffers directly. Instead, queues
-    /// per-slot delta increments to be applied at the next `buffer(forStep:)` call. Increments are
-    /// computed from `refCounts` at event time so the frequency/presence math is exact.
+    /// each changed token's new delta, computed from `refCounts` here, for the next
+    /// `buffer(forStep:)` call on every slot.
     func recordToken(_ token: Int32) {
         guard token >= 0 && Int(token) < vocabSize else { return }
 
@@ -112,38 +116,34 @@ final class AdditivePenaltyGPUState: @unchecked Sendable {
         if count == windowSize {
             let candidate = ring[writeIndex]
             if candidate >= 0 {
-                let oldCount = refCounts[candidate, default: 0]
-                let newCount = oldCount - 1
+                let newCount = refCounts[candidate, default: 0] - 1
                 if newCount <= 0 {
                     refCounts.removeValue(forKey: candidate)
                 } else {
                     refCounts[candidate] = newCount
                 }
-                // Removing one occurrence relaxes the frequency penalty; if the token leaves the
-                // window entirely, the presence penalty is lifted too.
-                var change = frequencyPenalty
-                if newCount <= 0 { change += presencePenalty }
-                enqueue(token: candidate, change: change)
+                enqueue(candidate)
             }
         } else {
             count += 1
         }
 
         // Add the new token.
-        let oldCount = refCounts[token, default: 0]
-        var change = -frequencyPenalty
-        if oldCount == 0 { change -= presencePenalty }
-        enqueue(token: token, change: change)
-
         ring[writeIndex] = token
         writeIndex = (writeIndex + 1) % windowSize
         refCounts[token, default: 0] += 1
+        enqueue(token)
     }
 
-    private func enqueue(token: Int32, change: Float) {
-        guard change != 0 else { return }
+    /// Queue `token`'s current delta: its bias, minus the frequency penalty per occurrence and the
+    /// presence penalty once while it is in the window.
+    private func enqueue(_ token: Int32) {
+        var delta = Double(logitBias[token] ?? 0)
+        if let count = refCounts[token] {
+            delta -= frequencyPenalty * Double(count) + presencePenalty
+        }
         for i in 0..<pipelineDepth {
-            dirtyIncrements[i].append((token: token, change: change))
+            dirtyDeltas[i].append((token: token, delta: delta))
         }
     }
 
@@ -161,6 +161,6 @@ final class AdditivePenaltyGPUState: @unchecked Sendable {
         writeIndex = 0
         count = 0
         refCounts.removeAll(keepingCapacity: true)
-        dirtyIncrements = Array(repeating: [], count: pipelineDepth)
+        dirtyDeltas = Array(repeating: [], count: pipelineDepth)
     }
 }

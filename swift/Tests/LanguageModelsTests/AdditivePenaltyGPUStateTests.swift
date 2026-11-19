@@ -80,4 +80,27 @@ struct AdditivePenaltyGPUStateTests {
         // Simpler invariant: token 2 present once -> -freq-presence = -2.0
         #expect(abs(value(b, 2) - (-2.0)) < 1e-2)
     }
+
+    @Test("a context-length window keeps early tokens penalized, matching the CPU path")
+    func contextLengthWindowMatchesCPU() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let vocabSize = 8
+        let tokens = (0..<600).map { Int32($0 == 10 ? 7 : $0 % 4) }
+        let state = try AdditivePenaltyGPUState(
+            device: device, vocabSize: vocabSize, pipelineDepth: 1,
+            frequencyPenalty: 0.01, presencePenalty: 0.5, logitBias: nil, windowSize: 4096)
+        _ = state.buffer(forStep: 0)
+        for token in tokens { state.recordToken(token) }
+        let gpu = state.buffer(forStep: 1)
+
+        // CPU path with a nil window penalizes the whole history.
+        var cpu = [LogitsScalarType](repeating: 0, count: vocabSize)
+        AdditivePenaltyProcessor.apply(
+            to: &cpu, recentTokenIds: tokens, frequencyPenalty: 0.01, presencePenalty: 0.5, logitBias: nil)
+        #expect(abs(value(gpu, 7) - (-0.51)) < 1e-2)  // the step-10 token is still penalized
+        for id in 0..<vocabSize {
+            #expect(
+                abs(value(gpu, id) - Float(cpu[id])) < 2e-3, "token \(id): gpu \(value(gpu, id)) cpu \(Float(cpu[id]))")
+        }
+    }
 }

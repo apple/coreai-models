@@ -29,23 +29,24 @@ public struct AdditivePenaltyProcessor {
     public static func apply<C: Collection<Int32>>(
         to logits: inout [LogitsScalarType],
         recentTokenIds: C,
-        frequencyPenalty: Float,
-        presencePenalty: Float,
+        frequencyPenalty: Double,
+        presencePenalty: Double,
         logitBias: [Int32: Float]?
     ) {
         let vocabSize = logits.count
 
         if frequencyPenalty != 0.0 || presencePenalty != 0.0 {
-            var counts = [Int32: Int](minimumCapacity: min(recentTokenIds.count, 512))
-            for tokenId in recentTokenIds {
-                guard tokenId >= 0 && Int(tokenId) < vocabSize else { continue }
+            // Counts as Float so the per-token delta needs no conversion; the logit is widened
+            // once and rounded back to the logits type once.
+            let frequency = Float(frequencyPenalty)
+            let presence = Float(presencePenalty)
+            var counts = [Int32: Float](minimumCapacity: min(recentTokenIds.count, 512))
+            for tokenId in recentTokenIds where tokenId >= 0 && Int(tokenId) < vocabSize {
                 counts[tokenId, default: 0] += 1
             }
             for (tokenId, count) in counts {
                 let idx = Int(tokenId)
-                let logit = Float(logits[idx])
-                let delta = frequencyPenalty * Float(count) + presencePenalty
-                logits[idx] = LogitsScalarType(logit - delta)
+                logits[idx] = LogitsScalarType(Float(logits[idx]) - (frequency * count + presence))
             }
         }
 

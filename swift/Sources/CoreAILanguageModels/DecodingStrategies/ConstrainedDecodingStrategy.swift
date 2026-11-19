@@ -166,8 +166,8 @@ public struct ConstrainedDecodingStrategy: DecodingStrategy {
             AdditivePenaltyProcessor.apply(
                 to: &maskedLogits,
                 recentTokenIds: generatedTokens.suffix(window),
-                frequencyPenalty: Float(samplingConfiguration.frequencyPenalty ?? 0),
-                presencePenalty: Float(samplingConfiguration.presencePenalty ?? 0),
+                frequencyPenalty: samplingConfiguration.frequencyPenalty ?? 0,
+                presencePenalty: samplingConfiguration.presencePenalty ?? 0,
                 logitBias: samplingConfiguration.logitBias
             )
         }

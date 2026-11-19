@@ -506,8 +506,8 @@ extension SamplingConfiguration {
             AdditivePenaltyProcessor.apply(
                 to: &logits,
                 recentTokenIds: recentTokens,
-                frequencyPenalty: Float(frequencyPenalty ?? 0),
-                presencePenalty: Float(presencePenalty ?? 0),
+                frequencyPenalty: frequencyPenalty ?? 0,
+                presencePenalty: presencePenalty ?? 0,
                 logitBias: logitBias
             )
         }
