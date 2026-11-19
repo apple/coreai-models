@@ -25,7 +25,8 @@ quantized values straight into CoreAI's own native quantized weight format
 `coreai_torch`'s `constexpr_blockwise_shift_scale`) instead of dequantizing and
 re-palettizing them -- no dequantize/requantize round-trip, and k-means
 palettization is skipped entirely for these checkpoints (their weights are
-already CoreAI-natively quantized). Attention/MLP/`lm_head` weights all keep
+already CoreAI-natively quantized), so the export refuses `--compression` and
+`--compression-config` for them. Attention/MLP/`lm_head` weights all keep
 native packing in the exported graph, but not always as affine
 `blockwise_shift_scale`:
 
@@ -107,7 +108,8 @@ uv run export.py --model google/gemma-4-E2B-it
 # Other variant
 uv run export.py --model google/gemma-4-E4B-it
 
-# QAT mobile-transformers checkpoints (quantization-aware-trained; kept quantized)
+# QAT mobile-transformers checkpoints (quantization-aware-trained; kept quantized).
+# They are never palettized, so --compression and --compression-config are refused.
 uv run export.py --model google/gemma-4-E2B-it-qat-mobile-transformers
 
 # No palettization. The embedding and PLE tables are still 8-bit quantized.

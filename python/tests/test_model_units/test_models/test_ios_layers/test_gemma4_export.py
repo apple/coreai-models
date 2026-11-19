@@ -134,6 +134,33 @@ def test_cli_accepts_small_and_default_contexts():
         export_g4._resolve_defaults(_cli_args(*argv))
 
 
+@pytest.mark.parametrize(
+    "argv", [("--compression", "none"), ("--compression-config", "my_palett.yaml")]
+)
+def test_native_checkpoint_refuses_explicit_compression(argv):
+    """A native-quantized checkpoint is never palettized, so an explicit flag is an error."""
+    args = _cli_args(*argv)
+    export_g4._resolve_defaults(args)
+    with pytest.raises(SystemExit, match="native-quantized checkpoint"):
+        export_g4._resolve_compression(args, native_quantized=True)
+
+
+def test_compression_defaults():
+    """No flag: a native checkpoint keeps its quantization, a standard one gets the recipe."""
+    args = _cli_args()
+    export_g4._resolve_defaults(args)
+    assert export_g4._resolve_compression(args, native_quantized=True) == (
+        None,
+        "native_quantized",
+    )
+    _, name = export_g4._resolve_compression(args, native_quantized=False)
+    assert name == export_g4.DEFAULT_IOS_COMPRESSION_CONFIG.stem
+
+    none_args = _cli_args("--compression", "none")
+    export_g4._resolve_defaults(none_args)
+    assert export_g4._resolve_compression(none_args, native_quantized=False) == (None, "none")
+
+
 def test_metadata_extras_require_what_the_runner_needs():
     cfg = _make_config()
     cfg.final_logit_softcapping = 30.0

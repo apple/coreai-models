@@ -31,13 +31,16 @@ except Exception:  # pragma: no cover - requires transformers>=5.5
 from coreai_models._constants import EXTEND_FUNCTION_NAME  # noqa: E402
 from coreai_models.models.base import TraceSpec, _is_layer_key_beyond  # noqa: E402
 from coreai_models.models.ios.gemma4_text import (  # noqa: E402
+    Gemma4Extend,
     Gemma4ForCausalLMForiOS,
     NativeLutQuantConv1x1,
     NativeQuantConv1x1,
     NativeQuantLinear,
+    _check_native_widths,
     _compute_kv_layout,
     _make_proj_conv,
     _native_mlp_nbits,
+    _native_ple_table,
     sliding_ring_size,
 )
 from coreai_models.primitives.ios.quantization import (  # noqa: E402
@@ -621,17 +624,61 @@ def test_native_mlp_nbits_reads_per_layer_plan():
     assert _native_mlp_nbits(cfg, 3) == 2
 
 
+def test_untied_lm_head_needs_a_native_quantized_checkpoint():
+    """A standard untied checkpoint has no loader for its ``lm_head``, so it is refused."""
+    cfg = _make_config()
+    cfg.tie_word_embeddings = False
+    with pytest.raises(NotImplementedError, match="untied lm_head"):
+        Gemma4Extend(cfg)
+
+
+def test_native_widths_must_cover_the_checkpoint():
+    """A module declaring fewer bits than its checkpoint module is refused; more is fine."""
+    cfg = _make_config()
+    cfg.native_quantized = True
+    model = Gemma4ForCausalLMForiOS(cfg, model_device="meta")
+    q_proj = "extend.model.layers.0.self_attn.q_proj"
+    _check_native_widths(model, {q_proj: 4, "extend.model.embed_tokens": 2})
+    _check_native_widths(model, {q_proj: 2})
+    with pytest.raises(NotImplementedError, match="8 bits in the checkpoint"):
+        _check_native_widths(model, {q_proj: 8})
+
+
+def test_native_ple_table_stores_8_bit_rows_offset():
+    """8-bit PLE rows ship as signed bytes; the sidecar stores them offset by 128, as the
+    runner reads every width."""
+    from types import SimpleNamespace
+
+    values = torch.tensor([[-128, -1, 0, 127]], dtype=torch.int8)
+    module = SimpleNamespace(
+        embedding_quantized=values,
+        embedding_scale=torch.ones(1, 1),
+        num_bits=8,
+        embedding_dim=4,
+    )
+    packed, scale, nbits = _native_ple_table(module, _make_config(), truncate=False)
+    assert nbits == 8 and packed.dtype == torch.uint8
+    assert packed.tolist() == [[0, 127, 128, 255]]
+    assert (packed.to(torch.int16) - 128).tolist() == values.tolist()
+
+    # Sub-byte rows are already offset-packed and pass through unchanged.
+    packed4 = torch.tensor([[0x8F]], dtype=torch.uint8)
+    module4 = SimpleNamespace(
+        embedding_quantized=packed4, embedding_scale=torch.ones(1, 1), num_bits=4, embedding_dim=2
+    )
+    assert torch.equal(_native_ple_table(module4, _make_config(), truncate=False)[0], packed4)
+
+
 # ---------------------------------------------------------------------------
 # Real QAT checkpoint: native-quantized module dispatch + bit-exactness.
 #
 # The tests above cover the standard (dequantize-and-palettize) checkpoints. This
 # one loads the real "-qat-mobile-transformers" E2B checkpoint through ``from_hf``
-# and checks the two things that actually went wrong during development: (1) each
-# MLP projection routes to the module its checkpoint bit-width calls for (affine
-# vs LUT), and (2) both paths dequantize bit-exact to HF's own reference
-# dequantization -- no dequantize/requantize round-trip anywhere. It is heavy
-# (downloads and loads a ~5B QAT checkpoint) and needs network + weights +
-# transformers>=5.5, so it is opt-in via ``-m slow``, same as
+# and checks that (1) each MLP projection routes to the module and bit width its
+# checkpoint calls for (affine vs LUT), and (2) both paths dequantize bit-exact to
+# HF's own reference dequantization -- no dequantize/requantize round-trip
+# anywhere. It is heavy (downloads and loads a ~5B QAT checkpoint) and needs
+# network + weights + transformers>=5.5, so it is opt-in via ``-m slow``, same as
 # ``test_e2b_full_parity_hf_vs_torch``.
 # ---------------------------------------------------------------------------
 
@@ -642,59 +689,58 @@ E2B_QAT_MODEL_ID = "google/gemma-4-E2B-it-qat-mobile-transformers"
 @pytest.mark.flaky(reruns=0)
 def test_e2b_qat_native_quantization_dispatch_and_bit_exactness():
     """Real E2B QAT checkpoint: per-layer affine/LUT dispatch and bit-exact dequant."""
-    if Gemma4ForCausalLM is None:
-        pytest.skip("gemma4 requires transformers>=5.5")
     if not _hf_hub_reachable(E2B_QAT_MODEL_ID):
         pytest.skip(f"HuggingFace Hub unreachable for {E2B_QAT_MODEL_ID!r}")
-    try:
-        from transformers import Gemma4ForConditionalGeneration
-    except Exception as exc:  # pragma: no cover
-        pytest.skip(f"transformers gemma4 symbols unavailable: {exc}")
+    from huggingface_hub.errors import GatedRepoError
+    from transformers import Gemma4ForConditionalGeneration
 
-    from coreai_models.primitives.ios.quantization import (
-        dequantize_native,
-        dequantize_native_dense,
-    )
+    from coreai_models.primitives.ios.quantization import dequantize_native_dense
 
     try:
         hf_model = Gemma4ForConditionalGeneration.from_pretrained(
             E2B_QAT_MODEL_ID, dtype=torch.float16
         )
-        model = Gemma4ForCausalLMForiOS.from_hf(
-            E2B_QAT_MODEL_ID, max_context_length=1024, target_dtype=torch.float16
-        ).eval()
-    except Exception as exc:  # pragma: no cover - gated/download failures
-        pytest.skip(f"could not load E2B QAT weights: {exc}")
+    except (OSError, GatedRepoError) as exc:  # download or gating failures only
+        pytest.skip(f"could not download E2B QAT weights: {exc}")
+    # A load failure past the download is a bug, not a skip.
+    model = Gemma4ForCausalLMForiOS.from_hf(
+        E2B_QAT_MODEL_ID, max_context_length=1024, target_dtype=torch.float16
+    ).eval()
 
     assert model.config.native_quantized is True
     hf_mods = dict(hf_model.named_modules())
 
-    # Check every layer's dispatch (cheap -- just isinstance checks), but only run the
-    # (more expensive) numeric bit-exactness compare for the first layer of each kind,
-    # since the module-level tests above already cover the arithmetic exhaustively.
-    saw_lut = saw_affine = False
+    # Every projection's dispatch and width is checked (cheap); the numeric compare runs
+    # for the first layer of each kind, since the module-level tests above cover the
+    # arithmetic exhaustively.
+    compared: set[bool] = set()
     for i, layer in enumerate(model.extend.model.layers):
-        hf_gate = hf_mods[f"model.language_model.layers.{i}.mlp.gate_proj"]
-        is_lut = hf_gate.num_bits < 4
-        gate_proj = layer.mlp.gate_proj
-        assert isinstance(gate_proj, NativeLutQuantConv1x1 if is_lut else NativeQuantConv1x1)
+        is_lut = None
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            hf_proj = hf_mods[f"model.language_model.layers.{i}.mlp.{proj}"]
+            ours = getattr(layer.mlp, proj)
+            lut = hf_proj.num_bits < 4
+            assert is_lut in (None, lut), f"layer {i} mixes LUT and affine MLP projections"
+            is_lut = lut
+            assert isinstance(ours, NativeLutQuantConv1x1 if lut else NativeQuantConv1x1)
+            assert ours.nbits == hf_proj.num_bits, f"layer {i} {proj}"
 
-        if is_lut and not saw_lut:
-            dense = torch.ops.coreai.lut_to_dense(gate_proj.indices, gate_proj.lut, 0)
-            ours = dequantize_native_dense(dense, gate_proj.scale, torch.float16)
-            saw_lut = True
-        elif not is_lut and not saw_affine:
-            ours = dequantize_native(
-                gate_proj.quantized_data, gate_proj.scale, gate_proj.nbits, torch.float16
-            )
-            saw_affine = True
-        else:
-            continue
-        ours = ours.squeeze(-1).squeeze(-1)
-        expected = hf_gate._dequantize_weights(torch.float16)
-        torch.testing.assert_close(ours, expected, atol=0, rtol=0)
+            if lut in compared:
+                continue
+            if lut:
+                dense = torch.ops.coreai.lut_to_dense(ours.indices, ours.lut, 0)
+                weight = dequantize_native_dense(dense, ours.scale, torch.float16)
+            else:
+                weight = dequantize_native(
+                    ours.quantized_data, ours.scale, ours.nbits, torch.float16
+                )
+            expected = hf_proj._dequantize_weights(torch.float16)
+            torch.testing.assert_close(weight.squeeze(-1).squeeze(-1), expected, atol=0, rtol=0)
+        compared.add(is_lut)
 
-    assert saw_lut, "expected at least one genuinely sub-4-bit MLP layer in this checkpoint"
-    assert saw_affine, "expected at least one 4-bit MLP layer in this checkpoint"
+    assert True in compared, (
+        "expected at least one genuinely sub-4-bit MLP layer in this checkpoint"
+    )
+    assert False in compared, "expected at least one 4-bit MLP layer in this checkpoint"
 
     del hf_model, model

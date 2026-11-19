@@ -72,6 +72,7 @@ from coreai_models.models.ios.gemma4_text import (
     EMBEDDING_SCALE_INPUT_NAME,
     EMBEDDING_SCALE_OUTPUT_NAME,
     Gemma4ForCausalLMForiOS,
+    is_native_quantized_config,
 )
 
 logger = logging.getLogger("gemma4.export")
@@ -213,11 +214,30 @@ def _text_config(hf_model_id: str) -> Any:
 
 def _native_quantized_checkpoint(hf_model_id: str) -> bool:
     """Whether the checkpoint ships Google's own quantization (the QAT ``-qat-mobile-transformers``
-    ones), which its Hugging Face config declares with ``quant_method: gemma``."""
-    quantization = getattr(AutoConfig.from_pretrained(hf_model_id), "quantization_config", None)
-    if isinstance(quantization, dict):
-        return quantization.get("quant_method") == "gemma"
-    return getattr(quantization, "quant_method", None) == "gemma"
+    ones)."""
+    return is_native_quantized_config(AutoConfig.from_pretrained(hf_model_id))
+
+
+def _resolve_compression(args: argparse.Namespace, native_quantized: bool) -> tuple[Any, str]:
+    """The palettization recipe (``None`` for none) and the compression name for the bundle.
+
+    A native-quantized (QAT) checkpoint is already quantized in the traced graph, and
+    re-clustering its weights would only add noise to the checkpoint's own QAT values, so it
+    is never palettized; an explicit ``--compression`` or ``--compression-config`` is refused
+    rather than ignored.
+    """
+    if native_quantized:
+        if getattr(args, "explicit_compression", False):
+            raise SystemExit(
+                f"{args.model} is a native-quantized checkpoint and is exported with its own "
+                "quantization; drop --compression / --compression-config."
+            )
+        return None, "native_quantized"
+    if args.compression_config is not None:
+        return _load_compression_config_object(args.compression_config, "iOS"), (
+            args.compression_config.stem
+        )
+    return None, "none"
 
 
 def _resolve_bundle_paths(output_dir: str, output_name: str, overwrite: bool) -> tuple[Path, Path]:
@@ -323,7 +343,7 @@ def _export_programs(
     the ladder rounds that up to a power of two, so the top bucket can exceed it.
 
     A native-quantized (QAT) model traces its gather once per query length in
-    ``gather_qlens`` instead of once, dynamically.
+    ``gather_qlens`` (by default every shipping one) instead of once, dynamically.
     """
     ladder_max = buckets[-1]
     decomp_table = _ios_decomp_table()
@@ -333,6 +353,8 @@ def _export_programs(
         return torch.export.export(module, args=(), kwargs=kwargs, dynamic_shapes=dynamic_shapes)
 
     native_quantized = getattr(config, "native_quantized", False)
+    if gather_qlens is None:
+        gather_qlens = set(SHIPPING_EXTEND_QLENS) | set(SHIPPING_PROMPT_QLENS)
     programs: list[tuple[str, str, int, torch.export.ExportedProgram]] = []
     with torch.no_grad():
         logger.info(f"Exporting {LOAD_EMBEDDINGS_FUNCTION_NAME}...")
@@ -549,23 +571,10 @@ async def _export_ios(args: argparse.Namespace) -> str:
 
     # Palettization comes from a coreai-opt YAML: DEFAULT_IOS_COMPRESSION_CONFIG
     # unless --compression-config overrides it. `--compression none` leaves it
-    # unset. Resolved before any weights are loaded so a bad recipe fails fast.
-    # A native-quantized (QAT) checkpoint is already quantized in the traced graph, so re-clustering
-    # its weights would only add noise to the checkpoint's own QAT values: palettization is skipped.
+    # unset, and a native-quantized checkpoint is never palettized. Resolved before
+    # any weights are loaded so a bad recipe fails fast.
     native_quantized = _native_quantized_checkpoint(hf_model_id)
-    palettization_config = None
-    if native_quantized:
-        compression = "native_quantized"
-        if args.compression_config is not None:
-            logger.info(
-                f"Skipping {args.compression_config.stem} palettization for a native-quantized "
-                "checkpoint."
-            )
-    elif args.compression_config is not None:
-        palettization_config = _load_compression_config_object(args.compression_config, "iOS")
-        compression = args.compression_config.stem
-    else:
-        compression = "none"
+    palettization_config, compression = _resolve_compression(args, native_quantized)
 
     output_name = args.output_name or _generate_output_name(
         ExportConfig(
@@ -708,7 +717,9 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="coreai-opt compression YAML: a 'kmeans_palettization_config' recipe "
-        f"(default: {DEFAULT_IOS_COMPRESSION_CONFIG.name}, alongside this script)",
+        f"(default: {DEFAULT_IOS_COMPRESSION_CONFIG.name}, alongside this script). "
+        "Not accepted for the native-quantized (QAT) checkpoints, which keep their own "
+        "quantization.",
     )
     compression_group.add_argument(
         "--compression",
@@ -717,7 +728,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Only 'none' is accepted, which exports at full precision. The named "
         "presets are not used for Gemma 4: the shipped YAML recipes are "
         "mixed-precision, which the presets cannot express. Pass "
-        "--compression-config <yaml> for a custom recipe.",
+        "--compression-config <yaml> for a custom recipe. Not accepted for the "
+        "native-quantized (QAT) checkpoints.",
     )
     parser.add_argument(
         "--max-context-length",
@@ -810,7 +822,10 @@ def _resolve_defaults(args: argparse.Namespace) -> None:
             f"(got {args.max_context_length})."
         )
 
-    if args.compression is None and args.compression_config is None:
+    # Recorded before the default fills in, so a native-quantized checkpoint can refuse an
+    # explicit compression flag (see `_resolve_compression`).
+    args.explicit_compression = args.compression is not None or args.compression_config is not None
+    if not args.explicit_compression:
         args.compression_config = DEFAULT_IOS_COMPRESSION_CONFIG
 
 

@@ -28,7 +28,7 @@ Key differences from other iOS models (Qwen3, Llama):
     attention enables large contexts)
 """
 
-from typing import Any
+from typing import Any, cast
 
 # Registers `torch.ops.coreai.lut_to_dense` and `torch.ops.coreai.constexpr_blockwise_shift_scale`,
 # used by the native quantized weight modules.
@@ -37,7 +37,8 @@ import torch
 import torch.nn as nn
 from coreai.authoring.types import AllocationType, HardwareConstraints
 from safetensors.torch import save_file
-from transformers import Gemma4ForConditionalGeneration
+from transformers import AutoConfig, Gemma4ForConditionalGeneration
+from transformers.modeling_utils import PreTrainedModel
 from typing_extensions import override
 
 from coreai_models._constants import (
@@ -54,7 +55,13 @@ from coreai_models._constants import (
     VALUE_CACHE_INPUT_NAME,
     VALUE_CACHE_OUTPUT_NAME,
 )
-from coreai_models.models.base import BaseForCausalLMForiOS, TraceSpec
+from coreai_models.hub import BackendName, resolve_local
+from coreai_models.models.base import (
+    BaseForCausalLMForiOS,
+    TraceSpec,
+    _is_layer_key_beyond,
+    move_model_to_disk,
+)
 from coreai_models.primitives.ios.cache import KVCacheHandler
 from coreai_models.primitives.ios.quantization import (
     dequantize_native,
@@ -723,25 +730,27 @@ class Gemma4Extend(nn.Module):
         self.emit_hidden_states = False
 
         # Tied embeddings reuse the embedding table for the projection, so there is no
-        # separate `lm_head` module to hold.
+        # separate `lm_head` module to hold. Only the native-quantized (QAT) checkpoints are
+        # untied; `from_hf` refuses a tied one.
         self.lm_head: nn.Module | None = None
         if not config.tie_word_embeddings:
-            if getattr(config, "native_quantized", False):
-                # Google's QAT recipe quantizes `lm_head` to 2 bits, but CoreAI's native
-                # affine blockwise_shift_scale has no static-shape-engine execution path
-                # below 4-bit (only LUT-based palettization goes narrower). The compiler
-                # silently promotes a declared INT2 affine tensor to INT4 regardless, so
-                # declaring INT4 here directly keeps the exported asset's size honest
-                # without losing any precision (the values only ever span 4 levels either
-                # way).
-                self.lm_head = NativeQuantLinear(
-                    config.hidden_size,
-                    config.vocab_size,
-                    nbits=4,
-                    block_size=DEFAULT_KV_BLOCK_SIZE,
+            if not getattr(config, "native_quantized", False):
+                raise NotImplementedError(
+                    "Gemma 4 iOS supports an untied lm_head for native-quantized checkpoints only"
                 )
-            else:
-                self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+            # Google's QAT recipe quantizes `lm_head` to 2 bits, but CoreAI's native
+            # affine blockwise_shift_scale has no static-shape-engine execution path
+            # below 4-bit (only LUT-based palettization goes narrower). The compiler
+            # silently promotes a declared INT2 affine tensor to INT4 regardless, so
+            # declaring INT4 here directly keeps the exported asset's size honest
+            # without losing any precision (the values only ever span 4 levels either
+            # way).
+            self.lm_head = NativeQuantLinear(
+                config.hidden_size,
+                config.vocab_size,
+                nbits=4,
+                block_size=DEFAULT_KV_BLOCK_SIZE,
+            )
 
         # Two compacted KV caches, both FLAT (single dynamic write offset, so each
         # attention region has ≤1 dynamic-offset slice):
@@ -835,45 +844,13 @@ class Gemma4Extend(nn.Module):
         return logits
 
 
-def _dequantized_hf_state_dict(
-    hf_model: nn.Module, target_dtype: torch.dtype
-) -> dict[str, torch.Tensor]:
-    """Plain-float state dict for a HF Gemma4 model, dequantizing it first if needed.
-
-    The "-qat-mobile-transformers" checkpoints load their `nn.Linear`/`nn.Embedding`
-    modules as `QuantizedLinear`/`QuantizedEmbedding` (packed INT2/4/8 weights + SRQ
-    activation scales -- see `transformers.integrations.gemma_quant`). Dequantizing them
-    back to plain `.weight` tensors here lets every Gemma4 checkpoint flow through the same
-    downstream code, including this pipeline's own iOS palettization on top -- exactly as
-    for an unquantized checkpoint. The SRQ activation scales are runtime-only and dropped.
-
-    Reaches into `QuantizedLinear._dequantize_weights` (private) because the wrapper has no
-    public dequant API for `nn.Linear`-shaped weights; `QuantizedEmbedding.weight` is public.
-    """
-    if QuantizedLinear is None:
-        return hf_model.state_dict()
-
-    quantized_modules = {
-        name: module
-        for name, module in hf_model.named_modules()
-        if isinstance(module, (QuantizedLinear, QuantizedEmbedding))
-    }
-    if not quantized_modules:
-        return hf_model.state_dict()
-
-    state_dict = {
-        k: v
-        for k, v in hf_model.state_dict().items()
-        if k.rsplit(".", 1)[0] not in quantized_modules
-    }
-    for name, module in quantized_modules.items():
-        if isinstance(module, QuantizedLinear):
-            state_dict[f"{name}.weight"] = module._dequantize_weights(target_dtype)
-            if module.bias is not None:
-                state_dict[f"{name}.bias"] = module.bias.to(target_dtype)
-        else:
-            state_dict[f"{name}.weight"] = module.weight.to(target_dtype)
-    return state_dict
+def is_native_quantized_config(hf_config) -> bool:
+    """Whether a Hugging Face config declares Google's own quantization (the QAT
+    ``-qat-mobile-transformers`` checkpoints declare ``quant_method: gemma``)."""
+    quantization = getattr(hf_config, "quantization_config", None)
+    if isinstance(quantization, dict):
+        return quantization.get("quant_method") == "gemma"
+    return getattr(quantization, "quant_method", None) == "gemma"
 
 
 def _is_quantized_hf_model(hf_model: nn.Module) -> bool:
@@ -886,10 +863,62 @@ def _is_quantized_hf_model(hf_model: nn.Module) -> bool:
     )
 
 
+def _native_module_name(hf_name: str, hf_prefix: str) -> str:
+    """This model's name for the HF text-decoder module ``hf_name``."""
+    if hf_name.startswith(hf_prefix):
+        return "extend.model." + hf_name[len(hf_prefix) :]
+    return f"extend.{hf_name}"
+
+
+def _check_native_widths(model: nn.Module, checkpoint_nbits: dict[str, int]) -> None:
+    """Fail if a native-quantized module declares fewer bits than its checkpoint module.
+
+    The projection widths are fixed by the module tree (4 bits for attention, 8 for the PLE
+    projections, the per-layer plan for the MLP), so a checkpoint quantized differently would
+    otherwise load values that do not fit the declared width. A wider declaration is fine: the
+    ``lm_head`` is declared 4 bits for a 2-bit checkpoint (see ``Gemma4Extend``).
+    """
+    modules = dict(model.named_modules())
+    for name, nbits in checkpoint_nbits.items():
+        declared = getattr(modules.get(name), "nbits", None)
+        if declared is not None and nbits > declared:
+            raise NotImplementedError(
+                f"{name} is quantized to {nbits} bits in the checkpoint, but the export "
+                f"declares it as {declared} bits."
+            )
+
+
+def _native_ple_table(
+    ple_module: nn.Module, config, truncate: bool
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """The PLE table's packed rows, per-block scales and bit width, as the sidecar stores them.
+
+    2- and 4-bit rows are packed as unsigned fields holding the value plus ``2^(nbits - 1)``,
+    which is what the runner unpacks. The checkpoint stores 8-bit rows as plain signed bytes,
+    so those are moved to the same offset form. ``truncate`` (``--num-layers``) cuts each row
+    to the remaining layers.
+    """
+    packed = ple_module.embedding_quantized.clone()
+    scale = ple_module.embedding_scale.to(torch.float16).clone()
+    nbits = ple_module.num_bits
+    if nbits == 8 and packed.dtype == torch.int8:
+        packed = (packed.to(torch.int16) + 128).to(torch.uint8)
+    if truncate:
+        expected_dim = config.num_hidden_layers * config.hidden_size_per_layer_input
+        values_per_byte = 8 // nbits
+        expected_blocks = expected_dim // (ple_module.embedding_dim // scale.shape[1])
+        if scale.shape[1] > expected_blocks:
+            scale = scale[:, :expected_blocks].contiguous()
+        expected_packed = -(-expected_dim // values_per_byte)  # ceil div
+        if packed.shape[1] > expected_packed:
+            packed = packed[:, :expected_packed].contiguous()
+    return packed, scale, nbits
+
+
 def _native_quantized_hf_state_dict(hf_model: nn.Module) -> dict[str, torch.Tensor]:
     """State dict for a QAT-quantized HF Gemma4 model, preserving its native quantization.
 
-    Unlike ``_dequantized_hf_state_dict``, this never reconstructs float weights: every
+    This never reconstructs float weights: every
     quantized Linear/Embedding module's packed data is unpacked to one value per element
     and kept alongside its literal scale. Most are keyed as ``<name>.quantized_data`` /
     ``<name>.scale`` (signed, one value per int8 -- see ``unpack_signed_subbyte``) for the
@@ -1312,97 +1341,109 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
         return text_config
 
     @classmethod
+    @override
     def from_hf(
         cls,
-        huggingface_model_id: str,
+        huggingface_model_id_or_path: str,
         max_context_length: int | None = None,
         target_dtype: torch.dtype = torch.float16,
         mmap_path: str | None = None,
         num_layers: int | None = None,
         disable_embedding_quantization: bool = False,
         use_attention_mask: bool = False,
+        backend: BackendName = "huggingface",
     ) -> "Gemma4ForCausalLMForiOS":
         """Load from HF multimodal model, extracting the text decoder only.
 
-        Unlike the base loader, this one also takes the QAT checkpoints, which load with
-        quantized modules and need their packed weights, per-layer bit widths and PLE table
-        read off those modules before the HF model is discarded.
+        A standard checkpoint loads through the base loader. A QAT checkpoint loads with
+        quantized modules, whose packed weights, per-layer bit widths and PLE table are read
+        off those modules before the HF model is discarded.
         """
-        hf_model = cls._HF_MODEL_CLASS.from_pretrained(huggingface_model_id, dtype=target_dtype)
-        is_native_quantized = _is_quantized_hf_model(hf_model)
+        load_id = resolve_local(
+            huggingface_model_id_or_path,
+            backend,
+            allow_patterns=[
+                "*.safetensors",
+                "*.safetensors.index.json",
+                "config.json",
+                "generation_config.json",
+            ],
+        )
+        if not is_native_quantized_config(AutoConfig.from_pretrained(load_id)):
+            return super().from_hf(
+                load_id,
+                max_context_length=max_context_length,
+                target_dtype=target_dtype,
+                mmap_path=mmap_path,
+                num_layers=num_layers,
+                disable_embedding_quantization=disable_embedding_quantization,
+                use_attention_mask=use_attention_mask,
+                backend=backend,
+            )
+
+        hf_model = cast(PreTrainedModel, cls._HF_MODEL_CLASS).from_pretrained(
+            load_id, dtype=target_dtype
+        )
+        if not _is_quantized_hf_model(hf_model):
+            raise ValueError(
+                f"{huggingface_model_id_or_path} declares Gemma quantization but loaded without "
+                "quantized modules; the installed transformers may predate it."
+            )
 
         config = cls._get_reauthored_config(
             hf_model.config, max_context_length, num_layers=num_layers
         )
-        config.native_quantized = is_native_quantized
-
-        # Per-layer MLP bit-width, read off the checkpoint's actual quantized modules --
-        # see `_native_mlp_nbits`. Must be set before `cls(config, ...)` constructs the
-        # (quantization-aware) module tree below.
-        if is_native_quantized:
-            modules_by_name = dict(hf_model.named_modules())
-            config.native_mlp_nbits = [
-                getattr(
-                    modules_by_name.get(f"model.language_model.layers.{i}.mlp.gate_proj"),
-                    "num_bits",
-                    4,
-                )
-                for i in range(config.num_hidden_layers)
-            ]
-
-        # The PLE table is never loaded into the model (it's externalized by
-        # `dump_ple_embedding`), so grab its raw quantized data before `hf_model` is
-        # discarded. Native mode keeps it packed as HF shipped it; float mode keeps the
-        # existing float extraction inside `_mutate_state_dict`.
-        ple_native = None
-        if is_native_quantized:
-            ple_module = dict(hf_model.named_modules()).get(
-                "model.language_model.embed_tokens_per_layer"
+        config.native_quantized = True
+        if config.tie_word_embeddings:
+            raise NotImplementedError(
+                "A native-quantized Gemma 4 export needs an untied lm_head: a tied projection "
+                "would reuse the low-bit embedding table without its per-row scale."
             )
-            if ple_module is not None:
-                packed = ple_module.embedding_quantized.clone()
-                scale = ple_module.embedding_scale.to(torch.float16).clone()
-                nbits = ple_module.num_bits
-                # `--num-layers` (dev/test only) truncates the layer count, so the PLE
-                # row needs the same truncation the checkpoint's full width would
-                # otherwise carry -- mirrors `_mutate_state_dict`'s float-path truncation.
-                if num_layers is not None:
-                    expected_dim = config.num_hidden_layers * config.hidden_size_per_layer_input
-                    values_per_byte = 8 // nbits
-                    expected_blocks = expected_dim // (ple_module.embedding_dim // scale.shape[1])
-                    if scale.shape[1] > expected_blocks:
-                        scale = scale[:, :expected_blocks].contiguous()
-                    expected_packed = -(-expected_dim // values_per_byte)  # ceil div
-                    if packed.shape[1] > expected_packed:
-                        packed = packed[:, :expected_packed].contiguous()
-                ple_native = (packed, scale, nbits)
 
-        if is_native_quantized:
-            full_sd = _native_quantized_hf_state_dict(hf_model)
-        else:
-            full_sd = _dequantized_hf_state_dict(hf_model, target_dtype)
-        prefix = "model.language_model."
+        modules_by_name = dict(hf_model.named_modules())
+        hf_prefix = "model.language_model."
+        # The checkpoint's bit width of each quantized module, by its name in this model, so the
+        # widths the modules below declare can be checked against it once they exist.
+        checkpoint_nbits = {
+            _native_module_name(name, hf_prefix): module.num_bits
+            for name, module in modules_by_name.items()
+            if isinstance(module, (QuantizedLinear, QuantizedEmbedding))
+        }
+
+        # Per-layer MLP bit width, read off the checkpoint's quantized modules (see
+        # `_native_mlp_nbits`). Set before `cls(config, ...)` builds the module tree.
+        config.native_mlp_nbits = []
+        for i in range(config.num_hidden_layers):
+            widths = {
+                getattr(modules_by_name.get(f"{hf_prefix}layers.{i}.mlp.{proj}"), "num_bits", 4)
+                for proj in ("gate_proj", "up_proj", "down_proj")
+            }
+            if len(widths) > 1:
+                raise NotImplementedError(
+                    f"layer {i} quantizes its MLP projections to mixed widths {sorted(widths)}; "
+                    "one width per layer is supported."
+                )
+            config.native_mlp_nbits.append(widths.pop())
+
+        # The PLE table is never loaded into the model (it is externalized by
+        # `dump_ple_embedding`), so its packed data is kept as the checkpoint ships it.
+        ple_native = None
+        ple_module = modules_by_name.get(f"{hf_prefix}embed_tokens_per_layer")
+        if ple_module is not None:
+            ple_native = _native_ple_table(ple_module, config, truncate=num_layers is not None)
+
+        full_sd = _native_quantized_hf_state_dict(hf_model)
         text_sd: dict[str, torch.Tensor] = {}
         for k, v in full_sd.items():
-            if k.startswith(prefix):
-                text_sd["model." + k[len(prefix) :]] = v
-            elif k in ("lm_head.weight", "lm_head.quantized_data", "lm_head.scale"):
-                # Untied checkpoints (e.g. the QAT mobile-transformers variants) ship a
-                # real top-level `lm_head`, outside the `model.language_model.` prefix.
+            if k.startswith(hf_prefix):
+                text_sd["model." + k[len(hf_prefix) :]] = v
+            elif k in ("lm_head.quantized_data", "lm_head.scale"):
+                # The untied `lm_head` sits outside the `model.language_model.` prefix.
                 text_sd[k] = v
 
-        if (
-            "lm_head.weight" not in text_sd
-            and "lm_head.quantized_data" not in text_sd
-            and "model.embed_tokens.weight" in text_sd
-        ):
-            text_sd["lm_head.weight"] = text_sd["model.embed_tokens.weight"]
-
-        del hf_model, full_sd
+        del hf_model, full_sd, modules_by_name, ple_module
 
         if num_layers is not None:
-            from coreai_models.models.base import _is_layer_key_beyond
-
             text_sd = {k: v for k, v in text_sd.items() if not _is_layer_key_beyond(k, num_layers)}
 
         model = cls(
@@ -1411,13 +1452,11 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
             disable_embedding_quantization=disable_embedding_quantization,
         )
         model.to(dtype=target_dtype)
+        _check_native_widths(model, checkpoint_nbits)
 
-        if is_native_quantized:
-            model._mutate_native_quantized_state_dict(text_sd)
-            if ple_native is not None:
-                model._ple_native = ple_native
-        else:
-            model._mutate_state_dict(text_sd)
+        model._mutate_native_quantized_state_dict(text_sd)
+        if ple_native is not None:
+            model._ple_native = ple_native
 
         for k, v in text_sd.items():
             if (
@@ -1434,8 +1473,6 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
         model.load_state_dict(text_sd, assign=True, strict=strict)
 
         if mmap_path is not None:
-            from coreai_models.models.base import move_model_to_disk
-
             move_model_to_disk(model, path=mmap_path)
 
         return model
@@ -1646,9 +1683,9 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
             "model.embed_tokens.scale"
         ).unsqueeze(1)
 
-        # Untied (always true for the QAT checkpoints -- `tie_word_embeddings` is never
-        # set for them), so `emb_scale`/`emb_zero_point` are never read at runtime; keep
-        # them as identity values since `Gemma4Extend` still declares the parameters.
+        # The projection is untied (`from_hf` refuses a tied QAT checkpoint), so
+        # `emb_scale`/`emb_zero_point` are never read at runtime; keep them as identity values
+        # since `Gemma4Extend` still declares the parameters.
         state_dict["extend.emb_scale"] = torch.tensor(1.0, dtype=torch.float16)
         state_dict["extend.emb_zero_point"] = torch.tensor(0, dtype=torch.int8)
 
