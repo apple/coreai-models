@@ -343,3 +343,131 @@ struct DeltaNetLoadValidationTests {
         }
     }
 }
+
+// MARK: - Step write (what `fill` runs once the buffers are sized)
+
+@Suite("DeltaNetInputHandler step write")
+struct DeltaNetStepWriteTests {
+    static let ringWidth = 8
+    static let kernelWindow = 3
+    static let batchSize = 4
+    static let columns = kernelWindow + batchSize
+
+    /// The buffers as `fill` leaves them after sizing. With `padded`, each selector row is 16
+    /// elements wide in memory, so a write that ignores the strides lands in the wrong place.
+    static func buffers(padded: Bool) -> InputBuffers {
+        var buffers = InputBuffers()
+        buffers[DeltaNetInputHandler.updateFlagInputName] = NDArray(
+            shape: [1, batchSize], scalarType: .float16)
+        buffers[DeltaNetInputHandler.convStepInputName] = NDArray(shape: [1], scalarType: .int32)
+        let shape = [1, ringWidth, columns]
+        buffers[DeltaNetInputHandler.seedSelectorInputName] =
+            padded
+            ? NDArray(shape: shape, scalarType: .float16, strides: [ringWidth * 16, 16, 1])
+            : NDArray(shape: shape, scalarType: .float16)
+        return buffers
+    }
+
+    static func context(tokens: Int, alignedStep: Int, processedTokenCount: Int) -> InputContext {
+        InputContext.static(
+            tokens: ArraySlice((0..<tokens).map { Int32($0) }), alignedStep: alignedStep,
+            batchSize: batchSize, slidingWindow: nil, contextBucket: 256,
+            processedTokenCount: processedTokenCount)
+    }
+
+    static func write(_ context: InputContext, into buffers: inout InputBuffers) throws {
+        try DeltaNetInputHandler.write(
+            context, into: &buffers, updateFlag: true, convStep: true, seedSelector: true)
+    }
+
+    static func flag(_ buffers: InputBuffers) -> [Float] {
+        readNDArray(
+            buffers[DeltaNetInputHandler.updateFlagInputName]!, as: Float16.self, count: batchSize
+        ).map { Float($0) }
+    }
+
+    static func convStep(_ buffers: InputBuffers) -> Int32 {
+        readNDArray(buffers[DeltaNetInputHandler.convStepInputName]!, as: Int32.self, count: 1)[0]
+    }
+
+    /// The selector as a `ringWidth x columns` matrix, read element by element through its strides.
+    static func selector(_ buffers: InputBuffers) -> [[Float]] {
+        let flat = readNDArray(
+            buffers[DeltaNetInputHandler.seedSelectorInputName]!, as: Float16.self,
+            count: ringWidth * columns
+        ).map { Float($0) }
+        return (0..<ringWidth).map { Array(flat[($0 * columns)..<(($0 + 1) * columns)]) }
+    }
+
+    /// The one-hot matrix with a 1 at `(rows[column], column)` and 0 everywhere else.
+    static func oneHot(rows: [Int]) -> [[Float]] {
+        (0..<ringWidth).map { row in (0..<columns).map { rows[$0] == row ? 1 : 0 } }
+    }
+
+    @Test("Two steps write the flag, conv step and selector, leaving nothing of the first", arguments: [false, true])
+    func twoSteps(padded: Bool) throws {
+        var buffers = Self.buffers(padded: padded)
+
+        // A full prefill block at 4: every slot new; the window covers positions 1...7.
+        try Self.write(
+            Self.context(tokens: 4, alignedStep: 4, processedTokenCount: 4), into: &buffers)
+        #expect(Self.flag(buffers) == [1, 1, 1, 1])
+        #expect(Self.convStep(buffers) == 4)
+        #expect(Self.selector(buffers) == Self.oneHot(rows: [1, 2, 3, 4, 5, 6, 7]))
+
+        // A decode block at 8 with 10 processed: slots 0 and 1 re-send positions 8 and 9, slot 2
+        // carries the new position 10, slot 3 is padding. The window covers positions 5...11 and
+        // wraps the ring.
+        try Self.write(
+            Self.context(tokens: 3, alignedStep: 8, processedTokenCount: 10), into: &buffers)
+        #expect(Self.flag(buffers) == [0, 0, 1, 0])
+        #expect(Self.convStep(buffers) == 0)
+        let selector = Self.selector(buffers)
+        #expect(selector == Self.oneHot(rows: [5, 6, 7, 0, 1, 2, 3]))
+        for column in 0..<Self.columns {
+            #expect(selector.map { $0[column] }.reduce(0, +) == 1, "column \(column)")
+        }
+    }
+
+    @Test("Only the declared inputs are written")
+    func onlyDeclaredInputs() throws {
+        var buffers = InputBuffers()
+        buffers[DeltaNetInputHandler.updateFlagInputName] = NDArray(
+            shape: [1, Self.batchSize], scalarType: .float16)
+        try DeltaNetInputHandler.write(
+            Self.context(tokens: 2, alignedStep: 0, processedTokenCount: 0), into: &buffers,
+            updateFlag: true, convStep: false, seedSelector: false)
+        #expect(Self.flag(buffers) == [1, 1, 0, 0])
+    }
+
+    @Test("conv_step without a seed selector throws")
+    func convStepNeedsSelector() {
+        var buffers = Self.buffers(padded: false)
+        #expect(throws: InferenceRuntimeError.self) {
+            try DeltaNetInputHandler.write(
+                Self.context(tokens: 1, alignedStep: 0, processedTokenCount: 0), into: &buffers,
+                updateFlag: true, convStep: true, seedSelector: false)
+        }
+    }
+
+    @Test("A declared input with no buffer throws")
+    func missingBufferThrows() {
+        var buffers = InputBuffers()
+        #expect(throws: InferenceRuntimeError.self) {
+            try Self.write(
+                Self.context(tokens: 1, alignedStep: 0, processedTokenCount: 0), into: &buffers)
+        }
+    }
+
+    @Test("A selector buffer that cannot address the block throws")
+    func badSelectorThrows() {
+        var buffers = Self.buffers(padded: false)
+        // Ring narrower than the window: (1, batchSize, kernelWindow + batchSize).
+        buffers[DeltaNetInputHandler.seedSelectorInputName] = NDArray(
+            shape: [1, Self.batchSize, Self.columns], scalarType: .float16)
+        #expect(throws: InferenceRuntimeError.self) {
+            try Self.write(
+                Self.context(tokens: 1, alignedStep: 0, processedTokenCount: 0), into: &buffers)
+        }
+    }
+}
