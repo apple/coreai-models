@@ -16,7 +16,7 @@ Exact rewrites, all checked against diffusers in float32:
 - The multiscale branch's grouped 1x1 conv is a dense block-diagonal one; the Neural Engine
   compiler rejects the grouped form.
 - Channel RMSNorms normalize over dim 1 in place of diffusers' ``movedim`` round trips, max-abs
-  because ``Σx²`` overflows float16 in every norm.
+  because ``Σx²`` overflows float16.
 - Linear attention uses the transformer's rewrite: per-token ``q`` max normalization and a ``K``
   scale folded into the fused qkv weights.
 - SiLU is :class:`~coreai_models.primitives.ios.silu.TanhSiLU`.
@@ -36,8 +36,7 @@ from coreai_models.primitives.ios.rms_norm import MaxAbsRMSNorm
 from coreai_models.primitives.ios.silu import TanhSiLU
 
 _FP16_TINY = torch.finfo(torch.float16).tiny
-# Linear attention K multiplier over N tokens, as in ``sana_transformer``. With it the decoder has
-# no float16 overflow on the Neural Engine over the reference prompts (63.9 dB vs float32).
+# Linear attention K multiplier over N tokens, as in ``sana_transformer``.
 _K_SCALE = 32.0
 
 
@@ -93,7 +92,7 @@ def _dense_block_diagonal(conv: nn.Conv2d) -> nn.Conv2d:
     """A grouped 1x1 conv as a dense one with block-diagonal weights.
 
     The Neural Engine compiler rejects the grouped conv, and its batched-matmul form after the
-    depthwise 5x5; the dense form costs ~7% of the decoder's FLOPs.
+    depthwise 5x5.
     """
     c, g = conv.out_channels, conv.groups
     dense = nn.Conv2d(conv.in_channels, c, 1, bias=False)

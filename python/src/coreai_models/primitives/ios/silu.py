@@ -7,8 +7,7 @@
 
 Uses the identity: x * sigmoid(x) = x * (0.5 * tanh(0.5 * x) + 0.5).
 
-The Neural Engine's fused SiLU is less precise than this form: in Sana Sprint's feed-forward it
-costs ~25 dB per block against float32, ~9 dB end to end. The tanh form is slower per element.
+The Neural Engine's fused SiLU is less precise than this form, which is slower per element.
 """
 
 import torch

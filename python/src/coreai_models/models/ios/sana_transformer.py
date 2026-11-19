@@ -6,18 +6,16 @@
 """Neural Engine float16 Sana Sprint transformer, channels-first (BC1S) conv layout.
 
 Same inputs and outputs as diffusers' ``SanaTransformer2DModel`` behind ``SanaTransformerWrapper``.
-Tokens live in ``(1, C, 1, N)``; linears are 1x1 ``Conv2d``. Every float16 overflow found by the
-range sweep over real prompts is removed with an exact rewrite:
+Tokens live in ``(1, C, 1, N)``; linears are 1x1 ``Conv2d``. Exact rewrites keep float16
+activations in range:
 
-- All norms are max-abs (``Σx²`` overflows float16 in every norm, by up to 1e5x).
+- All norms are max-abs (``Σx²`` overflows float16).
 - Linear attention scales ``K`` by ``_K_SCALE / N`` (folded into ``norm_k``) and divides each
   token's per-head ``q`` by its max. The output is a ratio in both, so both cancel; they keep
-  ``Σ v kᵀ`` and ``(Σ v kᵀ) q`` in range (3.5e5 unscaled) and the denominator well above the
-  float16-tiny floor.
+  ``Σ v kᵀ`` and ``(Σ v kᵀ) q`` in range and the denominator well above the float16-tiny floor.
 - Cross-attention scales ``to_q`` by ``_Q_SCALE`` and ``norm_q``'s eps by its square, which leaves
-  the RMSNorm unchanged; 1.6B's ``to_q`` peaks at 1.3e5.
-- SiLU is :class:`TanhSiLU`: the Neural Engine's fused SiLU costs the feed-forward ~25 dB, ~9 dB
-  end to end.
+  the RMSNorm unchanged and keeps ``to_q``'s output in range.
+- SiLU is :class:`TanhSiLU`, more precise than the Neural Engine's fused SiLU.
 - ``x * (1 + scale)`` folds the ``1`` into ``scale_shift_table``, and the cross-attention
   ``1/sqrt(d)`` folds into ``norm_q``, so the graph has no float32 literals.
 """
@@ -36,10 +34,9 @@ from coreai_models.primitives.ios.rms_norm import MaxAbsRMSNorm, MaxAbsRMSNormNo
 from coreai_models.primitives.ios.silu import TanhSiLU
 
 _FP16_TINY = torch.finfo(torch.float16).tiny
-# With normalized q and K / N the sweep's numerator peaks at 139 and the denominator's 0.1th
-# percentile is 4e-3; x32 keeps the numerator 14x below 65504 and the floor negligible.
+# Keeps the linear-attention numerator in float16 range and the denominator above the floor.
 _K_SCALE = 32.0
-# A power of two, so the fold is exact: 1.6B's peak 1.3e5 -> 8e3.
+# A power of two, so the fold is exact.
 _Q_SCALE = 1 / 16
 _MASK_BIAS = -10000.0  # diffusers' cross-attention mask bias
 
@@ -238,9 +235,8 @@ class SanaTransformer(nn.Module):
         n = height * width
         x = self.patch_embed(hidden_states.reshape(b, cin, 1, n))
 
-        # Float32 after `to_neural_engine_dtypes`: the conditioning modulates every block, and in
-        # float16 on the Neural Engine its error costs ~17 dB end to end. It runs off the Neural
-        # Engine.
+        # Float32 after `to_neural_engine_dtypes`: the conditioning modulates every block, so it
+        # runs in float32, off the Neural Engine.
         cond = self.time_embedder(timestep) + self.guidance_embedder(guidance)  # (1, C, 1, 1)
         t = self.time_linear(self.silu(cond)).reshape(6, self.dim, 1, 1).to(x.dtype)
         cond = cond.to(x.dtype)

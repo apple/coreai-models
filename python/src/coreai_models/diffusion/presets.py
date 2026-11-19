@@ -191,13 +191,13 @@ PRESETS: dict[str, dict[str, Any]] = {
         # bf16 ones. Sana's Gemma2 peaks at ~6% of the fp16 range, so fp16 is safe there.
         "component_precision": {"text_encoder": "float16"},
     },
-    # Sana Sprint's dense float16 Gemma-2 loads onto the Neural Engine at ~0.5 GB/s; 6-bit halves
-    # the asset (4.9 -> 2.5 GiB, the token table stays float16) for 58 -> 54 dB PSNR vs float32.
+    # Sana Sprint's text encoder for the Neural Engine; k-means skips the token table, which stays
+    # float16.
     "te6bit-pal": {
         "description": "Neural Engine: 6-bit palettized text encoder (k-means, group size 16)",
         "component_palettization": {"text_encoder": _PALETTE_6BIT_GS16},
     },
-    # The int8 token table saves 0.6 GB for 0.2 dB on the text encoder, none on the image.
+    # The Sana Sprint --platform iOS default.
     "te6bit-tok8-tx8bit-pal": {
         "description": "Neural Engine: 6-bit text encoder (k-means, group size 16) with an int8 "
         "token table, 8-bit transformer (k-means, per tensor)",
@@ -207,8 +207,8 @@ PRESETS: dict[str, dict[str, Any]] = {
             "transformer": _TRANSFORMER_PALETTE_8BIT,
         },
     },
-    # The text encoder at the GPU bundle's bit width: 0.7 GiB smaller and faster than te6bit-tok8,
-    # but the image PSNR vs float32 drops 26 -> 18.5 dB (compositions shift), so it is opt-in.
+    # The text encoder at the GPU bundle's bit width: smaller and faster than te6bit-tok8, but it
+    # shifts compositions, so it is opt-in.
     "te4bit-tok4-tx8bit-pal": {
         "description": "Neural Engine: 4-bit text encoder (k-means, group size 16) with an int4 "
         "token table (per block of 32), 8-bit transformer (k-means, per tensor)",

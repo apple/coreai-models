@@ -51,8 +51,8 @@ uv run coreai.diffusion.export sana-sprint-1.6b --compression none
   token table.
 - **VAE decoder:** not compressed.
 
-`--compression te4bit-tok4-tx8bit-pal` makes the text encoder 4-bit (0.7 GB smaller and faster)
-at the cost of shifted compositions; `--compression none` exports the whole build dense. The GPU
+`--compression te4bit-tok4-tx8bit-pal` makes the text encoder 4-bit, smaller and faster at the
+cost of shifted compositions; `--compression none` exports the whole build dense. The GPU
 presets do not apply to this build.
 
 ## Components

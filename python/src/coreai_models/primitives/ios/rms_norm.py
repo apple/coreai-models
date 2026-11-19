@@ -73,7 +73,7 @@ class MaxAbsRMSNormNoScale(nn.Module):
 
     ``floor="add"`` divides by ``max|x| + 1e-4`` instead of ``max(max|x|, 1e-4)``; the identity
     holds for any positive divisor. The Neural Engine compiler rejects a clamp or reciprocal of an
-    ``amax`` on some graphs (e.g. Sana Sprint's 1152-channel norms), but not this form.
+    ``amax`` on some graphs, but not this form.
     """
 
     _eps_sqrt: torch.Tensor
