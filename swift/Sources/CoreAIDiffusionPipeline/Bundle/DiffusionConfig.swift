@@ -61,8 +61,8 @@ public struct DiffusionConfig: Codable, Sendable, Equatable {
     // MARK: Compute units
 
     /// Component name (`transformer`, `text_encoder`, ...) to the compute units its asset was
-    /// built for, preferred first, e.g. `["neural_engine"]`. Unlisted components run on the GPU; an
-    /// unknown unit fails the load.
+    /// built for, preferred first, e.g. `["neural_engine"]`. Sana Sprint loads each asset on its
+    /// first unit (the GPU if unlisted) and refuses a unit it does not support.
     public let computeUnits: [String: [String]]?
 
     // MARK: Video (Wan)

@@ -270,7 +270,7 @@ extension FlowTransformerPipeline {
 
 extension DiffusionConfig {
     /// The compute unit `component`'s asset was exported for: its first `compute_units` entry, or
-    /// the GPU if it has none. Throws on a unit this runtime does not know.
+    /// the GPU if it has none. Throws on a unit the diffusion runtime does not load.
     func computeUnit(for component: String) throws -> ComputeUnitKind {
         switch computeUnits?[component]?.first {
         case nil, "gpu":
@@ -279,7 +279,7 @@ extension DiffusionConfig {
             return .neuralEngine
         case let unit?:
             throw PipelineLoadError.unsupportedConfiguration(
-                "Unknown compute unit '\(unit)' for component '\(component)'.")
+                "Unsupported compute unit '\(unit)' for component '\(component)'.")
         }
     }
 }

@@ -126,6 +126,7 @@ class SanaGemma2Encoder(nn.Module):
         self.output_length = output_length
         assert cfg.hidden_activation == "gelu_pytorch_tanh"
         assert cfg.sliding_window >= length, "the sliding-window mask would differ from causal"
+        assert 1 < output_length <= length
         d = cfg.hidden_size
         embed = src.embed_tokens
         table = embed.weight.detach().float() * float(embed.scalar_embed_scale)

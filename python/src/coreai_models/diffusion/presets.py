@@ -192,7 +192,7 @@ PRESETS: dict[str, dict[str, Any]] = {
         "component_precision": {"text_encoder": "float16"},
     },
     # Sana Sprint's dense float16 Gemma-2 loads onto the Neural Engine at ~0.5 GB/s; 6-bit halves
-    # the asset (4.9 -> 2.7 GB, the token table stays float16) for 58 -> 54 dB PSNR vs float32.
+    # the asset (4.9 -> 2.5 GiB, the token table stays float16) for 58 -> 54 dB PSNR vs float32.
     "te6bit-pal": {
         "description": "Neural Engine: 6-bit palettized text encoder (k-means, group size 16)",
         "component_palettization": {"text_encoder": _PALETTE_6BIT_GS16},
@@ -207,7 +207,7 @@ PRESETS: dict[str, dict[str, Any]] = {
             "transformer": _TRANSFORMER_PALETTE_8BIT,
         },
     },
-    # The text encoder at the GPU bundle's bit width: 0.7 GB smaller and faster than te6bit-tok8,
+    # The text encoder at the GPU bundle's bit width: 0.7 GiB smaller and faster than te6bit-tok8,
     # but the image PSNR vs float32 drops 26 -> 18.5 dB (compositions shift), so it is opt-in.
     "te4bit-tok4-tx8bit-pal": {
         "description": "Neural Engine: 4-bit text encoder (k-means, group size 16) with an int4 "
