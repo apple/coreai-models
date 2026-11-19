@@ -41,9 +41,9 @@ struct PrefixCacheStoreTests {
         return keys
     }
 
-    static func files(in directory: URL, withExtension pathExtension: String) -> [URL] {
+    static func files(in directory: URL, endingIn suffix: String) -> [URL] {
         let all = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
-        return all.filter { $0.pathExtension == pathExtension }
+        return all.filter { $0.lastPathComponent.hasSuffix(suffix) }
     }
 
     @Test("A chunk and its snapshot read back as written")
@@ -96,7 +96,7 @@ struct PrefixCacheStoreTests {
             }
             let other = try #require(PrefixCacheStore(directory: directory, byteBudget: 1 << 20, geometry: "another"))
             #expect(other.nodeCount == 0)
-            #expect(Self.files(in: directory, withExtension: "kv").isEmpty)
+            #expect(Self.files(in: directory, endingIn: ".kv.safetensors").isEmpty)
         }
     }
 
@@ -142,7 +142,7 @@ struct PrefixCacheStoreTests {
             #expect(store.nodeCount == 3)
             #expect(store.record(of: a[0]) != nil)
             #expect(store.record(of: b[0]) == nil)
-            #expect(Self.files(in: directory, withExtension: "kv").count == 3)
+            #expect(Self.files(in: directory, endingIn: ".kv.safetensors").count == 3)
         }
     }
 
@@ -166,7 +166,7 @@ struct PrefixCacheStoreTests {
                 let store = try #require(
                     PrefixCacheStore(directory: directory, byteBudget: 1 << 20, geometry: Self.geometry))
                 let chain = Self.writeChain(3, into: store)
-                let file = directory.appendingPathComponent("\(chain[1]).kv")
+                let file = directory.appendingPathComponent("\(chain[1]).kv.safetensors")
                 try Data([1, 2, 3]).write(to: file)
                 #expect(store.read(chain[1], withSnapshot: false) == nil)
                 store.flush()
@@ -194,8 +194,8 @@ struct PrefixCacheStoreTests {
             try handle.seekToEnd()
             try handle.write(contentsOf: Data("{\"key\":\"cut".utf8))
             try handle.close()
-            try FileManager.default.removeItem(at: directory.appendingPathComponent("\(chain[2]).kv"))
-            let stray = directory.appendingPathComponent("stray.kv")
+            try FileManager.default.removeItem(at: directory.appendingPathComponent("\(chain[2]).kv.safetensors"))
+            let stray = directory.appendingPathComponent("stray.kv.safetensors")
             try Data([0]).write(to: stray)
             let reopened = try #require(
                 PrefixCacheStore(directory: directory, byteBudget: 1 << 20, geometry: Self.geometry))
@@ -215,9 +215,9 @@ struct PrefixCacheStoreTests {
                 store.write(snapshot: [Data(count: 16)], for: chain[1])
                 store.flush()
             }
-            try Data([1, 2, 3]).write(to: directory.appendingPathComponent("\(chain[1]).state"))
-            let strayState = directory.appendingPathComponent("\(chain[0]).state")
-            try Data([0]).write(to: strayState)
+            try Data([1, 2, 3]).write(to: directory.appendingPathComponent("\(chain[1]).recurrent.safetensors"))
+            let strayRecurrent = directory.appendingPathComponent("\(chain[0]).recurrent.safetensors")
+            try Data([0]).write(to: strayRecurrent)
             let leftover = directory.appendingPathComponent("leftover.tmp")
             try Data([0]).write(to: leftover)
             let reopened = try #require(
@@ -225,7 +225,7 @@ struct PrefixCacheStoreTests {
             // The node with the short snapshot goes, and the one below it.
             #expect(reopened.nodeCount == 1)
             #expect(reopened.record(of: chain[1]) == nil && reopened.record(of: chain[2]) == nil)
-            #expect(!FileManager.default.fileExists(atPath: strayState.path))
+            #expect(!FileManager.default.fileExists(atPath: strayRecurrent.path))
             #expect(!FileManager.default.fileExists(atPath: leftover.path))
         }
     }
@@ -238,7 +238,7 @@ struct PrefixCacheStoreTests {
             let chain = Self.writeChain(2, into: store)
             store.write(snapshot: [Data(count: 16)], for: chain[0])
             store.flush()
-            try Data([1, 2, 3]).write(to: directory.appendingPathComponent("\(chain[0]).state"))
+            try Data([1, 2, 3]).write(to: directory.appendingPathComponent("\(chain[0]).recurrent.safetensors"))
             #expect(store.read(chain[0], withSnapshot: false) != nil)
             #expect(store.read(chain[0], withSnapshot: true) == nil)
             store.flush()
@@ -278,7 +278,7 @@ struct PrefixCacheStoreTests {
             #expect(reopened.bytesHeld <= budget)
             #expect(reopened.record(of: warm[0]) != nil && reopened.record(of: warm[1]) != nil)
             #expect(reopened.record(of: cold[0]) == nil && reopened.record(of: cold[1]) == nil)
-            #expect(Self.files(in: directory, withExtension: "kv").count == 2)
+            #expect(Self.files(in: directory, endingIn: ".kv.safetensors").count == 2)
         }
     }
 

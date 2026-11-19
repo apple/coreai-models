@@ -20,8 +20,8 @@ import Synchronization
 /// ```
 /// geometry      the layout the files were written for; a directory written for another is emptied
 /// index.jsonl   one record per line, appended to, and compacted when the store opens and as it grows
-/// <key>.kv      a chunk's KV, one tensor per KV state, as SafeTensors
-/// <key>.state   the recurrent state at the chunk's end, one tensor per state, as SafeTensors
+/// <key>.kv.safetensors          a chunk's attention KV: keys and values for its positions
+/// <key>.recurrent.safetensors   a hybrid model's recurrent state at the chunk's end, one tensor per buffer
 /// lock          held while a store has the directory open
 /// ```
 ///
@@ -77,8 +77,8 @@ package final class PrefixCacheStore: Sendable {
 
     private static let geometryName = "geometry"
     private static let indexName = "index.jsonl"
-    private static let kvExtension = "kv"
-    private static let stateExtension = "state"
+    private static let kvSuffix = ".kv.safetensors"
+    private static let recurrentSuffix = ".recurrent.safetensors"
     private static let lockName = "lock"
 
     /// The lock file, open for as long as the store: closing it lets another process have the directory.
@@ -156,7 +156,7 @@ package final class PrefixCacheStore: Sendable {
             for record in order.compactMap({ replayed[$0] }).sorted(by: { $0.depth < $1.depth }) {
                 let parentKept = record.parent.map { index.entries[$0] != nil } ?? (record.depth == 1)
                 guard parentKept, record.depth > 0, fileSize(kvURL(record.key)) == record.kvBytes,
-                    record.snapshotBytes == 0 || fileSize(stateURL(record.key)) == record.snapshotBytes
+                    record.snapshotBytes == 0 || fileSize(recurrentURL(record.key)) == record.snapshotBytes
                 else { continue }
                 index.entries[record.key] = Entry(record: record)
                 index.bytesHeld += record.bytes
@@ -177,22 +177,17 @@ package final class PrefixCacheStore: Sendable {
         let snapshotted = Set(kept.filter { $0.snapshotBytes > 0 }.map(\.key))
         let files = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
         for file in files {
-            switch file.pathExtension {
-            case Self.kvExtension:
-                if !names.contains(file.deletingPathExtension().lastPathComponent) {
-                    try? FileManager.default.removeItem(at: file)
-                }
-            case Self.stateExtension:
-                let key = file.deletingPathExtension().lastPathComponent
-                if !snapshotted.contains(key) {
-                    try? FileManager.default.removeItem(at: file)
-                }
-            default:
+            let name = file.lastPathComponent
+            let keep: Bool
+            if name.hasSuffix(Self.kvSuffix) {
+                keep = names.contains(String(name.dropLast(Self.kvSuffix.count)))
+            } else if name.hasSuffix(Self.recurrentSuffix) {
+                keep = snapshotted.contains(String(name.dropLast(Self.recurrentSuffix.count)))
+            } else {
                 // The stamp, the index and the lock; anything else is a write a crash left behind.
-                if ![Self.geometryName, Self.indexName, Self.lockName].contains(file.lastPathComponent) {
-                    try? FileManager.default.removeItem(at: file)
-                }
+                keep = [Self.geometryName, Self.indexName, Self.lockName].contains(name)
             }
+            if !keep { try? FileManager.default.removeItem(at: file) }
         }
         if !kept.isEmpty { CLILogger.log("prefix cache: disk tier holds \(kept.count) node(s); \(summary)") }
     }
@@ -261,7 +256,7 @@ package final class PrefixCacheStore: Sendable {
             }
             guard let evicted else { return }
             for victim in evicted { deleteFiles(of: victim) }
-            guard (try? file.write(to: stateURL(key), options: .atomic)) != nil else {
+            guard (try? file.write(to: recurrentURL(key), options: .atomic)) != nil else {
                 CLILogger.log("prefix cache: could not write a snapshot to \(directory.path)")
                 return
             }
@@ -310,7 +305,7 @@ package final class PrefixCacheStore: Sendable {
         }
         var snapshot: [Data]?
         if withSnapshot, record.snapshotBytes > 0 {
-            guard let state = Self.decode(contentsOf: stateURL(key)) else {
+            guard let state = Self.decode(contentsOf: recurrentURL(key)) else {
                 remove(key)
                 return nil
             }
@@ -371,7 +366,7 @@ package final class PrefixCacheStore: Sendable {
 
     private func deleteFiles(of key: Key) {
         try? FileManager.default.removeItem(at: kvURL(key))
-        try? FileManager.default.removeItem(at: stateURL(key))
+        try? FileManager.default.removeItem(at: recurrentURL(key))
         append(Record(key: key, parent: nil, depth: 0, kvBytes: 0, snapshotBytes: 0, removed: true))
     }
 
@@ -389,8 +384,8 @@ package final class PrefixCacheStore: Sendable {
     // MARK: - Files
 
     private var indexURL: URL { directory.appendingPathComponent(Self.indexName) }
-    private func kvURL(_ key: Key) -> URL { directory.appendingPathComponent("\(key).\(Self.kvExtension)") }
-    private func stateURL(_ key: Key) -> URL { directory.appendingPathComponent("\(key).\(Self.stateExtension)") }
+    private func kvURL(_ key: Key) -> URL { directory.appendingPathComponent(key + Self.kvSuffix) }
+    private func recurrentURL(_ key: Key) -> URL { directory.appendingPathComponent(key + Self.recurrentSuffix) }
 
     private func fileSize(_ url: URL) -> Int {
         ((try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? NSNumber)?.intValue ?? -1
