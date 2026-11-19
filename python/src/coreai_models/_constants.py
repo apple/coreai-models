@@ -76,6 +76,9 @@ OUTPUT_LOGITS_NAME = "out_logits"
 # --include-debug-info flag turns it on (DEBUG mode).
 DEFAULT_INCLUDE_DEBUG_INFO = False
 
+# Additive attention bias of a masked key in the Neural Engine embedding graphs; 0.0 attends.
+MASK_NEG = -30000.0
+
 # Max of the dynamic batch dim for `--attention-mask batched` exports when
 # --dynamic-batch-size is not given.
 DEFAULT_DYNAMIC_MAX_BATCH_SIZE = 8

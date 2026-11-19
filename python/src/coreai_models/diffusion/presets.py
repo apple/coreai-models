@@ -11,7 +11,10 @@ Presets describe weight quantization applied to quantizable components (text
 encoder and transformer). The VAE decoder is never quantized.
 
 Configs are coreai-opt ``quantization_config`` dicts, applied to the PyTorch module
-before torch export.
+before torch export. A preset holds either one ``config`` for every quantizable
+component, or ``component_configs`` keyed by diffusers component name (e.g.
+``transformer``, ``text_encoder``); unlisted components stay dense. An optional
+``component_precision`` overrides the export's compute precision per component.
 
 Usage::
 
@@ -58,6 +61,35 @@ _INT8_PER_CHANNEL = {
     "granularity": {"type": "per_channel"},
 }
 
+# coreai-opt looks up a default weight axis by exact module type, so an `nn.Embedding`
+# subclass gets none and fails prepare(). These take the axis the base class would get.
+_EMBEDDING_SUBCLASSES = (
+    "transformers.models.gemma2.modeling_gemma2.Gemma2TextScaledWordEmbedding",
+)
+
+
+def _weight_only(weight_spec: dict[str, Any]) -> dict[str, Any]:
+    """Eager weight-only config applying ``weight_spec`` to every quantizable weight.
+
+    Args:
+        weight_spec: coreai-opt ``QuantizationSpec`` dict, with ``axis`` left unset.
+    """
+    granularity = weight_spec["granularity"]
+    # Embedding weights are [num_embeddings, embedding_dim]: blocks run along the
+    # embedding dim, channels along the vocab.
+    embedding_axis = 1 if granularity["type"] == "per_block" else 0
+    embedding_spec = {**weight_spec, "granularity": {**granularity, "axis": embedding_axis}}
+    embedding_config = {"op_state_spec": {"weight": embedding_spec}, **_WEIGHT_ONLY}
+    return {
+        "execution_mode": "eager",
+        "global_config": {"op_state_spec": {"weight": weight_spec}, **_WEIGHT_ONLY},
+        "module_type_configs": {
+            **_MODULE_TYPE_EXCLUSIONS,
+            **{name: embedding_config for name in _EMBEDDING_SUBCLASSES},
+        },
+    }
+
+
 PRESETS: dict[str, dict[str, Any]] = {
     "none": {
         "description": "Full precision (no quantization)",
@@ -65,27 +97,27 @@ PRESETS: dict[str, dict[str, Any]] = {
     },
     "4bit": {
         "description": "INT4 symmetric per-block (block_size=32)",
-        "config": {
-            "execution_mode": "eager",
-            "global_config": {"op_state_spec": {"weight": _INT4_PER_BLOCK32}, **_WEIGHT_ONLY},
-            "module_type_configs": _MODULE_TYPE_EXCLUSIONS,
-        },
+        "config": _weight_only(_INT4_PER_BLOCK32),
     },
     "4bit-asym": {
         "description": "INT4 asymmetric per-block (block_size=32)",
-        "config": {
-            "execution_mode": "eager",
-            "global_config": {"op_state_spec": {"weight": _INT4_PER_BLOCK32_ASYM}, **_WEIGHT_ONLY},
-            "module_type_configs": _MODULE_TYPE_EXCLUSIONS,
-        },
+        "config": _weight_only(_INT4_PER_BLOCK32_ASYM),
     },
     "8bit": {
         "description": "INT8 per-channel, symmetric",
-        "config": {
-            "execution_mode": "eager",
-            "global_config": {"op_state_spec": {"weight": _INT8_PER_CHANNEL}, **_WEIGHT_ONLY},
-            "module_type_configs": _MODULE_TYPE_EXCLUSIONS,
+        "config": _weight_only(_INT8_PER_CHANNEL),
+    },
+    # The transformer runs every step, and int4 there visibly degrades detail and text.
+    # Int4 in the text encoder shifts compositions without degrading them.
+    "t8bit-te4bit-asym": {
+        "description": "INT8 per-channel transformer, INT4 asymmetric per-block text encoder",
+        "component_configs": {
+            "transformer": _weight_only(_INT8_PER_CHANNEL),
+            "text_encoder": _weight_only(_INT4_PER_BLOCK32_ASYM),
         },
+        # Int scales take the weight dtype, and the Core AI GPU int4 dequant kernel rejects
+        # bf16 ones. Sana's Gemma2 peaks at ~6% of the fp16 range, so fp16 is safe there.
+        "component_precision": {"text_encoder": "float16"},
     },
 }
 

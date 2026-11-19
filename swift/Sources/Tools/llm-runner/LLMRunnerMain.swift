@@ -6,6 +6,7 @@
 import ArgumentParser
 import CoreAI
 import CoreAILanguageModels
+import CoreAIMemoryMeasurement
 import CoreAIShared
 import CoreImage
 import Darwin
@@ -63,6 +64,17 @@ extension FrameSamplingStrategy: ExpressibleByArgument {
 @main
 struct Main {
     static func main() async throws {
+        #if os(macOS)
+        // llm-runner relaunches itself under sudo as the helper that reads the Neural Engine services' memory.
+        let arguments = CommandLine.arguments
+        if arguments.count == 3, arguments[1] == RootMemoryHelper.argument, let clientPid = pid_t(arguments[2]) {
+            RootMemoryHelper.run(clientPid: clientPid)
+            return
+        }
+        if arguments.count > 3, arguments[1] == RootMemoryHelper.terminalArgument {
+            RootMemoryHelper.runOnTerminal(arguments[2], command: Array(arguments[3...]))
+        }
+        #endif
         await LLMRunner.main()
     }
 }
@@ -166,6 +178,13 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     var drafterTopK: Int?
 
     @Option(
+        name: .customLong("draft-head-pack"),
+        help:
+            "With --speculative: run the draft head on the CPU from this pack (draft_head.safetensors from models/gemma4/export_draft_pack.py) instead of the bundle's draft head program, which the bundle then need not ship. The target still needs --emit-hidden-states."
+    )
+    var draftHeadPack: String?
+
+    @Option(
         name: .customLong("grammar-proposal-max"),
         help:
             "With --json-schema and speculative decoding: most tokens the grammar may propose in one verify block when it fully determines the next span (0 disables; default \(GrammarConstraint.defaultForcedRunLimit), at most \(GrammarConstraint.maxForcedRunLimit), the grammar's rollback budget less the anchor)."
@@ -239,6 +258,14 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     var bucketSize: Int?
 
     @Option(
+        name: .customLong("prefix-cache-mb"),
+        help: ArgumentHelp(
+            "Megabytes of earlier prompts' state to keep, so a prompt that starts the same way restores "
+                + "that prefix instead of computing it, across --prompt-list (default: 0, off; pipelined engine only)")
+    )
+    var prefixCacheMB: Int?
+
+    @Option(
         name: .customLong("chunk-size"),
         help: ArgumentHelp(
             "Prefill chunk size in tokens (default: 2048; 4096 on macOS with >=64GB memory)",
@@ -300,6 +327,20 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     var batchPrototypeRows: Int?
 
     @Option(
+        name: .customLong("prompt-list"),
+        help:
+            "Run each non-blank line of this file as its own prompt, several at once through the continuous-batching scheduler, and report per-request and aggregate tokens/sec. Needs the coreai-sequential engine and a model exported with --attention-mask batched --dynamic-batch-size N."
+    )
+    var promptList: String?
+
+    @Option(
+        name: .customLong("concurrent-requests"),
+        help:
+            "With --prompt-list: rows that decode at once, a number up to the model's max batch size (default: every prompt, up to that size; unlike llm-server's, no 'auto'). The other prompts wait for a free row."
+    )
+    var concurrentRequests: Int?
+
+    @Option(
         name: .customLong("draft-model"),
         help:
             "Path to a draft model bundle to enable speculative decoding. Must share the tokenizer/vocabulary with --model. The static-shape engine verifies and drafts."
@@ -346,7 +387,40 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     )
     var promptLookupMinNgram: Int = SpeculativeDefaults.lookupMinNgram
 
+    @OptionGroup var memoryOptions: MemoryOptions
+
     func validate() throws {
+        if let mb = prefixCacheMB, !(0...(Int.max >> 20)).contains(mb) {
+            throw ValidationError("--prefix-cache-mb must be between 0 and \(Int.max >> 20) (got \(mb))")
+        }
+        if let n = concurrentRequests {
+            if n < 1 { throw ValidationError("--concurrent-requests must be >= 1") }
+            if promptList == nil { throw ValidationError("--concurrent-requests applies to --prompt-list") }
+        }
+        if promptList != nil {
+            let conflicting = [
+                prompt != nil ? "--prompt" : nil,
+                promptFile != nil ? "--prompt-file" : nil,
+                rawTokens != nil ? "--raw-tokens" : nil,
+                jsonSchema != nil ? "--json-schema" : nil,
+                continuation != nil ? "--continuation" : nil,
+                rawContinuation != nil ? "--raw-continuation" : nil,
+                saveLogits != nil ? "--save-logits" : nil,
+                printLogits ? "--print-logits" : nil,
+                imagePath != nil ? "--image" : nil,
+                videoPath != nil ? "--video" : nil,
+                batchPrototypeRows != nil ? "--batch-prototype" : nil,
+                draftModel != nil ? "--draft-model" : nil,
+                promptLookup ? "--prompt-lookup" : nil,
+                speculative ? "--speculative" : nil,
+            ].compactMap { $0 }
+            if !conflicting.isEmpty {
+                throw ValidationError("--prompt-list cannot be used with \(conflicting.joined(separator: ", "))")
+            }
+            if !["default", "auto", "coreai-sequential"].contains(inferenceEngineVariant) {
+                throw ValidationError("--prompt-list runs on the coreai-sequential engine")
+            }
+        }
         if let rows = batchPrototypeRows {
             if rows < 1 { throw ValidationError("--batch-prototype must be >= 1") }
             if !["default", "auto", "coreai-sequential"].contains(inferenceEngineVariant) {
@@ -370,6 +444,9 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         }
         if imagePath != nil && videoPath != nil {
             throw ValidationError("--image and --video cannot be used together")
+        }
+        if memoryOptions.measuresMemory && (imagePath != nil || videoPath != nil || batchPrototypeRows != nil) {
+            throw ValidationError("Memory measurement doesn't support --image, --video, or --batch-prototype")
         }
         if videoFrames < 1 {
             throw ValidationError("--video-frames must be >= 1")
@@ -398,6 +475,14 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             draftHead: speculative, draftModel: draftModel != nil, drafterTopK: drafterTopK)
         {
             throw ValidationError(problem)
+        }
+        if let problem = SpeculativeDecodingOptions.draftHeadPackProblem(
+            hasPack: draftHeadPack != nil, draftHead: speculative)
+        {
+            throw ValidationError(problem)
+        }
+        if let draftHeadPack, !FileManager.default.fileExists(atPath: draftHeadPack) {
+            throw ValidationError("--draft-head-pack \(draftHeadPack) does not exist")
         }
         let speculating = draftModel != nil || promptLookup || speculative
         if seed != nil && !speculating {
@@ -555,10 +640,18 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         }
 
         let tokenizer = try await targetBundle.loadTokenizer()
-        let stopTokenIds = RunnerPrompting.stopTokenIds(
-            tokenizer: tokenizer,
-            additional: RunnerPrompting.additionalStopTokenIds(
-                tokenizerDirectory: targetBundle.tokenizerPath, tokenizer: tokenizer))
+        // The stops a plain run uses: the end-of-sequence tokens and `--stop-tokens`. Speculative
+        // decoding stops at those that are one token; see `SpeculativeDecodingOptions.stopTokenIds`.
+        let stopSequences = try validateAndEncodeStopTokens(
+            stopTokens: stopTokens, tokenizer: tokenizer,
+            additionalEosTokenIds: RunnerPrompting.additionalStopTokenIds(bundle: targetBundle, tokenizer: tokenizer))
+        let stops = SpeculativeDecodingOptions.stopTokenIds(stopSequences)
+        if let warning = SpeculativeDecodingOptions.multiTokenStopWarning(
+            stops.ignored.map { tokenizer.decode(tokens: $0.map(Int.init)) })
+        {
+            print(warning)
+        }
+        let stopTokenIds = stops.ids
 
         let promptInput = try resolvePromptInput()
         let promptTokens: [Int32]
@@ -625,7 +718,6 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             minP != nil ? "--min-p" : nil,
             repetitionPenalty != nil ? "--repetition-penalty" : nil,
             repetitionPenaltyWindow != nil ? "--repetition-penalty-window" : nil,
-            stopTokens.isEmpty ? nil : "--stop-tokens",
             synchronousSampling ? "--synchronous-sampling" : nil,
             saveLogits != nil ? "--save-logits" : nil,
             printLogits ? "--print-logits" : nil,
@@ -633,6 +725,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             chunkSize != nil ? "--chunk-size" : nil,
             chunkThreshold != nil ? "--chunk-threshold" : nil,
             imageStrategy != nil ? "--image-strategy" : nil,
+            prefixCacheMB != nil ? "--prefix-cache-mb" : nil,
         ].compactMap { $0 }
         if let warning = SpeculativeDecodingOptions.ignoredWarning(ignored: ignoredOptions) {
             print(warning)
@@ -666,8 +759,9 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
                     draftTokens: numDraftTokens, alignDraftsToVerifyTile: !noAlignProposals,
                     adaptiveDraftCount: adaptive,
                     promptLookupMinNgram: promptLookup ? promptLookupMinNgram : nil,
-                    drafterTopK: drafterTopK))
-            drafterLabel = promptLookup ? "draft head + prompt-lookup" : "draft head"
+                    drafterTopK: drafterTopK, cpuPack: draftHeadPack.map { URL(fileURLWithPath: $0) }))
+            let head = draftHeadPack == nil ? "draft head" : "draft head (CPU)"
+            drafterLabel = promptLookup ? "\(head) + prompt-lookup" : head
         } else if let draftEngine {
             decoder = SpeculativeDecoder(
                 draft: draftEngine, target: targetEngine,
@@ -863,6 +957,13 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             try RawTokenScoring.checkFits(
                 rawScoring, vocabSize: bundle.vocabSize, maxContextLength: bundle.maxContextLength)
         }
+        // Read and size a prompt list before the model loads, so a bad file or width fails fast.
+        let promptBatch = try promptList.map { path in
+            let prompts = try Self.readPromptList(path)
+            let width = try Self.batchWidth(
+                requested: concurrentRequests, promptCount: prompts.count, maxBatchSize: bundle.maxBatchSize)
+            return (prompts: prompts, width: width)
+        }
 
         // Resolve component model URLs once; reused for the cache check and model loading below.
         // An LLM bundle has only `main`; VLM bundles also have `vision`, plus `embedding` unless the
@@ -895,6 +996,13 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             cacheHit = PreparedModel.isCached(at: languageModelURL)
         }
 
+        // Initialize memory measurement, if activated by memoryOptions flag(s)
+        // Do this before starting "Preparing..."
+        let measurement = MemoryMeasurement(
+            options: memoryOptions, modelPath: bundle.bundlePath.path, runPhase: "inference")
+        // Restart the overall timer so Total Time and Overall Throughput leave out the sudo prompt.
+        if measurement != nil { await PerformanceMetrics.shared.startOverallTiming() }
+
         if !CLILogger.isVerbose {
             print("\n⏳ Preparing AI asset from \(languageModelURL.lastPathComponent)...", terminator: "")
             fflush(stdout)
@@ -918,9 +1026,11 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             kvCacheSize: kvCacheInitialCapacity,
             prefillChunkSize: resolvedChunkSize,
             prefillChunkThreshold: resolvedChunkThreshold,
-            tensorData: bundle.tensorData
+            tensorData: bundle.tensorData,
+            prefixCacheBytes: (prefixCacheMB ?? 0) << 20
         )
 
+        measurement?.begin("prepare")
         // Parallel loading: engine compilation + tokenizer are independent.
         let modelLoadSpan = InstrumentsProfiler.beginModelLoad(name: bundle.name)
         let tokenizerLoadSpan = InstrumentsProfiler.beginTokenizerLoad(id: modelFile)
@@ -938,10 +1048,9 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             "Tokenizer loaded from \(bundle.hasEmbeddedTokenizer ? "embedded bundle" : "HuggingFace")",
             component: "Main")
 
-        // Read additional stop token IDs from tokenizer_config.json (e.g. <end_of_turn> for Gemma)
-        // and, for agentic models, the end-of-turn token.
-        let additionalEosTokenIds = RunnerPrompting.additionalStopTokenIds(
-            tokenizerDirectory: bundle.tokenizerPath, tokenizer: tokenizer)
+        // Additional stop token IDs: from tokenizer_config.json (e.g. <end_of_turn> for Gemma), the
+        // bundle's eos_token_ids, and, for agentic models, the end-of-turn token.
+        let additionalEosTokenIds = RunnerPrompting.additionalStopTokenIds(bundle: bundle, tokenizer: tokenizer)
         if !additionalEosTokenIds.isEmpty {
             CLILogger.log(
                 "Found \(additionalEosTokenIds.count) additional stop token(s): \(additionalEosTokenIds.sorted())",
@@ -954,8 +1063,14 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
 
         // Validate that the sampling strategy is supported by this engine
         try inferenceEngine.validateSamplingStrategy(samplingConfiguration)
+        if let mb = prefixCacheMB, mb > 0, !inferenceEngine.prefixCacheEnabled {
+            print(
+                "⚠️  --prefix-cache-mb \(mb): no prefix cache here. Only the pipelined engine keeps one, and not "
+                    + "for every model (--verbose says why).")
+        }
 
         // Warmup: trigger kernel compilation before first inference
+        if warmup != .off { measurement?.begin("warmup") }
         try await performWarmup(
             mode: warmup,
             warmupLength: warmupLength,
@@ -967,6 +1082,17 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             let prepareElapsed = await PerformanceMetrics.shared.modelLoadTime
             let cacheSuffix = cacheHit ? " (cache hit)" : ""
             print(" done in \(String(format: "%.3f", prepareElapsed))s\(cacheSuffix)\n")
+        }
+
+        if let promptBatch {
+            try await runBatchGeneration(
+                prompts: promptBatch.prompts,
+                width: promptBatch.width,
+                inferenceEngine: inferenceEngine,
+                tokenizer: tokenizer,
+                samplingConfiguration: samplingConfiguration,
+                additionalEosTokenIds: additionalEosTokenIds)
+            return
         }
 
         // Resolve prompt input and tokenize
@@ -1051,6 +1177,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         }
 
         // Build text generator with preloaded inference engine
+        measurement?.begin("inference")
         CLILogger.log("Building text generator...", component: "Main")
 
         let generator = try await TextGeneratorBuilder()
@@ -1103,6 +1230,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
                 saveJsonPath: saveLogits,
                 printToConsole: printLogits
             )
+            try await reportMemory(measurement, generator: generator, input: input, cacheHit: cacheHit)
             return
         }
 
@@ -1205,6 +1333,10 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             // End overall timing now that core inference is complete
             await PerformanceMetrics.shared.endOverallTiming()
 
+            // A reply that ends at a stop sequence leaves the engine's generation task winding down.
+            // Wait for it, so it does not release the model while the process exits (#535).
+            try? await inferenceEngine.cancel()
+
             // Extract only the generated part (remove prompt from output)
             let formattedPrompt = tokenizer.decode(tokens: promptTokens)
             let generatedOnly =
@@ -1238,11 +1370,37 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             await StatsReporter(storage: .shared).printVerboseTable()
         }
 
+        try await reportMemory(measurement, generator: generator, input: input, cacheHit: cacheHit)
+
         // Log final memory usage
         InstrumentsProfiler.logMemoryUsage(phase: "ModelFinal")
 
         // Cleanup
         CLILogger.log("Resources cleaned up", component: "Main")
+    }
+
+    // MARK: - Memory Measurement
+
+    /// Ends the memory measurement and prints what `--measure-peak-memory` and the other memory flags ask for; does
+    /// nothing without them. Generates a few tokens after dropping the mapped model files, to see which the
+    /// model needs, with logging off so the engine's per-token logs don't repeat. `--print-memory-chart` adds each
+    /// phase's peak and what peak memory is made of.
+    private func reportMemory(
+        _ measurement: MemoryMeasurement?, generator: TextGenerator, input: Input, cacheHit: Bool
+    ) async throws {
+        guard let measurement else { return }
+        let memory = await measurement.finish {
+            let logLevel = CLILogger.level
+            CLILogger.level = 0
+            defer { CLILogger.level = logLevel }
+            _ = try? await generator.generate(input: input, maxTokens: 16, stopSequences: StopSequences(sequences: []))
+        }
+        print("\n📊 Memory Summary:")
+        print(String(repeating: "=", count: 50))
+        for line in memory.summaryLines() { print(line) }
+        print(String(repeating: "=", count: 50))
+        measurement.chart(memory: memory, cacheHit: cacheHit)
+        try measurement.writeCSVIfRequested()
     }
 
     // MARK: - Constrained Generation Helper
@@ -1705,7 +1863,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         let w = Int(ciImage.extent.width)
         let h = Int(ciImage.extent.height)
         CLILogger.log("Injected image info: \(w)x\(h)", component: "VLM")
-        return "Image: \(w)x\(h)\n\(displayPrompt)"
+        return ImagePlaceholders.imageInfoText(width: w, height: h) + displayPrompt
     }
 
     /// Prompt tokens for an image prompt: the tokenizer's chat template with the image placeholder
@@ -1736,38 +1894,17 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         imageTokenId: Int32,
         tokenizer: any Tokenizer
     ) throws -> [Int32]? {
-        // Use the tokenizer's applyChatTemplate with a multimodal message.
-        // The template should emit a single <image> token that we expand.
-        let imageToken = tokenizer.convertIdToToken(Int(imageTokenId)) ?? "<image>"
-        let templatedPrompt = "\(imageToken)\n\(prompt)"
+        // The template should emit the single image token, which is expanded to the image's tokens.
+        let imageToken = ImagePlaceholders.text(imageTokenId: imageTokenId, tokenizer: tokenizer)
         guard
             let tokens = try? PromptUtils.maybeApplyTokenizerChatTemplate(
-                .prompt(templatedPrompt), tokenizer: tokenizer
+                .prompt("\(imageToken)\n\(prompt)"), tokenizer: tokenizer
             )
         else {
             return nil
         }
-
-        // Expand the single image placeholder to imageTokenCount copies
-        var result: [Int32] = []
-        result.reserveCapacity(tokens.count + imageTokenCount - 1)
-        var foundPlaceholder = false
-        for tokenInt in tokens {
-            let token = Int32(tokenInt)
-            if token == imageTokenId && !foundPlaceholder {
-                result.append(contentsOf: [Int32](repeating: imageTokenId, count: imageTokenCount))
-                foundPlaceholder = true
-            } else if token == imageTokenId {
-                // Skip additional single image tokens (already expanded the first one)
-                continue
-            } else {
-                result.append(token)
-            }
-        }
-
-        // If we never found the placeholder, the template didn't produce it — fall back
-        guard foundPlaceholder else { return nil }
-        return result
+        return ImagePlaceholders.expand(
+            tokens.map { Int32($0) }, imageTokenId: imageTokenId, tokenCounts: [imageTokenCount])
     }
 
     // MARK: - Warmup

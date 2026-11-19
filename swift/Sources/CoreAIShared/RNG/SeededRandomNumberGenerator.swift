@@ -7,7 +7,7 @@
 ///
 /// Backs reproducible sampling: given the same seed, `next()` produces the same
 /// sequence of values on every run and every machine. Use it with
-/// `CompositeSampler.sample(from:config:using:)` (via `SamplingConfiguration.seed`)
+/// `ReferenceSampler.sample(from:config:using:)` (via `SamplingConfiguration.seed`)
 /// when a generation must be repeatable — determinism-under-load tests, evals, and
 /// bug reproduction. For ordinary generation, leave `seed` nil so the engine uses
 /// the system generator.
@@ -21,7 +21,7 @@
 /// advances the state, then two xor-shift/multiply rounds mix it. It is fast, has a
 /// full 2^64 period, and passes standard statistical tests — enough for a sampling
 /// determinism knob (it is not a cryptographic generator).
-public struct SeededRandomNumberGenerator: RandomNumberGenerator {
+public struct SeededRandomNumberGenerator: RandomNumberGenerator, Sendable {
     private var state: UInt64
 
     /// Creates a generator seeded with `seed`. Any 64-bit value is valid, including 0.

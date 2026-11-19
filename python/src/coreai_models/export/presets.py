@@ -304,8 +304,10 @@ IOS_PRESETS: dict[str, dict[str, Any]] = {
 DEFAULT_MACOS_COMPRESSION_PRESET = "4bit"
 DEFAULT_IOS_COMPRESSION_PRESET = "4bit_weight_palettized_group32"
 
-# Use a set since both dicts have a "none" preset
-ALL_PRESET_NAMES: list[str] = list(set(MACOS_PRESETS.keys()).union(set(IOS_PRESETS.keys())))
+# Deduplicate through a set since both dicts have a "none" preset, and sort so
+# list_presets() and the "Available:" error message come out in the same order
+# every run (set order varies per process), matching diffusion's list_presets.
+ALL_PRESET_NAMES: list[str] = sorted(set(MACOS_PRESETS).union(IOS_PRESETS))
 
 
 def get_preset(name: str) -> dict[str, Any]:

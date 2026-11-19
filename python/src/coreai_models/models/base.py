@@ -15,11 +15,11 @@ from abc import abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import wraps
+from pathlib import Path
 from typing import Any, TypeVar, cast
 
 import torch
 from coreai.authoring.types import AllocationType, HardwareConstraints
-from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from safetensors.torch import save_file
 from transformers import AutoConfig
@@ -50,6 +50,7 @@ from coreai_models._constants import (
     VALUE_CACHE_NAME,
     VALUE_CACHE_OUTPUT_NAME,
 )
+from coreai_models.hub import BackendName, get_backend, resolve_download_id, resolve_local
 from coreai_models.primitives.ios.cache import KVCacheHandler, causal_mask
 from coreai_models.primitives.ios.embedding import GatherEmbeddings, LoadEmbeddings
 from coreai_models.primitives.macos.cache import KVCache
@@ -231,8 +232,16 @@ def _save_and_mmap_safetensors(
     module.load_state_dict(new_sd, assign=True, strict=False)
 
 
-def _resolve_safetensors_files(model_dir: str) -> list[str]:
-    """Resolve the safetensors file paths in a local HuggingFace model directory."""
+def resolve_safetensors_files(model_dir: str) -> list[str]:
+    """Return the safetensors paths of a local HuggingFace model directory.
+
+    Returns the shards listed in ``model.safetensors.index.json`` if present, else
+    ``model.safetensors``.
+
+    Raises:
+        FileNotFoundError: if neither file exists or an indexed shard is missing.
+        RuntimeError: if the index has no ``weight_map``.
+    """
     single_path = os.path.join(model_dir, "model.safetensors")
     index_path = os.path.join(model_dir, "model.safetensors.index.json")
 
@@ -306,14 +315,14 @@ def _build_safetensors_key_index(
     return per_layer, shared
 
 
-def _load_tensors_for_keys(
+def load_tensors_for_keys(
     key_to_file: dict[str, str],
     target_dtype: torch.dtype,
 ) -> dict[str, torch.Tensor]:
-    """Load specific tensors from safetensors files by key.
+    """Load the tensors in ``key_to_file`` (tensor name -> safetensors path), keyed by name.
 
-    Each safetensors file is opened at most once. Tensors are cast to
-    ``target_dtype`` except embedding tables and quantization zero-points.
+    Tensors are cast to ``target_dtype`` except those whose names contain ``embedding_table`` or
+    ``zero_point``.
     """
     file_to_keys: dict[str, list[str]] = {}
     for key, path in key_to_file.items():
@@ -333,6 +342,29 @@ def _load_tensors_for_keys(
                 result[key] = tensor
 
     return result
+
+
+def read_checkpoint_tensors(
+    model_dir: str | Path, prefixes: tuple[str, ...], dtype: torch.dtype
+) -> dict[str, torch.Tensor]:
+    """Load the tensors of the ``model_dir`` checkpoint whose names start with one of ``prefixes``.
+
+    Reads the shards listed in ``model.safetensors.index.json``, else ``model.safetensors``. Names
+    are kept as in the checkpoint; tensors are cast to ``dtype`` except those whose names contain
+    ``embedding_table`` or ``zero_point``, as in ``load_tensors_for_keys``.
+
+    Raises:
+        FileNotFoundError: if ``model_dir`` has no safetensors weights or an indexed shard is
+            missing.
+        RuntimeError: if ``model.safetensors.index.json`` has no ``weight_map``.
+    """
+    key_to_file: dict[str, str] = {}
+    for file in resolve_safetensors_files(str(model_dir)):
+        with safe_open(file, framework="pt") as handle:
+            for key in handle.keys():  # noqa: SIM118 - safe_open is not a Mapping
+                if key.startswith(prefixes):
+                    key_to_file[key] = file
+    return load_tensors_for_keys(key_to_file, dtype)
 
 
 class BaseForCausalLM(torch.nn.Module):
@@ -728,13 +760,14 @@ class BaseForCausalLM(torch.nn.Module):
     @classmethod
     def from_hf(
         cls: type[T],
-        huggingface_model_id: str,
+        huggingface_model_id_or_path: str,
         max_context_length: int | None = None,
         target_dtype: torch.dtype = torch.float16,
         mmap_path: str | None = None,
         num_layers: int | None = None,
         disable_embedding_quantization: bool = False,
         use_attention_mask: bool = False,
+        backend: BackendName = "huggingface",
     ) -> T:
         """Load model from HuggingFace model hub.
 
@@ -761,9 +794,20 @@ class BaseForCausalLM(torch.nn.Module):
         if cls._HF_MODEL_CLASS is None:
             raise ValueError(f"{cls.__name__} must define _HF_MODEL_CLASS class attribute")
 
-        # Load the HuggingFace model
+        # A pre-downloaded local directory is read in place; a hub id is
+        # resolved through the selected backend first.
+        load_id = resolve_local(
+            huggingface_model_id_or_path,
+            backend,
+            allow_patterns=[
+                "*.safetensors",
+                "*.safetensors.index.json",
+                "config.json",
+                "generation_config.json",
+            ],
+        )
         hf_model = cast(PreTrainedModel, cls._HF_MODEL_CLASS).from_pretrained(
-            huggingface_model_id, dtype=target_dtype
+            load_id, dtype=target_dtype
         )
 
         # Convert config using the hook method (default: pass-through with context length)
@@ -815,7 +859,7 @@ class BaseForCausalLM(torch.nn.Module):
     @classmethod
     def from_hf_memory_efficient(
         cls: type[T],
-        huggingface_model_id: str,
+        huggingface_model_id_or_path: str,
         max_context_length: int | None = None,
         target_dtype: torch.dtype = torch.float16,
         mmap_path: str | None = None,
@@ -824,6 +868,7 @@ class BaseForCausalLM(torch.nn.Module):
         hf_state_dict_prefix: str = "",
         disable_embedding_quantization: bool = False,
         use_attention_mask: bool = False,
+        backend: BackendName = "huggingface",
     ) -> T:
         """Load model from HuggingFace with layer-by-layer memory offloading.
 
@@ -833,7 +878,8 @@ class BaseForCausalLM(torch.nn.Module):
         the peak RAM is roughly *one layer + shared params*.
 
         Args:
-            huggingface_model_id: HuggingFace model identifier.
+            huggingface_model_id_or_path: HuggingFace model identifier, or the path of a
+                local checkpoint directory, which is read in place.
             max_context_length: Optional override for the model's context length.
             target_dtype: Target dtype for the model weights.
             mmap_path: Directory for per-layer mmap files. When provided each
@@ -856,10 +902,14 @@ class BaseForCausalLM(torch.nn.Module):
                 explicit additive ``attn_mask`` input (``is_causal`` off).
                 Ignored for iOS model classes.
         """
-        model_dir = snapshot_download(
-            huggingface_model_id,
-            allow_patterns=["*.safetensors", "*.safetensors.index.json", "config.json"],
-        )
+        if Path(huggingface_model_id_or_path).is_dir():
+            model_dir = huggingface_model_id_or_path
+        else:
+            download_id = resolve_download_id(huggingface_model_id_or_path, backend)
+            model_dir = get_backend(backend).snapshot(
+                download_id,
+                allow_patterns=["*.safetensors", "*.safetensors.index.json", "config.json"],
+            )
 
         raw_config = AutoConfig.from_pretrained(model_dir)
         hf_config = getattr(raw_config, hf_config_attr) if hf_config_attr else raw_config
@@ -876,7 +926,7 @@ class BaseForCausalLM(torch.nn.Module):
         model = cls(**init_kwargs)
         model.to(dtype=target_dtype)
 
-        safetensors_files = _resolve_safetensors_files(model_dir)
+        safetensors_files = resolve_safetensors_files(model_dir)
         per_layer_index, shared_index = _build_safetensors_key_index(
             safetensors_files,
             num_layers=num_layers,
@@ -885,7 +935,7 @@ class BaseForCausalLM(torch.nn.Module):
         )
 
         # Shared params first (embeddings, norm, lm_head, ...).
-        shared_dict = _load_tensors_for_keys(shared_index, target_dtype)
+        shared_dict = load_tensors_for_keys(shared_index, target_dtype)
         shared_dict = {k.removeprefix(hf_state_dict_prefix): v for k, v in shared_dict.items()}
         del shared_index
 
@@ -903,7 +953,7 @@ class BaseForCausalLM(torch.nn.Module):
         exclude_buffers = {KVCache.HF_K_BUFFER_NAME, KVCache.HF_V_BUFFER_NAME}
         for layer_idx in sorted(per_layer_index.keys()):
             layer_key_to_file = per_layer_index.pop(layer_idx)
-            layer_sd = _load_tensors_for_keys(layer_key_to_file, target_dtype)
+            layer_sd = load_tensors_for_keys(layer_key_to_file, target_dtype)
             layer_sd = {k.removeprefix(hf_state_dict_prefix): v for k, v in layer_sd.items()}
             del layer_key_to_file
 

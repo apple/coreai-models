@@ -55,6 +55,11 @@ class ModelPreset:
     # config.json reports a type we don't want to register globally (e.g.
     # SmolLM2 reports "llama" but we use the qwen2 export path).
     _model_type_override: str | None = None
+    # ModelScope repo id for the download-backend override map. Defaults to
+    # the HF id — presets whose repo exists under the same org/name on both
+    # hubs leave this as None. Only namespace-differing models need an entry
+    # (currently just gpt-oss-20b).
+    modelscope_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -166,7 +171,15 @@ LLM_PRESETS: list[ModelPreset] = [
         32768,
     ),
     ModelPreset(
-        "gpt-oss-20b", "openai/gpt-oss-20b", "gpt-oss", "llm", "macOS", "none", "bfloat16", 32768
+        "gpt-oss-20b",
+        "openai/gpt-oss-20b",
+        "gpt-oss",
+        "llm",
+        "macOS",
+        "none",
+        "bfloat16",
+        32768,
+        modelscope_id="openai-mirror/gpt-oss-20b",
     ),
     ModelPreset(
         "phi-4-mini-instruct",
@@ -253,6 +266,30 @@ LLM_PRESETS: list[ModelPreset] = [
         "none",
         "float16",
         8192,
+        _model_type_override="qwen2",
+    ),
+    ModelPreset(
+        "smollm3-3b",
+        "HuggingFaceTB/SmolLM3-3B",
+        "smollm3",
+        "llm",
+        "macOS",
+        "4bit",
+        "float16",
+        8192,
+        compression_config="models/smollm3/smollm3_mixed_4bit_8bit.yaml",
+        _model_type_override="qwen2",
+    ),
+    ModelPreset(
+        "smollm3-3b-base",
+        "HuggingFaceTB/SmolLM3-3B-Base",
+        "smollm3",
+        "llm",
+        "macOS",
+        "4bit",
+        "float16",
+        8192,
+        compression_config="models/smollm3/smollm3_mixed_4bit_8bit.yaml",
         _model_type_override="qwen2",
     ),
     ModelPreset(
@@ -510,6 +547,30 @@ LLM_PRESETS: list[ModelPreset] = [
         _model_type_override="qwen2",
     ),
     ModelPreset(
+        "smollm3-3b",
+        "HuggingFaceTB/SmolLM3-3B",
+        "smollm3",
+        "llm",
+        "iOS",
+        "none",
+        "float16",
+        4096,
+        compression_config="models/smollm3/smollm3_3b_6bit.yaml",
+        _model_type_override="qwen2",
+    ),
+    ModelPreset(
+        "smollm3-3b-base",
+        "HuggingFaceTB/SmolLM3-3B-Base",
+        "smollm3",
+        "llm",
+        "iOS",
+        "none",
+        "float16",
+        4096,
+        compression_config="models/smollm3/smollm3_3b_6bit.yaml",
+        _model_type_override="qwen2",
+    ),
+    ModelPreset(
         "olmo2-1b-instruct",
         "allenai/OLMo-2-0425-1B-Instruct",
         "olmo2",
@@ -554,6 +615,36 @@ LLM_PRESETS: list[ModelPreset] = [
             "precomputed dual-RoPE rows). Pass --include-vision for image input."
         ),
     ),
+    ModelPreset(
+        "qwen3.5-2b",
+        "Qwen/Qwen3.5-2B",
+        "qwen3.5",
+        "llm",
+        "iOS",
+        "none",
+        "float16",
+        32768,
+        compression_config="models/qwen3_5/qwen3_5_2b_4bit_palettized.yaml",
+        notes=(
+            "Exported via models/qwen3_5/export.py (standalone recipe -- a per-bucket static "
+            "ladder with DeltaNet state, not coreai.llm.export). This preset serves evaluation."
+        ),
+    ),
+    ModelPreset(
+        "qwen3.5-4b",
+        "Qwen/Qwen3.5-4B",
+        "qwen3.5",
+        "llm",
+        "iOS",
+        "none",
+        "float16",
+        32768,
+        compression_config="models/qwen3_5/qwen3_5_4b_4bit_palettized.yaml",
+        notes=(
+            "Exported via models/qwen3_5/export.py (standalone recipe -- a per-bucket static "
+            "ladder with DeltaNet state, not coreai.llm.export). This preset serves evaluation."
+        ),
+    ),
 ]
 
 # ---------------------------------------------------------------------------
@@ -588,7 +679,7 @@ DIFFUSION_PRESETS: list[ModelPreset] = [
         "sana-sprint",
         "diffusion",
         None,
-        "none",
+        "t8bit-te4bit-asym",
         "bfloat16",
         None,
     ),
@@ -598,31 +689,46 @@ DIFFUSION_PRESETS: list[ModelPreset] = [
         "sana-sprint",
         "diffusion",
         None,
-        "none",
+        "t8bit-te4bit-asym",
         "bfloat16",
         None,
     ),
 ]
 
 # ---------------------------------------------------------------------------
-# Utility model presets (standalone export scripts)
+# Utility model presets (export_script: a models/<name>/export.py script or a console script)
 # ---------------------------------------------------------------------------
 
 UTILITY_PRESETS: list[UtilityModel] = [
     # --- Embedding ---
     UtilityModel(
+        "embeddinggemma-2",
+        "google/embeddinggemma-2",
+        "embeddinggemma",
+        "embedding",
+        "coreai.embedding.export",
+    ),
+    UtilityModel(
         "clip-vit-b32",
         "openai/clip-vit-base-patch32",
         "clip",
         "embedding",
-        "models/clip/export.py",
+        "coreai.embedding.export",
     ),
     UtilityModel(
         "clap-htsat",
         "laion/clap-htsat-unfused",
         "clap",
         "embedding",
-        "models/clap/export.py",
+        "coreai.embedding.export",
+    ),
+    UtilityModel(
+        "qwen3-embedding-0.6b",
+        "Qwen/Qwen3-Embedding-0.6B",
+        "qwen3-embedding",
+        "embedding",
+        "coreai.embedding.export",
+        platforms=("macOS",),
     ),
     # --- ASR ---
     UtilityModel(
@@ -1021,9 +1127,17 @@ def _format_diffusion_header() -> str:
     return f"{'SHORT_NAME':32s} {'COMPRESSION':18s} HF_ID"
 
 
-def _utility_to_export_args(model: UtilityModel) -> list[str]:
-    """Build the shell command to export a utility model."""
-    return ["uv", "run", model.export_script, "--model", model.hf_id]
+def _utility_to_export_args(model: UtilityModel, platform: str | None = None) -> list[str]:
+    """Build the shell command to export a utility model.
+
+    Scripts (``*.py``) take ``--model <hf_id>``; console scripts take the short name and
+    ``--platform iOS`` when targeting iOS.
+    """
+    if model.export_script.endswith(".py"):
+        return ["uv", "run", model.export_script, "--model", model.hf_id]
+    return ["uv", "run", model.export_script, model.short_name] + (
+        ["--platform", "iOS"] if platform == "iOS" else []
+    )
 
 
 def _format_utility_row(u: UtilityModel) -> str:
@@ -1328,7 +1442,7 @@ def _action_utility_model_info(args: argparse.Namespace) -> None:
         sys.stderr.write(f"Error: model {args.model_info!r} has no --platform {args.platform!r}\n")
         sys.exit(1)
     if args.format == "export-args":
-        print(" ".join(_utility_to_export_args(model)))
+        print(" ".join(_utility_to_export_args(model, args.platform)))
     elif args.format == "json":
         print(json.dumps(asdict(model), indent=2))
     elif args.format == "tsv":

@@ -761,6 +761,10 @@ class TestSwitch:
         )
         rtol = {Precision.f32: 1e-5, Precision.f16: 1e-3, Precision.bf16: 1e-2}[precision]
         atol = {Precision.f32: 1e-5, Precision.f16: 1e-3, Precision.bf16: 1e-2}[precision]
+        # The Core AI runtime sums in a different order than PyTorch. The f16 / bf16
+        # tolerances above are about one unit in the last place at these output
+        # magnitudes, and the two differ by one or two, so allow about four here.
+        coreai_tol = {Precision.f32: 1e-5, Precision.f16: 4e-3, Precision.bf16: 3e-2}[precision]
         with tempfile.TemporaryDirectory() as temp_directory:
             model = SwitchGLU(
                 Path(temp_directory),
@@ -792,6 +796,6 @@ class TestSwitch:
             model.validate(
                 coreai_torch_export_coreai_coreai_torch_config,
                 coreai_torch_export_config,
-                rtol=rtol,
-                atol=atol,
+                rtol=coreai_tol,
+                atol=coreai_tol,
             )

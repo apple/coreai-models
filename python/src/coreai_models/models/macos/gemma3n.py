@@ -26,6 +26,7 @@ from transformers.models.gemma3n.modeling_gemma3n import (
 from typing_extensions import Self, override
 
 from coreai_models._constants import MAX_GATHER_CONSTANT_ELEMENTS
+from coreai_models.hub import BackendName
 from coreai_models.models.base import BaseForCausalLM
 from coreai_models.primitives.macos.cache import KVCache
 from coreai_models.primitives.macos.rms_norm import RMSNorm
@@ -188,7 +189,11 @@ class Attention(nn.Module):
                 .reshape(batch_size, query_len, n_kv_heads, self.head_dim)
                 .permute(0, 2, 1, 3)
             )
-            value = value / torch.sqrt(value.pow(2).mean(-1, keepdim=True) + self._v_norm_eps)
+            # Every mean in this file is spelled `torch.mean`: export numbers `torch.mean` and
+            # `Tensor.mean` calls separately, and the clashing names break graph-mode quantization.
+            value = value / torch.sqrt(
+                torch.mean(value.pow(2), dim=-1, keepdim=True) + self._v_norm_eps
+            )
 
             if cache is not None:
                 key, value = cache.update_and_fetch(
@@ -221,8 +226,8 @@ class MLP(nn.Module):
     def _gaussian_topk(self, x: torch.Tensor) -> torch.Tensor:
         # Compute mean/std in float32 to avoid fp16 overflow in variance
         x_f32 = x.float()
-        mu = x_f32.mean(dim=-1, keepdim=True)
-        variance = (x_f32 - mu).pow(2).mean(dim=-1, keepdim=True)
+        mu = torch.mean(x_f32, dim=-1, keepdim=True)
+        variance = torch.mean((x_f32 - mu).pow(2), dim=-1, keepdim=True)
         std = variance.sqrt()
         cutoff = (mu + std * self._std_mult).to(x.dtype)
         return nn.functional.relu(x - cutoff)
@@ -413,7 +418,13 @@ class Gemma3nModel(nn.Module):
     def _get_per_layer_inputs(
         self, input_ids: torch.Tensor, inputs_embeds: torch.Tensor
     ) -> torch.Tensor:
-        per_layer = self.embed_tokens_per_layer(input_ids) * self.per_layer_embed_scale
+        # The per-layer table is smaller than the vocab; like HF, ids past it map to 0.
+        ple_ids = torch.where(
+            input_ids < self.config.vocab_size_per_layer_input,
+            input_ids,
+            torch.zeros_like(input_ids),
+        )
+        per_layer = self.embed_tokens_per_layer(ple_ids) * self.per_layer_embed_scale
         pli_dim = self.config.hidden_size_per_layer_input
         per_layer = per_layer.reshape(
             *input_ids.shape, self.config.num_hidden_layers, pli_dim
@@ -477,7 +488,7 @@ class Gemma3nForCausalLM(BaseForCausalLM):
     @override
     def from_hf_memory_efficient(
         cls,
-        huggingface_model_id: str,
+        huggingface_model_id_or_path: str,
         max_context_length: int | None = None,
         target_dtype: torch.dtype = torch.float16,
         mmap_path: str | None = None,
@@ -485,6 +496,7 @@ class Gemma3nForCausalLM(BaseForCausalLM):
         hf_config_attr: str | None = "text_config",
         hf_state_dict_prefix: str = "model.language_model.",
         disable_embedding_quantization: bool = False,
+        backend: BackendName = "huggingface",
     ):
         import gc
         import json
@@ -492,13 +504,13 @@ class Gemma3nForCausalLM(BaseForCausalLM):
         import re
         from types import SimpleNamespace
 
-        from huggingface_hub import snapshot_download
         from safetensors import safe_open
 
-        from coreai_models.models.base import _load_tensors_for_keys, _resolve_safetensors_files
+        from coreai_models.hub import get_backend, resolve_download_id
+        from coreai_models.models.base import load_tensors_for_keys, resolve_safetensors_files
 
-        model_dir = snapshot_download(
-            huggingface_model_id,
+        model_dir = get_backend(backend).snapshot(
+            resolve_download_id(huggingface_model_id_or_path, backend),
             allow_patterns=["*.safetensors", "*.safetensors.index.json", "config.json"],
         )
 
@@ -511,7 +523,7 @@ class Gemma3nForCausalLM(BaseForCausalLM):
         model = cls(config=config, model_device="meta")
         model.to(dtype=target_dtype)
 
-        safetensors_files = _resolve_safetensors_files(model_dir)
+        safetensors_files = resolve_safetensors_files(model_dir)
 
         prefix = hf_state_dict_prefix
         layer_pattern = re.compile(re.escape(prefix) + r"layers\.(\d+)\.")
@@ -532,7 +544,7 @@ class Gemma3nForCausalLM(BaseForCausalLM):
                     else:
                         shared[key] = path
 
-        shared_dict = _load_tensors_for_keys(shared, target_dtype)
+        shared_dict = load_tensors_for_keys(shared, target_dtype)
         normalized: dict[str, torch.Tensor] = {}
         for k, v in shared_dict.items():
             if k.startswith(prefix):
@@ -547,7 +559,7 @@ class Gemma3nForCausalLM(BaseForCausalLM):
 
         for layer_idx in sorted(per_layer.keys()):
             layer_key_to_file = per_layer.pop(layer_idx)
-            layer_sd = _load_tensors_for_keys(layer_key_to_file, target_dtype)
+            layer_sd = load_tensors_for_keys(layer_key_to_file, target_dtype)
             del layer_key_to_file
             remapped: dict[str, torch.Tensor] = {}
             for k, v in layer_sd.items():

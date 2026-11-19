@@ -9,6 +9,7 @@
 #     "coreai-core==1.0.0b3",
 #     "coreai-torch==0.4.3",
 #     "transformers[audio]>=5.9.0,<5.10.1",
+#     "protobuf",
 # ]
 #
 # [tool.uv]
@@ -30,6 +31,7 @@ import torch
 import transformers
 from coreai.runtime import AIModelAssetMetadata
 from coreai_torch import TorchConverter, get_decomp_table
+from nemo_checkpoint import load_from_nemo
 
 # Parakeet TDT exports as three separate graphs because the autoregressive
 # transducer loop (encoder frame pointer + (token, duration) sampling) lives
@@ -51,6 +53,22 @@ from coreai_torch import TorchConverter, get_decomp_table
 ENCODER_GRAPH = "encoder"
 DECODER_STEP_GRAPH = "decoder_step"
 JOINT_GRAPH = "joint"
+
+
+@dataclasses.dataclass(frozen=True)
+class ModelSource:
+    name: str
+    author: str
+    # The HF repo ships only NeMo's `.nemo` checkpoint, so it is converted at export time.
+    nemo_only: bool = False
+
+
+MODELS = {
+    "nvidia/parakeet-tdt-0.6b-v3": ModelSource(name="Parakeet-TDT v3", author="M. Sekoyan et al."),
+    "nvidia/parakeet-tdt-0.6b-v2": ModelSource(
+        name="Parakeet-TDT v2", author="NVIDIA", nemo_only=True
+    ),
+}
 
 
 class ParakeetEncoderModule(torch.nn.Module):
@@ -354,23 +372,23 @@ def _bundle_paths(
     return bundle_dir, assets
 
 
-def _build_aimodel_metadata(graph: str) -> AIModelAssetMetadata:
+def _build_aimodel_metadata(graph: str, model_name: str) -> AIModelAssetMetadata:
     metadata = AIModelAssetMetadata()
-    metadata.author = "M. Sekoyan et al."
+    metadata.author = MODELS[model_name].author
     metadata.license = "CC-BY-4.0"
     metadata.model_description = (
-        f"Parakeet-TDT v3 ASR ({graph} subgraph). Parakeet is a FastConformer "
+        f"{MODELS[model_name].name} ASR ({graph} subgraph). Parakeet is a FastConformer "
         f"encoder paired with a Token-and-Duration Transducer decoder that "
         f"predicts (token, duration) pairs for blank-skipping greedy decoding. "
-        f"Source: https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3"
+        f"Source: https://huggingface.co/{model_name}"
     )
     metadata.creation_date = int(time.time())
     return metadata
 
 
-def _save_program(program, model_path: Path, graph: str) -> None:
+def _save_program(program, model_path: Path, graph: str, model_name: str) -> None:
     model_path.parent.mkdir(parents=True, exist_ok=True)
-    program.save_asset(model_path, _build_aimodel_metadata(graph))
+    program.save_asset(model_path, _build_aimodel_metadata(graph, model_name))
     print(f"[INFO] Saved {graph} graph to {model_path}.")
 
 
@@ -482,6 +500,18 @@ def _log_streaming_window(geometry: dict) -> None:
     )
 
 
+def _load_model(
+    model_name: str, dtype: torch.dtype
+) -> tuple["transformers.ParakeetForTDT", "transformers.ProcessorMixin"]:
+    if MODELS[model_name].nemo_only:
+        print(f"[INFO] Converting {model_name} from its NeMo checkpoint...")
+        return load_from_nemo(model_name, dtype)
+    model = transformers.AutoModelForTDT.from_pretrained(
+        model_name, dtype=dtype, use_safetensors=True
+    )
+    return model, transformers.AutoProcessor.from_pretrained(model_name)
+
+
 def create_parakeet(
     output_dir: str,
     model_name: str,
@@ -493,9 +523,9 @@ def create_parakeet(
     window: StreamingWindowArgs | None = None,
 ):
     print(f"[INFO] Sourcing {model_name}...")
-    model = transformers.AutoModelForTDT.from_pretrained(
-        model_name, dtype=dtype, use_safetensors=True
-    )
+    # One load, threaded through: the processor sizes the window, shapes the dummy input, and
+    # ships in the bundle.
+    model, processor = _load_model(model_name, dtype)
     model.eval()
     config = model.config
     print(
@@ -503,9 +533,6 @@ def create_parakeet(
         f"decoder hidden={config.decoder_hidden_size}, vocab={config.vocab_size}, "
         f"durations={list(config.durations)}."
     )
-    # One load, threaded through: it sizes the window, shapes the dummy input, and ships in
-    # the bundle.
-    processor = transformers.AutoProcessor.from_pretrained(model_name)
 
     geometry = None
     if window is not None:
@@ -530,7 +557,7 @@ def create_parakeet(
         include_debug_info=include_debug_info,
         dynamic_shapes=_encoder_dynamic_shapes() if dynamic else None,
     )
-    _save_program(encoder_program, assets[ENCODER_GRAPH], ENCODER_GRAPH)
+    _save_program(encoder_program, assets[ENCODER_GRAPH], ENCODER_GRAPH, model_name)
 
     print(f"[INFO] Exporting {DECODER_STEP_GRAPH} graph...")
     decoder_program = _convert(
@@ -541,7 +568,7 @@ def create_parakeet(
         dtype=dtype,
         include_debug_info=include_debug_info,
     )
-    _save_program(decoder_program, assets[DECODER_STEP_GRAPH], DECODER_STEP_GRAPH)
+    _save_program(decoder_program, assets[DECODER_STEP_GRAPH], DECODER_STEP_GRAPH, model_name)
 
     print(f"[INFO] Exporting {JOINT_GRAPH} graph...")
     joint_program = _convert(
@@ -552,7 +579,7 @@ def create_parakeet(
         dtype=dtype,
         include_debug_info=include_debug_info,
     )
-    _save_program(joint_program, assets[JOINT_GRAPH], JOINT_GRAPH)
+    _save_program(joint_program, assets[JOINT_GRAPH], JOINT_GRAPH, model_name)
 
     _write_processor(bundle_dir / "processor", processor, model_name)
     _write_bundle_metadata(
@@ -605,7 +632,7 @@ def main():
     )
     parser.add_argument(
         "--model",
-        choices=["nvidia/parakeet-tdt-0.6b-v3"],
+        choices=list(MODELS),
         default="nvidia/parakeet-tdt-0.6b-v3",
         help="Model variant to convert.",
     )

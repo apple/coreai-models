@@ -37,8 +37,13 @@ extension FlowTransformerPipeline {
     }
 
     func makeSanaSprintPlan(_ configuration: PipelineConfiguration) async throws -> DenoisingPlan {
-        if configuration.isImageToImage && configuration.startingImage != nil {
+        if configuration.isImageToImage {
             throw PipelineLoadError.unsupportedConfiguration("Sana Sprint supports text-to-image only.")
+        }
+        if let requested = configuration.imageSize, requested != defaultImageSize.width {
+            throw PipelineLoadError.unsupportedConfiguration(
+                "Sana Sprint only produces \(defaultImageSize.width)×\(defaultImageSize.width); "
+                    + "got an image size of \(requested).")
         }
         if configuration.guidanceMode == .manual {
             throw PipelineLoadError.unsupportedConfiguration(
@@ -55,7 +60,7 @@ extension FlowTransformerPipeline {
         let latentCount = latentShape.reduce(1, *)
 
         // diffusers draws the initial latents and every step's renoise from one generator.
-        var rng = TorchRandomSource(seed: configuration.seed)
+        var rng = CoreAIShared.TorchRandomSource(seed: configuration.seed)
         let noise = rng.normalArray([latentCount])
 
         let scheduler = DiscreteFlowScheduler(
@@ -87,7 +92,8 @@ extension FlowTransformerPipeline {
             vaeShape: latentShape,
             denoiser: transformer,
             initialNoise: noise,
-            noiseShape: latentShape)
+            noiseShape: latentShape,
+            imageSize: defaultImageSize.width)
     }
 
     /// Returns the text encoder output `[1, textSequenceLength, D]` and its float mask.

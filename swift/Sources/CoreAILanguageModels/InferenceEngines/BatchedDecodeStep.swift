@@ -5,20 +5,23 @@
 
 // MARK: - Batched Decode Step
 
-/// Batched forward passes over the `N` rows of a batch KV cache: admitting a row, decoding all rows,
-/// and reading logits at every position. Sampling, stop handling and admission order stay with the
-/// caller.
+/// Batched forward passes over the `N` rows of a batch KV cache: prefilling a row, decoding all rows,
+/// and computing logits at every position. The caller handles sampling, stop conditions and admission
+/// order.
 ///
-/// The caller tracks each row's cursor. Neither method advances `session.processedTokenCount`.
+/// The caller tracks each row's position. `decodeBatch` and `commitRow` don't advance
+/// `session.processedTokenCount`; `prefillPiece` does advance the scratch session's count.
 ///
 /// ```swift
 /// let session = try engine.makeSessionState(batchSize: 2)
-/// let firstA = try await engine.prefillRow(row: 0, promptTokens: promptA, session: session)
-/// let firstB = try await engine.prefillRow(row: 1, promptTokens: promptB, session: session)
-/// // Sample nextA and nextB, then decode with each row at its own cursor.
+/// // Prefill row 0's prompt, except its last token, in a scratch session, then copy it into the row.
+/// let scratch = try engine.makeSessionState(batchSize: 1)
+/// try await engine.prefillPiece(promptA.dropLast(), scratch: scratch)
+/// try engine.commitRow(0, from: scratch, count: promptA.count - 1, session: session)
+/// // Row 0's first decode step processes its last prompt token at its own position; row 1 is unused.
 /// let logits = try await engine.decodeBatch(
-///     tokensPerRow: [[nextA], [nextB]],
-///     startPositions: [promptA.count, promptB.count],
+///     tokensPerRow: [[promptA.last!], [0]],
+///     startPositions: [promptA.count - 1, 0],
 ///     session: session)
 /// ```
 protocol BatchedDecodeStep {
@@ -38,14 +41,15 @@ protocol BatchedDecodeStep {
         session: GenerationSessionState
     ) async throws -> [[LogitsScalarType]]
 
-    /// Prefills `promptTokens` into row `row` of `session`'s KV cache, at positions
-    /// `[0, promptTokens.count)`, and returns the last prompt token's logits as `[vocab]`. The other
+    /// Prefills `tokens` into `scratch`, a batch-1 session from ``makeSessionState(batchSize:)``,
+    /// starting at its next position. No logits are read.
+    func prefillPiece(_ tokens: ArraySlice<Int32>, scratch: GenerationSessionState) async throws
+
+    /// Copies positions `[0, count)` of `scratch` into row `row` of `session`'s KV cache. The other
     /// rows are left untouched, so a request can join a running batch.
-    func prefillRow(
-        row: Int,
-        promptTokens: [Int32],
-        session: GenerationSessionState
-    ) async throws -> [LogitsScalarType]
+    func commitRow(
+        _ row: Int, from scratch: GenerationSessionState, count: Int, session: GenerationSessionState
+    ) throws
 
     /// Runs `tokensPerRow` (`[N][q]`, every row at `startPosition`) and returns the logits at every
     /// position, flat row-major `[N, q, vocab]`.

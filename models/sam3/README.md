@@ -5,7 +5,7 @@ SAM 3 (Segment Anything Model 3) is a unified vision model from Meta for prompta
 This export targets **iOS** by restructuring the model in a BC1S layout (channels-first, `Conv2d(1x1)` projections, fp16-safe primitives, rank-4 window attention) and splitting it into three independently optimizable functions:
 
 | Function       | Compression                                | Inputs                                                 | Outputs                                                                      |
-|----------------|--------------------------------------------|--------------------------------------------------------|------------------------------------------------------------------------------|
+| -------------- | ------------------------------------------ | ------------------------------------------------------ | ---------------------------------------------------------------------------- |
 | `image_encode` | 4-bit k-means palettization (gs=32) + fp16 | `pixel_values`                                         | `backbone_features`                                                          |
 | `text_encode`  | 6-bit k-means palettization (gs=8) + fp16  | `input_ids`                                            | `text_features`                                                              |
 | `detect`       | fp16 (no weight compression)               | `backbone_features`, `text_features`, `attention_mask` | `pred_masks`, `pred_boxes`, `pred_logits`, `presence_logits`, `semantic_seg` |
@@ -42,7 +42,7 @@ uv run export.py --help
 **Options:**
 
 | Flag                 | Description                                                               | Default                          |
-|----------------------|---------------------------------------------------------------------------|----------------------------------|
+| -------------------- | ------------------------------------------------------------------------- | -------------------------------- |
 | `--model`            | Model to export: `sam3` (shortname) or `facebook/sam3`                    | `facebook/sam3`                  |
 | `--full`             | Export plain HF `Sam3Model` (no iOS targeting)                            | —                                |
 | `--output-dir`       | Output directory for the bundle                                           | `<repo-root>/exports/`           |
@@ -79,7 +79,7 @@ Full bundles land at `<repo-root>/exports/<model>_<dtype>/` (e.g. `exports/sam3_
 ### In your iOS and macOS applications
 
 ```swift
-import ImageSegmenter
+import CoreAIImageSegmenter
 
 // Load from a segmenter bundle directory (contains metadata.json, *.aimodel, and tokenizer/)
 let segmenter = try await ImageSegmenter(resourcesAt: "coreai-models/exports/sam3_lite_336_w4_static")
@@ -97,7 +97,7 @@ swift run -c release image-segmenter --model path/to/exported_model_folder --pro
 ## Supported models
 
 | Model         | Parameters |
-|---------------|------------|
+| ------------- | ---------- |
 | facebook/sam3 | 848M       |
 
 [^1]: [Paper](https://arxiv.org/abs/2511.16719) · [HuggingFace](https://huggingface.co/facebook/sam3)

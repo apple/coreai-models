@@ -158,16 +158,11 @@ public struct SamplingConfiguration: Sendable, Equatable, Hashable {
         combined: Bool = true,
         seed: UInt64? = nil
     ) {
-        precondition(temperature >= 0, "Temperature must be non-negative.")
-        precondition(topK == nil || topK! > 0, "TopK must be positive if set.")
-        precondition(topP == nil || (topP! > 0 && topP! <= 1), "TopP must be in (0, 1] if set.")
-        precondition(minP == nil || (minP! > 0 && minP! <= 1), "MinP must be in (0, 1] if set.")
-        precondition(
-            repetitionPenalty == nil || repetitionPenalty! >= 1.0,
-            "Repetition penalty must be >= 1.0 if set.")
-        precondition(
-            repetitionPenaltyWindow == nil || repetitionPenaltyWindow! > 0,
-            "Repetition penalty window must be > 0 if set.")
+        if let error = Self.parameterError(
+            temperature, topK, topP, minP, repetitionPenalty, repetitionPenaltyWindow)
+        {
+            preconditionFailure(error.message(naming: error.parameter.rawValue))
+        }
 
         self.temperature = temperature
         self.topK = topK
@@ -177,6 +172,39 @@ public struct SamplingConfiguration: Sendable, Equatable, Hashable {
         self.repetitionPenaltyWindow = repetitionPenaltyWindow
         self.combined = combined
         self.seed = seed
+    }
+
+    /// The first out-of-range parameter, or nil. The initializer traps on the same checks.
+    package static func parameterError(
+        _ temperature: Double,
+        _ topK: Int? = nil,
+        _ topP: Double? = nil,
+        _ minP: Double? = nil,
+        _ repetitionPenalty: Double? = nil,
+        _ repetitionPenaltyWindow: Int? = nil
+    ) -> SamplingParameterError? {
+        // Each check is written so NaN fails it.
+        if !(temperature >= 0) {
+            return SamplingParameterError(parameter: .temperature, requirement: ">= 0", value: "\(temperature)")
+        }
+        if let topK, !(topK > 0) {
+            return SamplingParameterError(parameter: .topK, requirement: "> 0", value: "\(topK)")
+        }
+        if let topP, !(topP > 0 && topP <= 1) {
+            return SamplingParameterError(parameter: .topP, requirement: "in (0, 1]", value: "\(topP)")
+        }
+        if let minP, !(minP > 0 && minP <= 1) {
+            return SamplingParameterError(parameter: .minP, requirement: "in (0, 1]", value: "\(minP)")
+        }
+        if let repetitionPenalty, !(repetitionPenalty >= 1) {
+            return SamplingParameterError(
+                parameter: .repetitionPenalty, requirement: ">= 1", value: "\(repetitionPenalty)")
+        }
+        if let repetitionPenaltyWindow, !(repetitionPenaltyWindow > 0) {
+            return SamplingParameterError(
+                parameter: .repetitionPenaltyWindow, requirement: "> 0", value: "\(repetitionPenaltyWindow)")
+        }
+        return nil
     }
 
     /// A predefined configuration for deterministic, greedy token generation.
@@ -324,8 +352,26 @@ public struct SamplingConfiguration: Sendable, Equatable, Hashable {
     }
 }
 
+/// An out-of-range `SamplingConfiguration` parameter, from `SamplingConfiguration.parameterError`.
+package struct SamplingParameterError: Error, Equatable, Sendable {
+    package enum Parameter: String, Sendable {
+        case temperature, topK, topP, minP, repetitionPenalty, repetitionPenaltyWindow
+    }
+
+    package let parameter: Parameter
+    /// The accepted values, such as `>= 0` or `in (0, 1]`.
+    package let requirement: String
+    /// The rejected value.
+    package let value: String
+
+    /// `<name> must be <requirement>, got <value>`, with the caller's name for the parameter.
+    package func message(naming name: String) -> String {
+        "\(name) must be \(requirement), got \(value)"
+    }
+}
+
 extension SamplingConfiguration {
-    /// Samples the next token using CPU fallback samplers.
+    /// Samples the next token on the CPU.
     ///
     /// Routes to the appropriate sampler based on configuration:
     /// - Temperature == 0: Greedy (argmax)
@@ -336,10 +382,10 @@ extension SamplingConfiguration {
     ///   - step: Generation step index. Required when `seed` is set (each step derives its own
     ///     generator from `(seed, step)`); ignored otherwise.
     /// - Returns: The sampled token ID.
-    public func fallbackSampler(from logits: inout [LogitsScalarType], step: Int? = nil) -> Int32 {
+    public func cpuSampler(from logits: inout [LogitsScalarType], step: Int? = nil) -> Int32 {
         precondition(
             !needsRepetitionPenalty,
-            "Use fallbackSampler(from:tokenHistory:) when repetition penalty is configured"
+            "Use cpuSampler(from:tokenHistory:) when repetition penalty is configured"
         )
         return sampleToken(from: &logits, step: step)
     }
@@ -357,7 +403,7 @@ extension SamplingConfiguration {
     ///   - logitSoftcap: The model's final-logit soft cap, for models whose graph leaves it
     ///     out; see ``LogitSoftcapProcessor``.
     /// - Returns: The sampled token ID.
-    public func fallbackSampler(
+    public func cpuSampler(
         from logits: inout [LogitsScalarType],
         tokenHistory: some Collection<Int32>,
         step: Int? = nil,
@@ -384,7 +430,7 @@ extension SamplingConfiguration {
     /// With `seed` set, each step derives its own `SeededRandomNumberGenerator` from
     /// `(seed, step)`, so the sampled token is reproducible and independent of any running
     /// generator's stream position. With `seed` nil, the system generator is used. Greedy
-    /// (temperature 0) is argmax and ignores the generator. Used by both `fallbackSampler` and
+    /// (temperature 0) is argmax and ignores the generator. Used by both `cpuSampler` and
     /// the constrained-decoding path so seeded sampling is reproducible everywhere.
     ///
     /// - Parameters:
@@ -394,12 +440,29 @@ extension SamplingConfiguration {
     /// - Returns: The sampled token ID.
     public func sampleToken(from logits: inout [LogitsScalarType], step: Int?) -> Int32 {
         guard let seed else {
-            return CompositeSampler.sample(from: &logits, config: self)
+            return ReferenceSampler.sample(from: &logits, config: self)
         }
         guard let step else {
             preconditionFailure("A generation step index is required when a sampling seed is set.")
         }
-        var rng = SeededRandomNumberGenerator(seed: seed &+ UInt64(bitPattern: Int64(step)))
-        return CompositeSampler.sample(from: &logits, config: self, using: &rng)
+        var rng = CoreAIShared.SeededRandomNumberGenerator(seed: seed &+ UInt64(bitPattern: Int64(step)))
+        return ReferenceSampler.sample(from: &logits, config: self, using: &rng)
+    }
+
+    /// The former name of ``cpuSampler(from:step:)``.
+    @available(*, deprecated, renamed: "cpuSampler(from:step:)")
+    public func fallbackSampler(from logits: inout [LogitsScalarType], step: Int? = nil) -> Int32 {
+        cpuSampler(from: &logits, step: step)
+    }
+
+    /// The former name of ``cpuSampler(from:tokenHistory:step:logitSoftcap:)``.
+    @available(*, deprecated, renamed: "cpuSampler(from:tokenHistory:step:logitSoftcap:)")
+    public func fallbackSampler(
+        from logits: inout [LogitsScalarType],
+        tokenHistory: some Collection<Int32>,
+        step: Int? = nil,
+        logitSoftcap: Double? = nil
+    ) -> Int32 {
+        cpuSampler(from: &logits, tokenHistory: tokenHistory, step: step, logitSoftcap: logitSoftcap)
     }
 }

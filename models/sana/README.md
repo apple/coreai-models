@@ -25,15 +25,26 @@ uv run coreai.diffusion.export sana-sprint-1.6b
 ```
 
 These load `Efficient-Large-Model/Sana_Sprint_{0.6B,1.6B}_1024px_diffusers` with diffusers'
-`SanaSprintPipeline` and export in `bfloat16`. Other dtypes may be added in the future.
+`SanaSprintPipeline` and export in `bfloat16` with the `t8bit-te4bit-asym` compression preset:
+
+- **Transformer:** INT8 per-channel weights. INT4 here visibly degrades fine detail and text rendering.
+- **Text encoder:** INT4 asymmetric per-block weights, exported in `float16`, since the Core AI GPU
+  INT4 kernels need `float16` scales. INT4 here shifts compositions without degrading them.
+- **VAE decoder:** not quantized.
+
+For the full-precision `bfloat16` export, pass `--compression none`:
+
+```bash
+uv run coreai.diffusion.export sana-sprint-1.6b --compression none
+```
 
 ## Components
 
-| Component      | Asset                 | Size                          | Description                                                   |
-| -------------- | --------------------- | ----------------------------- | ------------------------------------------------------------- |
-| `transformer`  | `Transformer.aimodel` | 1.1 GB (0.6B) / 3.0 GB (1.6B) | Linear-attention DiT (28 / 20 blocks) on a 32x32x32 latent    |
-| `text_encoder` | `TextEncoder.aimodel` | 4.9 GB                        | Gemma-2-2B; returns the 300 tokens the transformer attends to |
-| `vae_decoder`  | `VAEDecoder.aimodel`  | 304 MB                        | DC-AE, 32x32 latent to 1024x1024 image                        |
+| Component      | Asset                 | Size (default)                | Size (`--compression none`)   | Description                                                   |
+| -------------- | --------------------- | ----------------------------- | ----------------------------- | ------------------------------------------------------------- |
+| `transformer`  | `Transformer.aimodel` | 570 MB (0.6B) / 1.5 GB (1.6B) | 1.1 GB (0.6B) / 3.0 GB (1.6B) | Linear-attention DiT (28 / 20 blocks) on a 32x32x32 latent    |
+| `text_encoder` | `TextEncoder.aimodel` | 1.4 GB                        | 4.9 GB                        | Gemma-2-2B; returns the 300 tokens the transformer attends to |
+| `vae_decoder`  | `VAEDecoder.aimodel`  | 304 MB                        | 304 MB                        | DC-AE, 32x32 latent to 1024x1024 image                        |
 
 Both variants share the text encoder, VAE, tokenizer, and sampler settings; only the transformer differs.
 

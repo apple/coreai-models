@@ -4,6 +4,7 @@
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
 import Foundation
+import Tokenizers
 
 /// Streaming parser that segments a model's text deltas into plain text and
 /// reasoning content emitted inside chain-of-thought markers.
@@ -48,6 +49,43 @@ public struct ThinkTagParser {
         if case .agentic = format {
             self.insideThink = true
         }
+    }
+
+    /// - Parameter startsInReasoning: The prompt already ends inside a reasoning block, so the
+    ///   output begins as reasoning and the first marker the model writes is the close. See
+    ///   ``promptOpensReasoning(_:tokenizer:format:)``.
+    public init(format: Format, startsInReasoning: Bool) {
+        self.init(format: format)
+        if case .tagPair = format, startsInReasoning {
+            self.insideThink = true
+        }
+    }
+
+    /// How many of a prompt's last tokens ``promptOpensReasoning(_:tokenizer:format:)`` decodes:
+    /// enough to hold a generation prompt's open marker and the whitespace after it (Qwen3's
+    /// `<think>\n` is two tokens), with room for a template that writes a few more.
+    public static let promptTailTokenCount = 8
+
+    /// Whether a rendered prompt leaves the model inside a reasoning block, judged from its last
+    /// ``promptTailTokenCount`` tokens. See ``promptOpensReasoning(_:format:)``.
+    public static func promptOpensReasoning(_ promptTokens: [Int], tokenizer: any Tokenizer, format: Format)
+        -> Bool
+    {
+        promptOpensReasoning(
+            tokenizer.decode(tokens: Array(promptTokens.suffix(promptTailTokenCount))), format: format)
+    }
+
+    /// Whether `promptTail`, the end of a rendered prompt, leaves the model inside a reasoning block:
+    /// it ends with the open marker and nothing after it but whitespace.
+    ///
+    /// A chat template that turns thinking on can write the open marker itself (Qwen3 ends the
+    /// prompt with `<think>\n`), so the model never generates it. A template that turns thinking off
+    /// writes an empty block (`<think>\n\n</think>\n\n`), which ends with the close, not the open.
+    public static func promptOpensReasoning(_ promptTail: String, format: Format) -> Bool {
+        guard case .tagPair(let open, _) = format,
+            let opened = promptTail.range(of: open, options: .backwards)
+        else { return false }
+        return promptTail[opened.upperBound...].allSatisfy(\.isWhitespace)
     }
 
     public mutating func consume(_ delta: String) -> [Event] {

@@ -56,6 +56,16 @@ struct SpeculativeDecodingOptionsTests {
         #expect(warning.hasPrefix("Warning: speculative decoding ignores"))
     }
 
+    @Test("A draft-head pack applies to the draft head only")
+    func draftHeadPack() {
+        #expect(
+            SpeculativeDecodingOptions.draftHeadPackProblem(hasPack: true, draftHead: false)?.contains("--speculative")
+                == true)
+        #expect(SpeculativeDecodingOptions.draftHeadPackProblem(hasPack: true, draftHead: true) == nil)
+        #expect(SpeculativeDecodingOptions.draftHeadPackProblem(hasPack: false, draftHead: true) == nil)
+        #expect(SpeculativeDecodingOptions.draftHeadPackProblem(hasPack: false, draftHead: false) == nil)
+    }
+
     @Test("A schema with speculative decoding needs greedy decoding")
     func grammarNeedsGreedy() throws {
         #expect(SpeculativeDecodingOptions.grammarSamplingProblem(greedy: true, hasSchema: true) == nil)
@@ -81,5 +91,22 @@ struct SpeculativeDecodingOptionsTests {
         }
         #expect(SpeculativeDecodingOptions.grammarProposalProblem(7, speculating: false, hasSchema: true) != nil)
         #expect(SpeculativeDecodingOptions.grammarProposalProblem(7, speculating: true, hasSchema: false) != nil)
+    }
+
+    @Test("Single-token stops become stop ids; no token of a longer sequence does")
+    func stopTokenSplit() {
+        let stops = SpeculativeDecodingOptions.stopTokenIds(
+            StopSequences(sequences: [[7], [3, 4], [9], [1, 2, 3]]))
+        #expect(stops.ids == [7, 9])
+        #expect(stops.ignored == [[3, 4], [1, 2, 3]])
+        #expect(SpeculativeDecodingOptions.stopTokenIds(StopSequences(sequences: [])).ids.isEmpty)
+    }
+
+    @Test("Multi-token stop strings are named in one warning, and nothing is said when there are none")
+    func multiTokenStopWarning() throws {
+        #expect(SpeculativeDecodingOptions.multiTokenStopWarning([]) == nil)
+        let warning = try #require(
+            SpeculativeDecodingOptions.multiTokenStopWarning(["two words", "a b", "two words"]))
+        #expect(warning.contains("'two words', 'a b'.") && warning.contains("single token"))
     }
 }

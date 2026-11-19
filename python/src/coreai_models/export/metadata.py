@@ -296,6 +296,26 @@ _METADATA: dict[str, AIModelMetadataFields] = {
             "Source: https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct"
         ),
     ),
+    "HuggingFaceTB/SmolLM3-3B": AIModelMetadataFields(
+        author="HuggingFace",
+        license="Apache-2.0",
+        model_description=(
+            "SmolLM3-3B is a 3B-parameter instruction-tuned causal language model "
+            "from HuggingFace, featuring hybrid NoPE/RoPE attention and "
+            "long-context support. "
+            "Source: https://huggingface.co/HuggingFaceTB/SmolLM3-3B"
+        ),
+    ),
+    "HuggingFaceTB/SmolLM3-3B-Base": AIModelMetadataFields(
+        author="HuggingFace",
+        license="Apache-2.0",
+        model_description=(
+            "SmolLM3-3B-Base is a 3B-parameter base causal language model from "
+            "HuggingFace, featuring hybrid NoPE/RoPE attention and long-context "
+            "support. "
+            "Source: https://huggingface.co/HuggingFaceTB/SmolLM3-3B-Base"
+        ),
+    ),
     "openai/gpt-oss-20b": AIModelMetadataFields(
         author="OpenAI",
         license="Apache-2.0",
@@ -380,6 +400,44 @@ _METADATA: dict[str, AIModelMetadataFields] = {
             "images and videos. It can detect, segment, and track objects using "
             "text or visual prompts such as points, boxes, and masks. "
             "Source: https://github.com/facebookresearch/sam3"
+        ),
+    ),
+    # ---- Embedding ----
+    "openai/clip-vit-base-patch32": AIModelMetadataFields(
+        author="A. Radford et al.",
+        license="MIT",
+        model_description=(
+            "CLIP (Contrastive Language-Image Pretraining) learns joint representations of "
+            "images and text, enabling zero-shot image classification with natural language "
+            "labels. Source: https://huggingface.co/openai/clip-vit-base-patch32"
+        ),
+    ),
+    "laion/clap-htsat-unfused": AIModelMetadataFields(
+        author="Y. Wu et al.",
+        license="Apache-2.0",
+        model_description=(
+            "CLAP (Contrastive Language-Audio Pretraining) learns joint representations of "
+            "audio and text, enabling zero-shot audio classification with natural language "
+            "labels. Source: https://huggingface.co/laion/clap-htsat-unfused"
+        ),
+    ),
+    "google/embeddinggemma-2": AIModelMetadataFields(
+        author="Google DeepMind",
+        license="Apache-2.0",
+        model_description=(
+            "EmbeddingGemma 2 is a multimodal retrieval embedding model from Google DeepMind "
+            "producing 768-d L2-normalized vectors (Matryoshka prefixes 512/256/128) for text "
+            "and images in one space. "
+            "Source: https://huggingface.co/google/embeddinggemma-2"
+        ),
+    ),
+    "Qwen/Qwen3-Embedding-0.6B": AIModelMetadataFields(
+        author="Qwen Team",
+        license="Apache-2.0",
+        model_description=(
+            "Qwen3-Embedding-0.6B is a multilingual text embedding model from the Qwen3 family "
+            "producing 1024-d L2-normalized vectors (Matryoshka prefixes down to 32) from the "
+            "last token. Source: https://huggingface.co/Qwen/Qwen3-Embedding-0.6B"
         ),
     ),
 }

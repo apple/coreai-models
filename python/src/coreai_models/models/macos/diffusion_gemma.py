@@ -249,7 +249,12 @@ class DiffusionGemmaAttention(nn.Module):
         self.k_norm = DiffusionGemmaRMSNorm(hd, eps=config.rms_norm_eps)
         self.v_norm = DiffusionGemmaRMSNorm(hd, eps=config.rms_norm_eps, with_scale=False)
 
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        # Stored as a plain attribute (like DecomposedRoPE._inv_freq) so
+        # model.to(dtype) does not round the frequencies to bfloat16.
+        # Note: Because inv_freq is a plain attribute, it is not tracked by
+        # named_buffers() or model.to(device). Runtime device placement and
+        # float32 precision are handled explicitly in _cos_sin.
+        self.inv_freq = inv_freq.float()
 
         if is_encoder:
             self.sdpa = SDPA(scale=1.0, window_size=sdpa_window, is_causal=True)
@@ -277,8 +282,8 @@ class DiffusionGemmaAttention(nn.Module):
         self, position_ids: torch.Tensor, dtype: torch.dtype
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Half-dim cos/sin [B, T, head_dim/2] from position_ids [B, T]."""
-        inv_freq = self.inv_freq
-        inv_freq_expanded = inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+        inv_freq = self.inv_freq.to(device=position_ids.device, dtype=torch.float32)
+        inv_freq_expanded = inv_freq[None, :, None].expand(position_ids.shape[0], -1, 1)
         position_ids_expanded = position_ids[:, None, :].float()
         freqs = (inv_freq_expanded @ position_ids_expanded).transpose(1, 2)  # [B, T, hd/2]
         return freqs.cos().to(dtype), freqs.sin().to(dtype)
@@ -823,20 +828,20 @@ def _load_state_dict_from_hub(
 
     from coreai_models.models.base import (
         _build_safetensors_key_index,
-        _load_tensors_for_keys,
-        _resolve_safetensors_files,
+        load_tensors_for_keys,
+        resolve_safetensors_files,
     )
 
     model_dir = snapshot_download(
         hf_model_id, allow_patterns=["*.safetensors", "*.safetensors.index.json"]
     )
-    sf_files = _resolve_safetensors_files(model_dir)
+    sf_files = resolve_safetensors_files(model_dir)
     per_layer, shared = _build_safetensors_key_index(
         sf_files, num_layers=num_layers, hf_state_dict_prefix=""
     )
-    sd: dict[str, torch.Tensor] = _load_tensors_for_keys(shared, target_dtype)
+    sd: dict[str, torch.Tensor] = load_tensors_for_keys(shared, target_dtype)
     for layer_idx in sorted(per_layer.keys()):
-        sd.update(_load_tensors_for_keys(per_layer[layer_idx], target_dtype))
+        sd.update(load_tensors_for_keys(per_layer[layer_idx], target_dtype))
     return sd
 
 

@@ -3,6 +3,8 @@
 // Use of this source code is governed by a BSD-3-clause license that can
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
+import CoreAIShared
+
 /// Which random number generator to use for noise generation.
 public enum RandomSourceType: Sendable {
     case numPy
@@ -16,13 +18,13 @@ public enum RandomSourceType: Sendable {
 public func generateNoise(count: Int, seed: UInt32, sourceType: RandomSourceType = .numPy) -> [Float] {
     switch sourceType {
     case .numPy:
-        var rng = NumPyRandomSource(seed: seed)
+        var rng = CoreAIShared.NumPyRandomSource(seed: seed)
         return (0..<count).map { _ in Float(rng.nextNormal()) }
     case .torch:
-        var rng = TorchRandomSource(seed: seed)
+        var rng = CoreAIShared.TorchRandomSource(seed: seed)
         return rng.normalArray([count])
     case .nvidia:
-        var rng = NvRandomSource(seed: seed)
+        var rng = CoreAIShared.NvRandomSource(seed: seed)
         return (0..<count).map { _ in Float(rng.nextNormal()) }
     }
 }

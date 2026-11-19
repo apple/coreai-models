@@ -3,6 +3,8 @@
 // Use of this source code is governed by a BSD-3-clause license that can
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
+import CoreAIShared
+import TestUtilities
 import Testing
 
 @testable import CoreAILanguageModels
@@ -40,7 +42,7 @@ struct WhitespaceLimitSamplingTests {
                 return Self.whitespaceTokens.contains(Int32(id)) ? base + whitespaceBoost : base
             }
             guard session.applyMask(to: &logits) else { break }
-            let token = CompositeSampler.sample(from: &logits, config: config, using: &rng)
+            let token = ReferenceSampler.sample(from: &logits, config: config, using: &rng)
             guard session.acceptToken(token) else { break }
             tokens.append(token)
         }

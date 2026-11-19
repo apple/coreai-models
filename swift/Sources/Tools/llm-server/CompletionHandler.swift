@@ -32,6 +32,8 @@ func handleCompletionsFromBody(body: ByteBuffer, state: ServerState) async throw
     let access: RequestAccess
     do {
         access = try await state.acquireScoringAccess()
+    } catch let refusal as MemoryRefusal {
+        return try outOfMemoryResponse(refusal.reason)
     } catch let error as ServerError {
         let err = ErrorResponse(
             error: .init(

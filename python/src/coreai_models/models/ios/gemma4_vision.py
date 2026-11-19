@@ -49,69 +49,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from coreai_models.primitives.ios.rms_norm import MaxAbsRMSNorm, MaxAbsRMSNormNoScale
 from coreai_models.primitives.ios.rope import apply_rope
 from coreai_models.primitives.ios.sdpa import SDPA
-
-# fp16-overflow-safe RMSNorm. RMSNorm is scale-invariant, so we normalize each row
-# by its own max magnitude *before* squaring: ``m = amax(|x|)`` (a data-dependent,
-# per-row reduction), ``xn = x/m``. Since ``|xn| <= 1``, ``xn^2`` can never overflow
-# fp16 (whereas raw ``x^2`` overflows once ``|x|>~256``: ``256^2~=65504``, the fp16 max
-# -- the tower's residual stream peaks at ``|x|~=500`` on real images, so raw ``x^2``
-# overflows to ``inf`` -> ``rsqrt(inf)=0`` -> zeroed features -> garbage soft tokens).
-#
-# The result is the *exact* RMSNorm because ``eps`` is folded back at the right scale::
-#
-#     xn*rsqrt(mean(xn^2) + (sqrt(eps)/m)^2) * w
-#       = (x/m)*rsqrt(mean(x^2)/m^2 + eps/m^2) * w
-#       = (x/m)*m*rsqrt(mean(x^2) + eps) * w
-#       = x*rsqrt(mean(x^2) + eps) * w
-#
-# ``(sqrt(eps)/m)^2`` computes ``eps/m^2`` without ever forming ``m^2`` (which would
-# itself overflow fp16 for ``m~=500``). Crucially this survives the ANE graph
-# optimizer: a constant prescale (``x*0.125``) gets reassociated back into ``x^2*c^2``
-# (recomputing the overflowing ``x^2``) or stripped as scale-invariant, but
-# ``x/amax(|x|)`` is data-dependent and cannot be folded away. All ops
-# (``abs``/``amax``/``div``/``mean``/``rsqrt``) are fp16 and ANE-resident -- no fp32
-# upcast.
-
-
-class RMSNormNoScale(nn.Module):
-    """RMSNorm without a learnable scale (v_norm and the projector pre-norm).
-
-    fp16-overflow-safe via per-row max-normalization before squaring (see the comment
-    directly above, and :class:`RMSNorm`, which adds the scale). Exact and ANE-resident (no fp32
-    upcast).
-    """
-
-    def __init__(self, eps: float = 1e-6) -> None:
-        super().__init__()
-        self._eps = eps
-        # Registered as a buffer (not a plain attribute) so it follows the module's
-        # device on `.to(device)` -- a plain `torch.tensor(...)` created in forward()
-        # defaults to CPU and raises on a GPU/MPS input (e.g. during parity tests).
-        self.register_buffer("_eps_sqrt", torch.tensor(eps**0.5), persistent=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Per-row max magnitude; clamp floor avoids 0/0 on an all-zero row (real rows
-        # have m >> floor, so this is a no-op for them).
-        m = torch.clamp(x.abs().amax(-1, keepdim=True), min=1e-4)
-        xn = x / m
-        eps_sqrt = self._eps_sqrt.to(dtype=x.dtype)
-        eps_term = (eps_sqrt / m) * (eps_sqrt / m)  # eps/m^2, no m^2 overflow
-        mean_square = (xn * xn).mean(-1, keepdim=True)
-        return xn * torch.rsqrt(mean_square + eps_term)
-
-
-class RMSNorm(RMSNormNoScale):
-    """:class:`RMSNormNoScale` followed by a learnable per-channel scale (last-dim reduction)."""
-
-    def __init__(self, dim: int, eps: float = 1e-6) -> None:
-        super().__init__(eps)
-        with torch.device("cpu"):
-            self.weight = nn.Parameter(torch.ones(dim))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return super().forward(x) * self.weight
 
 
 class ClippedConvLinear(nn.Module):
@@ -157,9 +97,9 @@ class VisionAttention(nn.Module):
         self.v_proj = ClippedConvLinear(dim, self.n_heads * self.head_dim)
         self.o_proj = ClippedConvLinear(self.n_heads * self.head_dim, dim)
 
-        self.q_norm = RMSNorm(self.head_dim, eps=eps)
-        self.k_norm = RMSNorm(self.head_dim, eps=eps)
-        self.v_norm = RMSNormNoScale(eps=eps)
+        self.q_norm = MaxAbsRMSNorm(self.head_dim, eps=eps)
+        self.k_norm = MaxAbsRMSNorm(self.head_dim, eps=eps)
+        self.v_norm = MaxAbsRMSNormNoScale(eps=eps)
 
         # scale 1.0: Q/K are RMS-normed, matching HF Gemma4VisionAttention.scaling.
         self.sdpa = SDPA(head_dim=self.head_dim, scale=1.0)
@@ -220,10 +160,10 @@ class VisionEncoderLayer(nn.Module):
         dim = config.hidden_size
         self.self_attn = VisionAttention(config)
         self.mlp = VisionMLP(config)
-        self.input_layernorm = RMSNorm(dim, eps=eps)
-        self.post_attention_layernorm = RMSNorm(dim, eps=eps)
-        self.pre_feedforward_layernorm = RMSNorm(dim, eps=eps)
-        self.post_feedforward_layernorm = RMSNorm(dim, eps=eps)
+        self.input_layernorm = MaxAbsRMSNorm(dim, eps=eps)
+        self.post_attention_layernorm = MaxAbsRMSNorm(dim, eps=eps)
+        self.pre_feedforward_layernorm = MaxAbsRMSNorm(dim, eps=eps)
+        self.post_feedforward_layernorm = MaxAbsRMSNorm(dim, eps=eps)
 
     def forward(
         self,
@@ -281,7 +221,7 @@ class Gemma4VisionEncoderForiOS(nn.Module):
         )
 
         # Projector (Gemma4MultimodalEmbedder): scale-less RMSNorm -> bias-free Linear.
-        self.embedding_pre_projection_norm = RMSNormNoScale(eps=config.rms_norm_eps)
+        self.embedding_pre_projection_norm = MaxAbsRMSNormNoScale(eps=config.rms_norm_eps)
         self.embedding_projection = nn.Conv2d(
             self.hidden_size, text_hidden_size, kernel_size=1, bias=False
         )

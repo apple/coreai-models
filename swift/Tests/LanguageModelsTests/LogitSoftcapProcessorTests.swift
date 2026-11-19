@@ -27,16 +27,16 @@ struct LogitSoftcapProcessorTests {
         }
     }
 
-    @Test("fallbackSampler caps before the repetition penalty")
+    @Test("cpuSampler caps before the repetition penalty")
     func fallbackSamplerCapsFirst() {
         // Uncapped, the penalty (÷2) leaves token 0 on top: 100 / 2 = 50 > 40. Capped at
         // 30 first, 30·tanh(100/30) / 2 ≈ 15 < 30·tanh(40/30) ≈ 26, so token 1 wins.
         let config = SamplingConfiguration(temperature: 0, repetitionPenalty: 2.0)
         var logits: [LogitsScalarType] = [100, 40, 0]
-        let token = config.fallbackSampler(from: &logits, tokenHistory: [0] as [Int32], logitSoftcap: 30)
+        let token = config.cpuSampler(from: &logits, tokenHistory: [0] as [Int32], logitSoftcap: 30)
         #expect(token == 1)
 
         var uncapped: [LogitsScalarType] = [100, 40, 0]
-        #expect(config.fallbackSampler(from: &uncapped, tokenHistory: [0] as [Int32]) == 0)
+        #expect(config.cpuSampler(from: &uncapped, tokenHistory: [0] as [Int32]) == 0)
     }
 }

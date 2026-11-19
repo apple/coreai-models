@@ -253,7 +253,13 @@ public struct LogitsWriter {
         tokenizer: any Tokenizer,
         k: Int
     ) -> [TopLogitEntry] {
-        extractTopK(from: logits.map({ Float($0) }), tokenizer: tokenizer, k: k)
+        // Callers in other modules run this unspecialized, so the engine's row type is widened in
+        // specialized code.
+        let row =
+            T.self == LogitsScalarType.self
+            ? unsafeBitCast(logits, to: [LogitsScalarType].self).map({ Float($0) })
+            : logits.map({ Float($0) })
+        return extractTopK(from: row, tokenizer: tokenizer, k: k)
     }
 
     public static func extractTopK(
@@ -261,18 +267,12 @@ public struct LogitsWriter {
         tokenizer: any Tokenizer,
         k: Int
     ) -> [TopLogitEntry] {
-        // Create array of (index, logit) pairs
-        let indexedLogits = logits.enumerated().map { ($0.offset, $0.element) }
-
-        // Sort by logit value (descending) and take top K
-        let topK =
-            indexedLogits
-            .sorted { $0.1 > $1.1 }
-            .prefix(k)
+        // LogitRowScan.topK overwrites the row it scans
+        var scratch = logits
+        let topK = scratch.withUnsafeMutableBufferPointer { LogitRowScan.topK($0, k: k, cap: nil) }
 
         // Convert to TopLogitEntry
-        return topK.map { index, logit in
-            let tokenId = Int32(index)
+        return zip(topK.indices, topK.values).map { tokenId, logit in
             let tokenText = tokenizer.decode(tokens: [Int(tokenId)])
             return TopLogitEntry(
                 tokenId: tokenId,
@@ -431,18 +431,18 @@ public struct LogitsWriter {
         // Get target probabilities
         let targetProbs = result.targetProbabilities()
 
-        // Use the helper to determine top-K for extraction
-        let topK = saveLogitsLength.topKForConsole
+        // Print each position (the JSON output extracts its own top-K)
+        if printToConsole {
+            // Use the helper to determine top-K for extraction
+            let topK = saveLogitsLength.topKForConsole
 
-        // Process each position
-        for (i, (logitsVec, targetToken)) in zip(result.logits, result.continuationTokens).enumerated() {
-            let targetText = i < continuationTexts.count ? continuationTexts[i] : "?"
-            let targetProb = i < targetProbs.count ? targetProbs[i] : 0.0
+            for (i, (logitsVec, targetToken)) in zip(result.logits, result.continuationTokens).enumerated() {
+                let targetText = i < continuationTexts.count ? continuationTexts[i] : "?"
+                let targetProb = i < targetProbs.count ? targetProbs[i] : 0.0
 
-            // Extract top-K for this position
-            let topLogits = extractTopK(from: logitsVec, tokenizer: tokenizer, k: topK)
+                // Extract top-K for this position
+                let topLogits = extractTopK(from: logitsVec, tokenizer: tokenizer, k: topK)
 
-            if printToConsole {
                 printEvaluationPosition(
                     position: i,
                     targetToken: targetToken,

@@ -65,10 +65,7 @@ public struct CoreAIVisionLanguageModel: LanguageModel {
 
         let tokenizer = try await tokenizerResult
 
-        let additionalStopTokenIds: Set<Int32> =
-            bundle.tokenizerPath.map {
-                LanguageConfig.additionalStopTokenIds(from: $0, tokenizer: tokenizer)
-            } ?? []
+        let additionalStopTokenIds = bundle.additionalStopTokenIds(tokenizer: tokenizer)
 
         self.executorConfiguration = CoreAIVLMExecutor.Configuration(
             bundleURL: url,
@@ -205,26 +202,13 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
         imageTokenId: Int32,
         tokenizer: any Tokenizer
     ) -> [Int32] {
-        let imageToken = tokenizer.convertIdToToken(Int(imageTokenId)) ?? "<|image_pad|>"
+        let imageToken = ImagePlaceholders.text(imageTokenId: imageTokenId, tokenizer: tokenizer)
         if let templated = try? PromptUtils.maybeApplyTokenizerChatTemplate(
-            .prompt("\(imageToken)\n\(userText)"), tokenizer: tokenizer)
+            .prompt("\(imageToken)\n\(userText)"), tokenizer: tokenizer),
+            let expanded = ImagePlaceholders.expand(
+                templated.map { Int32($0) }, imageTokenId: imageTokenId, tokenCounts: [imageTokenCount])
         {
-            var result: [Int32] = []
-            result.reserveCapacity(templated.count + imageTokenCount)
-            var expanded = false
-            for tokenInt in templated {
-                let token = Int32(tokenInt)
-                if token == imageTokenId {
-                    if !expanded {
-                        result.append(
-                            contentsOf: [Int32](repeating: imageTokenId, count: imageTokenCount))
-                        expanded = true
-                    }
-                    continue
-                }
-                result.append(token)
-            }
-            if expanded { return result }
+            return expanded
         }
 
         // Fallback for tokenizers without a multimodal chat template. Uses the

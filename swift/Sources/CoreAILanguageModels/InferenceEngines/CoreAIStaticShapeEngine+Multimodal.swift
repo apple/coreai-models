@@ -100,18 +100,8 @@ extension StaticShapeEngine: MultimodalInferenceEngine {
     /// Whether the engine was built with a vision model and its configuration.
     public var acceptsMultimodalInput: Bool { visionModel != nil && visionConfig != nil }
 
-    // CIContext is thread-safe and expensive to create; shared across every
-    // encodeImage(at:) call rather than allocated fresh each time.
-    private static let ciContext = CIContext()
-
     public func encodeImage(at url: URL) async throws -> InputEmbeddings {
-        guard let ciImage = CIImage(contentsOf: url) else {
-            throw ImagePreprocessorError.loadFailed(url)
-        }
-        guard let cgImage = Self.ciContext.createCGImage(ciImage, from: ciImage.extent) else {
-            throw ImagePreprocessorError.renderFailed
-        }
-        return try await encodeImage(cgImage: cgImage)
+        try await encodeImage(cgImage: ImagePreprocessor.loadCGImage(contentsOf: url))
     }
 
     public func encodeImage(cgImage: CGImage) async throws -> InputEmbeddings {
