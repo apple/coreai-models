@@ -241,9 +241,10 @@ public protocol InferenceEngine: Sendable {
     /// pipelined engine does, and only for a model whose state it can copy. Defaults to `false`.
     var prefixCacheEnabled: Bool { get }
 
-    /// Drops what the prefix cache holds in memory, for a caller short of it, and returns the bytes
-    /// freed: zero when there is no cache, or the engine is in use. Defaults to zero.
-    func shedPrefixCache() -> Int
+    /// Gives back at least `bytes` of what the prefix cache holds in memory, least recently used first,
+    /// or all of it when it holds less, for a caller short of memory. Returns the bytes freed: zero when
+    /// there is no cache, or the engine is in use. Defaults to zero.
+    func shedPrefixCache(atLeast bytes: Int) -> Int
 
     // MARK: - Configuration
 
@@ -311,7 +312,7 @@ extension InferenceEngine {
 
 extension InferenceEngine {
     public var prefixCacheEnabled: Bool { false }
-    public func shedPrefixCache() -> Int { 0 }
+    public func shedPrefixCache(atLeast bytes: Int) -> Int { 0 }
 }
 
 extension InferenceEngine {

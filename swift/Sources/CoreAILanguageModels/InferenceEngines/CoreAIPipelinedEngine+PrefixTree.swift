@@ -17,16 +17,21 @@ extension CoreAIPipelinedEngine {
 
     var prefixCacheEnabled: Bool { prefixTree != nil }
 
-    func shedPrefixCache() -> Int {
+    func shedPrefixCache(atLeast bytes: Int) -> Int {
         guard prefixTree != nil, tryAcquireEngine() else { return 0 }
         defer { releaseEngine() }
-        let freed =
-            (prefixTree?.bytesHeld ?? 0)
-            + engine.capturedSnapshots.reduce(0) { $0 + $1.copies.reduce(0) { $0 + $1.length } }
-        prefixTree?.removeAll()
-        publishedKeys = []
+        // Pending snapshot copies first: until the next publish they are held outside the budget.
+        var freed = engine.capturedSnapshots.reduce(0) { $0 + $1.copies.reduce(0) { $0 + $1.length } }
         engine.capturedSnapshots = []
-        if freed > 0 { CLILogger.log("prefix cache: dropped \(freed >> 20) MB to give memory back") }
+        if freed < bytes { freed += prefixTree?.evict(atLeast: bytes - freed) ?? 0 }
+        // Eviction takes leaves, so what is left of the published chain is a prefix of it.
+        publishedKeys = Array(publishedKeys.prefix { prefixTree?.contains($0) == true })
+        if freed > 0 {
+            CLILogger.log(
+                "prefix cache: gave back "
+                    + ByteCountFormatter.string(fromByteCount: Int64(freed), countStyle: .memory)
+                    + " for memory; " + (prefixTree?.summary ?? ""))
+        }
         return freed
     }
 

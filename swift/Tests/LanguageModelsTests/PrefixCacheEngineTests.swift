@@ -30,13 +30,21 @@ struct PrefixCacheEngineTests {
     private static let first = prompt(asking: "What colour are the marbles in Record 3?")
     private static let second = prompt(asking: "What is the label of the crate in Record 17?")
 
-    private func load(_ path: String, prefixCacheBytes: Int) async throws -> (any InferenceEngine, any Tokenizer) {
+    private func load(
+        _ path: String, prefixCacheBytes: Int, diskDirectory: URL? = nil
+    ) async throws -> (any InferenceEngine, any Tokenizer) {
         let bundle = try LanguageModelBundle(from: path)
         let engine = try await EngineFactory.createEngine(
             bundle: bundle,
             options: EngineOptions(
-                variant: "coreai-pipelined", tensorData: bundle.tensorData, prefixCacheBytes: prefixCacheBytes))
+                variant: "coreai-pipelined", tensorData: bundle.tensorData, prefixCacheBytes: prefixCacheBytes,
+                prefixCacheDiskBytes: diskDirectory == nil ? 0 : 1 << 30, prefixCacheDirectory: diskDirectory))
         return (engine, try await bundle.loadTokenizer())
+    }
+
+    /// Waits for `engine`'s last generation to give the engine back.
+    private func settle(_ engine: any InferenceEngine) async throws {
+        for _ in 0..<100 where engine.isBusy { try await Task.sleep(for: .milliseconds(20)) }
     }
 
     private func reply(_ prompt: String, engine: any InferenceEngine, tokenizer: any Tokenizer) async throws -> String {
@@ -78,8 +86,8 @@ struct PrefixCacheEngineTests {
         }
         #expect(withCache.map(\.text) == withoutCache)
         // The second and third diverge from the history inside the question, after the shared chunks.
-        #expect(withCache[1].restored >= 2 * 256)
-        #expect(withCache[2].restored >= 2 * 256)
+        #expect(withCache[1].restored >= 2 * CoreAIPipelinedEngine.prefixChunkTokens)
+        #expect(withCache[2].restored >= 2 * CoreAIPipelinedEngine.prefixChunkTokens)
     }
 
     @Test(
@@ -101,6 +109,58 @@ struct PrefixCacheEngineTests {
             withoutCache.append(try await reply(prompt, engine: cold, tokenizer: tokenizer))
         }
         #expect(withCache.map(\.text) == withoutCache)
+    }
+
+    @Test(
+        "A second engine on the same disk directory restores what the first one computed",
+        .enabled(if: ProcessInfo.processInfo.environment["COREAI_TEST_DECODE_BUNDLE"] != nil))
+    func diskAcrossEngines() async throws {
+        let path = try #require(ProcessInfo.processInfo.environment["COREAI_TEST_DECODE_BUNDLE"])
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PrefixCacheEngineTests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        do {
+            let (first, tokenizer) = try await load(path, prefixCacheBytes: 1 << 30, diskDirectory: directory)
+            _ = try await reply(Self.first, engine: first, tokenizer: tokenizer)
+            try await settle(first)
+            let store = try #require((first as? CoreAIPipelinedEngine)?.prefixStore)
+            store.flush()
+            #expect(store.nodeCount >= 2)
+        }
+        // The first engine is gone, and with it its hold on the directory.
+        let (second, tokenizer) = try await load(path, prefixCacheBytes: 1 << 30, diskDirectory: directory)
+        try #require((second as? CoreAIPipelinedEngine)?.prefixStore != nil)
+        let restored = try await replies([Self.second], engine: second, tokenizer: tokenizer)
+        #expect(restored[0].restored >= 2 * CoreAIPipelinedEngine.prefixChunkTokens)
+
+        let (cold, _) = try await load(path, prefixCacheBytes: 0)
+        #expect(restored[0].text == (try await reply(Self.second, engine: cold, tokenizer: tokenizer)))
+    }
+
+    @Test(
+        "Shedding for memory gives back what it says, least recently used first, and the cache fills again",
+        .enabled(if: ProcessInfo.processInfo.environment["COREAI_TEST_DECODE_BUNDLE"] != nil))
+    func shedForMemory() async throws {
+        let path = try #require(ProcessInfo.processInfo.environment["COREAI_TEST_DECODE_BUNDLE"])
+        let (engine, tokenizer) = try await load(path, prefixCacheBytes: 1 << 30)
+        let pipelined = try #require(engine as? CoreAIPipelinedEngine)
+        _ = try await reply(Self.first, engine: engine, tokenizer: tokenizer)
+        try await settle(engine)
+        let held = try #require(pipelined.prefixTree?.bytesHeld)
+        #expect(held > 0)
+
+        // One byte asked for takes one leaf.
+        let one = engine.shedPrefixCache(atLeast: 1)
+        #expect(one > 0 && one < held)
+        #expect(pipelined.prefixTree?.bytesHeld == held - one)
+        // More than it holds takes the rest.
+        #expect(engine.shedPrefixCache(atLeast: .max) == held - one)
+        #expect(pipelined.prefixTree?.nodeCount == 0)
+
+        // The next prompt's chunks are published again: what the engine had published is forgotten too.
+        _ = try await reply(Self.second, engine: engine, tokenizer: tokenizer)
+        try await settle(engine)
+        #expect((pipelined.prefixTree?.nodeCount ?? 0) >= 2)
     }
 }
 

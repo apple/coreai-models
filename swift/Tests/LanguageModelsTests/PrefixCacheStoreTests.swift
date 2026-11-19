@@ -162,15 +162,18 @@ struct PrefixCacheStoreTests {
     @Test("A damaged file takes its node and everything below it out")
     func damagedFileDropsSubtree() throws {
         try Self.withDirectory { directory in
-            let store = try #require(
-                PrefixCacheStore(directory: directory, byteBudget: 1 << 20, geometry: Self.geometry))
-            let chain = Self.writeChain(3, into: store)
-            let file = directory.appendingPathComponent("\(chain[1]).kv")
-            try Data([1, 2, 3]).write(to: file)
-            #expect(store.read(chain[1], withSnapshot: false) == nil)
-            store.flush()
-            #expect(store.nodeCount == 1)
-            #expect(store.record(of: chain[2]) == nil)
+            do {
+                let store = try #require(
+                    PrefixCacheStore(directory: directory, byteBudget: 1 << 20, geometry: Self.geometry))
+                let chain = Self.writeChain(3, into: store)
+                let file = directory.appendingPathComponent("\(chain[1]).kv")
+                try Data([1, 2, 3]).write(to: file)
+                #expect(store.read(chain[1], withSnapshot: false) == nil)
+                store.flush()
+                #expect(store.nodeCount == 1)
+                #expect(store.record(of: chain[2]) == nil)
+            }
+            // Reopened once the first store has let the directory go.
             let reopened = try #require(
                 PrefixCacheStore(directory: directory, byteBudget: 1 << 20, geometry: Self.geometry))
             #expect(reopened.nodeCount == 1)
@@ -198,6 +201,120 @@ struct PrefixCacheStoreTests {
                 PrefixCacheStore(directory: directory, byteBudget: 1 << 20, geometry: Self.geometry))
             #expect(reopened.nodeCount == 2)
             #expect(!FileManager.default.fileExists(atPath: stray.path))
+        }
+    }
+
+    @Test("Opening drops a node whose snapshot file is gone or the wrong size, and stray snapshot and temp files")
+    func openingDropsBrokenSnapshots() throws {
+        try Self.withDirectory { directory in
+            let chain: [PrefixTree.Key]
+            do {
+                let store = try #require(
+                    PrefixCacheStore(directory: directory, byteBudget: 1 << 20, geometry: Self.geometry))
+                chain = Self.writeChain(3, into: store)
+                store.write(snapshot: [Data(count: 16)], for: chain[1])
+                store.flush()
+            }
+            try Data([1, 2, 3]).write(to: directory.appendingPathComponent("\(chain[1]).state"))
+            let strayState = directory.appendingPathComponent("\(chain[0]).state")
+            try Data([0]).write(to: strayState)
+            let leftover = directory.appendingPathComponent("leftover.tmp")
+            try Data([0]).write(to: leftover)
+            let reopened = try #require(
+                PrefixCacheStore(directory: directory, byteBudget: 1 << 20, geometry: Self.geometry))
+            // The node with the short snapshot goes, and the one below it.
+            #expect(reopened.nodeCount == 1)
+            #expect(reopened.record(of: chain[1]) == nil && reopened.record(of: chain[2]) == nil)
+            #expect(!FileManager.default.fileExists(atPath: strayState.path))
+            #expect(!FileManager.default.fileExists(atPath: leftover.path))
+        }
+    }
+
+    @Test("A snapshot that no longer decodes takes its node and everything below it out")
+    func damagedSnapshotDropsSubtree() throws {
+        try Self.withDirectory { directory in
+            let store = try #require(
+                PrefixCacheStore(directory: directory, byteBudget: 1 << 20, geometry: Self.geometry))
+            let chain = Self.writeChain(2, into: store)
+            store.write(snapshot: [Data(count: 16)], for: chain[0])
+            store.flush()
+            try Data([1, 2, 3]).write(to: directory.appendingPathComponent("\(chain[0]).state"))
+            #expect(store.read(chain[0], withSnapshot: false) != nil)
+            #expect(store.read(chain[0], withSnapshot: true) == nil)
+            store.flush()
+            #expect(store.nodeCount == 0)
+        }
+    }
+
+    @Test("A snapshot that can't fit beside its chain is not written")
+    func oversizedSnapshotIsRefused() throws {
+        try Self.withDirectory { directory in
+            let store = try #require(
+                PrefixCacheStore(directory: directory, byteBudget: 3 * Self.nodeBytes, geometry: Self.geometry))
+            let chain = Self.writeChain(3, into: store)
+            store.write(snapshot: [Data(count: 2 * Self.nodeBytes)], for: chain[2])
+            store.flush()
+            #expect(store.record(of: chain[2])?.snapshotBytes == 0)
+            #expect(store.nodeCount == 3)
+        }
+    }
+
+    @Test("Opened under a smaller budget, the store keeps the most recently used chains and fits the budget")
+    func reopeningUnderASmallerBudget() throws {
+        try Self.withDirectory { directory in
+            let warm: [PrefixTree.Key]
+            let cold: [PrefixTree.Key]
+            do {
+                let store = try #require(
+                    PrefixCacheStore(directory: directory, byteBudget: 1 << 20, geometry: Self.geometry))
+                warm = Self.writeChain(2, from: 0, into: store)
+                cold = Self.writeChain(2, from: 50, into: store)
+                store.touch(warm)
+                store.flush()
+            }
+            let budget = 2 * Self.nodeBytes
+            let reopened = try #require(
+                PrefixCacheStore(directory: directory, byteBudget: budget, geometry: Self.geometry))
+            #expect(reopened.bytesHeld <= budget)
+            #expect(reopened.record(of: warm[0]) != nil && reopened.record(of: warm[1]) != nil)
+            #expect(reopened.record(of: cold[0]) == nil && reopened.record(of: cold[1]) == nil)
+            #expect(Self.files(in: directory, withExtension: "kv").count == 2)
+        }
+    }
+
+    @Test("Only one store at a time may use a directory")
+    func oneStorePerDirectory() throws {
+        try Self.withDirectory { directory in
+            do {
+                let first = try #require(
+                    PrefixCacheStore(directory: directory, byteBudget: 1 << 20, geometry: Self.geometry))
+                #expect(PrefixCacheStore(directory: directory, byteBudget: 1 << 20, geometry: Self.geometry) == nil)
+                Self.writeChain(1, into: first)
+            }
+            // The first is gone, and with it the lock.
+            let second = try #require(
+                PrefixCacheStore(directory: directory, byteBudget: 1 << 20, geometry: Self.geometry))
+            #expect(second.nodeCount == 1)
+        }
+    }
+
+    @Test("The index is compacted as uses pile up, not only when the store opens")
+    func indexStaysCompact() throws {
+        try Self.withDirectory { directory in
+            do {
+                let store = try #require(
+                    PrefixCacheStore(directory: directory, byteBudget: 1 << 20, geometry: Self.geometry))
+                let chain = Self.writeChain(2, into: store)
+                // 1,200 lines' worth of uses, against two live records.
+                for _ in 0..<600 { store.touch(chain) }
+                store.flush()
+                let lines = try String(contentsOf: directory.appendingPathComponent("index.jsonl"), encoding: .utf8)
+                    .split(separator: "\n").count
+                #expect(lines < 256)
+            }
+            let reopened = try #require(
+                PrefixCacheStore(directory: directory, byteBudget: 1 << 20, geometry: Self.geometry))
+            #expect(reopened.nodeCount == 2)
         }
     }
 

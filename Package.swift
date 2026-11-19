@@ -175,7 +175,7 @@ let package = Package(
             publicHeadersPath: "include"
         ),
 
-        // Memory measurement shared by the CLI tools (not itself a tool)
+        // Memory measurement and options shared by the CLI tools (not itself a tool)
         .target(
             name: "CoreAIMemoryMeasurement",
             dependencies: [
@@ -208,6 +208,7 @@ let package = Package(
             dependencies: [
                 "CoreAILanguageModels",
                 "CoreAILMCommon",
+                "CoreAIMemoryMeasurement",
                 "CoreAIShared",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
                 .product(name: "Hummingbird", package: "hummingbird"),

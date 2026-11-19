@@ -6,6 +6,7 @@
 import ArgumentParser
 import CoreAILMCommon
 import CoreAILanguageModels
+import CoreAIMemoryMeasurement
 import CoreAIShared
 import Foundation
 import Hummingbird
@@ -98,21 +99,7 @@ struct LLMServer: AsyncParsableCommand {
     @Option(name: .customLong("kv-cache-initial-capacity"), help: "Initial KV cache capacity in tokens")
     var kvCacheInitialCapacity: Int?
 
-    @Option(
-        name: .customLong("prefix-cache-mb"),
-        help: ArgumentHelp(
-            "Megabytes of earlier prompts' state to keep, so a prompt that starts the same way restores "
-                + "that prefix instead of computing it (default: 1024; 0 turns it off; pipelined engine only)")
-    )
-    var prefixCacheMB: Int?
-
-    @Option(
-        name: .customLong("prefix-cache-disk-mb"),
-        help: ArgumentHelp(
-            "Megabytes of disk the prefix cache may also use, under ~/Library/Caches/coreai-prefix-cache, so "
-                + "it can outgrow --prefix-cache-mb and is kept across restarts (default: 0, memory only)")
-    )
-    var prefixCacheDiskMB: Int = 0
+    @OptionGroup var prefixCache: PrefixCacheOptions
 
     @Option(
         name: .customLong("chunk-size"),
@@ -172,13 +159,7 @@ struct LLMServer: AsyncParsableCommand {
     var verbose: Bool = false
 
     func validate() throws {
-        if let mb = prefixCacheMB, !(0...(Int.max >> 20)).contains(mb) {
-            throw ValidationError("--prefix-cache-mb must be between 0 and \(Int.max >> 20) (got \(mb))")
-        }
-        if !(0...(Int.max >> 20)).contains(prefixCacheDiskMB) {
-            throw ValidationError(
-                "--prefix-cache-disk-mb must be between 0 and \(Int.max >> 20) (got \(prefixCacheDiskMB))")
-        }
+        try prefixCache.validate(defaultMB: EngineOptions.suggestedPrefixCacheBytes >> 20)
         guard maxQueueDepth >= 0 else {
             throw ValidationError("--max-queue-depth must be >= 0 (got \(maxQueueDepth))")
         }
@@ -225,9 +206,9 @@ struct LLMServer: AsyncParsableCommand {
             prefillChunkSize: resolvedChunkSize,
             prefillChunkThreshold: resolvedChunkThreshold,
             tensorData: bundle.tensorData,
-            prefixCacheBytes: (prefixCacheMB ?? EngineOptions.suggestedPrefixCacheBytes >> 20) << 20,
-            prefixCacheDiskBytes: prefixCacheDiskMB << 20,
-            prefixCacheDirectory: prefixCacheDiskMB > 0
+            prefixCacheBytes: prefixCache.memoryBytes(defaultMB: EngineOptions.suggestedPrefixCacheBytes >> 20),
+            prefixCacheDiskBytes: prefixCache.diskBytes,
+            prefixCacheDirectory: prefixCache.diskBytes > 0
                 ? EngineOptions.defaultPrefixCacheDirectory(forModelAt: bundle.bundlePath) : nil
         )
 
@@ -245,11 +226,7 @@ struct LLMServer: AsyncParsableCommand {
         let engineConfig = ModelConfig(bundle: bundle)
         // A vision-language bundle builds an engine that also takes images.
         let engine = try await EngineFactory.createEngine(bundle: bundle, options: engineOptions)
-        if let mb = prefixCacheMB, mb > 0, !engine.prefixCacheEnabled {
-            print(
-                "⚠️  --prefix-cache-mb \(mb): no prefix cache here. Only the pipelined engine keeps one, and not "
-                    + "for every model (--verbose says why).")
-        }
+        if let warning = prefixCache.ignoredWarning(cacheEnabled: engine.prefixCacheEnabled) { print(warning) }
 
         let tokenizer = try await bundle.loadTokenizer()
 

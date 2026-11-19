@@ -31,12 +31,17 @@ public final class FixedMTLBufferState {
             }, device: device)
     }
 
-    /// States of the given shapes, laid out densely, for a caller with no model descriptor to hand.
+    /// States of the given shapes, laid out densely, for a caller with no model descriptor to hand:
+    /// `NDArrayDescriptor` has no public initializer. For types a whole number of bytes wide.
     package convenience init(
         dense states: [(name: String, scalarType: NDArray.ScalarType, shape: [Int])], device: MTLDevice
     ) throws {
         try self.init(
             layouts: states.map { name, type, shape in
+                guard !shape.contains(where: { $0 < 0 }) else {
+                    throw InferenceRuntimeError.invalidOutputType(
+                        "FixedMTLBufferState '\(name)' has dynamic shape \(shape)")
+                }
                 let strides = shape.indices.map { shape[($0 + 1)...].reduce(1, *) }
                 return (name, type, shape, strides, shape.reduce(1, *) * type.byteSize)
             }, device: device)

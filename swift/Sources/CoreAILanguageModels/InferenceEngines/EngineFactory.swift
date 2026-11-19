@@ -473,11 +473,15 @@ public struct EngineOptions: Sendable {
     /// Every chunk the cache keeps in memory is also written to disk, in the background, and a prompt
     /// that runs past what memory holds reads the next chunks back from there. So this may be larger
     /// than ``prefixCacheBytes``, and a restarted engine reuses what an earlier one computed. Needs
-    /// ``prefixCacheBytes`` too: chunks reach the KV cache through memory.
+    /// ``prefixCacheBytes`` and ``prefixCacheDirectory`` too: chunks reach the KV cache through memory.
+    /// Without either, the engine logs why and keeps no disk tier.
     public var prefixCacheDiskBytes: Int
 
     /// Where the prefix cache keeps its files: a directory for this model alone, such as
     /// ``defaultPrefixCacheDirectory(forModelAt:)``. Nil keeps the cache in memory only.
+    ///
+    /// One process at a time: an engine that finds the directory in use by another runs without a disk
+    /// tier, and logs it.
     public var prefixCacheDirectory: URL?
 
     /// A directory for the prefix cache of the model at `modelURL`, under the user's caches directory.

@@ -104,6 +104,13 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
                 directory: directory, byteBudget: options.prefixCacheDiskBytes, geometry: geometry)
         } else {
             prefixStore = nil
+            // A disk budget asked for and not used says why.
+            if options.prefixCacheDiskBytes > 0 {
+                CLILogger.log(
+                    "prefix cache: no disk tier: "
+                        + (prefixTree == nil
+                            ? "it needs the memory cache, which is off" : "prefixCacheDirectory is not set"))
+            }
         }
     }
 

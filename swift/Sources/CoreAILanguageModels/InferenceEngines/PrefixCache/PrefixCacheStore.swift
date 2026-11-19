@@ -19,12 +19,14 @@ import Synchronization
 ///
 /// ```
 /// geometry      the layout the files were written for; a directory written for another is emptied
-/// index.jsonl   one record per line, appended to, and compacted when the store opens
+/// index.jsonl   one record per line, appended to, and compacted when the store opens and as it grows
 /// <key>.kv      a chunk's KV, one blob per KV state
 /// <key>.state   the recurrent state at the chunk's end, one blob per state
+/// lock          held while a store has the directory open
 /// ```
 ///
-/// Like the tree, the store keeps every chain whole: it evicts the least recently used leaf first.
+/// Like the tree, the store keeps every chain whole: it evicts the least recently used leaf first. One
+/// process at a time may use a directory: a second finds it locked and runs without a disk tier.
 package final class PrefixCacheStore: Sendable {
     package typealias Key = PrefixTree.Key
 
@@ -64,6 +66,8 @@ package final class PrefixCacheStore: Sendable {
         var writtenNodes = 0
         var readNodes = 0
         var evictedNodes = 0
+        /// Lines in the index file, live or not, so it is compacted before it outgrows the live ones.
+        var indexLines = 0
     }
 
     private let index = Mutex(Index())
@@ -75,13 +79,18 @@ package final class PrefixCacheStore: Sendable {
     private static let indexName = "index.jsonl"
     private static let kvExtension = "kv"
     private static let stateExtension = "state"
+    private static let lockName = "lock"
+
+    /// The lock file, open for as long as the store: closing it lets another process have the directory.
+    private let lock: Int32
 
     /// Opens, or creates, the store in `directory`.
     ///
     /// - Parameters:
     ///   - geometry: Describes how the files' bytes are laid out. A directory stamped with another is
     ///     emptied first, since its keys would still match but its bytes would not fit.
-    /// - Returns: Nil when the directory can't be created or the budget is not positive.
+    /// - Returns: Nil when the directory can't be created, another process has it open, or the budget
+    ///   is not positive.
     package init?(directory: URL, byteBudget: Int, geometry: String) {
         guard byteBudget > 0 else { return nil }
         do {
@@ -90,10 +99,23 @@ package final class PrefixCacheStore: Sendable {
             CLILogger.log("prefix cache: no disk tier, cannot create \(directory.path): \(error)")
             return nil
         }
+        // Another process's store would delete the files this one writes, and this one its files.
+        let lock = open(directory.appendingPathComponent(Self.lockName).path, O_CREAT | O_RDWR, 0o644)
+        guard lock >= 0, flock(lock, LOCK_EX | LOCK_NB) == 0 else {
+            if lock >= 0 { close(lock) }
+            CLILogger.log(
+                "prefix cache: no disk tier, another process is using \(directory.path)", level: 0)
+            return nil
+        }
+        self.lock = lock
         self.directory = directory
         self.byteBudget = byteBudget
         Self.matchOrDiscard(geometry: geometry, in: directory)
         load()
+    }
+
+    deinit {
+        close(lock)
     }
 
     // MARK: - Opening
@@ -107,12 +129,13 @@ package final class PrefixCacheStore: Sendable {
             CLILogger.log("prefix cache: emptying \(directory.lastPathComponent), written for another layout")
         }
         let files = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
-        for file in files { try? FileManager.default.removeItem(at: file) }
+        for file in files where file.lastPathComponent != lockName { try? FileManager.default.removeItem(at: file) }
         try? geometry.write(to: stamp, atomically: true, encoding: .utf8)
     }
 
-    /// Replays the index, keeps the records whose chain and files are whole, and rewrites it with just
-    /// those, least recently used first. Then deletes every file it does not name.
+    /// Replays the index, keeps the records whose chain and files are whole, evicts the least recently
+    /// used leaves while they are over the budget, and rewrites it with what is left, least recently
+    /// used first. Then deletes every file it does not name.
     private func load() {
         var replayed: [Key: Record] = [:]
         // A node's last line is its last use, so sorting by it puts the least recently used first.
@@ -133,30 +156,22 @@ package final class PrefixCacheStore: Sendable {
             for record in order.compactMap({ replayed[$0] }).sorted(by: { $0.depth < $1.depth }) {
                 let parentKept = record.parent.map { index.entries[$0] != nil } ?? (record.depth == 1)
                 guard parentKept, record.depth > 0, fileSize(kvURL(record.key)) == record.kvBytes,
-                    record.snapshotBytes == 0 || fileSize(stateURL(record.key)) == record.snapshotBytes,
-                    index.bytesHeld + record.bytes <= byteBudget
+                    record.snapshotBytes == 0 || fileSize(stateURL(record.key)) == record.snapshotBytes
                 else { continue }
                 index.entries[record.key] = Entry(record: record)
                 index.bytesHeld += record.bytes
                 if let parent = record.parent { index.entries[parent]?.children += 1 }
             }
-            var out: [Record] = []
-            for key in order {
-                guard let entry = index.entries[key] else { continue }
+            for key in order where index.entries[key] != nil {
                 index.clock += 1
                 index.entries[key]?.lastUsed = index.clock
-                out.append(entry.record)
             }
-            return out
+            // A budget smaller than the one the files were written under: the coldest go first.
+            _ = makeRoom(for: 0, keepingChainOf: nil, in: &index)
+            return liveRecords(in: index)
         }
 
-        var compacted = Data()
-        for record in kept {
-            guard let line = try? JSONEncoder().encode(record) else { continue }
-            compacted.append(line)
-            compacted.append(0x0A)
-        }
-        try? compacted.write(to: indexURL, options: .atomic)
+        writeIndex(kept)
 
         let names = Set(kept.map(\.key))
         let snapshotted = Set(kept.filter { $0.snapshotBytes > 0 }.map(\.key))
@@ -173,8 +188,8 @@ package final class PrefixCacheStore: Sendable {
                     try? FileManager.default.removeItem(at: file)
                 }
             default:
-                // The stamp and the index; anything else is a write a crash left behind.
-                if file.lastPathComponent != Self.geometryName, file.lastPathComponent != Self.indexName {
+                // The stamp, the index and the lock; anything else is a write a crash left behind.
+                if ![Self.geometryName, Self.indexName, Self.lockName].contains(file.lastPathComponent) {
                     try? FileManager.default.removeItem(at: file)
                 }
             }
@@ -213,7 +228,7 @@ package final class PrefixCacheStore: Sendable {
                 } else if depth != 1 {
                     return nil
                 }
-                return makeRoom(for: size, protecting: ancestors(of: parent, in: index), in: &index)
+                return makeRoom(for: size, keepingChainOf: parent, in: &index)
             }
             guard let evicted else { return }
             for victim in evicted { deleteFiles(of: victim) }
@@ -240,7 +255,7 @@ package final class PrefixCacheStore: Sendable {
             let size = Self.encodedSize(of: snapshot)
             let evicted = index.withLock { index -> [Key]? in
                 guard let entry = index.entries[key], entry.record.snapshotBytes == 0 else { return nil }
-                return makeRoom(for: size, protecting: ancestors(of: key, in: index), in: &index)
+                return makeRoom(for: size, keepingChainOf: key, in: &index)
             }
             guard let evicted else { return }
             for victim in evicted { deleteFiles(of: victim) }
@@ -279,18 +294,21 @@ package final class PrefixCacheStore: Sendable {
 
     // MARK: - Reading
 
-    /// `key`'s chunk, and its snapshot when `withSnapshot` and it has one, mapped from disk.
+    /// `key`'s chunk, and its snapshot when `withSnapshot` and it has one, read from disk.
+    ///
+    /// Read rather than mapped: the tree keeps what this returns, and a mapping would hold an evicted
+    /// file's space on disk past the budget, and count the system's file cache as the tree's memory.
     ///
     /// A file that is gone or does not parse takes the node, and everything below it, out of the store.
     package func read(_ key: Key, withSnapshot: Bool) -> (chunk: [Data], snapshot: [Data]?)? {
         guard let record = record(of: key) else { return nil }
-        guard let chunk = Self.decode(mapping: kvURL(key)) else {
+        guard let chunk = Self.decode(contentsOf: kvURL(key)) else {
             remove(key)
             return nil
         }
         var snapshot: [Data]?
         if withSnapshot, record.snapshotBytes > 0 {
-            guard let state = Self.decode(mapping: stateURL(key)) else {
+            guard let state = Self.decode(contentsOf: stateURL(key)) else {
                 remove(key)
                 return nil
             }
@@ -320,11 +338,13 @@ package final class PrefixCacheStore: Sendable {
 
     // MARK: - Eviction
 
-    /// Evicts least-recently-used leaves from the index until `bytes` more fit, never one in
-    /// `protected`, which holds every ancestor of each of its nodes. Returns them, for the caller to
-    /// delete once the lock is let go, or nil, having evicted nothing, when `bytes` can't fit.
-    private func makeRoom(for bytes: Int, protecting protected: Set<Key>, in index: inout Index) -> [Key]? {
+    /// Evicts least-recently-used leaves from the index until `bytes` more fit, never `key` or a node
+    /// above it. Returns them, for the caller to delete once the lock is let go, or nil, having evicted
+    /// nothing, when `bytes` can't fit.
+    private func makeRoom(for bytes: Int, keepingChainOf key: Key?, in index: inout Index) -> [Key]? {
+        guard index.bytesHeld + bytes > byteBudget else { return [] }
         // Every other node is evictable, leaves first, so this is exactly what can be freed.
+        let protected = ancestors(of: key, in: index)
         let protectedBytes = protected.reduce(0) { $0 + (index.entries[$1]?.record.bytes ?? 0) }
         guard protectedBytes + bytes <= byteBudget else { return nil }
         var evicted: [Key] = []
@@ -374,10 +394,23 @@ package final class PrefixCacheStore: Sendable {
         ((try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? NSNumber)?.intValue ?? -1
     }
 
-    /// Appends one record to the index. A crash costs at most the line being written.
+    /// Appends one record to the index. A crash costs at most the line being written. Only ever called
+    /// on the queue.
+    ///
+    /// Every use and removal adds a line, so once the file holds four times the live records, and at
+    /// least 256 lines, it is rewritten with just those.
     private func append(_ record: Record) {
         guard var line = try? JSONEncoder().encode(record) else { return }
         line.append(0x0A)
+        let live = index.withLock { index -> [Record]? in
+            index.indexLines += 1
+            guard index.indexLines >= Swift.max(256, 4 * index.entries.count) else { return nil }
+            return liveRecords(in: index)
+        }
+        if let live {
+            writeIndex(live)
+            return
+        }
         if let handle = try? FileHandle(forWritingTo: indexURL) {
             defer { try? handle.close() }
             _ = try? handle.seekToEnd()
@@ -385,6 +418,23 @@ package final class PrefixCacheStore: Sendable {
         } else {
             try? line.write(to: indexURL)
         }
+    }
+
+    /// The records held, least recently used first, as the index lists them.
+    private func liveRecords(in index: Index) -> [Record] {
+        index.entries.values.sorted { $0.lastUsed < $1.lastUsed }.map(\.record)
+    }
+
+    /// Replaces the index with `records`, one line each.
+    private func writeIndex(_ records: [Record]) {
+        var out = Data()
+        for record in records {
+            guard let line = try? JSONEncoder().encode(record) else { continue }
+            out.append(line)
+            out.append(0x0A)
+        }
+        try? out.write(to: indexURL, options: .atomic)
+        index.withLock { $0.indexLines = records.count }
     }
 
     /// A file's bytes: the blob count, each blob's length, then the blobs, all little-endian.
@@ -405,9 +455,9 @@ package final class PrefixCacheStore: Sendable {
         4 + 8 * blobs.count + blobs.reduce(0) { $0 + $1.count }
     }
 
-    /// The blobs in `url`, mapped rather than read, or nil when it is gone or does not parse.
-    static func decode(mapping url: URL) -> [Data]? {
-        guard let file = try? Data(contentsOf: url, options: .mappedIfSafe) else { return nil }
+    /// The blobs in `url`, or nil when it is gone or does not parse.
+    static func decode(contentsOf url: URL) -> [Data]? {
+        guard let file = try? Data(contentsOf: url) else { return nil }
         return decode(file)
     }
 
@@ -426,7 +476,7 @@ package final class PrefixCacheStore: Sendable {
             lengths.append(length)
         }
         guard remaining == 0 else { return nil }
-        // Slices, so a mapped file is not copied until its bytes go where they are used.
+        // Slices of the one read, so the file's bytes are not copied again.
         var cursor = file.startIndex + header
         return lengths.map { length in
             defer { cursor += length }
@@ -439,11 +489,10 @@ package final class PrefixCacheStore: Sendable {
     /// One line for a log.
     package var summary: String {
         index.withLock { index in
-            String(
-                format: "disk %d node(s), %.1f of %.1f GiB, %d written, %d read, %d evicted",
-                index.entries.count, Double(index.bytesHeld) / 1_073_741_824,
-                Double(byteBudget) / 1_073_741_824, index.writtenNodes, index.readNodes,
-                index.evictedNodes)
+            let held = ByteCountFormatter.string(fromByteCount: Int64(index.bytesHeld), countStyle: .memory)
+            let budget = ByteCountFormatter.string(fromByteCount: Int64(byteBudget), countStyle: .memory)
+            return "disk \(index.entries.count) node(s), \(held) of \(budget), \(index.writtenNodes) written, "
+                + "\(index.readNodes) read, \(index.evictedNodes) evicted"
         }
     }
 
