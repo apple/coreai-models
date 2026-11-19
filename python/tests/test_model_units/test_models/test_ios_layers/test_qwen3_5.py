@@ -24,13 +24,18 @@ import torch
 pytest.importorskip("transformers")
 
 try:  # transformers>=5.5 (qwen3_5)
-    from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+    from transformers.models.qwen3_5.configuration_qwen3_5 import (
+        Qwen3_5Config,
+        Qwen3_5TextConfig,
+    )
     from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
 except Exception:  # pragma: no cover - requires transformers>=5.5
+    Qwen3_5Config = None
     Qwen3_5TextConfig = None
     Qwen3_5ForCausalLM = None
 
 from coreai_models._constants import EXTEND_FUNCTION_NAME  # noqa: E402
+from coreai_models.export import pipeline as export_pipeline  # noqa: E402
 from coreai_models.models.ios.qwen3_5 import (  # noqa: E402
     Qwen3_5Extend,
     Qwen3_5ForCausalLMForiOS,
@@ -77,6 +82,15 @@ def tiny_config(n_layers: int = 4, ctx: int = CTX) -> Qwen3_5TextConfig:
     # independent random head.
     cfg.tie_word_embeddings = True
     return cfg
+
+
+def _ios_export_config(monkeypatch) -> "export_pipeline.ExportConfig":
+    """An iOS export of Qwen3.5 whose checkpoint config is the tiny one, read without network."""
+    hf_config = Qwen3_5Config(text_config=tiny_config().to_dict())
+    monkeypatch.setattr(export_pipeline.AutoConfig, "from_pretrained", lambda *_, **__: hf_config)
+    return export_pipeline.ExportConfig(
+        hf_model_id="Qwen/Qwen3.5-2B", variant="iOS", compression="none"
+    )
 
 
 def randomize(model: torch.nn.Module) -> None:
@@ -551,6 +565,19 @@ class TestExportRecipe:
         assert entry.ios_export_script == "models/qwen3_5/export.py"
         repo_root = pathlib.Path(__file__).resolve().parents[5]
         assert (repo_root / entry.ios_export_script).is_file()
+
+    def test_evaluation_resolves_the_ios_class(self, monkeypatch):
+        """Evaluation resolves the iOS class through `resolve_model`, so only export may refuse."""
+        resolved = export_pipeline.resolve_model(_ios_export_config(monkeypatch))
+        assert resolved.model_class is Qwen3_5ForCausalLMForiOS
+
+    def test_export_points_at_the_recipe_before_loading_weights(self, monkeypatch):
+        def load(*_, **__):
+            raise AssertionError("export loaded the weights before refusing")
+
+        monkeypatch.setattr(Qwen3_5ForCausalLMForiOS, "from_hf", classmethod(load))
+        with pytest.raises(ValueError, match="uv run models/qwen3_5/export.py"):
+            export_pipeline.export_model(_ios_export_config(monkeypatch))
 
     def test_constraints_name_real_graph_io(self):
         """Constraints are looked up by I/O name, so a name the graph does not have is

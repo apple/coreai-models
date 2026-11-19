@@ -254,11 +254,6 @@ def resolve_model(config: ExportConfig) -> ResolvedModel:
 
     if config.variant == "iOS" and entry.ios_class is None:
         raise ValueError(f"Model '{model_type}' does not support iOS variant")
-    if config.variant == "iOS" and entry.ios_export_script is not None:
-        raise ValueError(
-            f"Model '{model_type}' exports to iOS through its own script, not coreai.llm.export: "
-            f"uv run {entry.ios_export_script} --model <hf-id>"
-        )
 
     if config.with_drafter:
         if config.variant != "macOS":
@@ -560,6 +555,11 @@ async def _async_export_model(config: ExportConfig) -> str:
     resolved = resolve_model(config)
     entry, hf_config, model_type = resolved.entry, resolved.hf_config, resolved.model_type
     target_dtype, max_context_length = resolved.target_dtype, resolved.max_context_length
+    if config.variant == "iOS" and entry.ios_export_script is not None:
+        raise ValueError(
+            f"Model '{model_type}' exports to iOS through its own script, not coreai.llm.export: "
+            f"uv run {entry.ios_export_script} --model <hf-id>"
+        )
 
     # Memory-efficient layer-by-layer loading + quantizer disk-checkpointing
     # is macOS-only for now. The iOS variant keeps the legacy full-RAM path
