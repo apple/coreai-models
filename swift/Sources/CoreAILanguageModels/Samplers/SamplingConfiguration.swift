@@ -137,6 +137,32 @@ public struct SamplingConfiguration: Sendable, Equatable, Hashable {
     /// throws if a request sets `seed`.
     public let seed: UInt64?
 
+    /// The sampler implementation that serves this configuration.
+    ///
+    /// ``Backend/default`` uses the best known sampler for the engine (for the configuration and
+    /// the model's vocabulary size), and ``Backend/reference`` for seeded generation, so seeded
+    /// results are reproducible. Today the best known sampler happens to be ``ReferenceSampler``.
+    ///
+    /// - ``Backend/reference``: ``ReferenceSampler``, which defines the output distribution.
+    /// - ``Backend/bnns``: ``BNNSGraphSampler``, the same distribution on BNNSGraph. It walks the
+    ///   kept tokens in token-id order, so for the same random number it can pick a different token
+    ///   than ``ReferenceSampler``; it can't be combined with `seed`. Rows it can't decide the way
+    ///   ``ReferenceSampler`` does fall back to ``ReferenceSampler``.
+    ///
+    /// The backends are CPU samplers, for the sequential and static-shape engines. The GPU pipelined
+    /// engine samples on the GPU and throws when a request names one.
+    public let backend: Backend
+
+    /// Sampler implementations. See ``SamplingConfiguration/backend``.
+    public enum Backend: String, Sendable, Hashable, CaseIterable {
+        /// The best known sampler for the engine; ``reference`` for seeded generation.
+        case `default`
+        /// ``ReferenceSampler``.
+        case reference
+        /// ``BNNSGraphSampler``. Unseeded requests only.
+        case bnns
+    }
+
     /// Creates a new sampling configuration with validation.
     ///
     /// - Parameters:
@@ -148,6 +174,8 @@ public struct SamplingConfiguration: Sendable, Equatable, Hashable {
     ///   - repetitionPenaltyWindow: Optional window size. Must be > 0 if set.
     ///   - combined: Whether to combine sampling with logit inference. Defaults to true.
     ///   - seed: Optional seed for reproducible sampling. Defaults to nil (system generator).
+    ///   - backend: The sampler implementation. Defaults to `.default`. `.bnns` can't be combined
+    ///     with `seed`.
     public init(
         temperature: Double,
         topK: Int? = nil,
@@ -156,10 +184,12 @@ public struct SamplingConfiguration: Sendable, Equatable, Hashable {
         repetitionPenalty: Double? = nil,
         repetitionPenaltyWindow: Int? = nil,
         combined: Bool = true,
-        seed: UInt64? = nil
+        seed: UInt64? = nil,
+        backend: Backend = .default
     ) {
         if let error = Self.parameterError(
-            temperature, topK, topP, minP, repetitionPenalty, repetitionPenaltyWindow)
+            temperature, topK, topP, minP, repetitionPenalty, repetitionPenaltyWindow, seed: seed,
+            backend: backend)
         {
             preconditionFailure(error.message(naming: error.parameter.rawValue))
         }
@@ -172,6 +202,7 @@ public struct SamplingConfiguration: Sendable, Equatable, Hashable {
         self.repetitionPenaltyWindow = repetitionPenaltyWindow
         self.combined = combined
         self.seed = seed
+        self.backend = backend
     }
 
     /// The first out-of-range parameter, or nil. The initializer traps on the same checks.
@@ -181,7 +212,9 @@ public struct SamplingConfiguration: Sendable, Equatable, Hashable {
         _ topP: Double? = nil,
         _ minP: Double? = nil,
         _ repetitionPenalty: Double? = nil,
-        _ repetitionPenaltyWindow: Int? = nil
+        _ repetitionPenaltyWindow: Int? = nil,
+        seed: UInt64? = nil,
+        backend: Backend = .default
     ) -> SamplingParameterError? {
         // Each check is written so NaN fails it.
         if !(temperature >= 0) {
@@ -203,6 +236,11 @@ public struct SamplingConfiguration: Sendable, Equatable, Hashable {
         if let repetitionPenaltyWindow, !(repetitionPenaltyWindow > 0) {
             return SamplingParameterError(
                 parameter: .repetitionPenaltyWindow, requirement: "> 0", value: "\(repetitionPenaltyWindow)")
+        }
+        // BNNSGraphSampler walks tokens in token-id order, so it can't reproduce seeded output.
+        if seed != nil, backend == .bnns {
+            return SamplingParameterError(
+                parameter: .backend, requirement: "reference or default for seeded sampling", value: "bnns")
         }
         return nil
     }
@@ -320,7 +358,7 @@ public struct SamplingConfiguration: Sendable, Equatable, Hashable {
             CLILogger.log(
                 "⚠️ SamplingConfiguration: topK=1 normalized to greedy (temperature=0)",
                 component: "Sampling")
-            return .greedy
+            return SamplingConfiguration(temperature: 0, backend: backend)
         }
 
         let effectiveTopK: Int?
@@ -347,7 +385,8 @@ public struct SamplingConfiguration: Sendable, Equatable, Hashable {
             repetitionPenalty: repetitionPenalty,
             repetitionPenaltyWindow: repetitionPenaltyWindow,
             combined: combined,
-            seed: seed
+            seed: seed,
+            backend: backend
         )
     }
 }
@@ -355,7 +394,7 @@ public struct SamplingConfiguration: Sendable, Equatable, Hashable {
 /// An out-of-range `SamplingConfiguration` parameter, from `SamplingConfiguration.parameterError`.
 package struct SamplingParameterError: Error, Equatable, Sendable {
     package enum Parameter: String, Sendable {
-        case temperature, topK, topP, minP, repetitionPenalty, repetitionPenaltyWindow
+        case temperature, topK, topP, minP, repetitionPenalty, repetitionPenaltyWindow, backend
     }
 
     package let parameter: Parameter
@@ -440,13 +479,35 @@ extension SamplingConfiguration {
     /// - Returns: The sampled token ID.
     public func sampleToken(from logits: inout [LogitsScalarType], step: Int?) -> Int32 {
         guard let seed else {
-            return ReferenceSampler.sample(from: &logits, config: self)
+            switch resolvedBackend {
+            case .bnns:
+                return BNNSGraphSampler.sample(from: &logits, config: self)
+            case .default, .reference:
+                SamplerUsage.recordReference()
+                return ReferenceSampler.sample(from: &logits, config: self)
+            }
         }
         guard let step else {
             preconditionFailure("A generation step index is required when a sampling seed is set.")
         }
         var rng = CoreAIShared.SeededRandomNumberGenerator(seed: seed &+ UInt64(bitPattern: Int64(step)))
+        SamplerUsage.recordReference()
         return ReferenceSampler.sample(from: &logits, config: self, using: &rng)
+    }
+
+    /// The backend selected for this configuration: `.default` resolved, and `.reference` for
+    /// seeded requests. ``BNNSGraphSampler`` can still give individual rows to
+    /// ``ReferenceSampler``; ``SamplerUsage`` counts which implementation sampled each token.
+    public var resolvedBackend: Backend {
+        if seed != nil {
+            return .reference
+        }
+        switch backend {
+        case .default, .reference:
+            return .reference
+        case .bnns:
+            return .bnns
+        }
     }
 
     /// The former name of ``cpuSampler(from:step:)``.

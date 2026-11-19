@@ -10,8 +10,8 @@ import Synchronization
 /// A CPU sampler built on BNNSGraph, with one compiled graph per sampling configuration.
 ///
 /// It samples from the same distribution as ``ReferenceSampler``, but it walks the kept tokens
-/// in vocabulary order, so for the same random number it can return a different token. Seeded
-/// requests should therefore keep using ``ReferenceSampler``.
+/// in vocabulary order, so for the same random number it can return a different token. Select it
+/// with `SamplingConfiguration.Backend.bnns`; seeded requests always use ``ReferenceSampler``.
 ///
 /// Each temperature, topK, topP, minP and vocabulary size gets its own graph, compiled on first use
 /// and kept for the life of the process. Repetition penalty, the logit soft cap and grammar masks
@@ -46,12 +46,15 @@ enum BNNSGraphSampler {
     ) -> Int32 {
         let key = GraphKey(config, vocabSize: logits.count)
         guard !logits.isEmpty, let graph = graph(for: key) else {
+            SamplerUsage.recordBNNSFallback()
             return ReferenceSampler.sample(from: &logits, config: config, using: &rng)
         }
         let u = key.isGreedy ? 0 : Float.random(in: 0..<1, using: &rng)
         if let token = graph.run(logits: &logits, u: u) {
+            SamplerUsage.recordBNNS()
             return token
         }
+        SamplerUsage.recordBNNSFallback()
         return ReferenceSampler.sample(from: &logits, config: config, using: &rng)
     }
 

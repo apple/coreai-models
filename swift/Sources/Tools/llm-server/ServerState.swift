@@ -497,6 +497,7 @@ extension SamplingParameterError.Parameter {
         case .minP: "min_p"
         case .repetitionPenalty: "repetition_penalty"
         case .repetitionPenaltyWindow: "repetition_penalty_window"
+        case .backend: "sampler"
         }
     }
 }
