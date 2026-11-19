@@ -615,6 +615,36 @@ LLM_PRESETS: list[ModelPreset] = [
             "precomputed dual-RoPE rows). Pass --include-vision for image input."
         ),
     ),
+    ModelPreset(
+        "qwen3.5-2b",
+        "Qwen/Qwen3.5-2B",
+        "qwen3.5",
+        "llm",
+        "iOS",
+        "none",
+        "float16",
+        32768,
+        compression_config="models/qwen3_5/qwen3_5_2b_4bit_palettized.yaml",
+        notes=(
+            "Exported via models/qwen3_5/export.py (standalone recipe -- a per-bucket static "
+            "ladder with DeltaNet state, not coreai.llm.export). This preset serves evaluation."
+        ),
+    ),
+    ModelPreset(
+        "qwen3.5-4b",
+        "Qwen/Qwen3.5-4B",
+        "qwen3.5",
+        "llm",
+        "iOS",
+        "none",
+        "float16",
+        32768,
+        compression_config="models/qwen3_5/qwen3_5_4b_4bit_palettized.yaml",
+        notes=(
+            "Exported via models/qwen3_5/export.py (standalone recipe -- a per-bucket static "
+            "ladder with DeltaNet state, not coreai.llm.export). This preset serves evaluation."
+        ),
+    ),
 ]
 
 # ---------------------------------------------------------------------------
