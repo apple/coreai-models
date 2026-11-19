@@ -75,6 +75,11 @@ class StaticStateStorage {
 /// slices to whatever the running function declares, so that case needs no
 /// re-layout — the storage underneath is already the one the program indexes.
 final class FixedStaticState: StaticStateStorage {
+    /// A saved copy of every state, allocated on the first ``saveCheckpoint(at:)``.
+    private var checkpointArrays: [String: NDArray] = [:]
+    /// The position the saved copy was taken at; nil when there is none to restore.
+    private(set) var checkpointPosition: Int?
+
     init(states: [(name: String, descriptor: NDArrayDescriptor)]) {
         var arrays: [String: NDArray] = [:]
         for (name, descriptor) in states {
@@ -86,6 +91,41 @@ final class FixedStaticState: StaticStateStorage {
                     + "(fixed, shape \(descriptor.shape))")
         }
         super.init(stateNames: states.map(\.name), arrays: arrays)
+    }
+
+    /// Wraps arrays allocated elsewhere. Internal for testing.
+    init(arrays: [String: NDArray]) {
+        super.init(stateNames: arrays.keys.sorted(), arrays: arrays)
+    }
+
+    /// Saves a copy of every state, as the states at `position`.
+    func saveCheckpoint(at position: Int) {
+        for name in stateNames {
+            if checkpointArrays[name] == nil {
+                // A byte-for-byte copy, so it needs only the same element count and type.
+                checkpointArrays[name] = NDArray(shape: arrays[name]!.shape, scalarType: arrays[name]!.scalarType)
+            }
+            copyNDArrayContents(from: arrays[name]!, to: &checkpointArrays[name]!)
+        }
+        checkpointPosition = position
+    }
+
+    /// Puts the saved copy back. The copy stays, so it can be restored again.
+    func restoreCheckpoint() {
+        precondition(checkpointPosition != nil, "restoreCheckpoint without a saved copy")
+        for name in stateNames {
+            copyNDArrayContents(from: checkpointArrays[name]!, to: &arrays[name]!)
+        }
+    }
+
+    /// Forgets the saved copy; its buffers are kept for the next save.
+    func discardCheckpoint() {
+        checkpointPosition = nil
+    }
+
+    override func reset() {
+        super.reset()
+        discardCheckpoint()
     }
 }
 
