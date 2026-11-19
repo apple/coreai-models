@@ -36,6 +36,7 @@ except Exception:  # pragma: no cover - requires transformers>=5.5
 
 from coreai_models._constants import EXTEND_FUNCTION_NAME  # noqa: E402
 from coreai_models.export import pipeline as export_pipeline  # noqa: E402
+from coreai_models.llm.export import _load_compression_config_object  # noqa: E402
 from coreai_models.models.ios.qwen3_5 import (  # noqa: E402
     Qwen3_5Extend,
     Qwen3_5ForCausalLMForiOS,
@@ -84,12 +85,12 @@ def tiny_config(n_layers: int = 4, ctx: int = CTX) -> Qwen3_5TextConfig:
     return cfg
 
 
-def _ios_export_config(monkeypatch) -> "export_pipeline.ExportConfig":
+def _ios_export_config(monkeypatch, **kwargs) -> "export_pipeline.ExportConfig":
     """An iOS export of Qwen3.5 whose checkpoint config is the tiny one, read without network."""
     hf_config = Qwen3_5Config(text_config=tiny_config().to_dict())
     monkeypatch.setattr(export_pipeline.AutoConfig, "from_pretrained", lambda *_, **__: hf_config)
     return export_pipeline.ExportConfig(
-        hf_model_id="Qwen/Qwen3.5-2B", variant="iOS", compression="none"
+        hf_model_id="Qwen/Qwen3.5-2B", variant="iOS", compression="none", **kwargs
     )
 
 
@@ -578,6 +579,32 @@ class TestExportRecipe:
         monkeypatch.setattr(Qwen3_5ForCausalLMForiOS, "from_hf", classmethod(load))
         with pytest.raises(ValueError, match="uv run models/qwen3_5/export.py"):
             export_pipeline.export_model(_ios_export_config(monkeypatch))
+
+    def test_build_model_palettizes_with_eager_forward_args(self, monkeypatch):
+        """The palettizer traces `forward` on what `build_model` hands it, and Qwen3.5's takes
+        the DeltaNet inputs and states on top of the KV pair."""
+        cfg = tiny_config()
+        monkeypatch.setattr(
+            Qwen3_5ForCausalLMForiOS,
+            "from_hf",
+            classmethod(lambda cls, *_, **__: cls(cfg, torch.device("cpu")).to(torch.float16)),
+        )
+        logits = []
+
+        def palettize(model, example_inputs, *_, **__):
+            logits.append(model(*example_inputs))
+            return model
+
+        monkeypatch.setattr(export_pipeline, "palettize_pytorch_model", palettize)
+        recipe = pathlib.Path(__file__).resolve().parents[5] / "models/qwen3_5"
+        config = _ios_export_config(
+            monkeypatch,
+            compression_config_object=_load_compression_config_object(
+                recipe / "qwen3_5_2b_4bit_palettized.yaml", "iOS"
+            ),
+        )
+        export_pipeline.build_model(export_pipeline.resolve_model(config))
+        assert logits[0].shape[-1] == cfg.vocab_size
 
     def test_constraints_name_real_graph_io(self):
         """Constraints are looked up by I/O name, so a name the graph does not have is

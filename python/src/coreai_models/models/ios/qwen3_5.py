@@ -11,6 +11,8 @@ full-attention layers keep a growing KV cache. Exported by
 ``models/qwen3_5/export.py``; see ``models/qwen3_5/README.md``.
 """
 
+from typing import Any
+
 import torch
 import torch.nn as nn
 from typing_extensions import override
@@ -1004,6 +1006,10 @@ class Qwen3_5ForCausalLMForiOS(BaseForCausalLMForiOS):
         """The four states, sized to the whole context like every iOS cache: ``max_seq_len``
         is ignored."""
         return EagerState(self.fresh_states(self.config.max_position_embeddings, dtype, device))
+
+    @override
+    def eager_forward_args(self, input_ids: torch.Tensor, state: EagerState) -> tuple[Any, ...]:
+        return self.block_forward_args(input_ids, state.tensors, state.offset)
 
     @override
     def eager_step(self, input_ids: torch.Tensor, state: EagerState) -> torch.Tensor:
