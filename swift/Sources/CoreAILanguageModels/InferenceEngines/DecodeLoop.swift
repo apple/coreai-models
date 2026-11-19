@@ -165,7 +165,7 @@ struct DecodeLoop {
             return forced[step]
         }
         var logits = logits
-        return sampling.fallbackSampler(
+        return sampling.cpuSampler(
             from: &logits, tokenHistory: tokenHistory, step: step, logitSoftcap: logitSoftcap)
     }
 

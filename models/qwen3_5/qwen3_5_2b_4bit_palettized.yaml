@@ -1,0 +1,16 @@
+# 4-bit k-means weight palettization, group size 8 (Qwen3.5 2B).
+#
+# Left uncompressed: the int8 embedding table and the DeltaNet conv taps (raw parameters).
+kmeans_palettization_config:
+  global_config:
+    op_state_spec:
+      weight:
+        n_bits: 4
+        granularity:
+          type: per_grouped_channel
+          axis: 0
+          group_size: 8
+
+  module_type_configs:
+    torch.nn.modules.sparse.Embedding: null
+    coreai_models.primitives.ios.embedding.LoadEmbeddings: null
