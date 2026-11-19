@@ -29,7 +29,7 @@ from coreai_models._constants import (
     VALUE_CACHE_INPUT_NAME,
 )
 from coreai_models._hf import resolve_rope_theta
-from coreai_models.models.base import BaseForCausalLMForiOS
+from coreai_models.models.base import BaseForCausalLMForiOS, EagerState
 from coreai_models.primitives.ios.cache import KVCacheHandler
 from coreai_models.primitives.ios.mlp import MLP
 from coreai_models.primitives.ios.quantization import (
@@ -917,8 +917,8 @@ class Qwen3_5ForCausalLMForiOS(BaseForCausalLMForiOS):
     # Eager evaluation
     #
     # The graph takes three DeltaNet inputs and two extra states on top of the standard iOS
-    # contract, and the conv ring bounds how many tokens one call may write. These two
-    # methods let a harness score or generate without knowing either.
+    # contract, and the conv ring bounds how many tokens one call may write. `new_eager_state`
+    # and `eager_step`, at the end, let a harness score or generate without knowing either.
     # ------------------------------------------------------------------
 
     def fresh_states(
@@ -996,3 +996,18 @@ class Qwen3_5ForCausalLMForiOS(BaseForCausalLMForiOS):
             logits.append(out.reshape(stop - start, -1))
             start = stop
         return torch.cat(logits)
+
+    @override
+    def new_eager_state(
+        self, *, dtype: torch.dtype, device: torch.device | str, max_seq_len: int | None = None
+    ) -> EagerState:
+        """The four states, sized to the whole context like every iOS cache: ``max_seq_len``
+        is ignored."""
+        return EagerState(self.fresh_states(self.config.max_position_embeddings, dtype, device))
+
+    @override
+    def eager_step(self, input_ids: torch.Tensor, state: EagerState) -> torch.Tensor:
+        """Logits ``[1, query_len, vocab]``, run through ``forward_sequence``."""
+        logits = self.forward_sequence(input_ids, state.tensors, state.offset)
+        state.offset += input_ids.shape[1]
+        return logits.unsqueeze(0)
