@@ -38,7 +38,7 @@ struct BatchedSampler {
         for row in rows.indices {
             var logits = rows[row]
             tokens.append(
-                configurations[row].normalized().fallbackSampler(
+                configurations[row].normalized().cpuSampler(
                     from: &logits, tokenHistory: histories[row], step: steps[row]))
         }
         return tokens

@@ -18,7 +18,7 @@ struct LogitRowScanTests {
     private func plainGreedy(_ row: [LogitsScalarType], cap: Float?) -> Int32 {
         var logits = row
         if let cap { LogitSoftcapProcessor.apply(to: &logits, cap: cap) }
-        return CompositeSampler.sample(from: &logits, config: .greedy)
+        return ReferenceSampler.sample(from: &logits, config: .greedy)
     }
 
     private func scanArgmax(_ row: [LogitsScalarType], cap: Float?) -> Int32 {

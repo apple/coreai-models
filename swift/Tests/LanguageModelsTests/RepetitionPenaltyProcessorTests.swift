@@ -58,12 +58,12 @@ struct RepetitionPenaltyProcessorTests {
         #expect(Float(logits[1]) == 2.0)
     }
 
-    @Test("fallbackSampler with tokenHistory applies penalty")
+    @Test("cpuSampler with tokenHistory applies penalty")
     func fallbackSamplerWithHistory() {
         let config = SamplingConfiguration(temperature: 0, repetitionPenalty: 2.0)
         // Token 0 has highest logit but is penalized; token 1 should win
         var logits: [LogitsScalarType] = [LogitsScalarType(3.0), LogitsScalarType(2.0), LogitsScalarType(1.0)]
-        let token = config.fallbackSampler(from: &logits, tokenHistory: [0] as [Int32])
+        let token = config.cpuSampler(from: &logits, tokenHistory: [0] as [Int32])
         #expect(token == 1)
     }
 
@@ -72,7 +72,7 @@ struct RepetitionPenaltyProcessorTests {
         let config = SamplingConfiguration(temperature: 0, repetitionPenalty: 2.0, repetitionPenaltyWindow: 1)
         // History: [0, 1] but window=1, so only token 1 is penalized
         var logits: [LogitsScalarType] = [LogitsScalarType(2.0), LogitsScalarType(3.0), LogitsScalarType(1.0)]
-        let token = config.fallbackSampler(from: &logits, tokenHistory: [0, 1] as [Int32])
+        let token = config.cpuSampler(from: &logits, tokenHistory: [0, 1] as [Int32])
         // Token 1 (3.0/2.0=1.5) penalized, token 0 (2.0) not penalized → token 0 wins
         #expect(token == 0)
     }

@@ -254,6 +254,11 @@ def resolve_model(config: ExportConfig) -> ResolvedModel:
 
     if config.variant == "iOS" and entry.ios_class is None:
         raise ValueError(f"Model '{model_type}' does not support iOS variant")
+    if config.variant == "iOS" and entry.ios_export_script is not None:
+        raise ValueError(
+            f"Model '{model_type}' exports to iOS through its own script, not coreai.llm.export: "
+            f"uv run {entry.ios_export_script} --model <hf-id>"
+        )
 
     if config.with_drafter:
         if config.variant != "macOS":
