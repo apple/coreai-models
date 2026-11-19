@@ -61,10 +61,26 @@ from coreai_models.primitives.ios.quantization import (
     dequantize_native_dense,
     dequantize_per_tensor,
     quantize_per_tensor,
+    unpack_signed_subbyte,
+    unpack_unsigned_subbyte,
 )
 from coreai_models.primitives.ios.rms_norm import RMSNorm
 from coreai_models.primitives.ios.rope import apply_rope
 from coreai_models.primitives.ios.sdpa import SDPA, BlockedSDPA
+
+# The "-qat-mobile-transformers" checkpoints ship pre-quantized (Google's own QAT mixed
+# INT2/4/8 recipe): `from_pretrained` replaces `nn.Linear`/`nn.Embedding` with these wrapper
+# modules and loads packed weights + per-channel scales into them. Optional for the same
+# reason as `HFGemma4ForCausalLM` above -- only consumed when a quantized checkpoint is
+# actually loaded.
+try:
+    from transformers.integrations.gemma_quant import (  # type: ignore[import-not-found]
+        QuantizedEmbedding,
+        QuantizedLinear,
+    )
+except ImportError:  # pragma: no cover - depends on the installed transformers
+    QuantizedEmbedding = None  # type: ignore[assignment,misc]
+    QuantizedLinear = None  # type: ignore[assignment,misc]
 
 # Flash chunk width for the global (full-attention) ``BlockedSDPA`` over the flat cache:
 # the largest key-axis chunk whose per-block score/softmax stays within the accelerator's
@@ -82,6 +98,10 @@ SLIDING_VALUE_CACHE_INPUT_NAME = "sliding_value_cache"
 SLIDING_KEY_CACHE_OUTPUT_NAME = "new_sliding_k_cache"
 SLIDING_VALUE_CACHE_OUTPUT_NAME = "new_sliding_v_cache"
 PLE_EMBEDDINGS_INPUT_NAME = "ple_embeddings"
+# Companion per-row scale of the native-quantized (QAT) embedding table: a second output of
+# `load_embeddings` and a third input of `gather_embeddings`, present for those checkpoints only.
+EMBEDDING_SCALE_INPUT_NAME = "embedding_scale"
+EMBEDDING_SCALE_OUTPUT_NAME = "embedding_scale"
 
 # Widest iOS static-shape query length (a prefill chunk); sizes the sliding-cache ring.
 MAX_QUERY_LEN = max(BaseForCausalLMForiOS.IOS_STATIC_QUERY_LENS)
@@ -258,14 +278,46 @@ class NativeQuantLinearBlock(nn.Module):
         return nn.functional.linear(x, weight)
 
 
+def _make_proj_conv(config, in_channels: int, out_channels: int, nbits: int) -> nn.Module:
+    """Build a 1x1-conv projection: plain float, or CoreAI-native quantized for QAT
+    checkpoints (see ``config.native_quantized``, set in ``Gemma4ForCausalLMForiOS.from_hf``).
+
+    ``nbits < 4`` routes through the LUT/palettization path
+    (``NativeLutQuantConv1x1``) instead of the affine one (``NativeQuantConv1x1``), since
+    CoreAI's affine ``blockwise_shift_scale`` has no static-shape-engine execution path
+    below INT4 -- see ``NativeLutQuantConv1x1``'s docstring. Only Gemma4 E2B's shared-KV MLP layers
+    actually ship below 4 bits (see ``_native_mlp_nbits``); every other caller passes 4
+    or 8 and gets the existing affine path unchanged.
+    """
+    if getattr(config, "native_quantized", False):
+        if nbits < 4:
+            return NativeLutQuantConv1x1(in_channels, out_channels, nbits)
+        return NativeQuantConv1x1(in_channels, out_channels, nbits)
+    return nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
+
+
+def _native_mlp_nbits(config, layer_idx: int) -> int:
+    """Per-layer MLP bit-width for QAT checkpoints.
+
+    Gemma4 E2B's checkpoint quantizes `mlp.*` to genuine 2 bits on its shared-KV,
+    double-wide layers (see ``Gemma4ForCausalLMForiOS.from_hf``, which builds
+    ``config.native_mlp_nbits`` from the checkpoint's actual per-module ``num_bits``); 4
+    bits everywhere else, including for non-native (standard) checkpoints, where the
+    plan is never set.
+    """
+    plan = getattr(config, "native_mlp_nbits", None)
+    return 4 if plan is None else plan[layer_idx]
+
+
 class GeGLUMLP(nn.Module):
     """MLP with GELU-gated activation (GeGLU) using Conv2d for iOS."""
 
-    def __init__(self, dim: int, hidden_dim: int) -> None:
+    def __init__(self, config, dim: int, hidden_dim: int, layer_idx: int) -> None:
         super().__init__()
-        self.gate_proj = nn.Conv2d(dim, hidden_dim, kernel_size=1, bias=False)
-        self.up_proj = nn.Conv2d(dim, hidden_dim, kernel_size=1, bias=False)
-        self.down_proj = nn.Conv2d(hidden_dim, dim, kernel_size=1, bias=False)
+        nbits = _native_mlp_nbits(config, layer_idx)
+        self.gate_proj = _make_proj_conv(config, dim, hidden_dim, nbits=nbits)
+        self.up_proj = _make_proj_conv(config, dim, hidden_dim, nbits=nbits)
+        self.down_proj = _make_proj_conv(config, hidden_dim, dim, nbits=nbits)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch_size, query_len, _, dim = x.shape
@@ -309,11 +361,11 @@ class Attention(nn.Module):
         else:
             self.sdpa = SDPA(head_dim=self.head_dim, scale=1.0)
 
-        self.q_proj = nn.Conv2d(dim, self.n_heads * self.head_dim, kernel_size=1, bias=False)
+        self.q_proj = _make_proj_conv(config, dim, self.n_heads * self.head_dim, nbits=4)
         if not is_kv_shared:
-            self.k_proj = nn.Conv2d(dim, self.n_kv_heads * self.head_dim, kernel_size=1, bias=False)
-            self.v_proj = nn.Conv2d(dim, self.n_kv_heads * self.head_dim, kernel_size=1, bias=False)
-        self.o_proj = nn.Conv2d(self.n_heads * self.head_dim, dim, kernel_size=1, bias=False)
+            self.k_proj = _make_proj_conv(config, dim, self.n_kv_heads * self.head_dim, nbits=4)
+            self.v_proj = _make_proj_conv(config, dim, self.n_kv_heads * self.head_dim, nbits=4)
+        self.o_proj = _make_proj_conv(config, self.n_heads * self.head_dim, dim, nbits=4)
 
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         if not is_kv_shared:
@@ -400,6 +452,7 @@ class TransformerBlock(nn.Module):
         is_kv_shared: bool,
         slot: int,
         intermediate_size: int,
+        layer_idx: int,
     ) -> None:
         super().__init__()
         hidden_size = config.hidden_size
@@ -410,7 +463,7 @@ class TransformerBlock(nn.Module):
             is_kv_shared=is_kv_shared,
             slot=slot,
         )
-        self.mlp = GeGLUMLP(hidden_size, intermediate_size)
+        self.mlp = GeGLUMLP(config, hidden_size, intermediate_size, layer_idx)
 
         eps = config.rms_norm_eps
         self.input_layernorm = RMSNorm(hidden_size, eps=eps)
@@ -420,11 +473,12 @@ class TransformerBlock(nn.Module):
 
         self.hidden_size_per_layer_input = config.hidden_size_per_layer_input
         if self.hidden_size_per_layer_input:
-            self.per_layer_input_gate = nn.Conv2d(
-                hidden_size, self.hidden_size_per_layer_input, kernel_size=1, bias=False
+            # Google's QAT recipe quantizes these two to 8 bits (vs. 4 for attn/mlp).
+            self.per_layer_input_gate = _make_proj_conv(
+                config, hidden_size, self.hidden_size_per_layer_input, nbits=8
             )
-            self.per_layer_projection = nn.Conv2d(
-                self.hidden_size_per_layer_input, hidden_size, kernel_size=1, bias=False
+            self.per_layer_projection = _make_proj_conv(
+                config, self.hidden_size_per_layer_input, hidden_size, nbits=8
             )
             self.post_per_layer_input_norm = RMSNorm(hidden_size, eps=eps)
 
@@ -554,6 +608,7 @@ class Gemma4Model(nn.Module):
                     is_kv_shared=is_kv_shared,
                     slot=slot,
                     intermediate_size=intermediate_size,
+                    layer_idx=i,
                 )
             )
         self.layers = nn.ModuleList(layers)
@@ -667,9 +722,26 @@ class Gemma4Extend(nn.Module):
         # default so the standard single-output export is unchanged.
         self.emit_hidden_states = False
 
-        # E2B/E4B tie word embeddings: the output projection reuses the embedding table.
+        # Tied embeddings reuse the embedding table for the projection, so there is no
+        # separate `lm_head` module to hold.
+        self.lm_head: nn.Module | None = None
         if not config.tie_word_embeddings:
-            raise NotImplementedError("Gemma 4 iOS supports tied word embeddings only")
+            if getattr(config, "native_quantized", False):
+                # Google's QAT recipe quantizes `lm_head` to 2 bits, but CoreAI's native
+                # affine blockwise_shift_scale has no static-shape-engine execution path
+                # below 4-bit (only LUT-based palettization goes narrower). The compiler
+                # silently promotes a declared INT2 affine tensor to INT4 regardless, so
+                # declaring INT4 here directly keeps the exported asset's size honest
+                # without losing any precision (the values only ever span 4 levels either
+                # way).
+                self.lm_head = NativeQuantLinear(
+                    config.hidden_size,
+                    config.vocab_size,
+                    nbits=4,
+                    block_size=DEFAULT_KV_BLOCK_SIZE,
+                )
+            else:
+                self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         # Two compacted KV caches, both FLAT (single dynamic write offset, so each
         # attention region has ≤1 dynamic-offset slice):
@@ -739,24 +811,180 @@ class Gemma4Extend(nn.Module):
                 + self.global_cache.v_cache[:1, :1, :1, :1, :1]
             )
 
-        if embedding_table is None:
-            raise ValueError("embedding_table is required for the tied output projection")
-
-        # Post-norm final hidden state (batch, seq, hidden). Captured before the
-        # tied-embedding path reshapes `out`, so a speculative drafter can consume it.
+        # Post-norm final hidden state (batch, seq, hidden). Captured before the output
+        # projection reshapes `out`, so a speculative drafter can consume it.
         final_hidden = out.reshape(batch_size, seq_len, hidden_dim)
 
-        table = embedding_table
-        if table.dtype == torch.int8:
-            table = dequantize_per_tensor(table, self.emb_scale, self.emb_zero_point, out.dtype)
+        if self.lm_head is not None:
+            # Untied checkpoints carry their own output projection.
+            logits = self.lm_head(out.transpose(-2, -3))
+        else:
+            if embedding_table is None:
+                raise ValueError("embedding_table is required for the tied output projection")
 
-        table = table.reshape(table.shape[1], table.shape[0], table.shape[2])
-        proj = out.transpose(-3, -1).reshape(batch_size, 1, hidden_dim, seq_len)
-        logits = (table @ proj).transpose(-1, -2)
+            table = embedding_table
+            if table.dtype == torch.int8:
+                table = dequantize_per_tensor(table, self.emb_scale, self.emb_zero_point, out.dtype)
+
+            table = table.reshape(table.shape[1], table.shape[0], table.shape[2])
+            proj = out.transpose(-3, -1).reshape(batch_size, 1, hidden_dim, seq_len)
+            logits = (table @ proj).transpose(-1, -2)
 
         if self.emit_hidden_states:
             return logits, final_hidden
         return logits
+
+
+def _dequantized_hf_state_dict(
+    hf_model: nn.Module, target_dtype: torch.dtype
+) -> dict[str, torch.Tensor]:
+    """Plain-float state dict for a HF Gemma4 model, dequantizing it first if needed.
+
+    The "-qat-mobile-transformers" checkpoints load their `nn.Linear`/`nn.Embedding`
+    modules as `QuantizedLinear`/`QuantizedEmbedding` (packed INT2/4/8 weights + SRQ
+    activation scales -- see `transformers.integrations.gemma_quant`). Dequantizing them
+    back to plain `.weight` tensors here lets every Gemma4 checkpoint flow through the same
+    downstream code, including this pipeline's own iOS palettization on top -- exactly as
+    for an unquantized checkpoint. The SRQ activation scales are runtime-only and dropped.
+
+    Reaches into `QuantizedLinear._dequantize_weights` (private) because the wrapper has no
+    public dequant API for `nn.Linear`-shaped weights; `QuantizedEmbedding.weight` is public.
+    """
+    if QuantizedLinear is None:
+        return hf_model.state_dict()
+
+    quantized_modules = {
+        name: module
+        for name, module in hf_model.named_modules()
+        if isinstance(module, (QuantizedLinear, QuantizedEmbedding))
+    }
+    if not quantized_modules:
+        return hf_model.state_dict()
+
+    state_dict = {
+        k: v
+        for k, v in hf_model.state_dict().items()
+        if k.rsplit(".", 1)[0] not in quantized_modules
+    }
+    for name, module in quantized_modules.items():
+        if isinstance(module, QuantizedLinear):
+            state_dict[f"{name}.weight"] = module._dequantize_weights(target_dtype)
+            if module.bias is not None:
+                state_dict[f"{name}.bias"] = module.bias.to(target_dtype)
+        else:
+            state_dict[f"{name}.weight"] = module.weight.to(target_dtype)
+    return state_dict
+
+
+def _is_quantized_hf_model(hf_model: nn.Module) -> bool:
+    """Whether ``hf_model`` was loaded through HF's Gemma QAT quantizer."""
+    if QuantizedLinear is None:
+        return False
+    return any(
+        isinstance(module, (QuantizedLinear, QuantizedEmbedding))
+        for _, module in hf_model.named_modules()
+    )
+
+
+def _native_quantized_hf_state_dict(hf_model: nn.Module) -> dict[str, torch.Tensor]:
+    """State dict for a QAT-quantized HF Gemma4 model, preserving its native quantization.
+
+    Unlike ``_dequantized_hf_state_dict``, this never reconstructs float weights: every
+    quantized Linear/Embedding module's packed data is unpacked to one value per element
+    and kept alongside its literal scale. Most are keyed as ``<name>.quantized_data`` /
+    ``<name>.scale`` (signed, one value per int8 -- see ``unpack_signed_subbyte``) for the
+    affine path (``NativeQuantConv1x1`` / ``NativeQuantLinear`` / the native embedding
+    modules). ``mlp.*`` modules the checkpoint quantizes below 4 bits (Gemma4 E2B's
+    shared-KV layers) are keyed as ``<name>.indices`` / ``<name>.scale`` instead (unsigned
+    LUT indices -- see ``unpack_unsigned_subbyte``) for the palettization path
+    (``NativeLutQuantConv1x1``); everything else stays on the affine path regardless of
+    its own checkpoint bit-width (``lm_head``/``embed_tokens`` are deliberately widened to
+    4 bits elsewhere -- see ``Gemma4Extend.__init__``'s ``lm_head`` comment -- so they're
+    excluded from the ``.mlp.`` check here even though the checkpoint also ships them
+    below 4 bits). ``Gemma4ForCausalLMForiOS._mutate_native_quantized_state_dict``
+    reshapes either key set for Conv2d.
+
+    ``embed_tokens_per_layer`` (the PLE table) is excluded here: it's never loaded into
+    the model, only externalized by ``dump_ple_embedding`` -- see
+    ``Gemma4ForCausalLMForiOS.from_hf``, which reads it directly off ``hf_model`` before
+    this function's caller discards it.
+    """
+    quantized_modules = {
+        name: module
+        for name, module in hf_model.named_modules()
+        if isinstance(module, (QuantizedLinear, QuantizedEmbedding))
+        and not name.endswith("embed_tokens_per_layer")
+    }
+    state_dict = {
+        k: v
+        for k, v in hf_model.state_dict().items()
+        if k.rsplit(".", 1)[0] not in quantized_modules and "embed_tokens_per_layer" not in k
+    }
+    for name, module in quantized_modules.items():
+        if isinstance(module, QuantizedLinear):
+            if module.num_bits < 4 and ".mlp." in name:
+                state_dict[f"{name}.indices"] = unpack_unsigned_subbyte(
+                    module.weight, module.num_bits, module.in_features
+                )
+            else:
+                state_dict[f"{name}.quantized_data"] = unpack_signed_subbyte(
+                    module.weight, module.num_bits, module.in_features
+                )
+            state_dict[f"{name}.scale"] = module.weight_scale.to(torch.float16)
+        else:
+            unpacked = unpack_signed_subbyte(
+                module.embedding_quantized, module.num_bits, module.embedding_dim
+            )
+            state_dict[f"{name}.quantized_data"] = unpacked
+            state_dict[f"{name}.scale"] = module.embedding_scale.to(torch.float16)
+    return state_dict
+
+
+class Gemma4NativeQuantLoadEmbeddings(nn.Module):
+    """Loads the native-quantized embedding table + its per-row scale.
+
+    Replaces the standard ``LoadEmbeddings`` for QAT checkpoints. Two outputs instead of
+    one: the table (in the same ``(vocab, 1, hidden)`` INT8 layout as the standard table)
+    and a per-vocab-row scale, gathered together downstream by
+    ``Gemma4NativeQuantGatherEmbeddings``. Google's checkpoint quantizes this to 2 bits;
+    the values are kept exactly, one per INT8 element, because the table is a runtime
+    input of the gather and the runtime cannot gather from a sub-byte tensor.
+    """
+
+    def __init__(self, vocab_size: int, hidden_size: int) -> None:
+        super().__init__()
+        self.embedding_table = nn.Parameter(
+            torch.zeros(vocab_size, 1, hidden_size, dtype=torch.int8), requires_grad=False
+        )
+        self.embedding_scale = nn.Parameter(
+            torch.ones(vocab_size, 1, 1, dtype=torch.float16), requires_grad=False
+        )
+
+    def forward(self):
+        return self.embedding_table, self.embedding_scale
+
+
+class Gemma4NativeQuantGatherEmbeddings(nn.Module):
+    """Gathers embedding rows, dequantizing via CoreAI's native ``blockwise_shift_scale``.
+
+    Unlike the standard ``GatherEmbeddings`` (per-tensor INT8 scale), the scale here is
+    gathered per-row alongside the table -- Google's QAT embeddings use a per-vocab-row
+    scale, not per-tensor.
+    """
+
+    def __init__(self, nbits: int) -> None:
+        super().__init__()
+        self.nbits = nbits
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        embedding_table: torch.Tensor,
+        embedding_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        gathered = embedding_table[input_ids]
+        gathered_scale = embedding_scale[input_ids]
+        return dequantize_native(gathered, gathered_scale, self.nbits, torch.float16)
 
 
 class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
@@ -771,6 +999,25 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
     #: gets no config; build_reference_inputs checks the config agrees.
     SLIDING_RING_SIZE = sliding_ring_size(SLIDING_WINDOW, MAX_QUERY_LEN)
 
+    def __init__(
+        self, config, model_device: str = "cpu", disable_embedding_quantization: bool = False
+    ) -> None:
+        # INT8 embedding table by default (the iOS default); routes the token
+        # gather through the fused_dequant_gather composite. Tests pass
+        # ``disable_embedding_quantization=True`` to isolate logic from quant noise.
+        super().__init__(
+            config, model_device, disable_embedding_quantization=disable_embedding_quantization
+        )
+        if getattr(config, "native_quantized", False):
+            # Google's QAT recipe quantizes `embed_tokens` to 2 bits with a per-row
+            # (not per-tensor) scale, so it needs its own load/gather pair -- see
+            # `Gemma4NativeQuantGatherEmbeddings`. Held as INT8, not packed: the table is a
+            # runtime input of the gather, and the runtime cannot gather from a sub-byte tensor.
+            self.load_embeddings = Gemma4NativeQuantLoadEmbeddings(
+                config.vocab_size, config.hidden_size
+            )
+            self.gather_embeddings = Gemma4NativeQuantGatherEmbeddings(nbits=8)
+
     def _init_model(self, config) -> None:
         self.extend = Gemma4Extend(config)
 
@@ -782,6 +1029,30 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
     # `ple_embeddings`. Each hook describes one ladder rung; `models/gemma4/export.py`
     # calls them once per (context bucket, query length).
     # ------------------------------------------------------------------
+
+    @property
+    def _native_quantized(self) -> bool:
+        """Whether this model was built from a native-quantized (QAT) checkpoint."""
+        return bool(getattr(self.config, "native_quantized", False))
+
+    @override
+    def validate_export_contract(
+        self, reference_inputs: dict[str, dict[str, Any]], dynamic_shapes: dict[str, Any]
+    ) -> None:
+        # The name hooks are classmethods, so they describe the standard contract. A
+        # native-quantized gather also takes the per-row embedding scale, which `export.py` adds
+        # to the names it converts with; the rest of the contract is checked as it is.
+        if self._native_quantized:
+            gather = GATHER_EMBEDDINGS_FUNCTION_NAME
+            reference_inputs = {
+                **reference_inputs,
+                gather: {
+                    name: tensor
+                    for name, tensor in reference_inputs[gather].items()
+                    if name != EMBEDDING_SCALE_INPUT_NAME
+                },
+            }
+        super().validate_export_contract(reference_inputs, dynamic_shapes)
 
     @classmethod
     @override
@@ -843,7 +1114,8 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
         length: each (context bucket, query length) pair is its own program, with the
         caches at ``spec.cache_seq_len`` and ``spec.query_len`` query positions.
         """
-        if self.disable_embedding_quantization:
+        native = self._native_quantized
+        if self.disable_embedding_quantization and not native:
             raise ValueError(
                 "The iOS graph takes INT8 ple_embeddings; disable_embedding_quantization "
                 "is for eager tests"
@@ -861,8 +1133,12 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
 
         embedding_table = self.load_embeddings.embedding_table
         input_ids = torch.randint(1, config.vocab_size, (1, query_len), dtype=torch.int32)
-        # One graph's reference input is produced by running another.
-        transformer_input = self.gather_embeddings(input_ids, embedding_table)
+        if native:
+            embedding_scale = self.load_embeddings.embedding_scale
+            # One graph's reference input is produced by running another.
+            transformer_input = self.gather_embeddings(input_ids, embedding_table, embedding_scale)
+        else:
+            transformer_input = self.gather_embeddings(input_ids, embedding_table)
 
         key_cache = torch.zeros(
             self.extend.model.n_global_storing,
@@ -881,13 +1157,22 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
             dtype=torch.float16,
         )
         ple_width = config.num_hidden_layers * config.hidden_size_per_layer_input
+        if native:
+            # The runner unpacks and dequantizes native PLE rows itself, so the graph takes plain
+            # float16 rows rather than INT8 ones.
+            ple_embeddings = torch.zeros(1, query_len, 1, ple_width, dtype=torch.float16)
+        else:
+            ple_embeddings = torch.randint(
+                -128, 127, (1, query_len, 1, ple_width), dtype=torch.int8
+            )
+
+        gather_inputs = {"input_ids": input_ids, "embedding_table": embedding_table}
+        if native:
+            gather_inputs[EMBEDDING_SCALE_INPUT_NAME] = embedding_scale
 
         return {
             LOAD_EMBEDDINGS_FUNCTION_NAME: {},
-            GATHER_EMBEDDINGS_FUNCTION_NAME: {
-                "input_ids": input_ids,
-                "embedding_table": embedding_table,
-            },
+            GATHER_EMBEDDINGS_FUNCTION_NAME: gather_inputs,
             # Exact signature order of Gemma4Extend.forward.
             EXTEND_FUNCTION_NAME: {
                 TRANSFORMER_INPUT_NAME: transformer_input,
@@ -904,21 +1189,24 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
                 SLIDING_KEY_CACHE_INPUT_NAME: sliding_key_cache,
                 SLIDING_VALUE_CACHE_INPUT_NAME: sliding_key_cache.clone(),
                 EMBEDDING_TABLE_INPUT_NAME: embedding_table,
-                PLE_EMBEDDINGS_INPUT_NAME: torch.randint(
-                    -128, 127, (1, query_len, 1, ple_width), dtype=torch.int8
-                ),
+                PLE_EMBEDDINGS_INPUT_NAME: ple_embeddings,
             },
         }
 
     @override
     def build_dynamic_shapes(self, config, spec: TraceSpec) -> dict[str, Any]:
         # The transformer rungs are fully static (see build_reference_inputs); the gather
-        # is dynamic in the query length and specialized, as for every iOS model.
+        # is dynamic in the query length and specialized, as for every iOS model. A
+        # native-quantized gather is traced at one static shape per query length instead:
+        # the blockwise dequantization cannot build its zero-offset constant when the
+        # per-row scale it gathers carries a dynamic dimension.
         return {
             LOAD_EMBEDDINGS_FUNCTION_NAME: None,
-            GATHER_EMBEDDINGS_FUNCTION_NAME: super().build_dynamic_shapes(config, spec)[
-                GATHER_EMBEDDINGS_FUNCTION_NAME
-            ],
+            GATHER_EMBEDDINGS_FUNCTION_NAME: (
+                None
+                if self._native_quantized
+                else super().build_dynamic_shapes(config, spec)[GATHER_EMBEDDINGS_FUNCTION_NAME]
+            ),
             EXTEND_FUNCTION_NAME: None,
         }
 
@@ -973,7 +1261,16 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
         sliding_value_cache: torch.Tensor,
         ple_embeddings: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        token_embeddings = self.gather_embeddings(input_ids, self.load_embeddings.embedding_table)
+        if isinstance(self.gather_embeddings, Gemma4NativeQuantGatherEmbeddings):
+            token_embeddings = self.gather_embeddings(
+                input_ids,
+                self.load_embeddings.embedding_table,
+                self.load_embeddings.embedding_scale,
+            )
+        else:
+            token_embeddings = self.gather_embeddings(
+                input_ids, self.load_embeddings.embedding_table
+            )
         return self.extend(
             token_embeddings,
             rope_cos,
@@ -999,6 +1296,7 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
     ):
         """Extract text config from the multimodal Gemma4Config."""
         text_config = hf_config.text_config if hasattr(hf_config, "text_config") else hf_config
+        text_config.native_quantized = False
 
         if max_context_length is not None:
             text_config.max_position_embeddings = max_context_length
@@ -1012,6 +1310,135 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
             text_config.num_hidden_layers = num_layers
 
         return text_config
+
+    @classmethod
+    def from_hf(
+        cls,
+        huggingface_model_id: str,
+        max_context_length: int | None = None,
+        target_dtype: torch.dtype = torch.float16,
+        mmap_path: str | None = None,
+        num_layers: int | None = None,
+        disable_embedding_quantization: bool = False,
+        use_attention_mask: bool = False,
+    ) -> "Gemma4ForCausalLMForiOS":
+        """Load from HF multimodal model, extracting the text decoder only.
+
+        Unlike the base loader, this one also takes the QAT checkpoints, which load with
+        quantized modules and need their packed weights, per-layer bit widths and PLE table
+        read off those modules before the HF model is discarded.
+        """
+        hf_model = cls._HF_MODEL_CLASS.from_pretrained(huggingface_model_id, dtype=target_dtype)
+        is_native_quantized = _is_quantized_hf_model(hf_model)
+
+        config = cls._get_reauthored_config(
+            hf_model.config, max_context_length, num_layers=num_layers
+        )
+        config.native_quantized = is_native_quantized
+
+        # Per-layer MLP bit-width, read off the checkpoint's actual quantized modules --
+        # see `_native_mlp_nbits`. Must be set before `cls(config, ...)` constructs the
+        # (quantization-aware) module tree below.
+        if is_native_quantized:
+            modules_by_name = dict(hf_model.named_modules())
+            config.native_mlp_nbits = [
+                getattr(
+                    modules_by_name.get(f"model.language_model.layers.{i}.mlp.gate_proj"),
+                    "num_bits",
+                    4,
+                )
+                for i in range(config.num_hidden_layers)
+            ]
+
+        # The PLE table is never loaded into the model (it's externalized by
+        # `dump_ple_embedding`), so grab its raw quantized data before `hf_model` is
+        # discarded. Native mode keeps it packed as HF shipped it; float mode keeps the
+        # existing float extraction inside `_mutate_state_dict`.
+        ple_native = None
+        if is_native_quantized:
+            ple_module = dict(hf_model.named_modules()).get(
+                "model.language_model.embed_tokens_per_layer"
+            )
+            if ple_module is not None:
+                packed = ple_module.embedding_quantized.clone()
+                scale = ple_module.embedding_scale.to(torch.float16).clone()
+                nbits = ple_module.num_bits
+                # `--num-layers` (dev/test only) truncates the layer count, so the PLE
+                # row needs the same truncation the checkpoint's full width would
+                # otherwise carry -- mirrors `_mutate_state_dict`'s float-path truncation.
+                if num_layers is not None:
+                    expected_dim = config.num_hidden_layers * config.hidden_size_per_layer_input
+                    values_per_byte = 8 // nbits
+                    expected_blocks = expected_dim // (ple_module.embedding_dim // scale.shape[1])
+                    if scale.shape[1] > expected_blocks:
+                        scale = scale[:, :expected_blocks].contiguous()
+                    expected_packed = -(-expected_dim // values_per_byte)  # ceil div
+                    if packed.shape[1] > expected_packed:
+                        packed = packed[:, :expected_packed].contiguous()
+                ple_native = (packed, scale, nbits)
+
+        if is_native_quantized:
+            full_sd = _native_quantized_hf_state_dict(hf_model)
+        else:
+            full_sd = _dequantized_hf_state_dict(hf_model, target_dtype)
+        prefix = "model.language_model."
+        text_sd: dict[str, torch.Tensor] = {}
+        for k, v in full_sd.items():
+            if k.startswith(prefix):
+                text_sd["model." + k[len(prefix) :]] = v
+            elif k in ("lm_head.weight", "lm_head.quantized_data", "lm_head.scale"):
+                # Untied checkpoints (e.g. the QAT mobile-transformers variants) ship a
+                # real top-level `lm_head`, outside the `model.language_model.` prefix.
+                text_sd[k] = v
+
+        if (
+            "lm_head.weight" not in text_sd
+            and "lm_head.quantized_data" not in text_sd
+            and "model.embed_tokens.weight" in text_sd
+        ):
+            text_sd["lm_head.weight"] = text_sd["model.embed_tokens.weight"]
+
+        del hf_model, full_sd
+
+        if num_layers is not None:
+            from coreai_models.models.base import _is_layer_key_beyond
+
+            text_sd = {k: v for k, v in text_sd.items() if not _is_layer_key_beyond(k, num_layers)}
+
+        model = cls(
+            config,
+            model_device="meta",
+            disable_embedding_quantization=disable_embedding_quantization,
+        )
+        model.to(dtype=target_dtype)
+
+        if is_native_quantized:
+            model._mutate_native_quantized_state_dict(text_sd)
+            if ple_native is not None:
+                model._ple_native = ple_native
+        else:
+            model._mutate_state_dict(text_sd)
+
+        for k, v in text_sd.items():
+            if (
+                v.dtype != target_dtype
+                and v.is_floating_point()
+                and "embedding_table" not in k
+                and "zero_point" not in k
+            ):
+                raise ValueError(
+                    f"tensor {k} in incorrect dtype {v.dtype}. Expected {target_dtype}."
+                )
+
+        strict = num_layers is None
+        model.load_state_dict(text_sd, assign=True, strict=strict)
+
+        if mmap_path is not None:
+            from coreai_models.models.base import move_model_to_disk
+
+            move_model_to_disk(model, path=mmap_path)
+
+        return model
 
     def _mutate_state_dict(self, state_dict: dict[str, torch.Tensor]) -> None:
         """Transform HF state dict for iOS Gemma4 model."""
@@ -1129,36 +1556,184 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
 
         state_dict.pop("lm_head.weight", None)
 
+    def _mutate_native_quantized_state_dict(self, state_dict: dict[str, torch.Tensor]) -> None:
+        """``_mutate_state_dict``'s native-quantized counterpart.
+
+        Same reshaping/pruning shape as ``_mutate_state_dict``, but every Linear-shaped
+        param carries a ``(quantized_data, scale)`` or, for the palettization path (see
+        ``_native_quantized_hf_state_dict``), an ``(indices, scale)`` pair instead of a
+        single ``.weight``, and the embedding table keeps its literal per-row scale rather
+        than being requantized to a single per-tensor one. The PLE table isn't here at all
+        -- ``from_hf`` externalizes it directly off the HF module before this ever runs.
+        """
+        config = self.config
+        num_layers = config.num_hidden_layers
+        first_kv_shared_idx = num_layers - config.num_kv_shared_layers
+        ple_dim = config.hidden_size_per_layer_input
+
+        def _reshape_for_conv(base_key: str) -> None:
+            scale_key = f"{base_key}.scale"
+            for data_key in (f"{base_key}.quantized_data", f"{base_key}.indices"):
+                if data_key in state_dict:
+                    state_dict[data_key] = state_dict[data_key].unsqueeze(-1).unsqueeze(-1)
+                    state_dict[scale_key] = state_dict[scale_key].unsqueeze(-1).unsqueeze(-1)
+                    return
+
+        def _drop(base_key: str) -> None:
+            state_dict.pop(f"{base_key}.quantized_data", None)
+            state_dict.pop(f"{base_key}.indices", None)
+            state_dict.pop(f"{base_key}.scale", None)
+
+        # The runner dequantizes the PLE rows itself and feeds the graph a float input, so the
+        # graph's own PLE dequantization is an identity here.
+        state_dict["extend.ple_scale"] = torch.ones([], dtype=torch.float16)
+        state_dict["extend.ple_zero_point"] = torch.zeros([], dtype=torch.int8)
+
+        if ple_dim > 0:
+            # Truncate per_layer_model_projection if needed (unquantized -- Google's own
+            # recipe leaves it float too, see `modules_to_not_convert`).
+            proj_key = "model.per_layer_model_projection.weight"
+            if proj_key in state_dict:
+                full_proj = state_dict[proj_key]
+                expected_out = num_layers * ple_dim
+                if full_proj.shape[0] > expected_out:
+                    state_dict[proj_key] = full_proj[:expected_out, :]
+
+        # Reshape quantized weights for Conv2d and handle shared layers
+        for i in range(num_layers):
+            is_kv_shared = i >= first_kv_shared_idx and config.num_kv_shared_layers > 0
+
+            for proj in ("q_proj", "o_proj"):
+                _reshape_for_conv(f"model.layers.{i}.self_attn.{proj}")
+
+            if is_kv_shared:
+                for proj in ("k_proj", "v_proj"):
+                    _drop(f"model.layers.{i}.self_attn.{proj}")
+                state_dict.pop(f"model.layers.{i}.self_attn.k_norm.weight", None)
+            else:
+                for proj in ("k_proj", "v_proj"):
+                    _reshape_for_conv(f"model.layers.{i}.self_attn.{proj}")
+
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                _reshape_for_conv(f"model.layers.{i}.mlp.{proj}")
+
+            if ple_dim > 0:
+                for proj in ("per_layer_input_gate", "per_layer_projection"):
+                    _reshape_for_conv(f"model.layers.{i}.{proj}")
+
+        if ple_dim > 0:
+            proj_key = "model.per_layer_model_projection.weight"
+            if proj_key in state_dict:
+                state_dict[proj_key] = state_dict[proj_key].unsqueeze(-1).unsqueeze(-1)
+
+        # Wrap model weights under extend.model.* prefix
+        new_state_dict = {}
+        keys_to_pop = set()
+        for k in state_dict:
+            if k.startswith("model.") and "embed_tokens" not in k:
+                new_state_dict[f"extend.{k}"] = state_dict[k]
+                keys_to_pop.add(k)
+        for k in keys_to_pop:
+            state_dict.pop(k)
+        state_dict.update(new_state_dict)
+
+        # Embeddings: keep the literal per-row scale, reshaped to this module's
+        # `(vocab, 1, hidden)` / `(vocab, 1, 1)` layout convention.
+        state_dict["load_embeddings.embedding_table"] = state_dict.pop(
+            "model.embed_tokens.quantized_data"
+        ).unsqueeze(1)
+        state_dict["load_embeddings.embedding_scale"] = state_dict.pop(
+            "model.embed_tokens.scale"
+        ).unsqueeze(1)
+
+        # Untied (always true for the QAT checkpoints -- `tie_word_embeddings` is never
+        # set for them), so `emb_scale`/`emb_zero_point` are never read at runtime; keep
+        # them as identity values since `Gemma4Extend` still declares the parameters.
+        state_dict["extend.emb_scale"] = torch.tensor(1.0, dtype=torch.float16)
+        state_dict["extend.emb_zero_point"] = torch.tensor(0, dtype=torch.int8)
+
+        # Handle lm_head: split into the same output-channel blocks
+        # `NativeQuantLinear` builds internally (see its docstring for why each block
+        # needs its own direct-placeholder buffer pair, not a shared sliced one).
+        if not config.tie_word_embeddings:
+            full_data = state_dict["lm_head.quantized_data"]
+            full_scale = state_dict["lm_head.scale"]
+            vocab_size = full_data.shape[0]
+            block_size = DEFAULT_KV_BLOCK_SIZE
+            if vocab_size <= block_size:
+                state_dict["extend.lm_head.quantized_data"] = full_data
+                state_dict["extend.lm_head.scale"] = full_scale
+            else:
+                for i, lo in enumerate(range(0, vocab_size, block_size)):
+                    hi = min(lo + block_size, vocab_size)
+                    state_dict[f"extend.lm_head.blocks.{i}.quantized_data"] = full_data[
+                        lo:hi
+                    ].contiguous()
+                    state_dict[f"extend.lm_head.blocks.{i}.scale"] = full_scale[lo:hi].contiguous()
+        state_dict.pop("lm_head.quantized_data", None)
+        state_dict.pop("lm_head.scale", None)
+
     def dump_ple_embedding(self, output_path: str, model_name: str) -> str:
-        """Dump the externalized PLE embedding table as a quantized INT8 safetensors file."""
+        """Dump the externalized PLE embedding table as a safetensors sidecar.
+
+        Native-quantized checkpoints (``self._ple_native`` set by ``from_hf``) keep the
+        checkpoint's own packed low-bit bytes and per-row-per-block scale exactly as shipped,
+        with the architectural ``sqrt(ple_dim)`` embed scale folded into the scale so the
+        runner's plain ``int_value * scale[block]`` directly produces the value the graph
+        expects. The runner (``PerLayerEmbeddings.swift``) unpacks and dequantizes these rows
+        itself and feeds the graph a plain float ``ple_embeddings`` input, so the graph never
+        sees a quantized PLE tensor in that format.
+
+        Every other checkpoint gets a quantized INT8 table, which the graph dequantizes.
+        """
         import os
+
+        config = self.config
+        ple_dim = config.hidden_size_per_layer_input
+        embed_scale = ple_dim**0.5
+
+        os.makedirs(output_path, exist_ok=True)
+        ple_path = os.path.join(output_path, f"{model_name}_ple.safetensors")
+
+        if hasattr(self, "_ple_native"):
+            packed, scale, nbits = self._ple_native
+            native_scale = (scale.float() * embed_scale).to(torch.float16)
+            save_file(
+                {
+                    "embed_tokens_per_layer": packed.contiguous(),
+                    "embed_tokens_per_layer_scale": native_scale.contiguous(),
+                },
+                ple_path,
+                metadata={
+                    "nbits": str(nbits),
+                    "ple_total_dim": str(config.num_hidden_layers * ple_dim),
+                    "num_blocks": str(scale.shape[1]),
+                    "dtype": "native_quantized",
+                },
+            )
+            return ple_path
 
         if self.disable_embedding_quantization:
             raise ValueError(
                 "The PLE sidecar is INT8; disable_embedding_quantization is for eager tests"
             )
         ple_weight = self._ple_weight
-        ple_dim = self.config.hidden_size_per_layer_input
-        embed_scale = str(ple_dim**0.5)
-        ple_scale = _ple_quant_scale(ple_weight, float(embed_scale))
+        ple_scale = _ple_quant_scale(ple_weight, embed_scale)
 
         # quantize_per_tensor's rounding, a block of rows at a time so the table never
         # has a full fp32 copy.
         ple_q = torch.empty(ple_weight.shape, dtype=torch.int8)
         for start in range(0, ple_weight.shape[0], 8192):
-            rows = ple_weight[start : start + 8192].float() * float(embed_scale)
+            rows = ple_weight[start : start + 8192].float() * embed_scale
             ple_q[start : start + 8192] = torch.clamp(torch.round(rows / ple_scale), -128, 127).to(
                 torch.int8
             )
-
-        os.makedirs(output_path, exist_ok=True)
-        ple_path = os.path.join(output_path, f"{model_name}_ple.safetensors")
 
         save_file(
             {"embed_tokens_per_layer": ple_q},
             ple_path,
             metadata={
-                "embed_scale": embed_scale,
+                "embed_scale": str(embed_scale),
                 "ple_scale": str(float(ple_scale)),
                 "ple_zero_point": "0",
                 "dtype": "SI8",

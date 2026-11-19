@@ -4,16 +4,61 @@ Google's Gemma 4 models for on-device inference via Core AI (iOS).
 
 ## Supported Models
 
-| Model                | Parameters | iOS |
-| -------------------- | ---------- | --- |
-| Gemma 4 E2B Instruct | 5.0B       | Yes (27.2+) |
-| Gemma 4 E4B Instruct | 8.0B       | Yes (27.2+) |
+| Model                                          | Parameters | iOS         |
+| ---------------------------------------------- | ---------- | ----------- |
+| Gemma 4 E2B Instruct                           | 5.0B       | Yes (27.2+) |
+| Gemma 4 E4B Instruct                           | 8.0B       | Yes (27.2+) |
+| Gemma 4 E2B Instruct (QAT mobile transformers) | 5.0B       | Yes (27.2+) |
 
 These are the Gemma 4 checkpoints sized for a phone. They export through the
 standalone [`export.py`](export.py) rather than the generic `coreai.llm.export`
 pipeline, for two reasons: the blocked attention's graph depends on the context
 length, so each context bucket is traced as its own static graph, and the
 Per-Layer Embeddings (PLE) table is dumped as a sidecar next to the asset.
+
+The `-qat-mobile-transformers` checkpoints are the same architecture, trained
+with Google's own quantization-aware training and shipped with `nn.Linear` /
+`nn.Embedding` replaced by packed INT2/4/8 weights (see
+`transformers.integrations.gemma_quant`). The export carries those exact
+quantized values straight into CoreAI's own native quantized weight format
+(`coreai.blockwise_shift_scale`, driven by
+`coreai_torch`'s `constexpr_blockwise_shift_scale`) instead of dequantizing and
+re-palettizing them -- no dequantize/requantize round-trip, and k-means
+palettization is skipped entirely for these checkpoints (their weights are
+already CoreAI-natively quantized). Attention/MLP/`lm_head` weights all keep
+native packing in the exported graph, but not always as affine
+`blockwise_shift_scale`:
+
+- CoreAI's affine `blockwise_shift_scale` has no execution path on the
+  static-shape engine below INT4 -- the compiler silently promotes anything
+  declared INT2 back up to INT4 at compile time. `lm_head` is always declared
+  INT4 rather than INT2 up front, so the exported asset's size is honest about
+  what actually ships. The `embed_tokens` table is a runtime input of the
+  gather, and the runtime cannot gather from a sub-byte tensor, so its 2-bit
+  values are kept one per INT8 element (the same layout as the standard
+  table) with their per-row scale.
+- Some checkpoints (E2B, but not E4B) genuinely ship INT2 weights for the MLP
+  of their shared-KV/double-wide layers (`config.native_mlp_nbits`, read
+  per-layer from each `QuantizedLinear.num_bits`). For those layers only,
+  the MLP's `gate_proj`/`up_proj`/`down_proj` are exported as LUT
+  palettization (`coreai.lut_to_dense` decoding a 4-entry table) instead of
+  affine quantization, since that's the only way to realize genuine sub-4-bit
+  density on the static-shape engine -- affine INT2 there would just be
+  promoted back to INT4 by the compiler, as above, silently doubling that
+  layer's on-device size.
+- `lm_head`'s output dimension (vocab size, 262144) exceeds the static-shape
+  engine's per-op tensor size limit, so it's exported as a `nn.ModuleList` of independently
+  quantized output-dimension blocks (`DEFAULT_KV_BLOCK_SIZE` each) rather
+  than one big quantized matmul -- each block needs its own state-dict
+  buffers (not a slice of one shared buffer) for CoreAI's converter to
+  promote it to genuinely packed sub-byte constants; a shared/sliced buffer
+  silently falls back to a full-byte container instead of erroring.
+
+The externalized PLE table sidecar keeps Google's packed INT2 rows as
+shipped, unpacked and dequantized directly by the runner
+(`PerLayerEmbeddings.swift`) rather than the graph, so the graph takes a plain
+float16 input for it.
+
 
 ## Gated Access
 
@@ -62,6 +107,9 @@ uv run export.py --model google/gemma-4-E2B-it
 # Other variant
 uv run export.py --model google/gemma-4-E4B-it
 
+# QAT mobile-transformers checkpoints (quantization-aware-trained; kept quantized)
+uv run export.py --model google/gemma-4-E2B-it-qat-mobile-transformers
+
 # No palettization. The embedding and PLE tables are still 8-bit quantized.
 uv run export.py --model google/gemma-4-E2B-it --compression none
 
@@ -80,8 +128,10 @@ that each transformer (context bucket, query length) pair is traced as its own
 fully static program, `extend_{ctx}_{q}` / `prompt_opt_{ctx}_{q}`: the blocked
 attention unrolls its block loop, so the graph depends on the context length. A
 flat global KV cache is paired with a fixed-depth sliding-window ring, RoPE
-arrives precomputed as `rope_cos`/`rope_sin` inputs, and the INT8 Per-Layer
-Embeddings table is written as a sidecar next to the asset.
+arrives precomputed as `rope_cos`/`rope_sin` inputs, and the Per-Layer
+Embeddings table is written as a sidecar next to the asset (INT8 per-tensor for
+the standard checkpoints; for the QAT checkpoints, the checkpoint's own packed
+low-bit rows plus a scale per layer in each row).
 
 ## Note on AOT Compilation
 
@@ -209,7 +259,11 @@ the final-logit soft cap applied before sampling
 gather (`auxiliary_assets.per_layer_embeddings`). The global KV cache is classified as
 per-bucket automatically — its backing buffer varies across the ladder — so it is
 allocated at the running context bucket and re-laid-out as decode grows into
-larger ones, while the fixed-depth sliding ring is allocated once.
+larger ones, while the fixed-depth sliding ring is allocated once. For the QAT
+checkpoints, the embedding table carries a companion per-row `embedding_scale`
+tensor (an additive extension to the `load_embeddings`/`gather_embeddings`
+contract — absent for the standard checkpoints), and the PLE sidecar's rows are
+unpacked and dequantized directly by the runner rather than the graph.
 
 ## Run a Core AI Language Model
 
