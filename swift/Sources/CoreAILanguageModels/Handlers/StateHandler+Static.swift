@@ -352,7 +352,8 @@ struct StaticStateSet {
 
     /// Whether the states can be truncated from `processed` back to `target`
     /// positions. Flat caches always can; a sliding-window ring only while it still
-    /// holds the keys the next query needs; a `.startOnly` set only back to 0.
+    /// holds the keys the next query needs; a `.startOnly` set only back to 0, or to
+    /// `processed` itself (a no-op).
     func canTruncate(processed: Int, to target: Int, alignment: Int = 1) -> Bool {
         if rollback == .startOnly && target != 0 && target != processed { return false }
         return slidingRing?.allowsRewind(processed: processed, to: target, alignment: alignment) ?? true
