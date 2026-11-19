@@ -854,12 +854,18 @@ def is_native_quantized_config(hf_config) -> bool:
 
 
 def _is_quantized_hf_model(hf_model: nn.Module) -> bool:
-    """Whether ``hf_model`` was loaded through HF's Gemma QAT quantizer."""
+    """Whether ``hf_model``'s text decoder was loaded through HF's Gemma QAT quantizer.
+
+    Only the modules this loader reads count (the text decoder and ``lm_head``): a checkpoint
+    that quantizes only its vision or audio tower has a float text decoder, which the native
+    modules cannot load.
+    """
     if QuantizedLinear is None:
         return False
     return any(
         isinstance(module, (QuantizedLinear, QuantizedEmbedding))
-        for _, module in hf_model.named_modules()
+        for name, module in hf_model.named_modules()
+        if name.startswith("model.language_model.") or name == "lm_head"
     )
 
 
@@ -1042,9 +1048,12 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
             # (not per-tensor) scale, so it needs its own load/gather pair -- see
             # `Gemma4NativeQuantGatherEmbeddings`. Held as INT8, not packed: the table is a
             # runtime input of the gather, and the runtime cannot gather from a sub-byte tensor.
-            self.load_embeddings = Gemma4NativeQuantLoadEmbeddings(
-                config.vocab_size, config.hidden_size
-            )
+            # Built on `model_device` (meta under `from_hf`), as the transformer is, so the
+            # table is not allocated only to be replaced by `load_state_dict`.
+            with torch.device(model_device):
+                self.load_embeddings = Gemma4NativeQuantLoadEmbeddings(
+                    config.vocab_size, config.hidden_size
+                )
             self.gather_embeddings = Gemma4NativeQuantGatherEmbeddings(nbits=8)
 
     def _init_model(self, config) -> None:
@@ -1386,8 +1395,8 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
         )
         if not _is_quantized_hf_model(hf_model):
             raise ValueError(
-                f"{huggingface_model_id_or_path} declares Gemma quantization but loaded without "
-                "quantized modules; the installed transformers may predate it."
+                f"{huggingface_model_id_or_path} declares Gemma quantization but its text decoder "
+                "loaded without quantized modules; the installed transformers may predate it."
             )
 
         config = cls._get_reauthored_config(
