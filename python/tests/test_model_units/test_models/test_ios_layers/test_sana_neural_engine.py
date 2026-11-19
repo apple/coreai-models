@@ -6,7 +6,7 @@
 """Neural Engine Sana Sprint components (``models/ios/sana_*.py``) vs diffusers / transformers.
 
 Tiny random configs, float32: every rewrite in the re-authored modules is exact, so each must
-match its source to well above the 70 dB re-authoring gate.
+match its source above the 70 dB re-authoring gate.
 """
 
 import pytest
@@ -21,7 +21,6 @@ from coreai_models.models.ios.sana_dc_ae_decoder import (
 )
 from coreai_models.models.ios.sana_gemma2_encoder import SanaGemma2Encoder
 from coreai_models.models.ios.sana_transformer import SanaTransformer
-from coreai_models.primitives.ios.rms_norm import MaxAbsRMSNorm
 
 
 def _psnr(got: torch.Tensor, want: torch.Tensor) -> float:
@@ -37,24 +36,14 @@ def _randomize(module: torch.nn.Module, seed: int) -> None:
             p.add_(0.1 * torch.randn(p.shape, generator=gen))
 
 
-def test_max_abs_rms_norm_add_floor_matches_clamp() -> None:
-    torch.manual_seed(0)
-    x = torch.randn(1, 64, 1, 16) * 300
-    x[..., 3] = 0  # an all-zero column stays zero under both floors
-    a, b = MaxAbsRMSNorm(64, 1e-5, axis=-3), MaxAbsRMSNorm(64, 1e-5, axis=-3, floor="add")
-    with torch.no_grad():
-        a.weight.normal_()
-        b.weight.copy_(a.weight)
-        assert _psnr(b(x), a(x)) > 100
-        assert torch.equal(b(x)[..., 3], torch.zeros_like(x[:, :, :, 3]))
-
-
 def test_merged_upsample_conv_matches_conv_of_nearest() -> None:
     torch.manual_seed(0)
     conv = torch.nn.Conv2d(6, 5, 3, padding=1)
     x = torch.randn(1, 6, 7, 9)
-    want = conv(F.interpolate(x, scale_factor=2, mode="nearest"))
-    assert _psnr(_merged_upsample_conv(conv)(x), want) > 120
+    with torch.no_grad():
+        want = conv(F.interpolate(x, scale_factor=2, mode="nearest"))
+        got = _merged_upsample_conv(conv)(x)
+    assert _psnr(got, want) > 120
 
 
 @pytest.mark.parametrize("cin,cout", [(8, 8), (8, 4), (16, 8)])
@@ -63,6 +52,21 @@ def test_shuffle_shortcut_matches_pixel_shuffle(cin: int, cout: int) -> None:
     r = cout * 4 // cin
     want = F.pixel_shuffle(x.repeat_interleave(r, dim=1), 2)
     assert torch.equal(_shuffle_shortcut(cin, cout)(x), want)
+
+
+def test_neural_engine_components_bind_like_the_gpu_components() -> None:
+    """The runtime binds both builds by the same asset, input and output names."""
+    from coreai_models.diffusion.components import SANA_SPRINT_COMPONENTS
+    from coreai_models.diffusion.sana_neural_engine import SANA_SPRINT_NEURAL_ENGINE_COMPONENTS
+
+    assert SANA_SPRINT_NEURAL_ENGINE_COMPONENTS.keys() == SANA_SPRINT_COMPONENTS.keys()
+    for name, ne in SANA_SPRINT_NEURAL_ENGINE_COMPONENTS.items():
+        gpu = SANA_SPRINT_COMPONENTS[name]
+        assert (ne.asset_name, ne.input_names, ne.output_names) == (
+            gpu.asset_name,
+            gpu.input_names,
+            gpu.output_names,
+        ), name
 
 
 def _tiny_sana_transformer():

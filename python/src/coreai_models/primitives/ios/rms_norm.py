@@ -4,6 +4,7 @@
 # be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
 import os
+from typing import Literal
 
 import torch
 import torch.nn as nn
@@ -78,7 +79,9 @@ class MaxAbsRMSNormNoScale(nn.Module):
     _eps_sqrt: torch.Tensor
     _floor: torch.Tensor
 
-    def __init__(self, eps: float = 1e-6, axis: int = -1, floor: str = "clamp") -> None:
+    def __init__(
+        self, eps: float = 1e-6, axis: int = -1, floor: Literal["clamp", "add"] = "clamp"
+    ) -> None:
         super().__init__()
         if floor not in ("clamp", "add"):
             raise ValueError(f"floor must be 'clamp' or 'add', got {floor!r}")
@@ -107,7 +110,13 @@ class MaxAbsRMSNorm(MaxAbsRMSNormNoScale):
     after ``axis``.
     """
 
-    def __init__(self, dim: int, eps: float = 1e-6, axis: int = -1, floor: str = "clamp") -> None:
+    def __init__(
+        self,
+        dim: int,
+        eps: float = 1e-6,
+        axis: int = -1,
+        floor: Literal["clamp", "add"] = "clamp",
+    ) -> None:
         super().__init__(eps, axis, floor)
         with torch.device("cpu"):
             self.weight = nn.Parameter(torch.ones((dim,) + (1,) * (-axis - 1)))
