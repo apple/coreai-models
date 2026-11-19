@@ -240,6 +240,20 @@ def _resolve_compression(args: argparse.Namespace, native_quantized: bool) -> tu
     return None, "none"
 
 
+def _check_native_quantized_options(args: argparse.Namespace, native_quantized: bool) -> None:
+    """Refuse options a native-quantized (QAT) checkpoint cannot be exported with.
+
+    ``--include-vision``: the vision encoder export reads float ``*.linear.weight`` tensors,
+    but the QAT checkpoints quantize the vision tower too (INT8 weights with a per-channel
+    scale), which it would load as float values without their scale.
+    """
+    if native_quantized and getattr(args, "include_vision", False):
+        raise SystemExit(
+            f"--include-vision is not supported for the native-quantized checkpoint {args.model}: "
+            "its vision tower is quantized, and the vision encoder export reads float weights."
+        )
+
+
 def _resolve_bundle_paths(output_dir: str, output_name: str, overwrite: bool) -> tuple[Path, Path]:
     """Create the bundle directory, failing fast on an existing asset without
     ``--overwrite``. Returns (bundle, asset). The existing asset is only removed just
@@ -574,7 +588,14 @@ async def _export_ios(args: argparse.Namespace) -> str:
     # unset, and a native-quantized checkpoint is never palettized. Resolved before
     # any weights are loaded so a bad recipe fails fast.
     native_quantized = _native_quantized_checkpoint(hf_model_id)
+    _check_native_quantized_options(args, native_quantized)
     palettization_config, compression = _resolve_compression(args, native_quantized)
+    if native_quantized:
+        logger.warning(
+            f"{hf_model_id} is exported with its quantized weights only: the static activation "
+            "quantization it was trained with is not applied, so its accuracy can fall below "
+            "the default palettized export of the standard checkpoint."
+        )
 
     output_name = args.output_name or _generate_output_name(
         ExportConfig(

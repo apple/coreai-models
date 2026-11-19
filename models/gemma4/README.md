@@ -26,7 +26,12 @@ quantized values straight into CoreAI's own native quantized weight format
 re-palettizing them -- no dequantize/requantize round-trip, and k-means
 palettization is skipped entirely for these checkpoints (their weights are
 already CoreAI-natively quantized), so the export refuses `--compression` and
-`--compression-config` for them. Attention/MLP/`lm_head` weights all keep
+`--compression-config` for them. `--include-vision` is refused too: the vision
+tower is quantized as well, and the vision encoder export reads float weights.
+The export carries the quantized weights only, not the static activation
+quantization the checkpoints were trained with, so their accuracy can fall below
+the default palettized export of the standard checkpoint; the export logs a
+warning to that effect. Attention/MLP/`lm_head` weights all keep
 native packing in the exported graph, but not always as affine
 `blockwise_shift_scale`:
 
@@ -265,7 +270,12 @@ larger ones, while the fixed-depth sliding ring is allocated once. For the QAT
 checkpoints, the embedding table carries a companion per-row `embedding_scale`
 tensor (an additive extension to the `load_embeddings`/`gather_embeddings`
 contract — absent for the standard checkpoints), and the PLE sidecar's rows are
-unpacked and dequantized directly by the runner rather than the graph.
+unpacked and dequantized directly by the runner rather than the graph. Their
+gather is also traced as one fully static program per shipping query length
+rather than one dynamic program specialized per query length; the entrypoints
+keep the same `gather_embeddings_<q>` names the runner looks up, and the
+embedding table has no hardware constraint (it is a plain gather input, not
+the standard checkpoints' fused dequantizing gather).
 
 ## Run a Core AI Language Model
 

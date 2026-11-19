@@ -153,12 +153,23 @@ def test_compression_defaults():
         None,
         "native_quantized",
     )
-    _, name = export_g4._resolve_compression(args, native_quantized=False)
+    recipe, name = export_g4._resolve_compression(args, native_quantized=False)
+    assert recipe is not None
     assert name == export_g4.DEFAULT_IOS_COMPRESSION_CONFIG.stem
 
     none_args = _cli_args("--compression", "none")
     export_g4._resolve_defaults(none_args)
     assert export_g4._resolve_compression(none_args, native_quantized=False) == (None, "none")
+
+
+def test_native_checkpoint_refuses_include_vision():
+    """The QAT vision tower is quantized, which the vision encoder export cannot read."""
+    args = _cli_args("--include-vision")
+    export_g4._resolve_defaults(args)
+    with pytest.raises(SystemExit, match="--include-vision"):
+        export_g4._check_native_quantized_options(args, native_quantized=True)
+    export_g4._check_native_quantized_options(args, native_quantized=False)
+    export_g4._check_native_quantized_options(_cli_args(), native_quantized=True)
 
 
 def test_metadata_extras_require_what_the_runner_needs():
