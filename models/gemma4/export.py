@@ -476,7 +476,8 @@ async def _convert_to_coreai(
     native_quantized = model.native_quantized
     if native_quantized:
         # A native-quantized embedding table carries a per-row scale: a second output of
-        # `load_embeddings` and a third input of `gather_embeddings`.
+        # `load_embeddings` and a third input of `gather_embeddings`, which the runner passes
+        # through when the program declares them. The standard export declares neither.
         inputs = {
             **inputs,
             GATHER_EMBEDDINGS_FUNCTION_NAME: (
