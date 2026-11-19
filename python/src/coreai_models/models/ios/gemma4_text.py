@@ -1740,7 +1740,7 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
         applied. An output quantize/dequantize sits between a conv and the op after it (the
         MLP's GELU, for one), which keeps the Neural Engine compiler from fusing the input
         quantize into an integer convolution, and the next projection quantizes its own input
-        anyway."""
+        anyway. ``lm_head`` is not a 1x1-conv projection and keeps a float input."""
         root = "extend.model."
         applied = 0
         for name, module in self.named_modules():

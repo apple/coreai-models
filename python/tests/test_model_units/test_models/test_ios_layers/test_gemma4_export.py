@@ -184,6 +184,24 @@ def test_supported_models_match_the_registry_and_metadata():
     assert {k for k in _METADATA if k.startswith("google/gemma-4-")} == supported
 
 
+def test_weights_only_needs_a_native_checkpoint_and_names_its_bundle_apart():
+    """``--weights-only`` is refused for a standard checkpoint, and a weights-only QAT export is
+    named apart from the default one, which also quantizes activations."""
+    args = _cli_args("--weights-only")
+    export_g4._resolve_defaults(args)
+    with pytest.raises(SystemExit, match="--weights-only"):
+        export_g4._check_native_quantized_options(args, native_quantized=False)
+    export_g4._check_native_quantized_options(args, native_quantized=True)
+
+    weights_only = export_g4._resolve_compression(args, native_quantized=True)
+    assert weights_only == (None, "native_quantized_weights_only")
+    default_args = _cli_args()
+    export_g4._resolve_defaults(default_args)
+    assert (
+        export_g4._resolve_compression(default_args, native_quantized=True)[1] != (weights_only[1])
+    )
+
+
 def test_metadata_extras_require_what_the_runner_needs():
     cfg = _make_config()
     cfg.final_logit_softcapping = 30.0
