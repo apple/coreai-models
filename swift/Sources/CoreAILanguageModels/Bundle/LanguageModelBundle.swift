@@ -22,6 +22,9 @@ public struct LanguageModelBundle: Sendable {
     public let modelAssetPath: String
     public let language: LanguageConfig
     public let visionConfig: VisionConfig?
+    /// `speculative.drafter_kind`: how the `drafter` component proposes tokens, nil when the bundle
+    /// declares none.
+    package let drafterKind: String?
 
     public init(from path: String) throws {
         let expanded = (path as NSString).expandingTildeInPath
@@ -47,6 +50,7 @@ public struct LanguageModelBundle: Sendable {
         self.modelAssetPath = main
         self.language = language
         self.visionConfig = payload.vision
+        self.drafterKind = payload.speculative?.drafterKind
 
         if bundle.kind == .vlm && self.visionConfig == nil {
             throw ModelBundle.BundleError.missingField("vision")
@@ -60,6 +64,8 @@ public struct LanguageModelBundle: Sendable {
     public var tokenizer: String { language.tokenizer }
     public var vocabSize: Int { language.vocabSize }
     public var maxContextLength: Int { language.maxContextLength }
+    /// Largest batch the graph accepts. 1 for single-sequence graphs.
+    package var maxBatchSize: Int { language.maxBatchSize }
 
     /// Model-specific runtime settings (`language.overrides`); nil for most models.
     public var overrides: LanguageOverrides? { language.overrides }
@@ -74,6 +80,44 @@ public struct LanguageModelBundle: Sendable {
         }
         return resolved
     }
+
+    /// `auxiliary_assets` roles of a draft head's sidecars.
+    package enum DrafterAssetKey {
+        package static let config = "drafter_config"
+        package static let scan = "drafter_scan"
+        package static let scanIndex = "drafter_scan_index"
+    }
+
+    /// The `speculative.drafter_kind` of a draft head that runs off the target's final hidden state
+    /// and shared K/V.
+    package static let mtpDrafterKind = "mtp"
+
+    /// The bundle's draft head, when it ships one: the program under `assets.drafter` and its
+    /// sidecars under `auxiliary_assets` (``DrafterAssetKey``). Throws when the program is listed
+    /// without its sidecars, or when the drafter is of a kind other than ``mtpDrafterKind``, since
+    /// other drafters declare the same asset key with different semantics.
+    package var drafter: DrafterComponent? {
+        get throws {
+            guard let step = modelBundle.modelURL(for: ModelBundle.ComponentKey.drafter) else { return nil }
+            guard drafterKind == Self.mtpDrafterKind else {
+                throw InferenceRuntimeError.invalidState(
+                    "the bundle's drafter is of kind \(drafterKind.map { "'\($0)'" } ?? "unspecified"), "
+                        + "not '\(Self.mtpDrafterKind)'; this runner reads hidden-state draft heads only")
+            }
+            func sidecar(_ key: String) throws -> URL {
+                guard let url = modelBundle.auxiliaryAssetURL(for: key) else {
+                    throw ModelBundle.BundleError.missingField("auxiliary_assets.\(key)")
+                }
+                return url
+            }
+            return DrafterComponent(
+                step: step, config: try sidecar(DrafterAssetKey.config), scan: try sidecar(DrafterAssetKey.scan),
+                scanIndex: try sidecar(DrafterAssetKey.scanIndex))
+        }
+    }
+
+    /// Whether the decode graphs emit the hidden states a draft head seeds from.
+    public var emitsHiddenStates: Bool { overrides?.emitsHiddenStates ?? false }
 
     /// Raw metadata bytes for passing to engine config parsers.
     public var rawMetadata: Data { modelBundle.raw }
@@ -98,6 +142,15 @@ public struct LanguageModelBundle: Sendable {
         }
         return try await AutoTokenizer.from(pretrained: language.tokenizer)
     }
+    /// Token IDs beyond `tokenizer`'s main EOS that end generation: those the tokenizer files
+    /// mark as turn-ending (`LanguageConfig.additionalStopTokenIds(from:tokenizer:)`) and those the
+    /// export declares in `eos_token_ids`.
+    public func additionalStopTokenIds(tokenizer: any Tokenizer) -> Set<Int32> {
+        var ids = tokenizerPath.map { LanguageConfig.additionalStopTokenIds(from: $0, tokenizer: tokenizer) } ?? []
+        ids.formUnion(language.eosTokenIds)
+        if let eos = tokenizer.eosTokenId { ids.remove(Int32(eos)) }
+        return ids
+    }
 }
 
 // MARK: - 0.2 payload shape
@@ -107,9 +160,16 @@ extension LanguageModelBundle {
         let assets: Assets
         let language: LanguageConfig?
         let vision: VisionConfig?
+        let speculative: Speculative?
 
         struct Assets: Decodable {
             let main: String?
+        }
+
+        struct Speculative: Decodable {
+            let drafterKind: String?
+
+            enum CodingKeys: String, CodingKey { case drafterKind = "drafter_kind" }
         }
     }
 }

@@ -58,16 +58,21 @@ public struct CoreAIVisionLanguageModel: LanguageModel {
                 prefillChunkThreshold: bundle.language.prefillChunkThreshold
             )
         )
-        guard let vlmEngine = engine as? CoreAISequentialVLMEngine else {
+        guard let vlmEngine = engine as? any MultimodalInferenceEngine, vlmEngine.acceptsMultimodalInput else {
             throw InferenceRuntimeError.invalidArgument(
-                "Expected a vision-language engine for a VLM bundle, got \(type(of: engine))")
+                "The \(type(of: engine)) built for this VLM bundle does not accept image input")
         }
+
+        let tokenizer = try await tokenizerResult
+
+        let additionalStopTokenIds = bundle.additionalStopTokenIds(tokenizer: tokenizer)
 
         self.executorConfiguration = CoreAIVLMExecutor.Configuration(
             bundleURL: url,
             engine: vlmEngine,
-            tokenizer: try await tokenizerResult,
-            visionConfig: visionConfig
+            tokenizer: tokenizer,
+            visionConfig: visionConfig,
+            additionalStopTokenIds: additionalStopTokenIds
         )
     }
 }
@@ -79,9 +84,10 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
 
     public struct Configuration: Hashable, Sendable {
         let bundleURL: URL
-        let engine: CoreAISequentialVLMEngine
+        let engine: any MultimodalInferenceEngine
         let tokenizer: any Tokenizer
         let visionConfig: VisionConfig
+        let additionalStopTokenIds: Set<Int32>
 
         public static func == (lhs: Configuration, rhs: Configuration) -> Bool {
             lhs.bundleURL == rhs.bundleURL
@@ -91,14 +97,16 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
         }
     }
 
-    private let engine: CoreAISequentialVLMEngine
+    private let engine: any MultimodalInferenceEngine
     private let tokenizer: any Tokenizer
     private let visionConfig: VisionConfig
+    private let additionalStopTokenIds: Set<Int32>
 
     public init(configuration: Configuration) throws {
         self.engine = configuration.engine
         self.tokenizer = configuration.tokenizer
         self.visionConfig = configuration.visionConfig
+        self.additionalStopTokenIds = configuration.additionalStopTokenIds
     }
 
     public nonisolated(nonsending) func respond(
@@ -144,17 +152,13 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
         )
 
         let maxTokens = request.generationOptions.maximumResponseTokens ?? 512
-        var stopTokens = Set<Int32>()
-        if let eos = tokenizer.eosTokenId { stopTokens.insert(Int32(eos)) }
-        if let imEnd = tokenizer.vocabContains("<|im_end|>") ? tokenizer.convertTokenToId("<|im_end|>") : nil {
-            stopTokens.insert(Int32(imEnd))
-        }
+        let stopTokens = tokenizer.runtimeStopTokens(additional: additionalStopTokenIds)
 
         let stream = try await engine.generate(
             with: embeddedInput,
             tokens: promptTokens,
             samplingConfiguration: SamplingConfiguration(temperature: 1.0, topK: 1),
-            inferenceOptions: InferenceOptions(maxTokens: maxTokens, includeLogits: false)
+            inferenceOptions: .extend(maxTokens: maxTokens)
         )
 
         var generatedCount = 0
@@ -198,26 +202,13 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
         imageTokenId: Int32,
         tokenizer: any Tokenizer
     ) -> [Int32] {
-        let imageToken = tokenizer.convertIdToToken(Int(imageTokenId)) ?? "<|image_pad|>"
+        let imageToken = ImagePlaceholders.text(imageTokenId: imageTokenId, tokenizer: tokenizer)
         if let templated = try? PromptUtils.maybeApplyTokenizerChatTemplate(
-            .prompt("\(imageToken)\n\(userText)"), tokenizer: tokenizer)
+            .prompt("\(imageToken)\n\(userText)"), tokenizer: tokenizer),
+            let expanded = ImagePlaceholders.expand(
+                templated.map { Int32($0) }, imageTokenId: imageTokenId, tokenCounts: [imageTokenCount])
         {
-            var result: [Int32] = []
-            result.reserveCapacity(templated.count + imageTokenCount)
-            var expanded = false
-            for tokenInt in templated {
-                let token = Int32(tokenInt)
-                if token == imageTokenId {
-                    if !expanded {
-                        result.append(
-                            contentsOf: [Int32](repeating: imageTokenId, count: imageTokenCount))
-                        expanded = true
-                    }
-                    continue
-                }
-                result.append(token)
-            }
-            if expanded { return result }
+            return expanded
         }
 
         // Fallback for tokenizers without a multimodal chat template. Uses the

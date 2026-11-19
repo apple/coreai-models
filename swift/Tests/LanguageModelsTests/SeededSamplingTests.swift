@@ -3,34 +3,16 @@
 // Use of this source code is governed by a BSD-3-clause license that can
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
+import CoreAIShared
 import Testing
 
 @testable import CoreAILanguageModels
 
 /// Coverage for seeded, reproducible sampling: the `SeededRandomNumberGenerator` and the
-/// `SamplingConfiguration.seed` path through `fallbackSampler`. All model-free and
+/// `SamplingConfiguration.seed` path through `cpuSampler`. All model-free and
 /// hardware-free — pure CPU sampling over hand-built logits.
 @Suite("Seeded sampling", .serialized)
 struct SeededSamplingTests {
-    // MARK: - SeededRandomNumberGenerator
-
-    @Test("Same seed reproduces the same stream")
-    func sameSeedSameStream() {
-        var a = SeededRandomNumberGenerator(seed: 12345)
-        var b = SeededRandomNumberGenerator(seed: 12345)
-        for _ in 0..<32 {
-            #expect(a.next() == b.next())
-        }
-    }
-
-    @Test("Different seeds diverge immediately")
-    func differentSeedsDiverge() {
-        var a = SeededRandomNumberGenerator(seed: 1)
-        var b = SeededRandomNumberGenerator(seed: 2)
-        // SplitMix64 mixes hard, so adjacent seeds differ on the first draw.
-        #expect(a.next() != b.next())
-    }
-
     // MARK: - Reproducible token selection
 
     /// A flat distribution: equal logits so softmax is uniform and the RNG alone
@@ -44,8 +26,8 @@ struct SeededSamplingTests {
         let config = SamplingConfiguration(temperature: 1.0, seed: 777)
         var first = flatLogits(16)
         var second = flatLogits(16)
-        let a = config.fallbackSampler(from: &first, step: 3)
-        let b = config.fallbackSampler(from: &second, step: 3)
+        let a = config.cpuSampler(from: &first, step: 3)
+        let b = config.cpuSampler(from: &second, step: 3)
         #expect(a == b)
     }
 
@@ -56,7 +38,7 @@ struct SeededSamplingTests {
         func run() -> [Int32] {
             (0..<24).map { step in
                 var logits = flatLogits(32)
-                return config.fallbackSampler(from: &logits, step: step)
+                return config.cpuSampler(from: &logits, step: step)
             }
         }
 
@@ -72,7 +54,7 @@ struct SeededSamplingTests {
         for seed in 0..<UInt64(128) {
             let config = SamplingConfiguration(temperature: 1.0, seed: seed)
             var logits = flatLogits(4)
-            tokens.insert(config.fallbackSampler(from: &logits, step: 0))
+            tokens.insert(config.cpuSampler(from: &logits, step: 0))
         }
         #expect(tokens.count > 1)
         #expect(tokens.allSatisfy { $0 >= 0 && $0 < 4 })
@@ -86,7 +68,7 @@ struct SeededSamplingTests {
         var tokens: Set<Int32> = []
         for step in 0..<64 {
             var logits = flatLogits(4)
-            tokens.insert(config.fallbackSampler(from: &logits, step: step))
+            tokens.insert(config.cpuSampler(from: &logits, step: step))
         }
         #expect(tokens.count > 1)
     }
@@ -96,9 +78,9 @@ struct SeededSamplingTests {
     @Test("Greedy is argmax regardless of seed")
     func greedyIgnoresSeed() {
         var logits: [LogitsScalarType] = [0.1, 3.0, 0.2, 1.5]
-        let s1 = SamplingConfiguration(temperature: 0, seed: 1).fallbackSampler(from: &logits, step: 0)
+        let s1 = SamplingConfiguration(temperature: 0, seed: 1).cpuSampler(from: &logits, step: 0)
         var logits2: [LogitsScalarType] = [0.1, 3.0, 0.2, 1.5]
-        let s2 = SamplingConfiguration(temperature: 0, seed: 2).fallbackSampler(from: &logits2, step: 9)
+        let s2 = SamplingConfiguration(temperature: 0, seed: 2).cpuSampler(from: &logits2, step: 9)
         #expect(s1 == 1)
         #expect(s2 == 1)
     }
@@ -110,7 +92,7 @@ struct SeededSamplingTests {
         let config = SamplingConfiguration(temperature: 1.0)
         #expect(config.seed == nil)
         var logits = flatLogits(8)
-        let token = config.fallbackSampler(from: &logits, step: 0)
+        let token = config.cpuSampler(from: &logits, step: 0)
         #expect(token >= 0 && token < 8)
     }
 
@@ -140,9 +122,9 @@ struct SeededSamplingTests {
         #expect(token >= 0 && token < 8)
     }
 
-    // MARK: - fallbackSampler(from:tokenHistory:step:) — the static-shape engine path
+    // MARK: - cpuSampler(from:tokenHistory:step:) — the static-shape engine path
 
-    /// The static-shape/ANE engine samples through `fallbackSampler(from:tokenHistory:step:)`.
+    /// The static-shape/ANE engine samples through `cpuSampler(from:tokenHistory:step:)`.
     /// Before the fix it always passed `step: 0`, so `seed &+ step` never advanced and every
     /// token drew the same quantile. With the step threaded through, consecutive steps derive
     /// distinct generators and do not collapse to a single token on a flat distribution.
@@ -153,7 +135,7 @@ struct SeededSamplingTests {
         var tokens: Set<Int32> = []
         for step in 0..<64 {
             var logits = flatLogits(4)
-            tokens.insert(config.fallbackSampler(from: &logits, tokenHistory: history, step: step))
+            tokens.insert(config.cpuSampler(from: &logits, tokenHistory: history, step: step))
         }
         #expect(tokens.count > 1)
     }
@@ -166,7 +148,7 @@ struct SeededSamplingTests {
         var tokens: Set<Int32> = []
         for _ in 0..<64 {
             var logits = flatLogits(4)
-            tokens.insert(config.fallbackSampler(from: &logits, tokenHistory: history, step: 0))
+            tokens.insert(config.cpuSampler(from: &logits, tokenHistory: history, step: 0))
         }
         #expect(tokens.count == 1)
     }

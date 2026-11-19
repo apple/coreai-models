@@ -44,13 +44,13 @@ uv run export.py --help
 
 ### Common Variants
 
-| Use case                        | Command                                         |
-| ------------------------------- | ----------------------------------------------- |
+| Use case                        | Command                                        |
+| ------------------------------- | ---------------------------------------------- |
 | Single foreground click         | `uv run export.py` (defaults: Q=1, P=1)        |
-| Box prompt                      | `uv run export.py --num-pts 2`                  |
-| Box + extra click in one query  | `uv run export.py --num-pts 3`                  |
-| Segment-everything (8x8 grid)   | `uv run export.py --num-queries 64`             |
-| Independent multi-click prompts | `uv run export.py --num-queries 4 --num-pts 1`  |
+| Box prompt                      | `uv run export.py --num-pts 2`                 |
+| Box + extra click in one query  | `uv run export.py --num-pts 3`                 |
+| Segment-everything (8x8 grid)   | `uv run export.py --num-queries 64`            |
+| Independent multi-click prompts | `uv run export.py --num-queries 4 --num-pts 1` |
 
 `Q` is the number of independent masks the model emits per image; `P` is how many points fuse into the same prompt. A box requires both corners in the *same* query (P >= 2), not two separate single-point queries.
 
@@ -59,7 +59,7 @@ uv run export.py --help
 ### In your iOS and macOS applications
 
 ```swift
-import ImageSegmenter
+import CoreAIImageSegmenter
 
 // Load from a segmenter bundle directory (contains metadata.json and *.aimodel).
 let segmenter = try await ImageSegmenter(resourcesAt: "coreai-models/exports/efficient_sam_vitt_float32_static")

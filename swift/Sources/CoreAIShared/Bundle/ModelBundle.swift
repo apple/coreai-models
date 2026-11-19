@@ -41,12 +41,16 @@ public struct ModelBundle: Sendable {
     /// their own blocks without re-reading the file.
     public let raw: Data
 
+    /// `metadata_version` values this runtime loads. Any other version is rejected.
+    private static let supportedMetadataVersions = ["0.3", "0.2"]
+
     // MARK: - Component Keys
 
     public enum ComponentKey {
         public static let main = "main"
         public static let vision = "vision"
         public static let embedding = "embedding"
+        public static let drafter = "drafter"
     }
 
     /// All component keys declared in this bundle's `assets` map, sorted.
@@ -124,7 +128,8 @@ public struct ModelBundle: Sendable {
             case .malformedMetadata(let url, let err):
                 return "malformed metadata.json at \(url.path): \(err)"
             case .unsupportedVersion(let v):
-                return "unsupported metadata_version '\(v)' (known: 0.2)"
+                let known = ModelBundle.supportedMetadataVersions.joined(separator: ", ")
+                return "unsupported metadata_version '\(v)' (known: \(known))"
             case .kindMismatch(let expected, let got):
                 return "expected bundle kind \(expected), got \(got)"
             case .missingField(let name):
@@ -185,7 +190,7 @@ public struct ModelBundle: Sendable {
         }
 
         let version = envelope.metadataVersion ?? "0.1"
-        guard version == "0.2" else {
+        guard Self.supportedMetadataVersions.contains(version) else {
             throw BundleError.unsupportedVersion(version)
         }
 
@@ -196,7 +201,7 @@ public struct ModelBundle: Sendable {
             throw BundleError.malformedMetadata(
                 bundlePath.appending(path: "metadata.json"), underlying: error)
         }
-        self.metadataVersion = "0.2"
+        self.metadataVersion = version
         self.kind = common.kind
         self.name = common.name
         self.userData = common.userData

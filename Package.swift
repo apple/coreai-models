@@ -55,6 +55,10 @@ let package = Package(
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.2.0"),
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.1.0"),
+        // Also resolved through swift-transformers. Chat templates need 2.5.1: a stable key order in
+        // tojson (2.3.5), loop.previtem/nextitem (2.3.6), tojson written like json.dumps (2.5.0) and
+        // whitespace control on comment tags (2.5.1).
+        .package(url: "https://github.com/huggingface/swift-jinja.git", from: "2.5.1"),
         .package(url: "https://github.com/mlc-ai/xgrammar", exact: "0.2.2"),
         .package(url: "https://github.com/hummingbird-project/hummingbird", exact: "2.22.0"),
     ],
@@ -65,6 +69,7 @@ let package = Package(
                 "CoreAIShared",
                 "CXGrammar",
                 .product(name: "Transformers", package: "swift-transformers"),
+                .product(name: "Jinja", package: "swift-jinja"),
             ],
             path: "swift/Sources/CoreAILanguageModels",
             swiftSettings: [
@@ -170,12 +175,26 @@ let package = Package(
             publicHeadersPath: "include"
         ),
 
+        // Memory measurement shared by the CLI tools (not itself a tool)
+        .target(
+            name: "CoreAIMemoryMeasurement",
+            dependencies: [
+                "CoreAIShared",
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+            ],
+            path: "swift/Sources/Tools/CoreAIMemoryMeasurement",
+            swiftSettings: [
+                .enableUpcomingFeature("MemberImportVisibility")
+            ]
+        ),
+
         // MARK: Executable targets
 
         .executableTarget(
             name: "llm-runner",
             dependencies: [
                 "CoreAILanguageModels",
+                "CoreAIMemoryMeasurement",
                 "CoreAIShared",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ],
@@ -276,6 +295,7 @@ let package = Package(
             name: "llm-benchmark",
             dependencies: [
                 "CoreAILanguageModels",
+                "CoreAIMemoryMeasurement",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ],
             path: "swift/Sources/Tools/benchmark",
@@ -303,6 +323,7 @@ let package = Package(
                 "CoreAIShared",
                 "TestUtilities",
                 .product(name: "Transformers", package: "swift-transformers"),
+                .product(name: "Jinja", package: "swift-jinja"),
             ],
             path: "swift/Tests/LanguageModelsTests",
             resources: [
@@ -314,6 +335,14 @@ let package = Package(
             linkerSettings: [
                 .linkedLibrary("c++")
             ]
+        ),
+        .testTarget(
+            name: "LLMRunnerTests",
+            dependencies: [
+                "llm-runner",
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+            ],
+            path: "swift/Tests/LLMRunnerTests"
         ),
         .testTarget(
             name: "ImageSegmenterTests",
@@ -338,6 +367,7 @@ let package = Package(
             name: "DiffusionPipelineTests",
             dependencies: [
                 "CoreAIDiffusionPipeline",
+                "CoreAIShared",
                 "CoreAIVideoDiffusionPipeline",
                 "TestUtilities",
             ],
@@ -357,6 +387,17 @@ let package = Package(
             name: "CoreAILMCommonTests",
             dependencies: ["CoreAILMCommon"],
             path: "swift/Tests/CoreAILMCommonTests"
+        ),
+        .testTarget(
+            name: "LLMServerTests",
+            dependencies: [
+                "llm-server",
+                "CoreAILanguageModels",
+                "CoreAILMCommon",
+                "TestUtilities",
+                .product(name: "Transformers", package: "swift-transformers"),
+            ],
+            path: "swift/Tests/LLMServerTests"
         ),
         .testTarget(
             name: "GuidedGenerationTests",

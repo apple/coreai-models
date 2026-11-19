@@ -6,7 +6,7 @@
 """
 Sana Sprint component specifications and torch wrappers for Core AI export.
 
-Sana Sprint 0.6B is a few-step (1-4) distilled linear-attention DiT that uses:
+Sana Sprint (0.6B / 1.6B) is a few-step (1-4) distilled linear-attention DiT that uses:
 - Gemma-2-2B text encoder (last hidden state), prompt prefixed with a fixed instruction
 - SanaTransformer2DModel with guidance embedding and no positional embedding
 - DC-AE (AutoencoderDC) with 32 latent channels at 32× spatial compression

@@ -25,7 +25,9 @@ USE_FUSED_KV = True
 
 
 class Attention(nn.Module):
-    def __init__(self, config: Qwen3Config, layer_idx: int) -> None:
+    def __init__(
+        self, config: Qwen3Config, layer_idx: int, use_attention_mask: bool = False
+    ) -> None:
         super().__init__()
         self.layer_idx = layer_idx
 
@@ -47,7 +49,7 @@ class Attention(nn.Module):
             self.q_norm = RMSNorm(head_dim, eps=config.rms_norm_eps)
             self.k_norm = RMSNorm(head_dim, eps=config.rms_norm_eps)
 
-        self.sdpa = SDPA(is_causal=True)
+        self.sdpa = SDPA(is_causal=not use_attention_mask)
         assert is_default_rope_scaling(config), f"unsupported rope_scaling: {config.rope_scaling}"
         self.rope = initialize_rope(base=resolve_rope_theta(config))
 
@@ -56,6 +58,7 @@ class Attention(nn.Module):
         x: torch.Tensor,
         position_ids: torch.IntTensor,
         cache: KVCache | None = None,
+        attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch_size, query_len, _ = x.shape
         n_heads, n_kv_heads = self.n_heads, self.n_kv_heads
@@ -101,7 +104,7 @@ class Attention(nn.Module):
             )
 
         output = (
-            self.sdpa(query, key, value)
+            self.sdpa(query, key, value, attn_mask=attn_mask)
             .permute(0, 2, 1, 3)
             .reshape(batch_size, query_len, self.n_heads * self.head_dim)
         )
@@ -109,10 +112,14 @@ class Attention(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, config: Qwen3Config, layer_idx: int) -> None:
+    def __init__(
+        self, config: Qwen3Config, layer_idx: int, use_attention_mask: bool = False
+    ) -> None:
         super().__init__()
         hidden_size = config.hidden_size
-        self.self_attn = Attention(config, layer_idx=layer_idx)
+        self.self_attn = Attention(
+            config, layer_idx=layer_idx, use_attention_mask=use_attention_mask
+        )
         self.mlp = MLP(hidden_size, config.intermediate_size)
 
         self.input_layernorm = RMSNorm(hidden_size, eps=config.rms_norm_eps)
@@ -123,20 +130,24 @@ class TransformerBlock(nn.Module):
         x: torch.Tensor,
         position_ids: torch.IntTensor,
         cache: KVCache | None = None,
+        attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        r = self.self_attn(self.input_layernorm(x), position_ids, cache)
+        r = self.self_attn(self.input_layernorm(x), position_ids, cache, attn_mask=attn_mask)
         h = x + r
         r = self.mlp(self.post_attention_layernorm(h))
         return h + r
 
 
 class Qwen3Model(nn.Module):
-    def __init__(self, config: Qwen3Config) -> None:
+    def __init__(self, config: Qwen3Config, use_attention_mask: bool = False) -> None:
         super().__init__()
         hidden_size = config.hidden_size
         self.embed_tokens = nn.Embedding(config.vocab_size, hidden_size)
         self.layers = nn.ModuleList(
-            [TransformerBlock(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [
+                TransformerBlock(config, layer_idx, use_attention_mask=use_attention_mask)
+                for layer_idx in range(config.num_hidden_layers)
+            ]
         )
         self.norm = RMSNorm(hidden_size, eps=config.rms_norm_eps)
 
@@ -145,10 +156,11 @@ class Qwen3Model(nn.Module):
         input_ids: torch.Tensor,
         position_ids: torch.IntTensor = None,
         cache: KVCache | None = None,
+        attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         h = self.embed_tokens(input_ids)
         for layer in self.layers:
-            h = layer(h, position_ids, cache)
+            h = layer(h, position_ids, cache, attn_mask=attn_mask)
         return self.norm(h)
 
 
@@ -160,7 +172,7 @@ class Qwen3ForCausalLM(BaseForCausalLM):
 
     @override
     def _init_model(self, config: Qwen3Config) -> None:
-        self.model = Qwen3Model(config)
+        self.model = Qwen3Model(config, use_attention_mask=self.use_attention_mask)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         if config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
@@ -172,9 +184,10 @@ class Qwen3ForCausalLM(BaseForCausalLM):
         position_ids: torch.IntTensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple:
         cache = KVCache(k_cache, v_cache)
-        out = self.model(input_ids, position_ids, cache)
+        out = self.model(input_ids, position_ids, cache, attn_mask=attn_mask)
         if self.prefill_mode:
             # A bare `return` causes torch export to trace a leaf node with value
             # `None` rather than having no leaf nodes whatsoever. Remedied with

@@ -34,3 +34,12 @@ public func resolveExistingPipelineAsset(_ path: String, in directory: URL, comp
     }
     return url
 }
+
+/// The URL of the asset `metadata.json` declares for `key`. The manifest is the only source of
+/// asset filenames: an undeclared key or a missing file throws `PipelineLoadError.missingComponent`.
+public func resolveDeclaredPipelineAsset(_ key: String, in bundle: DiffusionBundle) throws -> URL {
+    guard let filename = bundle.assetFilename(for: key) else {
+        throw PipelineLoadError.missingComponent("\(key) (not declared in metadata.json)")
+    }
+    return try resolveExistingPipelineAsset(filename, in: bundle.bundlePath, component: key)
+}

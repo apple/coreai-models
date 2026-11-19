@@ -103,6 +103,10 @@ class ModelEntry:
     # tokenizer (e.g. a drafter that shares one with its target model), set
     # this to the HF model ID that carries the tokenizer.
     tokenizer_model_id: str | None = None
+    # iOS models that export through their own script rather than `coreai.llm.export` (the
+    # `ios_class` then serves evaluation only). `coreai.llm.export --variant iOS` refuses
+    # them up front and points at the script.
+    ios_export_script: str | None = None
     # Speculative decoding: drafter model class, HF checkpoint, and runtime config.
     # When all three are set, ``--with-drafter`` exports the drafter alongside the
     # target into the same bundle.
@@ -118,6 +122,7 @@ def _get_registry() -> dict[str, ModelEntry]:
     from coreai_models.models.ios.olmo2 import Olmo2ForCausalLMForiOS
     from coreai_models.models.ios.qwen2 import Qwen2ForCausalLMForiOS
     from coreai_models.models.ios.qwen3 import Qwen3ForCausalLMForiOS
+    from coreai_models.models.ios.qwen3_5 import Qwen3_5ForCausalLMForiOS
     from coreai_models.models.macos.diffusion_gemma import DiffusionGemmaEncoder
     from coreai_models.models.macos.gemma3_text import Gemma3ForCausalLM
     from coreai_models.models.macos.gemma3n import Gemma3nForCausalLM
@@ -130,6 +135,7 @@ def _get_registry() -> dict[str, ModelEntry]:
     from coreai_models.models.macos.phi3 import Phi3ForCausalLM
     from coreai_models.models.macos.qwen2 import Qwen2ForCausalLM
     from coreai_models.models.macos.qwen3 import Qwen3ForCausalLM
+    from coreai_models.models.macos.qwen3_5 import Qwen3_5ForCausalLM
     from coreai_models.models.macos.qwen3_moe import Qwen3MoeForCausalLM
     from coreai_models.models.macos.qwen3_vl import (
         Qwen3VLForCausalLM,
@@ -193,6 +199,20 @@ def _get_registry() -> dict[str, ModelEntry]:
         "qwen3_moe": ModelEntry(
             macos_class=Qwen3MoeForCausalLM,
         ),
+        # Qwen3.5 / Qwen3.5-MoE: hybrid full-attention + gated-delta-net decoders.
+        # Both checkpoints wrap the decoder under `text_config` / `model.language_model.`.
+        "qwen3_5": ModelEntry(
+            macos_class=Qwen3_5ForCausalLM,
+            ios_class=Qwen3_5ForCausalLMForiOS,
+            ios_export_script="models/qwen3_5/export.py",
+            hf_config_attr="text_config",
+            hf_state_dict_prefix="model.language_model.",
+        ),
+        "qwen3_5_moe": ModelEntry(
+            macos_class=Qwen3_5ForCausalLM,
+            hf_config_attr="text_config",
+            hf_state_dict_prefix="model.language_model.",
+        ),
         # Qwen3-VL: vision-language model.
         # macos_class = standard text decoder (input_ids, for text-only use).
         # Qwen3VLForCausalLMEmbeddings is used by the VLM export script (takes inputs_embeds).
@@ -211,6 +231,7 @@ MODEL_TYPE_REMAPPING: dict[str, str] = {
     "diffusion_gemma": "diffusion_gemma_text",
     "muse_glimmer": "muse_glimmer_text",
     "qwen2_5": "qwen2",
+    "smollm3": "qwen2",
 }
 
 

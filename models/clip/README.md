@@ -13,24 +13,42 @@ brew install uv
 ## Export
 
 ```sh
-uv run export.py
+uv run coreai.embedding.export clip-vit-b32
 ```
 
-Saves to `<repo-root>/exports/<model>_<dtype>_<static_or_dynamic>.aimodel` (e.g. `<repo-root>/exports/openai_clip-vit-base-patch32_float32_static.aimodel`). Pass `--output-dir <path>` to override the destination.
+This writes the bundle `<repo-root>/exports/clip-vit-b32/`:
+
+- `text_encoder.aimodel`: `input_ids`, `attention_mask` `[B, 77]` → `embedding` `[B, 512]`
+- `image_encoder.aimodel`: `pixel_values` `[B, 3, 224, 224]` → `embedding` `[B, 512]`
+- `tokenizer/`
+- `metadata.json`: the tokenizer settings, image preprocessing, batch range and `logit_scale`
+
+`B` is 1 to 64. Embeddings are L2-normalized; `logit_scale * dot(text, image)` gives Hugging Face's `CLIPModel` logits. Pass `--output-dir <path>` to write the bundle somewhere else.
 
 ```sh
-uv run export.py --help
+uv run coreai.embedding.export clip-vit-b32 --fused           # a single fused asset, including a `main`
+uv run coreai.embedding.export clip-vit-b32 --platform iOS    # bundle clip-vit-b32-ios
+uv run coreai.embedding.export clip-vit-b32 --compute-precision float16
+uv run coreai.embedding.export --help
 ```
+
+`--fused` writes a single `model.aimodel` instead. It holds both tower functions and `main`, which runs Hugging Face's `CLIPModel` forward:
+
+- inputs: `pixel_values`, `input_ids`, `attention_mask` (text length 77)
+- outputs: `logits_per_image`, `logits_per_text`, `image_embeds`, `text_embeds`
 
 **Options:**
 
-| Flag           | Description                                                   | Default                        |
-| -------------- | ------------------------------------------------------------- | ------------------------------ |
-| `--model`      | Model variant                                                 | `openai/clip-vit-base-patch32` |
-| `--output-dir` | Output directory for `.aimodel`                               | `<repo-root>/exports/`         |
-| `--dtype`      | `float16`, `bfloat16`, `float32`                              | `float32`                      |
-| `--overwrite`  | Overwrite existing `.aimodel`                                 | —                              |
-| `--dynamic`    | Dynamic batch (image 1–64, text 1–64); spatial/sequence fixed | —                              |
+| Flag                   | Description                                   | Default                |
+| ---------------------- | --------------------------------------------- | ---------------------- |
+| `clip-vit-b32`         | Short name, or `openai/clip-vit-base-patch32` | —                      |
+| `--compute-precision`  | `float32`, `float16`, `bfloat16`              | `float32`              |
+| `--platform`           | `macOS` or `iOS` (same GPU programs)          | `macOS`                |
+| `--fused`              | A single fused asset, including a `main`      | —                      |
+| `--text-only`          | Text tower only                               | —                      |
+| `--output-dir`         | Parent of the bundle directory                | `<repo-root>/exports/` |
+| `--overwrite`          | Replace an existing bundle                    | —                      |
+| `--include-debug-info` | Embed debug information in the assets         | —                      |
 
 **Supported models:**
 

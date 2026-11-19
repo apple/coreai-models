@@ -20,6 +20,7 @@ import pytest
 
 from coreai_models._constants import DEFAULT_INCLUDE_DEBUG_INFO
 from coreai_models.diffusion.pipeline import DiffusionExportConfig
+from coreai_models.embedding import export as embedding_export
 from coreai_models.export.pipeline import ExportConfig
 from coreai_models.llm.export import build_parser
 from coreai_models.segmentation.export import build_parser as build_segmentation_parser
@@ -76,6 +77,21 @@ def test_llm_cli_resolves_the_flag_onto_the_export_config() -> None:
     for argv, expected in ((["qwen3-0.6b"], False), (["qwen3-0.6b", "--include-debug-info"], True)):
         config = _resolve_export_config(build_parser().parse_args(argv))
         assert config.include_debug_info is expected
+
+
+# --- coreai.embedding.export ------------------------------------------
+
+
+def test_embedding_cli_passes_the_flag_to_the_export(tmp_path, monkeypatch) -> None:
+    """Covers the wiring in ``main``, not just the parser."""
+    seen = {}
+    monkeypatch.setattr(
+        embedding_export, "export_embedding_bundle", lambda exporter, out, **kw: seen.update(kw)
+    )
+    argv = ["embeddinggemma-2", "--output-dir", str(tmp_path)]
+    for extra, expected in (([], False), (["--include-debug-info"], True)):
+        assert embedding_export.main(argv + extra) == 0
+        assert seen["include_debug_info"] is expected
 
 
 # --- standalone models/*/export.py recipes ----------------------------
@@ -142,3 +158,19 @@ def test_standalone_recipe_defaults_to_release_and_offers_include_debug_info(rec
         f"{recipe.parent.name}: constructs TorchConverter() with no mode, "
         "which silently inherits the library's DEBUG default"
     )
+
+
+# --- coreai.embedding.export (CLIP, CLAP) -----------------------------
+
+
+@pytest.mark.parametrize("model", ["clip-vit-b32", "clap-htsat"])
+def test_embedding_cli_passes_the_flag_for_clip_and_clap(model, tmp_path, monkeypatch) -> None:
+    """Covers the wiring in ``main``, not just the parser."""
+    seen = {}
+    monkeypatch.setattr(
+        embedding_export, "export_embedding_bundle", lambda exporter, out, **kw: seen.update(kw)
+    )
+    argv = [model, "--output-dir", str(tmp_path)]
+    for extra, expected in (([], False), (["--include-debug-info"], True)):
+        assert embedding_export.main(argv + extra) == 0
+        assert seen["include_debug_info"] is expected

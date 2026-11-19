@@ -24,10 +24,9 @@
 ///
 /// Caveats:
 /// - A session is single-owner: only one active generation may drive a given state
-///   at a time (enforced by `GenerationTokenBox`; see `GenerationSessionState`).
-/// - Not all engine state is per-session yet. `lastPrefixHitCount` and the shared
-///   `GenerationTokenBox` stay engine-scoped, so sessions run sequentially, not
-///   concurrently; a concurrent scheduler would need to relocate those too.
+///   at a time. Starting a generation cancels the previous one on the same session.
+/// - Sessions do not affect each other. The engine-level `lastPrefixHitCount` reports only the
+///   session that ran last.
 package protocol IdempotentEngine: InferenceEngine {
     /// Mint a fresh, independent per-request state (fresh KV cache + empty history).
     func makeSessionState() throws -> GenerationSessionState

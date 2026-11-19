@@ -50,9 +50,15 @@ public struct CoreAILanguageModel: LanguageModel {
     private let supportsToolCalling: Bool
     fileprivate let supportsReasoning: Bool
     fileprivate let resources: ModelResources
-    /// All EOS-like token IDs beyond the tokenizer's main `eosTokenId` — e.g.
-    /// Gemma's `<end_of_turn>`, read from tokenizer_config.json at init.
-    fileprivate let additionalEosTokenIds: [Int32]
+    /// All EOS-like token IDs beyond the tokenizer's main `eosTokenId`, resolved at init: the
+    /// turn-ending IDs the tokenizer files mark (e.g. Gemma's `<end_of_turn>`), the bundle's
+    /// `eos_token_ids` minus the main `eosTokenId` (e.g. Gemma 4's `<|tool_response>`), and this
+    /// model's agentic `<|eot|>` when present. The base-vocab `<|im_end|>` is not stored here;
+    /// `runtimeStopTokens` adds it at generation time.
+    fileprivate let additionalEosTokenIds: Set<Int32>
+    /// Most whitespace characters allowed between two JSON tokens in schema-guided generation from
+    /// this model; nil when unlimited.
+    fileprivate let maxWhitespaceCount: Int?
 
     // MARK: - Protocol Requirements
 
@@ -91,8 +97,8 @@ public struct CoreAILanguageModel: LanguageModel {
     /// - Parameter url: URL to the model bundle directory.
     /// - Parameter mode: When to load the engine. Defaults to `.lazy`. With
     ///   `.eager`, the tokenizer and engine load concurrently
-    /// - Parameter variant: Engine variant override (e.g. "coreai-sequential",
-    ///   "ane"). Nil for auto-detect from model structure.
+    /// - Parameter variant: Engine variant override: "coreai-sequential", "coreai-pipelined" or
+    ///   "static-shape". Nil for auto-detect from model structure.
     /// - Parameter kvCacheStrategy: KV cache memory strategy. Defaults to
     ///   `.auto` (256-token initial size for dynamic models). Pass
     ///   `.fixedSize` to pre-allocate at full `maxContextLength`.
@@ -100,6 +106,11 @@ public struct CoreAILanguageModel: LanguageModel {
     ///   to use the model metadata or engine default.
     /// - Parameter prefillChunkThreshold: Minimum prompt tokens to trigger
     ///   chunking, or `nil` to use the model metadata or engine default.
+    /// - Parameter maxWhitespaceCount: Most whitespace characters the grammar allows between
+    ///   two JSON tokens during schema-guided generation. Defaults to
+    ///   ``ConstrainedGenerationSession/defaultMaxWhitespaceCount``; `nil` for no limit. The limit
+    ///   ends a model that keeps choosing whitespace after the last value, and does not change
+    ///   output that stays within it.
     /// - Throws: If the asset bundle is invalid or the tokenizer fails to load.
     ///   With `.eager`, also throws on engine-creation failure.
     public init(
@@ -108,7 +119,8 @@ public struct CoreAILanguageModel: LanguageModel {
         variant: String? = nil,
         kvCacheStrategy: KVCacheStrategy = .auto,
         prefillChunkSize: Int? = nil,
-        prefillChunkThreshold: Int? = nil
+        prefillChunkThreshold: Int? = nil,
+        maxWhitespaceCount: Int? = ConstrainedGenerationSession.defaultMaxWhitespaceCount
     ) async throws {
         let bundle = try LanguageModelBundle(at: url)
         let configuration = CoreAIExecutor.Configuration(
@@ -127,21 +139,24 @@ public struct CoreAILanguageModel: LanguageModel {
             if mode == .eager { try await resources.loadResources() }
         }()
 
-        let tokenizerLoadSpan = InstrumentsProfiler.beginTokenizerLoad(id: bundle.tokenizer)
-        let tokenizer = try await bundle.loadTokenizer()
-        tokenizerLoadSpan.end()
+        let tokenizer = try await InstrumentsProfiler.profile(
+            InstrumentsProfiler.beginTokenizerLoad(id: bundle.tokenizer)
+        ) {
+            try await bundle.loadTokenizer()
+        }
 
         try await engineLoad
         self.init(
             configuration: configuration, bundle: bundle, tokenizer: tokenizer,
-            resources: resources)
+            resources: resources, maxWhitespaceCount: maxWhitespaceCount)
     }
 
     private init(
         configuration: CoreAIExecutor.Configuration,
         bundle: LanguageModelBundle,
         tokenizer: any Tokenizer,
-        resources: ModelResources
+        resources: ModelResources,
+        maxWhitespaceCount: Int?
     ) {
         let toolCallDetection = detectToolCallFormat(using: tokenizer)
         let thinkingFormat = detectThinkingFormat(using: tokenizer)
@@ -163,23 +178,18 @@ public struct CoreAILanguageModel: LanguageModel {
             }
         }()
         self.resources = resources
-        // Read additional stop token IDs from tokenizer_config.json (e.g. Gemma's
-        // <end_of_turn>). Empty when the bundle has no tokenizer directory.
-        var extraEos: [Int32] = []
-        if let tokenizerDir = bundle.tokenizerPath {
-            extraEos = LanguageConfig.additionalStopTokenIds(
-                from: tokenizerDir, tokenizer: tokenizer)
+        // Config-derived turn-end IDs: the tokenizer files' turn-ending IDs and the
+        // bundle's eos_token_ids. The base-vocab <|im_end|> baseline is
+        // folded in at runtime by runtimeStopTokens.
+        var additional = bundle.additionalStopTokenIds(tokenizer: tokenizer)
+        // Agentic models stop on <|eot|> so the runner doesn't loop self->user
+        // turns. This is text-adapter-specific, so it is folded in here rather
+        // than in the shared resolver.
+        if let id = agenticEndOfTurnTokenId(thinkingFormat: thinkingFormat, tokenizer: tokenizer) {
+            additional.insert(id)
         }
-        // Agentic models: stop on <|eot|> (end of user-facing turn) so the
-        // runner doesn't loop through repeated self→user cycles.
-        if case .agentic(_, _, _, let eot) = thinkingFormat,
-            let eotId = tokenizer.vocabContains(eot) ? tokenizer.convertTokenToId(eot) : nil
-        {
-            if !extraEos.contains(Int32(eotId)) {
-                extraEos.append(Int32(eotId))
-            }
-        }
-        self.additionalEosTokenIds = extraEos
+        self.additionalEosTokenIds = additional
+        self.maxWhitespaceCount = maxWhitespaceCount
     }
 
     // MARK: - Resource control
@@ -334,11 +344,7 @@ public struct CoreAILanguageModel: LanguageModel {
                 inferenceOptions: InferenceOptions(maxTokens: maxTokens)
             )
 
-            // All EOS-like tokens: the tokenizer's main EOS plus any additional
-            // stop tokens from tokenizer_config.json (e.g. Gemma's <end_of_turn>).
-            var eosTokens = Set<Int32>()
-            if let id = tokenizer.eosTokenId { eosTokens.insert(Int32(id)) }
-            eosTokens.formUnion(model.additionalEosTokenIds)
+            let eosTokens = tokenizer.runtimeStopTokens(additional: model.additionalEosTokenIds)
             // Incremental-decode buffer. After a clean emit, one token is
             // retained as context for the next step (see below). During a
             // multi-byte sequence that hasn't decoded cleanly yet, multiple
@@ -354,8 +360,13 @@ public struct CoreAILanguageModel: LanguageModel {
             // to a top-level `.reasoning(...)` channel event so it lands as
             // its own `Transcript.Reasoning` entry, not mixed into the
             // user-facing `Transcript.Response`. Markers were resolved at
-            // model init from the tokenizer's known token ids.
-            var thinkParser = ThinkTagParser(format: model.thinkingFormat)
+            // model init from the tokenizer's known token ids. A chat template
+            // that writes the open marker itself leaves the prompt inside the
+            // block, so the stream starts as reasoning.
+            var thinkParser = ThinkTagParser(
+                format: model.thinkingFormat,
+                startsInReasoning: ThinkTagParser.promptOpensReasoning(
+                    promptTokens, tokenizer: tokenizer, format: model.thinkingFormat))
             // Routes tool call markup to .toolCalls(...) channel events.
             // nil when the model's tokenizer has no tool call tokens.
             var toolCallParser: ToolCallParser? = model.toolCallDetection.map {
@@ -525,19 +536,19 @@ public struct CoreAILanguageModel: LanguageModel {
             maxTokens: Int,
             channel: LanguageModelExecutorGenerationChannel
         ) async throws {
-            let schemaData = try JSONEncoder().encode(schema)
-
-            guard let jsonSchema = String(data: schemaData, encoding: .utf8) else {
-                preconditionFailure("GenerationSchema JSON encoding produced invalid UTF-8")
-            }
+            // The grammar generates properties in the order the schema lists them, which in
+            // GenerationSchema's own encoding changes from one process to the next.
+            let jsonSchema = try GrammarSchemaJSON.ordered(schema)
 
             let strategy: any DecodingStrategy
             if engine is any ConstrainedGenerationCapable {
                 strategy = PipelinedConstrainedDecodingStrategy(
-                    jsonSchema: jsonSchema, vocabSize: model.bundle.vocabSize)
+                    jsonSchema: jsonSchema, vocabSize: model.bundle.vocabSize,
+                    maxWhitespaceCount: model.maxWhitespaceCount)
             } else {
                 strategy = ConstrainedDecodingStrategy(
-                    jsonSchema: jsonSchema, vocabSize: model.bundle.vocabSize)
+                    jsonSchema: jsonSchema, vocabSize: model.bundle.vocabSize,
+                    maxWhitespaceCount: model.maxWhitespaceCount)
             }
             let stopSequences = StopSequences(
                 for: model.tokenizer,
@@ -596,12 +607,11 @@ public struct CoreAILanguageModel: LanguageModel {
             let name: String
             let arguments: String
 
-            var message: [String: any Sendable] {
-                [
-                    "id": id,
-                    "type": "function",
-                    "function": ["name": name, "arguments": arguments] as [String: any Sendable],
-                ]
+            /// The call as a template's `tool_calls` entry. Decoding sorts the arguments' keys, which
+            /// also makes them render the same way every time: `GeneratedContent` keeps no order of
+            /// its own (its `jsonString` varies from one instance to the next).
+            var message: any Sendable {
+                TemplateValues.toolCall(id: id, name: name, arguments: arguments)
             }
         }
 
@@ -684,8 +694,11 @@ public struct CoreAILanguageModel: LanguageModel {
                     messages: messages, tools: toolSpecs,
                     additionalContext: extra.isEmpty ? nil : extra)
             } catch {
-                CLILogger.log(
-                    "Failed to apply chat template: \(error), falling back to simple encoding",
+                // Shown without --verbose, once per kind of failure: the simple encoding below is not
+                // what the model was trained on.
+                CLILogger.warnOnce(
+                    "chat template: \(error)",
+                    "Warning: failed to apply chat template: \(error), falling back to simple encoding",
                     component: component)
                 let text = messages.compactMap { $0["content"] as? String }.joined(separator: "\n")
                 return tokenizer.encode(text: text)

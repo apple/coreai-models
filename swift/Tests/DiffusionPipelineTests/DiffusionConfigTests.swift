@@ -49,6 +49,32 @@ struct DiffusionConfigTests {
         #expect(config.decoderShiftFactor == 0.1159)
         #expect(config.ropeAxesDims == [32, 32, 32, 32])
         #expect(config.defaultSteps == 4)
+        #expect(config.dynamicShapes == nil)
+    }
+
+    /// Keys as `_build_flux2_config(dynamic=True)` writes them. A mismatch on either side
+    /// would silently leave a dynamic bundle treated as static.
+    @Test("Decodes a dynamic FLUX.2 block's shape bounds")
+    func decodesDynamicFlux2() throws {
+        let config = try decode(
+            """
+            {
+                "type": "flux2",
+                "image_size": 1024,
+                "dynamic_shapes": true,
+                "min_image_size": 256,
+                "max_image_size": 1024,
+                "image_size_multiple": 16,
+                "max_image_tokens": 16384,
+                "min_reference_size": 128
+            }
+            """)
+        #expect(config.dynamicShapes == true)
+        #expect(config.minImageSize == 256)
+        #expect(config.maxImageSize == 1024)
+        #expect(config.imageSizeMultiple == 16)
+        #expect(config.maxImageTokens == 16384)
+        #expect(config.minReferenceSize == 128)
     }
 
     @Test("Decodes a Wan video block; unknown type decodes to nil")

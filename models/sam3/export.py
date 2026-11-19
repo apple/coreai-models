@@ -15,7 +15,6 @@
 #
 # [tool.uv]
 # index-url       = "https://pypi.org/simple"
-# prerelease      = "allow"
 # index-strategy  = "unsafe-best-match"
 # # Force these past the workspace's `coreai-models` pins:
 # #   - transformers: workspace is <5.0, SAM3 needs Sam3Model from >=5.5.4

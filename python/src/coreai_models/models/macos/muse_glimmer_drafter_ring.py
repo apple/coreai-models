@@ -13,6 +13,9 @@ Architecture:
 - No gated attention, no sandwich norms
 - Shares embed_tokens and lm_head with the target model
 - Ring buffer KV cache with explicit attention mask
+
+Sliding attention reads before writing (concat), so a multi-token chunk can't
+evict window history it still needs.
 """
 
 import gc
@@ -24,7 +27,6 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from huggingface_hub import snapshot_download
 from typing_extensions import Self, override
 
 from coreai_models._constants import (
@@ -32,13 +34,14 @@ from coreai_models._constants import (
     SLIDING_KEY_CACHE_NAME,
     SLIDING_VALUE_CACHE_NAME,
 )
+from coreai_models.hub import BackendName, get_backend, resolve_download_id
 from coreai_models.models.base import (
     BaseForCausalLM,
     TraceSpec,
-    _load_tensors_for_keys,
-    _resolve_safetensors_files,
+    load_tensors_for_keys,
+    resolve_safetensors_files,
 )
-from coreai_models.primitives.macos.cache import RingKVCache, ring_window_causal_mask
+from coreai_models.primitives.macos.cache import RingKVCache, concat_window_causal_mask
 from coreai_models.primitives.macos.mlp import MLP
 from coreai_models.primitives.macos.rms_norm import RMSNorm
 from coreai_models.primitives.macos.rope import RoPE
@@ -111,15 +114,20 @@ class Attention(nn.Module):
         key = self.rope(key, position_ids=rope_positions, freqs=freqs)
 
         if cache is not None:
-            key, value = cache.update_and_fetch(
-                self.layer_idx, offset, key, value, query_len=query_len
-            )
+            # Read before write (concat), else a multi-token chunk garbles output.
+            attn_key, attn_value = cache.fetch_and_concat(self.layer_idx, key, value)
+        else:
+            attn_key, attn_value = key, value
 
         attn_output = (
-            self.sdpa(query=query, key=key, value=value, attn_mask=attn_mask)
+            self.sdpa(query=query, key=attn_key, value=attn_value, attn_mask=attn_mask)
             .permute(0, 2, 1, 3)
             .reshape(batch_size, query_len, self.n_heads * self.head_dim)
         )
+
+        if cache is not None:
+            cache.update(self.layer_idx, offset, key, value, query_len=query_len)
+
         return self.o_proj(attn_output)
 
 
@@ -175,7 +183,9 @@ class DrafterRingModel(nn.Module):
         h = h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + self.config.rms_norm_eps)
 
         if cache is not None:
-            attn_mask = ring_window_causal_mask(
+            # Drafter is always multi-token (one main graph, no decode split), so
+            # it stays on the read-before-write concat path.
+            attn_mask = concat_window_causal_mask(
                 query_len=query_len,
                 capacity=cache.capacity(),
                 offset=offset,
@@ -236,12 +246,13 @@ class MuseGlimmerDrafterForCausalLM(BaseForCausalLM):
     @override
     def from_hf(
         cls,
-        huggingface_model_id: str,
+        huggingface_model_id_or_path: str,
         max_context_length: int | None = None,
         target_dtype: torch.dtype = torch.float16,
         mmap_path: str | None = None,
         num_layers: int | None = None,
         disable_embedding_quantization: bool = False,
+        backend: BackendName = "huggingface",
         *,
         target_model_id: str = "meta-models/Muse-Glimmer-30B",
     ) -> Self:
@@ -253,17 +264,21 @@ class MuseGlimmerDrafterForCausalLM(BaseForCausalLM):
         from *target_model_id*.
 
         Args:
-            huggingface_model_id: Drafter checkpoint id
+            huggingface_model_id_or_path: Drafter checkpoint id or local path
                 (e.g. ``meta-models/Muse-Glimmer-30B-assistant``).
             target_model_id: Full target model id to borrow embeddings from.
+            backend: Model download backend (see ``coreai_models.hub``).
             Other args: see :meth:`BaseForCausalLM.from_hf`.
         """
         from safetensors import safe_open
 
         # ---- 1. Download both checkpoints (safetensors + config only) --------
         allow = ["*.safetensors", "*.safetensors.index.json", "config.json"]
-        drafter_dir = snapshot_download(huggingface_model_id, allow_patterns=allow)
-        target_dir = snapshot_download(target_model_id, allow_patterns=allow)
+        download = get_backend(backend).snapshot
+        drafter_id = resolve_download_id(huggingface_model_id_or_path, backend)
+        target_id = resolve_download_id(target_model_id, backend)
+        drafter_dir = download(drafter_id, allow_patterns=allow)
+        target_dir = download(target_id, allow_patterns=allow)
 
         # ---- 2. Build drafter config, inject vocab_size from target ----------
         with open(os.path.join(drafter_dir, "config.json")) as f:
@@ -286,7 +301,7 @@ class MuseGlimmerDrafterForCausalLM(BaseForCausalLM):
         model.to(dtype=target_dtype)
 
         # ---- 4. Load drafter weights (skip encoder.*, add model. prefix) -----
-        drafter_files = _resolve_safetensors_files(drafter_dir)
+        drafter_files = resolve_safetensors_files(drafter_dir)
         drafter_keys: dict[str, str] = {}
         for path in drafter_files:
             with safe_open(path, framework="pt", device="cpu") as f:
@@ -299,7 +314,7 @@ class MuseGlimmerDrafterForCausalLM(BaseForCausalLM):
                             continue
                     drafter_keys[key] = path
 
-        drafter_sd = _load_tensors_for_keys(drafter_keys, target_dtype)
+        drafter_sd = load_tensors_for_keys(drafter_keys, target_dtype)
         # "layers.0.*" → "model.layers.0.*", "norm.weight" → "model.norm.weight"
         remapped: dict[str, torch.Tensor] = {}
         for k, v in drafter_sd.items():
@@ -310,7 +325,7 @@ class MuseGlimmerDrafterForCausalLM(BaseForCausalLM):
         gc.collect()
 
         # ---- 5. Load embed_tokens and lm_head from target (2 tensors) -------
-        target_files = _resolve_safetensors_files(target_dir)
+        target_files = resolve_safetensors_files(target_dir)
         embed_hf_key = "model.language_model.embed_tokens.weight"
         lm_head_hf_key = "lm_head.weight"
         target_keys: dict[str, str] = {}
@@ -327,7 +342,7 @@ class MuseGlimmerDrafterForCausalLM(BaseForCausalLM):
                 f"found: {found}"
             )
 
-        target_sd = _load_tensors_for_keys(target_keys, target_dtype)
+        target_sd = load_tensors_for_keys(target_keys, target_dtype)
         shared: dict[str, torch.Tensor] = {
             "model.embed_tokens.weight": target_sd[embed_hf_key],
             "lm_head.weight": target_sd[lm_head_hf_key],
@@ -348,19 +363,21 @@ class MuseGlimmerDrafterForCausalLM(BaseForCausalLM):
     @override
     def from_hf_memory_efficient(
         cls,
-        huggingface_model_id: str,
+        huggingface_model_id_or_path: str,
         max_context_length: int | None = None,
         target_dtype: torch.dtype = torch.float16,
         mmap_path: str | None = None,
         num_layers: int | None = None,
+        backend: BackendName = "huggingface",
         **kwargs: Any,
     ) -> Self:
         return cls.from_hf(
-            huggingface_model_id,
+            huggingface_model_id_or_path,
             max_context_length=max_context_length,
             target_dtype=target_dtype,
             mmap_path=mmap_path,
             num_layers=num_layers,
+            backend=backend,
         )
 
     # ------------------------------------------------------------------

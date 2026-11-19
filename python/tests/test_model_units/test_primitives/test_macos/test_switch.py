@@ -40,6 +40,7 @@ from tests._runner_infra.common.types.source_types import (
     Source,
     SourceConfig,
 )
+from tests._runner_infra.testing_utils import MACOS_27_KNOWN_ISSUE, uses_os_coreai
 from tests.test_model_units.test_primitives.test_macos._random_input_models import (
     RandomInputModel,
     RandomInputWithIndicesModel,
@@ -51,6 +52,12 @@ if _HAS_MLX:
     from mlx_lm.models.switch_layers import SwiGLU as MlxSwiGLU
     from mlx_lm.models.switch_layers import SwitchGLU as MlxSwitchGLU
     from mlx_lm.models.switch_layers import SwitchLinear as MlxSwitchLinear
+
+
+F16_MACOS_27_XFAIL = pytest.param(
+    Precision.f16,
+    marks=pytest.mark.xfail(uses_os_coreai(), reason=MACOS_27_KNOWN_ISSUE, strict=False),
+)
 
 
 try:
@@ -648,7 +655,7 @@ class TestSwitch:
             )
 
     @staticmethod
-    @pytest.mark.parametrize("precision", [Precision.f32, Precision.f16, Precision.bf16])
+    @pytest.mark.parametrize("precision", [Precision.f32, F16_MACOS_27_XFAIL, Precision.bf16])
     def test_swiglu(precision: Precision) -> None:
         """Verify Core AI Torch / Core AI SwiGLU matches OSS (naive and MLX-LM)."""
         oss_torch_config = RunConfig(
@@ -754,6 +761,10 @@ class TestSwitch:
         )
         rtol = {Precision.f32: 1e-5, Precision.f16: 1e-3, Precision.bf16: 1e-2}[precision]
         atol = {Precision.f32: 1e-5, Precision.f16: 1e-3, Precision.bf16: 1e-2}[precision]
+        # The Core AI runtime sums in a different order than PyTorch. The f16 / bf16
+        # tolerances above are about one unit in the last place at these output
+        # magnitudes, and the two differ by one or two, so allow about four here.
+        coreai_tol = {Precision.f32: 1e-5, Precision.f16: 4e-3, Precision.bf16: 3e-2}[precision]
         with tempfile.TemporaryDirectory() as temp_directory:
             model = SwitchGLU(
                 Path(temp_directory),
@@ -785,6 +796,6 @@ class TestSwitch:
             model.validate(
                 coreai_torch_export_coreai_coreai_torch_config,
                 coreai_torch_export_config,
-                rtol=rtol,
-                atol=atol,
+                rtol=coreai_tol,
+                atol=coreai_tol,
             )

@@ -112,6 +112,50 @@ struct PrefillGraphTests {
         #expect(sizes == [64, 64, 64, 64, 64, 64, 16])
     }
 
+    @Test(
+        "With a sliding ring, chunks end at ring boundaries",
+        arguments: [
+            // A 4096-token chunk (the >=64GB default) against a 2048-slot ring.
+            (5000, 4096, 0, [2048, 2048, 903]),
+            // Second turn with 3000 tokens cached: the first write starts at slot 952.
+            (3001, 2048, 3000, [1096, 1904]),
+        ])
+    func ringAlignedChunks(plan: (tokens: Int, chunk: Int, start: Int, sizes: [Int])) {
+        #expect(
+            prefillChunkSizes(
+                tokenCount: plan.tokens, chunkSize: plan.chunk, heldBack: 1, startOffset: plan.start,
+                ringCapacity: 2048) == plan.sizes)
+    }
+
+    @Test("Ring-aligned chunks never cross a ring boundary and cover the prompt")
+    func ringAlignedInvariant() {
+        for ring in [8, 64, 2048] {
+            for start in [0, 1, 7, 100, 2047, 3000] {
+                for width in [1, 3, 8, 64, 512, 4096] {
+                    let sizes = prefillChunkSizes(
+                        tokenCount: 1000, chunkSize: width, heldBack: 1, startOffset: start,
+                        ringCapacity: ring)
+                    #expect(sizes.reduce(0, +) == 999)
+                    var position = start
+                    for size in sizes {
+                        #expect(size >= 1 && size <= width)
+                        #expect(
+                            position % ring + size <= ring,
+                            "ring=\(ring) start=\(start) width=\(width) crosses at \(position)")
+                        position += size
+                    }
+                }
+            }
+        }
+    }
+
+    @Test("Without a ring, the start offset does not change the plan")
+    func startOffsetIgnoredWithoutRing() {
+        #expect(
+            prefillChunkSizes(tokenCount: 400, chunkSize: 64, heldBack: 1, startOffset: 37)
+                == prefillChunkSizes(tokenCount: 400, chunkSize: 64, heldBack: 1))
+    }
+
     @Test("A degenerate chunk size still terminates")
     func degenerateChunkSizeTerminates() {
         // Belt and braces: prefillQueryLength already floors at 1, but a direct caller
@@ -308,6 +352,47 @@ struct PrefillGraphTests {
             let message = "\(error)"
             #expect(message.contains(prefillGraphFunctionName))
             #expect(message.contains("Re-export"))
+        }
+    }
+}
+
+@Suite("Main Graph Step Sizes")
+struct MainGraphStepSizesTests {
+    @Test(
+        "Chunks while inside the ring, single tokens past it",
+        arguments: [
+            (5000, 2048, 3000, nil, [2048, 2048, 904]),  // no ring: plain chunk walk
+            (1500, 512, 0, 2048, [512, 512, 476]),  // inside the ring
+            (2051, 1024, 0, 2048, [1024, 1024, 1, 1, 1]),  // crossing it
+            (10, 8, 2044, 2048, [4, 1, 1, 1, 1, 1, 1]),  // mid-ring start
+            (4, 512, 3000, 2048, [1, 1, 1, 1]),  // past it
+        ] as [(Int, Int, Int, Int?, [Int])])
+    func plans(plan: (tokens: Int, chunk: Int, start: Int, ring: Int?, sizes: [Int])) {
+        #expect(
+            mainGraphStepSizes(
+                tokenCount: plan.tokens, chunkSize: plan.chunk, startOffset: plan.start,
+                ringCapacity: plan.ring) == plan.sizes)
+    }
+
+    @Test("No step evicts or exceeds the chunk, and the steps cover every token")
+    func invariant() {
+        let ring = 64
+        for start in [0, 1, 63, 64, 200] {
+            for count in [1, 2, 64, 65, 130] {
+                for chunk in [1, 7, 64, 100] {
+                    let steps = mainGraphStepSizes(
+                        tokenCount: count, chunkSize: chunk, startOffset: start, ringCapacity: ring)
+                    #expect(steps.reduce(0, +) == count)
+                    var offset = start
+                    for q in steps {
+                        #expect(q <= chunk)
+                        #expect(
+                            !StateHandlerFactory.writeFirstStepEvicts(
+                                offset: offset, queryLength: q, ringCapacity: ring))
+                        offset += q
+                    }
+                }
+            }
         }
     }
 }

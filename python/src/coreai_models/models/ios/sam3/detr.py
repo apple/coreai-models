@@ -24,6 +24,7 @@ import torch.nn.functional as F
 
 from coreai_models.primitives.ios.bidirectional_sdpa import BidirectionalSDPA
 from coreai_models.primitives.ios.layer_norm import LayerNormReauthored
+from coreai_models.primitives.ios.trig import cos_0_2pi, sin_0_2pi
 
 _HIDDEN_SIZE = 256
 _NUM_HEADS = 8
@@ -97,7 +98,12 @@ class SinePositionEmbeddingReauthored(nn.Module):
         self.register_buffer("_scale", torch.tensor(2.0 * math.pi, dtype=torch.float16))
 
     def encode_boxes(self, boxes: torch.Tensor) -> torch.Tensor:
-        """Encode (cx, cy, w, h) boxes to (B, num_queries, num_pos_feats * 4)."""
+        """Encode (cx, cy, w, h) boxes to (B, num_queries, num_pos_feats * 4).
+
+        Boxes come from a sigmoid, so every angle is in [0, 2*pi] and the multiply/add
+        ``sin_0_2pi``/``cos_0_2pi`` stand in for ``sin``/``cos``. The M2 Neural Engine has no
+        sin/cos, and MPSGraph would otherwise run decoder layers 1-4 on the GPU.
+        """
         scale = self._scale.to(dtype=boxes.dtype)
         temperature = self._temperature.to(dtype=boxes.dtype)
 
@@ -116,10 +122,14 @@ class SinePositionEmbeddingReauthored(nn.Module):
         pos_w = w_embed[:, :, None] / dim_t
         pos_h = h_embed[:, :, None] / dim_t
 
-        pos_x = torch.stack((pos_x[:, :, 0::2].sin(), pos_x[:, :, 1::2].cos()), dim=3).flatten(2)
-        pos_y = torch.stack((pos_y[:, :, 0::2].sin(), pos_y[:, :, 1::2].cos()), dim=3).flatten(2)
-        pos_w = torch.stack((pos_w[:, :, 0::2].sin(), pos_w[:, :, 1::2].cos()), dim=3).flatten(2)
-        pos_h = torch.stack((pos_h[:, :, 0::2].sin(), pos_h[:, :, 1::2].cos()), dim=3).flatten(2)
+        pos_x = torch.stack((sin_0_2pi(pos_x[:, :, 0::2]), cos_0_2pi(pos_x[:, :, 1::2])), dim=3)
+        pos_x = pos_x.flatten(2)
+        pos_y = torch.stack((sin_0_2pi(pos_y[:, :, 0::2]), cos_0_2pi(pos_y[:, :, 1::2])), dim=3)
+        pos_y = pos_y.flatten(2)
+        pos_w = torch.stack((sin_0_2pi(pos_w[:, :, 0::2]), cos_0_2pi(pos_w[:, :, 1::2])), dim=3)
+        pos_w = pos_w.flatten(2)
+        pos_h = torch.stack((sin_0_2pi(pos_h[:, :, 0::2]), cos_0_2pi(pos_h[:, :, 1::2])), dim=3)
+        pos_h = pos_h.flatten(2)
 
         return torch.cat((pos_y, pos_x, pos_w, pos_h), dim=2)
 
@@ -544,7 +554,7 @@ class DETRDecoderReauthored(nn.Module):
         text_features: torch.Tensor,
         vision_pos: torch.Tensor,
         spatial_shapes: torch.Tensor | None = None,
-        text_mask: torch.Tensor | None = None,
+        text_cross_attn_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size = vision_features.shape[0]
 
@@ -556,15 +566,6 @@ class DETRDecoderReauthored(nn.Module):
 
         hidden_bsc = torch.cat([presence_token, query_embeds], dim=1)
         hidden_states = hidden_bsc.permute(0, 2, 1).unsqueeze(2)
-
-        text_cross_attn_mask = None
-        if text_mask is not None:
-            inv_mask = (~text_mask).to(dtype=vision_features.dtype) * (-40000.0)
-            text_cross_attn_mask = (
-                inv_mask.unsqueeze(1)
-                .unsqueeze(1)
-                .expand(-1, self.num_heads, hidden_states.shape[3], -1)
-            )
 
         normed_hs = None
         new_ref = None

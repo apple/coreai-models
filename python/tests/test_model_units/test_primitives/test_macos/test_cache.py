@@ -9,10 +9,12 @@ import pytest
 import torch
 
 import coreai_models.primitives.macos.cache as cache_module
-from coreai_models.primitives.macos.cache import KVCache, SSMState
+from coreai_models.primitives.macos.cache import DeltaNetCache, KVCache, SSMState
 from tests._runner_infra.testing_utils import (
+    MACOS_27_KNOWN_ISSUE,
     assert_close,
     run_compare_coreai_explicit_kv_cache,
+    uses_os_coreai,
 )
 
 
@@ -265,6 +267,8 @@ class TestKVCache:
         This verifies the pattern used by macOS models (e.g., Qwen2ForCausalLM) where
         forward(input_ids, position_ids, k_cache, v_cache) -> (logits, k_cache, v_cache).
         """
+        if uses_os_coreai():
+            pytest.skip(MACOS_27_KNOWN_ISSUE)
         N_KV_HEADS = 2
         HEAD_DIM = 4
         MAX_SEQ = 32
@@ -385,3 +389,59 @@ class TestSSMState:
 
         assert_close(ssm_state.states[layer_idx], new_state)
         assert_close(ssm_state.states[0], torch.zeros(batch_size, *state_dims))
+
+
+class _MockDeltaNetConfig:
+    num_hidden_layers = 3
+    linear_num_value_heads = 4
+    linear_num_key_heads = 2
+    linear_key_head_dim = 8
+    linear_value_head_dim = 8
+    linear_conv_kernel_dim = 3
+
+
+class TestDeltaNetCache:
+    KEY_DIM = _MockDeltaNetConfig.linear_key_head_dim * _MockDeltaNetConfig.linear_num_key_heads
+    VALUE_DIM = (
+        _MockDeltaNetConfig.linear_value_head_dim * _MockDeltaNetConfig.linear_num_value_heads
+    )
+    CONV_DIM = KEY_DIM * 2 + VALUE_DIM
+    CONV_KERNEL = _MockDeltaNetConfig.linear_conv_kernel_dim
+
+    def test_update_conv_state(self) -> None:
+        config = _MockDeltaNetConfig()
+        conv_states, recurrent_states = DeltaNetCache.create_cache_tensors(
+            config, n_layers=config.num_hidden_layers
+        )
+        cache = DeltaNetCache(conv_states, recurrent_states)
+
+        window = (1, self.CONV_KERNEL, self.CONV_DIM)
+        assert conv_states.shape == (config.num_hidden_layers, *window)
+
+        expected = []
+        for i in range(config.num_hidden_layers):
+            new_state = torch.randn(*window)
+            expected.append(new_state)
+            cache.update_conv_state(i, new_state)
+            for j in range(i + 1):
+                assert_close(cache.conv_states[j], expected[j])
+
+    def test_update_recurrent_state(self) -> None:
+        config = _MockDeltaNetConfig()
+        conv_states, recurrent_states = DeltaNetCache.create_cache_tensors(
+            config, n_layers=config.num_hidden_layers
+        )
+        cache = DeltaNetCache(conv_states, recurrent_states)
+
+        expected = []
+        for i in range(config.num_hidden_layers):
+            new_state = torch.randn(
+                1,
+                config.linear_num_value_heads,
+                config.linear_key_head_dim,
+                config.linear_value_head_dim,
+            )
+            expected.append(new_state)
+            cache.update_recurrent_state(i, new_state)
+            for j in range(i + 1):
+                assert_close(cache.recurrent_states[j], expected[j])

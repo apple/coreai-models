@@ -298,6 +298,29 @@ struct InputHandlerFuzzTests {
         }
     }
 
+    @Test(
+        "Additive causal attn_mask [1,1,query,key] correctness",
+        arguments: [
+            (4, 0),  // prefill from the start
+            (1, 0),  // single-token prompt
+            (1, 5),  // decode step after 5 processed tokens
+            (8, 100),  // prefill chunk mid-sequence
+        ] as [(Int, Int)])
+    func additiveCausalMaskFill(queryLen: Int, processedTokenCount: Int) {
+        let keyLen = processedTokenCount + queryLen
+        var mask = NDArray(shape: [1, 1, queryLen, keyLen], scalarType: .float16)
+
+        fillAdditiveCausalMask(&mask, processedTokenCount: processedTokenCount)
+
+        let result = readNDArray(mask, as: Float16.self, count: queryLen * keyLen)
+        for query in 0..<queryLen {
+            for key in 0..<keyLen {
+                let attends = key <= processedTokenCount + query
+                #expect(result[query * keyLen + key] == (attends ? 0 : causalMaskSentinel), "q=\(query) k=\(key)")
+            }
+        }
+    }
+
     @Test("Rapid re-fill does not corrupt")
     func rapidRefill() {
         var array = NDArray(shape: [1, 256], scalarType: .float16)

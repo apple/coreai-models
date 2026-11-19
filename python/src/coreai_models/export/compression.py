@@ -291,6 +291,13 @@ def quantize_for_export(
             "for single-graph (macOS) models; iOS uses palettization."
         )
     graph_inputs = reference_inputs[MAIN_GRAPH_NAME]
+    # torch.export bakes the device of the example inputs into the graph, so they must be
+    # on the model's device.
+    device = next(model.parameters()).device
+    graph_inputs = {
+        name: value.to(device) if isinstance(value, torch.Tensor) else value
+        for name, value in graph_inputs.items()
+    }
     keys = list(graph_inputs)
     if quantization_config.get("calibrate_activations") and keys[:2] != [
         "input_ids",
@@ -326,6 +333,7 @@ def palettize_pytorch_model(
     model: nn.Module,
     example_inputs: tuple,
     palettization_config: "dict | KMeansPalettizerConfig",
+    export_backend: ExportBackend | None = None,
 ) -> nn.Module:
     """
     Palettize a PyTorch model using post-training palettization with coreai-opt.
@@ -337,6 +345,8 @@ def palettize_pytorch_model(
         palettization_config: Either a configuration dictionary (matching the
             inner shape coreai-opt expects under `kmeans_palettization_config`)
             or a prebuilt KMeansPalettizerConfig instance.
+        export_backend: Backend for the finalized palettized model.
+            Defaults to ExportBackend.CoreAI if not specified.
 
     Returns:
         Palettized model ready for export.
@@ -345,6 +355,9 @@ def palettize_pytorch_model(
         ImportError: If coreai-opt is not installed.
     """
     _require_coreai_opt()
+
+    if export_backend is None:
+        export_backend = ExportBackend.CoreAI
 
     logger.info("Palettizing model with coreai-opt")
 
@@ -359,7 +372,7 @@ def palettize_pytorch_model(
     palettizer = KMeansPalettizer(model, config)
     prepared_model = palettizer.prepare(example_inputs=example_inputs, num_workers=32)
 
-    finalized_model = palettizer.finalize(prepared_model, backend=ExportBackend.CoreAI)
+    finalized_model = palettizer.finalize(prepared_model, backend=export_backend)
 
     logger.info("Palettization with coreai-opt complete")
     return finalized_model

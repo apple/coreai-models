@@ -186,3 +186,20 @@ class KVCacheHandler:
     @property
     def v_cache(self) -> torch.Tensor:
         return self._v_cache
+
+
+def causal_mask(
+    max_context_length: int,
+    query_len: int,
+    offset: int,
+    *,
+    dtype: torch.dtype,
+    device: torch.device | str = "cpu",
+) -> torch.Tensor:
+    """Additive mask in the iOS layout ``(1, key, 1, query)``: query ``i`` sees keys to
+    ``offset + i``.
+    """
+    keys = torch.arange(max_context_length, device=device).view(1, -1, 1, 1)
+    queries = torch.arange(query_len, device=device).view(1, 1, 1, -1)
+    mask = torch.zeros(1, max_context_length, 1, query_len, dtype=dtype, device=device)
+    return mask.masked_fill(keys > offset + queries, float("-inf"))

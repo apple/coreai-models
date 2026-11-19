@@ -150,6 +150,9 @@ public struct CoreAISegmentationEngine {
         // Text-based inputs (SAM3-style baseline).
         let textInputName: String?
         let embeddingsInputName: String?
+        /// Text-padding mask, present on full SAM3 exports with a padded prompt. Nil for older
+        /// exports (a 3-token prompt with no padding) and for point models.
+        let textAttentionMaskInput: TextAttentionMaskInput?
 
         // Point-based inputs (EfficientSAM).
         let pointsInputName: String?
@@ -176,6 +179,9 @@ public struct CoreAISegmentationEngine {
 
             let textInputName = findTextInputName(in: descriptor.inputNames)
             let embeddingsInputName = findEmbeddingsInputName(in: descriptor.inputNames)
+            let textAttentionMaskInput =
+                textInputName == nil
+                ? nil : try resolveTextAttentionMaskInput(in: descriptor, functionName: GraphNames.main)
             let pointsInputName = findPointsInputName(in: descriptor.inputNames)
             let pointLabelsInputName = findPointLabelsInputName(in: descriptor.inputNames)
 
@@ -239,6 +245,7 @@ public struct CoreAISegmentationEngine {
             self.imageInputName = imageInputName
             self.textInputName = textInputName
             self.embeddingsInputName = embeddingsInputName
+            self.textAttentionMaskInput = textAttentionMaskInput
             self.pointsInputName = pointsInputName
             self.pointLabelsInputName = pointLabelsInputName
             self.masksOutputName = masksOutputName
@@ -271,6 +278,9 @@ public struct CoreAISegmentationEngine {
         // outputs so re-export naming changes can be absorbed without code edits.
         let backboneFeaturesInputName: String
         let textFeaturesInputName: String
+        /// Text-padding mask (1 = prompt token, 0 = padding). Nil for bundles exported before
+        /// `detect` took one; those still run, but attend to the padding slots.
+        let textAttentionMaskInput: TextAttentionMaskInput?
         let masksOutputName: String
         let boxesOutputName: String
         let logitsOutputName: String
@@ -329,6 +339,8 @@ public struct CoreAISegmentationEngine {
                     "Cannot find text-features input in 'detect'. Inputs: \(detectDescriptor.inputNames)"
                 )
             }
+            let textAttentionMaskInput = try resolveTextAttentionMaskInput(
+                in: detectDescriptor, functionName: GraphNames.detect)
             guard let masksOutputName = findMasksOutputName(in: detectDescriptor.outputNames) else {
                 throw SegmentationRuntimeError.invalidConfiguration(
                     "Cannot find masks output in 'detect'. Outputs: \(detectDescriptor.outputNames)"
@@ -392,6 +404,7 @@ public struct CoreAISegmentationEngine {
 
             self.backboneFeaturesInputName = backboneFeaturesInputName
             self.textFeaturesInputName = textFeaturesInputName
+            self.textAttentionMaskInput = textAttentionMaskInput
             self.masksOutputName = masksOutputName
             self.boxesOutputName = boxesOutputName
             self.logitsOutputName = logitsOutputName
@@ -417,10 +430,13 @@ public struct CoreAISegmentationEngine {
         fillNDArray(&textArray, as: Int32.self, count: textDescriptor.shape.reduce(1, *)) { _ in
             CLIPTokenizer.eotTokenId
         }
-        try await runSingleFunctionTextInference(
-            state: state,
-            inputs: [state.imageInputName: imageArray, textInputName: textArray]
-        )
+        var inputs = [state.imageInputName: imageArray, textInputName: textArray]
+        if let input = state.textAttentionMaskInput,
+            let mask = Self.buildTextAttentionMaskNDArray(input: input, tokensBatch: [])
+        {
+            inputs[input.name] = mask
+        }
+        try await runSingleFunctionTextInference(state: state, inputs: inputs)
     }
 
     private func warmupSingleFunctionPointModel(state: SingleFunctionContext) async throws {
@@ -488,6 +504,11 @@ public struct CoreAISegmentationEngine {
             inputs[textInputName] = Self.buildTextTokensNDArray(
                 tokensBatch: textTokensBatch, descriptor: textDescriptor
             )
+            if let input = state.textAttentionMaskInput,
+                let mask = Self.buildTextAttentionMaskNDArray(input: input, tokensBatch: textTokensBatch)
+            {
+                inputs[input.name] = mask
+            }
 
         case .embeddings(let embeddingsBatch):
             guard let embInputName = state.embeddingsInputName else {
@@ -511,6 +532,11 @@ public struct CoreAISegmentationEngine {
                     at: idx, sequenceLength: sequenceLength, hiddenSize: hiddenSize, batch: embeddingsBatch)
             }
             inputs[embInputName] = embeddingsArray
+            if let input = state.textAttentionMaskInput,
+                let mask = Self.buildTextAttentionMaskNDArray(input: input, tokensBatch: nil)
+            {
+                inputs[input.name] = mask
+            }
         }
 
         return try await runSingleFunctionTextInference(state: state, inputs: inputs)
@@ -814,7 +840,9 @@ public struct CoreAISegmentationEngine {
         try await runMultiFunctionInference(
             state: state,
             imageArray: imageArray,
-            textArray: textArray
+            textArray: textArray,
+            textAttentionMask: Self.buildTextAttentionMaskNDArray(
+                input: state.textAttentionMaskInput, tokensBatch: [])
         )
     }
 
@@ -837,12 +865,14 @@ public struct CoreAISegmentationEngine {
         )
 
         let textArray: NDArray
+        let textTokensBatch: [[Int32]]
         switch textQuery {
         case .prompt:
             throw SegmentationRuntimeError.invalidConfiguration(
                 "TextQuery.prompt must be resolved to .tokens by ImageSegmenter before reaching the engine."
             )
-        case .tokens(let textTokensBatch):
+        case .tokens(let tokensBatch):
+            textTokensBatch = tokensBatch
             guard
                 case .ndArray(let textDescriptor) = state.textEncodeDescriptor.inputDescriptor(
                     of: state.textInputName)
@@ -864,7 +894,9 @@ public struct CoreAISegmentationEngine {
         return try await runMultiFunctionInference(
             state: state,
             imageArray: imageArray,
-            textArray: textArray
+            textArray: textArray,
+            textAttentionMask: Self.buildTextAttentionMaskNDArray(
+                input: state.textAttentionMaskInput, tokensBatch: textTokensBatch)
         )
     }
 
@@ -874,7 +906,8 @@ public struct CoreAISegmentationEngine {
     private func runMultiFunctionInference(
         state: MultiFunctionContext,
         imageArray: NDArray,
-        textArray: NDArray
+        textArray: NDArray,
+        textAttentionMask: NDArray?
     ) async throws -> SegmentationOutput {
         var imageOutputs = try await state.imageEncode.run(
             inputs: [state.imageInputName: imageArray]
@@ -893,12 +926,14 @@ public struct CoreAISegmentationEngine {
             )
         }
 
-        var detectOutputs = try await state.detect.run(
-            inputs: [
-                state.backboneFeaturesInputName: backboneFeatures,
-                state.textFeaturesInputName: textFeatures,
-            ]
-        )
+        var detectInputs: [String: NDArray] = [
+            state.backboneFeaturesInputName: backboneFeatures,
+            state.textFeaturesInputName: textFeatures,
+        ]
+        if let input = state.textAttentionMaskInput, let textAttentionMask {
+            detectInputs[input.name] = textAttentionMask
+        }
+        var detectOutputs = try await state.detect.run(inputs: detectInputs)
         guard let masks = detectOutputs.remove(state.masksOutputName)?.ndArray,
             let boxes = detectOutputs.remove(state.boxesOutputName)?.ndArray,
             let logits = detectOutputs.remove(state.logitsOutputName)?.ndArray,
@@ -974,6 +1009,76 @@ public struct CoreAISegmentationEngine {
                 eotTokenId: CLIPTokenizer.eotTokenId)
         }
         return array
+    }
+
+    /// An optional text-padding mask input: SAM3 lite `detect` and full SAM3 `main` exports take
+    /// one (1 = prompt token, 0 = padding); older exports and other models don't.
+    typealias TextAttentionMaskInput = (name: String, descriptor: NDArrayDescriptor)
+
+    /// The function's `attention_mask` input, or nil when it has none. A nil result still loads
+    /// (older bundles keep working) but warns: those exports attend to prompt padding (#381).
+    static func resolveTextAttentionMaskInput(
+        in descriptor: InferenceFunctionDescriptor, functionName: String
+    ) throws -> TextAttentionMaskInput? {
+        guard let name = findTextAttentionMaskName(in: descriptor.inputNames) else {
+            CLILogger.log(
+                "Warning: '\(functionName)' has no 'attention_mask' input, so this SAM3 bundle predates "
+                    + "the text-padding fix and its scores and masks can differ from Sam3Model. "
+                    + "Re-export it with the current models/sam3/export.py.",
+                component: "ImageSegmenter",
+                level: 0
+            )
+            return nil
+        }
+        guard case .ndArray(let arrayDescriptor) = descriptor.inputDescriptor(of: name) else {
+            throw SegmentationRuntimeError.invalidConfiguration(
+                "No array descriptor for '\(name)' input of '\(functionName)'."
+            )
+        }
+        return (name, arrayDescriptor)
+    }
+
+    /// The text-padding mask for `tokensBatch`, or nil when the asset has no such input. Its last
+    /// dimension is the prompt length; rows are padded as in `buildTextTokensNDArray`. A nil
+    /// `tokensBatch` (embedding prompts, which carry no ids) marks every slot as a real token.
+    static func buildTextAttentionMaskNDArray(
+        input: TextAttentionMaskInput?,
+        tokensBatch: [[Int32]]?
+    ) -> NDArray? {
+        guard let input else { return nil }
+        var array = NDArray(descriptor: input.descriptor)
+        fillTextAttentionMask(&array, tokensBatch: tokensBatch)
+        return array
+    }
+
+    /// Fill a `[batch, ..., sequenceLength]` mask array via `textAttentionMask`, row by row. A nil
+    /// `tokensBatch` fills every slot with 1.
+    static func fillTextAttentionMask(_ array: inout NDArray, tokensBatch: [[Int32]]?) {
+        let batchSize = array.shape[0]
+        let sequenceLength = array.shape[array.shape.count - 1]
+        let values: [Float]
+        if let tokensBatch {
+            values = (0..<batchSize).flatMap { b in
+                textAttentionMask(
+                    tokens: b < tokensBatch.count ? tokensBatch[b] : [], sequenceLength: sequenceLength)
+            }
+        } else {
+            values = [Float](repeating: 1, count: batchSize * sequenceLength)
+        }
+        if array.scalarType == .int32 {
+            fillNDArray(&array, as: Int32.self, count: values.count) { Int32(values[$0]) }
+        } else {
+            fillFloatNDArray(&array, with: values)
+        }
+    }
+
+    /// 1 for the slots of `tokens` (padded with EOT to `sequenceLength`) up to and including the
+    /// first EOT, 0 after it. The pad id is EOT, so this matches `CLIPTokenizer.encodeWithMask`.
+    static func textAttentionMask(tokens: [Int32], sequenceLength: Int) -> [Float] {
+        let eot = CLIPTokenizer.eotTokenId
+        let end =
+            tokens.prefix(sequenceLength).firstIndex(of: eot) ?? min(tokens.count, sequenceLength - 1)
+        return (0..<sequenceLength).map { $0 <= end ? 1 : 0 }
     }
 
     // MARK: - Best-of-K helpers (point path; pure-data, easily unit testable)
@@ -1232,6 +1337,10 @@ public struct CoreAISegmentationEngine {
             let l = $0.lowercased()
             return l.contains("text_feat") || l == "text_features"
         }
+    }
+
+    static func findTextAttentionMaskName(in names: [String]) -> String? {
+        names.first { $0.lowercased() == "attention_mask" }
     }
 
     static func findMasksOutputName(in names: [String]) -> String? {

@@ -37,7 +37,10 @@ public struct TokenInputHandler: SyncInputHandler {
         self.useCompactPositionIds = useCompactPositionIds
         self.inputNames = [inputIdsName, positionIdsName]
 
-        let initDesc = inputIdsDescriptor.resolvingDynamicDimensions([1, 1])
+        // Keep a static batch dim as is, because `resolvingDynamicDimensions` rejects a mismatch on
+        // a pinned dim. A dynamic batch dim resolves to 1.
+        let batch = (inputIdsDescriptor.shape.first ?? 1) > 0 ? inputIdsDescriptor.shape[0] : 1
+        let initDesc = inputIdsDescriptor.resolvingDynamicDimensions([batch, 1])
         self.inputIdsArray = NDArray(descriptor: initDesc)
         self.cachedBatchSize = 1
     }

@@ -3,6 +3,7 @@
 // Use of this source code is governed by a BSD-3-clause license that can
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
+import CoreAI
 import CoreAIShared
 import CoreGraphics
 import Foundation
@@ -62,6 +63,19 @@ struct CoreAISegmentationEngineTests {
         #expect(CoreAISegmentationEngine.findTextFeaturesName(in: ["text_feat"]) == "text_feat")
         // 'text_tokens' is the text input, not the text-features intermediate — must not match.
         #expect(CoreAISegmentationEngine.findTextFeaturesName(in: ["text_tokens", "input_ids"]) == nil)
+    }
+
+    @Test("findTextAttentionMaskName: matches 'attention_mask' only, not mask outputs")
+    func findTextAttentionMaskName() {
+        #expect(
+            CoreAISegmentationEngine.findTextAttentionMaskName(
+                in: ["backbone_features", "text_features", "attention_mask"]) == "attention_mask"
+        )
+        // Bundles exported before `detect` took a mask have only the two feature inputs.
+        #expect(
+            CoreAISegmentationEngine.findTextAttentionMaskName(in: ["backbone_features", "text_features"])
+                == nil)
+        #expect(CoreAISegmentationEngine.findTextAttentionMaskName(in: ["pred_masks"]) == nil)
     }
 
     @Test("findPointsInputName: matches 'point' but excludes 'point_label'")
@@ -217,6 +231,78 @@ struct CoreAISegmentationEngineTests {
         #expect(
             CoreAISegmentationEngine.tokenValue(at: 10, sequenceLength: sequenceLength, batch: batch, eotTokenId: eot)
                 == eot)
+    }
+
+    // MARK: - Text attention mask
+
+    @Test("textAttentionMask: real tokens through the first EOT, padding after it")
+    func textAttentionMaskShortPrompt() {
+        let eot = CLIPTokenizer.eotTokenId
+        // SOT, word, EOT, then EOT padding: the closing EOT counts, the pads don't.
+        #expect(
+            CoreAISegmentationEngine.textAttentionMask(tokens: [49406, 320, eot, eot, eot], sequenceLength: 6)
+                == [1, 1, 1, 0, 0, 0])
+        // A row shorter than the sequence is padded with EOT, so the first pad closes it.
+        #expect(
+            CoreAISegmentationEngine.textAttentionMask(tokens: [49406, 320], sequenceLength: 5)
+                == [1, 1, 1, 0, 0])
+        // A missing row is all EOT: only slot 0, matching the ids `tokenValue` produces.
+        #expect(CoreAISegmentationEngine.textAttentionMask(tokens: [], sequenceLength: 3) == [1, 0, 0])
+    }
+
+    @Test("textAttentionMask: a full-length row (truncated prompt) is all real")
+    func textAttentionMaskFullRow() {
+        let eot = CLIPTokenizer.eotTokenId
+        #expect(
+            CoreAISegmentationEngine.textAttentionMask(tokens: [49406, 320, 736, eot], sequenceLength: 4)
+                == [1, 1, 1, 1])
+        // No EOT within the sequence at all: nothing to mask.
+        #expect(
+            CoreAISegmentationEngine.textAttentionMask(tokens: [49406, 320, 736, 1615, 9], sequenceLength: 4)
+                == [1, 1, 1, 1])
+    }
+
+    @Test("textAttentionMask matches CLIPTokenizer.encodeWithMask")
+    func textAttentionMaskMatchesTokenizer() throws {
+        let tokenizer = try CLIPTokenizer(
+            vocab: ["<|startoftext|>": 49406, "<|endoftext|>": 49407, "a</w>": 320, "b</w>": 736],
+            merges: [])
+        for (prompt, length) in [("a", 32), ("a b a b", 32), ("a b a b a b", 4)] {
+            let (ids, mask) = tokenizer.encodeWithMask(prompt, contextLength: length)
+            #expect(
+                CoreAISegmentationEngine.textAttentionMask(tokens: ids, sequenceLength: length)
+                    == mask.map(Float.init))
+        }
+    }
+
+    @Test("fillTextAttentionMask: fills a [B, 1, 1, S] fp16 array row by row")
+    func fillTextAttentionMaskFloat16() {
+        let eot = CLIPTokenizer.eotTokenId
+        var array = NDArray(shape: [2, 1, 1, 4], scalarType: .float16)
+        CoreAISegmentationEngine.fillTextAttentionMask(&array, tokensBatch: [[49406, 320, 736, eot]])
+        // Row 1 has no tokens, so it is all EOT and only slot 0 is real.
+        #expect(flattenAsFloat(array) == [1, 1, 1, 1, 1, 0, 0, 0])
+    }
+
+    @Test("fillTextAttentionMask: fills a [B, S] int32 array (full SAM3 `main` layout)")
+    func fillTextAttentionMaskInt32() {
+        let eot = CLIPTokenizer.eotTokenId
+        var array = NDArray(shape: [1, 6], scalarType: .int32)
+        CoreAISegmentationEngine.fillTextAttentionMask(&array, tokensBatch: [[49406, 320, eot]])
+        #expect(readNDArray(array, as: Int32.self, count: 6) == [1, 1, 1, 0, 0, 0])
+    }
+
+    @Test("buildTextAttentionMaskNDArray: nil when the asset has no mask input")
+    func buildTextAttentionMaskWithoutInput() {
+        #expect(CoreAISegmentationEngine.buildTextAttentionMaskNDArray(input: nil, tokensBatch: [[49406]]) == nil)
+        #expect(CoreAISegmentationEngine.buildTextAttentionMaskNDArray(input: nil, tokensBatch: nil) == nil)
+    }
+
+    @Test("fillTextAttentionMask: embedding prompts (nil tokens) mark every slot real")
+    func fillTextAttentionMaskForEmbeddings() {
+        var array = NDArray(shape: [1, 4], scalarType: .float32)
+        CoreAISegmentationEngine.fillTextAttentionMask(&array, tokensBatch: nil)
+        #expect(flattenAsFloat(array) == [1, 1, 1, 1])
     }
 
     // MARK: - Embedding value indexing

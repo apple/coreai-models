@@ -9,7 +9,8 @@ Pure PyTorch ops (split / cat / matmul / softmax) in BC1S layout.
 
 Mask convention: ``attention_mask`` (when provided) is in GPU layout
 (B, num_heads, query_seq, key_seq), with ``-40000.0`` for masked
-positions. ``None`` is unmasked attention.
+positions. Size-1 head / query dims broadcast (a key-padding mask is
+``(B, 1, 1, key_seq)``). ``None`` is unmasked attention.
 """
 
 import torch
@@ -60,7 +61,10 @@ class BidirectionalSDPA(nn.Module):
         for start in range(0, query_seq, chunk_size):
             end = min(start + chunk_size, query_seq)
             q_chunk = query[:, :, :, start:end]
-            mask_chunk = attention_mask[:, :, start:end, :] if attention_mask is not None else None
+            # A mask broadcast over queries (query dim of 1) applies to every chunk as is.
+            mask_chunk = attention_mask
+            if attention_mask is not None and attention_mask.shape[2] > 1:
+                mask_chunk = attention_mask[:, :, start:end, :]
             chunks.append(self._standard_forward(q_chunk, key, value, mask_chunk))
         return torch.cat(chunks, dim=3)
 

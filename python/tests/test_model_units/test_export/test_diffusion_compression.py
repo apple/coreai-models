@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import copy
 import json
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -30,8 +31,16 @@ from coreai_models.diffusion.components import (
     WAN_COMPONENTS,
     quant_weight_owner,
 )
-from coreai_models.diffusion.pipeline import _quantize_component_weights, _resolve_compression
-from coreai_models.diffusion.presets import _MODULE_TYPE_EXCLUSIONS, PRESETS
+from coreai_models.diffusion.pipeline import (
+    _apply_component_precision,
+    _check_quantization_precision,
+    _pipeline_component_name,
+    _quantize_component_weights,
+    _resolve_component_precision,
+    _resolve_compression,
+    _uses_int4,
+)
+from coreai_models.diffusion.presets import _EMBEDDING_SUBCLASSES, _MODULE_TYPE_EXCLUSIONS, PRESETS
 from coreai_models.export.compression import quantize_pytorch_model
 
 
@@ -92,19 +101,36 @@ def _quantize(model: nn.Module, config: dict) -> nn.Module:
     return quantize_pytorch_model(model, (torch.randn(1, 4, 256),), None, config, 0, ())
 
 
+# Component names every supported diffusers pipeline registers.
+_COMPONENTS = ["transformer", "text_encoder", "vae", "tokenizer", "scheduler"]
+
+
 # ---------------------------------------------------------------------------
 # Presets
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("name", [n for n, p in PRESETS.items() if p["config"] is not None])
-def test_presets_are_weight_only_and_eager(name: str) -> None:
+def _preset_configs() -> list[tuple[str, dict]]:
+    """``(label, config)`` for every non-None config a preset holds, uniform or per component."""
+    out = []
+    for name, preset in PRESETS.items():
+        if preset.get("config") is not None:
+            out.append((name, preset["config"]))
+        for component, config in preset.get("component_configs", {}).items():
+            if config is not None:
+                out.append((f"{name}[{component}]", config))
+    return out
+
+
+@pytest.mark.parametrize(
+    ("label", "config"), _preset_configs(), ids=[c[0] for c in _preset_configs()]
+)
+def test_presets_are_weight_only_and_eager(label: str, config: dict) -> None:
     """Every preset quantizes weights only, in eager mode.
 
     Eager mode keeps the component wrapper as a live module, which multi-function export
     re-traces at each of its shapes.
     """
-    config = PRESETS[name]["config"]
     assert config["execution_mode"] == "eager"
     assert config["global_config"]["op_input_spec"] is None
     assert config["global_config"]["op_output_spec"] is None
@@ -151,11 +177,125 @@ def test_int8_preset_is_no_longer_a_silent_no_op() -> None:
     assert spec["dtype"] == "int8"
 
 
-@pytest.mark.parametrize("name", [n for n, p in PRESETS.items() if p["config"] is not None])
-def test_presets_satisfy_the_coreai_opt_schema(name: str) -> None:
+@pytest.mark.parametrize(
+    ("label", "config"), _preset_configs(), ids=[c[0] for c in _preset_configs()]
+)
+def test_presets_satisfy_the_coreai_opt_schema(label: str, config: dict) -> None:
     """Catches a schema typo without downloading any weights."""
-    config = copy.deepcopy(PRESETS[name]["config"])
+    QuantizerConfig.from_dict({"quantization_config": copy.deepcopy(config)})
+
+
+def test_every_preset_has_exactly_one_config_shape() -> None:
+    """``config`` and ``component_configs`` are alternatives; the resolver reads only one."""
+    for name, preset in PRESETS.items():
+        assert ("config" in preset) != ("component_configs" in preset), name
+
+
+def test_int_scales_take_the_dtype_the_weights_are_quantized_in() -> None:
+    """Int scales follow the weight dtype, which is why the mixed preset casts its text encoder.
+
+    The Core AI GPU int4 dequant kernel rejects bf16 scales (``scale should be half or float``).
+    """
+    for dtype in (torch.bfloat16, torch.float16):
+        model = _TwoLinears().to(dtype).eval()
+        quantize_pytorch_model(
+            model,
+            (torch.randn(1, 4, 256, dtype=dtype),),
+            None,
+            copy.deepcopy(_int4_config()),
+            0,
+            (),
+        )
+        assert model.a.parametrizations["weight"][0].scale.dtype == dtype
+
+
+def test_uniform_presets_keep_the_pipeline_precision() -> None:
+    assert _resolve_component_precision("4bit", _COMPONENTS) == {}
+    assert _resolve_component_precision("none", _COMPONENTS) == {}
+
+
+def test_component_precision_in_json_is_kept_out_of_the_coreai_opt_config() -> None:
+    """coreai-opt forbids unknown keys, so the quantization side must not see it."""
+    value = json.dumps({**_int4_config(), "component_precision": {"transformer": "float32"}})
+    assert _resolve_component_precision(value, _COMPONENTS) == {"transformer": "float32"}
+    config = _resolve_compression(value, _COMPONENTS)["transformer"]
+    assert config == _int4_config()
     QuantizerConfig.from_dict({"quantization_config": config})
+
+
+def test_component_precision_rejects_unknown_components_and_precisions() -> None:
+    with pytest.raises(ValueError, match="text_encodr"):
+        _resolve_component_precision(
+            json.dumps({"component_precision": {"text_encodr": "float16"}}), _COMPONENTS
+        )
+    with pytest.raises(ValueError, match="fp16"):
+        _resolve_component_precision(
+            json.dumps({"component_precision": {"text_encoder": "fp16"}}), _COMPONENTS
+        )
+
+
+def test_apply_component_precision_casts_only_the_named_components() -> None:
+    pipe = SimpleNamespace(
+        text_encoder=_TwoLinears().to(torch.bfloat16), transformer=_TwoLinears().to(torch.bfloat16)
+    )
+    _apply_component_precision(pipe, {"text_encoder": "float16"})
+    assert pipe.text_encoder.a.weight.dtype == torch.float16
+    assert pipe.transformer.a.weight.dtype == torch.bfloat16
+
+
+def test_uses_int4_finds_4bit_specs_anywhere_in_a_config() -> None:
+    assert _uses_int4(PRESETS["4bit"]["config"])
+    assert _uses_int4(PRESETS["4bit-asym"]["config"])
+    assert not _uses_int4(PRESETS["8bit"]["config"])
+    mixed = PRESETS["t8bit-te4bit-asym"]["component_configs"]
+    assert _uses_int4(mixed["text_encoder"]) and not _uses_int4(mixed["transformer"])
+    nested = {
+        "module_type_configs": {"x.Linear": {"op_state_spec": {"weight": {"dtype": "uint4"}}}}
+    }
+    assert _uses_int4(nested)
+
+
+def test_int4_from_bf16_is_rejected_before_export() -> None:
+    """It would export fine and abort at runtime: ``scale should be half or float``."""
+    with pytest.raises(ValueError, match="text_encoder: INT4 weights quantized from bfloat16"):
+        _check_quantization_precision(
+            _int4_config(), _TwoLinears().to(torch.bfloat16), "text_encoder"
+        )
+
+
+@pytest.mark.parametrize(
+    ("preset", "dtype"),
+    [
+        ("4bit", torch.float16),
+        ("4bit", torch.float32),
+        ("8bit", torch.bfloat16),
+        ("none", torch.bfloat16),
+    ],
+)
+def test_supported_precisions_pass_the_check(preset: str, dtype: torch.dtype) -> None:
+    _check_quantization_precision(PRESETS[preset]["config"], _TwoLinears().to(dtype), "transformer")
+
+
+def test_mixed_preset_passes_the_check_on_a_bf16_pipeline() -> None:
+    """Sana exports in bf16: the preset's fp16 text encoder is what makes its int4 legal."""
+    pipe = SimpleNamespace(
+        text_encoder=_TwoLinears().to(torch.bfloat16), transformer=_TwoLinears().to(torch.bfloat16)
+    )
+    configs = _resolve_compression("t8bit-te4bit-asym", _COMPONENTS)
+    with pytest.raises(ValueError, match="text_encoder"):
+        _check_quantization_precision(configs["text_encoder"], pipe.text_encoder, "text_encoder")
+
+    _apply_component_precision(pipe, _resolve_component_precision("t8bit-te4bit-asym", _COMPONENTS))
+    for name in ("text_encoder", "transformer"):
+        _check_quantization_precision(configs[name], getattr(pipe, name), name)
+
+
+def test_mixed_preset_keeps_the_transformer_at_int8() -> None:
+    """Int4 in the transformer visibly degrades detail and text; the text encoder tolerates it."""
+    resolved = _resolve_compression("t8bit-te4bit-asym", _COMPONENTS)
+    assert resolved["transformer"] == PRESETS["8bit"]["config"]
+    assert resolved["text_encoder"] == PRESETS["4bit-asym"]["config"]
+    assert resolved["vae"] is None
 
 
 @pytest.mark.parametrize(
@@ -177,14 +317,51 @@ def test_required_module_exclusions_are_present(fq_name: str, why: str) -> None:
 
 
 def test_resolve_compression_round_trips_preset_names() -> None:
-    assert _resolve_compression("none") is None
-    assert _resolve_compression("4bit") == PRESETS["4bit"]["config"]
+    assert _resolve_compression("none", _COMPONENTS) == dict.fromkeys(_COMPONENTS)
+    assert _resolve_compression("4bit", _COMPONENTS) == dict.fromkeys(
+        _COMPONENTS, PRESETS["4bit"]["config"]
+    )
 
 
 def test_resolve_compression_accepts_a_coreai_opt_json_config() -> None:
     """``--compression '<json>'`` takes the same shape the presets hold."""
     config = copy.deepcopy(PRESETS["4bit"]["config"])
-    assert _resolve_compression(json.dumps(config)) == config
+    assert _resolve_compression(json.dumps(config), _COMPONENTS) == dict.fromkeys(
+        _COMPONENTS, config
+    )
+
+
+def test_resolve_compression_keys_configs_by_component() -> None:
+    """Listed components get their own config; unlisted ones stay dense."""
+    int4, int8 = PRESETS["4bit"]["config"], PRESETS["8bit"]["config"]
+    value = json.dumps({"components": {"transformer": int4, "text_encoder": int8}})
+    resolved = _resolve_compression(value, _COMPONENTS)
+    assert resolved["transformer"] == int4
+    assert resolved["text_encoder"] == int8
+    assert resolved["vae"] is None
+
+
+def test_resolve_compression_rejects_an_unknown_component() -> None:
+    """A typo would otherwise leave that component dense with no warning."""
+    value = json.dumps({"components": {"transfomer": PRESETS["4bit"]["config"]}})
+    with pytest.raises(ValueError, match="transfomer"):
+        _resolve_compression(value, _COMPONENTS)
+
+
+@pytest.mark.parametrize("name", [n for n, p in PRESETS.items() if "component_configs" in p])
+def test_per_component_presets_name_real_components(name: str) -> None:
+    """Every mixed preset only names components the pipelines actually have."""
+    _resolve_compression(name, _COMPONENTS)
+
+
+def test_pipeline_component_name_is_found_by_identity() -> None:
+    """All FLUX.2 transformer variants wrap the one ``transformer``, so they share its config."""
+    transformer, text_encoder = _TwoLinears(), _TwoLinears()
+    pipe = SimpleNamespace(components={"transformer": transformer, "text_encoder": text_encoder})
+    assert _pipeline_component_name(pipe, _ModelWrapper(transformer).model) == "transformer"
+    assert _pipeline_component_name(pipe, text_encoder) == "text_encoder"
+    with pytest.raises(ValueError, match="not a component"):
+        _pipeline_component_name(pipe, _TwoLinears())
 
 
 # ---------------------------------------------------------------------------
@@ -329,7 +506,51 @@ def test_exclusions_are_keyed_by_importable_class_paths() -> None:
     """A typo in a fully-qualified name would be a silent no-op, so check that each resolves."""
     import importlib
 
-    for fq_name in _MODULE_TYPE_EXCLUSIONS:
+    for fq_name in (*_MODULE_TYPE_EXCLUSIONS, *_EMBEDDING_SUBCLASSES):
         module_name, _, class_name = fq_name.rpartition(".")
         module = importlib.import_module(module_name)
         assert hasattr(module, class_name), fq_name
+
+
+class _Embed(nn.Module):
+    def __init__(self, embedding: nn.Embedding) -> None:
+        super().__init__()
+        self.embed_tokens = embedding
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.embed_tokens(input_ids)
+
+
+def _gemma2_embedding() -> nn.Embedding:
+    from transformers.models.gemma2.modeling_gemma2 import Gemma2TextScaledWordEmbedding
+
+    return Gemma2TextScaledWordEmbedding(1000, 256, 0, embed_scale=16.0)
+
+
+def _quantize_embedding(model: nn.Module, config: dict) -> None:
+    ids = torch.randint(0, 1000, (1, 16))
+    quantize_pytorch_model(model, (ids,), None, copy.deepcopy(config), 0, ())
+
+
+def test_embedding_subclass_raises_without_the_override() -> None:
+    """coreai-opt defaults the axis by exact type, so Sana's Gemma2 embedding gets none."""
+    config = {**_int4_config(), "module_type_configs": _MODULE_TYPE_EXCLUSIONS}
+    with pytest.raises(ValueError, match="unresolved axis"):
+        _quantize_embedding(_Embed(_gemma2_embedding()).eval(), config)
+
+
+@pytest.mark.parametrize(
+    ("name", "scale_shape"), [("4bit", (1000, 8)), ("4bit-asym", (1000, 8)), ("8bit", (1000, 1))]
+)
+def test_embedding_subclass_matches_the_base_class_default(name: str, scale_shape: tuple) -> None:
+    """The override reproduces what coreai-opt picks for a plain ``nn.Embedding``."""
+    subclass = _Embed(_gemma2_embedding()).eval()
+    base = _Embed(nn.Embedding(1000, 256)).eval()
+    base.embed_tokens.weight.data.copy_(subclass.embed_tokens.weight.data)
+
+    _quantize_embedding(subclass, PRESETS[name]["config"])
+    _quantize_embedding(base, PRESETS[name]["config"])
+
+    scale = subclass.embed_tokens.parametrizations["weight"][0].scale
+    assert tuple(scale.shape) == scale_shape
+    assert torch.equal(scale, base.embed_tokens.parametrizations["weight"][0].scale)

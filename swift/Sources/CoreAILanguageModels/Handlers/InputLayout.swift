@@ -11,6 +11,9 @@ public struct InputLayout: Sendable {
     public let positionIdsName: String
     public let logitsName: String
 
+    /// Name of the additive attention-mask input, or `nil` when the graph applies its own causal mask.
+    public let attnMaskName: String?
+
     public let queryPolicy: QueryPolicy
     public let logitsPolicy: LogitsPolicy
     public let positionPolicy: PositionPolicy
@@ -57,7 +60,7 @@ extension InputLayout {
             from: descriptor.inputNames,
             candidates: knownInputIdNames,
             label: "input_ids")
-        let logitsName = descriptor.outputNames[0]
+        let logitsName = resolveLogitsName(from: descriptor.outputNames)
 
         let inputIdsSeqLen: Int?
         if case .ndArray(let desc) = descriptor.inputDescriptor(of: inputIdsName),
@@ -109,7 +112,9 @@ extension InputLayout {
             from: inputNames, candidates: knownInputIdNames, label: "input_ids")
         let positionIdsName = try resolveRequired(
             from: inputNames, candidates: knownPositionIdNames, label: "position_ids")
-        let logitsName = outputNames[0]
+        let logitsName = resolveLogitsName(from: outputNames)
+
+        let attnMaskName = knownAttnMaskNames.first(where: inputNames.contains)
 
         let queryPolicy: QueryPolicy =
             if let s = inputIdsSeqLen, s > 0 { .fixed(s) } else { .dynamic }
@@ -132,6 +137,7 @@ extension InputLayout {
             inputIdsName: inputIdsName,
             positionIdsName: positionIdsName,
             logitsName: logitsName,
+            attnMaskName: attnMaskName,
             queryPolicy: queryPolicy,
             logitsPolicy: logitsPolicy,
             positionPolicy: positionPolicy,
@@ -140,6 +146,38 @@ extension InputLayout {
 
     static let knownInputIdNames = ["input_ids", "in_new_token_ids"]
     static let knownPositionIdNames = ["position_ids", "pos_ids"]
+    static let knownAttnMaskNames = ["attn_mask"]
+    static let knownLogitsNames = ["logits"]
+    static let knownEmbeddingsInputNames = ["inputs_embeds", "in_embeddings"]
+
+    /// Resolve an embeddings-input decoder's two inputs (vision-language models): by name when
+    /// the export uses a known one, otherwise by position, embeddings first.
+    static func resolveEmbeddingsInputs(
+        inputNames: [String]
+    ) throws -> (embeddings: String, positionIds: String) {
+        guard inputNames.count == 2 else {
+            throw InferenceRuntimeError.invalidInputType(
+                "Embeddings-input decoder expected 2 inputs (embeddings, position_ids), "
+                    + "got \(inputNames.count): \(inputNames)")
+        }
+        let embeddings = knownEmbeddingsInputNames.first(where: inputNames.contains)
+        let positionIds = knownPositionIdNames.first(where: inputNames.contains)
+        switch (embeddings, positionIds) {
+        case (let embeddings?, let positionIds?):
+            return (embeddings, positionIds)
+        case (let embeddings?, nil):
+            return (embeddings, inputNames.first { $0 != embeddings } ?? inputNames[1])
+        case (nil, let positionIds?):
+            return (inputNames.first { $0 != positionIds } ?? inputNames[0], positionIds)
+        case (nil, nil):
+            return (inputNames[0], inputNames[1])
+        }
+    }
+
+    /// Logits output name: the first of `knownLogitsNames` present in `outputNames`, else `outputNames[0]`.
+    static func resolveLogitsName(from outputNames: [String]) -> String {
+        knownLogitsNames.first(where: outputNames.contains) ?? outputNames[0]
+    }
 
     static func resolveRequired(
         from names: [String], candidates: [String], label: String

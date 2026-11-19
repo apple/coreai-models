@@ -467,7 +467,7 @@ private func metricRow(
             ok: false)
     }
     let p = psnr(actual, ref)
-    let c = cosineSimilarity(actual, ref)
+    let c = Double(cosineSimilarity(actual, ref))
     let maxAbs = zip(actual, ref).reduce(Float(0)) { max($0, abs($1.0 - $1.1)) }
     let ok = (p.isInfinite || p >= psnrFloor) && c >= cosineFloor
     let psnrStr = p.isInfinite ? "INF" : String(format: "%.2f", p)
@@ -490,17 +490,4 @@ private func psnr(_ a: [Float], _ b: [Float]) -> Double {
     if mse == 0 { return .infinity }
     if peak == 0 { peak = 1 }
     return 10 * log10(peak * peak / mse)
-}
-
-private func cosineSimilarity(_ a: [Float], _ b: [Float]) -> Double {
-    var dot = 0.0
-    var na = 0.0
-    var nb = 0.0
-    for i in a.indices {
-        dot += Double(a[i]) * Double(b[i])
-        na += Double(a[i]) * Double(a[i])
-        nb += Double(b[i]) * Double(b[i])
-    }
-    guard na > 0 && nb > 0 else { return na == nb ? 1 : 0 }
-    return dot / (na.squareRoot() * nb.squareRoot())
 }

@@ -45,22 +45,35 @@ from coreai_models.models.base import BaseForCausalLM, TraceSpec
 
 logger = logging.getLogger(__name__)
 
+#: Batch size a *dynamic* batch graph is traced at. Must be >= 2 (torch.export specializes a
+#: size-1 dim) and strictly below the declared max, so the batch axis stays symbolic.
+_DYNAMIC_BATCH_TRACE_SIZE = 2
+
 
 def _build_reference_inputs(
     model: BaseForCausalLM,
     config,
     target_dtype: torch.dtype,
     max_context_length: int,
+    dynamic_max_batch_size: int | None = None,
 ) -> tuple[dict[str, Any], dict]:
     """Reference inputs and dynamic shapes for macOS export.
 
     Thin wrapper over the model's export-contract hooks, where the per-model variation
     lives. Returns ``(reference_inputs, dynamic_shapes)``.
+
+    ``dynamic_max_batch_size``, when set, declares a dynamic ``batch`` Dim up to that max,
+    tracing at the minimum valid size (2) so torch.export does not specialize the batch
+    axis; otherwise the model traces single-batch (the single-sequence contract).
     """
+    # Trace at the minimum valid batch for a dynamic batch dim; else single-batch.
+    trace_batch = _DYNAMIC_BATCH_TRACE_SIZE if dynamic_max_batch_size is not None else 1
     # The trace cache length only bounds peak memory, so cap it at the context it serves.
     spec = TraceSpec(
         max_context_length=max_context_length,
         cache_seq_len=min(TRACE_KV_CACHE_SEQ_LEN, max_context_length),
+        batch_size=trace_batch,
+        max_batch_size=dynamic_max_batch_size,
     )
     reference_inputs = model.build_reference_inputs(config, target_dtype, spec)
     dynamic_shapes = model.build_dynamic_shapes(config, spec)
@@ -406,6 +419,8 @@ def export_macos_model(
     if max_context_length is None:
         max_context_length = getattr(config, "max_position_embeddings", 2048)
 
+    dynamic_max_batch_size = getattr(export_config, "dynamic_max_batch_size", None)
+
     # Graph-mode quantization flattens the model into a torch.fx.GraphModule, which
     # carries none of the export-contract hooks. `externalized_model` is the eager
     # module that graph was captured from, so query the contract there.
@@ -420,7 +435,11 @@ def export_macos_model(
     )
 
     reference_inputs, dynamic_shapes = _build_reference_inputs(
-        contract_model, config, target_dtype, max_context_length
+        contract_model,
+        config,
+        target_dtype,
+        max_context_length,
+        dynamic_max_batch_size,
     )
 
     reference_inputs = _retype_inputs_to_quantized_graph(reference_inputs, model)

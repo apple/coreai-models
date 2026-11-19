@@ -31,6 +31,18 @@ struct ConstrainedGenerationSessionTests {
         }
     }
 
+    @Test("A schema with a trailing comma and a bound written 5.0 compiles, and keeps the caller's text")
+    func initMakesALenientSchemaStrict() throws {
+        let schema = #"{"type":"object","properties":{"name":{"type":"string","maxLength":5.0},},}"#
+        let session = try ConstrainedGenerationSession(
+            jsonSchema: schema,
+            vocabulary: sharedToyVocab,
+            vocabType: .raw
+        )
+        // The session cache compares `schema` with the next request's text, so it stays as written.
+        #expect(session.schema == schema)
+    }
+
     @Test func initWithTokenizerInfo() throws {
         let tokenizerInfo = TokenizerInfo(
             vocabulary: sharedToyVocab,
@@ -423,6 +435,16 @@ struct ConstrainedGenerationSessionTests {
         #expect(applied, "applyMask should return true when mask is applied")
         #expect(logits[Int(TestConstants.openBraceToken)] == 1.0, "'{' logit should be unchanged")
         #expect(logits[Int(TestConstants.closeBraceToken)] == -.infinity, "'}' logit should be -inf")
+    }
+
+    @Test("Logits past the grammar's vocabulary, as a padded output layer has, are masked too")
+    func applyMaskMasksPaddedLogits() throws {
+        var session = try createTestSession()
+        var logits = [Float](repeating: 1.0, count: sharedToyVocab.count + 3)
+        let applied = session.applyMask(to: &logits)
+        #expect(applied)
+        #expect(logits[Int(TestConstants.openBraceToken)] == 1.0, "'{' logit should be unchanged")
+        #expect(logits[sharedToyVocab.count...].allSatisfy { $0 == -.infinity }, "padded logits should be -inf")
     }
 
     @Test func applyMaskReturnsFalseWhenTerminated() throws {

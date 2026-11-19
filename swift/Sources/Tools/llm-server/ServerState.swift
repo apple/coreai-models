@@ -26,7 +26,7 @@ struct ServerConfig: Sendable {
     let supportsLogprobs: Bool
     let maxContextLength: Int
     let vocabSize: Int?
-    let additionalEosTokenIds: [Int32]
+    let additionalEosTokenIds: Set<Int32>
     let maxQueueDepth: Int
 }
 
@@ -127,8 +127,22 @@ final class ServerState: @unchecked Sendable {
     /// Stable identifier for the backend configuration, echoed on responses as
     /// `system_fingerprint`. Reproducible outputs (same `seed` + prompt) are only
     /// guaranteed while this value is unchanged; it changes when output-affecting
-    /// configuration (model, engine, context length, sampling defaults) changes.
+    /// configuration (model, engine, batch size, context length, sampling defaults) changes. The
+    /// batch size is part of it because batched decoding sums in a different order, so the same
+    /// seed can give slightly different logits.
     let systemFingerprint: String
+    /// The shared engine as a multimodal engine and the model's vision config, nil for a model that
+    /// does not accept image input. Requests with images run on it on the `.fallbackBatchOne` lane.
+    let vision: (engine: any MultimodalInferenceEngine, config: VisionConfig)?
+    /// Scheduler for the batched lane and completions scoring, and the model config for each
+    /// `SchedulerSession`. Nil when batched serving is off.
+    private let batchServing: (scheduler: BatchScheduler, modelConfig: ModelConfig)?
+    private var batchScheduler: BatchScheduler? { batchServing?.scheduler }
+
+    /// What the process holds against the device's recommendation: reported in /ready, and checked
+    /// whenever a request is granted its access, so a request that queued before the process went
+    /// past the line is refused too.
+    private let memoryGuard: DeviceMemoryGuard?
     private let _state = Mutex<InternalState>(InternalState())
 
     private struct InternalState {
@@ -138,25 +152,134 @@ final class ServerState: @unchecked Sendable {
         var prefixMisses: Int = 0
         var toolCallCounts: [String: Int] = [:]
         var totalToolCalls: Int = 0
+        // TODO: Keep image embeddings in an in-memory content-addressed store that sessions share.
+        /// Embeddings of the images of a session's last completed request.
+        var sessionImages: (sessionID: String, embeddings: [ImageKey: InputEmbeddings])? = nil
     }
 
-    init(engine: any InferenceEngine, tokenizer: any Tokenizer, config: ServerConfig) {
+    init(
+        engine: any InferenceEngine,
+        tokenizer: any Tokenizer,
+        config: ServerConfig,
+        visionConfig: VisionConfig? = nil,
+        batchServing: (scheduler: BatchScheduler, modelConfig: ModelConfig)? = nil,
+        memoryGuard: DeviceMemoryGuard? = nil
+    ) {
+        self.memoryGuard = memoryGuard
         self.engine = engine
+        if let visionConfig, let multimodal = engine as? any MultimodalInferenceEngine,
+            multimodal.acceptsMultimodalInput
+        {
+            self.vision = (multimodal, visionConfig)
+        } else {
+            self.vision = nil
+        }
         self.tokenizer = tokenizer
         self.config = config
         self.queue = RequestQueue(maxDepth: config.maxQueueDepth)
         self.toolCallDetection = detectToolCallFormat(using: tokenizer)
         self.thinkingFormat = detectThinkingFormat(using: tokenizer)
-        self.systemFingerprint = Self.makeSystemFingerprint(config: config, engine: engine)
+        self.systemFingerprint = Self.makeSystemFingerprint(
+            config: config, engine: engine, batchSize: batchServing?.scheduler.maxConcurrent ?? 1)
+        self.batchServing = batchServing
+    }
+
+    /// Token ids that end a row in the scheduler: the tokenizer's EOS id and
+    /// `config.additionalEosTokenIds`. Stop sequences are not included.
+    private var schedulerStopTokenIds: Set<Int32> {
+        var ids = Set<Int32>()
+        if let eos = tokenizer.eosTokenId { ids.insert(Int32(eos)) }
+        ids.formUnion(config.additionalEosTokenIds.map { Int32($0) })
+        return ids
+    }
+
+    /// Returns the engine for one request on `lane`. Call once per request.
+    ///
+    /// - `.batched`: a new `SchedulerSession` over the batch scheduler, or the shared engine when
+    ///   batched serving is off.
+    /// - `.fallbackBatchOne`: the shared engine. With a batch scheduler running, hold the access from
+    ///   `acquireAccess(lane:)` while using it.
+    func engineForRequest(lane: BatchServingLane) -> any InferenceEngine {
+        switch lane {
+        case .batched:
+            guard let batchServing else { return engine }
+            return SchedulerSession(
+                sink: batchServing.scheduler, config: batchServing.modelConfig,
+                stopTokenIds: schedulerStopTokenIds)
+        case .fallbackBatchOne:
+            return engine
+        }
+    }
+
+    /// Waits for and returns the access a request on `lane` holds while it uses the engine.
+    ///
+    /// - Single-slot permit from `queue`: on every lane except `.batched` with a scheduler that
+    ///   supports continuous batching.
+    /// - `ExclusiveEngineLease`: on `.fallbackBatchOne` when `batchScheduler` is set. The batch
+    ///   does not step while the lease is held.
+    ///
+    /// Throws `ServerError.queueFull` when the queue is full, `CancellationError` when the task
+    /// is cancelled while waiting for the permit, and ``MemoryRefusal`` when the process is past the
+    /// device's memory recommendation once the access is granted, having released it.
+    ///
+    /// Pass the same lane here and to `engineForRequest(lane:)`, and release the access when the
+    /// request is done:
+    ///
+    /// ```swift
+    /// let lane = BatchServingRouter.lane(hasResponseSchema: schema != nil, hasImages: hasImages)
+    /// let access = try await state.acquireAccess(lane: lane)
+    /// defer { access.release() }
+    /// let engine = state.engineForRequest(lane: lane)
+    /// ```
+    func acquireAccess(lane: BatchServingLane) async throws -> RequestAccess {
+        let permit = needsServerPermit(lane: lane) ? try await queue.acquire() : nil
+        let lease = lane == .fallbackBatchOne ? await batchScheduler?.acquireExclusiveAccess() : nil
+        return try admittedForMemory(RequestAccess(permit: permit, lease: lease))
+    }
+
+    /// Scheduler that scores completion prompts in batches, or nil when batched serving is off.
+    var scoringScheduler: BatchScheduler? { batchScheduler }
+
+    /// Waits for and returns the single-slot permit for a scoring request, with no engine lease.
+    /// Throws `ServerError.queueFull` when the queue is full, `CancellationError` when the task
+    /// is cancelled while waiting, and ``MemoryRefusal`` as ``acquireAccess(lane:)`` does.
+    func acquireScoringAccess() async throws -> RequestAccess {
+        try admittedForMemory(RequestAccess(permit: try await queue.acquire(), lease: nil))
+    }
+
+    /// `access`, unless the process is past the device's memory recommendation: then releases it and
+    /// throws ``MemoryRefusal``. The engine's prefix cache goes first, since it is only a cache.
+    private func admittedForMemory(_ access: RequestAccess) throws -> RequestAccess {
+        guard var reason = memoryGuard?.refusalReason() else { return access }
+        if engine.shedPrefixCache() > 0 {
+            guard let still = memoryGuard?.refusalReason() else { return access }
+            reason = still
+        }
+        access.release()
+        throw MemoryRefusal(reason: reason)
+    }
+
+    /// True when a request on `lane` needs the single-slot permit: every lane except `.batched`
+    /// with a scheduler that supports continuous batching.
+    private func needsServerPermit(lane: BatchServingLane) -> Bool {
+        switch lane {
+        case .batched:
+            return !(batchScheduler?.supportsContinuousBatching ?? false)
+        case .fallbackBatchOne:
+            return true
+        }
     }
 
     /// Deterministic FNV-1a hash of a canonical config descriptor. Deterministic (not
     /// Swift's per-process-seeded `Hasher`) so two identical launches produce the same
     /// fingerprint and a config change produces a different one.
-    private static func makeSystemFingerprint(config: ServerConfig, engine: any InferenceEngine) -> String {
+    private static func makeSystemFingerprint(
+        config: ServerConfig, engine: any InferenceEngine, batchSize: Int
+    ) -> String {
         let descriptor = [
             config.modelName,
             String(describing: type(of: engine)),
+            "batch=\(batchSize)",
             "ctx=\(config.maxContextLength)",
             "t=\(config.defaultTemperature)",
             "k=\(config.defaultTopK.map { "\($0)" } ?? "nil")",
@@ -172,6 +295,9 @@ final class ServerState: @unchecked Sendable {
     }
 
     var supportsToolCalling: Bool { toolCallDetection != nil }
+
+    /// Input modalities the model accepts besides text.
+    var modalities: Modalities { Modalities(vision: vision != nil) }
 
     func makeToolCallParser() -> ToolCallParser? {
         guard let detection = toolCallDetection else { return nil }
@@ -229,6 +355,23 @@ final class ServerState: @unchecked Sendable {
         _state.withLock { $0.lastPromptTokens = tokens }
     }
 
+    /// Image embeddings cached for `sessionID`; empty for a request with no session ID or of
+    /// another session, whose embeddings this drops.
+    func cachedImageEmbeddings(sessionID: String?) -> [ImageKey: InputEmbeddings] {
+        _state.withLock { s in
+            guard let sessionID, s.sessionImages?.sessionID == sessionID else {
+                s.sessionImages = nil
+                return [:]
+            }
+            return s.sessionImages?.embeddings ?? [:]
+        }
+    }
+
+    /// Replaces the cached image embeddings with those of `sessionID`'s completed request.
+    func recordImageEmbeddings(_ embeddings: [ImageKey: InputEmbeddings], sessionID: String?) {
+        _state.withLock { $0.sessionImages = sessionID.map { ($0, embeddings) } }
+    }
+
     /// Record tool calls made in a response.
     func recordToolCalls(_ names: [String]) {
         _state.withLock { s in
@@ -261,14 +404,32 @@ final class ServerState: @unchecked Sendable {
         case reuse(prefixLength: Int)
     }
 
+    /// Memory held by the single-request and batch sessions, or nil when the engine keeps no session
+    /// the server can size.
+    private func estimatedMemory() -> ReadyResponse.EstimatedMemory? {
+        let single = (engine as? CoreAISequentialEngine)?.estimatedSessionBytes
+        let batch = batchScheduler?.estimatedSessionBytes
+        guard single != nil || batch != nil else { return nil }
+        let megabyte = 1024.0 * 1024.0
+        return ReadyResponse.EstimatedMemory(
+            kvCacheMB: Double(single?.states ?? 0) / megabyte,
+            batchKVCacheMB: batch.map { Double($0.states) / megabyte },
+            logitsScratchMB: Double((single?.logitsScratch ?? 0) + (batch?.logitsScratch ?? 0)) / megabyte)
+    }
+
     /// Readiness snapshot for /ready endpoint.
+    ///
+    /// `status` is `"refusing"` while new requests get 503 for memory, `"ready"` otherwise;
+    /// `deviceMemory` reports the figures and the refusal from one measurement.
     func readySnapshot() -> ReadyResponse {
-        let busy = queue.isActive
+        let memory = memoryGuard?.check()
+        let occupancy = batchScheduler?.occupancy
+        let busy = queue.isActive || (occupancy?.active ?? 0) > 0
         let usedTokens = engine.processedTokenCount
         let maxTokens = config.maxContextLength
         let utilization = maxTokens > 0 ? Double(usedTokens) / Double(maxTokens) : 0
         return ReadyResponse(
-            status: "ready",
+            status: memory?.refusal == nil ? "ready" : "refusing",
             model: config.modelName,
             maxContextLength: maxTokens,
             busy: busy,
@@ -277,10 +438,28 @@ final class ServerState: @unchecked Sendable {
                 maxTokens: maxTokens,
                 utilization: utilization
             ),
-            toolCalling: supportsToolCalling
+            toolCalling: supportsToolCalling,
+            modalities: modalities,
+            estimatedMemory: estimatedMemory(),
+            deviceMemory: memory.map { memory in
+                let megabyte = 1024.0 * 1024.0
+                return .init(
+                    metalAllocatedMB: Double(memory.snapshot.allocated) / megabyte,
+                    recommendedMB: Double(memory.snapshot.recommended) / megabyte,
+                    footprintMB: Double(memory.snapshot.footprint) / megabyte,
+                    mappedMB: Double(memory.snapshot.mapped) / megabyte,
+                    refusing: memory.refusal)
+            },
+            batching: batchScheduler.map { scheduler in
+                .init(
+                    concurrentRequests: scheduler.maxConcurrent, active: occupancy?.active ?? 0,
+                    queued: occupancy?.queued ?? 0)
+            }
         )
     }
 
+    /// Request values over server defaults. Throws `ServerError.badRequest` on the first out-of-range
+    /// value; temperature 0 is greedy, which ignores the rest.
     func makeSamplingConfig(
         temperature: Double?,
         topP: Double?,
@@ -290,7 +469,7 @@ final class ServerState: @unchecked Sendable {
         frequencyPenalty: Double? = nil,
         presencePenalty: Double? = nil,
         logitBias: [Int32: Float]? = nil
-    ) -> SamplingConfiguration {
+    ) throws -> SamplingConfiguration {
         let temp = temperature ?? config.defaultTemperature
         let hasAdditiveProcessing =
             (frequencyPenalty ?? 0) != 0 || (presencePenalty ?? 0) != 0 || !(logitBias?.isEmpty ?? true)
@@ -298,6 +477,11 @@ final class ServerState: @unchecked Sendable {
             // Greedy: additive penalties and the logit bias still shift the argmax, so build a
             // full temperature-0 config carrying them rather than dropping to bare `.greedy`.
             guard hasAdditiveProcessing else { return .greedy }
+            if let error = SamplingConfiguration.parameterError(
+                0, frequencyPenalty: frequencyPenalty, presencePenalty: presencePenalty)
+            {
+                throw ServerError.badRequest(error.message(naming: error.parameter.requestField))
+            }
             return SamplingConfiguration(
                 temperature: 0,
                 seed: seed,
@@ -306,16 +490,40 @@ final class ServerState: @unchecked Sendable {
                 logitBias: logitBias
             )
         }
+        let topK = topK ?? config.defaultTopK
+        let topP = topP ?? config.defaultTopP
+        let minP = minP ?? config.defaultMinP
+        if let error = SamplingConfiguration.parameterError(
+            temp, topK, topP, minP, frequencyPenalty: frequencyPenalty, presencePenalty: presencePenalty)
+        {
+            throw ServerError.badRequest(error.message(naming: error.parameter.requestField))
+        }
         return SamplingConfiguration(
             temperature: temp,
-            topK: topK ?? config.defaultTopK,
-            topP: topP ?? config.defaultTopP,
-            minP: minP ?? config.defaultMinP,
+            topK: topK,
+            topP: topP,
+            minP: minP,
             seed: seed,
             frequencyPenalty: frequencyPenalty,
             presencePenalty: presencePenalty,
             logitBias: logitBias
         )
+    }
+}
+
+extension SamplingParameterError.Parameter {
+    /// The OpenAI request field that carries this parameter.
+    fileprivate var requestField: String {
+        switch self {
+        case .temperature: "temperature"
+        case .topK: "top_k"
+        case .topP: "top_p"
+        case .minP: "min_p"
+        case .repetitionPenalty: "repetition_penalty"
+        case .repetitionPenaltyWindow: "repetition_penalty_window"
+        case .frequencyPenalty: "frequency_penalty"
+        case .presencePenalty: "presence_penalty"
+        }
     }
 }
 
@@ -330,5 +538,29 @@ enum RequestID {
             return val
         }
         return "coreai-\(n)"
+    }
+}
+
+/// Single-slot permit and engine lease a request holds while it uses the engine. Either can be nil.
+/// `release()` can be called more than once, and the permit and lease also release on deinit.
+/// A request refused because the process is past the device's memory recommendation. The server
+/// answers 503 `out_of_memory` with `Retry-After`; the refusal clears once the process is back under.
+struct MemoryRefusal: Error, CustomStringConvertible {
+    let reason: String
+    var description: String { reason }
+}
+
+final class RequestAccess: Sendable {
+    private let permit: QueuePermit?
+    private let lease: ExclusiveEngineLease?
+
+    init(permit: QueuePermit?, lease: ExclusiveEngineLease?) {
+        self.permit = permit
+        self.lease = lease
+    }
+
+    func release() {
+        lease?.release()
+        permit?.release()
     }
 }

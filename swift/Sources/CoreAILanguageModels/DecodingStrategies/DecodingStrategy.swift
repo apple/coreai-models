@@ -73,15 +73,23 @@ public struct StopSequences: Sendable {
         self.maxLength = sequences.map { $0.count }.max() ?? 0
     }
 
+    /// The stops that are one token each, as a JSON-schema grammar takes them: it allows them only
+    /// once the JSON is complete. Nil when there are none. A grammar cannot take longer sequences.
+    public var singleTokenStopIds: [Int32]? {
+        let ids = sequences.filter { $0.count == 1 }.map { $0[0] }
+        return ids.isEmpty ? nil : ids
+    }
+
     /// Initialize with tokenizer, automatically including EOS tokens
     /// - Parameter tokenizer: Tokenizer to extract EOS token from
     /// - Parameter additionalSequences: Optional additional stop sequences to include
     /// - Parameter additionalEosTokenIds: Optional additional single-token EOS IDs
-    ///   (e.g. from tokenizer_config.json's `additional_special_tokens`)
+    ///   (e.g. from tokenizer_config.json's `additional_special_tokens`); folded
+    ///   into `sequences` in sorted order for deterministic tie-break diagnostics
     public init(
         for tokenizer: any Tokenizer,
         additionalSequences: [[Int32]] = [],
-        additionalEosTokenIds: [Int32] = []
+        additionalEosTokenIds: Set<Int32> = []
     ) {
         var allSequences = additionalSequences
 
@@ -100,8 +108,10 @@ public struct StopSequences: Sendable {
             }
         }
 
-        // Add additional EOS token IDs (e.g. from tokenizer_config.json)
-        for token in additionalEosTokenIds {
+        // Add additional EOS token IDs (e.g. from tokenizer_config.json). Sort at
+        // this ordering boundary so the built sequence order (and thus the
+        // `.stopSequence` diagnostic on ties) is deterministic.
+        for token in additionalEosTokenIds.sorted() {
             if !existingTokens.contains(token) {
                 existingTokens.insert(token)
                 allSequences.append([token])
@@ -153,6 +163,21 @@ public struct StopSequences: Sendable {
 
 // MARK: - Decoding Strategy Protocol
 
+/// A decoded stream that reports, once it has ended, why it ended and how many tokens it took.
+///
+/// A server maps these to `finish_reason` and `usage.completion_tokens`, which it cannot infer from
+/// the results it read: a token that adds no visible text (a byte-level piece mid-character, a
+/// marker the detokenizer holds back) yields no result, and a reply cut short by a failure or a
+/// limit looks the same as one that finished.
+public protocol DecodeOutcomeReporting {
+    /// Why the stream ended: set once it returns nil or throws, nil before then.
+    var stopReason: StopReason? { get }
+
+    /// Tokens the model produced for this reply, including the one that ended it (an end-of-sequence
+    /// token or the last token of a stop sequence), which costs a forward pass like any other.
+    var tokensGenerated: Int { get }
+}
+
 /// Decoding strategies produce text + optional enrichments (logits, token IDs)
 /// from an inference engine.
 public protocol DecodingStrategy: Sendable {
@@ -168,7 +193,7 @@ public protocol DecodingStrategy: Sendable {
     ///   - tokenizer: Tokenizer for encoding/decoding
     ///   - inferenceEngine: Engine for model inference
     ///   - samplingConfiguration: Sampling parameters (temperature, topK, etc.)
-    ///   - options: Inference options (maxTokens, includeLogits)
+    ///   - options: Inference options (maxTokens, tokens, logits)
     ///   - stopSequences: Token sequences that halt generation
     /// - Returns: Stream of `GenerationResult` (text + optional logits)
     func decode(

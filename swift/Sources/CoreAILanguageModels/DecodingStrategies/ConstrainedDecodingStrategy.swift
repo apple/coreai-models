@@ -23,14 +23,23 @@ public struct ConstrainedDecodingStrategy: DecodingStrategy {
     /// Vocabulary size override. If nil, derived from tokenizer at generation time.
     private let vocabSizeOverride: Int?
 
+    /// Most whitespace characters allowed between two JSON tokens; nil when unlimited.
+    private let maxWhitespaceCount: Int?
+
     /// Initialize with a JSON schema string.
     ///
     /// - Parameters:
     ///   - jsonSchema: A valid JSON schema string that constrains output structure
     ///   - vocabSize: Optional vocabulary size override. If nil, derived from tokenizer.
-    public init(jsonSchema: String, vocabSize: Int? = nil) {
+    ///   - maxWhitespaceCount: Most whitespace characters allowed between two JSON tokens (default:
+    ///     ``ConstrainedGenerationSession/defaultMaxWhitespaceCount``), or `nil` for no limit.
+    public init(
+        jsonSchema: String, vocabSize: Int? = nil,
+        maxWhitespaceCount: Int? = ConstrainedGenerationSession.defaultMaxWhitespaceCount
+    ) {
         self.jsonSchema = jsonSchema
         self.vocabSizeOverride = vocabSize
+        self.maxWhitespaceCount = maxWhitespaceCount
     }
 
     // MARK: - DecodingStrategy conformance
@@ -53,7 +62,8 @@ public struct ConstrainedDecodingStrategy: DecodingStrategy {
             jsonSchema: jsonSchema,
             vocabSizeOverride: vocabSizeOverride,
             tokenizer: tokenizer,
-            stopSequences: stopSequences
+            stopSequences: stopSequences,
+            maxWhitespaceCount: maxWhitespaceCount
         )
         let inputTokens =
             try PromptUtils
@@ -83,7 +93,8 @@ public struct ConstrainedDecodingStrategy: DecodingStrategy {
         jsonSchema: String,
         vocabSizeOverride: Int?,
         tokenizer: any Tokenizer,
-        stopSequences: StopSequences
+        stopSequences: StopSequences,
+        maxWhitespaceCount: Int?
     ) throws -> ConstrainedGenerationSession {
         guard let vocabSize = vocabSizeOverride ?? Self.deriveVocabSize(from: tokenizer) else {
             throw InferenceRuntimeError.invalidArgument(
@@ -92,19 +103,19 @@ public struct ConstrainedDecodingStrategy: DecodingStrategy {
             )
         }
 
-        let singleTokenStops = stopSequences.sequences.filter { $0.count == 1 }.map { $0[0] }
         if stopSequences.sequences.contains(where: { $0.count > 1 }) {
             CLILogger.log(
                 "Warning: Multi-token stop sequences not supported by xgrammar, using single-token stops only",
                 component: "ConstrainedDecodingStrategy")
         }
-        let stopTokenIds: [Int32]? = singleTokenStops.isEmpty ? nil : singleTokenStops
+        let stopTokenIds = stopSequences.singleTokenStopIds
 
         let session = try ConstrainedGenerationSession(
             jsonSchema: jsonSchema,
             tokenizer: tokenizer,
             vocabSize: vocabSize,
-            stopTokenIds: stopTokenIds
+            stopTokenIds: stopTokenIds,
+            maxWhitespaceCount: maxWhitespaceCount
         )
         CLILogger.log(
             "Constrained session created (vocabSize=\(vocabSize), stopTokenIds=\(stopTokenIds ?? []))",
@@ -223,7 +234,7 @@ public struct ConstrainedDecodingStrategy: DecodingStrategy {
 
 extension ConstrainedDecodingStrategy {
     /// Async sequence of `GenerationResult` produced by `decode()`.
-    public struct ConstrainedDecodedSequence: AsyncSequence {
+    public struct ConstrainedDecodedSequence: AsyncSequence, DecodeOutcomeReporting {
         public typealias Element = GenerationResult
         public typealias Failure = Error
 
@@ -242,6 +253,10 @@ extension ConstrainedDecodingStrategy {
                 stopSequences: stopSequences
             )
         }
+
+        public var stopReason: StopReason? { prepared.outcome.stopReason }
+
+        public var tokensGenerated: Int { prepared.tokenCount.count }
     }
 }
 
@@ -251,6 +266,10 @@ extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
         var session: ConstrainedGenerationSession?
         let inputTokens: [Int32]
         let maxTokens: Int
+        /// Why the stream ended, for ``ConstrainedDecodedSequence/stopReason``.
+        let outcome = StopReasonStore()
+        /// Tokens sampled, the one that ended the reply included, for ``tokensGenerated``.
+        let tokenCount = TokenCountStore()
 
         init(
             session: consuming ConstrainedGenerationSession,
@@ -273,7 +292,7 @@ extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
         private let inferenceEngine: any InferenceEngine
         private let samplingConfiguration: SamplingConfiguration
         private let stopSequences: StopSequences
-        private let constrainedOptions = InferenceOptions(maxTokens: 1, includeLogits: true)
+        private let constrainedOptions = InferenceOptions.guided(maxTokens: 1)
 
         // Generation state, seeded eagerly from the prepared setup.
         private var session: ConstrainedGenerationSession?
@@ -283,6 +302,8 @@ extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
         private var previousDecodedText: String = ""
         private var tokenStep: Int = 0
         private var finished: Bool = false
+        private let outcome: StopReasonStore
+        private let tokenCount: TokenCountStore
 
         fileprivate init(
             prepared: ConstrainedDecodingStrategy.ConstrainedDecodedSequence.Prepared,
@@ -295,6 +316,8 @@ extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
             self.session = prepared.session.take()
             self.inputTokens = prepared.inputTokens
             self.maxTokens = prepared.maxTokens
+            self.outcome = prepared.outcome
+            self.tokenCount = prepared.tokenCount
             self.tokenizer = tokenizer
             self.inferenceEngine = inferenceEngine
             self.samplingConfiguration = samplingConfiguration
@@ -311,10 +334,12 @@ extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
 
                 guard var session = self.session.take() else {
                     finished = true
+                    outcome.setIfUnset(.error)
                     return nil
                 }
                 if session.isTerminated {
                     finished = true
+                    outcome.setIfUnset(.eos)
                     return nil
                 }
 
@@ -330,6 +355,7 @@ extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
                     )
                 } catch {
                     finished = true
+                    outcome.setIfUnset(.error)
                     // Drop session — generation failed, no further use.
                     throw error
                 }
@@ -339,20 +365,26 @@ extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
 
                 guard let bestToken = result.0, let logits = result.1 else {
                     finished = true
+                    outcome.setIfUnset(.error)
                     return nil
                 }
 
                 if stopSequences.matches(recentTokens: [bestToken]) {
+                    // Sampled, and paid for, though not part of the reply.
+                    tokenCount.set(generatedTokens.count + 1)
                     finished = true
+                    outcome.setIfUnset(.stopSequence(tokenizer.decode(tokens: [Int(bestToken)])))
                     return nil
                 }
 
                 inputTokens.append(bestToken)
                 generatedTokens.append(bestToken)
+                tokenCount.set(generatedTokens.count)
                 tokenStep += 1
 
                 if terminatedAfterAccept {
                     finished = true
+                    outcome.setIfUnset(.eos)
                     return nil
                 }
 
@@ -367,6 +399,7 @@ extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
             }
 
             finished = true
+            outcome.setIfUnset(.maxTokens)
             return nil
         }
     }

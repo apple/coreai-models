@@ -38,6 +38,8 @@ public enum SignpostCategory: String, Sendable {
     case extend = "Extend"  // Strategy layer: inter-token timing (N-1 spans)
     case decode = "Decode"  // Tokenizer: token ID → text string (N spans)
     case logitsInference = "LogitsInference"  // Engine layer: model forward pass (N spans)
+    case speculativeDraft = "SpeculativeDraft"  // Strategy layer: one drafter call of a speculative round
+    case speculativeVerify = "SpeculativeVerify"  // Strategy layer: one target verify pass, with its acceptance
     case warmup = "Warmup"
     case sample = "Sample"
     case sampleEncoding = "SampleEncoding"  // GPU sampler command buffer encoding
@@ -61,7 +63,7 @@ public enum SignpostCategory: String, Sendable {
         switch self {
         case .modelLoad, .tokenizerLoad, .warmup, .reset, .cleanup:
             return .main
-        case .prompt, .extend, .decode, .tokenization:
+        case .prompt, .extend, .decode, .tokenization, .speculativeDraft, .speculativeVerify:
             return .decoder
         case .logitsInference, .prepareStep, .cacheManagement, .sample, .sampleEncoding,
             .gatherEmbeddings, .maskBuild, .ropeBuild, .pleGather, .logitsCopy:
@@ -75,6 +77,8 @@ public enum SignpostCategory: String, Sendable {
         case .extend: return "Extend"
         case .decode: return "Decode"
         case .logitsInference: return "LogitsInference"
+        case .speculativeDraft: return "SpeculativeDraft"
+        case .speculativeVerify: return "SpeculativeVerify"
         case .warmup: return "Warmup"
         case .sample: return "Sample"
         case .sampleEncoding: return "SampleEncoding"
@@ -622,6 +626,33 @@ public struct InstrumentsProfiler {
             metadata["tokens"] = "\(tokens)"
         }
         return ProfileSpan(category: .extend, log: Self.log, metadata: metadata)
+    }
+
+    /// Runs `body` inside `span` and ends the span whether `body` returns or throws, so a caller
+    /// with several exits cannot leave one open. It runs on the caller's isolation.
+    public static func profile<T>(
+        isolation: isolated (any Actor)? = #isolation,
+        _ span: consuming ProfileSpan, _ body: () async throws -> T
+    ) async rethrows -> T {
+        do {
+            let value = try await body()
+            span.end()
+            return value
+        } catch {
+            span.end()
+            throw error
+        }
+    }
+
+    /// Begin profiling one drafter call of a speculative round, which proposes `tokens` candidates.
+    public static func beginSpeculativeDraft(tokens: Int) -> ProfileSpan {
+        ProfileSpan(category: .speculativeDraft, log: Self.log, metadata: ["tokens": "\(tokens)"])
+    }
+
+    /// Begin profiling one target verify pass of a speculative round over a block of `tokens`
+    /// (the anchor and the proposal), including the acceptance decision.
+    public static func beginSpeculativeVerify(tokens: Int) -> ProfileSpan {
+        ProfileSpan(category: .speculativeVerify, log: Self.log, metadata: ["tokens": "\(tokens)"])
     }
 
     /// Begin profiling step preparation (tensor reshape, rebind, input writes)

@@ -102,20 +102,6 @@ extension DiffusionRunner {
 
     // MARK: - Helpers
 
-    private func cosineSimilarity(_ a: [Float], _ b: [Float]) -> Float {
-        guard a.count == b.count, !a.isEmpty else { return 0 }
-        var dot: Float = 0
-        var normA: Float = 0
-        var normB: Float = 0
-        for i in 0..<a.count {
-            dot += a[i] * b[i]
-            normA += a[i] * a[i]
-            normB += b[i] * b[i]
-        }
-        let denom = sqrt(normA) * sqrt(normB)
-        return denom > 0 ? dot / denom : 0
-    }
-
     /// Widen a `[Float]` buffer into an `NDArray` of the requested scalar type.
     ///
     /// Not diffusion- or model-specific. Float targets defer to

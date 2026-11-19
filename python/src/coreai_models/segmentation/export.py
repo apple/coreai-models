@@ -353,6 +353,7 @@ def main() -> None:
                     "hf_model_id",
                     "image_size",
                     "dtype",
+                    "max_text_seq_len",
                     "output_dir",
                     "output_name",
                     "overwrite",

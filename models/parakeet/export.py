@@ -9,11 +9,11 @@
 #     "coreai-core==1.0.0b3",
 #     "coreai-torch==0.4.3",
 #     "transformers[audio]>=5.9.0,<5.10.1",
+#     "protobuf",
 # ]
 #
 # [tool.uv]
 # index-url       = "https://pypi.org/simple"
-# prerelease      = "allow"
 # index-strategy  = "unsafe-best-match"
 # override-dependencies = [
 #     "numpy>=2.3.0",
@@ -31,7 +31,7 @@ import torch
 import transformers
 from coreai.runtime import AIModelAssetMetadata
 from coreai_torch import TorchConverter, get_decomp_table
-
+from nemo_checkpoint import load_from_nemo
 
 # Parakeet TDT exports as three separate graphs because the autoregressive
 # transducer loop (encoder frame pointer + (token, duration) sampling) lives
@@ -55,6 +55,22 @@ DECODER_STEP_GRAPH = "decoder_step"
 JOINT_GRAPH = "joint"
 
 
+@dataclasses.dataclass(frozen=True)
+class ModelSource:
+    name: str
+    author: str
+    # The HF repo ships only NeMo's `.nemo` checkpoint, so it is converted at export time.
+    nemo_only: bool = False
+
+
+MODELS = {
+    "nvidia/parakeet-tdt-0.6b-v3": ModelSource(name="Parakeet-TDT v3", author="M. Sekoyan et al."),
+    "nvidia/parakeet-tdt-0.6b-v2": ModelSource(
+        name="Parakeet-TDT v2", author="NVIDIA", nemo_only=True
+    ),
+}
+
+
 class ParakeetEncoderModule(torch.nn.Module):
     """FastConformer encoder + encoder_projector linear."""
 
@@ -63,9 +79,7 @@ class ParakeetEncoderModule(torch.nn.Module):
         self._encoder = model.encoder
         self._encoder_projector = model.encoder_projector
 
-    def forward(
-        self, input_features: torch.Tensor, attention_mask: torch.Tensor
-    ) -> torch.Tensor:
+    def forward(self, input_features: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         # attention_mask is a (B, T_audio) bool mask marking real-audio frames.
         # It makes the encoder exclude padding from self-attention *and* the
         # subsampling / conformer conv modules (matching HF). Without it a
@@ -99,9 +113,7 @@ class ParakeetDecoderStepModule(torch.nn.Module):
         cell_state: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         embeddings = self._embedding(input_ids)
-        lstm_output, (new_hidden, new_cell) = self._lstm(
-            embeddings, (hidden_state, cell_state)
-        )
+        lstm_output, (new_hidden, new_cell) = self._lstm(embeddings, (hidden_state, cell_state))
         decoder_output = self._projector(lstm_output)
         return decoder_output, new_hidden, new_cell
 
@@ -155,9 +167,7 @@ def _encoder_frame_count(mel_frames: int, subsampling_factor: int) -> int:
     if mel_frames <= 0 or subsampling_factor <= 1:
         return max(0, mel_frames)
     if subsampling_factor & (subsampling_factor - 1) != 0:
-        raise ValueError(
-            f"subsampling_factor must be a power of two, got {subsampling_factor}"
-        )
+        raise ValueError(f"subsampling_factor must be a power of two, got {subsampling_factor}")
     length, factor = mel_frames, subsampling_factor
     while factor > 1:
         length = (length - 1) // 2 + 1
@@ -314,9 +324,7 @@ def _convert(
             dynamic_shapes=dynamic_shapes,
         )
     exported = exported.run_decompositions(get_decomp_table())
-    mode = (
-        TorchConverter.Mode.DEBUG if include_debug_info else TorchConverter.Mode.RELEASE
-    )
+    mode = TorchConverter.Mode.DEBUG if include_debug_info else TorchConverter.Mode.RELEASE
     converter = TorchConverter(mode=mode).add_exported_program(
         exported_program=exported,
         input_names=input_names,
@@ -364,42 +372,36 @@ def _bundle_paths(
     return bundle_dir, assets
 
 
-def _build_aimodel_metadata(graph: str) -> AIModelAssetMetadata:
+def _build_aimodel_metadata(graph: str, model_name: str) -> AIModelAssetMetadata:
     metadata = AIModelAssetMetadata()
-    metadata.author = "M. Sekoyan et al."
+    metadata.author = MODELS[model_name].author
     metadata.license = "CC-BY-4.0"
     metadata.model_description = (
-        f"Parakeet-TDT v3 ASR ({graph} subgraph). Parakeet is a FastConformer "
+        f"{MODELS[model_name].name} ASR ({graph} subgraph). Parakeet is a FastConformer "
         f"encoder paired with a Token-and-Duration Transducer decoder that "
         f"predicts (token, duration) pairs for blank-skipping greedy decoding. "
-        f"Source: https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3"
+        f"Source: https://huggingface.co/{model_name}"
     )
     metadata.creation_date = int(time.time())
     return metadata
 
 
-def _save_program(program, model_path: Path, graph: str) -> None:
+def _save_program(program, model_path: Path, graph: str, model_name: str) -> None:
     model_path.parent.mkdir(parents=True, exist_ok=True)
-    program.save_asset(model_path, _build_aimodel_metadata(graph))
+    program.save_asset(model_path, _build_aimodel_metadata(graph, model_name))
     print(f"[INFO] Saved {graph} graph to {model_path}.")
 
 
 def _prepare_bundle_dir(bundle_dir: Path, overwrite: bool) -> None:
     if bundle_dir.exists():
         if not overwrite:
-            raise FileExistsError(
-                f"{bundle_dir} already exists. Pass --overwrite to replace it."
-            )
+            raise FileExistsError(f"{bundle_dir} already exists. Pass --overwrite to replace it.")
         shutil.rmtree(bundle_dir)
     bundle_dir.mkdir(parents=True, exist_ok=True)
 
 
-def _write_processor(
-    dest: Path, processor: "transformers.ProcessorMixin", model_name: str
-) -> None:
-    print(
-        f"[INFO] Saving processor (feature extractor + tokenizer) from {model_name} to {dest}..."
-    )
+def _write_processor(dest: Path, processor: "transformers.ProcessorMixin", model_name: str) -> None:
+    print(f"[INFO] Saving processor (feature extractor + tokenizer) from {model_name} to {dest}...")
     processor.save_pretrained(str(dest))
 
 
@@ -461,9 +463,7 @@ def _streaming_encoder_inputs(
     one-frame slice error is 80 ms of audio and would drop or duplicate words at every chunk
     boundary. Costs one forward pass.
     """
-    features = _audio_features_samples(
-        processor, dtype, geometry["window_sample_count"]
-    )
+    features = _audio_features_samples(processor, dtype, geometry["window_sample_count"])
     if features.shape[1] != geometry["window_mel_frames"]:
         raise ValueError(
             f"streaming geometry mismatch: {geometry['window_sample_count']} samples "
@@ -500,6 +500,18 @@ def _log_streaming_window(geometry: dict) -> None:
     )
 
 
+def _load_model(
+    model_name: str, dtype: torch.dtype
+) -> tuple["transformers.ParakeetForTDT", "transformers.ProcessorMixin"]:
+    if MODELS[model_name].nemo_only:
+        print(f"[INFO] Converting {model_name} from its NeMo checkpoint...")
+        return load_from_nemo(model_name, dtype)
+    model = transformers.AutoModelForTDT.from_pretrained(
+        model_name, dtype=dtype, use_safetensors=True
+    )
+    return model, transformers.AutoProcessor.from_pretrained(model_name)
+
+
 def create_parakeet(
     output_dir: str,
     model_name: str,
@@ -511,9 +523,9 @@ def create_parakeet(
     window: StreamingWindowArgs | None = None,
 ):
     print(f"[INFO] Sourcing {model_name}...")
-    model = transformers.AutoModelForTDT.from_pretrained(
-        model_name, dtype=dtype, use_safetensors=True
-    )
+    # One load, threaded through: the processor sizes the window, shapes the dummy input, and
+    # ships in the bundle.
+    model, processor = _load_model(model_name, dtype)
     model.eval()
     config = model.config
     print(
@@ -521,9 +533,6 @@ def create_parakeet(
         f"decoder hidden={config.decoder_hidden_size}, vocab={config.vocab_size}, "
         f"durations={list(config.durations)}."
     )
-    # One load, threaded through: it sizes the window, shapes the dummy input, and ships in
-    # the bundle.
-    processor = transformers.AutoProcessor.from_pretrained(model_name)
 
     geometry = None
     if window is not None:
@@ -537,9 +546,7 @@ def create_parakeet(
     if geometry is not None:
         encoder_inputs = _streaming_encoder_inputs(processor, model, dtype, geometry)
     else:
-        encoder_inputs = _encoder_inputs(
-            _audio_features(processor, dtype, audio_seconds)
-        )
+        encoder_inputs = _encoder_inputs(_audio_features(processor, dtype, audio_seconds))
 
     encoder_program = _convert(
         ParakeetEncoderModule(model),
@@ -550,7 +557,7 @@ def create_parakeet(
         include_debug_info=include_debug_info,
         dynamic_shapes=_encoder_dynamic_shapes() if dynamic else None,
     )
-    _save_program(encoder_program, assets[ENCODER_GRAPH], ENCODER_GRAPH)
+    _save_program(encoder_program, assets[ENCODER_GRAPH], ENCODER_GRAPH, model_name)
 
     print(f"[INFO] Exporting {DECODER_STEP_GRAPH} graph...")
     decoder_program = _convert(
@@ -561,7 +568,7 @@ def create_parakeet(
         dtype=dtype,
         include_debug_info=include_debug_info,
     )
-    _save_program(decoder_program, assets[DECODER_STEP_GRAPH], DECODER_STEP_GRAPH)
+    _save_program(decoder_program, assets[DECODER_STEP_GRAPH], DECODER_STEP_GRAPH, model_name)
 
     print(f"[INFO] Exporting {JOINT_GRAPH} graph...")
     joint_program = _convert(
@@ -572,7 +579,7 @@ def create_parakeet(
         dtype=dtype,
         include_debug_info=include_debug_info,
     )
-    _save_program(joint_program, assets[JOINT_GRAPH], JOINT_GRAPH)
+    _save_program(joint_program, assets[JOINT_GRAPH], JOINT_GRAPH, model_name)
 
     _write_processor(bundle_dir / "processor", processor, model_name)
     _write_bundle_metadata(
@@ -593,9 +600,7 @@ _WINDOW_FLAGS = (
 _AUDIO_SECONDS_FLAG = ("--audio-seconds", "audio_seconds")
 
 
-def _warn_ignored_shape_args(
-    parser: argparse.ArgumentParser, args: argparse.Namespace
-) -> None:
+def _warn_ignored_shape_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     """Warn about window flags the chosen shape mode never reads.
 
     Each mode sizes the encoder trace a different way, and a flag belonging to
@@ -612,11 +617,7 @@ def _warn_ignored_shape_args(
         candidates = list(_WINDOW_FLAGS)
         reason = "the frame counts only apply with --streaming"
 
-    ignored = [
-        flag
-        for flag, dest in candidates
-        if getattr(args, dest) != parser.get_default(dest)
-    ]
+    ignored = [flag for flag, dest in candidates if getattr(args, dest) != parser.get_default(dest)]
     if ignored:
         print(f"[WARN] Ignoring {', '.join(ignored)} — {reason}.")
 
@@ -631,7 +632,7 @@ def main():
     )
     parser.add_argument(
         "--model",
-        choices=["nvidia/parakeet-tdt-0.6b-v3"],
+        choices=list(MODELS),
         default="nvidia/parakeet-tdt-0.6b-v3",
         help="Model variant to convert.",
     )
@@ -709,7 +710,8 @@ def main():
         "--include-debug-info",
         action="store_true",
         help="Embed debug information in the exported .aimodel for debugging a conversion. "
-        "Default: off, which embeds minimum debug information and makes the exported asset smaller.",
+        "Default: off, which embeds minimum debug information and makes the exported asset "
+        "smaller.",
     )
     args = parser.parse_args()
     _warn_ignored_shape_args(parser, args)

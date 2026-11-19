@@ -3,6 +3,7 @@
 // Use of this source code is governed by a BSD-3-clause license that can
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
+import TestUtilities
 import Testing
 import Tokenizers
 
@@ -92,5 +93,39 @@ struct VocabProbeTests {
             return
         }
         #expect(detectToolCallFormat(using: tok)?.openMarker == "<tool_call>")
+    }
+}
+
+@Suite("agenticEndOfTurnTokenId")
+struct AgenticEndOfTurnTokenIdTests {
+    @Test("agentic format with present eot returns its id")
+    func agenticReturnsId() {
+        let tok = MockTokenizer(vocab: ["<|eot|>": 7, "<|eom|>": 8, "<|message|>": 9])
+        let format = ThinkTagParser.Format.agentic(
+            selfMarker: "to=self<|message|>",
+            userMarker: "to=user<|message|>",
+            endOfMessage: "<|eom|>",
+            endOfTurn: "<|eot|>"
+        )
+        #expect(agenticEndOfTurnTokenId(thinkingFormat: format, tokenizer: tok) == 7)
+    }
+
+    @Test("non-agentic format returns nil")
+    func nonAgenticReturnsNil() {
+        let tok = MockTokenizer(vocab: ["<think>": 1, "</think>": 2])
+        let format = ThinkTagParser.Format.tagPair(open: "<think>", close: "</think>")
+        #expect(agenticEndOfTurnTokenId(thinkingFormat: format, tokenizer: tok) == nil)
+    }
+
+    @Test("agentic format with absent eot returns nil")
+    func absentEotReturnsNil() {
+        let tok = MockTokenizer(vocab: ["<|eom|>": 8, "<|message|>": 9])
+        let format = ThinkTagParser.Format.agentic(
+            selfMarker: "to=self<|message|>",
+            userMarker: "to=user<|message|>",
+            endOfMessage: "<|eom|>",
+            endOfTurn: "<|eot|>"
+        )
+        #expect(agenticEndOfTurnTokenId(thinkingFormat: format, tokenizer: tok) == nil)
     }
 }

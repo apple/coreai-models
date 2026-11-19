@@ -3,7 +3,6 @@ members = ["python"]
 
 [tool.uv]
 index-url = "https://pypi.org/simple"
-prerelease = "allow"
 index-strategy = "unsafe-best-match"
 keyring-provider = "subprocess"
 default-groups = ["dev"]
