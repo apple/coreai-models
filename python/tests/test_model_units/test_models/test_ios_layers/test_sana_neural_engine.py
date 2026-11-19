@@ -245,6 +245,38 @@ def test_gemma2_encoder_takes_an_int8_token_table() -> None:
     assert _psnr(got[:, keep], dense[:, keep]) > 25
 
 
+def test_gemma2_encoder_takes_a_4bit_preset_with_an_int4_token_table() -> None:
+    """``te4bit-tok4-tx8bit-pal``: int4 token table in blocks of 32, 4-bit convs, still encodes."""
+    from coreai_models.diffusion.pipeline import _palettize_weights, _quantize_component_weights
+    from coreai_models.diffusion.presets import PRESETS
+
+    src = _tiny_gemma2()
+    ids, mask = _tiny_gemma2_inputs(src.config.vocab_size)
+    m = SanaGemma2Encoder.from_source_model(src, ids.shape[1])
+    with torch.no_grad():
+        dense = m(ids, mask)
+    preset = PRESETS["te4bit-tok4-tx8bit-pal"]
+    _quantize_component_weights(
+        m, m, (ids, mask), preset["component_quantization"]["text_encoder"], set()
+    )
+    m = _palettize_weights(m, preset["component_palettization"]["text_encoder"], (ids, mask))
+    state = m.state_dict()
+    # int4 values in an int8 container, one scale and zero point per 32 values of a row.
+    table = state["embed_tokens.parametrizations.weight.0.quantized_data"]
+    assert table.dtype == torch.int8 and table.min() >= -8 and table.max() <= 7
+    blocks = (table.shape[0], table.shape[1] // 32)
+    assert state["embed_tokens.parametrizations.weight.0.scale"].shape == blocks
+    assert state["embed_tokens.parametrizations.weight.0.zero_point"].shape == blocks
+    convs = [n for n, mod in m.named_modules() if isinstance(mod, torch.nn.Conv2d)]
+    assert convs and all(state[f"{n}.parametrizations.weight.0.lut"].shape[-2] == 16 for n in convs)
+    with torch.no_grad():
+        got = m.half()(ids, mask).float()
+    keep = torch.cat([mask[:, :1], mask[:, -(TEXT_SEQUENCE_LENGTH - 1) :]], 1)[0].bool()
+    assert torch.isfinite(got).all()
+    # 4-bit k-means on these random Gaussian weights caps the output near 24 dB.
+    assert _psnr(got[:, keep], dense[:, keep]) > 20
+
+
 def test_transformer_palettizes_with_the_neural_engine_preset() -> None:
     """The preset palettizes the block convs and keeps the conditioning path dense."""
     from coreai_models.diffusion.pipeline import _palettize_weights

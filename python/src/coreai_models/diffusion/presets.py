@@ -96,18 +96,22 @@ def _weight_only(weight_spec: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-# 6-bit k-means palettization with one lookup table per 16 output channels. The Neural Engine
-# runs palettized weights natively; unlike int4 per-block, it keeps the graph on the Neural Engine.
-_PALETTE_6BIT_GS16 = {
-    "global_config": {
-        "op_state_spec": {
-            "weight": {
-                "n_bits": 6,
-                "granularity": {"type": "per_grouped_channel", "axis": 0, "group_size": 16},
-            }
+def _palette_gs16(n_bits: int) -> dict[str, Any]:
+    """k-means palettization with one lookup table per 16 output channels.
+
+    The Neural Engine runs palettized weights natively; unlike int4 per-block, it keeps the graph
+    on the Neural Engine.
+    """
+    granularity = {"type": "per_grouped_channel", "axis": 0, "group_size": 16}
+    return {
+        "global_config": {
+            "op_state_spec": {"weight": {"n_bits": n_bits, "granularity": granularity}}
         }
     }
-}
+
+
+_PALETTE_6BIT_GS16 = _palette_gs16(6)
+_PALETTE_4BIT_GS16 = _palette_gs16(4)
 
 # 8-bit k-means, one lookup table per tensor, for the Neural Engine transformer (SanaTransformer).
 # Its timestep/guidance conditioning (float32), caption projection and I/O projections stay
@@ -135,6 +139,23 @@ _TOKEN_TABLE_INT8 = {
         "embed_tokens": {
             "op_state_spec": {
                 "weight": {**_INT8_PER_CHANNEL, "granularity": {"type": "per_channel", "axis": 0}}
+            },
+            **_WEIGHT_ONLY,
+        }
+    },
+}
+
+# int4 in blocks of 32 along the embedding dim, as the GPU text encoder's table: one scale per
+# 2304-wide row leaves too few of int4's 16 levels for most values.
+_TOKEN_TABLE_INT4 = {
+    **_TOKEN_TABLE_INT8,
+    "module_name_configs": {
+        "embed_tokens": {
+            "op_state_spec": {
+                "weight": {
+                    **_INT4_PER_BLOCK32_ASYM,
+                    "granularity": {**_INT4_PER_BLOCK32_ASYM["granularity"], "axis": 1},
+                }
             },
             **_WEIGHT_ONLY,
         }
@@ -183,6 +204,16 @@ PRESETS: dict[str, dict[str, Any]] = {
         "component_quantization": {"text_encoder": _TOKEN_TABLE_INT8},
         "component_palettization": {
             "text_encoder": _PALETTE_6BIT_GS16,
+            "transformer": _TRANSFORMER_PALETTE_8BIT,
+        },
+    },
+    # The text encoder at the GPU bundle's bit width: about 0.7 GB smaller than te6bit-tok8.
+    "te4bit-tok4-tx8bit-pal": {
+        "description": "Neural Engine: 4-bit text encoder (k-means, group size 16) with an int4 "
+        "token table (per block of 32), 8-bit transformer (k-means, per tensor)",
+        "component_quantization": {"text_encoder": _TOKEN_TABLE_INT4},
+        "component_palettization": {
+            "text_encoder": _PALETTE_4BIT_GS16,
             "transformer": _TRANSFORMER_PALETTE_8BIT,
         },
     },
