@@ -166,7 +166,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     @Flag(
         name: .customLong("speculative"),
         help:
-            "Self-speculative decoding with the bundle's draft head (the 'drafter' component of metadata.json, added by models/gemma4/export_drafter.py --bundle). The head drafts from the target's hidden states and shared K/V, so --model must be exported with --emit-hidden-states. Greedy only; combines with --prompt-lookup and --json-schema."
+            "Self-speculative decoding with the bundle's draft head (the 'drafter' component of metadata.json, added by models/gemma4/export_drafter.py --bundle). The head drafts from the target's hidden states and shared K/V, so --model must be exported with --emit-hidden-states. Combines with --prompt-lookup and, under greedy decoding, --json-schema."
     )
     var speculative: Bool = false
 
@@ -376,7 +376,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     @Flag(
         name: .customLong("prompt-lookup"),
         help:
-            "Speculative decoding from the running context: a block whose recent tokens recur earlier proposes what followed. Alone it needs no draft model; with --draft-model, a recurring block is proposed from the context and any other from the draft model. Greedy only."
+            "Speculative decoding from the running context: a block whose recent tokens recur earlier proposes what followed. Alone it needs no draft model; with --draft-model, a recurring block is proposed from the context and any other from the draft model."
     )
     var promptLookup: Bool = false
 
@@ -486,7 +486,8 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         }
         let speculating = draftModel != nil || promptLookup || speculative
         if seed != nil && !speculating {
-            throw ValidationError("--seed applies to speculative decoding (--draft-model or --prompt-lookup)")
+            throw ValidationError(
+                "--seed applies to speculative decoding (--draft-model, --prompt-lookup or --speculative)")
         }
         if let problem = SpeculativeDecodingOptions.grammarProposalProblem(
             grammarProposalMax, speculating: speculating, hasSchema: jsonSchema != nil)
@@ -504,9 +505,8 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
                 throw ValidationError(problem)
             }
             let greedy = samplingStrategy.lowercased() == "greedy" || temperature == 0
-            if let problem = SpeculativeDecodingOptions.samplingProblem(
-                greedy: greedy, promptLookup: promptLookup, draftHead: speculative)
-                ?? SpeculativeDecodingOptions.grammarSamplingProblem(greedy: greedy, hasSchema: jsonSchema != nil)
+            if let problem = SpeculativeDecodingOptions.grammarSamplingProblem(
+                greedy: greedy, hasSchema: jsonSchema != nil)
                 ?? SpeculativeDecodingOptions.imageProblem(hasImage: imagePath != nil, hasRawTokens: rawTokens != nil)
             {
                 throw ValidationError(problem)
@@ -1332,6 +1332,10 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
 
             // End overall timing now that core inference is complete
             await PerformanceMetrics.shared.endOverallTiming()
+
+            // A reply that ends at a stop sequence leaves the engine's generation task winding down.
+            // Wait for it, so it does not release the model while the process exits (#535).
+            try? await inferenceEngine.cancel()
 
             // Extract only the generated part (remove prompt from output)
             let formattedPrompt = tokenizer.decode(tokens: promptTokens)
