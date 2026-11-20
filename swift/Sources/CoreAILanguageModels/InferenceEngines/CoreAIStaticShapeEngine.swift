@@ -107,6 +107,8 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     private var history = TokenHistory()
     public private(set) var lastPrefixHitCount: Int = 0
 
+    public var hasRecurrentState: Bool { states.rollback == .startOnly }
+
     // Track in-flight generation via token
     private let tokenBox = GenerationTokenBox()
 
@@ -214,7 +216,8 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         self.states = try StaticStateFactory.makeStateSet(
             descriptorsByContext: descriptorsByContext,
             referenceDescriptor: referenceDescriptor,
-            slidingWindow: configuration.overrides?.slidingWindow)
+            slidingWindow: configuration.overrides?.slidingWindow,
+            stateKinds: configuration.states)
 
         // Inputs: the standard filler, plus whichever optional handlers the graph asks for.
         var handlers: [any StaticInputHandler] = []
@@ -272,6 +275,24 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
                 try SlidingWindowInputHandler(
                     window: window, ringDepth: ringDepth,
                     maskDescriptors: slidingMask, stepDescriptors: slidingStep))
+        }
+
+        let deltaNetFlag = BucketedInputDescriptors.collect(
+            DeltaNetInputHandler.updateFlagInputName, from: functionsByKey)
+        let deltaNetConvStep = BucketedInputDescriptors.collect(
+            DeltaNetInputHandler.convStepInputName, from: functionsByKey)
+        let deltaNetSelector = BucketedInputDescriptors.collect(
+            DeltaNetInputHandler.seedSelectorInputName, from: functionsByKey)
+        if !deltaNetFlag.isEmpty || !deltaNetConvStep.isEmpty || !deltaNetSelector.isEmpty {
+            try DeltaNetInputHandler.validate(rollback: self.states.rollback)
+            try DeltaNetInputHandler.validate(
+                updateFlag: deltaNetFlag, convStep: deltaNetConvStep, seedSelector: deltaNetSelector)
+            CLILogger.log("Input handler: gated DeltaNet (recurrent state + conv ring)")
+            handlers.append(
+                DeltaNetInputHandler(
+                    updateFlagDescriptors: deltaNetFlag,
+                    convStepDescriptors: deltaNetConvStep,
+                    seedSelectorDescriptors: deltaNetSelector))
         }
 
         if referenceDescriptor.inputNames.contains(PerLayerEmbeddingsInputHandler.inputName) {
@@ -507,6 +528,47 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         return "\(prefix)_\(selected.contextLength)_\(selected.queryLength)"
     }
 
+    /// Whether the step at `currentPosition` with `remaining` tokens runs a prefill graph. A model
+    /// with recurrent state takes one only when its block starts at the cursor: the states it saved
+    /// (see ``prepareRecurrentStates(blockStart:tokensInBlock:batchSize:cursor:)``) are those at
+    /// the start of the last decode block, not of a wider one.
+    private func usesPrefill(remaining: Int, currentPosition: Int) throws -> Bool {
+        guard remaining > maxQueryLength else { return false }
+        guard hasRecurrentState else { return true }
+        let graphName = try forwardGraph(
+            numInputTokens: remaining, currentPosition: currentPosition, isPrefill: true)
+        return currentPosition % (try queryLength(of: graphName)) == 0
+    }
+
+    /// Readies a model's recurrent states for a block of `batchSize` slots from `blockStart`, the
+    /// first `tokensInBlock` of them tokens, with `cursor` tokens processed; returns the position
+    /// the block's new tokens start at.
+    ///
+    /// A block starts on a multiple of its query length, so it can send processed tokens again.
+    /// A recurrent state already includes them, and their K/V and conv inputs recomputed against
+    /// it would overwrite the cached values with different ones. So the states are saved before a
+    /// block that ends mid-block, and the next block from the same start restores them and
+    /// processes every one of its tokens as new, which writes the same values again. Other models
+    /// keep their states and treat the tokens before `cursor` as already processed.
+    private func prepareRecurrentStates(
+        blockStart: Int, tokensInBlock: Int, batchSize: Int, cursor: Int
+    ) throws -> Int {
+        guard hasRecurrentState, let fixed = states.fixed else { return cursor }
+        if blockStart < cursor {
+            guard fixed.checkpointPosition == blockStart else {
+                throw InferenceRuntimeError.invalidState(
+                    "a block from position \(blockStart) sends processed tokens again, but the "
+                        + "recurrent state was saved "
+                        + (fixed.checkpointPosition.map { "at \($0)" } ?? "at no position"))
+            }
+            fixed.restoreCheckpoint()
+        } else if tokensInBlock < batchSize {
+            fixed.saveCheckpoint(at: blockStart)
+        }
+        if tokensInBlock == batchSize { fixed.discardCheckpoint() }
+        return blockStart
+    }
+
     // MARK: - Generate (primary API)
 
     public func generate(
@@ -617,7 +679,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
 
         while currentPosition < totalTokenCount {
             let remaining = totalTokenCount - currentPosition
-            let usePrefill = remaining > maxQueryLength
+            let usePrefill = try usesPrefill(remaining: remaining, currentPosition: currentPosition)
             let graphName = try forwardGraph(
                 numInputTokens: remaining, currentPosition: currentPosition, isPrefill: usePrefill)
             let contextBucket = try contextLength(of: graphName)
@@ -630,6 +692,9 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
             let batchStartToken = (currentPosition / batchSize) * batchSize
             let batchEndToken = min(batchStartToken + batchSize - 1, totalTokenCount - 1)
             let tokensInBatch = batchEndToken - batchStartToken + 1
+            let newTokensFrom = try prepareRecurrentStates(
+                blockStart: batchStartToken, tokensInBlock: tokensInBatch, batchSize: batchSize,
+                cursor: currentPosition)
 
             CLILogger.log("Graph: \(graphName), batch=\(batchSize), step=\(batchStartToken), tokens=\(tokensInBatch)")
 
@@ -642,7 +707,8 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
                     batchTokens: inputTokens[batchStartToken...batchEndToken],
                     batchSize: batchSize,
                     alignedStep: batchStartToken,
-                    contextBucket: contextBucket
+                    contextBucket: contextBucket,
+                    processedTokenCount: newTokensFrom
                 )
             }
 
@@ -785,7 +851,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
 
         while processedTokenCount < total {
             let remaining = total - processedTokenCount
-            let usePrefill = remaining > maxQueryLength
+            let usePrefill = try usesPrefill(remaining: remaining, currentPosition: processedTokenCount)
             let graphName = try forwardGraph(
                 numInputTokens: remaining, currentPosition: processedTokenCount, isPrefill: usePrefill)
             let contextBucket = try contextLength(of: graphName)
@@ -805,12 +871,16 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
             let newInBatch = tokens[(processedTokenCount - captureFrom)...(batchEndToken - captureFrom)]
             let batchTokens = history.tokens[batchStartToken..<processedTokenCount] + newInBatch
 
+            let newTokensFrom = try prepareRecurrentStates(
+                blockStart: batchStartToken, tokensInBlock: tokensInBatch, batchSize: batchSize,
+                cursor: processedTokenCount)
             let inputs = try await buildInputs(
                 graphName: graphName,
                 batchTokens: batchTokens,
                 batchSize: batchSize,
                 alignedStep: batchStartToken,
-                contextBucket: contextBucket)
+                contextBucket: contextBucket,
+                processedTokenCount: newTokensFrom)
 
             let fn = try loadFunction(named: graphName)
             let desc = try functionDescriptor(for: graphName)
@@ -1033,7 +1103,8 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         batchTokens: Tokens,
         batchSize: Int,
         alignedStep: Int,
-        contextBucket: Int
+        contextBucket: Int,
+        processedTokenCount: Int
     ) async throws -> [String: NDArray] {
         let desc = try functionDescriptor(for: graphName)
 
@@ -1042,7 +1113,8 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
             alignedStep: alignedStep,
             batchSize: batchSize,
             slidingWindow: nil,
-            contextBucket: contextBucket)
+            contextBucket: contextBucket,
+            processedTokenCount: processedTokenCount)
 
         // Multimodal: HF masks image-placeholder positions to the pad token BEFORE the
         // per-layer-embedding gather (`llm_input_ids = where(image_mask, pad_token_id,
@@ -1060,7 +1132,8 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
                 alignedStep: alignedStep,
                 batchSize: batchSize,
                 slidingWindow: config.overrides?.slidingWindow,
-                contextBucket: contextBucket)
+                contextBucket: contextBucket,
+                processedTokenCount: processedTokenCount)
         } else {
             pleContext = context
         }
@@ -1165,13 +1238,18 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     }
 
     /// Rewinds to `tokenIndex` processed tokens. Throws, leaving the engine unchanged, when
-    /// the index is out of range or the sliding-window ring no longer holds the keys the
-    /// restarted forward needs.
+    /// the index is out of range or the states cannot rewind there: a start-only state set
+    /// (recurrent state) only to 0 or the current position, and a sliding-window ring only
+    /// while it still holds the keys the restarted forward needs.
     public func reset(to tokenIndex: Int) async throws {
         try Self.validateResetTarget(tokenIndex, processed: processedTokenCount)
         guard canRewind(to: tokenIndex, alignment: verifyTileWidth ?? 1) else {
+            let reason =
+                states.rollback == .startOnly
+                ? "the model's recurrent state summarizes the whole prefix"
+                : "it needs keys the sliding-window ring has overwritten"
             throw InferenceRuntimeError.invalidState(
-                "reset(to: \(tokenIndex)) needs keys the sliding-window ring has overwritten "
+                "reset(to: \(tokenIndex)) is not possible: \(reason) "
                     + "(\(processedTokenCount) tokens processed). Use reset(to: 0) and replay "
                     + "the prefix.")
         }
