@@ -76,6 +76,19 @@ class TestMutableWeightStore:
         with pytest.raises(KeyError):
             store.load({"other": torch.zeros(1)})
 
+    @pytest.mark.parametrize(
+        "value",
+        [torch.ones(1), torch.ones(4), torch.ones(4, 3), torch.ones(3, 4, dtype=torch.float64)],
+        ids=["broadcast-scalar-like", "broadcast-row", "transposed", "float64"],
+    )
+    def test_load_with_a_wrong_shape_or_dtype_is_refused(self, value: torch.Tensor) -> None:
+        store = MutableWeightStore([MutableWeight("a", (2,)), MutableWeight("w", (3, 4))])
+        with pytest.raises(ValueError, match=r"MutableWeight 'w' is \(3, 4\) torch.float32"):
+            store.load({"a": torch.ones(2), "w": value})
+        # Checked before anything is written.
+        assert torch.equal(store["a"].value(), torch.zeros(2))
+        assert torch.equal(store["w"].value(), torch.zeros(3, 4))
+
 
 class _Accumulator(nn.Module):
     """Adds its input to a mutable weight each call and returns the new total."""

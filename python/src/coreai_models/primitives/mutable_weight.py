@@ -96,7 +96,13 @@ class MutableWeight(nn.Module):
         return self.update(self.value())
 
     def update(self, new_value: Tensor) -> Tensor:
-        """Copy ``new_value`` into the weight in place and return the weight."""
+        """Copy ``new_value`` into the weight in place and return the weight.
+
+        This has ``Tensor.copy_`` semantics, so ``new_value`` is broadcast to the
+        weight's shape and cast to its dtype; ``forward`` can, for example, compute in
+        float32 and write a float16 weight. Host data loaded with
+        :meth:`MutableWeightStore.load` is checked strictly instead.
+        """
         data = cast(Tensor, self._data)
         data.copy_(new_value)
         return data
@@ -150,9 +156,20 @@ class MutableWeightStore(nn.Module):
     def load(self, snapshot: dict[str, Tensor]) -> Self:
         """Copy the values in ``snapshot`` into the weights of the same name.
 
+        Each value must have the weight's exact shape and dtype; nothing is broadcast or
+        cast. Every entry is checked before any weight is written.
+
         Raises:
             KeyError: If ``snapshot`` names a weight this store does not have.
+            ValueError: If a value's shape or dtype differs from its weight's.
         """
+        for name, value in snapshot.items():
+            spec = self[name].spec
+            if tuple(value.shape) != spec.shape or value.dtype != spec.dtype:
+                raise ValueError(
+                    f"MutableWeight {name!r} is {spec.shape} {spec.dtype}, "
+                    f"got {tuple(value.shape)} {value.dtype}"
+                )
         for name, value in snapshot.items():
             self[name].update(value)
         return self
