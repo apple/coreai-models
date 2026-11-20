@@ -65,8 +65,9 @@ class SSMStateHandler:
         """Build the one-hot that reads a block's whole conv window out of the ring.
 
         Column ``j`` selects position ``block_start - kernel_window + j`` mod ``ring_width``.
-        The block's columns are written first, so one matmul reads the whole window. Negative
-        positions read zeros on a fresh ring.
+        Read before the block is written, the last ``query_len`` columns give what the ring
+        already holds at the block's own positions. Negative positions read zeros on a fresh
+        ring.
         """
         selector = torch.zeros(1, ring_width, kernel_window + query_len, dtype=dtype)
         for j in range(kernel_window + query_len):
@@ -121,23 +122,31 @@ class SSMStateHandler:
         self._conv_state = conv_state
         self._recurrent_state = recurrent_state
 
-    def conv_update_and_fetch(
+    def conv_slot(self, delta_idx: int) -> torch.Tensor:
+        """This layer's conv ring, ``(1, conv_dim, 1, ring_width)``."""
+        assert self._conv_state is not None, "register_state before conv_slot"
+        return self._conv_state[delta_idx : delta_idx + 1]
+
+    def update_conv(
         self,
         delta_idx: int,
         conv_step: torch.IntTensor,
         values: torch.Tensor,
         num_token_updates: int,
-    ) -> torch.Tensor:
-        """Write this layer's block into the conv ring at ``conv_step``, then return the ring.
+    ) -> None:
+        """Write this layer's block into the conv ring at ``conv_step``, in place.
 
         ``conv_step`` is the block's start modulo the ring width, computed by the caller.
         ``ring_width`` is a multiple of the widest block, so this write never straddles the
         wrap and stays a single slice.
 
-        Returns the layer's ring after the write, ``(1, conv_dim, 1, ring_width)``, as a
-        one-wide slice so the result keeps the state's rank.
+        Args:
+            delta_idx: linear-attention layer index (static).
+            conv_step: ``(1,)`` int32 ring column of the block's first slot.
+            values: ``(1, conv_dim, 1, num_token_updates)``.
+            num_token_updates: block width.
         """
-        assert self._conv_state is not None, "register_state before conv_update_and_fetch"
+        assert self._conv_state is not None, "register_state before update_conv"
         torch._check_is_size(delta_idx, message="int layer index >= 0")
         torch._check(
             delta_idx < self._conv_state.size(0),
@@ -160,7 +169,7 @@ class SSMStateHandler:
                 conv_step + num_token_updates,
             ]
         )
-        return mutable_slice_update(self._conv_state, values, begin, end)[delta_idx : delta_idx + 1]
+        mutable_slice_update(self._conv_state, values, begin, end)
 
     def recurrent_slot(self, delta_idx: int) -> torch.Tensor:
         """This layer's recurrent state, ``(1, num_v_heads, head_k_dim, head_v_dim)``."""
