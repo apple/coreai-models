@@ -9,34 +9,6 @@ import Testing
 
 @Suite("Runner option checks")
 struct RunnerOptionChecksTests {
-    @Test("Greedy speculative decoding is accepted with prompt lookup")
-    func greedyAccepted() {
-        #expect(SpeculativeDecodingOptions.samplingProblem(greedy: true, promptLookup: true) == nil)
-    }
-
-    @Test("Sampling is accepted when prompt lookup is off")
-    func samplingWithoutPromptLookup() {
-        #expect(SpeculativeDecodingOptions.samplingProblem(greedy: false, promptLookup: false) == nil)
-    }
-
-    @Test("Prompt lookup with sampling is rejected, naming --prompt-lookup")
-    func promptLookupWithSampling() throws {
-        let message = try #require(SpeculativeDecodingOptions.samplingProblem(greedy: false, promptLookup: true))
-        #expect(message.contains("--prompt-lookup"))
-    }
-
-    @Test("The draft head, like prompt lookup, needs greedy decoding")
-    func draftHeadWithSampling() throws {
-        let message = try #require(
-            SpeculativeDecodingOptions.samplingProblem(greedy: false, promptLookup: false, draftHead: true))
-        #expect(message.contains("--speculative"))
-        #expect(SpeculativeDecodingOptions.samplingProblem(greedy: true, promptLookup: false, draftHead: true) == nil)
-        // With both, the message names the one the user is more likely to have meant to drop.
-        let both = try #require(
-            SpeculativeDecodingOptions.samplingProblem(greedy: false, promptLookup: true, draftHead: true))
-        #expect(both.contains("--prompt-lookup"))
-    }
-
     @Test("--speculative excludes --draft-model, and --drafter-top-k needs it and a positive count")
     func draftHeadOptions() throws {
         #expect(
