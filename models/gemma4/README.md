@@ -87,8 +87,8 @@ flat global KV cache is paired with a fixed-depth sliding-window ring, RoPE
 arrives precomputed as `rope_cos`/`rope_sin` inputs, and the INT8 Per-Layer
 Embeddings table is written as a sidecar next to the asset.
 
-The QAT checkpoint is not palettized, so `--compression` and
-`--compression-config` are refused for it, and so is `--include-vision`. Its
+The `--compression`, `--compression-config` and `--include-vision` options are not supported
+for the QAT checkpoint since we load the pre-quantized version. Its
 export keeps the quantized weights but not the activation quantization the
 checkpoint was trained with, so its accuracy can be lower than that of the
 standard checkpoint's default export. It runs like any other export.

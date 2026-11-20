@@ -122,6 +122,10 @@ def dequantize_per_tensor_meta(
 # ---------------------------------------------------------------------------
 # CoreAI-native quantized weights (bit-exact passthrough of a pre-quantized
 # checkpoint, e.g. Gemma4's "-qat-mobile-transformers" variants)
+#
+# Experimental: everything from here to the end of the module is used only by the Gemma 4 QAT
+# export, and its API may change. The per-tensor helpers above are the stable part of this
+# module that the other iOS models use.
 # ---------------------------------------------------------------------------
 
 # `torch.ops.coreai.constexpr_blockwise_shift_scale`, registered by the `custom_layers` import
