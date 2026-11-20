@@ -44,6 +44,9 @@ public struct BucketedInputDescriptors: Sendable {
     /// Every bucket's descriptor, in no particular order.
     var descriptors: Dictionary<StaticBucketKey, NDArrayDescriptor>.Values { byKey.values }
 
+    /// Every bucket's input shape.
+    var shapesByKey: [StaticBucketKey: [Int]] { byKey.mapValues(\.shape) }
+
     /// Look up the bucket's descriptor, or throw naming what was available.
     func require(_ key: StaticBucketKey, input name: String) throws -> NDArrayDescriptor {
         guard let descriptor = byKey[key] else {

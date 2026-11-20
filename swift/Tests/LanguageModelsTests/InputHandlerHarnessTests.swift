@@ -229,12 +229,15 @@ struct InputHandlerFuzzTests {
     func staticContextBuckets(batchSize: Int) {
         let tokens = ArraySlice((0..<batchSize).map { Int32($0) })
         let alignedStep = 512
+        // The block start aligns down, so the processed count can run ahead of it.
         let context = InputContext.static(
             tokens: tokens, alignedStep: alignedStep,
-            batchSize: batchSize, slidingWindow: 256, contextBucket: 2048)
+            batchSize: batchSize, slidingWindow: 256, contextBucket: 2048,
+            processedTokenCount: alignedStep + 3)
 
         #expect(context.batchSize == batchSize)
         #expect(context.alignedStep == alignedStep)
+        #expect(context.processedTokenCount == alignedStep + 3)
         #expect(context.slidingWindow == 256)
     }
 

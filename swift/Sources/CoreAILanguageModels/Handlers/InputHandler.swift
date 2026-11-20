@@ -38,16 +38,20 @@ public struct InputContext: Sendable {
     }
 
     /// For static-shape engines. Batch is fixed-size and aligned.
+    ///
+    /// `alignedStep` rounds down, so a batch can re-send tokens already processed;
+    /// `processedTokenCount` marks where new tokens start.
     public static func `static`(
         tokens: ArraySlice<Int32>,
         alignedStep: Int,
         batchSize: Int,
         slidingWindow: Int?,
-        contextBucket: Int
+        contextBucket: Int,
+        processedTokenCount: Int
     ) -> InputContext {
         InputContext(
             tokens: tokens,
-            processedTokenCount: alignedStep,
+            processedTokenCount: processedTokenCount,
             alignedStep: alignedStep,
             batchSize: batchSize,
             slidingWindow: slidingWindow,
