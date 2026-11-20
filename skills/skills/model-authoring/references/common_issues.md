@@ -214,17 +214,17 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
-## `.aimodelc` is larger than the `.aimodel`
+## `.aimodelc` can be larger than the `.aimodel`
 
-**Cause**: An `.aimodel` stores a shared weight once and keeps per-block int8. A `--preferred-compute gpu` bundle stores the weight once per function. With static shapes it also expands per-block int8 to the float size. A dynamic dimension keeps the int8 size, and per-block int4 stays small.
-**Fix**: Size the download from the compiled bundle, not from the `.aimodel`.
+**Cause**: An `.aimodel` stores a shared weight once and keeps per-block int8. An `.aimodelc` compiled with `--preferred-compute gpu` stores the weight once per function. With static shapes it also expands per-block int8 to the float size. A dynamic dimension keeps the int8 size, and per-block int4 stays small.
+**Fix**: Size the download from the compiled `.aimodelc`, not from the `.aimodel`.
 
 ```python
 from pathlib import Path
 
 
-def megabytes(bundle):  # an .aimodelc is a directory: sum its files
-    return sum(f.stat().st_size for f in Path(bundle).rglob("*") if f.is_file()) / 1e6
+def megabytes(aimodelc):  # an .aimodelc is a directory: sum its files
+    return sum(f.stat().st_size for f in Path(aimodelc).rglob("*") if f.is_file()) / 1e6
 ```
 
 ______________________________________________________________________
