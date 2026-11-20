@@ -26,8 +26,10 @@ from typing_extensions import Self
 class MutableWeightSpec:
     """The name, shape and dtype of a :class:`MutableWeight`.
 
-    ``name`` identifies the weight to the exporter and the runtime, so it must match
-    between export and runtime.
+    ``name`` is the weight's runtime state name. The exporter declares each buffer the
+    graph writes under the ``name`` of the :class:`MutableWeight` that owns it, and the
+    runner seeds, replaces and reads the weight by that name, so names must be unique
+    within a module.
     """
 
     name: str

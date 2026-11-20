@@ -164,6 +164,92 @@ class TestMutableWeightRoundTrip:
         with pytest.raises(ValueError, match=r"MutableWeight\.read\(\)"):
             self._export(_Projection(read_with_value=True), torch.randn(2, 4), "weight", tmp_path)
 
+    def test_weights_bind_by_name_whatever_the_order(self, tmp_path: Path) -> None:
+        # Registered w00, w01, w02; forward writes them in reverse; listed in a third order.
+        module = _ManyWeights(3)
+        x = torch.arange(1.0, 5.0)
+        _, path = export_mutable_weight_module(
+            module,
+            (x,),
+            input_names=["x"],
+            output_names=["y"],
+            weight_names=["w01", "w02", "w00"],
+            output_path=tmp_path / "model.aimodel",
+        )
+        init = {f"w{i:02d}": torch.full((4,), float(i + 1)) for i in range(3)}
+        with MutableWeightRunner(path, init) as runner:
+            assert sorted(runner.weight_names) == ["w00", "w01", "w02"]
+            expected = torch.stack([x * (i + 1) for i in range(3)]).numpy()
+            np.testing.assert_allclose(runner.step({"x": x})["y"], expected)
+
+    def test_weight_names_default_to_every_mutable_weight(self, tmp_path: Path) -> None:
+        module = _ManyWeights(2)
+        x = torch.arange(1.0, 5.0)
+        _, path = export_mutable_weight_module(
+            module, (x,), input_names=["x"], output_names=["y"], output_path=tmp_path / "m.aimodel"
+        )
+        init = {"w00": torch.full((4,), 2.0), "w01": torch.full((4,), 3.0)}
+        with MutableWeightRunner(path, init) as runner:
+            np.testing.assert_allclose(runner.step({"x": x})["y"], torch.stack([x * 2, x * 3]))
+
+    @pytest.mark.parametrize(
+        ("names", "message"),
+        [
+            (["w00", "w0l"], r"\['w0l'\] are not MutableWeights of the module"),
+            (["w00", "w00", "w01"], r"lists \['w00'\] more than once"),
+            (["w00"], r"writes the mutable weight\(s\) \['w01'\], not in weight_names"),
+        ],
+        ids=["misspelled", "duplicated", "incomplete"],
+    )
+    def test_weight_names_that_do_not_match_the_module_are_refused(
+        self, names: list[str], message: str, tmp_path: Path
+    ) -> None:
+        with pytest.raises(ValueError, match=message):
+            export_mutable_weight_module(
+                _ManyWeights(2),
+                (torch.ones(4),),
+                input_names=["x"],
+                output_names=["y"],
+                weight_names=names,
+                output_path=tmp_path / "model.aimodel",
+            )
+
+    def test_a_written_buffer_that_is_not_a_mutable_weight_is_refused(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match=r"buffer 'cache', which is not a MutableWeight"):
+            self._export(_WritesAPlainBuffer(), torch.ones(4), "weight", tmp_path)
+
+    def test_two_mutable_weights_with_one_name_are_refused(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match=r"share the name 'w00'"):
+            self._export(_SharedName(), torch.ones(4), "w00", tmp_path)
+
+    @pytest.mark.parametrize(
+        "init",
+        [{}, {"total": torch.zeros(4), "totl": torch.zeros(4)}, {"totl": torch.zeros(4)}],
+        ids=["missing", "extra", "misspelled"],
+    )
+    def test_weights_init_must_match_the_models_states(
+        self, init: dict[str, torch.Tensor], tmp_path: Path
+    ) -> None:
+        path = self._export(_Accumulator(), torch.ones(4), "total", tmp_path)
+        with pytest.raises(ValueError, match=r"every mutable weight of 'main', \['total'\]"):
+            MutableWeightRunner(path, init)
+
+    @pytest.mark.parametrize(
+        "value",
+        [torch.zeros(3), torch.zeros(4, dtype=torch.float16)],
+        ids=["shape", "dtype"],
+    )
+    def test_a_value_that_does_not_match_the_state_is_refused(
+        self, value: torch.Tensor, tmp_path: Path
+    ) -> None:
+        path = self._export(_Accumulator(), torch.ones(4), "total", tmp_path)
+        with pytest.raises(ValueError, match=r"'total' is \(4,\) float32"):
+            MutableWeightRunner(path, {"total": value})
+        with MutableWeightRunner(path, {"total": torch.zeros(4)}) as runner:
+            assert runner.weight_names == ("total",)
+            with pytest.raises(ValueError, match=r"'total' is \(4,\) float32"):
+                runner.set_weight("total", value)
+
 
 class _Weighted(nn.Module):
     """``x @ weight`` for one ``(n, m)`` mutable weight of a given dtype."""
@@ -177,14 +263,44 @@ class _Weighted(nn.Module):
 
 
 class _ManyWeights(nn.Module):
-    """Row ``i`` of the output is ``x * w_i``, so a weight bound to the wrong name shows."""
+    """Row ``i`` of the output is ``x * w_i``, so a weight bound to the wrong name shows.
+
+    ``forward`` writes the weights in the reverse of their registration order, so neither
+    order alone can produce the right binding.
+    """
 
     def __init__(self, count: int) -> None:
         super().__init__()
         self.store = MutableWeightStore([MutableWeight(f"w{i:02d}", (4,)) for i in range(count)])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.stack([x * weight.read() for weight in self.store.weights()])
+        rows = {weight.name: x * weight.read() for weight in reversed(self.store.weights())}
+        return torch.stack([rows[name] for name in self.store.weight_names()])
+
+
+class _WritesAPlainBuffer(nn.Module):
+    """Reads a mutable weight but writes a plain buffer, as a KV cache would."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = MutableWeight("weight", (4,))
+        self.register_buffer("cache", torch.zeros(4))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        self.cache.add_(x)
+        return x * self.weight.read()
+
+
+class _SharedName(nn.Module):
+    """Two mutable weights in different submodules with the same name."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.first = MutableWeightStore([MutableWeight("w00", (4,))])
+        self.second = MutableWeightStore([MutableWeight("w00", (4,))])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.first["w00"].read() + x * self.second["w00"].read()
 
 
 _COMPUTE_UNITS = [
@@ -251,12 +367,16 @@ class TestMutableWeightStress:
                     runner.step({"x": x})["y"], (x @ weight).numpy(), rtol=1e-3, atol=1e-3
                 )
 
-    def test_many_weights_keep_their_names(self, compute_unit: str, tmp_path: Path) -> None:
+    @pytest.mark.parametrize("order", ["registration", "reversed"])
+    def test_many_weights_keep_their_names(
+        self, compute_unit: str, order: str, tmp_path: Path
+    ) -> None:
         count = 24
         module = _ManyWeights(count)
         x = torch.arange(1.0, 5.0)
-        path = self._export(module, x, list(module.store.weight_names()), tmp_path)
         names = module.store.weight_names()
+        listed = list(names) if order == "registration" else list(reversed(names))
+        path = self._export(module, x, listed, tmp_path)
         init = {name: torch.full((4,), float(i)) for i, name in enumerate(names)}
         with MutableWeightRunner(path, init, options=self._options(compute_unit)) as runner:
             expected = torch.stack([x * i for i in range(count)]).numpy()
