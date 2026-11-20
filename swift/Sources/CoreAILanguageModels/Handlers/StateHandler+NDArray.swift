@@ -369,6 +369,23 @@ func zeroFillNDArray(_ array: inout NDArray) {
     }
 }
 
+/// Copies `source`'s elements into `destination`, an array of the same shape and scalar type.
+func copyNDArrayContents(from source: NDArray, to destination: inout NDArray) {
+    guard let width = stateElementByteWidth(source.scalarType) else {
+        preconditionFailure("Packed sub-byte scalar type for state copy: \(source.scalarType)")
+    }
+    precondition(
+        source.shape == destination.shape && source.scalarType == destination.scalarType,
+        "copyNDArrayContents between \(source.shape) and \(destination.shape)")
+    // Sized as `zeroFillNDArray` sizes the arrays it clears.
+    let byteCount = source.shape.reduce(1, *) * width
+    source.rawView().withUnsafeBytes { sourceBytes, _, _ in
+        destination.mutableRawView().withUnsafeMutableBytes { destinationBytes, _, _ in
+            destinationBytes.copyMemory(from: sourceBytes, byteCount: byteCount)
+        }
+    }
+}
+
 /// Bytes held by `array`, from its shape and element size. Packed sub-byte arrays count as 0.
 func estimatedArrayBytes(_ array: NDArray) -> Int {
     array.shape.reduce(1, *) * (stateElementByteWidth(array.scalarType) ?? 0)

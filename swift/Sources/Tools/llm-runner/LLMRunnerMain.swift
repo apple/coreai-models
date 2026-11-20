@@ -166,7 +166,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     @Flag(
         name: .customLong("speculative"),
         help:
-            "Self-speculative decoding with the bundle's draft head (the 'drafter' component of metadata.json, added by models/gemma4/export_drafter.py --bundle). The head drafts from the target's hidden states and shared K/V, so --model must be exported with --emit-hidden-states. Greedy only; combines with --prompt-lookup and --json-schema."
+            "Self-speculative decoding with the bundle's draft head (the 'drafter' component of metadata.json, added by models/gemma4/export_drafter.py --bundle). The head drafts from the target's hidden states and shared K/V, so --model must be exported with --emit-hidden-states. Combines with --prompt-lookup and, under greedy decoding, --json-schema."
     )
     var speculative: Bool = false
 
@@ -213,6 +213,13 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         help: "Additional stop tokens that will halt generation. Can be specified multiple times."
     )
     var stopTokens: [String] = []
+
+    @Flag(
+        name: .customLong("ignore-eos"),
+        help:
+            "Disable all stop sequences (incl. EOS / end-of-turn) so generation always runs the full --max-tokens. For benchmarking decode throughput."
+    )
+    var ignoreEos: Bool = false
 
     @Option(help: "Save logits to JSON file (path to output file)")
     var saveLogits: String?
@@ -370,7 +377,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     @Flag(
         name: .customLong("prompt-lookup"),
         help:
-            "Speculative decoding from the running context: a block whose recent tokens recur earlier proposes what followed. Alone it needs no draft model; with --draft-model, a recurring block is proposed from the context and any other from the draft model. Greedy only."
+            "Speculative decoding from the running context: a block whose recent tokens recur earlier proposes what followed. Alone it needs no draft model; with --draft-model, a recurring block is proposed from the context and any other from the draft model."
     )
     var promptLookup: Bool = false
 
@@ -454,6 +461,27 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         if repetitionPenaltyWindow != nil && repetitionPenalty == nil {
             throw ValidationError("--repetition-penalty-window requires --repetition-penalty")
         }
+        if ignoreEos {
+            // --ignore-eos only reaches plain text generation; every other path keeps its stops.
+            let conflicting = [
+                jsonSchema != nil ? "--json-schema" : nil,
+                imagePath != nil ? "--image" : nil,
+                videoPath != nil ? "--video" : nil,
+                promptList != nil ? "--prompt-list" : nil,
+                batchPrototypeRows != nil ? "--batch-prototype" : nil,
+                draftModel != nil ? "--draft-model" : nil,
+                promptLookup ? "--prompt-lookup" : nil,
+                speculative ? "--speculative" : nil,
+                continuation != nil ? "--continuation" : nil,
+                rawContinuation != nil ? "--raw-continuation" : nil,
+                stopTokens.isEmpty ? nil : "--stop-tokens",
+            ].compactMap { $0 }
+            if !conflicting.isEmpty {
+                throw ValidationError(
+                    "--ignore-eos applies to plain text generation only; it cannot be used with "
+                        + conflicting.joined(separator: ", "))
+            }
+        }
         if repetitionPenalty != nil && jsonSchema != nil {
             throw ValidationError(
                 "--repetition-penalty cannot be used with --json-schema"
@@ -483,7 +511,8 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         }
         let speculating = draftModel != nil || promptLookup || speculative
         if seed != nil && !speculating {
-            throw ValidationError("--seed applies to speculative decoding (--draft-model or --prompt-lookup)")
+            throw ValidationError(
+                "--seed applies to speculative decoding (--draft-model, --prompt-lookup or --speculative)")
         }
         if let problem = SpeculativeDecodingOptions.grammarProposalProblem(
             grammarProposalMax, speculating: speculating, hasSchema: jsonSchema != nil)
@@ -501,9 +530,8 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
                 throw ValidationError(problem)
             }
             let greedy = samplingStrategy.lowercased() == "greedy" || temperature == 0
-            if let problem = SpeculativeDecodingOptions.samplingProblem(
-                greedy: greedy, promptLookup: promptLookup, draftHead: speculative)
-                ?? SpeculativeDecodingOptions.grammarSamplingProblem(greedy: greedy, hasSchema: jsonSchema != nil)
+            if let problem = SpeculativeDecodingOptions.grammarSamplingProblem(
+                greedy: greedy, hasSchema: jsonSchema != nil)
                 ?? SpeculativeDecodingOptions.imageProblem(hasImage: imagePath != nil, hasRawTokens: rawTokens != nil)
             {
                 throw ValidationError(problem)
@@ -1291,11 +1319,14 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             let decodingID = InstrumentsProfiler.beginDecoding(strategy: "vanilla")
 
             // Encode stop tokens to sequences
-            let stopSequences = try validateAndEncodeStopTokens(
-                stopTokens: stopTokens,
-                tokenizer: tokenizer,
-                additionalEosTokenIds: additionalEosTokenIds
-            )
+            let stopSequences =
+                ignoreEos
+                ? StopSequences(sequences: [])
+                : try validateAndEncodeStopTokens(
+                    stopTokens: stopTokens,
+                    tokenizer: tokenizer,
+                    additionalEosTokenIds: additionalEosTokenIds
+                )
 
             // Check if logits are requested
             let needsLogits = saveLogits != nil || printLogits

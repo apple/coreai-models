@@ -199,10 +199,10 @@ AIModelAsset.load("outputModel.aimodel").update_metadata(
 | Proposals come from        | Flag                     | Notes                                                                                                                                              |
 |----------------------------|--------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------|
 | A separate draft model     | `--draft-model <bundle>` | Shares the tokenizer and vocabulary with `--model`. Greedy or sampling.                                                                            |
-| The running context        | `--prompt-lookup`        | Needs no extra model; a block whose recent tokens recur earlier proposes what followed. Helps when the output copies from the prompt. Greedy only. |
-| A draft head in the bundle | `--speculative`          | Gemma 4; see [its README](gemma4/README.md#draft-head-speculative-decoding). Greedy only.                                                          |
+| The running context        | `--prompt-lookup`        | Needs no extra model; a block whose recent tokens recur earlier proposes what followed. Helps when the output copies from the prompt.             |
+| A draft head in the bundle | `--speculative`          | Gemma 4; see [its README](gemma4/README.md#draft-head-speculative-decoding).                                                                      |
 
-With greedy decoding (`--sampling-strategy greedy` or `--temperature 0`) the output is token for token what the target produces alone. With `--draft-model` and temperature sampling, the output follows the target's distribution (the accept/reject scheme of [Chen et al. 2023](https://arxiv.org/abs/2302.01318)), and `--seed` makes a run reproducible. `--prompt-lookup` and `--speculative` supply no draft distribution, so they stop with a message unless decoding is greedy.
+With greedy decoding (`--sampling-strategy greedy` or `--temperature 0`) the output is token for token what the target produces alone. With temperature sampling the output follows the target's distribution (the accept/reject scheme of [Chen et al. 2023](https://arxiv.org/abs/2302.01318)), and `--seed` makes a run reproducible. `--prompt-lookup` and `--speculative` propose each token with no draft distribution, which the scheme treats as a draw with all its mass on that token: it is accepted with the target's probability for it, so these drafts are accepted less often as the temperature rises. `--json-schema` with speculation still needs greedy decoding.
 
 ```bash
 # Prompt lookup, no extra model

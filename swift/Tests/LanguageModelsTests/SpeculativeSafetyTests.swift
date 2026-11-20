@@ -53,24 +53,17 @@ struct SpeculativeSafetyTests {
         return decoder
     }
 
-    @Test("Sampling with prompt lookup throws instead of trapping")
-    func samplingWithPromptLookupThrows() async {
-        let decoder = decoderWithoutDraftLogits(lookup: true)
-        await #expect(throws: InferenceRuntimeError.self) {
-            _ = try await decoder.generateSampling(
-                promptTokens: [0, 0, 0, 0, 0, 0], maxNewTokens: 8, stopTokenIds: [], temperature: 1,
-                onToken: { _ in })
-        }
-    }
-
-    @Test("Sampling with a drafter that supplies no logits throws instead of trapping")
-    func samplingWithLogitlessDrafterThrows() async {
-        let decoder = decoderWithoutDraftLogits(lookup: false)
-        await #expect(throws: InferenceRuntimeError.self) {
-            _ = try await decoder.generateSampling(
-                promptTokens: [0, 0, 0, 0, 0, 0], maxNewTokens: 8, stopTokenIds: [], temperature: 1,
-                onToken: { _ in })
-        }
+    @Test(
+        "Sampling with drafts that carry no logits (prompt lookup, a model-free drafter) runs to the limit",
+        arguments: [true, false])
+    func samplingWithoutDraftLogitsRuns(lookup: Bool) async throws {
+        let decoder = decoderWithoutDraftLogits(lookup: lookup)
+        var emitted: [Int32] = []
+        _ = try await decoder.generateSampling(
+            promptTokens: [0, 0, 0, 0, 0, 0], maxNewTokens: 8, stopTokenIds: [], temperature: 1,
+            onToken: { emitted.append($0) })
+        #expect(emitted.count == 8)
+        #expect(emitted.allSatisfy { (0..<4).contains($0) })
     }
 
     @Test("Sampling needs a positive finite temperature")
