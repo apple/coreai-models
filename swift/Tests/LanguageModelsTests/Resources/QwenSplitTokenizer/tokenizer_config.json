@@ -1,0 +1,9 @@
+{
+  "tokenizer_class": "Qwen2Tokenizer",
+  "clean_up_tokenization_spaces": false,
+  "model_max_length": 131072,
+  "bos_token": null,
+  "eos_token": null,
+  "pad_token": null,
+  "unk_token": null
+}
