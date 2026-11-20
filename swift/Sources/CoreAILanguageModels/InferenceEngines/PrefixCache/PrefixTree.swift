@@ -92,9 +92,13 @@ package struct PrefixTree: Sendable {
         var hasher = SHA256()
         hasher.update(data: Data(parent.utf8))
         Array(tokens).withUnsafeBytes { hasher.update(bufferPointer: $0) }
+        return hex(hasher.finalize())
+    }
+
+    /// `bytes` as lowercase hex.
+    package static func hex(_ bytes: some Sequence<UInt8>) -> String {
         var hex = [UInt8]()
-        hex.reserveCapacity(SHA256.byteCount * 2)
-        for byte in hasher.finalize() {
+        for byte in bytes {
             hex.append(hexDigits[Int(byte >> 4)])
             hex.append(hexDigits[Int(byte & 0x0f)])
         }
@@ -226,6 +230,12 @@ package struct PrefixTree: Sendable {
         return key
     }
 
+    /// Whether `key` is a node.
+    package func contains(_ key: Key) -> Bool { nodes[key] != nil }
+
+    /// `key`'s chunk, for a caller writing it elsewhere.
+    package func chunk(for key: Key) -> [Data]? { nodes[key]?.chunk }
+
     /// Whether `key` is a node that already holds a snapshot, so taking another is wasted.
     package func hasSnapshot(at key: Key) -> Bool {
         nodes[key]?.snapshot != nil
@@ -240,8 +250,9 @@ package struct PrefixTree: Sendable {
     package mutating func attach(snapshot: [Data], to key: Key, keepingChainTo tip: Key? = nil) -> Bool {
         guard let node = nodes[key], node.snapshot == nil else { return false }
         let size = snapshot.reduce(0) { $0 + $1.count }
-        let kept = ancestors(of: key).union(ancestors(of: tip))
-        guard makeRoom(for: size, protecting: kept) else { return false }
+        if bytesHeld + size > byteBudget {
+            guard makeRoom(for: size, protecting: ancestors(of: key).union(ancestors(of: tip))) else { return false }
+        }
         clock += 1
         nodes[key]?.snapshot = snapshot
         nodes[key]?.lastUsed = clock
@@ -249,11 +260,21 @@ package struct PrefixTree: Sendable {
         return true
     }
 
-    /// Drops every node, counting them as evicted, for a caller short of memory.
-    package mutating func removeAll() {
-        evictedNodes += nodes.count
-        nodes = [:]
-        bytesHeld = 0
+    /// Evicts least-recently-used leaves until at least `bytes` are freed, or the tree is empty, for a
+    /// caller short of memory. Returns the bytes freed.
+    @discardableResult
+    package mutating func evict(atLeast bytes: Int) -> Int {
+        var freed = 0
+        while freed < bytes {
+            let candidate = nodes.lazy.filter { $0.value.children == 0 }.min { $0.value.lastUsed < $1.value.lastUsed }
+            guard let (victim, node) = candidate else { break }
+            nodes.removeValue(forKey: victim)
+            if let parent = node.parent { nodes[parent]?.children -= 1 }
+            bytesHeld -= node.bytes
+            evictedNodes += 1
+            freed += node.bytes
+        }
+        return freed
     }
 
     // MARK: - Eviction
@@ -262,7 +283,9 @@ package struct PrefixTree: Sendable {
     ///
     /// False when they cannot fit at all.
     private mutating func makeRoom(for bytes: Int, keeping key: Key?) -> Bool {
-        makeRoom(for: bytes, protecting: ancestors(of: key))
+        // The chain above is only walked when something has to go.
+        guard bytesHeld + bytes > byteBudget else { return true }
+        return makeRoom(for: bytes, protecting: ancestors(of: key))
     }
 
     /// Evicts least-recently-used leaves until `bytes` more fit, never one in `protected`, which must
@@ -298,13 +321,11 @@ package struct PrefixTree: Sendable {
     /// One line for a log.
     package var summary: String {
         let requests = hits + misses
-        let rate = requests > 0 ? Double(hits) / Double(requests) * 100 : 0
-        return String(
-            format:
-                "%d node(s), %d snapshot(s), %.1f of %.1f GiB, %d/%d hit (%.0f%%), %d token(s) reused, "
-                + "%d replayed for want of a snapshot, %d node(s) evicted",
-            nodeCount, snapshotCount, Double(bytesHeld) / 1_073_741_824,
-            Double(byteBudget) / 1_073_741_824, hits, requests, rate, reusedTokens,
-            matchedButReplayedTokens, evictedNodes)
+        let rate = requests > 0 ? Int((Double(hits) / Double(requests) * 100).rounded()) : 0
+        let held = ByteCountFormatter.string(fromByteCount: Int64(bytesHeld), countStyle: .memory)
+        let budget = ByteCountFormatter.string(fromByteCount: Int64(byteBudget), countStyle: .memory)
+        return "\(nodeCount) node(s), \(snapshotCount) snapshot(s), \(held) of \(budget), "
+            + "\(hits)/\(requests) hit (\(rate)%), \(reusedTokens) token(s) reused, "
+            + "\(matchedButReplayedTokens) replayed for want of a snapshot, \(evictedNodes) node(s) evicted"
     }
 }

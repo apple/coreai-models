@@ -31,12 +31,15 @@ public final class FixedMTLBufferState {
             }, device: device)
     }
 
-    /// States of the given shapes, laid out densely, for a caller with no model descriptor to hand.
     package convenience init(
         dense states: [(name: String, scalarType: NDArray.ScalarType, shape: [Int])], device: MTLDevice
     ) throws {
         try self.init(
             layouts: states.map { name, type, shape in
+                guard !shape.contains(where: { $0 < 0 }) else {
+                    throw InferenceRuntimeError.invalidOutputType(
+                        "FixedMTLBufferState '\(name)' has dynamic shape \(shape)")
+                }
                 let strides = shape.indices.map { shape[($0 + 1)...].reduce(1, *) }
                 return (name, type, shape, strides, shape.reduce(1, *) * type.byteSize)
             }, device: device)
@@ -81,6 +84,11 @@ public final class FixedMTLBufferState {
 
     /// Bytes the state buffers take together, and so a copy of them all.
     package var byteCount: Int { bindings.reduce(0) { $0 + $1.buffer.length } }
+
+    /// Each state's name and the bytes a snapshot of it takes, in order.
+    package var snapshotLayout: [(name: String, bytes: Int)] {
+        bindings.map { ($0.name, $0.buffer.length) }
+    }
 
     /// Queues a copy of every state buffer, in order, into new buffers on `commandBuffer`.
     ///

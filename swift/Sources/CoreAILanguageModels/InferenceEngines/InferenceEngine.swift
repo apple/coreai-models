@@ -241,8 +241,16 @@ public protocol InferenceEngine: Sendable {
     /// pipelined engine does, and only for a model whose state it can copy. Defaults to `false`.
     var prefixCacheEnabled: Bool { get }
 
-    /// Drops what the prefix cache holds in memory, for a caller short of it, and returns the bytes
-    /// freed: zero when there is no cache, or the engine is in use. Defaults to zero.
+    /// Gives back at least `bytes` of what the prefix cache holds in memory, or all of it when it holds
+    /// less, for a caller short of memory: every pending snapshot copy first, then the least recently
+    /// used nodes. Returns the bytes freed: zero when there is no cache, or the engine is in use.
+    /// Defaults to zero.
+    ///
+    /// A disk tier keeps its copies, and a later prompt reads its own chain back into memory.
+    func shedPrefixCache(atLeast bytes: Int) -> Int
+
+    /// Gives back everything the prefix cache holds in memory: ``shedPrefixCache(atLeast:)`` with no
+    /// limit. Defaults to forwarding there.
     func shedPrefixCache() -> Int
 
     // MARK: - Configuration
@@ -322,7 +330,8 @@ public enum RollbackCapability: Sendable, Equatable {
 
 extension InferenceEngine {
     public var prefixCacheEnabled: Bool { false }
-    public func shedPrefixCache() -> Int { 0 }
+    public func shedPrefixCache(atLeast bytes: Int) -> Int { 0 }
+    public func shedPrefixCache() -> Int { shedPrefixCache(atLeast: .max) }
 }
 
 extension InferenceEngine {
