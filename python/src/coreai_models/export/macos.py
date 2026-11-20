@@ -208,6 +208,48 @@ def _rename_for_second_entrypoint(externalized_programs: list, graph: torch.fx.G
     ]
 
 
+def export_and_decompose(
+    module: torch.nn.Module,
+    args: tuple[Any, ...] = (),
+    kwargs: dict[str, Any] | None = None,
+    dynamic_shapes: dict | tuple | None = None,
+) -> torch.export.ExportedProgram:
+    """Export ``module`` to the program ``TorchConverter`` converts.
+
+    Runs ``torch.export`` under ``no_grad``, decomposes with the coreai_torch table, and
+    replaces auto-functionalized ops with their immutable variants. Buffer mutations
+    appear in ``graph_signature.buffers_to_mutate`` only after the decomposition.
+
+    Args:
+        module: The module to export.
+        args: Positional ``forward`` arguments.
+        kwargs: Keyword ``forward`` arguments.
+        dynamic_shapes: Dynamic shape specifications for ``torch.export``.
+
+    Returns:
+        The decomposed, defunctionalized ``ExportedProgram``.
+    """
+    with torch.no_grad():
+        aten_exported_program = torch.export.export(
+            module, args=args, kwargs=kwargs, dynamic_shapes=dynamic_shapes
+        )
+    exported_program = aten_exported_program.run_decompositions(coreai_torch.get_decomp_table())
+    remove_functionalization(exported_program)
+    return exported_program
+
+
+def make_torch_converter(
+    include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
+) -> coreai_torch.TorchConverter:
+    """A ``TorchConverter`` in ``DEBUG`` mode when ``include_debug_info``, else ``RELEASE``."""
+    mode = (
+        coreai_torch.TorchConverter.Mode.DEBUG
+        if include_debug_info
+        else coreai_torch.TorchConverter.Mode.RELEASE
+    )
+    return coreai_torch.TorchConverter(mode=mode)
+
+
 def export_to_coreai(
     model: torch.nn.Module,
     reference_inputs: dict[str, Any],
@@ -282,28 +324,11 @@ def export_to_coreai(
             # `reference_inputs` is insertion-ordered to match the forward signature.
             export_args = () if pass_inputs_as_kwargs else tuple(reference_inputs.values())
             export_kwargs = reference_inputs if pass_inputs_as_kwargs else None
-            with torch.no_grad():
-                aten_exported_program = torch.export.export(
-                    module,
-                    args=export_args,
-                    kwargs=export_kwargs,
-                    dynamic_shapes=dynamic_shapes,
-                )
-            coreai_decomp_table = coreai_torch.get_decomp_table()
-            coreaten_exported_program = aten_exported_program.run_decompositions(
-                coreai_decomp_table
-            )
-            remove_functionalization(coreaten_exported_program)
-            return coreaten_exported_program
+            return export_and_decompose(module, export_args, export_kwargs, dynamic_shapes)
 
         return export_fn
 
-    mode = (
-        coreai_torch.TorchConverter.Mode.DEBUG
-        if include_debug_info
-        else coreai_torch.TorchConverter.Mode.RELEASE
-    )
-    converter = coreai_torch.TorchConverter(mode=mode)
+    converter = make_torch_converter(include_debug_info)
 
     # GraphModule subclasses nn.Module, so this specific check has to come first
     if isinstance(model, torch.fx.GraphModule):
