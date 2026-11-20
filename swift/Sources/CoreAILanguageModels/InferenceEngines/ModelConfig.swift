@@ -75,9 +75,10 @@ public struct ModelConfig: InferenceConfiguration, Codable, Sendable {
     /// honored by the static-shape engine. nil for most models.
     public var overrides: LanguageOverrides?
 
-    /// Explicit state classification from the bundle's `language.states`, keyed by state
-    /// name. nil = classify by shape and name.
-    var states: [String: StateKind]?
+    /// Explicit state classification from the bundle's `language.states`. The static-shape
+    /// engine reads `fixed` states as ones it can't rewind (see ``RollbackCapability``).
+    /// nil = infer.
+    public var states: [String: StateKind]?
 
     public enum InputMode: String, Codable, Sendable {
         case random
@@ -95,7 +96,8 @@ public struct ModelConfig: InferenceConfiguration, Codable, Sendable {
         inputMode: InputMode? = nil,
         prefillChunkSize: Int? = nil,
         prefillChunkThreshold: Int? = nil,
-        overrides: LanguageOverrides? = nil
+        overrides: LanguageOverrides? = nil,
+        states: [String: StateKind]? = nil
     ) {
         self.name = name
         self.tokenizer = tokenizer
@@ -108,6 +110,7 @@ public struct ModelConfig: InferenceConfiguration, Codable, Sendable {
         self.prefillChunkSizeOverride = prefillChunkSize
         self.prefillChunkThresholdOverride = prefillChunkThreshold
         self.overrides = overrides
+        self.states = states
     }
 
     /// The engine config for a bundle's language model: identity and sizes from the
