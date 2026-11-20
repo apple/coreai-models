@@ -40,6 +40,7 @@ from coreai_models.models.ios.qwen3_5 import (  # noqa: E402
     _l2norm,
     _layer_maps,
 )
+from coreai_models.primitives.ios.cache import KVCacheHandler  # noqa: E402
 from coreai_models.primitives.ios.ssm_cache import (  # noqa: E402
     MAX_QUERY_LEN,
     SSMStateHandler,
@@ -529,51 +530,87 @@ def _block_call(model, state, ids, start, flag) -> torch.Tensor:
     return out.reshape(q, -1)
 
 
-def _engine_decode(model, state, ids, n_cached, query_len) -> torch.Tensor:
+def _engine_decode(model, state, ids, n_cached, query_len, flag_override=None) -> torch.Tensor:
     """Decode token ``n_cached`` the way the static-shape engine does: the block starts at
     ``n_cached`` aligned down to ``query_len``, re-sends the cached tail with flag 0, and
-    pads the rest with flag 0. Returns the new token's logits."""
+    pads the rest with flag 0. Returns the new token's logits.
+
+    `flag_override` exists for the mutation checks: it receives the engine's flag and the
+    new token's slot, and returns the flag to send instead.
+    """
     start = (n_cached // query_len) * query_len
     block = torch.zeros(1, query_len, dtype=torch.int32)
     block[0, : n_cached + 1 - start] = ids[0, start : n_cached + 1]
     flag = torch.zeros(query_len)
     flag[n_cached - start] = 1.0
+    if flag_override is not None:
+        flag = flag_override(flag, n_cached - start)
     return _block_call(model, state, block, start, flag)[n_cached - start]
+
+
+def _resent_slots_as_new(flag: torch.Tensor, new_slot: int) -> torch.Tensor:
+    """Mutation: mark the re-sent slots (before the new one) as new, so they write state."""
+    flag = flag.clone()
+    flag[:new_slot] = 1.0
+    return flag
+
+
+def _turn_off_kv_gate(monkeypatch) -> None:
+    """Mutation: make the K/V write ignore `update_flag`, as a broken gate in
+    `KVCacheHandler.update_and_fetch` would."""
+    write = KVCacheHandler.update_and_fetch
+
+    def ungated(self, *args, update_flag=None, **kwargs):
+        return write(self, *args, **kwargs)
+
+    monkeypatch.setattr(KVCacheHandler, "update_and_fetch", ungated)
+
+
+def _resent_state_errors(model, n_prefill=21, query_len=8):
+    """Prefill ``n_prefill`` tokens, decode one engine-style, and return the max change of
+    the K cache, the V cache and the conv ring at the re-sent positions, plus the change of
+    the K cache at the new token's position."""
+    cfg = model.config
+    ids = torch.randint(1, cfg.vocab_size, (1, n_prefill + 1), dtype=torch.int32)
+    state = _float64_state(cfg)
+    kv, v, conv, _, dims = state
+
+    # Prefill in one call: every slot is new.
+    _block_call(model, state, ids[:, :n_prefill], 0, torch.ones(n_prefill))
+    assert kv.abs().max() > 0 and conv.abs().max() > 0, "prefill wrote no state"
+    kv0, v0, conv0 = kv.clone(), v.clone(), conv.clone()
+
+    _engine_decode(model, state, ids, n_prefill, query_len)
+
+    start = (n_prefill // query_len) * query_len
+    resent = list(range(start, n_prefill))
+    cols = [p % dims["ring_width"] for p in resent]
+    kv_err = (kv[..., resent] - kv0[..., resent]).abs().max().item()
+    v_err = (v[..., resent] - v0[..., resent]).abs().max().item()
+    conv_err = max(
+        (conv[i][..., cols] - conv0[i][..., cols]).abs().max().item() for i in range(conv.shape[0])
+    )
+    new_slot_change = (kv[..., n_prefill] - kv0[..., n_prefill]).abs().max().item()
+    return kv_err, v_err, conv_err, new_slot_change
 
 
 def test_resent_slots_do_not_modify_kv_or_conv_state():
     """A q=8 decode after a 21-token prefill starts at 16 and re-sends 16..20 with flag 0.
     Those slots must leave the K/V cache and the conv ring as prefill wrote them."""
-    model = _float64_model(seed=2)
-    cfg = model.config
-
-    n_prefill, q = 21, 8
-    ids = torch.randint(1, cfg.vocab_size, (1, n_prefill + 1), dtype=torch.int32)
-    state = _float64_state(cfg)
-    kv, v, conv, _, dims = state
-
-    # Prefill 0..20 in one call: every slot is new.
-    _block_call(model, state, ids[:, :n_prefill], 0, torch.ones(n_prefill))
-    assert kv.abs().max() > 0 and conv.abs().max() > 0, "prefill wrote no state"
-    kv0, v0, conv0 = kv.clone(), v.clone(), conv.clone()
-
-    # Engine-style decode of token 21: block starts at (21 // 8) * 8 = 16.
-    _engine_decode(model, state, ids, n_prefill, q)
-
-    start = (n_prefill // q) * q
-    resent = list(range(start, n_prefill))  # 16..20
-    cols = [p % dims["ring_width"] for p in resent]
-    kv_err = (kv[..., resent] - kv0[..., resent]).abs().max().item()
-    v_err = (v[..., resent] - v0[..., resent]).abs().max().item()
-    conv_err = [
-        (conv[i][..., cols] - conv0[i][..., cols]).abs().max().item() for i in range(conv.shape[0])
-    ]
-
+    kv_err, v_err, conv_err, new_slot_change = _resent_state_errors(_float64_model(seed=2))
     assert kv_err < 1e-9, f"re-sent slots overwrote K cache (max diff {kv_err:.3e})"
     assert v_err < 1e-9, f"re-sent slots overwrote V cache (max diff {v_err:.3e})"
-    assert max(conv_err) < 1e-9, f"re-sent slots overwrote conv ring (per-layer {conv_err})"
+    assert conv_err < 1e-9, f"re-sent slots overwrote conv ring (max diff {conv_err:.3e})"
     # The new slot itself must still be written.
-    assert (kv[..., n_prefill] - kv0[..., n_prefill]).abs().max().item() > 1e-6
+    assert new_slot_change > 1e-6
+
+
+def test_ungated_kv_write_breaks_the_resent_state_check(monkeypatch):
+    """Mutation check: with the K/V gate off, re-sent slots overwrite the K and V cache, so
+    `test_resent_slots_do_not_modify_kv_or_conv_state` would fail."""
+    _turn_off_kv_gate(monkeypatch)
+    kv_err, v_err, _, _ = _resent_state_errors(_float64_model(seed=2))
+    assert kv_err > 1e-6 and v_err > 1e-6, f"K err {kv_err:.3e}, V err {v_err:.3e}"
 
 
 @pytest.fixture(scope="module")
@@ -595,6 +632,22 @@ class TestResentSlotEquivalence:
     # differently chunked delta rule and the large weights amplify to ~1e-9; the bug is ~1e-1.
     TOLERANCE = 1e-7
     DECODE_STEPS = 3
+    # A mutation must exceed the baseline error by this factor, and the tolerance as well.
+    MUTATION_RATIO = 100.0
+
+    def _one_shot_error(self, setup, n_prefill, query_len, flag_override=None):
+        """Max logit error, relative to the reference's scale, over the decode steps."""
+        model, ids, reference = setup
+        state = _float64_state(model.config)
+        _block_call(model, state, ids[:, :n_prefill], 0, torch.ones(n_prefill))
+        worst = 0.0
+        for pos in range(n_prefill, n_prefill + self.DECODE_STEPS):
+            got = _engine_decode(model, state, ids, pos, query_len, flag_override)
+            worst = max(
+                worst,
+                (got - reference[pos]).abs().max().item() / reference[pos].abs().max().item(),
+            )
+        return worst
 
     @pytest.mark.parametrize("query_len", [DECODE_QUERY_LEN, PREFILL_QUERY_LEN])
     @pytest.mark.parametrize("n_prefill", [17, 21, 23])
@@ -640,6 +693,32 @@ class TestResentSlotEquivalence:
             (rec_e, rec_s),
         ):
             assert (a - b).abs().max().item() < self.TOLERANCE * b.abs().max().item()
+
+    # -- mutation checks: prove the tolerances above catch a broken gate --
+
+    @pytest.mark.parametrize("query_len", [DECODE_QUERY_LEN, PREFILL_QUERY_LEN])
+    def test_resent_slots_flagged_new_break_one_shot_parity(self, resend_float64_setup, query_len):
+        """Mutation check: re-sent slots sent with flag 1 rewrite every state, and the
+        logit error must exceed both `TOLERANCE` and the baseline by `MUTATION_RATIO`."""
+        baseline = self._one_shot_error(resend_float64_setup, 21, query_len)
+        mutated = self._one_shot_error(
+            resend_float64_setup, 21, query_len, flag_override=_resent_slots_as_new
+        )
+        assert mutated > self.MUTATION_RATIO * self.TOLERANCE, f"mutated error {mutated:.3e}"
+        assert mutated > self.MUTATION_RATIO * baseline, f"{mutated:.3e} vs {baseline:.3e}"
+
+    @pytest.mark.parametrize("query_len", [DECODE_QUERY_LEN, PREFILL_QUERY_LEN])
+    def test_ungated_kv_write_breaks_one_shot_parity(
+        self, resend_float64_setup, query_len, monkeypatch
+    ):
+        """Mutation check for the K/V gate alone: with `update_and_fetch` ignoring
+        `update_flag`, the re-sent slots overwrite the K/V cache and the logit error must
+        exceed both `TOLERANCE` and the baseline by `MUTATION_RATIO`."""
+        baseline = self._one_shot_error(resend_float64_setup, 21, query_len)
+        _turn_off_kv_gate(monkeypatch)
+        mutated = self._one_shot_error(resend_float64_setup, 21, query_len)
+        assert mutated > self.MUTATION_RATIO * self.TOLERANCE, f"mutated error {mutated:.3e}"
+        assert mutated > self.MUTATION_RATIO * baseline, f"{mutated:.3e} vs {baseline:.3e}"
 
 
 # ---------------------------------------------------------------------------
