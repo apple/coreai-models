@@ -4,10 +4,17 @@ Google's Gemma 4 models for on-device inference via Core AI (iOS).
 
 ## Supported Models
 
-| Model                | Parameters | iOS |
-| -------------------- | ---------- | --- |
-| Gemma 4 E2B Instruct | 5.0B       | Yes (27.2+) |
-| Gemma 4 E4B Instruct | 8.0B       | Yes (27.2+) |
+| Model                | Parameters | iOS | Min. Device RAM |
+| -------------------- | ---------- | --- | --------------- |
+| Gemma 4 E2B Instruct | 5.0B       | Yes (27.2+) | 8 GB |
+| Gemma 4 E4B Instruct | 8.0B       | Yes (27.2+) | 12 GB+ |
+
+> **Device fit:** The 4-bit palettized E4B export is ~5.6 GB on disk and
+> peaks above 6 GB resident during on-device specialization. On 8 GB
+> devices (iPhone 15 Pro, iPad mini A17 Pro) the system terminates the
+> process before specialization completes. E2B fits comfortably on 8 GB
+> devices. See [#507](https://github.com/apple/coreai-models/issues/507)
+> for measured jetsam thresholds.
 
 These are the Gemma 4 checkpoints sized for a phone. They export through the
 standalone [`export.py`](export.py) rather than the generic `coreai.llm.export`
