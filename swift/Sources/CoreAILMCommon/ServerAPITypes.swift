@@ -16,6 +16,15 @@ public struct ChatCompletionRequest: Decodable, Sendable {
     public let topP: Double?
     public let topK: Int?
     public let seed: UInt64?
+    /// Additive penalty scaled by how often a token has already appeared (range [-2, 2]).
+    /// Applied as `logit -= frequencyPenalty * count`.
+    public let frequencyPenalty: Double?
+    /// Additive penalty applied once if a token has appeared at all (range [-2, 2]).
+    /// Applied as `logit -= presencePenalty` for any seen token.
+    public let presencePenalty: Double?
+    /// Per-token logit bias keyed by token-ID string → bias value (range [-100, 100]).
+    /// Applied as `logit += bias` before sampling.
+    public let logitBias: [String: Double]?
     public let stream: Bool?
     public let stop: [String]?
     public let responseFormat: ResponseFormat?
@@ -33,6 +42,9 @@ public struct ChatCompletionRequest: Decodable, Sendable {
         case maxCompletionTokens = "max_completion_tokens"
         case topP = "top_p"
         case topK = "top_k"
+        case frequencyPenalty = "frequency_penalty"
+        case presencePenalty = "presence_penalty"
+        case logitBias = "logit_bias"
         case responseFormat = "response_format"
         case toolChoice = "tool_choice"
         case parallelToolCalls = "parallel_tool_calls"
@@ -49,6 +61,9 @@ public struct ChatCompletionRequest: Decodable, Sendable {
         topP = try container.decodeIfPresent(Double.self, forKey: .topP)
         topK = try container.decodeIfPresent(Int.self, forKey: .topK)
         seed = try container.decodeIfPresent(UInt64.self, forKey: .seed)
+        frequencyPenalty = try container.decodeIfPresent(Double.self, forKey: .frequencyPenalty)
+        presencePenalty = try container.decodeIfPresent(Double.self, forKey: .presencePenalty)
+        logitBias = try container.decodeIfPresent([String: Double].self, forKey: .logitBias)
         stream = try container.decodeIfPresent(Bool.self, forKey: .stream)
         responseFormat = try container.decodeIfPresent(ResponseFormat.self, forKey: .responseFormat)
         tools = try container.decodeIfPresent([ToolDefinition].self, forKey: .tools)

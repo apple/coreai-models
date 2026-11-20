@@ -271,6 +271,10 @@ struct SamplingParameterValidationTests {
                 SamplingConfiguration.parameterError(1, nil, nil, nil, nil, 0),
                 .repetitionPenaltyWindow, "> 0", "0"
             ),
+            (SamplingConfiguration.parameterError(1, frequencyPenalty: 2.5), .frequencyPenalty, "in [-2, 2]", "2.5"),
+            (SamplingConfiguration.parameterError(1, frequencyPenalty: .nan), .frequencyPenalty, "in [-2, 2]", "nan"),
+            (SamplingConfiguration.parameterError(1, presencePenalty: -2.5), .presencePenalty, "in [-2, 2]", "-2.5"),
+            (SamplingConfiguration.parameterError(1, presencePenalty: .nan), .presencePenalty, "in [-2, 2]", "nan"),
         ]
         for (error, parameter, requirement, value) in cases {
             #expect(error == SamplingParameterError(parameter: parameter, requirement: requirement, value: value))
@@ -284,6 +288,7 @@ struct SamplingParameterValidationTests {
             SamplingConfiguration.parameterError(0.7, 1, 1, 1, 1, 1)
                 == nil)
         #expect(SamplingConfiguration.parameterError(1, nil, .leastNonzeroMagnitude) == nil)
+        #expect(SamplingConfiguration.parameterError(1, frequencyPenalty: -2, presencePenalty: 2) == nil)
     }
 
     @Test("The first out-of-range parameter is reported")

@@ -53,6 +53,37 @@ struct ServerAPITypesTests {
         #expect(request.responseFormat?.type == "json_schema")
     }
 
+    @Test("frequency_penalty and presence_penalty decode")
+    func penaltiesDecoding() throws {
+        let json = """
+            {"messages":[{"role":"user","content":"Hi"}],"frequency_penalty":1.5,"presence_penalty":-0.5}
+            """.data(using: .utf8)!
+        let request = try JSONDecoder().decode(ChatCompletionRequest.self, from: json)
+        #expect(request.frequencyPenalty == 1.5)
+        #expect(request.presencePenalty == -0.5)
+    }
+
+    @Test("logit_bias object decodes to token-id keyed map")
+    func logitBiasDecoding() throws {
+        let json = """
+            {"messages":[{"role":"user","content":"Hi"}],"logit_bias":{"50256":-100,"1917":12.5}}
+            """.data(using: .utf8)!
+        let request = try JSONDecoder().decode(ChatCompletionRequest.self, from: json)
+        #expect(request.logitBias?["50256"] == -100)
+        #expect(request.logitBias?["1917"] == 12.5)
+    }
+
+    @Test("Absent penalty and logit_bias fields default to nil")
+    func penaltyFieldsDefaultNil() throws {
+        let json = """
+            {"messages":[{"role":"user","content":"Hi"}]}
+            """.data(using: .utf8)!
+        let request = try JSONDecoder().decode(ChatCompletionRequest.self, from: json)
+        #expect(request.frequencyPenalty == nil)
+        #expect(request.presencePenalty == nil)
+        #expect(request.logitBias == nil)
+    }
+
     @Test("Multimodal message content with image_url")
     func multimodalContent() throws {
         let json = """
