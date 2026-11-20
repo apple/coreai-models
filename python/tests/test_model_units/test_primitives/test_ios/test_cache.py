@@ -55,6 +55,44 @@ class TestiOSKVCacheHandlerBasic:
         torch.testing.assert_close(k_out[:, :, :, :num_tokens], k)
         torch.testing.assert_close(v_out[:, :, :, :num_tokens], v)
 
+    def test_update_flag_keeps_cached_values_for_unflagged_slots(self):
+        """Slots with flag 0 must keep the cached K/V, both in the cache and in the fetched
+        row; slots with flag 1 are written as usual."""
+        handler, hidden_size = self._make_cache(n_layers=2, max_seq_len=16)
+        old_k = torch.randn(1, hidden_size, 1, 8)
+        old_v = torch.randn(1, hidden_size, 1, 8)
+        handler.update_and_fetch(
+            layer_idx=1,
+            offset=torch.tensor([4], dtype=torch.int32),
+            k=old_k,
+            v=old_v,
+            num_token_updates=8,
+        )
+
+        # Rewrite positions 6..9 with only 8 and 9 flagged: 6 and 7 must keep their values.
+        new_k = torch.randn(1, hidden_size, 1, 4)
+        new_v = torch.randn(1, hidden_size, 1, 4)
+        flag = torch.tensor([[0.0, 0.0, 1.0, 1.0]])
+        k_out, v_out = handler.update_and_fetch(
+            layer_idx=1,
+            offset=torch.tensor([6], dtype=torch.int32),
+            k=new_k,
+            v=new_v,
+            num_token_updates=4,
+            update_flag=flag,
+        )
+
+        for out, cache, old, new in (
+            (k_out, handler.k_cache[1], old_k, new_k),
+            (v_out, handler.v_cache[1], old_v, new_v),
+        ):
+            for row in (out, cache):
+                torch.testing.assert_close(row[..., 4:8], old[..., 0:4])
+                torch.testing.assert_close(row[..., 8:10], new[..., 2:4])
+                torch.testing.assert_close(row[..., 10:12], old[..., 6:8])
+        # The other layer is untouched.
+        assert handler.k_cache[0].abs().max() == 0
+
     def test_sequential_updates(self):
         """Multiple sequential updates should accumulate correctly."""
         n_layers, n_kv_heads, head_dim, max_seq_len = 1, 2, 4, 16
