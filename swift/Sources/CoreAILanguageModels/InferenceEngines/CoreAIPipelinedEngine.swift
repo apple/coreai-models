@@ -27,7 +27,6 @@ private func milliseconds(since start: ContinuousClock.Instant) -> Double {
 /// the same memory.
 private let pipelineDepth = 3
 private let averageExpectedPromptSize = 256
-private let temperatureTolerance: Double = 0.001
 
 /// MPSNDArray enforces 64-byte row-stride alignment on backing buffers.
 private let minimumMPSNDArrayBufferSize = 64
@@ -691,8 +690,7 @@ struct EngineImpl: ~Copyable {
 
     // GPU sampler — reuses MPSGraphSampler from MPSGraphSamplers.swift
     var cachedSampler: (any MPSGraphSampler)?
-    var cachedSamplerTemperature: Double?
-    var cachedSamplerPenaltySignature: PenaltySignature?
+    var cachedSamplerConfig: SamplingConfiguration?
     var penaltyState: RepetitionPenaltyGPUState?
     var additivePenaltyState: AdditivePenaltyGPUState?
     // No step using `penaltyState` is in flight; set by the end-of-generation sentinel and reset().
@@ -958,8 +956,7 @@ struct EngineImpl: ~Copyable {
             classified: classified, descriptor: descriptor)
         self.logits = logitsRef
         self.cachedSampler = nil
-        self.cachedSamplerTemperature = nil
-        self.cachedSamplerPenaltySignature = nil
+        self.cachedSamplerConfig = nil
         self.penaltyState = nil
         self.additivePenaltyState = nil
 
@@ -968,35 +965,16 @@ struct EngineImpl: ~Copyable {
 
     // MARK: - Sampler
 
+    /// Returns the cached sampler when `config` matches the one it was built for, else builds a
+    /// new one. Steps already in flight keep the sampler they were given.
     private mutating func getOrCreateSampler(for config: SamplingConfiguration) throws -> any MPSGraphSampler {
         let config = config.normalized()
-        let temperature = config.temperature
-
-        if let existingSampler = cachedSampler, let existingTemp = cachedSamplerTemperature {
-            let existingIsGreedy = existingTemp == 0
-            let requestedIsGreedy = temperature == 0
-
-            if existingIsGreedy != requestedIsGreedy {
-                throw InferenceRuntimeError.genericError(
-                    "Sampling configuration changed mid-generation. Call reset() first.")
-            }
-            if !existingIsGreedy && !requestedIsGreedy
-                && abs(existingTemp - temperature) > temperatureTolerance
-            {
-                throw InferenceRuntimeError.genericError(
-                    "Temperature changed mid-generation (\(existingTemp) -> \(temperature)). Call reset() first.")
-            }
-            // Penalty/bias config is compiled into the sampler graph, not just temperature. A
-            // request that changed it rebuilds instead of reusing. Penalty history is per
-            // generation (see runCompletion), so the GPU states are not touched here.
-            if cachedSamplerPenaltySignature == PenaltySignature(config) {
-                return existingSampler
-            }
-            cachedSampler = nil
-            cachedSamplerTemperature = nil
-            cachedSamplerPenaltySignature = nil
+        if let cachedSampler, cachedSamplerConfig == config {
+            return cachedSampler
         }
 
+        // The repetition-penalty stage is compiled into the composite graph only; the argmax
+        // sampler has none (it does have the additive frequency/presence/logit-bias stage).
         if config.needsRepetitionPenalty && config.temperature == 0 {
             throw InferenceRuntimeError.invalidArgument(
                 "Repetition penalty with greedy sampling is not supported on pipelined engine. "
@@ -1009,27 +987,8 @@ struct EngineImpl: ~Copyable {
             config: config
         )
         cachedSampler = newSampler
-        cachedSamplerTemperature = temperature
-        cachedSamplerPenaltySignature = PenaltySignature(config)
+        cachedSamplerConfig = config
         return newSampler
-    }
-
-    /// Identifies the penalty/logit-bias configuration a cached sampler was built for, so the cache
-    /// can be invalidated when a new request changes it (see `getOrCreateSampler`).
-    struct PenaltySignature: Equatable {
-        let repetitionPenalty: Double?
-        let repetitionPenaltyWindow: Int?
-        let frequencyPenalty: Double
-        let presencePenalty: Double
-        let logitBias: [Int32: Float]
-
-        init(_ config: SamplingConfiguration) {
-            self.repetitionPenalty = config.needsRepetitionPenalty ? config.repetitionPenalty : nil
-            self.repetitionPenaltyWindow = config.repetitionPenaltyWindow
-            self.frequencyPenalty = config.frequencyPenalty ?? 0
-            self.presencePenalty = config.presencePenalty ?? 0
-            self.logitBias = config.logitBias ?? [:]
-        }
     }
 
     // MARK: - Core Encode Step
@@ -1204,7 +1163,7 @@ struct EngineImpl: ~Copyable {
         let localGPUSampler = gpuSampler
         let outputBuffer = decodeOutputBuffers[step % pipelineDepth]
         let samplerStrategy = gpuSampler is MPSGraphArgmaxSampler ? "GPU-argmax" : "GPU-composite"
-        let samplerTemperature = cachedSamplerTemperature ?? 0.0
+        let samplerTemperature = cachedSamplerConfig?.temperature ?? 0.0
 
         let sampleSpan = InstrumentsProfiler.beginSampleEncoding(
             step: currentStep, strategy: samplerStrategy, temperature: samplerTemperature)
@@ -2065,8 +2024,7 @@ struct EngineImpl: ~Copyable {
         processedTokenCount = 0
         step = 0
         cachedSampler = nil
-        cachedSamplerTemperature = nil
-        cachedSamplerPenaltySignature = nil
+        cachedSamplerConfig = nil
         // Steps still in flight hold their own reference.
         penaltyState = nil
         penaltyStateIdle = true
