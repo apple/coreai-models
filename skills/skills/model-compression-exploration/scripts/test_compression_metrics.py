@@ -20,8 +20,9 @@ from compression_metrics import (
 
 
 def _toy_model() -> nn.Module:
-    # LayerNorm's weight is 1-D: it has no in-features axis to block along,
-    # and used to crash check_divisibility with IndexError.
+    # LayerNorm's weight is 1-D and used to crash check_divisibility with
+    # IndexError on axis=1; it is not a type coreai-opt compresses, so it
+    # must never be flagged at all.
     return nn.Sequential(nn.Linear(64, 48), nn.LayerNorm(48), nn.Linear(48, 10))
 
 
@@ -35,18 +36,36 @@ class TestCheckDivisibility:
 
     def test_reports_offending_dims_along_axis_0(self):
         result = check_divisibility(_toy_model(), axis=0, block_size=16)
-        # Out-features: 48 % 16 == 0, 48 (norm: axis 0 exists on a 1-D
-        # weight, checked and divisible), 10 % 16 != 0.
+        # Out-features: 48 % 16 == 0, 10 % 16 != 0; the norm is not a
+        # compressible type and is not checked.
         assert list(result.values()) == [(10, 16)]
 
-    def test_one_dimensional_weight_checked_along_axis_0(self):
-        # Grouped palettization groups along axis 0, which exists on a 1-D
-        # weight (coreai_opt's kmeans palettizer presets use axis=0), so an
-        # indivisible norm weight must be reported — only a nonexistent axis
-        # (e.g. axis=1 on 1-D) is skipped.
-        model = nn.Sequential(nn.LayerNorm(50))
-        result = check_divisibility(model, axis=0, block_size=16)
-        assert list(result.values()) == [(50, 16)]
+    def test_norms_are_never_flagged(self):
+        # coreai-opt never palettizes or block-quantizes norms, so an
+        # indivisible norm weight cannot cause a silently skipped layer
+        # and must not appear in the report.
+        model = nn.Sequential(nn.LayerNorm(60))
+        assert check_divisibility(model, axis=0, block_size=8) == {}
+
+    def test_conv_transpose_output_channels_resolve_to_dim_1(self):
+        # ConvTranspose stores weight as (in, out, *kernel): its output
+        # channels live on tensor dim 1. With axis=0 (output channels) and
+        # group 8, ConvTranspose2d(64, 12, 3) must be reported for 12 —
+        # the palettizer would silently skip it — not cleared for 64.
+        model = nn.Sequential(nn.ConvTranspose2d(64, 12, 3))
+        result = check_divisibility(model, axis=0, block_size=8)
+        assert list(result.values()) == [(12, 8)]
+
+    def test_conv_transpose_input_channels_resolve_to_dim_0(self):
+        # The same layer along the input-channel axis resolves to dim 0
+        # (64), which is divisible by 8.
+        model = nn.Sequential(nn.ConvTranspose2d(64, 12, 3))
+        assert check_divisibility(model, axis=1, block_size=8) == {}
+
+    def test_embedding_is_checked(self):
+        model = nn.Sequential(nn.Embedding(100, 32))
+        result = check_divisibility(model, axis=0, block_size=8)
+        assert list(result.values()) == [(100, 8)]
 
     def test_all_divisible_returns_empty(self):
         model = nn.Sequential(nn.Linear(64, 64), nn.LayerNorm(64))
@@ -81,11 +100,9 @@ class TestPureMathHelpers:
         assert abs(compression_ratio(100.0, 25.0) - 4.0) < 1e-9
 
     def test_torch_tensor_guard_ignores_non_tensor_weight(self):
-        class Odd(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.weight = "not-a-tensor"
-
-        model = nn.Sequential(nn.Linear(32, 32))
-        model.add_module("odd", Odd())
+        # A compressible type whose weight is not a tensor (e.g. swapped
+        # out by an export wrapper) must be skipped, not crash the check.
+        model = nn.Sequential(nn.Linear(32, 30))
+        del model[0].weight
+        model[0].weight = "not-a-tensor"
         assert check_divisibility(model, axis=1, block_size=32) == {}
