@@ -460,12 +460,39 @@ public struct EngineOptions: Sendable {
     ///
     /// Only the pipelined engine keeps one, and only for a model whose state it can copy (not one with
     /// a sliding-window ring); every other engine ignores this. ``InferenceEngine/prefixCacheEnabled``
-    /// says whether an engine took it. On a model with recurrent state, prefill also holds snapshots
-    /// it has taken until the next request, up to half this again.
+    /// says whether an engine took it. On a model with recurrent state, prefill also holds the snapshots
+    /// it has taken until the reply is out, up to half this again.
     public var prefixCacheBytes: Int
 
     /// 1 GiB, what llm-server keeps unless told otherwise.
     public static let suggestedPrefixCacheBytes = 1 << 30
+
+    /// Bytes of disk the prefix cache may also use, in ``prefixCacheDirectory``; zero, the default,
+    /// keeps it in memory only.
+    ///
+    /// Chunks the cache takes in memory are also written to disk, in the background, as far as this
+    /// budget allows, and a prompt that runs past what memory holds reads the next chunks back from there. So this may be larger
+    /// than ``prefixCacheBytes``, and a restarted engine reuses what an earlier one computed. Needs
+    /// ``prefixCacheBytes`` and ``prefixCacheDirectory`` too: chunks reach the KV cache through memory.
+    /// Without either, creating the engine throws. Setting this back to zero leaves the files in
+    /// ``prefixCacheDirectory`` where they are, for a later engine with a disk budget to use; nothing
+    /// deletes them but that engine's own eviction and the system's clearing of its caches directory.
+    public var prefixCacheDiskBytes: Int
+
+    /// Where the prefix cache keeps its files: a directory for this model alone, such as
+    /// ``defaultPrefixCacheDirectory(forModelAt:)``. Nil keeps the cache in memory only.
+    ///
+    /// One process at a time: an engine that finds the directory in use by another runs without a disk
+    /// tier, and logs it.
+    public var prefixCacheDirectory: URL?
+
+    /// A directory for the prefix cache of the model at `modelURL`, under the user's caches directory.
+    ///
+    /// Named by the model's folder and a digest of its path and its files' sizes and modification
+    /// dates, so a model exported again starts afresh rather than reuse another's state.
+    public static func defaultPrefixCacheDirectory(forModelAt modelURL: URL) -> URL? {
+        PrefixCacheStore.defaultDirectory(forModelAt: modelURL)
+    }
 
     /// Well-known `assets` roles for tensor data.
     public enum TensorDataKey {
@@ -485,6 +512,8 @@ public struct EngineOptions: Sendable {
     ///   - prefillChunkThreshold: Minimum prompt tokens to trigger chunking, or `nil` for default.
     ///   - tensorData: Tensor data URLs keyed by `auxiliary_assets` role. Defaults to empty.
     ///   - prefixCacheBytes: Bytes of earlier prompts' state to keep. Defaults to zero, off.
+    ///   - prefixCacheDiskBytes: Bytes of disk the prefix cache may also use. Defaults to zero, off.
+    ///   - prefixCacheDirectory: Where the prefix cache keeps its files. Defaults to nil, none.
     public init(
         variant: String? = nil,
         kvCacheStrategy: KVCacheStrategy = .auto,
@@ -492,7 +521,9 @@ public struct EngineOptions: Sendable {
         prefillChunkSize: Int? = nil,
         prefillChunkThreshold: Int? = nil,
         tensorData: [String: URL] = [:],
-        prefixCacheBytes: Int = 0
+        prefixCacheBytes: Int = 0,
+        prefixCacheDiskBytes: Int = 0,
+        prefixCacheDirectory: URL? = nil
     ) {
         self.variant = variant
         self.kvCacheStrategy = kvCacheStrategy
@@ -501,6 +532,8 @@ public struct EngineOptions: Sendable {
         self.prefillChunkThreshold = prefillChunkThreshold
         self.tensorData = tensorData
         self.prefixCacheBytes = prefixCacheBytes
+        self.prefixCacheDiskBytes = prefixCacheDiskBytes
+        self.prefixCacheDirectory = prefixCacheDirectory
     }
 
     /// Returns the KV cache size in tokens that the engine uses for a given context length.

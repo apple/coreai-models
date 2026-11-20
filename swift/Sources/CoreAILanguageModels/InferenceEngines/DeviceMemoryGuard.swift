@@ -174,6 +174,19 @@ package final class DeviceMemoryGuard: Sendable {
     /// Why this process should admit nothing more right now, or nil. See ``check()``.
     package func refusalReason() -> String? { check().refusal }
 
+    /// Bytes this process would have to give back for every figure to be under its line, with
+    /// ``pastArmMargin`` of the recommendation to spare; zero when none is over, or before ``arm()``.
+    ///
+    /// The larger of the two overages, Metal's or the resident one, so giving back heap memory may not
+    /// bring Metal's figure down: a caller re-checks ``refusalReason()`` after giving it back.
+    package func excess() -> Int {
+        let now = measure()
+        guard let lines = watch.withLock({ $0.lines }) else { return 0 }
+        let over = Swift.max(now.allocated - lines.allocated, now.resident - lines.resident)
+        guard over >= 0 else { return 0 }
+        return over + Int(Double(now.recommended) * Self.pastArmMargin)
+    }
+
     /// Reports where the process stands after `stage` (such as load or warmup): a warning when it is
     /// near or past the device's recommendation, naming `advice` as what would give memory back.
     package func report(after stage: String, advice: String) {

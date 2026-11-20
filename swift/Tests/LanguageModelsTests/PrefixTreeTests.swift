@@ -190,16 +190,36 @@ struct PrefixTreeTests {
         #expect(tree.nodeCount == 1)
     }
 
-    @Test("Dropping everything for memory empties the tree and counts what went")
-    func removeAll() {
+    @Test("Giving memory back evicts the least recently used leaves until enough is freed, and no more")
+    func evictsForMemory() {
         var tree = PrefixTree(chunkTokens: Self.chunk, byteBudget: 1 << 20)
-        Self.publish(Self.tokens(12), into: &tree)
-        tree.removeAll()
-        #expect(tree.nodeCount == 0 && tree.bytesHeld == 0 && tree.evictedNodes == 3)
-        let after = tree.match(Self.tokens(13), limit: 12, needsSnapshot: false)
-        #expect(after.isEmpty)
-        // It takes chunks again from the root.
+        Self.publish(Self.tokens(12), into: &tree)  // A: three nodes of 16 bytes
+        Self.publish(Self.tokens(4, from: 50), into: &tree)  // B: one
+        tree.record(tree.match(Self.tokens(12) + [0], limit: 12, needsSnapshot: false), restored: true)
+        // B is the coldest leaf, and 16 bytes is all one takes.
+        #expect(tree.evict(atLeast: 10) == 16)
+        #expect(tree.nodeCount == 3 && tree.bytesHeld == 48)
+        let chainA = tree.match(Self.tokens(12) + [0], limit: 12, needsSnapshot: false)
+        #expect(chainA.reusedTokens == 12)
+        // More than it holds empties it, leaves first.
+        #expect(tree.evict(atLeast: 1 << 20) == 48)
+        #expect(tree.nodeCount == 0 && tree.bytesHeld == 0 && tree.evictedNodes == 4)
         #expect(Self.publish(Self.tokens(4), into: &tree).count == 1)
+    }
+
+    @Test("A node that has a snapshot refuses a second, and nothing it counts changes")
+    func secondSnapshotIsRefused() {
+        var tree = PrefixTree(chunkTokens: Self.chunk, byteBudget: 1 << 20)
+        let keys = Self.publish(Self.tokens(8), into: &tree)
+        let first = [Data(repeating: 1, count: 16)]
+        let attached = tree.attach(snapshot: first, to: keys[1])
+        #expect(attached)
+        let held = tree.bytesHeld
+        let again = tree.attach(snapshot: [Data(repeating: 2, count: 32)], to: keys[1])
+        #expect(!again)
+        #expect(tree.bytesHeld == held && tree.snapshotCount == 1)
+        let match = tree.match(Self.tokens(9), limit: 8, needsSnapshot: true)
+        #expect(match.snapshot == first)
     }
 
     @Test("A chunk that can't fit beside the chain it extends evicts nothing")
@@ -272,25 +292,45 @@ struct PrefixSnapshotPlanTests {
     @Test("A run restored at any grid point steps as a cold run of the same prompt does from there")
     func restoredStepsMatchCold() {
         // The steps a recurrent prompt of `count` tokens takes from `start`, as positions reached.
-        func reached(from start: Int, count: Int, step: Int) -> [Int] {
-            let cut = PrefixSnapshotPlan.steps(from: start, to: count, stepTokens: step)
+        func reached(from start: Int, count: Int, step: Int, ring: Int?) -> [Int] {
+            let cut = PrefixSnapshotPlan.steps(from: start, to: count, stepTokens: step, ringCapacity: ring)
             #expect(cut.allSatisfy { $0 > 0 && $0 <= step })
+            #expect(cut.reduce(0, +) == count - start)
             var position = start
             return cut.map { size in
                 position += size
                 return position
             }
         }
-        for step in [256, 768, 2048, 4096] {
-            for count in [1500, 2363, 5000] {
-                let cold = reached(from: 0, count: count, step: step)
-                for restore in stride(from: PrefixSnapshotPlan.gridTokens, to: count, by: PrefixSnapshotPlan.gridTokens)
-                {
-                    #expect(reached(from: restore, count: count, step: step) == cold.filter { $0 > restore })
-                    #expect(cold.contains(restore))
+        // Step sizes that divide the grid and some that don't; rings, counted from the start too.
+        for step in [256, 384, 768, 2048, 4096] {
+            for ring in [nil, 600, 4096] as [Int?] {
+                for count in [1500, 2363, 5000] {
+                    let cold = reached(from: 0, count: count, step: step, ring: ring)
+                    for restore in stride(
+                        from: PrefixSnapshotPlan.gridTokens, to: count, by: PrefixSnapshotPlan.gridTokens)
+                    {
+                        #expect(
+                            reached(from: restore, count: count, step: step, ring: ring)
+                                == cold.filter { $0 > restore })
+                        #expect(cold.contains(restore))
+                    }
                 }
             }
         }
+    }
+
+    @Test("Every point a prompt snapshots at is one its prefill stops at")
+    func snapshotsAreStops() {
+        for start in [0, 1000, 1024, 3000] {
+            for count in [1, 2, 1024, 1025, 2049, 3000] {
+                let snapshots = PrefixSnapshotPlan.boundaries(start: start, promptTokens: count)
+                let stops = PrefixSnapshotPlan.stops(after: start, before: start + count, stepTokens: 4096)
+                #expect(Set(snapshots).isSubset(of: stops), "start \(start), \(count) tokens")
+            }
+        }
+        #expect(PrefixSnapshotPlan.steps(from: 7, to: 7, stepTokens: 256).isEmpty)
+        #expect(PrefixSnapshotPlan.steps(from: 7, to: 8, stepTokens: 256) == [1])
     }
 
     @Test("A sliding ring's end is a stop too, so no step crosses it")
