@@ -55,6 +55,10 @@ uv run coreai.diffusion.export sana-sprint-1.6b --compression none
 cost of shifted compositions; `--compression none` exports the whole build dense. The GPU
 presets do not apply to this build.
 
+## Note on AOT Compilation
+
+Ahead-of-time compilation is not supported for this model. Please use on-device specialization from .aimodel directly.
+
 ## Components
 
 | Component      | Asset                 | Size (default)                | Size (`--compression none`)   | Size (`--platform iOS`)       | Description                                                   |
