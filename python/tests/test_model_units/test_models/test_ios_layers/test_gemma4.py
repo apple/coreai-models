@@ -31,11 +31,22 @@ except Exception:  # pragma: no cover - requires transformers>=5.5
 from coreai_models._constants import EXTEND_FUNCTION_NAME  # noqa: E402
 from coreai_models.models.base import TraceSpec, _is_layer_key_beyond  # noqa: E402
 from coreai_models.models.ios.gemma4_text import (  # noqa: E402
+    DEFAULT_KV_BLOCK_SIZE,
+    GeGLUMLP,
+    Gemma4Extend,
     Gemma4ForCausalLMForiOS,
     NativeLutQuantConv1x1,
     NativeQuantConv1x1,
     NativeQuantLinear,
+    QuantizedLinear,
+    _check_native_nbits,
+    _check_native_widths,
     _compute_kv_layout,
+    _is_quantized_hf_model,
+    _make_proj_conv,
+    _native_mlp_nbits,
+    _native_module_name,
+    _native_ple_table,
     sliding_ring_size,
 )
 from coreai_models.primitives.ios.quantization import (  # noqa: E402
@@ -45,6 +56,7 @@ from coreai_models.primitives.ios.quantization import (  # noqa: E402
     unpack_unsigned_subbyte,
 )
 from coreai_models.primitives.ios.rope import RoPECache  # noqa: E402
+from tests._runner_infra._deps import _hf_hub_reachable  # noqa: E402
 
 DTYPE = torch.float32
 NEG = float("-inf")
@@ -592,3 +604,459 @@ def test_native_quant_helpers_reject_unsupported_nbits(nbits):
         unpack_unsigned_subbyte(torch.zeros(1, 1, dtype=torch.uint8), nbits, 1)
     with pytest.raises(ValueError, match="nbits must be one of"):
         dequantize_native(torch.zeros(1, 1), torch.ones(1, 1), nbits, torch.float16)
+
+
+@pytest.mark.parametrize("nbits", [1, 3, 6, 16])
+def test_native_projections_reject_unsupported_nbits(nbits):
+    """A native projection is built at 2, 4 or 8 bits only; a standard one ignores the width."""
+    cfg = _make_config()
+    cfg.native_quantized = True
+    with pytest.raises(ValueError, match=r"one of \(2, 4, 8\) bits"):
+        _make_proj_conv(cfg, 4, 8, nbits=nbits)
+    cfg.native_quantized = False
+    assert isinstance(_make_proj_conv(cfg, 4, 8, nbits=nbits), torch.nn.Conv2d)
+
+
+def test_checkpoint_widths_must_be_supported():
+    """A checkpoint module at a width other than 2, 4 or 8 bits is refused, by name, before
+    anything is unpacked."""
+    ple = "extend.model.embed_tokens_per_layer"
+    q_proj = "extend.model.layers.0.self_attn.q_proj"
+    _check_native_nbits({q_proj: 4, ple: 2, "extend.lm_head": 2, "extend.model.embed_tokens": 8})
+    with pytest.raises(NotImplementedError, match=rf"{ple} \(3 bits\)"):
+        _check_native_nbits({q_proj: 4, ple: 3})
+
+
+def test_make_proj_conv_dispatches_on_nbits_and_native_flag():
+    """``_make_proj_conv`` picks LUT vs affine by bit-width, plain Conv2d if not native."""
+    cfg = _make_config()
+
+    cfg.native_quantized = True
+    assert isinstance(_make_proj_conv(cfg, 4, 8, nbits=4), NativeQuantConv1x1)
+    assert isinstance(_make_proj_conv(cfg, 4, 8, nbits=8), NativeQuantConv1x1)
+    assert isinstance(_make_proj_conv(cfg, 4, 8, nbits=2), NativeLutQuantConv1x1)
+
+    cfg.native_quantized = False
+    assert isinstance(_make_proj_conv(cfg, 4, 8, nbits=2), torch.nn.Conv2d)
+
+
+def test_native_mlp_nbits_reads_per_layer_plan():
+    """``_native_mlp_nbits`` defaults to 4 with no plan, else reads the per-layer entry."""
+    cfg = _make_config()
+    assert _native_mlp_nbits(cfg, 0) == 4  # no plan set (standard, non-QAT checkpoint)
+
+    cfg.native_mlp_nbits = [4, 4, 2, 2, 4, 4]
+    assert _native_mlp_nbits(cfg, 0) == 4
+    assert _native_mlp_nbits(cfg, 2) == 2
+    assert _native_mlp_nbits(cfg, 3) == 2
+
+
+def test_untied_lm_head_needs_a_native_quantized_checkpoint():
+    """A standard untied checkpoint has no loader for its ``lm_head``, so it is refused."""
+    cfg = _make_config()
+    cfg.tie_word_embeddings = False
+    with pytest.raises(NotImplementedError, match="untied lm_head"):
+        Gemma4Extend(cfg)
+
+
+def test_native_widths_must_cover_the_checkpoint():
+    """A module declaring fewer bits than its checkpoint module is refused; more is fine."""
+    cfg = _make_config()
+    cfg.native_quantized = True
+    model = Gemma4ForCausalLMForiOS(cfg, model_device="meta")
+    q_proj = "extend.model.layers.0.self_attn.q_proj"
+    _check_native_widths(model, {q_proj: 4, "extend.model.embed_tokens": 2})
+    _check_native_widths(model, {q_proj: 2})
+    with pytest.raises(NotImplementedError, match="8 bits in the checkpoint"):
+        _check_native_widths(model, {q_proj: 8})
+
+
+def test_native_ple_table_stores_8_bit_rows_offset():
+    """8-bit PLE rows ship as signed bytes; the sidecar stores them offset by 128, as the
+    runner reads every width."""
+    from types import SimpleNamespace
+
+    values = torch.tensor([[-128, -1, 0, 127]], dtype=torch.int8)
+    module = SimpleNamespace(
+        embedding_quantized=values,
+        embedding_scale=torch.ones(1, 1),
+        num_bits=8,
+        embedding_dim=4,
+    )
+    packed, scale, nbits = _native_ple_table(module, _make_config(), truncate=False)
+    assert nbits == 8 and packed.dtype == torch.uint8
+    assert packed.tolist() == [[0, 127, 128, 255]]
+    assert (packed.to(torch.int16) - 128).tolist() == values.tolist()
+
+    # Sub-byte rows are already offset-packed and pass through unchanged.
+    packed4 = torch.tensor([[0x8F]], dtype=torch.uint8)
+    module4 = SimpleNamespace(
+        embedding_quantized=packed4, embedding_scale=torch.ones(1, 1), num_bits=4, embedding_dim=2
+    )
+    assert torch.equal(_native_ple_table(module4, _make_config(), truncate=False)[0], packed4)
+
+
+def test_native_ple_table_truncates_to_the_remaining_layers():
+    """``--num-layers`` cuts each packed row and its per-block scales to the kept layers."""
+    from types import SimpleNamespace
+
+    cfg = _make_config()  # 6 layers x 16 PLE dims; the checkpoint below has 8 layers
+    ple_dim, nbits, block = cfg.hidden_size_per_layer_input, 4, 32
+    full_dim = 8 * ple_dim
+    module = SimpleNamespace(
+        embedding_quantized=torch.arange(3 * full_dim // 2, dtype=torch.uint8).reshape(3, -1),
+        embedding_scale=torch.arange(3 * full_dim // block, dtype=torch.float32).reshape(3, -1),
+        num_bits=nbits,
+        embedding_dim=full_dim,
+    )
+    packed, scale, _ = _native_ple_table(module, cfg, truncate=True)
+    kept = cfg.num_hidden_layers * ple_dim
+    assert packed.shape == (3, kept // 2)
+    assert scale.shape == (3, kept // block)
+    assert torch.equal(packed, module.embedding_quantized[:, : kept // 2])
+    assert torch.equal(scale, module.embedding_scale[:, : kept // block].to(torch.float16))
+    assert packed.is_contiguous() and scale.is_contiguous()
+
+    # Without truncation the rows ship whole.
+    packed, scale, _ = _native_ple_table(module, cfg, truncate=False)
+    assert packed.shape == (3, full_dim // 2) and scale.shape == (3, full_dim // block)
+
+
+def _native_config(mlp_nbits: list[int]) -> Gemma4TextConfig:
+    """A tiny native-quantized config: untied ``lm_head`` wider than one output block, so it is
+    split, and the given per-layer MLP widths."""
+    cfg = _make_config()
+    cfg.vocab_size = DEFAULT_KV_BLOCK_SIZE + 8
+    cfg.tie_word_embeddings = False
+    cfg.native_quantized = True
+    cfg.native_mlp_nbits = mlp_nbits
+    return cfg
+
+
+def _fake_native_hf_state_dict(cfg) -> dict[str, torch.Tensor]:
+    """A text decoder's state dict in the form ``_native_quantized_hf_state_dict`` produces it:
+    each quantized projection and the embedding table as an unpacked ``(quantized_data, scale)``
+    pair, a sub-4-bit MLP projection as ``(indices, scale)``, everything else as is, and no PLE
+    table (``from_hf`` externalizes it)."""
+    torch.manual_seed(0)
+    out: dict[str, torch.Tensor] = {}
+    for key, value in Gemma4ForCausalLM(cfg).state_dict().items():
+        base, leaf = key.rsplit(".", 1)
+        if "embed_tokens_per_layer" in base:
+            continue
+        quantized = leaf == "weight" and (
+            (".self_attn." in base and base.endswith("_proj"))
+            or ".mlp." in base
+            or base.endswith((".per_layer_input_gate", ".per_layer_projection"))
+            or base in ("model.embed_tokens", "lm_head")
+        )
+        if not quantized:
+            out[key] = value
+            continue
+        nbits = 8
+        if ".mlp." in base:
+            nbits = cfg.native_mlp_nbits[int(base.split(".")[2])]
+        if nbits < 4:
+            out[f"{base}.indices"] = torch.randint(0, 2**nbits, value.shape, dtype=torch.uint8)
+        else:
+            lo, hi = -(2 ** (nbits - 1)), 2 ** (nbits - 1)
+            out[f"{base}.quantized_data"] = torch.randint(lo, hi, value.shape, dtype=torch.int8)
+        out[f"{base}.scale"] = torch.rand(value.shape[0], 1).to(torch.float16)
+    return out
+
+
+def test_native_quantized_state_dict_loads_strictly():
+    """``_mutate_native_quantized_state_dict`` maps every checkpoint tensor onto the native
+    model: the shared-KV layers' ``k``/``v`` dropped, LUT vs affine MLP keys, the embedding
+    table and scale moved to ``load_embeddings``, and ``lm_head`` split into output blocks."""
+    cfg = _native_config([4, 4, 4, 4, 2, 2])  # layers 4 and 5 share KV and ship at 2 bits
+    hf_sd = _fake_native_hf_state_dict(cfg)
+    sd = dict(hf_sd)
+    model = Gemma4ForCausalLMForiOS(cfg, model_device="meta")
+    model.to(dtype=torch.float16)
+    model._mutate_native_quantized_state_dict(sd)
+    model.load_state_dict(sd, assign=True, strict=True)
+
+    layers = model.extend.model.layers
+    assert isinstance(layers[0].mlp.down_proj, NativeQuantConv1x1)
+    assert isinstance(layers[5].mlp.down_proj, NativeLutQuantConv1x1)
+    assert not hasattr(layers[5].self_attn, "k_proj")
+    assert torch.equal(
+        layers[5].mlp.down_proj.indices.squeeze(-1).squeeze(-1),
+        hf_sd["model.layers.5.mlp.down_proj.indices"],
+    )
+    assert torch.equal(
+        layers[0].self_attn.k_proj.quantized_data.squeeze(-1).squeeze(-1),
+        hf_sd["model.layers.0.self_attn.k_proj.quantized_data"],
+    )
+    assert torch.equal(
+        model.load_embeddings.embedding_table.squeeze(1),
+        hf_sd["model.embed_tokens.quantized_data"],
+    )
+    assert torch.equal(
+        model.load_embeddings.embedding_scale.squeeze(1), hf_sd["model.embed_tokens.scale"]
+    )
+
+    blocks = model.extend.lm_head.blocks
+    assert [b.quantized_data.shape[0] for b in blocks] == [DEFAULT_KV_BLOCK_SIZE, 8]
+    assert torch.equal(
+        torch.cat([b.quantized_data for b in blocks]), hf_sd["lm_head.quantized_data"]
+    )
+    assert torch.equal(torch.cat([b.scale for b in blocks]), hf_sd["lm_head.scale"])
+
+
+def test_native_quantized_reads_the_config_flag():
+    """A built model reports the flag its modules were built from; no flag is standard."""
+    cfg = _make_config()
+    assert not hasattr(cfg, "native_quantized")
+    standard = Gemma4ForCausalLMForiOS(cfg, model_device="meta")
+    assert not standard.native_quantized
+    assert isinstance(standard.extend.model.layers[0].self_attn.q_proj, torch.nn.Conv2d)
+
+    native = Gemma4ForCausalLMForiOS(_native_config([4] * 6), model_device="meta")
+    assert native.native_quantized
+    assert isinstance(native.extend.model.layers[0].self_attn.q_proj, NativeQuantConv1x1)
+
+
+def test_native_embedding_tables_follow_the_model_device():
+    """The native embedding table and its scale are built on ``model_device``, so ``from_hf``
+    (which builds on meta) does not allocate the table before loading it."""
+    model = Gemma4ForCausalLMForiOS(_native_config([4] * 6), model_device="meta")
+    assert model.load_embeddings.embedding_table.is_meta
+    assert model.load_embeddings.embedding_scale.is_meta
+
+
+@pytest.mark.skipif(QuantizedLinear is None, reason="needs transformers' Gemma QAT quantizer")
+def test_quantized_detection_reads_the_text_decoder_only():
+    """A quantized vision or audio tower alone does not make the text decoder native."""
+    hf_model = torch.nn.Module()
+    hf_model.model = torch.nn.Module()
+    hf_model.model.vision_tower = QuantizedLinear(4, 4, num_bits=8)
+    hf_model.model.language_model = torch.nn.Module()
+    hf_model.model.language_model.q_proj = torch.nn.Linear(4, 4)
+    assert not _is_quantized_hf_model(hf_model)
+
+    hf_model.model.language_model.q_proj = QuantizedLinear(4, 4, num_bits=4)
+    assert _is_quantized_hf_model(hf_model)
+
+
+# ---------------------------------------------------------------------------
+# Real QAT checkpoint: native-quantized module dispatch + bit-exactness.
+#
+# The tests above cover the standard (dequantize-and-palettize) checkpoints. This
+# one loads the real "-qat-mobile-transformers" E2B checkpoint through ``from_hf``
+# and checks that (1) each MLP projection routes to the module and bit width its
+# checkpoint calls for (affine vs LUT), and (2) both paths dequantize bit-exact to
+# HF's own reference dequantization -- no dequantize/requantize round-trip
+# anywhere. It is heavy (downloads and loads a ~5B QAT checkpoint) and needs
+# network + weights + transformers>=5.5, so it is opt-in via ``-m slow``, same as
+# ``test_e2b_full_parity_hf_vs_torch``.
+# ---------------------------------------------------------------------------
+
+E2B_QAT_MODEL_ID = "google/gemma-4-E2B-it-qat-mobile-transformers"
+
+
+@pytest.mark.slow
+@pytest.mark.flaky(reruns=0)
+def test_e2b_qat_native_quantization_dispatch_and_bit_exactness():
+    """Real E2B QAT checkpoint: per-layer affine/LUT dispatch and bit-exact dequant."""
+    if not _hf_hub_reachable(E2B_QAT_MODEL_ID):
+        pytest.skip(f"HuggingFace Hub unreachable for {E2B_QAT_MODEL_ID!r}")
+    from huggingface_hub.errors import GatedRepoError
+    from transformers import Gemma4ForConditionalGeneration
+
+    from coreai_models.primitives.ios.quantization import dequantize_native_dense
+
+    try:
+        hf_model = Gemma4ForConditionalGeneration.from_pretrained(
+            E2B_QAT_MODEL_ID, dtype=torch.float16
+        )
+    except (OSError, GatedRepoError) as exc:  # download or gating failures only
+        pytest.skip(f"could not download E2B QAT weights: {exc}")
+    # A load failure past the download is a bug, not a skip.
+    model = Gemma4ForCausalLMForiOS.from_hf(
+        E2B_QAT_MODEL_ID, max_context_length=1024, target_dtype=torch.float16
+    ).eval()
+
+    assert model.config.native_quantized is True
+    hf_mods = dict(hf_model.named_modules())
+
+    # Every projection's dispatch and width is checked (cheap); the numeric compare runs
+    # for the first layer of each kind, since the module-level tests above cover the
+    # arithmetic exhaustively.
+    compared: set[bool] = set()
+    for i, layer in enumerate(model.extend.model.layers):
+        is_lut = None
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            hf_proj = hf_mods[f"model.language_model.layers.{i}.mlp.{proj}"]
+            ours = getattr(layer.mlp, proj)
+            lut = hf_proj.num_bits < 4
+            assert is_lut in (None, lut), f"layer {i} mixes LUT and affine MLP projections"
+            is_lut = lut
+            assert isinstance(ours, NativeLutQuantConv1x1 if lut else NativeQuantConv1x1)
+            assert ours.nbits == hf_proj.num_bits, f"layer {i} {proj}"
+
+            if lut in compared:
+                continue
+            if lut:
+                dense = torch.ops.coreai.lut_to_dense(ours.indices, ours.lut, 0)
+                weight = dequantize_native_dense(dense, ours.scale, torch.float16)
+            else:
+                weight = dequantize_native(
+                    ours.quantized_data, ours.scale, ours.nbits, torch.float16
+                )
+            expected = hf_proj._dequantize_weights(torch.float16)
+            torch.testing.assert_close(weight.squeeze(-1).squeeze(-1), expected, atol=0, rtol=0)
+        compared.add(is_lut)
+
+    assert True in compared, (
+        "expected at least one genuinely sub-4-bit MLP layer in this checkpoint"
+    )
+
+    # Every quantized text-decoder projection has a native module at least as wide as the
+    # checkpoint's, so `_check_native_widths` saw it; only the shared-KV layers' k/v
+    # projections, which this model does not build, have none.
+    ours_mods = dict(model.named_modules())
+    hf_prefix = "model.language_model."
+    covered = set()
+    quantized_inputs = 0
+    for name, hf_mod in hf_mods.items():
+        if not isinstance(hf_mod, QuantizedLinear) or not (
+            name.startswith(hf_prefix) or name == "lm_head"
+        ):
+            continue
+        ours = ours_mods.get(_native_module_name(name, hf_prefix))
+        if ours is None:
+            assert name.endswith((".self_attn.k_proj", ".self_attn.v_proj")), name
+            continue
+        assert ours.nbits >= hf_mod.num_bits, name
+        covered.add(name.rsplit(".", 1)[-1])
+        # `from_hf` carries each conv projection's input activation scale over (o_proj's
+        # stays 0, see `_apply_activation_scales`) and never its output scale.
+        if isinstance(ours, (NativeQuantConv1x1, NativeLutQuantConv1x1)):
+            if name.endswith(".self_attn.o_proj"):
+                assert ours.input_activation_scale == 0.0, name
+            else:
+                expected = float(hf_mod.input_activation_scale)
+                assert expected > 0, name
+                assert ours.input_activation_scale == pytest.approx(expected), name
+                quantized_inputs += 1
+            assert ours.output_activation_scale == 0.0, name
+    assert {
+        "q_proj",
+        "o_proj",
+        "per_layer_input_gate",
+        "per_layer_projection",
+        "lm_head",
+    } <= covered
+    assert quantized_inputs > 0
+    assert False in compared, "expected at least one 4-bit MLP layer in this checkpoint"
+
+    del hf_model, model
+
+
+def test_native_quant_conv1x1_activation_quant_matches_hf_srq():
+    """With activation scales set, the module quantizes its input and output exactly as the
+    HF QAT layer does (``apply_srq`` around the matmul); a scale of 0 leaves that side alone."""
+    gemma_quant = pytest.importorskip("transformers.integrations.gemma_quant")
+    torch.manual_seed(0)
+    out_c, in_c = 16, 8
+    mod = NativeQuantConv1x1(in_c, out_c, nbits=4)
+    q = torch.randint(-8, 8, (out_c, in_c, 1, 1), dtype=torch.int8)
+    scale = torch.rand(out_c, 1, 1, 1, dtype=torch.float16) * 0.05
+    with torch.no_grad():
+        mod.quantized_data.copy_(q)
+        mod.scale.copy_(scale)
+    x = torch.randn(1, in_c, 1, 6, dtype=torch.float16)
+    weight = q.reshape(out_c, in_c).to(torch.float16) * scale.reshape(out_c, 1)
+
+    def reference(s_in: float, s_out: float) -> torch.Tensor:
+        xs = x.squeeze(2).transpose(1, 2)  # (1, 6, in_c): the HF linear layout
+        xs = gemma_quant.apply_srq(xs, torch.tensor(s_in))
+        out = gemma_quant.apply_srq(torch.nn.functional.linear(xs, weight), torch.tensor(s_out))
+        return out.transpose(1, 2).unsqueeze(2)
+
+    for s_in in (0.0, 0.02):
+        mod.input_activation_scale, mod.output_activation_scale = s_in, 0.0
+        with torch.no_grad():
+            torch.testing.assert_close(mod(x), reference(s_in, 0.0), atol=1e-3, rtol=1e-3)
+    # With the output quantized too, the conv and the linear accumulate in a different fp16
+    # order, so a value on a rounding boundary can land one step either way.
+    mod.input_activation_scale, mod.output_activation_scale = 0.02, 0.01
+    with torch.no_grad():
+        diff = (mod(x) - reference(0.02, 0.01)).abs()
+    assert diff.max() <= 0.01 + 1e-3
+    assert (diff > 1e-3).float().mean() < 0.05
+    # The scales really do change the result.
+    mod.input_activation_scale = mod.output_activation_scale = 0.0
+    plain = mod(x)
+    mod.input_activation_scale, mod.output_activation_scale = 0.05, 0.05
+    assert not torch.allclose(mod(x), plain)
+
+
+def test_geglu_mlp_puts_tokens_in_the_conv_width():
+    """The MLP runs its 1x1 convs with the tokens in their width, (B, D, 1, S), and computes
+    exactly what the per-token batch layout, (B*S, D, 1, 1), computes, activation quantization
+    included."""
+    cfg = _make_config()
+    cfg.native_quantized = True
+    torch.manual_seed(0)
+    mlp = GeGLUMLP(cfg, cfg.hidden_size, cfg.intermediate_size, layer_idx=0).half().eval()
+    with torch.no_grad():
+        for conv in (mlp.gate_proj, mlp.up_proj, mlp.down_proj):
+            conv.quantized_data.copy_(torch.randint(-8, 8, conv.quantized_data.shape))
+            conv.scale.copy_(torch.rand_like(conv.scale) * 0.05)
+            conv.input_activation_scale, conv.output_activation_scale = 0.02, 0.03
+    shapes = []
+    mlp.gate_proj.register_forward_pre_hook(lambda _, args: shapes.append(tuple(args[0].shape)))
+    seq, dim = 7, cfg.hidden_size
+    x = torch.randn(1, seq, 1, dim, dtype=torch.float16)
+
+    with torch.no_grad():
+        out = mlp(x)
+        xb = x.reshape(seq, dim, 1, 1)
+        gate = torch.nn.functional.gelu(mlp.gate_proj(xb), approximate="tanh")
+        reference = mlp.down_proj(mlp.up_proj(xb) * gate).reshape(1, seq, 1, dim)
+
+    assert shapes[0] == (1, dim, 1, seq)
+    assert torch.equal(out, reference)
+
+
+def test_activation_scales_quantize_only_projection_inputs():
+    """The checkpoint's input scales are applied and its output scales are not, so no
+    quantize/dequantize sits between a conv and the op after it; o_proj's input stays
+    unquantized; a projection the checkpoint has no scales for is an error."""
+
+    def tree(names):
+        root = torch.nn.Module()
+        for name in names:
+            parent = root
+            *path, leaf = name.split(".")
+            for part in path:
+                if not hasattr(parent, part):
+                    parent.add_module(part, torch.nn.Module())
+                parent = getattr(parent, part)
+            # The sub-4-bit MLP projections are LUT-decoded; they get their input scale too.
+            conv = (
+                NativeLutQuantConv1x1(4, 4, nbits=2)
+                if name.endswith("down_proj")
+                else NativeQuantConv1x1(4, 4, nbits=4)
+            )
+            parent.add_module(leaf, conv)
+        return root
+
+    names = ["layers.0.mlp.gate_proj", "layers.0.mlp.down_proj", "layers.0.self_attn.o_proj"]
+    root = tree([f"extend.model.{n}" for n in names])
+    scales = {n: (0.02 + i * 0.01, 0.5) for i, n in enumerate(names)}
+    Gemma4ForCausalLMForiOS._apply_activation_scales(root, scales)
+
+    modules = dict(root.named_modules())
+    assert isinstance(modules["extend.model.layers.0.mlp.down_proj"], NativeLutQuantConv1x1)
+    for i, n in enumerate(names):
+        conv = modules[f"extend.model.{n}"]
+        assert conv.output_activation_scale == 0.0, n
+        expected = 0.0 if n.endswith("o_proj") else 0.02 + i * 0.01
+        assert conv.input_activation_scale == pytest.approx(expected), n
+
+    with pytest.raises(ValueError, match="No activation scales"):
+        Gemma4ForCausalLMForiOS._apply_activation_scales(root, {})
