@@ -214,6 +214,13 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     )
     var stopTokens: [String] = []
 
+    @Flag(
+        name: .customLong("ignore-eos"),
+        help:
+            "Disable all stop sequences (incl. EOS / end-of-turn) so generation always runs the full --max-tokens. For benchmarking decode throughput."
+    )
+    var ignoreEos: Bool = false
+
     @Option(help: "Save logits to JSON file (path to output file)")
     var saveLogits: String?
 
@@ -456,6 +463,27 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         }
         if repetitionPenaltyWindow != nil && repetitionPenalty == nil {
             throw ValidationError("--repetition-penalty-window requires --repetition-penalty")
+        }
+        if ignoreEos {
+            // --ignore-eos only reaches plain text generation; every other path keeps its stops.
+            let conflicting = [
+                jsonSchema != nil ? "--json-schema" : nil,
+                imagePath != nil ? "--image" : nil,
+                videoPath != nil ? "--video" : nil,
+                promptList != nil ? "--prompt-list" : nil,
+                batchPrototypeRows != nil ? "--batch-prototype" : nil,
+                draftModel != nil ? "--draft-model" : nil,
+                promptLookup ? "--prompt-lookup" : nil,
+                speculative ? "--speculative" : nil,
+                continuation != nil ? "--continuation" : nil,
+                rawContinuation != nil ? "--raw-continuation" : nil,
+                stopTokens.isEmpty ? nil : "--stop-tokens",
+            ].compactMap { $0 }
+            if !conflicting.isEmpty {
+                throw ValidationError(
+                    "--ignore-eos applies to plain text generation only; it cannot be used with "
+                        + conflicting.joined(separator: ", "))
+            }
         }
         if repetitionPenalty != nil && jsonSchema != nil {
             throw ValidationError(
@@ -1293,11 +1321,14 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             let decodingID = InstrumentsProfiler.beginDecoding(strategy: "vanilla")
 
             // Encode stop tokens to sequences
-            let stopSequences = try validateAndEncodeStopTokens(
-                stopTokens: stopTokens,
-                tokenizer: tokenizer,
-                additionalEosTokenIds: additionalEosTokenIds
-            )
+            let stopSequences =
+                ignoreEos
+                ? StopSequences(sequences: [])
+                : try validateAndEncodeStopTokens(
+                    stopTokens: stopTokens,
+                    tokenizer: tokenizer,
+                    additionalEosTokenIds: additionalEosTokenIds
+                )
 
             // Check if logits are requested
             let needsLogits = saveLogits != nil || printLogits

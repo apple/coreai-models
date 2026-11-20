@@ -29,11 +29,13 @@ struct InputHandlerTests {
     @Test("InputContext.static creates correct context")
     func staticContext() {
         let tokens: ArraySlice<Int32> = [10, 20][...]
+        // Distinct values, so a swap or `processedTokenCount: alignedStep` fails.
         let ctx = InputContext.static(
-            tokens: tokens, alignedStep: 10, batchSize: 4, slidingWindow: 256, contextBucket: 2048)
+            tokens: tokens, alignedStep: 8, batchSize: 4, slidingWindow: 256, contextBucket: 2048,
+            processedTokenCount: 10)
         #expect(ctx.tokens.count == 2)
         #expect(ctx.processedTokenCount == 10)
-        #expect(ctx.alignedStep == 10)
+        #expect(ctx.alignedStep == 8)
         #expect(ctx.batchSize == 4)
         #expect(ctx.slidingWindow == 256)
     }
