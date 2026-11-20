@@ -32,12 +32,15 @@ except Exception:  # pragma: no cover - requires transformers>=5.5
 
 from coreai_models._constants import EXTEND_FUNCTION_NAME  # noqa: E402
 from coreai_models.models.ios.qwen3_5 import (  # noqa: E402
+    DECODE_QUERY_LEN,
+    PREFILL_QUERY_LEN,
     Qwen3_5Extend,
     Qwen3_5ForCausalLMForiOS,
     _chunk_gated_delta_rule,
     _l2norm,
     _layer_maps,
 )
+from coreai_models.primitives.ios.cache import KVCacheHandler  # noqa: E402
 from coreai_models.primitives.ios.ssm_cache import (  # noqa: E402
     MAX_QUERY_LEN,
     SSMStateHandler,
@@ -319,10 +322,11 @@ def parity_setup():
     model = Qwen3_5ForCausalLMForiOS(cfg, torch.device("cpu")).eval()
     randomize(model)
     ids = torch.randint(1, cfg.vocab_size, (1, N_TOKENS), dtype=torch.int32)
-    reference, _ = run_one_shot(model, ids, cfg, N_TOKENS)
+    reference, reference_state = run_one_shot(model, ids, cfg, N_TOKENS)
     # A vacuous comparison (all-zero logits) would pass every assertion below.
     assert reference.abs().max().item() > 1e-3
-    return model, ids, cfg, reference
+    assert reference_state.abs().max().item() > 1e-6
+    return model, ids, cfg, reference, reference_state
 
 
 @pytest.fixture(scope="module")
@@ -366,11 +370,13 @@ class TestConvRingParity:
 
     def test_blocked_matches_one_shot(self, parity_setup):
         """Walking the sequence in query-length blocks, carrying ring state across calls,
-        must not change the final token's logits."""
-        model, ids, cfg, reference = parity_setup
-        got, _ = run_blocked(model, ids, cfg, N_TOKENS)
+        must not change the final token's logits or the recurrent state."""
+        model, ids, cfg, reference, reference_state = parity_setup
+        got, state = run_blocked(model, ids, cfg, N_TOKENS)
         scale = reference.abs().max().item()
         assert (got - reference).abs().max().item() < 1e-3 * scale
+        state_scale = reference_state.abs().max().item()
+        assert (state - reference_state).abs().max().item() < 1e-3 * state_scale
 
     def test_resend_after_prefill_matches_one_shot(self, resend_setup):
         """A decode block that re-sends the tail of the prompt across a
@@ -384,11 +390,17 @@ class TestConvRingParity:
 
     def test_wrong_conv_step_breaks_blocked_parity(self, parity_setup):
         """Mutation check: writing the conv window at the wrong ring offset must show up.
-        If this passes, `test_blocked_matches_one_shot` is inert."""
-        model, ids, cfg, reference = parity_setup
-        baseline = (run_blocked(model, ids, cfg, N_TOKENS)[0] - reference).abs().max().item()
+        If this passes, `test_blocked_matches_one_shot` is inert.
+
+        A block's own conv inputs do not round-trip through the ring, so a misplaced write
+        only corrupts the left context the next block reads. The final token's window lies
+        inside its block, so this is asserted on the recurrent state, which every earlier
+        token feeds.
+        """
+        model, ids, cfg, _, reference_state = parity_setup
+        baseline = (run_blocked(model, ids, cfg, N_TOKENS)[1] - reference_state).abs().max().item()
         mutated = (
-            (run_blocked(model, ids, cfg, N_TOKENS, conv_step_bias=1)[0] - reference)
+            (run_blocked(model, ids, cfg, N_TOKENS, conv_step_bias=1)[1] - reference_state)
             .abs()
             .max()
             .item()
@@ -448,7 +460,8 @@ class TestConvRingWrap:
         for start in range(0, 2 * width, self.MAX_Q):
             block = torch.full((1, conv_dim, 1, self.MAX_Q), float(start + 1))
             conv_step = torch.tensor([start % width], dtype=torch.int32)
-            ring = handler.conv_update_and_fetch(0, conv_step, block, self.MAX_Q)
+            handler.update_conv(0, conv_step, block, self.MAX_Q)
+            ring = handler.conv_slot(0)
 
             selector = SSMStateHandler.build_seed_selector(
                 width, kernel_window, start, self.MAX_Q, dtype=torch.float32
@@ -461,6 +474,251 @@ class TestConvRingWrap:
             # read from the end of the ring.
             if start:
                 assert torch.all(window[:, :, :kernel_window] == start - self.MAX_Q + 1)
+
+
+# ---------------------------------------------------------------------------
+# Re-sent slots
+# ---------------------------------------------------------------------------
+#
+# The engine aligns a decode block's start down to a multiple of its query length, so the
+# block re-sends the tail of what is already cached with `ssm_update_flag=0`. Those slots
+# hold values recomputed against a recurrent state that already includes them, so writing
+# them would corrupt every state. Run in float64 with large weights, so the DeltaNet output
+# is not drowned out and the comparisons can be tight.
+
+F64 = torch.float64
+
+
+def _float64_model(seed: int) -> Qwen3_5ForCausalLMForiOS:
+    torch.manual_seed(seed)
+    cfg = tiny_config()
+    model = Qwen3_5ForCausalLMForiOS(cfg, torch.device("cpu")).eval().double()
+    for p in model.parameters():  # weights large enough that DeltaNet output matters
+        if p.numel() <= 1:
+            continue
+        if p.is_floating_point():
+            p.data = torch.randn_like(p) * 0.3
+        else:  # int8 embedding table
+            p.data = torch.randint(-8, 9, p.shape, dtype=p.dtype)
+    return model
+
+
+def _float64_state(cfg):
+    return [t.double() if torch.is_tensor(t) else t for t in fresh_state(cfg)]
+
+
+def _block_call(model, state, ids, start, flag) -> torch.Tensor:
+    """One graph call on the block ``ids`` ``(1, q)`` at ``start``; returns ``(q, vocab)``."""
+    kv, v, conv, rec, dims = state
+    q = ids.shape[1]
+    with torch.no_grad():
+        out = model(
+            ids,
+            (torch.arange(q) + start).to(torch.uint16).unsqueeze(0),
+            torch.tensor([start], dtype=torch.int32),
+            causal_mask(CTX, start, q).to(F64),
+            flag.to(F64).unsqueeze(0),
+            torch.tensor([start % dims["ring_width"]], dtype=torch.int32),
+            SSMStateHandler.build_seed_selector(
+                dims["ring_width"], dims["kernel_window"], start, q, dtype=F64
+            ),
+            kv,
+            v,
+            conv,
+            rec,
+        )
+    return out.reshape(q, -1)
+
+
+def _engine_decode(model, state, ids, n_cached, query_len, flag_override=None) -> torch.Tensor:
+    """Decode token ``n_cached`` the way the static-shape engine does: the block starts at
+    ``n_cached`` aligned down to ``query_len``, re-sends the cached tail with flag 0, and
+    pads the rest with flag 0. Returns the new token's logits.
+
+    `flag_override` exists for the mutation checks: it receives the engine's flag and the
+    new token's slot, and returns the flag to send instead.
+    """
+    start = (n_cached // query_len) * query_len
+    block = torch.zeros(1, query_len, dtype=torch.int32)
+    block[0, : n_cached + 1 - start] = ids[0, start : n_cached + 1]
+    flag = torch.zeros(query_len)
+    flag[n_cached - start] = 1.0
+    if flag_override is not None:
+        flag = flag_override(flag, n_cached - start)
+    return _block_call(model, state, block, start, flag)[n_cached - start]
+
+
+def _resent_slots_as_new(flag: torch.Tensor, new_slot: int) -> torch.Tensor:
+    """Mutation: mark the re-sent slots (before the new one) as new, so they write state."""
+    flag = flag.clone()
+    flag[:new_slot] = 1.0
+    return flag
+
+
+def _turn_off_kv_gate(monkeypatch) -> None:
+    """Mutation: make the K/V write ignore `update_flag`, as a broken gate in
+    `KVCacheHandler.update_and_fetch` would."""
+    write = KVCacheHandler.update_and_fetch
+
+    def ungated(self, *args, update_flag=None, **kwargs):
+        return write(self, *args, **kwargs)
+
+    monkeypatch.setattr(KVCacheHandler, "update_and_fetch", ungated)
+
+
+def _resent_state_errors(model, n_prefill=21, query_len=8):
+    """Prefill ``n_prefill`` tokens, decode one engine-style, and return the max change of
+    the K cache, the V cache and the conv ring at the re-sent positions, plus the change of
+    the K cache at the new token's position."""
+    cfg = model.config
+    ids = torch.randint(1, cfg.vocab_size, (1, n_prefill + 1), dtype=torch.int32)
+    state = _float64_state(cfg)
+    kv, v, conv, _, dims = state
+
+    # Prefill in one call: every slot is new.
+    _block_call(model, state, ids[:, :n_prefill], 0, torch.ones(n_prefill))
+    assert kv.abs().max() > 0 and conv.abs().max() > 0, "prefill wrote no state"
+    kv0, v0, conv0 = kv.clone(), v.clone(), conv.clone()
+
+    _engine_decode(model, state, ids, n_prefill, query_len)
+
+    start = (n_prefill // query_len) * query_len
+    resent = list(range(start, n_prefill))
+    cols = [p % dims["ring_width"] for p in resent]
+    kv_err = (kv[..., resent] - kv0[..., resent]).abs().max().item()
+    v_err = (v[..., resent] - v0[..., resent]).abs().max().item()
+    conv_err = max(
+        (conv[i][..., cols] - conv0[i][..., cols]).abs().max().item() for i in range(conv.shape[0])
+    )
+    new_slot_change = (kv[..., n_prefill] - kv0[..., n_prefill]).abs().max().item()
+    return kv_err, v_err, conv_err, new_slot_change
+
+
+def test_resent_slots_do_not_modify_kv_or_conv_state():
+    """A q=8 decode after a 21-token prefill starts at 16 and re-sends 16..20 with flag 0.
+    Those slots must leave the K/V cache and the conv ring as prefill wrote them."""
+    kv_err, v_err, conv_err, new_slot_change = _resent_state_errors(_float64_model(seed=2))
+    assert kv_err < 1e-9, f"re-sent slots overwrote K cache (max diff {kv_err:.3e})"
+    assert v_err < 1e-9, f"re-sent slots overwrote V cache (max diff {v_err:.3e})"
+    assert conv_err < 1e-9, f"re-sent slots overwrote conv ring (max diff {conv_err:.3e})"
+    # The new slot itself must still be written.
+    assert new_slot_change > 1e-6
+
+
+def test_ungated_kv_write_breaks_the_resent_state_check(monkeypatch):
+    """Mutation check: with the K/V gate off, re-sent slots overwrite the K and V cache, so
+    `test_resent_slots_do_not_modify_kv_or_conv_state` would fail."""
+    _turn_off_kv_gate(monkeypatch)
+    kv_err, v_err, _, _ = _resent_state_errors(_float64_model(seed=2))
+    assert kv_err > 1e-6 and v_err > 1e-6, f"K err {kv_err:.3e}, V err {v_err:.3e}"
+
+
+@pytest.fixture(scope="module")
+def resend_float64_setup():
+    model = _float64_model(seed=5)
+    cfg = model.config
+    n_max = 32
+    ids = torch.randint(1, cfg.vocab_size, (1, n_max), dtype=torch.int32)
+    # Every position's logits from one uninterrupted call.
+    reference = _block_call(model, _float64_state(cfg), ids, 0, torch.ones(n_max))
+    return model, ids, reference
+
+
+class TestResentSlotEquivalence:
+    """The new token's logits from an engine-style block, which re-sends the cached tail,
+    must match decoding that token with no re-sent slots at all."""
+
+    # Relative to the largest reference value. Float64 leaves only rounding error, which the
+    # differently chunked delta rule and the large weights amplify to ~1e-9; the bug is ~1e-1.
+    TOLERANCE = 1e-7
+    DECODE_STEPS = 3
+    # A mutation must exceed the baseline error by this factor, and the tolerance as well.
+    MUTATION_RATIO = 100.0
+
+    def _one_shot_error(self, setup, n_prefill, query_len, flag_override=None):
+        """Max logit error, relative to the reference's scale, over the decode steps."""
+        model, ids, reference = setup
+        state = _float64_state(model.config)
+        _block_call(model, state, ids[:, :n_prefill], 0, torch.ones(n_prefill))
+        worst = 0.0
+        for pos in range(n_prefill, n_prefill + self.DECODE_STEPS):
+            got = _engine_decode(model, state, ids, pos, query_len, flag_override)
+            worst = max(
+                worst,
+                (got - reference[pos]).abs().max().item() / reference[pos].abs().max().item(),
+            )
+        return worst
+
+    @pytest.mark.parametrize("query_len", [DECODE_QUERY_LEN, PREFILL_QUERY_LEN])
+    @pytest.mark.parametrize("n_prefill", [17, 21, 23])
+    def test_engine_decode_matches_one_shot(self, resend_float64_setup, n_prefill, query_len):
+        """Prefill, then decode several tokens engine-style. Each new token's logits must
+        match one uninterrupted call over the whole sequence."""
+        model, ids, reference = resend_float64_setup
+        assert n_prefill % query_len, "test must re-send: pick n_prefill off a block boundary"
+        state = _float64_state(model.config)
+        _block_call(model, state, ids[:, :n_prefill], 0, torch.ones(n_prefill))
+        for pos in range(n_prefill, n_prefill + self.DECODE_STEPS):
+            got = _engine_decode(model, state, ids, pos, query_len)
+            scale = reference[pos].abs().max().item()
+            err = (got - reference[pos]).abs().max().item()
+            assert err < self.TOLERANCE * scale, f"token {pos}: max diff {err:.3e}"
+
+    @pytest.mark.parametrize("query_len", [DECODE_QUERY_LEN, PREFILL_QUERY_LEN])
+    @pytest.mark.parametrize("n_prefill", [17, 21, 23])
+    def test_engine_decode_matches_single_slot_decode(
+        self, resend_float64_setup, n_prefill, query_len
+    ):
+        """The same decode as a one-slot call at the new token's own position, so no slot
+        is re-sent; both start from the same prefill."""
+        model, ids, _ = resend_float64_setup
+        engine, single = _float64_state(model.config), _float64_state(model.config)
+        for state in (engine, single):
+            _block_call(model, state, ids[:, :n_prefill], 0, torch.ones(n_prefill))
+        got = _engine_decode(model, engine, ids, n_prefill, query_len)
+        expected = _block_call(
+            model, single, ids[:, n_prefill : n_prefill + 1], n_prefill, torch.ones(1)
+        )[0]
+        scale = expected.abs().max().item()
+        assert (got - expected).abs().max().item() < self.TOLERANCE * scale
+        # Every state must agree as well, at the positions both calls own.
+        kv_e, v_e, conv_e, rec_e, dims = engine
+        kv_s, v_s, conv_s, rec_s, _ = single
+        written = list(range(n_prefill + 1))
+        cols = [p % dims["ring_width"] for p in written]
+        for a, b in (
+            (kv_e[..., written], kv_s[..., written]),
+            (v_e[..., written], v_s[..., written]),
+            (conv_e[..., cols], conv_s[..., cols]),
+            (rec_e, rec_s),
+        ):
+            assert (a - b).abs().max().item() < self.TOLERANCE * b.abs().max().item()
+
+    # -- mutation checks: prove the tolerances above catch a broken gate --
+
+    @pytest.mark.parametrize("query_len", [DECODE_QUERY_LEN, PREFILL_QUERY_LEN])
+    def test_resent_slots_flagged_new_break_one_shot_parity(self, resend_float64_setup, query_len):
+        """Mutation check: re-sent slots sent with flag 1 rewrite every state, and the
+        logit error must exceed both `TOLERANCE` and the baseline by `MUTATION_RATIO`."""
+        baseline = self._one_shot_error(resend_float64_setup, 21, query_len)
+        mutated = self._one_shot_error(
+            resend_float64_setup, 21, query_len, flag_override=_resent_slots_as_new
+        )
+        assert mutated > self.MUTATION_RATIO * self.TOLERANCE, f"mutated error {mutated:.3e}"
+        assert mutated > self.MUTATION_RATIO * baseline, f"{mutated:.3e} vs {baseline:.3e}"
+
+    @pytest.mark.parametrize("query_len", [DECODE_QUERY_LEN, PREFILL_QUERY_LEN])
+    def test_ungated_kv_write_breaks_one_shot_parity(
+        self, resend_float64_setup, query_len, monkeypatch
+    ):
+        """Mutation check for the K/V gate alone: with `update_and_fetch` ignoring
+        `update_flag`, the re-sent slots overwrite the K/V cache and the logit error must
+        exceed both `TOLERANCE` and the baseline by `MUTATION_RATIO`."""
+        baseline = self._one_shot_error(resend_float64_setup, 21, query_len)
+        _turn_off_kv_gate(monkeypatch)
+        mutated = self._one_shot_error(resend_float64_setup, 21, query_len)
+        assert mutated > self.MUTATION_RATIO * self.TOLERANCE, f"mutated error {mutated:.3e}"
+        assert mutated > self.MUTATION_RATIO * baseline, f"{mutated:.3e} vs {baseline:.3e}"
 
 
 # ---------------------------------------------------------------------------
