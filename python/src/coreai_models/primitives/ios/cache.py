@@ -124,6 +124,7 @@ class KVCacheHandler:
         k: torch.Tensor,
         v: torch.Tensor,
         num_token_updates: int,
+        update_flag: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Update the KV cache for a specific layer and return the updated cache for that layer.
@@ -134,6 +135,9 @@ class KVCacheHandler:
             k: New key tensor to insert into the cache
             v: New value tensor to insert into the cache
             num_token_updates: Number of tokens being updated
+            update_flag: Optional ``(1, num_token_updates)`` with 1.0 for slots whose K/V
+                should be written and 0.0 for slots that must keep the value already cached
+                at that position. ``None`` writes every slot.
 
         Returns:
             Tuple of (key_cache, value_cache) for the specified layer
@@ -152,6 +156,10 @@ class KVCacheHandler:
             layer_idx < self._v_cache.size(0),
             message="layer index < number of transformer layers",
         )
+
+        if update_flag is not None:
+            k = self._keep_unflagged(self._k_cache, layer_idx, offset, k, update_flag)
+            v = self._keep_unflagged(self._v_cache, layer_idx, offset, v, update_flag)
 
         begin, end = self.gen_slice_args(layer_idx, offset, num_token_updates)
 
@@ -178,6 +186,31 @@ class KVCacheHandler:
         )
 
         return k_out, v_out
+
+    @staticmethod
+    def _keep_unflagged(
+        cache: torch.Tensor,
+        layer_idx: int,
+        offset: torch.IntTensor,
+        update: torch.Tensor,
+        update_flag: torch.Tensor,
+    ) -> torch.Tensor:
+        """Blend ``update`` with the values already cached at its positions.
+
+        Returns ``flag * update + (1 - flag) * cached``, so writing the result leaves slots with
+        flag 0.0 unchanged. The cached block is a slice of fixed width at the runtime
+        ``offset``, the read counterpart of the write's slice update.
+        """
+        num_tokens = update.shape[-1]
+        start = offset[0].item()
+        torch._check_is_size(start, message="cache offset >= 0")
+        torch._check(
+            start + num_tokens <= cache.size(-1),
+            message="cache offset + query length <= context size",
+        )
+        cached = cache[layer_idx].narrow(-1, start, num_tokens)  # (1, hidden, 1, num_tokens)
+        flag = update_flag.to(update.dtype).reshape(1, 1, 1, num_tokens)
+        return flag * update + (1 - flag) * cached
 
     @property
     def k_cache(self) -> torch.Tensor:
