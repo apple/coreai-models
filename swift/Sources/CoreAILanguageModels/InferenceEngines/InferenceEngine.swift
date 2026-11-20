@@ -309,6 +309,17 @@ extension InferenceEngine {
     public var hasRecurrentState: Bool { false }
 }
 
+/// How far back a state set can rewind its processed state. An engine whose states are
+/// `.startOnly` reports ``InferenceEngine/hasRecurrentState``.
+public enum RollbackCapability: Sendable, Equatable {
+    /// Partial rewind is supported: every state is a cache indexed by position. A rewind can
+    /// still be refused once a sliding-window ring has overwritten the keys it needs.
+    case anyPosition
+    /// Only back to 0 (or to the current position, a no-op): a recurrent or conv state
+    /// summarizes the whole prefix, so rewinding means clearing it and replaying the prompt.
+    case startOnly
+}
+
 extension InferenceEngine {
     public var prefixCacheEnabled: Bool { false }
     public func shedPrefixCache() -> Int { 0 }

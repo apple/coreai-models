@@ -75,6 +75,11 @@ class StaticStateStorage {
 /// slices to whatever the running function declares, so that case needs no
 /// re-layout — the storage underneath is already the one the program indexes.
 final class FixedStaticState: StaticStateStorage {
+    /// A saved copy of every state, allocated on the first ``saveCheckpoint(at:)``.
+    private var checkpointArrays: [String: NDArray] = [:]
+    /// The position the saved copy was taken at; nil when there is none to restore.
+    private(set) var checkpointPosition: Int?
+
     init(states: [(name: String, descriptor: NDArrayDescriptor)]) {
         var arrays: [String: NDArray] = [:]
         for (name, descriptor) in states {
@@ -86,6 +91,41 @@ final class FixedStaticState: StaticStateStorage {
                     + "(fixed, shape \(descriptor.shape))")
         }
         super.init(stateNames: states.map(\.name), arrays: arrays)
+    }
+
+    /// Wraps arrays allocated elsewhere. Internal for testing.
+    init(arrays: [String: NDArray]) {
+        super.init(stateNames: arrays.keys.sorted(), arrays: arrays)
+    }
+
+    /// Saves a copy of every state, as the states at `position`.
+    func saveCheckpoint(at position: Int) {
+        for name in stateNames {
+            if checkpointArrays[name] == nil {
+                // A byte-for-byte copy, so it needs only the same element count and type.
+                checkpointArrays[name] = NDArray(shape: arrays[name]!.shape, scalarType: arrays[name]!.scalarType)
+            }
+            copyNDArrayContents(from: arrays[name]!, to: &checkpointArrays[name]!)
+        }
+        checkpointPosition = position
+    }
+
+    /// Puts the saved copy back. The copy stays, so it can be restored again.
+    func restoreCheckpoint() {
+        precondition(checkpointPosition != nil, "restoreCheckpoint without a saved copy")
+        for name in stateNames {
+            copyNDArrayContents(from: checkpointArrays[name]!, to: &arrays[name]!)
+        }
+    }
+
+    /// Forgets the saved copy; its buffers are kept for the next save.
+    func discardCheckpoint() {
+        checkpointPosition = nil
+    }
+
+    override func reset() {
+        super.reset()
+        discardCheckpoint()
     }
 }
 
@@ -334,11 +374,29 @@ struct StaticStateSet {
     /// The sliding-window ring among the fixed states, when the asset has one.
     let slidingRing: SlidingRing?
 
+    /// How far back these states can be rewound. `.startOnly` when any state is declared
+    /// `fixed`: a conv or recurrent state that summarizes the whole prefix.
+    let rollback: RollbackCapability
+
+    init(
+        bucketed: BucketedStaticState?,
+        fixed: FixedStaticState?,
+        slidingRing: SlidingRing?,
+        rollback: RollbackCapability = .anyPosition
+    ) {
+        self.bucketed = bucketed
+        self.fixed = fixed
+        self.slidingRing = slidingRing
+        self.rollback = rollback
+    }
+
     /// Whether the states can be truncated from `processed` back to `target`
     /// positions. Flat caches always can; a sliding-window ring only while it still
-    /// holds the keys the next query needs.
+    /// holds the keys the next query needs; a `.startOnly` set only back to 0, or to
+    /// `processed` itself (a no-op).
     func canTruncate(processed: Int, to target: Int, alignment: Int = 1) -> Bool {
-        slidingRing?.allowsRewind(processed: processed, to: target, alignment: alignment) ?? true
+        if rollback == .startOnly && target != 0 && target != processed { return false }
+        return slidingRing?.allowsRewind(processed: processed, to: target, alignment: alignment) ?? true
     }
 
     /// A state's backing array, from whichever handler owns it; nil when none does. Lets a draft
@@ -375,10 +433,12 @@ enum StaticStateFactory {
     ///     state names and to size fixed states.
     ///   - slidingWindow: The model's sliding-attention window, if it has one. With a
     ///     ``SlidingRing/keyCacheName`` state it describes the set's sliding ring.
+    ///   - stateKinds: The bundle's declared state kinds (`metadata.json` `states`), if any.
     static func makeStateSet(
         descriptorsByContext: [Int: InferenceFunctionDescriptor],
         referenceDescriptor: InferenceFunctionDescriptor,
-        slidingWindow: Int?
+        slidingWindow: Int?,
+        stateKinds: [String: StateKind]? = nil
     ) throws -> StaticStateSet {
         let names = referenceDescriptor.stateNames
 
@@ -431,7 +491,16 @@ enum StaticStateFactory {
             slidingRing = SlidingRing(depth: depth, window: slidingWindow)
         }
 
-        return StaticStateSet(bucketed: bucketed, fixed: fixed, slidingRing: slidingRing)
+        return StaticStateSet(
+            bucketed: bucketed, fixed: fixed, slidingRing: slidingRing,
+            rollback: rollback(stateNames: names, stateKinds: stateKinds))
+    }
+
+    /// `.startOnly` when any state is declared `fixed`. Internal for testing.
+    static func rollback(
+        stateNames: [String], stateKinds: [String: StateKind]?
+    ) -> RollbackCapability {
+        stateNames.contains { stateKinds?[$0] == .fixed } ? .startOnly : .anyPosition
     }
 
     /// Whether a state needs its own buffer per context bucket.

@@ -25,22 +25,6 @@ package enum SpeculativeDecodingOptions {
         return nil
     }
 
-    /// Sampling needs the draft distribution, which only a draft model supplies. Prompt lookup and
-    /// the draft head propose tokens without one, so they require greedy decoding, also when a draft
-    /// model is given as well.
-    package static func samplingProblem(greedy: Bool, promptLookup: Bool, draftHead: Bool = false) -> String? {
-        guard !greedy else { return nil }
-        if promptLookup {
-            return
-                "--prompt-lookup does not support sampling (it supplies no draft logits); use --sampling-strategy greedy"
-        }
-        if draftHead {
-            return
-                "--speculative does not support sampling (the draft head supplies no draft logits); use --sampling-strategy greedy"
-        }
-        return nil
-    }
-
     /// `--speculative` drafts with the bundle's draft head, so it excludes a separate `--draft-model`,
     /// and `--drafter-top-k`, which configures the head's scan, needs it and a positive count.
     package static func draftHeadProblem(draftHead: Bool, draftModel: Bool, drafterTopK: Int?) -> String? {

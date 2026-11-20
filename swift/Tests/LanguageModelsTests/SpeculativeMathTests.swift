@@ -101,4 +101,37 @@ struct SpeculativeMathTests {
         #expect(SpeculativeMath.sampleResidual(p: p, q: [0.5, 1, 0.5], using: &rng) == 1)
         #expect(SpeculativeMath.sampleResidual(p: [], q: [], using: &rng) == 0)
     }
+
+    @Test("sampleExcluding draws from p without the token, as sampleResidual does for a point mass")
+    func excludingMatchesPointMassResidual() {
+        let p: [Float] = [0.5, 0.1, 0.3, 0.1]
+        // Without token 0: [0.1, 0.3, 0.1] / 0.5 → [0.2, 0.6, 0.2]
+        var rng = SeededRandomNumberGenerator(seed: 11)
+        var counts = [Int](repeating: 0, count: 4)
+        let n = 20_000
+        for _ in 0..<n {
+            var copy = p
+            counts[Int(SpeculativeMath.sampleExcluding(0, from: &copy, using: &rng))] += 1
+        }
+        #expect(counts[0] == 0)
+        for (i, want) in [(1, 0.2), (2, 0.6), (3, 0.2)] {
+            #expect(abs(Double(counts[i]) / Double(n) - want) < 0.02, "token \(i): \(counts)")
+        }
+        // Same draws as the residual against an explicit one-hot q.
+        var a = SeededRandomNumberGenerator(seed: 5)
+        var b = SeededRandomNumberGenerator(seed: 5)
+        for _ in 0..<500 {
+            var copy = p
+            #expect(
+                SpeculativeMath.sampleExcluding(2, from: &copy, using: &a)
+                    == SpeculativeMath.sampleResidual(p: p, q: [0, 0, 1, 0], using: &b))
+        }
+    }
+
+    @Test("sampleExcluding returns the token when no other token has mass")
+    func excludingDegenerate() {
+        var rng = SeededRandomNumberGenerator(seed: 3)
+        var p: [Float] = [0, 1, 0]
+        #expect(SpeculativeMath.sampleExcluding(1, from: &p, using: &rng) == 1)
+    }
 }

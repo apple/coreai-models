@@ -53,8 +53,8 @@ except ImportError:  # pragma: no cover - depends on the installed transformers
 # `recurrent_state` are mutable in-graph state like the KV cache: passed in, updated in
 # place, rebound by the runtime, with no separate `new_*` output.
 #
-# `ssm_update_flag`: 1.0 for slots holding a new token; re-sent and padding slots must not
-# update the recurrent state.
+# `ssm_update_flag`: 1.0 for slots holding a new token. Re-sent and padding slots (0.0) must
+# leave every state as it was: the recurrent state, the conv ring and the KV cache.
 #
 # `conv_step`: the block's start modulo the ring width, where this call writes.
 # `conv_seed_selector` is the one-hot that reads the block's whole conv window back out of
@@ -178,13 +178,19 @@ class GatedDeltaNet(nn.Module):
         a = self.in_proj_a(xt)  # (B, num_v_heads, 1, S)
         bproj = self.in_proj_b(xt)  # (B, num_v_heads, 1, S)
 
-        # Write this block into the conv ring, then read the causal window back through the
-        # one-hot selector.
-        ring = delta_state.conv_update_and_fetch(
-            self.delta_idx, conv_step, qkv, s
-        )  # (1, conv_dim, 1, ring_width)
-        # (1, conv_dim, 1, W) @ (1, W, K-1+S) -> (1, conv_dim, 1, K-1+S).
-        conv_in = ring @ conv_seed_selector
+        # Read the causal window out of the ring through the one-hot selector before this
+        # block is written: (1, conv_dim, 1, W) @ (1, W, K-1+S) -> (1, conv_dim, 1, K-1+S).
+        # Its last S columns are what the ring holds at the block's own positions.
+        window = delta_state.conv_slot(self.delta_idx) @ conv_seed_selector
+        kernel_window = window.shape[-1] - s
+        # Re-sent and padding slots (flag=0) keep the ring's value, so the write is a no-op
+        # for them and the conv sees the inputs the call that first wrote them computed.
+        flag = ssm_update_flag.reshape(b, 1, 1, s)
+        qkv = flag * qkv + (1 - flag) * window[..., kernel_window:]
+        delta_state.update_conv(self.delta_idx, conv_step, qkv, s)
+        # The ring is at least K-1 + MAX_QUERY_LEN wide, so the block's columns never overlap
+        # the window's left context, which the write therefore leaves unchanged.
+        conv_in = torch.cat([window[..., :kernel_window], qkv], dim=-1)
         conv_out = self._depthwise_conv(conv_in)  # (B, conv_dim, 1, S)
         conv_out = torch.nn.functional.silu(conv_out)
 
@@ -236,7 +242,7 @@ class GatedDeltaNet(nn.Module):
         out = self.out_proj(core.transpose(-3, -1)).transpose(-3, -1)  # (B,S,1,hidden)
 
         # Overwrite this layer's recurrent slot in place (mutable state); the conv ring
-        # was already written above, before its window was read back.
+        # was already written above.
         delta_state.update_recurrent(self.delta_idx, new_recurrent_state)
         return out
 
@@ -403,6 +409,7 @@ class Attention(nn.Module):
         rope_sin: torch.Tensor,
         in_step: torch.IntTensor,
         causal_mask: torch.Tensor,
+        ssm_update_flag: torch.Tensor,
         cache: KVCacheHandler | None,
     ) -> torch.Tensor:
         b, q, _, _ = x.shape
@@ -429,7 +436,11 @@ class Attention(nn.Module):
         value = value.transpose(-2, -3).reshape(b, q, 1, n_kv_heads * hd).transpose(-3, -1)
 
         if cache is not None:
-            key, value = cache.update_and_fetch(self.attn_idx, in_step, key, value, q)
+            # Slots with flag 0 keep the cached K/V, so the fetched row attention reads holds
+            # the values the call that first wrote those positions computed.
+            key, value = cache.update_and_fetch(
+                self.attn_idx, in_step, key, value, q, update_flag=ssm_update_flag
+            )
 
         output = self.sdpa(query, key, value, causal_mask)  # (B, n_heads*hd, 1, q)
         gate_t = gate.reshape(b, q, 1, n_heads * hd).transpose(-3, -1)  # (B, n_heads*hd, 1, q)
@@ -474,7 +485,7 @@ class DecoderLayer(nn.Module):
         if self.block_type == "linear_attention":
             r = self.linear_attn(h, delta_state, ssm_update_flag, conv_step, conv_seed_selector)
         else:
-            r = self.self_attn(h, rope_cos, rope_sin, in_step, causal_mask, cache)
+            r = self.self_attn(h, rope_cos, rope_sin, in_step, causal_mask, ssm_update_flag, cache)
         x = x + r
         r = self.mlp(self.post_attention_layernorm(x))
         return x + r
