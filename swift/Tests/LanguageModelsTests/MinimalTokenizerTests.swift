@@ -130,3 +130,30 @@ struct ByteLevelIssue139RegressionTests {
         #expect(continuation.contains(5), "Continuation should have B (5)")
     }
 }
+
+// MARK: - Split Pre-Tokenizer Code-Point Matching
+//
+// `QwenSplitTokenizer` keeps the Qwen2/Qwen3 normalizer and pre-tokenizer, the 256 byte-level
+// tokens, and only the merges this text needs, with the token ids of Qwen3. Hugging Face matches
+// the Split regex per code point. swift-transformers before 1.4.0 matched it per grapheme cluster,
+// so a Thai vowel sign joined the letter before it and the text split into different words
+// (`[35648, 124294, 35648, 124311, 125459, 220, 138294, 138759]`).
+
+@Suite("Split pre-tokenizer")
+struct SplitPreTokenizerTests {
+    @Test("Thai splits per code point, as in Hugging Face")
+    func thaiMatchesHuggingFace() async throws {
+        let tokenizerURL = try #require(TestResources.url(for: "QwenSplitTokenizer"))
+        let tokenizer = try await AutoTokenizer.from(modelFolder: tokenizerURL)
+        let text = "สวัสดีครับ ยินดีต้อนรับ"
+
+        // From the Python `tokenizers` library on the same tokenizer.json, and on the full Qwen3 one.
+        let expected = [
+            143126, 23271, 125136, 28319, 123886, 83546, 220, 34509, 85045, 37033, 28319, 39855, 125820,
+            22287, 83546,
+        ]
+        let ids = tokenizer.encode(text: text, addSpecialTokens: false)
+        #expect(ids == expected)
+        #expect(tokenizer.decode(tokens: ids) == text)
+    }
+}

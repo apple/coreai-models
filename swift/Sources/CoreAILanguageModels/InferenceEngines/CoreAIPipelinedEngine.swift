@@ -27,7 +27,6 @@ private func milliseconds(since start: ContinuousClock.Instant) -> Double {
 /// the same memory.
 private let pipelineDepth = 3
 private let averageExpectedPromptSize = 256
-private let temperatureTolerance: Double = 0.001
 
 /// MPSNDArray enforces 64-byte row-stride alignment on backing buffers.
 private let minimumMPSNDArrayBufferSize = 64
@@ -691,8 +690,9 @@ struct EngineImpl: ~Copyable {
 
     // GPU sampler — reuses MPSGraphSampler from MPSGraphSamplers.swift
     var cachedSampler: (any MPSGraphSampler)?
-    var cachedSamplerTemperature: Double?
+    var cachedSamplerConfig: SamplingConfiguration?
     var penaltyState: RepetitionPenaltyGPUState?
+    var additivePenaltyState: AdditivePenaltyGPUState?
     // No step using `penaltyState` is in flight; set by the end-of-generation sentinel and reset().
     var penaltyStateIdle = true
 
@@ -956,38 +956,25 @@ struct EngineImpl: ~Copyable {
             classified: classified, descriptor: descriptor)
         self.logits = logitsRef
         self.cachedSampler = nil
-        self.cachedSamplerTemperature = nil
+        self.cachedSamplerConfig = nil
+        self.penaltyState = nil
+        self.additivePenaltyState = nil
 
         CLILogger.log("CoreAI pipelined engine initialized — Vocab: \(config.vocabSize)")
     }
 
     // MARK: - Sampler
 
+    /// Returns the cached sampler when `config` matches the one it was built for, else builds a
+    /// new one. Steps already in flight keep the sampler they were given.
     private mutating func getOrCreateSampler(for config: SamplingConfiguration) throws -> any MPSGraphSampler {
         let config = config.normalized()
-        let temperature = config.temperature
-
-        if let existingSampler = cachedSampler, let existingTemp = cachedSamplerTemperature {
-            let existingIsGreedy = existingTemp == 0
-            let requestedIsGreedy = temperature == 0
-
-            if existingIsGreedy != requestedIsGreedy {
-                throw InferenceRuntimeError.genericError(
-                    "Sampling configuration changed mid-generation. Call reset() first.")
-            }
-            if !existingIsGreedy && !requestedIsGreedy
-                && abs(existingTemp - temperature) > temperatureTolerance
-            {
-                throw InferenceRuntimeError.genericError(
-                    "Temperature changed mid-generation (\(existingTemp) -> \(temperature)). Call reset() first.")
-            }
-            // The penalty stage is compiled into the graph; rebuild when this request needs it.
-            let cachedPenaltyEnabled = (existingSampler as? MPSGraphCompositeSampler)?.penaltyEnabled ?? false
-            if cachedPenaltyEnabled || !config.needsRepetitionPenalty {
-                return existingSampler
-            }
+        if let cachedSampler, cachedSamplerConfig == config {
+            return cachedSampler
         }
 
+        // The repetition-penalty stage is compiled into the composite graph only; the argmax
+        // sampler has none (it does have the additive frequency/presence/logit-bias stage).
         if config.needsRepetitionPenalty && config.temperature == 0 {
             throw InferenceRuntimeError.invalidArgument(
                 "Repetition penalty with greedy sampling is not supported on pipelined engine. "
@@ -1000,7 +987,7 @@ struct EngineImpl: ~Copyable {
             config: config
         )
         cachedSampler = newSampler
-        cachedSamplerTemperature = temperature
+        cachedSamplerConfig = config
         return newSampler
     }
 
@@ -1176,7 +1163,7 @@ struct EngineImpl: ~Copyable {
         let localGPUSampler = gpuSampler
         let outputBuffer = decodeOutputBuffers[step % pipelineDepth]
         let samplerStrategy = gpuSampler is MPSGraphArgmaxSampler ? "GPU-argmax" : "GPU-composite"
-        let samplerTemperature = cachedSamplerTemperature ?? 0.0
+        let samplerTemperature = cachedSamplerConfig?.temperature ?? 0.0
 
         let sampleSpan = InstrumentsProfiler.beginSampleEncoding(
             step: currentStep, strategy: samplerStrategy, temperature: samplerTemperature)
@@ -1184,10 +1171,12 @@ struct EngineImpl: ~Copyable {
         let queue = pipelineQueue
         let localInFlightGate = inFlightGate
         let localPenaltyState = penaltyState
+        let localAdditiveState = additivePenaltyState
         let localGPUErrors = gpuErrors
         let completionCallback: (Int32, Error?) -> Void = { nextToken, error in
-            // Update penalty state BEFORE releasing the gate.
+            // Update penalty/additive state BEFORE releasing the gate.
             localPenaltyState?.recordToken(nextToken)
+            localAdditiveState?.recordToken(nextToken)
             // Release the pipeline slot acquired before encode. Happens on
             // Metal's callback thread — PipelineGate.release() is thread-safe.
             localInFlightGate.release()
@@ -1205,17 +1194,34 @@ struct EngineImpl: ~Copyable {
         }
 
         do {
-            // Use penalty-aware path for decode steps when penalty is active.
-            if queryLength == 1, let state = penaltyState,
-                let compositeSampler = localGPUSampler as? MPSGraphCompositeSampler,
-                compositeSampler.penaltyEnabled
+            if queryLength == 1, let compositeSampler = localGPUSampler as? MPSGraphCompositeSampler,
+                compositeSampler.penaltyEnabled || compositeSampler.additiveEnabled
             {
-                let penaltyBuf = state.buffer(forStep: currentStep)
+                // Composite decode with repetition penalty and/or additive delta. Each buffer is
+                // fetched only when used, so its slot's queued increments are consumed exactly once.
+                let penaltyBuf = compositeSampler.penaltyEnabled ? penaltyState?.buffer(forStep: currentStep) : nil
+                let additiveBuf =
+                    compositeSampler.additiveEnabled ? additivePenaltyState?.buffer(forStep: currentStep) : nil
                 compositeSampler.encode(
                     to: queue,
                     logitsBuffer: samplerLogitsBuffer,
                     logitsOffset: logitsOffset,
                     penaltyBuffer: penaltyBuf,
+                    additiveBuffer: additiveBuf,
+                    outputBuffer: outputBuffer,
+                    outputOffset: 0,
+                    completion: completionCallback
+                )
+            } else if queryLength == 1, let argmaxSampler = localGPUSampler as? MPSGraphArgmaxSampler,
+                argmaxSampler.additiveEnabled
+            {
+                // Greedy decode with an additive delta (frequency/presence penalty + logit bias).
+                let additiveBuf = additivePenaltyState?.buffer(forStep: currentStep)
+                argmaxSampler.encode(
+                    to: queue,
+                    logitsBuffer: samplerLogitsBuffer,
+                    logitsOffset: logitsOffset,
+                    additiveBuffer: additiveBuf,
                     outputBuffer: outputBuffer,
                     outputOffset: 0,
                     completion: completionCallback
@@ -1225,6 +1231,36 @@ struct EngineImpl: ~Copyable {
                     to: queue,
                     logitsBuffer: samplerLogitsBuffer,
                     logitsOffset: logitsOffset,
+                    outputBuffer: outputBuffer,
+                    outputOffset: 0,
+                    completion: completionCallback
+                )
+            } else if let compositeSampler = localGPUSampler as? MPSGraphCompositeSampler,
+                compositeSampler.additiveEnabled
+            {
+                // Prefill's first token with an additive delta (composite path). The multiplicative
+                // repetition penalty is intentionally not applied during prefill, matching the
+                // existing behavior; the additive delta at this point is just the static bias.
+                let additiveBuf = additivePenaltyState?.buffer(forStep: currentStep)
+                compositeSampler.encodeWithSlice(
+                    to: queue,
+                    logitsBuffer: samplerLogitsBuffer,
+                    queryLength: actualTokenCount,
+                    additiveBuffer: additiveBuf,
+                    outputBuffer: outputBuffer,
+                    outputOffset: 0,
+                    completion: completionCallback
+                )
+            } else if let argmaxSampler = localGPUSampler as? MPSGraphArgmaxSampler,
+                argmaxSampler.additiveEnabled
+            {
+                // Prefill's first token with an additive delta (greedy path).
+                let additiveBuf = additivePenaltyState?.buffer(forStep: currentStep)
+                argmaxSampler.encodeWithSlice(
+                    to: queue,
+                    logitsBuffer: samplerLogitsBuffer,
+                    queryLength: actualTokenCount,
+                    additiveBuffer: additiveBuf,
                     outputBuffer: outputBuffer,
                     outputOffset: 0,
                     completion: completionCallback
@@ -1349,8 +1385,24 @@ struct EngineImpl: ~Copyable {
             vocabSize: config.vocabSize,
             pipelineDepth: pipelineDepth,
             penalty: sampler.needsRepetitionPenalty ? sampler.repetitionPenalty : nil,
-            windowSize: sampler.repetitionPenaltyWindow
+            // nil window means "all history" (SamplingConfiguration contract); the GPU ring is
+            // fixed-size, so size it to the max possible history to match the CPU path.
+            windowSize: sampler.repetitionPenaltyWindow ?? config.maxContextLength
         )
+        // Additive penalties keep per-generation history too. The delta baseline carries this
+        // request's logit bias, so build it fresh; steps still in flight hold their own reference.
+        additivePenaltyState =
+            sampler.needsAdditiveLogitProcessing
+            ? try AdditivePenaltyGPUState(
+                device: device,
+                vocabSize: config.vocabSize,
+                pipelineDepth: pipelineDepth,
+                frequencyPenalty: sampler.frequencyPenalty ?? 0,
+                presencePenalty: sampler.presencePenalty ?? 0,
+                logitBias: sampler.logitBias,
+                windowSize: sampler.repetitionPenaltyWindow ?? config.maxContextLength
+            )
+            : nil
         penaltyStateIdle = false
 
         // Prefill the prompt, then sample from the tokens prefill left behind.
@@ -1972,10 +2024,11 @@ struct EngineImpl: ~Copyable {
         processedTokenCount = 0
         step = 0
         cachedSampler = nil
-        cachedSamplerTemperature = nil
+        cachedSamplerConfig = nil
         // Steps still in flight hold their own reference.
         penaltyState = nil
         penaltyStateIdle = true
+        additivePenaltyState = nil
         // Zero SSM states so the next conversation starts from a clean slate.
         additionalStates?.reset()
         snapshotPositions = []
