@@ -15,12 +15,13 @@ import Testing
 @Suite("VanillaDecodingStrategy — how a stream ends")
 struct VanillaDecodingStopTests {
     private func decode(
-        _ engine: MockEngine, maxTokens: Int, stops: [[Int32]] = []
+        _ engine: MockEngine, maxTokens: Int, stops: [[Int32]] = [], recordTokenIds: Bool = false
     ) async throws -> VanillaDecodingStrategy.VanillaDecodedSequence {
         try await VanillaDecodingStrategy().decode(
             from: .tokens([1]), tokenizer: MockTokenizer(), inferenceEngine: engine,
             samplingConfiguration: .greedy, options: InferenceOptions(maxTokens: maxTokens),
-            stopSequences: StopSequences(sequences: stops))
+            decoderOptions: DecoderOptions(
+                stopSequences: StopSequences(sequences: stops), recordTokenIds: recordTokenIds))
     }
 
     /// Every result's text, and how many results there were.
@@ -65,6 +66,39 @@ struct VanillaDecodingStopTests {
         #expect(stream.tokensGenerated == 3)
         // Draining would have run the engine to all 100.
         #expect(engine.inferenceCallCount == 3)
+    }
+
+    @Test("Token IDs are recorded only when asked for")
+    func tokenIdsOnlyWhenAsked() async throws {
+        let stream = try await decode(MockEngine(tokens: [104, 105, 33]), maxTokens: 100, stops: [[33]])
+        _ = try await read(stream)
+        #expect(stream.generatedTokenIds == nil)
+    }
+
+    @Test("Recorded token IDs are every generated token: those with no text and the stop token too")
+    func tokenIdsMatchTheCount() async throws {
+        // 0xC3 yields no result of its own; "!" ends the reply.
+        let stream = try await decode(
+            MockEngine(tokens: [104, 0xC3, 0xA9, 33]), maxTokens: 100, stops: [[33]], recordTokenIds: true)
+        let (text, _) = try await read(stream)
+        #expect(text == "hé")
+        #expect(stream.generatedTokenIds == [104, 0xC3, 0xA9, 33])
+        #expect(stream.generatedTokenIds?.count == stream.tokensGenerated)
+    }
+
+    @Test("Recorded token IDs can be read while the stream runs, and from an offset")
+    func tokenIdsWhileStreaming() async throws {
+        let stream = try await decode(
+            MockEngine(tokens: [104, 105, 33]), maxTokens: 100, stops: [[33]], recordTokenIds: true)
+        var seen: [[Int32]] = []
+        var read = 0
+        for try await _ in stream {
+            let ids = try #require(stream.generatedTokenIds(from: read))
+            read += ids.count
+            seen.append(ids)
+        }
+        #expect(seen == [[104], [105]])
+        #expect(stream.generatedTokenIds(from: read) == [33])
     }
 
     @Test("A lone id the tokenizer has no token for is skipped; the reply goes on")

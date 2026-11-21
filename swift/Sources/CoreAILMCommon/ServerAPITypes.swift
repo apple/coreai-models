@@ -35,6 +35,9 @@ public struct ChatCompletionRequest: Decodable, Sendable {
     /// Reasoning-effort control, OpenAI-compatible. Canonical values are none, low, medium, high;
     /// other values pass through to the model's chat template.
     public let reasoningEffort: String?
+    /// Return the prompt's token IDs and each choice's generated token IDs (vLLM's field). Off by
+    /// default, and then the response has neither and generation records nothing.
+    public let returnTokenIds: Bool?
 
     enum CodingKeys: String, CodingKey {
         case model, messages, temperature, stream, stop, tools, raw, seed
@@ -49,6 +52,7 @@ public struct ChatCompletionRequest: Decodable, Sendable {
         case toolChoice = "tool_choice"
         case parallelToolCalls = "parallel_tool_calls"
         case reasoningEffort = "reasoning_effort"
+        case returnTokenIds = "return_token_ids"
     }
 
     public init(from decoder: Decoder) throws {
@@ -71,6 +75,7 @@ public struct ChatCompletionRequest: Decodable, Sendable {
         parallelToolCalls = try container.decodeIfPresent(Bool.self, forKey: .parallelToolCalls)
         raw = try container.decodeIfPresent(Bool.self, forKey: .raw)
         reasoningEffort = try container.decodeIfPresent(String.self, forKey: .reasoningEffort)
+        returnTokenIds = try container.decodeIfPresent(Bool.self, forKey: .returnTokenIds)
 
         if let arr = try? container.decode([String].self, forKey: .stop) {
             stop = arr
@@ -316,12 +321,14 @@ public struct ChatCompletionResponse: Encodable, Sendable {
     public let choices: [Choice]
     public let usage: Usage?
     public let systemFingerprint: String?
+    /// The prompt's token IDs, for a request with `return_token_ids`; left out otherwise.
+    public let promptTokenIds: [Int32]?
 
     public init(
         id: String, object: String = "chat.completion",
         created: Int = Int(Date().timeIntervalSince1970),
         model: String, choices: [Choice], usage: Usage? = nil,
-        systemFingerprint: String? = nil
+        systemFingerprint: String? = nil, promptTokenIds: [Int32]? = nil
     ) {
         self.id = id
         self.object = object
@@ -330,25 +337,32 @@ public struct ChatCompletionResponse: Encodable, Sendable {
         self.choices = choices
         self.usage = usage
         self.systemFingerprint = systemFingerprint
+        self.promptTokenIds = promptTokenIds
     }
 
     enum CodingKeys: String, CodingKey {
         case id, object, created, model, choices, usage
         case systemFingerprint = "system_fingerprint"
+        case promptTokenIds = "prompt_token_ids"
     }
 
     public struct Choice: Encodable, Sendable {
         public let index: Int
         public let message: ResponseMessage
         public let finishReason: String?
-        public init(index: Int, message: ResponseMessage, finishReason: String?) {
+        /// Every token the model generated for this choice, the one that ended it included, so as
+        /// many as `usage.completion_tokens`. For a request with `return_token_ids`; left out otherwise.
+        public let tokenIds: [Int32]?
+        public init(index: Int, message: ResponseMessage, finishReason: String?, tokenIds: [Int32]? = nil) {
             self.index = index
             self.message = message
             self.finishReason = finishReason
+            self.tokenIds = tokenIds
         }
         enum CodingKeys: String, CodingKey {
             case index, message
             case finishReason = "finish_reason"
+            case tokenIds = "token_ids"
         }
     }
 
@@ -403,12 +417,14 @@ public struct ChatCompletionChunk: Encodable, Sendable {
     public let model: String
     public let choices: [ChunkChoice]
     public let systemFingerprint: String?
+    /// The prompt's token IDs, on the first chunk of a request with `return_token_ids`.
+    public let promptTokenIds: [Int32]?
 
     public init(
         id: String, object: String = "chat.completion.chunk",
         created: Int = Int(Date().timeIntervalSince1970),
         model: String, choices: [ChunkChoice],
-        systemFingerprint: String? = nil
+        systemFingerprint: String? = nil, promptTokenIds: [Int32]? = nil
     ) {
         self.id = id
         self.object = object
@@ -416,25 +432,33 @@ public struct ChatCompletionChunk: Encodable, Sendable {
         self.model = model
         self.choices = choices
         self.systemFingerprint = systemFingerprint
+        self.promptTokenIds = promptTokenIds
     }
 
     enum CodingKeys: String, CodingKey {
         case id, object, created, model, choices
         case systemFingerprint = "system_fingerprint"
+        case promptTokenIds = "prompt_token_ids"
     }
 
     public struct ChunkChoice: Encodable, Sendable {
         public let index: Int
         public let delta: Delta
         public let finishReason: String?
-        public init(index: Int, delta: Delta, finishReason: String?) {
+        /// The tokens generated since the previous chunk, for a request with `return_token_ids`:
+        /// joined over the stream, every generated token, the one that ended it included (on the
+        /// finish chunk). Left out otherwise.
+        public let tokenIds: [Int32]?
+        public init(index: Int, delta: Delta, finishReason: String?, tokenIds: [Int32]? = nil) {
             self.index = index
             self.delta = delta
             self.finishReason = finishReason
+            self.tokenIds = tokenIds
         }
         enum CodingKeys: String, CodingKey {
             case index, delta
             case finishReason = "finish_reason"
+            case tokenIds = "token_ids"
         }
     }
 

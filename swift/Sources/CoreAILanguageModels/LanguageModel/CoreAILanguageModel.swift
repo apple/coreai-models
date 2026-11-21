@@ -561,7 +561,7 @@ public struct CoreAILanguageModel: LanguageModel {
                 inferenceEngine: engine,
                 samplingConfiguration: samplingConfig,
                 options: InferenceOptions(maxTokens: maxTokens),
-                stopSequences: stopSequences
+                decoderOptions: DecoderOptions(stopSequences: stopSequences)
             )
 
             // Bridge AsyncThrowingStream -> LanguageModelExecutorGenerationChannel

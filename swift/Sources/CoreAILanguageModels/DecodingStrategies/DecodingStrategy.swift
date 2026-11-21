@@ -176,6 +176,36 @@ public protocol DecodeOutcomeReporting {
     /// Tokens the model produced for this reply, including the one that ended it (an end-of-sequence
     /// token or the last token of a stop sequence), which costs a forward pass like any other.
     var tokensGenerated: Int { get }
+
+    /// The IDs of the tokens counted in ``tokensGenerated`` from index `start` on, in order. Nil unless
+    /// the stream was decoded with ``DecoderOptions/recordTokenIds``. Readable while the stream runs:
+    /// after a result, it holds every token up to and including that result's.
+    func generatedTokenIds(from start: Int) -> [Int32]?
+}
+
+extension DecodeOutcomeReporting {
+    /// Every ID counted in ``tokensGenerated``; see ``generatedTokenIds(from:)``.
+    public var generatedTokenIds: [Int32]? { generatedTokenIds(from: 0) }
+}
+
+// MARK: - Decoder Options
+
+/// Options that only the decoding strategy acts on; the engine never sees them. Engine options
+/// (`maxTokens`, logits) stay in `InferenceOptions`.
+public struct DecoderOptions: Sendable {
+    /// Token sequences that halt generation.
+    public var stopSequences: StopSequences
+
+    /// Record every generated token ID, including the one that ended the reply, for
+    /// ``DecodeOutcomeReporting/generatedTokenIds(from:)``. Off by default, and then the stream keeps
+    /// no record and does no work for it. A strategy that cannot record the IDs throws
+    /// `InferenceRuntimeError.unsupportedDecoderOption` from `decode` rather than ignore it.
+    public var recordTokenIds: Bool
+
+    public init(stopSequences: StopSequences, recordTokenIds: Bool = false) {
+        self.stopSequences = stopSequences
+        self.recordTokenIds = recordTokenIds
+    }
 }
 
 /// Decoding strategies produce text + optional enrichments (logits, token IDs)
@@ -194,7 +224,7 @@ public protocol DecodingStrategy: Sendable {
     ///   - inferenceEngine: Engine for model inference
     ///   - samplingConfiguration: Sampling parameters (temperature, topK, etc.)
     ///   - options: Inference options (maxTokens, tokens, logits)
-    ///   - stopSequences: Token sequences that halt generation
+    ///   - decoderOptions: Stop sequences and other options only the strategy acts on
     /// - Returns: Stream of `GenerationResult` (text + optional logits)
     func decode(
         from input: Input,
@@ -202,7 +232,7 @@ public protocol DecodingStrategy: Sendable {
         inferenceEngine: any InferenceEngine,
         samplingConfiguration: SamplingConfiguration,
         options: InferenceOptions,
-        stopSequences: StopSequences
+        decoderOptions: DecoderOptions
     ) async throws -> ResultSequence
 }
 

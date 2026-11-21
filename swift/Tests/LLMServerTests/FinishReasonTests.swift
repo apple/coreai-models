@@ -9,12 +9,15 @@ import Testing
 
 @testable import llm_server
 
-/// A finished stream that reports `stopReason` and `tokensGenerated`.
+/// A finished stream that reports `stopReason`, `tokensGenerated` and, when recorded, the token IDs.
 private struct EndedStream: AsyncSequence, DecodeOutcomeReporting {
     typealias Element = GenerationResult
     typealias Failure = Error
     let stopReason: StopReason?
     var tokensGenerated: Int = 0
+    var tokenIds: [Int32]? = nil
+
+    func generatedTokenIds(from start: Int) -> [Int32]? { tokenIds.map { Array($0[start...]) } }
 
     struct AsyncIterator: AsyncIteratorProtocol {
         mutating func next() async throws -> GenerationResult? { nil }
@@ -71,6 +74,24 @@ struct FinishReasonTests {
         #expect(reportedTokenCount(of: EndedStream(stopReason: .eos, tokensGenerated: 5), results: 2) == 5)
         #expect(reportedTokenCount(of: EndedStream(stopReason: .eos), results: 2) == 2)
         #expect(reportedTokenCount(of: SilentStream(), results: 3) == 3)
+    }
+
+    @Test("return_token_ids reads the stream's IDs from an offset, and nothing when not asked for")
+    func tokenIds() throws {
+        let stream = EndedStream(stopReason: .eos, tokensGenerated: 3, tokenIds: [7, 8, 9])
+        #expect(try generatedTokenIds(of: stream, from: 0, requested: false) == nil)
+        #expect(try generatedTokenIds(of: stream, from: 0, requested: true) == [7, 8, 9])
+        #expect(try generatedTokenIds(of: stream, from: 2, requested: true) == [9])
+    }
+
+    @Test("return_token_ids fails on a stream that recorded no IDs")
+    func tokenIdsMissing() {
+        #expect(throws: InferenceRuntimeError.self) {
+            try generatedTokenIds(of: EndedStream(stopReason: .eos), from: 0, requested: true)
+        }
+        #expect(throws: InferenceRuntimeError.self) {
+            try generatedTokenIds(of: SilentStream(), from: 0, requested: true)
+        }
     }
 
     @Test("A stream that fails after it started ends with an error frame")

@@ -38,7 +38,8 @@ struct BackToBackDecodeTests {
     ) async throws -> String {
         let stream = try await VanillaDecodingStrategy().decode(
             from: .prompt(prompt), tokenizer: tokenizer, inferenceEngine: engine, samplingConfiguration: sampling,
-            options: InferenceOptions(maxTokens: maxTokens), stopSequences: StopSequences(sequences: stops))
+            options: InferenceOptions(maxTokens: maxTokens),
+            decoderOptions: DecoderOptions(stopSequences: StopSequences(sequences: stops)))
         var text = ""
         for try await result in stream { text += result.text }
         return text

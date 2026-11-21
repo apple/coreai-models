@@ -225,6 +225,8 @@ func runChatCompletion(chatRequest: ChatCompletionRequest, state: ServerState, s
         genTokenCount += 1
     }
     genTokenCount = reportedTokenCount(of: stream, results: genTokenCount)
+    let generatedIds = try generatedTokenIds(
+        of: stream, from: 0, requested: prepared.decoderOptions.recordTokenIds)
     let text = parts.joined()
 
     let elapsed = SuspendingClock().now - t0
@@ -312,7 +314,8 @@ func runChatCompletion(chatRequest: ChatCompletionRequest, state: ServerState, s
                     reasoningContent: responseReasoningContent,
                     toolCalls: responseToolCalls
                 ),
-                finishReason: finishReason
+                finishReason: finishReason,
+                tokenIds: generatedIds
             )
         ],
         usage: ChatCompletionResponse.Usage(
@@ -320,7 +323,8 @@ func runChatCompletion(chatRequest: ChatCompletionRequest, state: ServerState, s
             completionTokens: genTokenCount,
             totalTokens: promptTokens.count + genTokenCount
         ),
-        systemFingerprint: state.systemFingerprint
+        systemFingerprint: state.systemFingerprint,
+        promptTokenIds: prepared.decoderOptions.recordTokenIds ? promptTokens : nil
     )
 
     return ChatCompletionOutcome(
@@ -358,7 +362,8 @@ struct PreparedStream {
     /// Nil for a request without images.
     let images: PromptImages?
     let samplingConfig: SamplingConfiguration
-    let stopSequences: StopSequences
+    /// Stop sequences, and whether to record the generated token IDs (`return_token_ids`).
+    let decoderOptions: DecoderOptions
     let requestMaxTokens: Int
     let prefixReuseTokens: Int
     /// The chat template ended the prompt inside a reasoning block.
@@ -418,7 +423,8 @@ func prepareStreaming(
     return PreparedStream(
         requestID: requestID, sessionID: sessionID, promptTokenCount: promptTokens.count,
         promptTokensInt32: promptTokensInt32, input: input, images: prompt.images, samplingConfig: samplingConfig,
-        stopSequences: stopSequences,
+        decoderOptions: DecoderOptions(
+            stopSequences: stopSequences, recordTokenIds: chatRequest.returnTokenIds == true),
         requestMaxTokens: requestMaxTokens, prefixReuseTokens: prefixReused,
         promptOpensReasoning: ThinkTagParser.promptOpensReasoning(
             promptTokens, tokenizer: state.tokenizer, format: state.thinkingFormat))
@@ -434,8 +440,19 @@ struct StartedDecode: @unchecked Sendable {
 /// Starts decoding `prepared` on the engine for the request's lane, with constrained decoding when
 /// `chatRequest` has a JSON schema. A prompt with images decodes with their embeddings on the
 /// multimodal engine (the `.fallbackBatchOne` lane), which reuses the prefix in front of the first
-/// image. Throws `InferenceRuntimeError.queueFull` when the batch scheduler is full.
+/// image. Throws `InferenceRuntimeError.queueFull` when the batch scheduler is full, and
+/// `ServerError.badRequest` when the strategy cannot honor the request's decoder options.
 func startStreamingDecode(
+    prepared: PreparedStream, chatRequest: ChatCompletionRequest, state: ServerState
+) async throws -> StartedDecode {
+    do {
+        return try await startDecode(prepared: prepared, chatRequest: chatRequest, state: state)
+    } catch InferenceRuntimeError.unsupportedDecoderOption(let reason) {
+        throw ServerError.badRequest(reason)
+    }
+}
+
+private func startDecode(
     prepared: PreparedStream, chatRequest: ChatCompletionRequest, state: ServerState
 ) async throws -> StartedDecode {
     let start = SuspendingClock().now
@@ -443,7 +460,7 @@ func startStreamingDecode(
         let tokens = try await VanillaDecodingStrategy().decode(
             embeddings: images.joined, tokens: prepared.promptTokensInt32, tokenizer: state.tokenizer,
             inferenceEngine: vision.engine, samplingConfiguration: prepared.samplingConfig,
-            options: InferenceOptions(maxTokens: prepared.requestMaxTokens), stopSequences: prepared.stopSequences)
+            options: InferenceOptions(maxTokens: prepared.requestMaxTokens), decoderOptions: prepared.decoderOptions)
         return StartedDecode(tokens: tokens, start: start)
     }
 
@@ -463,7 +480,7 @@ func startStreamingDecode(
         inferenceEngine: state.engineForRequest(lane: lane),
         samplingConfiguration: prepared.samplingConfig,
         options: InferenceOptions(maxTokens: prepared.requestMaxTokens),
-        stopSequences: prepared.stopSequences
+        decoderOptions: prepared.decoderOptions
     )
     return StartedDecode(tokens: tokens, start: start)
 }
@@ -614,13 +631,20 @@ private func handleStreamingRequest(
         defer { access.release() }
         do {
             let encoder = JSONEncoder()
+            let returnTokenIds = prepared.decoderOptions.recordTokenIds
+            var sentTokenIds = 0
 
             func writeDelta(_ delta: ChatCompletionChunk.Delta, finishReason: String? = nil) async throws {
+                // The tokens since the previous chunk; the stream has every one up to the result just read.
+                let tokenIds = try generatedTokenIds(
+                    of: started.tokens, from: sentTokenIds, requested: returnTokenIds)
+                sentTokenIds += tokenIds?.count ?? 0
                 let chunk = ChatCompletionChunk(
                     id: prepared.requestID, object: "chat.completion.chunk", created: created,
                     model: state.config.modelName,
-                    choices: [.init(index: 0, delta: delta, finishReason: finishReason)],
-                    systemFingerprint: state.systemFingerprint)
+                    choices: [.init(index: 0, delta: delta, finishReason: finishReason, tokenIds: tokenIds)],
+                    systemFingerprint: state.systemFingerprint,
+                    promptTokenIds: returnTokenIds && delta.role != nil ? prepared.promptTokensInt32 : nil)
                 if let data = try? encoder.encode(chunk), let json = String(data: data, encoding: .utf8) {
                     try await writer.write(ByteBuffer(string: "data: \(json)\n\n"))
                 }
@@ -882,6 +906,19 @@ let outOfMemoryRetryAfterSeconds = "5"
 func reportedTokenCount(of stream: any AsyncSequence<GenerationResult, Error>, results: Int) -> Int {
     guard let count = (stream as? any DecodeOutcomeReporting)?.tokensGenerated, count > 0 else { return results }
     return count
+}
+
+/// The token IDs `stream` generated from index `start` on, for a request with `return_token_ids`;
+/// nil for one without. Throws when the request asked for them and the stream recorded none: a
+/// strategy that cannot record them must refuse in `decode`.
+func generatedTokenIds(
+    of stream: any AsyncSequence<GenerationResult, Error>, from start: Int, requested: Bool
+) throws -> [Int32]? {
+    guard requested else { return nil }
+    guard let ids = (stream as? any DecodeOutcomeReporting)?.generatedTokenIds(from: start) else {
+        throw InferenceRuntimeError.invalidState("return_token_ids: the decoding strategy recorded no token IDs")
+    }
+    return ids
 }
 
 /// `finish_reason` for a stream that has ended.

@@ -1497,7 +1497,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             inferenceEngine: inferenceEngine,
             samplingConfiguration: samplingConfiguration,
             options: InferenceOptions(maxTokens: maxTokens),
-            stopSequences: stopSequences
+            decoderOptions: DecoderOptions(stopSequences: stopSequences)
         )
 
         var promptSpan: ProfileSpan? = InstrumentsProfiler.beginPrompt(
