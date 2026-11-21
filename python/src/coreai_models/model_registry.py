@@ -600,6 +600,22 @@ LLM_PRESETS: list[ModelPreset] = [
         ),
     ),
     ModelPreset(
+        "gemma4-e2b-it-qat",
+        "google/gemma-4-E2B-it-qat-mobile-transformers",
+        "gemma4",
+        "llm",
+        "iOS",
+        "native_quantized",
+        "float16",
+        131072,
+        notes=(
+            "Exported via models/gemma4/export.py (standalone recipe, as gemma4-e2b-it). "
+            "The quantization-aware-trained checkpoint keeps its own quantized weights, so it "
+            "is not palettized: the export refuses --compression, --compression-config and "
+            "--include-vision for it."
+        ),
+    ),
+    ModelPreset(
         "gemma4-e4b-it",
         "google/gemma-4-E4B-it",
         "gemma4",

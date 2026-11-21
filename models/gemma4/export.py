@@ -69,7 +69,10 @@ from coreai_models.export.pipeline import ExportConfig, _generate_output_name
 from coreai_models.llm.export import _load_compression_config_object
 from coreai_models.models.base import TraceSpec
 from coreai_models.models.ios.gemma4_text import (
+    EMBEDDING_SCALE_INPUT_NAME,
+    EMBEDDING_SCALE_OUTPUT_NAME,
     Gemma4ForCausalLMForiOS,
+    is_native_quantized_config,
 )
 
 logger = logging.getLogger("gemma4.export")
@@ -84,6 +87,7 @@ DEFAULT_IOS_COMPRESSION_CONFIG = Path(__file__).resolve().parent / "4bit_paletti
 SUPPORTED_MODELS = (
     "google/gemma-4-E2B-it",
     "google/gemma-4-E4B-it",
+    "google/gemma-4-E2B-it-qat-mobile-transformers",
 )
 
 # Gemma 4 checkpoints are multimodal: the text decoder is nested under
@@ -208,6 +212,49 @@ def _text_config(hf_model_id: str) -> Any:
     return getattr(raw_config, HF_CONFIG_ATTR, raw_config)
 
 
+def _native_quantized_checkpoint(hf_model_id: str) -> bool:
+    """Whether the checkpoint ships Google's own quantization (the QAT ``-qat-mobile-transformers``
+    ones), from its config alone, so the export's options are resolved before any weight is
+    loaded. Once loaded, the model's ``native_quantized`` is read instead."""
+    return is_native_quantized_config(AutoConfig.from_pretrained(hf_model_id))
+
+
+def _resolve_compression(args: argparse.Namespace, native_quantized: bool) -> tuple[Any, str]:
+    """The palettization recipe (``None`` for none) and the compression name for the bundle.
+
+    A native-quantized (QAT) checkpoint is already quantized in the traced graph, and
+    re-clustering its weights would only add noise to the checkpoint's own QAT values, so it
+    is never palettized; an explicit ``--compression`` or ``--compression-config`` is refused
+    rather than ignored.
+    """
+    if native_quantized:
+        if getattr(args, "explicit_compression", False):
+            raise SystemExit(
+                f"{args.model} is a native-quantized checkpoint and is exported with its own "
+                "quantization; drop --compression / --compression-config."
+            )
+        return None, "native_quantized"
+    if args.compression_config is not None:
+        return _load_compression_config_object(args.compression_config, "iOS"), (
+            args.compression_config.stem
+        )
+    return None, "none"
+
+
+def _check_native_quantized_options(args: argparse.Namespace, native_quantized: bool) -> None:
+    """Refuse options a native-quantized (QAT) checkpoint cannot be exported with.
+
+    ``--include-vision``: the vision encoder export reads float ``*.linear.weight`` tensors,
+    but the QAT checkpoints quantize the vision tower too (INT8 weights with a per-channel
+    scale), which it would load as float values without their scale.
+    """
+    if native_quantized and getattr(args, "include_vision", False):
+        raise SystemExit(
+            f"--include-vision is not supported for the native-quantized checkpoint {args.model}: "
+            "its vision tower is quantized, and the vision encoder export reads float weights."
+        )
+
+
 def _resolve_bundle_paths(output_dir: str, output_name: str, overwrite: bool) -> tuple[Path, Path]:
     """Create the bundle directory, failing fast on an existing asset without
     ``--overwrite``. Returns (bundle, asset). The existing asset is only removed just
@@ -298,6 +345,7 @@ def _export_programs(
     config,
     buckets: list[int],
     emit_hidden_states: bool = False,
+    gather_qlens: set[int] | None = None,
 ) -> list[tuple[str, str, int, torch.export.ExportedProgram]]:
     """Trace one program per emitted entrypoint.
 
@@ -308,6 +356,9 @@ def _export_programs(
 
     Every trace is bounded by the top bucket rather than ``--max-context-length``:
     the ladder rounds that up to a power of two, so the top bucket can exceed it.
+
+    A native-quantized (QAT) model traces its gather once per query length in
+    ``gather_qlens`` (by default every shipping one) instead of once, dynamically.
     """
     ladder_max = buckets[-1]
     decomp_table = _ios_decomp_table()
@@ -316,18 +367,21 @@ def _export_programs(
     def trace(module, kwargs: dict, dynamic_shapes=None) -> torch.export.ExportedProgram:
         return torch.export.export(module, args=(), kwargs=kwargs, dynamic_shapes=dynamic_shapes)
 
+    native_quantized = model.native_quantized
+    if gather_qlens is None:
+        gather_qlens = set(SHIPPING_EXTEND_QLENS) | set(SHIPPING_PROMPT_QLENS)
     programs: list[tuple[str, str, int, torch.export.ExportedProgram]] = []
     with torch.no_grad():
         logger.info(f"Exporting {LOAD_EMBEDDINGS_FUNCTION_NAME}...")
+        load_program = trace(model.load_embeddings, {})
         programs.append(
             (
                 LOAD_EMBEDDINGS_FUNCTION_NAME,
                 LOAD_EMBEDDINGS_FUNCTION_NAME,
                 buckets[0],
-                trace(model.load_embeddings, {}),
+                load_program,
             )
         )
-        logger.info(f"Exporting {GATHER_EMBEDDINGS_FUNCTION_NAME}...")
         ref, dynamic_shapes = _reference_inputs(
             model,
             config,
@@ -337,18 +391,37 @@ def _export_programs(
                 query_len=model.IOS_QUERY_LEN,
             ),
         )
-        programs.append(
-            (
-                GATHER_EMBEDDINGS_FUNCTION_NAME,
-                GATHER_EMBEDDINGS_FUNCTION_NAME,
-                buckets[0],
-                trace(
-                    model.gather_embeddings,
-                    ref[GATHER_EMBEDDINGS_FUNCTION_NAME],
-                    dynamic_shapes[GATHER_EMBEDDINGS_FUNCTION_NAME],
-                ),
+        if native_quantized:
+            # One fully static gather per query length, named as the runner looks them up
+            # (`gather_embeddings_<q>`): see `build_dynamic_shapes` for why not one dynamic one.
+            for q in sorted(gather_qlens):
+                logger.info(f"Exporting {GATHER_EMBEDDINGS_FUNCTION_NAME} (q={q})...")
+                gather_ref = dict(ref[GATHER_EMBEDDINGS_FUNCTION_NAME])
+                gather_ref["input_ids"] = torch.randint(
+                    1, config.vocab_size, (1, q), dtype=torch.int32
+                )
+                programs.append(
+                    (
+                        f"{GATHER_EMBEDDINGS_FUNCTION_NAME}_{q}",
+                        GATHER_EMBEDDINGS_FUNCTION_NAME,
+                        buckets[0],
+                        trace(model.gather_embeddings, gather_ref).run_decompositions(decomp_table),
+                    )
+                )
+        else:
+            logger.info(f"Exporting {GATHER_EMBEDDINGS_FUNCTION_NAME}...")
+            programs.append(
+                (
+                    GATHER_EMBEDDINGS_FUNCTION_NAME,
+                    GATHER_EMBEDDINGS_FUNCTION_NAME,
+                    buckets[0],
+                    trace(
+                        model.gather_embeddings,
+                        ref[GATHER_EMBEDDINGS_FUNCTION_NAME],
+                        dynamic_shapes[GATHER_EMBEDDINGS_FUNCTION_NAME],
+                    ),
+                )
             )
-        )
 
         # The transformer entry is used for both emitted entrypoints.
         for ctx in buckets:
@@ -400,6 +473,25 @@ async def _convert_to_coreai(
     inputs = model.export_input_names()
     states = model.export_state_names()
     outputs = model.export_output_names()
+    native_quantized = model.native_quantized
+    if native_quantized:
+        # A native-quantized embedding table carries a per-row scale: a second output of
+        # `load_embeddings` and a third input of `gather_embeddings`, which the runner passes
+        # through when the program declares them. The standard export declares neither.
+        inputs = {
+            **inputs,
+            GATHER_EMBEDDINGS_FUNCTION_NAME: (
+                *inputs[GATHER_EMBEDDINGS_FUNCTION_NAME],
+                EMBEDDING_SCALE_INPUT_NAME,
+            ),
+        }
+        outputs = {
+            **outputs,
+            LOAD_EMBEDDINGS_FUNCTION_NAME: (
+                *outputs[LOAD_EMBEDDINGS_FUNCTION_NAME],
+                EMBEDDING_SCALE_OUTPUT_NAME,
+            ),
+        }
 
     mode = TorchConverter.Mode.DEBUG if include_debug_info else TorchConverter.Mode.RELEASE
     converter = TorchConverter(mode=mode)
@@ -422,8 +514,14 @@ async def _convert_to_coreai(
     # Hardware constraints must be set before a graph's static shape config.
     for name, graph, ctx, _ in programs:
         constraints = model.export_hardware_constraints(ctx)[graph]
+        if native_quantized:
+            # Tuned for the standard gather's fused dequantizing composite; the native gather is
+            # a plain gather with a per-row scale, so its table stays on the default allocation.
+            constraints = {k: v for k, v in constraints.items() if k != EMBEDDING_TABLE_INPUT_NAME}
         if constraints:
             coreai_program.set_hardware_constraints(name, constraints)
+        if native_quantized and graph == GATHER_EMBEDDINGS_FUNCTION_NAME:
+            continue  # already static, one entrypoint per query length
         static_shapes = model.export_static_shape_configs(config, ctx)[graph]
         if graph == GATHER_EMBEDDINGS_FUNCTION_NAME:
             static_shapes = {
@@ -447,8 +545,8 @@ async def _export_blocked_ladder(
     """Export the Gemma4 model as a per-context blocked-flash ladder AIProgram."""
     buckets = context_ladder(max_context_length)
     logger.info(f"iOS context ladder: {buckets}")
-    programs = _export_programs(model, config, buckets, emit_hidden_states)
     gather_qlens = set(SHIPPING_EXTEND_QLENS) | set(SHIPPING_PROMPT_QLENS)
+    programs = _export_programs(model, config, buckets, emit_hidden_states, gather_qlens)
     return await _convert_to_coreai(
         model, programs, config, gather_qlens, include_debug_info, emit_hidden_states
     )
@@ -489,13 +587,17 @@ async def _export_ios(args: argparse.Namespace) -> str:
 
     # Palettization comes from a coreai-opt YAML: DEFAULT_IOS_COMPRESSION_CONFIG
     # unless --compression-config overrides it. `--compression none` leaves it
-    # unset. Resolved before any weights are loaded so a bad recipe fails fast.
-    palettization_config = None
-    if args.compression_config is not None:
-        palettization_config = _load_compression_config_object(args.compression_config, "iOS")
-        compression = args.compression_config.stem
-    else:
-        compression = "none"
+    # unset, and a native-quantized checkpoint is never palettized. Resolved before
+    # any weights are loaded so a bad recipe fails fast.
+    native_quantized = _native_quantized_checkpoint(hf_model_id)
+    _check_native_quantized_options(args, native_quantized)
+    palettization_config, compression = _resolve_compression(args, native_quantized)
+    if native_quantized:
+        logger.warning(
+            f"{hf_model_id} is exported with its quantized weights only: the static activation "
+            "quantization it was trained with is not applied, so its accuracy can fall below "
+            "the default palettized export of the standard checkpoint."
+        )
 
     output_name = args.output_name or _generate_output_name(
         ExportConfig(
@@ -539,14 +641,27 @@ async def _export_ios(args: argparse.Namespace) -> str:
         ).eval()
         hf_config.max_position_embeddings = max_ctx
 
+        # The options above were resolved from the Hugging Face config; from here on the loaded
+        # model's flag is the one read (`_export_programs`, `_convert_to_coreai`), so they must
+        # agree.
+        if model.native_quantized != native_quantized:
+            raise SystemExit(
+                f"{hf_model_id} loaded as "
+                f"{'native-quantized' if not native_quantized else 'unquantized'}, but its "
+                "Hugging Face config says otherwise."
+            )
+
         # Write the PLE sidecar straight away and drop the table: it is multiple
         # gigabytes and not a module weight, so mmap can't evict it.
         logger.info("Dumping Per-Layer Embeddings (PLE) artifact...")
         ple_path = model.dump_ple_embedding(str(bundle_path), output_name)
         logger.info(f"Wrote PLE artifact to {ple_path}")
-        del model._ple_weight
+        if native_quantized:
+            del model._ple_native
+        else:
+            del model._ple_weight
 
-        # ---- Palettization (skipped for --compression none) ----
+        # ---- Palettization (skipped for --compression none, and for native-quantized ones) ----
         if palettization_config is not None:
             logger.info(f"Applying palettization ({compression})...")
             inputs = _palettization_inputs(model, hf_config, max_ctx)
@@ -624,7 +739,9 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="coreai-opt compression YAML: a 'kmeans_palettization_config' recipe "
-        f"(default: {DEFAULT_IOS_COMPRESSION_CONFIG.name}, alongside this script)",
+        f"(default: {DEFAULT_IOS_COMPRESSION_CONFIG.name}, alongside this script). "
+        "Not accepted for the native-quantized (QAT) checkpoints, which keep their own "
+        "quantization.",
     )
     compression_group.add_argument(
         "--compression",
@@ -633,7 +750,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Only 'none' is accepted, which exports at full precision. The named "
         "presets are not used for Gemma 4: the shipped YAML recipes are "
         "mixed-precision, which the presets cannot express. Pass "
-        "--compression-config <yaml> for a custom recipe.",
+        "--compression-config <yaml> for a custom recipe. Not accepted for the "
+        "native-quantized (QAT) checkpoints.",
     )
     parser.add_argument(
         "--max-context-length",
@@ -726,7 +844,10 @@ def _resolve_defaults(args: argparse.Namespace) -> None:
             f"(got {args.max_context_length})."
         )
 
-    if args.compression is None and args.compression_config is None:
+    # Recorded before the default fills in, so a native-quantized checkpoint can refuse an
+    # explicit compression flag (see `_resolve_compression`).
+    args.explicit_compression = args.compression is not None or args.compression_config is not None
+    if not args.explicit_compression:
         args.compression_config = DEFAULT_IOS_COMPRESSION_CONFIG
 
 
