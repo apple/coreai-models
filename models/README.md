@@ -374,3 +374,11 @@ States the map leaves out keep their inferred kind. Only `kv_cache` states may h
 ## Compiling models
 
 Models can optionally be ahead-of-time compiled. Run `xcrun coreai-build compile --help` for usage. If you compile a model, replace the corresponding asset in the bundle directory and update `metadata.json` to reference the new filename.
+
+The compiled model keeps the compute unit chosen at compile time. The iOS LLM exports are built for the Neural Engine, and the Swift runtime asks for the Neural Engine when it specializes them on device, but `coreai-build compile` does not unless you pass `--preferred-compute neural-engine`:
+
+```bash
+xcrun coreai-build compile <bundle>/<name>.aimodel --platform macOS --architecture <arch> --preferred-compute neural-engine
+```
+
+Without the flag, the compiled model has no Neural Engine region and runs on the GPU, several times slower than the same export specialized on device.
