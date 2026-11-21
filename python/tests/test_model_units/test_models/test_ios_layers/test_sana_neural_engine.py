@@ -6,7 +6,8 @@
 """Neural Engine Sana Sprint components (``models/ios/sana_*.py``) vs diffusers / transformers.
 
 Tiny random configs, float32: every rewrite in the re-authored modules is exact, so each must
-match its source above the 70 dB re-authoring gate.
+match its source above the 70 dB re-authoring gate. The float16 and compressed cases have their
+own bounds.
 """
 
 import pytest
@@ -15,6 +16,7 @@ import torch.nn.functional as F
 
 from coreai_models.diffusion.sana import TEXT_SEQUENCE_LENGTH, SanaTextEncoderWrapper
 from coreai_models.models.ios.sana_dc_ae_decoder import (
+    MultiscaleLinearAttention,
     SanaDCAEDecoder,
     _merged_upsample_conv,
     _shuffle_shortcut,
@@ -114,7 +116,9 @@ def test_transformer_matches_diffusers() -> None:
     assert _psnr(got, want) > 70
 
 
-def test_dc_ae_decoder_matches_diffusers() -> None:
+def _tiny_dc_ae():
+    """Its EfficientViT blocks see 16 and 64 tokens, above ``attention_head_dim``, so diffusers
+    takes its linear-attention path as at full size."""
     from diffusers import AutoencoderDC
 
     torch.manual_seed(0)
@@ -140,6 +144,11 @@ def test_dc_ae_decoder_matches_diffusers() -> None:
         decoder_act_fns="silu",
     ).eval()
     _randomize(vae.decoder, seed=2)
+    return vae
+
+
+def test_dc_ae_decoder_matches_diffusers() -> None:
+    vae = _tiny_dc_ae()
     m = SanaDCAEDecoder.from_source_model(vae.decoder, latent_size=4)
     z = torch.randn(1, 4, 4, 4)
     with torch.no_grad():
@@ -147,6 +156,48 @@ def test_dc_ae_decoder_matches_diffusers() -> None:
         got = m(z)
     assert got.shape == want.shape == (1, 3, 32, 32)
     assert _psnr(got, want) > 70
+
+
+def test_dc_ae_decoder_runs_in_float16() -> None:
+    vae = _tiny_dc_ae()
+    m = SanaDCAEDecoder.from_source_model(vae.decoder, latent_size=4)
+    z = torch.randn(1, 4, 4, 4)
+    with torch.no_grad():
+        want = vae.decoder(z)
+        got = m.half()(z.half()).float()
+    assert torch.isfinite(got).all()
+    # float16 rounding alone: 44-65 dB over random latents.
+    assert _psnr(got, want) > 40
+
+
+def test_dc_ae_attention_scales_the_k_diffusers_splits_out() -> None:
+    """The K scale cancels in the output, so a scale on the wrong rows only shows in the weights.
+
+    diffusers splits ``q, k, v`` out of the concatenated projection reshaped to rows of
+    ``3 * head_dim``, so ``k`` is the middle third of each row.
+    """
+    from diffusers.models.attention_processor import SanaMultiscaleLinearAttention
+
+    vae = _tiny_dc_ae()
+    src = next(m for m in vae.decoder.modules() if isinstance(m, SanaMultiscaleLinearAttention))
+    n_tokens = 64
+    got = MultiscaleLinearAttention(src, n_tokens).qkv.weight[:, :, 0, 0]
+    want = torch.cat([src.to_q.weight, src.to_k.weight, src.to_v.weight]).detach().clone()
+    d = src.attention_head_dim
+    k_rows = torch.arange(want.shape[0]).reshape(-1, 3 * d)[:, d : 2 * d].flatten()
+    want[k_rows] *= 32 / n_tokens
+    torch.testing.assert_close(got, want)
+
+
+def test_neural_engine_modules_refuse_other_latent_sizes() -> None:
+    """The K scale keeps float16 in range only at the token count it was folded for."""
+    m = SanaTransformer.from_source_model(_tiny_sana_transformer())
+    latent, text, mask, sigma, guidance = _tiny_sana_transformer_inputs()
+    with pytest.raises(AssertionError, match="built for 64 latent tokens"):
+        m(latent[..., :4, :4], text, mask, sigma, guidance)
+    decoder = SanaDCAEDecoder.from_source_model(_tiny_dc_ae().decoder, latent_size=4)
+    with pytest.raises(AssertionError, match="built for a 4x4 latent"):
+        decoder(torch.randn(1, 4, 8, 8))
 
 
 def _tiny_gemma2() -> torch.nn.Module:

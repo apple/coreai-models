@@ -82,7 +82,7 @@ def export_diffusion(config: DiffusionExportConfig) -> dict[str, str]:
     """
     model_dtype = _PRECISIONS.get(config.compute_precision, torch.float32)
     neural_engine = config.neural_engine
-    palettization = _resolve_palettization(config.compression, neural_engine)
+    palettization = resolve_palettization(config.compression, neural_engine)
     neural_engine_quantization = _resolve_neural_engine_quantization(config.compression)
 
     # 1. Determine pipeline type and load HF pipeline
@@ -126,14 +126,9 @@ def export_diffusion(config: DiffusionExportConfig) -> dict[str, str]:
                 _check_quantization_precision(component_config, owner, component)
                 spec_configs[name] = component_config
 
-    # Output goes to <output_dir>/<model-name>/. A dynamic export reuses the static asset
-    # names, so it gets its own directory rather than overwriting the static bundle; so does
-    # Sana Sprint's iOS (Neural Engine) export (<model-name>-ios/).
-    model_subdir = config.hf_model_id.split("/")[-1]
-    if config.dynamic:
-        model_subdir += "-dynamic"
-    if neural_engine:
-        model_subdir += "-ios"
+    model_subdir = diffusion_output_subdir(
+        config.hf_model_id, dynamic=config.dynamic, neural_engine=neural_engine
+    )
     output_path = Path(config.output_dir) / model_subdir
     output_path.mkdir(parents=True, exist_ok=True)
 
@@ -253,6 +248,22 @@ def export_diffusion(config: DiffusionExportConfig) -> dict[str, str]:
         logger.info(f"  {name}: {path}")
 
     return results
+
+
+def diffusion_output_subdir(
+    hf_model_id: str, *, dynamic: bool = False, neural_engine: bool = False
+) -> str:
+    """The ``<output_dir>`` subdirectory an export writes: the HF id's tail.
+
+    A dynamic export reuses the static asset names, so it gets its own directory rather than
+    overwriting the static bundle; so does Sana Sprint's iOS (Neural Engine) export.
+    """
+    subdir = hf_model_id.split("/")[-1]
+    if dynamic:
+        subdir += "-dynamic"
+    if neural_engine:
+        subdir += "-ios"
+    return subdir
 
 
 def _save_program(
@@ -633,7 +644,7 @@ def _resolve_compression(compression: str, component_names: list[str]) -> dict[s
     return {name: per_component.get(name) for name in component_names}
 
 
-def _resolve_palettization(compression: str, neural_engine: bool) -> dict[str, dict]:
+def resolve_palettization(compression: str, neural_engine: bool) -> dict[str, dict]:
     """A preset's ``component_palettization``, which only the Neural Engine export applies.
 
     The Neural Engine export takes ``none`` or a palettization preset; the GPU export rejects

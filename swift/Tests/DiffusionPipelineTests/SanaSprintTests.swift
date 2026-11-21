@@ -147,6 +147,7 @@ struct SanaSprintTests {
         #expect(try config.computeUnit(for: DiffusionComponentKey.transformer) == .neuralEngine)
         #expect(try config.computeUnit(for: DiffusionComponentKey.textEncoder) == .gpu)
         #expect(try DiffusionConfig(type: .sanaSprint).computeUnit(for: "transformer") == .gpu)
+        #expect(try config.computeUnit(for: DiffusionComponentKey.vaeEncoder) == .gpu)
         #expect(throws: PipelineLoadError.self) {
             try config.computeUnit(for: DiffusionComponentKey.vaeDecoder)
         }

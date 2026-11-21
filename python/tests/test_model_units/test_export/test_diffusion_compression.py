@@ -38,8 +38,8 @@ from coreai_models.diffusion.pipeline import (
     _quantize_component_weights,
     _resolve_component_precision,
     _resolve_compression,
-    _resolve_palettization,
     _uses_int4,
+    resolve_palettization,
 )
 from coreai_models.diffusion.presets import _EMBEDDING_SUBCLASSES, _MODULE_TYPE_EXCLUSIONS, PRESETS
 from coreai_models.export.compression import quantize_pytorch_model
@@ -220,18 +220,18 @@ def test_neural_engine_quantization_satisfies_the_coreai_opt_schema(name: str) -
 def test_palettization_presets_are_neural_engine_only() -> None:
     """The GPU export would otherwise drop the palettization and export dense."""
     with pytest.raises(ValueError, match="--platform iOS"):
-        _resolve_palettization("te6bit-pal", neural_engine=False)
-    assert set(_resolve_palettization("te6bit-pal", neural_engine=True)) == {"text_encoder"}
+        resolve_palettization("te6bit-pal", neural_engine=False)
+    assert set(resolve_palettization("te6bit-pal", neural_engine=True)) == {"text_encoder"}
 
 
 @pytest.mark.parametrize("compression", ["8bit", "t8bit-te4bit-asym"])
 def test_neural_engine_export_rejects_quantization_presets(compression: str) -> None:
     with pytest.raises(ValueError, match="palettization preset"):
-        _resolve_palettization(compression, neural_engine=True)
+        resolve_palettization(compression, neural_engine=True)
 
 
 def test_neural_engine_export_accepts_none() -> None:
-    assert _resolve_palettization("none", neural_engine=True) == {}
+    assert resolve_palettization("none", neural_engine=True) == {}
 
 
 def _dry_run(
@@ -293,6 +293,29 @@ def test_sana_platform_ios_takes_only_float16(
     with pytest.raises(SystemExit):
         export.main()
     assert "--platform iOS build is float16" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "argv,error",
+    [
+        (["--platform", "iOS", "--compression", "8bit"], "palettization preset"),
+        (["--compression", "te6bit-pal"], "use it with Sana Sprint and --platform iOS"),
+        (["--platform", "iOS", "--resolution", "512"], "--resolution does not apply"),
+        (["--platform", "iOS", "--low-memory"], "--low-memory does not apply"),
+    ],
+)
+def test_sana_dry_run_refuses_what_the_export_would(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    argv: list[str],
+    error: str,
+) -> None:
+    from coreai_models.diffusion import export
+
+    monkeypatch.setattr("sys.argv", ["export", "sana-sprint-0.6b", *argv, "--dry-run"])
+    with pytest.raises(SystemExit):
+        export.main()
+    assert error in capsys.readouterr().err
 
 
 def test_flux2_platform_ios_stays_on_the_gpu(

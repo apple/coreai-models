@@ -208,6 +208,8 @@ class SanaTransformer(nn.Module):
         assert cfg.patch_size == 1 and cfg.guidance_embeds and cfg.interpolation_scale is None
         dim = cfg.num_attention_heads * cfg.attention_head_dim
         self.dim = dim
+        # The token count the linear-attention K scale is folded for.
+        self.n_tokens = cfg.sample_size * cfg.sample_size
         self.patch_embed = conv1x1(cfg.in_channels, dim)
         self.time_embedder = TimestepEmbedding(dim)
         self.guidance_embedder = TimestepEmbedding(dim, freq_scale=cfg.guidance_embeds_scale)
@@ -233,6 +235,7 @@ class SanaTransformer(nn.Module):
     ) -> torch.Tensor:
         b, cin, height, width = hidden_states.shape
         n = height * width
+        assert n == self.n_tokens, f"built for {self.n_tokens} latent tokens, got {n}"
         x = self.patch_embed(hidden_states.reshape(b, cin, 1, n))
 
         # Float32 after `to_neural_engine_dtypes`: the conditioning modulates every block, so it
@@ -266,7 +269,6 @@ class SanaTransformer(nn.Module):
         cfg = src.config
         m = cls(cfg).float()
         dim = m.dim
-        n_tokens = cfg.sample_size * cfg.sample_size
         with torch.no_grad():
             m.patch_embed.load_state_dict(src.patch_embed.proj.float().state_dict())
             te = src.time_embed
@@ -291,7 +293,7 @@ class SanaTransformer(nn.Module):
                 _load_linear(dst.attn1.to_out, a1.to_out[0])
                 _load_linear(dst.attn2.to_out, a2.to_out[0])
                 dst.attn1.norm_q.weight.copy_(a1.norm_q.weight.float().reshape(-1, 1, 1))
-                k_scale = _K_SCALE / n_tokens
+                k_scale = _K_SCALE / m.n_tokens
                 dst.attn1.norm_k.weight.copy_(
                     (a1.norm_k.weight.float() * k_scale).reshape(-1, 1, 1)
                 )

@@ -1193,8 +1193,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--platform",
         choices=KNOWN_VARIANTS,
-        help="Platform filter (macOS / iOS). Filters LLM variants and utility model platforms; "
-        "diffusion entries are excluded when --platform is set.",
+        help="Platform filter (macOS / iOS). Filters LLM and Sana Sprint variants and utility "
+        "model platforms; diffusion entries without a platform (FLUX.2, Wan) are excluded "
+        "when --platform is set.",
     )
     parser.add_argument(
         "--family",
@@ -1260,7 +1261,7 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="format",
         const="export-args",
         help="Print the argv to forward to coreai.{type}.export. "
-        "Requires --model-info plus --platform for LLM.",
+        "Requires --model-info plus --platform for LLM and Sana Sprint.",
     )
     fmt.add_argument(
         "--as-output-name",
@@ -1270,7 +1271,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Print the basename the export tool would write for "
         "this preset (LLM: bundle directory name; "
         "diffusion: model directory name). "
-        "Requires --model-info plus --platform for LLM.",
+        "Requires --model-info plus --platform for LLM and Sana Sprint.",
     )
     parser.set_defaults(format="text")
 

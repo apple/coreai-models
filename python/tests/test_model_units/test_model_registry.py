@@ -46,6 +46,8 @@ def test_only_sana_diffusion_presets_have_a_platform() -> None:
 @pytest.mark.parametrize("size", ["0.6B", "1.6B"])
 def test_sana_presets_are_selected_by_platform(size: str) -> None:
     """Like an LLM: macOS (GPU) unless iOS (Neural Engine) is asked for."""
+    from coreai_models.diffusion.pipeline import diffusion_output_subdir
+
     hf_id = f"Efficient-Large-Model/Sana_Sprint_{size}_1024px_diffusers"
     short = f"sana-sprint-{size.lower()}"
     for macos in (
@@ -57,6 +59,7 @@ def test_sana_presets_are_selected_by_platform(size: str) -> None:
         assert macos.compression == "t8bit-te4bit-asym"
         assert "--platform" not in _preset_to_export_args(macos)
         assert _preset_to_output_name(macos) == f"Sana_Sprint_{size}_1024px_diffusers"
+        assert _preset_to_output_name(macos) == diffusion_output_subdir(macos.hf_id)
     for ios in (
         lookup_preset(short, model_type="diffusion", variant="iOS"),
         try_lookup_preset_by_hf_id(hf_id, model_type="diffusion", variant="iOS"),
@@ -65,6 +68,7 @@ def test_sana_presets_are_selected_by_platform(size: str) -> None:
         assert ios.compression == "te6bit-tok8-tx8bit-pal"
         assert _preset_to_export_args(ios)[-2:] == ["--platform", "iOS"]
         assert _preset_to_output_name(ios) == f"Sana_Sprint_{size}_1024px_diffusers-ios"
+        assert _preset_to_output_name(ios) == diffusion_output_subdir(ios.hf_id, neural_engine=True)
     with pytest.raises(KeyError, match="Pass --platform"):
         lookup_preset(short, model_type="diffusion")
 

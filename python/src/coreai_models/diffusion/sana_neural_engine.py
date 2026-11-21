@@ -14,7 +14,11 @@ from typing import Any, cast
 import torch
 
 from coreai_models.diffusion.components import SANA_SPRINT_COMPONENTS, NeuralEngineComponentSpec
-from coreai_models.diffusion.sana import TEXT_SEQUENCE_LENGTH, sana_text_input_length
+from coreai_models.diffusion.sana import (
+    TEXT_SEQUENCE_LENGTH,
+    dummy_sana_text_encoder,
+    sana_text_input_length,
+)
 
 
 def build_transformer(pipe: Any) -> torch.nn.Module:
@@ -51,11 +55,6 @@ def build_text_encoder(pipe: Any) -> torch.nn.Module:
     )
 
 
-def dummy_text_encoder(pipe: Any) -> tuple[torch.Tensor, ...]:
-    length = sana_text_input_length(pipe)
-    return (torch.zeros(1, length, dtype=torch.long), torch.ones(1, length, dtype=torch.long))
-
-
 def build_vae_decoder(pipe: Any) -> torch.nn.Module:
     from coreai_models.models.ios.sana_dc_ae_decoder import SanaDCAEDecoder
 
@@ -84,6 +83,6 @@ SANA_SPRINT_NEURAL_ENGINE_COMPONENTS: dict[str, NeuralEngineComponentSpec] = {
     "transformer": _spec(
         "transformer", build_transformer, dummy_transformer, cast_fn=cast_transformer
     ),
-    "text_encoder": _spec("text_encoder", build_text_encoder, dummy_text_encoder),
+    "text_encoder": _spec("text_encoder", build_text_encoder, dummy_sana_text_encoder),
     "vae_decoder": _spec("vae_decoder", build_vae_decoder, dummy_vae_decoder),
 }

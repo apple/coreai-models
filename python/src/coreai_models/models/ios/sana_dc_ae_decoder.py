@@ -205,6 +205,8 @@ class SanaDCAEDecoder(nn.Module):
         from diffusers.models.autoencoders.autoencoder_dc import ResBlock as SrcResBlock
 
         assert src.in_shortcut
+        # The latent size the linear-attention K scales are folded for.
+        self.latent_size = latent_size
         cz, cin = src.conv_in.in_channels, src.conv_in.out_channels
         self.conv_in = src.conv_in
         self.in_shortcut = nn.Conv2d(cz, cin, 1, bias=False)
@@ -233,6 +235,8 @@ class SanaDCAEDecoder(nn.Module):
         self.conv_out = src.conv_out
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
+        size = self.latent_size
+        assert z.shape[-2:] == (size, size), f"built for a {size}x{size} latent, got {z.shape}"
         x = self.conv_in(z) + self.in_shortcut(z)
         x = self.blocks(x)
         return self.conv_out(F.relu(self.norm_out(x)))

@@ -17,7 +17,9 @@ def test_tanh_silu_matches_silu() -> None:
 
 
 def test_tanh_silu_computes_in_the_module_dtype() -> None:
+    m = TanhSiLU().half()
+    # A 0-dim `c` never changes the output dtype, so check the constant the graph gets.
+    assert m.c.dtype == torch.float16
     x = torch.linspace(-30, 30, 4001)
-    got = TanhSiLU().half()(x.half())
-    assert got.dtype == torch.float16
+    got = m(x.half())
     torch.testing.assert_close(got.float(), F.silu(x), rtol=2e-3, atol=2e-3)

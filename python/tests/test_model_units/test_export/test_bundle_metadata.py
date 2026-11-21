@@ -59,19 +59,42 @@ def test_other_bundle_kinds_stay_on_0_2() -> None:
     assert DIFFUSION_VERSION == "0.2"
 
 
+def _fake_pipe(neural_engine: bool) -> tuple[object, str]:
+    """A pipe for the type the exporter pairs with ``neural_engine``: only Sana Sprint has a
+    Neural Engine build."""
+    if not neural_engine:
+        pipe = SimpleNamespace(
+            vae=SimpleNamespace(config=SimpleNamespace(block_out_channels=[1, 2, 3, 4])),
+            transformer=SimpleNamespace(config=SimpleNamespace()),
+        )
+        return pipe, "flux2"
+
+    from diffusers import SanaSprintPipeline
+
+    class FakeSanaPipe:
+        # `_build_sana_sprint_config` reads the real pipeline's call defaults.
+        __call__ = SanaSprintPipeline.__call__
+        vae = SimpleNamespace(
+            config=SimpleNamespace(encoder_block_out_channels=[1, 2, 3, 4, 5, 6], scaling_factor=1)
+        )
+        transformer = SimpleNamespace(config=SimpleNamespace(sample_size=32))
+        tokenizer = SimpleNamespace(encode=lambda text: [0] * 8)
+
+    return FakeSanaPipe(), "sana_sprint"
+
+
 def _write_diffusion_metadata(out: Path, assets: list[str], *, neural_engine: bool) -> dict:
-    """Write a FLUX.2-shaped diffusion manifest for empty ``<name>.aimodel`` assets."""
+    """Write a diffusion manifest for empty ``<name>.aimodel`` assets."""
     from coreai_models.diffusion.pipeline import _write_metadata_json
 
     exported = {}
     for name in assets:
         (out / f"{name}.aimodel").mkdir(exist_ok=True)
         exported[name] = str(out / f"{name}.aimodel")
-    pipe = SimpleNamespace(
-        vae=SimpleNamespace(config=SimpleNamespace(block_out_channels=[1, 2, 3, 4])),
-        transformer=SimpleNamespace(config=SimpleNamespace()),
+    pipe, pipeline_type = _fake_pipe(neural_engine)
+    _write_metadata_json(
+        pipe, "m", pipeline_type, out, "none", exported, neural_engine=neural_engine
     )
-    _write_metadata_json(pipe, "m", "flux2", out, "none", exported, neural_engine=neural_engine)
     return json.loads((out / "metadata.json").read_text())["diffusion"]
 
 
@@ -82,13 +105,16 @@ def test_diffusion_lists_the_compute_unit_of_every_asset(tmp_path: Path) -> None
     ne = tmp_path / "ne"
     ne.mkdir()
     units = _write_diffusion_metadata(ne, ["transformer", "vae_decoder"], neural_engine=True)
+    assert units["type"] == "sana-sprint"
     assert units["compute_units"] == {
         "transformer": ["neural_engine"],
         "vae_decoder": ["neural_engine"],
     }
 
 
-def test_partial_diffusion_export_keeps_the_other_assets_compute_units(tmp_path: Path) -> None:
+def test_partial_diffusion_export_stamps_every_merged_asset_with_its_unit(tmp_path: Path) -> None:
+    """The merged asset list takes this run's unit, as the whole directory shares one: the
+    Neural Engine build writes to its own ``<model>-ios/`` directory."""
     _write_diffusion_metadata(tmp_path, ["transformer", "vae_decoder"], neural_engine=True)
     units = _write_diffusion_metadata(tmp_path, ["transformer"], neural_engine=True)
     assert units["compute_units"] == {

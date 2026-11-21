@@ -12,7 +12,11 @@ from pathlib import Path
 
 from coreai_models.diffusion.components import get_valid_components
 from coreai_models.diffusion.models import get_pipeline_type
-from coreai_models.diffusion.pipeline import DiffusionExportConfig, export_diffusion
+from coreai_models.diffusion.pipeline import (
+    DiffusionExportConfig,
+    export_diffusion,
+    resolve_palettization,
+)
 from coreai_models.diffusion.presets import DEFAULT_COMPRESSION_PRESET
 from coreai_models.model_registry import try_lookup_preset, try_lookup_preset_by_hf_id
 
@@ -72,9 +76,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--platform",
         default=None,
         choices=["iOS", "macOS"],
-        help="Target platform. iOS defaults to 512 resolution, --single-function, and "
+        help="Target platform. FLUX.2: iOS defaults to 512 resolution, --single-function, and "
         "the half img2img reference grid; macOS defaults to 1024 and the full grid. "
-        "Sana Sprint: iOS exports the float16 Neural Engine build to <model>-ios/.",
+        "Sana Sprint: iOS exports the float16 Neural Engine build, at the model's native "
+        "resolution, to <model>-ios/.",
     )
     parser.add_argument(
         "--resolution",
@@ -216,6 +221,21 @@ def main() -> None:
             f"Sana Sprint's --platform iOS build is float16; got --compute-precision "
             f"{args.compute_precision}."
         )
+    if neural_engine:
+        for flag, given in [
+            ("--resolution", args.resolution is not None),
+            ("--low-memory", args.low_memory),
+        ]:
+            if given:
+                parser.error(
+                    f"{flag} does not apply to Sana Sprint's --platform iOS build: it is fixed "
+                    "at the model's native resolution."
+                )
+    # Checked here so --dry-run refuses the same presets the export does.
+    try:
+        resolve_palettization(compression, neural_engine)
+    except ValueError as e:
+        parser.error(str(e))
 
     # Sana Sprint's --platform only picks the build, so it combines with --components.
     if args.components and args.platform and pipeline_type != "sana_sprint":
