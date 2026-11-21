@@ -266,7 +266,8 @@ Each export writes a bundle directory `exports/<name>/` with:
   ([contract](../python/src/coreai_models/embedding/contract.py))
 
 Every tower returns L2-normalized vectors in one shared space: the cosine of a
-text vector and an image or audio vector is their similarity.
+text vector and an image or audio vector is their similarity. In Swift,
+`CoreAIEmbeddings` runs the text and image towers; see the [CLIP](clip/README.md), [EmbeddingGemma 2](embedding_gemma2/README.md), [Qwen3-Embedding](qwen3_embedding/README.md) and [CLAP](clap/README.md) (text tower) model cards.
 
 - `--text-only` exports the text tower alone.
 - `--compute-precision` picks the compute precision; `--list-models` shows each model's options.

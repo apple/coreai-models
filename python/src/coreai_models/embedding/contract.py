@@ -37,7 +37,7 @@ R4. ``towers``: ``[{modality, pipeline}]``, with ``modality`` one of ``text``, `
       ``input_features`` for audio.
     - Batches smaller than ``batch.min`` are padded; batches larger than ``batch.max`` are split.
 
-R5. A reader refuses a bundle with a tower, component key or enum value it does not know.
+R5. A reader skips towers of modalities it does not run, and may ignore keys it does not read.
 
 R6. ``text``: how to tokenize.
     - ``embedded_tokenizer``: true when the tokenizer files are in ``tokenizer/``.
