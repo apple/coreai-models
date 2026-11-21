@@ -22,16 +22,17 @@ import logging
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import torch
 from huggingface_hub import snapshot_download
 
 from coreai_models._constants import DEFAULT_INCLUDE_DEBUG_INFO
-from coreai_models.converter import export_stateless
+from coreai_models.converter import convert_ane_functions, export_stateless
 from coreai_models.diffusion.components import (
     MultiFunctionComponentSpec,
+    NeuralEngineComponentSpec,
     get_component_registry,
     quant_weight_owner,
 )
@@ -66,6 +67,8 @@ class DiffusionExportConfig:
     multifunction: bool = True
     # FLUX.2 only: one symbolic "main" per asset. Takes precedence over multifunction if True.
     dynamic: bool = False
+    # Sana Sprint only: the float16 components re-authored for the Neural Engine.
+    neural_engine: bool = False
 
 
 def export_diffusion(config: DiffusionExportConfig) -> dict[str, str]:
@@ -78,18 +81,28 @@ def export_diffusion(config: DiffusionExportConfig) -> dict[str, str]:
         Dict mapping component name to its .aimodel path.
     """
     model_dtype = _PRECISIONS.get(config.compute_precision, torch.float32)
+    neural_engine = config.neural_engine
+    palettization = resolve_palettization(config.compression, neural_engine)
+    neural_engine_quantization = _resolve_neural_engine_quantization(config.compression)
 
     # 1. Determine pipeline type and load HF pipeline
     pipeline_type = get_pipeline_type(config.hf_model_id)
     if config.dynamic and pipeline_type != "flux2":
         raise ValueError(f"dynamic export is only supported for FLUX.2, not {pipeline_type}.")
-    hf_pipe = _load_hf_pipeline(config.hf_model_id, pipeline_type, model_dtype)
+    if neural_engine and pipeline_type != "sana_sprint":
+        raise ValueError(
+            f"Neural Engine export is only supported for Sana Sprint, not {pipeline_type}."
+        )
+    # Neural Engine components fold constants into float32 weights, then set their own dtypes.
+    load_dtype = torch.float32 if neural_engine else model_dtype
+    hf_pipe = _load_hf_pipeline(config.hf_model_id, pipeline_type, load_dtype)
 
     registry = get_component_registry(
         hf_pipe,
         pipeline_type=pipeline_type,
         multifunction=config.multifunction,
         dynamic=config.dynamic,
+        neural_engine=neural_engine,
     )
     component_names = config.components or list(registry.keys())
     logger.info(f"Pipeline type: {pipeline_type}, components: {component_names}")
@@ -104,7 +117,7 @@ def export_diffusion(config: DiffusionExportConfig) -> dict[str, str]:
     if any(c is not None for c in quant_configs.values()):
         for name in component_names:
             spec = registry.get(name)
-            if spec is None or not spec.quantizable:
+            if spec is None or isinstance(spec, NeuralEngineComponentSpec) or not spec.quantizable:
                 continue
             owner = quant_weight_owner(spec.wrapper_fn(hf_pipe))
             component = _pipeline_component_name(hf_pipe, owner)
@@ -113,11 +126,9 @@ def export_diffusion(config: DiffusionExportConfig) -> dict[str, str]:
                 _check_quantization_precision(component_config, owner, component)
                 spec_configs[name] = component_config
 
-    # Output goes to <output_dir>/<model-name>/. A dynamic export reuses the static asset
-    # names, so it gets its own directory rather than overwriting the static bundle.
-    model_subdir = config.hf_model_id.split("/")[-1]
-    if config.dynamic:
-        model_subdir += "-dynamic"
+    model_subdir = diffusion_output_subdir(
+        config.hf_model_id, dynamic=config.dynamic, neural_engine=neural_engine
+    )
     output_path = Path(config.output_dir) / model_subdir
     output_path.mkdir(parents=True, exist_ok=True)
 
@@ -138,6 +149,27 @@ def export_diffusion(config: DiffusionExportConfig) -> dict[str, str]:
 
         if asset_path.exists() and not config.overwrite:
             logger.info(f"Skipping {name}: {asset_path} exists (use --overwrite)")
+            results[name] = str(asset_path)
+            continue
+
+        if isinstance(spec, NeuralEngineComponentSpec):
+            logger.info(f"Exporting {name} -> {spec.asset_name}.aimodel (Neural Engine)")
+            module = spec.build_fn(hf_pipe)
+            dummy_inputs = spec.dummy_fn(hf_pipe)
+            if name in neural_engine_quantization:
+                logger.info(f"Quantizing {name}...")
+                floats = tuple(a.float() if a.is_floating_point() else a for a in dummy_inputs)
+                _quantize_component_weights(
+                    module, module, floats, neural_engine_quantization[name], quantized_modules
+                )
+            if name in palettization:
+                logger.info(f"Palettizing {name}...")
+                module = _palettize_weights(module, palettization[name], dummy_inputs)
+            program = convert_ane_functions(
+                [("main", spec.cast_fn(module), dummy_inputs, spec.input_names, spec.output_names)],
+                include_debug_info=config.include_debug_info,
+            )
+            _save_program(program, asset_path, output_path, config.hf_model_id, spec.asset_name)
             results[name] = str(asset_path)
             continue
 
@@ -185,20 +217,9 @@ def export_diffusion(config: DiffusionExportConfig) -> dict[str, str]:
                 include_debug_info=config.include_debug_info,
             )
 
-        if asset_path.exists():
-            shutil.rmtree(asset_path)
-        logger.info(f"Saving {name} to {asset_path}...")
-        metadata = build_aimodel_metadata(config.hf_model_id, component=spec.asset_name)
-        program.save_asset(asset_path, metadata)
+        _save_program(program, asset_path, output_path, config.hf_model_id, spec.asset_name)
         del program
-
-        # Clean up leftover .mlirb from older export runs
-        mlirb_path = output_path / f"{spec.asset_name}.mlirb"
-        if mlirb_path.exists():
-            mlirb_path.unlink()
-
         results[name] = str(asset_path)
-        logger.info(f"Exported {name} -> {asset_path}")
 
     # 3. Save sidecar assets (tokenizer, BN stats, etc.)
     if pipeline_type == "flux2":
@@ -218,6 +239,7 @@ def export_diffusion(config: DiffusionExportConfig) -> dict[str, str]:
         results,
         vae_tile_size=config.vae_tile_size,
         dynamic=config.dynamic,
+        neural_engine=neural_engine,
     )
 
     # Summary
@@ -226,6 +248,37 @@ def export_diffusion(config: DiffusionExportConfig) -> dict[str, str]:
         logger.info(f"  {name}: {path}")
 
     return results
+
+
+def diffusion_output_subdir(
+    hf_model_id: str, *, dynamic: bool = False, neural_engine: bool = False
+) -> str:
+    """The ``<output_dir>`` subdirectory an export writes: the HF id's tail.
+
+    A dynamic export reuses the static asset names, so it gets its own directory rather than
+    overwriting the static bundle; so does Sana Sprint's iOS (Neural Engine) export.
+    """
+    subdir = hf_model_id.split("/")[-1]
+    if dynamic:
+        subdir += "-dynamic"
+    if neural_engine:
+        subdir += "-ios"
+    return subdir
+
+
+def _save_program(
+    program: Any, asset_path: Path, output_path: Path, model_id: str, asset_name: str
+) -> None:
+    if asset_path.exists():
+        shutil.rmtree(asset_path)
+    logger.info(f"Saving {asset_name} to {asset_path}...")
+    program.save_asset(asset_path, build_aimodel_metadata(model_id, component=asset_name))
+
+    # Clean up leftover .mlirb from older export runs
+    mlirb_path = output_path / f"{asset_name}.mlirb"
+    if mlirb_path.exists():
+        mlirb_path.unlink()
+    logger.info(f"Exported {asset_name} -> {asset_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -399,8 +452,12 @@ def _write_metadata_json(
     *,
     vae_tile_size: int | None = None,
     dynamic: bool = False,
+    neural_engine: bool = False,
 ) -> None:
-    """Write metadata.json with the v0.2 bundle schema for diffusion models."""
+    """Write metadata.json with the v0.2 bundle schema for diffusion models.
+
+    ``diffusion.compute_units`` lists each asset's compute units, as in the embedding bundle.
+    """
     from datetime import datetime
 
     if pipeline_type == "flux2":
@@ -414,6 +471,9 @@ def _write_metadata_json(
 
     json_path = output_path / "metadata.json"
     assets = _prepare_assets(json_path, exported_assets)
+    # A bundle directory holds one registry's assets, so all share the export's compute unit.
+    unit = "neural_engine" if neural_engine else "gpu"
+    diffusion_config["compute_units"] = {name: [unit] for name in assets}
 
     metadata = {
         "metadata_version": METADATA_VERSION,
@@ -582,6 +642,52 @@ def _resolve_compression(compression: str, component_names: list[str]) -> dict[s
             f"Valid: {sorted(component_names)}."
         )
     return {name: per_component.get(name) for name in component_names}
+
+
+def resolve_palettization(compression: str, neural_engine: bool) -> dict[str, dict]:
+    """A preset's ``component_palettization``, which only the Neural Engine export applies.
+
+    The Neural Engine export takes ``none`` or a palettization preset; the GPU export rejects
+    palettization presets rather than exporting dense.
+    """
+    palettization: dict[str, dict] = PRESETS.get(compression, {}).get("component_palettization", {})
+    if neural_engine and compression != "none" and not palettization:
+        names = [n for n, p in PRESETS.items() if "component_palettization" in p]
+        raise ValueError(
+            "The Sana Sprint --platform iOS export takes --compression none or a palettization "
+            f"preset ({', '.join(names)}); got '{compression}'."
+        )
+    if palettization and not neural_engine:
+        raise ValueError(
+            f"'{compression}' palettizes for the Neural Engine; use it with Sana Sprint and "
+            "--platform iOS."
+        )
+    return palettization
+
+
+def _resolve_neural_engine_quantization(compression: str) -> dict[str, dict]:
+    """A Neural Engine preset's ``component_quantization``, applied before palettization.
+
+    Only palettization presets carry it, and the GPU export rejects those.
+    """
+    return PRESETS.get(compression, {}).get("component_quantization", {})
+
+
+def _palettize_weights(
+    module: torch.nn.Module, config: dict, example_inputs: tuple[torch.Tensor, ...]
+) -> torch.nn.Module:
+    """k-means palettize ``module``'s weights (coreai-opt, Core AI export backend).
+
+    ``module`` is float32; floating ``example_inputs`` are traced in float32 to match it.
+    """
+    from coreai_opt.base_model_compressor import ExportBackend
+    from coreai_opt.palettization import KMeansPalettizer, KMeansPalettizerConfig
+
+    cfg = KMeansPalettizerConfig.from_dict({"kmeans_palettization_config": copy.deepcopy(config)})
+    palettizer = KMeansPalettizer(module, cast(KMeansPalettizerConfig, cfg))
+    args = tuple(a.float() if a.is_floating_point() else a for a in example_inputs)
+    palettizer.prepare(example_inputs=args)
+    return cast(torch.nn.Module, palettizer.finalize(backend=ExportBackend.CoreAI))
 
 
 def _resolve_component_precision(compression: str, component_names: list[str]) -> dict[str, str]:
