@@ -57,4 +57,19 @@ A host runs a bundle as follows:
 - **Queries:** `prompts.query` is the instruction for web search: `Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:`. For another task, write `Instruct: {task}\nQuery:{query}` with a one-sentence task. Documents take no prefix (`prompts.document` is empty).
 - **Vectors:** to use a smaller Matryoshka dimension, keep the leading dimensions and L2-normalize again. Compare vectors with cosine similarity.
 
+## Running
+
+### In your macOS applications
+
+```swift
+import CoreAIEmbeddings
+
+var model = try await CoreAIEmbeddingModel(resourcesAt: URL(filePath: "coreai-models/exports/qwen3-embedding-0.6b"))
+let instruct = "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:"
+let query = try await model.embed(texts: [instruct + "how do cats sleep?"])[0]
+let passages = try await model.embed(texts: ["Cats sleep about 15 hours a day."], dimensions: 256)
+```
+
+`CoreAIEmbeddings` does not add the prompt: prepend `"Instruct: <task>\nQuery:"` to each query yourself, and pass documents as they are. Texts are cut at 2,048 tokens; such an embedding's `status` is `.truncated(tokens:limit:)`.
+
 [^1]: [Blog](https://qwenlm.github.io/blog/qwen3-embedding/) · [GitHub](https://github.com/QwenLM/Qwen3-Embedding) · [HuggingFace](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B)

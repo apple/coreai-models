@@ -1,0 +1,50 @@
+{
+  "metadata_version": "0.2",
+  "kind": "embedding",
+  "name": "clip-vit-b32",
+  "assets": {"text_encoder": "text_encoder.aimodel", "image_encoder": "image_encoder.aimodel"},
+  "embedding": {
+    "space": {
+      "id": "openai/clip-vit-base-patch32",
+      "revision": "3d74acf9a28c67741b2f4f2ea7635f0aaf6f0268"
+    },
+    "dimension": 512,
+    "logit_scale": 100.00000762939453,
+    "components": {
+      "text_encoder": {
+        "asset": "text_encoder",
+        "inputs": {"input_ids": "int32[B,L]", "attention_mask": "int32[B,L]"},
+        "outputs": {"embedding": "float32[B,512]"},
+        "compute_units": ["gpu"],
+        "functions": [{"function": "text_encoder", "batch": {"min": 1, "max": 64}, "length": 77}]
+      },
+      "image_encoder": {
+        "asset": "image_encoder",
+        "inputs": {"pixel_values": "float32[B,3,224,224]"},
+        "outputs": {"embedding": "float32[B,512]"},
+        "compute_units": ["gpu"],
+        "functions": [{"function": "image_encoder", "batch": {"min": 1, "max": 64}}]
+      }
+    },
+    "towers": [
+      {"modality": "text", "pipeline": ["text_encoder"]},
+      {"modality": "image", "pipeline": ["image_encoder"]}
+    ],
+    "text": {
+      "embedded_tokenizer": true,
+      "add_bos_token": true,
+      "add_eos_token": true,
+      "bos_token_id": 49406,
+      "eos_token_id": 49407,
+      "pad_token_id": 49407,
+      "padding_side": "right",
+      "truncation": {"max_tokens": 77, "keep_eos": true}
+    },
+    "image": {
+      "image_strategy": "center_crop",
+      "image_size": 224,
+      "image_mean": [0.48145466, 0.4578275, 0.40821073],
+      "image_std": [0.26862954, 0.26130258, 0.27577711]
+    }
+  }
+}

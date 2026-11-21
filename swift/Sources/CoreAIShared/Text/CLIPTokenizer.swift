@@ -107,18 +107,19 @@ public struct CLIPTokenizer: Sendable {
         return (ids, attentionMask)
     }
 
+    /// Token IDs of `text` from `<|startoftext|>` to `<|endoftext|>`, neither truncated nor padded.
+    public func encodeUntruncated(_ text: String) -> [Int32] {
+        let cleaned = whitespaceClean(text).lowercased()
+        return [Self.sotTokenId] + tokenize(cleaned).compactMap { encoder[$0] } + [Self.eotTokenId]
+    }
+
     /// Tokenize, truncate and pad to `contextLength`, reporting how many leading slots came
     /// from the prompt. A `contextLength` of zero or less yields nothing.
     private func encodeIDs(
         _ text: String, contextLength: Int
     ) -> (ids: [Int32], realCount: Int) {
         guard contextLength > 0 else { return ([], 0) }
-        let cleaned = whitespaceClean(text).lowercased()
-        let wordTokens = tokenize(cleaned)
-
-        var ids: [Int32] = [Self.sotTokenId]
-        ids += wordTokens.compactMap { encoder[$0] }
-        ids.append(Self.eotTokenId)
+        var ids = encodeUntruncated(text)
 
         if ids.count > contextLength {
             ids = Array(ids.prefix(contextLength))
