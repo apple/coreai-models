@@ -16,6 +16,42 @@ from dataclasses import dataclass
 from typing import Optional
 
 import torch
+from torch import nn
+
+# Module types coreai-opt actually compresses. Anything else (norms,
+# activations, custom modules) is never palettized or block-quantized, so
+# an indivisible dim there cannot cause a silently skipped layer.
+_COMPRESSIBLE_TYPES = (
+    nn.Linear,
+    nn.Conv1d,
+    nn.Conv2d,
+    nn.Conv3d,
+    nn.ConvTranspose1d,
+    nn.ConvTranspose2d,
+    nn.ConvTranspose3d,
+    nn.Embedding,
+)
+
+_CONV_TRANSPOSE_TYPES = (
+    nn.ConvTranspose1d,
+    nn.ConvTranspose2d,
+    nn.ConvTranspose3d,
+)
+
+
+def _resolve_axis(module: nn.Module, axis: int) -> int:
+    """Map a config's channel axis to the tensor dim it lands on for module.
+
+    A compression config's axis names the logical channel axis: 0 for
+    output channels, 1 for input channels. ConvTranspose stores its weight
+    as (in_channels, out_channels, *kernel), so the two logical axes swap
+    (mirrors coreai_opt/quantization/_axis_defaults.py); everything else
+    stores (out_channels, in_channels, ...) and maps 1:1. Axes outside
+    {0, 1} are passed through unchanged.
+    """
+    if isinstance(module, _CONV_TRANSPOSE_TYPES) and axis in (0, 1):
+        return 1 - axis
+    return axis
 
 
 @dataclass(frozen=True)
@@ -58,21 +94,36 @@ def fp16_baseline_mb(model) -> float:
 
 
 def check_divisibility(model, axis: int, block_size: int) -> dict[str, tuple[int, int]]:
-    """Return layers whose weight.shape[axis] is not divisible by block_size.
+    """Return compressible layers whose resolved dim is not divisible.
 
     Per-block quantization and per-grouped-channel palettization silently
     skip these layers. Run this before applying such configs and override
     the offending layers via ``set_module_name``.
+
+    Only module types coreai-opt compresses (Linear, Conv*, ConvTranspose*,
+    Embedding) are checked — a norm's weight can never be silently skipped
+    because it is never compressed. axis is the config's channel axis
+    (0 = output channels, 1 = input channels) and is resolved per module
+    type; in particular ConvTranspose's output channels live on tensor
+    dim 1, so ``ConvTranspose2d(64, 12, 3)`` with axis=0, block 8 is
+    reported for 12, not cleared for 64.
 
     Returns:
         Dict mapping module_name -> (offending_dim, block_size).
     """
     incompatible: dict[str, tuple[int, int]] = {}
     for name, module in model.named_modules():
-        if hasattr(module, "weight") and module.weight is not None:
-            dim = module.weight.shape[axis]
-            if dim % block_size != 0:
-                incompatible[name] = (dim, block_size)
+        if not isinstance(module, _COMPRESSIBLE_TYPES):
+            continue
+        weight = getattr(module, "weight", None)
+        if not isinstance(weight, torch.Tensor):
+            continue
+        resolved = _resolve_axis(module, axis)
+        if resolved >= weight.ndim or resolved < -weight.ndim:
+            continue
+        dim = weight.shape[resolved]
+        if dim % block_size != 0:
+            incompatible[name] = (dim, block_size)
     return incompatible
 
 
