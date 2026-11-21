@@ -29,7 +29,6 @@ from coreai_models._constants import (
     DEFAULT_INCLUDE_DEBUG_INFO,
     IOS_DEFAULT_MAX_CONTEXT_LENGTH,
     MAX_GATHER_CONSTANT_ELEMENTS,
-    TRACE_KV_CACHE_SEQ_LEN,
 )
 from coreai_models.export.bundle import bundle_llm_asset
 from coreai_models.export.compression import (
@@ -254,11 +253,6 @@ def resolve_model(config: ExportConfig) -> ResolvedModel:
 
     if config.variant == "iOS" and entry.ios_class is None:
         raise ValueError(f"Model '{model_type}' does not support iOS variant")
-    if config.variant == "iOS" and entry.ios_export_script is not None:
-        raise ValueError(
-            f"Model '{model_type}' exports to iOS through its own script, not coreai.llm.export: "
-            f"uv run {entry.ios_export_script} --model <hf-id>"
-        )
 
     if config.with_drafter:
         if config.variant != "macOS":
@@ -406,11 +400,6 @@ def build_model(
     torch_palettization_config = resolved.palettization_config
 
     # ---- 3a. Pre-export torch quantization (if configured) ----
-    effective_max_ctx = max_context_length or getattr(
-        hf_config, "max_position_embeddings", TRACE_KV_CACHE_SEQ_LEN
-    )
-    vocab_size = hf_config.vocab_size
-    batch_size = 1
     # Set when composite ops are marked for externalization before quantization.
     externalized_model: torch.nn.Module | None = None
     if torch_quantization_config is not None:
@@ -489,33 +478,9 @@ def build_model(
     if torch_palettization_config is not None:
         assert config.variant == "iOS", "palettization is only supported for iOS variant."
 
-        query_len = 8
-        input_ids = torch.randint(1, vocab_size, (batch_size, query_len), dtype=torch.int32)
-        position_ids = (
-            torch.arange(query_len).to(torch.uint16).unsqueeze(0).expand(batch_size, query_len)
-        )
-        in_step = torch.zeros((1,), dtype=torch.int32)
-        causal_mask = torch.zeros(1, effective_max_ctx, 1, query_len, dtype=torch.float16)
-        if hasattr(hf_config, "head_dim") and isinstance(hf_config.head_dim, int):
-            head_dim = hf_config.head_dim
-        else:
-            head_dim = hf_config.hidden_size // hf_config.num_attention_heads
-        key_cache = torch.zeros(
-            hf_config.num_hidden_layers,
-            1,  # batch_size
-            hf_config.num_key_value_heads * head_dim,
-            1,
-            effective_max_ctx,
-            dtype=torch.float16,
-        )
-        value_cache = key_cache.clone()
-        palettization_inputs = (
-            input_ids,
-            position_ids,
-            in_step,
-            causal_mask,
-            key_cache,
-            value_cache,
+        input_ids = torch.randint(1, hf_config.vocab_size, (1, 8), dtype=torch.int32)
+        palettization_inputs = model.eager_forward_args(
+            input_ids, model.new_eager_state(dtype=torch.float16, device="cpu")
         )
         model = palettize_pytorch_model(
             model, palettization_inputs, torch_palettization_config, export_backend=export_backend
@@ -560,6 +525,11 @@ async def _async_export_model(config: ExportConfig) -> str:
     resolved = resolve_model(config)
     entry, hf_config, model_type = resolved.entry, resolved.hf_config, resolved.model_type
     target_dtype, max_context_length = resolved.target_dtype, resolved.max_context_length
+    if config.variant == "iOS" and entry.ios_export_script is not None:
+        raise ValueError(
+            f"Model '{model_type}' exports to iOS through its own script, not coreai.llm.export: "
+            f"uv run {entry.ios_export_script} --model <hf-id>"
+        )
 
     # Memory-efficient layer-by-layer loading + quantizer disk-checkpointing
     # is macOS-only for now. The iOS variant keeps the legacy full-RAM path

@@ -24,13 +24,19 @@ import torch
 pytest.importorskip("transformers")
 
 try:  # transformers>=5.5 (qwen3_5)
-    from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+    from transformers.models.qwen3_5.configuration_qwen3_5 import (
+        Qwen3_5Config,
+        Qwen3_5TextConfig,
+    )
     from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
 except Exception:  # pragma: no cover - requires transformers>=5.5
+    Qwen3_5Config = None
     Qwen3_5TextConfig = None
     Qwen3_5ForCausalLM = None
 
 from coreai_models._constants import EXTEND_FUNCTION_NAME  # noqa: E402
+from coreai_models.export import pipeline as export_pipeline  # noqa: E402
+from coreai_models.llm.export import _load_compression_config_object  # noqa: E402
 from coreai_models.models.ios.qwen3_5 import (  # noqa: E402
     DECODE_QUERY_LEN,
     PREFILL_QUERY_LEN,
@@ -80,6 +86,15 @@ def tiny_config(n_layers: int = 4, ctx: int = CTX) -> Qwen3_5TextConfig:
     # independent random head.
     cfg.tie_word_embeddings = True
     return cfg
+
+
+def _ios_export_config(monkeypatch, **kwargs) -> "export_pipeline.ExportConfig":
+    """An iOS export of Qwen3.5 whose checkpoint config is the tiny one, read without network."""
+    hf_config = Qwen3_5Config(text_config=tiny_config().to_dict())
+    monkeypatch.setattr(export_pipeline.AutoConfig, "from_pretrained", lambda *_, **__: hf_config)
+    return export_pipeline.ExportConfig(
+        hf_model_id="Qwen/Qwen3.5-2B", variant="iOS", compression="none", **kwargs
+    )
 
 
 def randomize(model: torch.nn.Module) -> None:
@@ -810,6 +825,45 @@ class TestExportRecipe:
         repo_root = pathlib.Path(__file__).resolve().parents[5]
         assert (repo_root / entry.ios_export_script).is_file()
 
+    def test_evaluation_resolves_the_ios_class(self, monkeypatch):
+        """Evaluation resolves the iOS class through `resolve_model`, so only export may refuse."""
+        resolved = export_pipeline.resolve_model(_ios_export_config(monkeypatch))
+        assert resolved.model_class is Qwen3_5ForCausalLMForiOS
+
+    def test_export_points_at_the_recipe_before_loading_weights(self, monkeypatch):
+        def load(*_, **__):
+            raise AssertionError("export loaded the weights before refusing")
+
+        monkeypatch.setattr(Qwen3_5ForCausalLMForiOS, "from_hf", classmethod(load))
+        with pytest.raises(ValueError, match="uv run models/qwen3_5/export.py"):
+            export_pipeline.export_model(_ios_export_config(monkeypatch))
+
+    def test_build_model_palettizes_with_eager_forward_args(self, monkeypatch):
+        """The palettizer traces `forward` on what `build_model` hands it, and Qwen3.5's takes
+        the DeltaNet inputs and states on top of the KV pair."""
+        cfg = tiny_config()
+        monkeypatch.setattr(
+            Qwen3_5ForCausalLMForiOS,
+            "from_hf",
+            classmethod(lambda cls, *_, **__: cls(cfg, torch.device("cpu")).to(torch.float16)),
+        )
+        logits = []
+
+        def palettize(model, example_inputs, *_, **__):
+            logits.append(model(*example_inputs))
+            return model
+
+        monkeypatch.setattr(export_pipeline, "palettize_pytorch_model", palettize)
+        recipe = pathlib.Path(__file__).resolve().parents[5] / "models/qwen3_5"
+        config = _ios_export_config(
+            monkeypatch,
+            compression_config_object=_load_compression_config_object(
+                recipe / "qwen3_5_2b_4bit_palettized.yaml", "iOS"
+            ),
+        )
+        export_pipeline.build_model(export_pipeline.resolve_model(config))
+        assert logits[0].shape[-1] == cfg.vocab_size
+
     def test_constraints_name_real_graph_io(self):
         """Constraints are looked up by I/O name, so a name the graph does not have is
         silently ignored. Every constrained name must be an input, state or state output."""
@@ -915,6 +969,22 @@ class TestHuggingFaceParity:
         head = ios.forward_sequence(ids[:, :split], states)
         tail = ios.forward_sequence(ids[:, split:], states, offset=split)
         assert _psnr(whole, torch.cat([head, tail])) > 100.0
+
+    def test_eager_step_matches_hf_across_calls(self, hf_pair):
+        """The scorers' entry point: two calls, the second from an unaligned offset and past a
+        ``MAX_QUERY_LEN`` boundary, give HF's logits at every position."""
+        hf, ios, cfg = hf_pair
+        n, split = MAX_QUERY_LEN + 36, 37
+        ids = torch.randint(1, cfg.vocab_size, (1, n), dtype=torch.int32)
+        with torch.no_grad():
+            expected = hf(ids.to(torch.long)).logits.to(torch.float32)
+        state = ios.new_eager_state(dtype=torch.float32, device="cpu")
+        head = ios.eager_step(ids[:, :split], state)
+        tail = ios.eager_step(ids[:, split:], state)
+        actual = torch.cat([head, tail], dim=1)
+        assert state.offset == n
+        assert _psnr(expected, actual) > 40.0
+        assert torch.equal(expected.argmax(-1), actual.argmax(-1))
 
     def test_blocked_walk_matches_hf(self, hf_pair):
         """A blocked walk must match HF."""
