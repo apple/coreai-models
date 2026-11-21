@@ -230,6 +230,7 @@ On a row of logits that contains NaN, plain greedy decoding and the verify scan 
 uv run coreai.diffusion.export black-forest-labs/FLUX.2-klein-4B
 uv run coreai.diffusion.export sana-sprint-0.6b
 uv run coreai.diffusion.export sana-sprint-1.6b
+uv run coreai.diffusion.export sana-sprint-0.6b --platform iOS # Neural Engine
 ```
 
 ### Vision-Language Models (VLMs)

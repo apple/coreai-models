@@ -11,15 +11,18 @@ import torch
 from coreai_models.primitives.ios.rms_norm import MaxAbsRMSNorm, MaxAbsRMSNormNoScale
 
 
+@pytest.mark.parametrize("floor", ["clamp", "add"])
 @pytest.mark.parametrize("peak", [0.0, 1e-7, 1e-5, 1e-3, 3.9e-3, 4e-3, 1.0, 1e2, 1e4, 6e4])
-def test_float16_max_abs_rms_norm_matches_float32_across_magnitudes(peak: float) -> None:
+def test_float16_max_abs_rms_norm_matches_float32_across_magnitudes(
+    peak: float, floor: str
+) -> None:
     eps = 1e-6
     x = torch.randn(8, 256, generator=torch.Generator().manual_seed(0))
     x = x / x.abs().amax(1, keepdim=True) * peak
     x16 = x.half()
     want = x16.float() * torch.rsqrt((x16.float() ** 2).mean(1, keepdim=True) + eps)
     with torch.no_grad():
-        got = MaxAbsRMSNormNoScale(eps).half()(x16).float()
+        got = MaxAbsRMSNormNoScale(eps, floor=floor).half()(x16).float()
     assert torch.isfinite(got).all()
     torch.testing.assert_close(got, want, rtol=2e-3, atol=2e-3)
 
@@ -34,3 +37,20 @@ def test_scale_over_a_leading_axis_matches_the_last_axis() -> None:
         got = channels_first(x)
         want = channels_last(x.transpose(1, 3)).transpose(1, 3)
     torch.testing.assert_close(got, want)
+
+
+def test_add_floor_matches_clamp_floor() -> None:
+    x = torch.randn(1, 64, 1, 16, generator=torch.Generator().manual_seed(2)) * 300
+    x[..., 3] = 0  # an all-zero column stays zero under both floors
+    clamp, add = MaxAbsRMSNorm(64, 1e-5, axis=-3), MaxAbsRMSNorm(64, 1e-5, axis=-3, floor="add")
+    with torch.no_grad():
+        clamp.weight.normal_()
+        add.weight.copy_(clamp.weight)
+        got, want = add(x), clamp(x)
+    torch.testing.assert_close(got, want)
+    assert torch.equal(got[..., 3], torch.zeros_like(got[..., 3]))
+
+
+def test_unknown_floor_is_rejected() -> None:
+    with pytest.raises(ValueError, match="floor"):
+        MaxAbsRMSNormNoScale(floor="max")  # type: ignore[arg-type]

@@ -94,6 +94,7 @@ public struct WanPipeline: VideoPipeline {
         // (below) rather than coming from the bundle's `assets` map.
         let bundle = try DiffusionBundle(at: url)
         let config = bundle.config
+        try config.requireGPUComputeUnits()
 
         let textDim = config.textDim ?? DiffusionDefaults.Video.textDim
         let latentChannels = config.latentChannels ?? DiffusionDefaults.Video.latentChannels

@@ -25,6 +25,15 @@ struct DiffusionConfigTests {
         #expect(config.textDim == nil)
     }
 
+    @Test("GPU-only pipelines accept GPU or unlisted compute units and refuse any other")
+    func requiresGPUComputeUnits() throws {
+        try DiffusionConfig(type: .flux2).requireGPUComputeUnits()
+        try DiffusionConfig(type: .flux2, computeUnits: ["transformer": ["gpu"]]).requireGPUComputeUnits()
+        let neuralEngine = DiffusionConfig(
+            type: .flux2, computeUnits: ["text_encoder": ["gpu"], "transformer": ["neural_engine"]])
+        #expect(throws: PipelineLoadError.self) { try neuralEngine.requireGPUComputeUnits() }
+    }
+
     @Test("Decodes a FLUX.2 diffusion block")
     func decodesFlux2() throws {
         let config = try decode(

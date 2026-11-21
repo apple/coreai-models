@@ -12,7 +12,11 @@ from pathlib import Path
 
 from coreai_models.diffusion.components import get_valid_components
 from coreai_models.diffusion.models import get_pipeline_type
-from coreai_models.diffusion.pipeline import DiffusionExportConfig, export_diffusion
+from coreai_models.diffusion.pipeline import (
+    DiffusionExportConfig,
+    export_diffusion,
+    resolve_palettization,
+)
 from coreai_models.diffusion.presets import DEFAULT_COMPRESSION_PRESET
 from coreai_models.model_registry import try_lookup_preset, try_lookup_preset_by_hf_id
 
@@ -72,8 +76,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--platform",
         default=None,
         choices=["iOS", "macOS"],
-        help="Target platform. iOS defaults to 512 resolution, --single-function, and "
-        "the half img2img reference grid; macOS defaults to 1024 and the full grid.",
+        help="Target platform. FLUX.2: iOS defaults to 512 resolution, --single-function, and "
+        "the half img2img reference grid; macOS defaults to 1024 and the full grid. "
+        "Sana Sprint: iOS exports the float16 Neural Engine build, at the model's native "
+        "resolution, to <model>-ios/.",
     )
     parser.add_argument(
         "--resolution",
@@ -175,6 +181,12 @@ def main() -> None:
             )
     else:
         preset = try_lookup_preset_by_hf_id(args.model, model_type="diffusion")
+    # A platform's own preset (Sana Sprint's iOS build) replaces the default one.
+    if preset is not None and args.platform is not None:
+        platform_preset = try_lookup_preset(
+            preset.short_name, model_type="diffusion", variant=args.platform
+        )
+        preset = platform_preset or preset
 
     if preset is not None:
         hf_model_id = preset.hf_id
@@ -202,7 +214,31 @@ def main() -> None:
 
     pipeline_type = get_pipeline_type(hf_model_id)
 
-    if args.components and args.platform:
+    # Sana Sprint's iOS build is the one re-authored for the Neural Engine.
+    neural_engine = args.platform == "iOS" and pipeline_type == "sana_sprint"
+    if neural_engine and args.compute_precision not in (None, "float16"):
+        parser.error(
+            f"Sana Sprint's --platform iOS build is float16; got --compute-precision "
+            f"{args.compute_precision}."
+        )
+    if neural_engine:
+        for flag, given in [
+            ("--resolution", args.resolution is not None),
+            ("--low-memory", args.low_memory),
+        ]:
+            if given:
+                parser.error(
+                    f"{flag} does not apply to Sana Sprint's --platform iOS build: it is fixed "
+                    "at the model's native resolution."
+                )
+    # Checked here so --dry-run refuses the same presets the export does.
+    try:
+        resolve_palettization(compression, neural_engine)
+    except ValueError as e:
+        parser.error(str(e))
+
+    # Sana Sprint's --platform only picks the build, so it combines with --components.
+    if args.components and args.platform and pipeline_type != "sana_sprint":
         parser.error("Cannot specify both --components and --platform. Use only one.")
 
     # iOS forces single-function: multi-function saves disk but raises peak memory.
@@ -333,6 +369,7 @@ def main() -> None:
         components=args.components or target_components,
         compute_precision=compute_precision,
         compression=compression,
+        neural_engine=neural_engine,
         overwrite=args.overwrite,
         include_debug_info=args.include_debug_info,
         multifunction=multifunction,
@@ -351,6 +388,7 @@ def main() -> None:
             print("  components:        all")
         print(f"  multifunction:     {config.multifunction}")
         print(f"  dynamic:           {config.dynamic}")
+        print(f"  neural_engine:     {config.neural_engine}")
         print(f"  overwrite:         {config.overwrite}")
         print(f"  include_debug_info: {config.include_debug_info}")
         return

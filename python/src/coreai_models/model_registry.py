@@ -14,7 +14,7 @@ CLI:
     uv run coreai.model.registry --model-info clip-vit-b32 --type utility --as-export-args
 
 `--type` selects the preset table (`llm`, `diffusion`, or `utility`).
-`--platform` (`macOS` / `iOS`) filters LLM variants and utility model platforms.
+`--platform` (`macOS` / `iOS`) filters LLM and diffusion variants and utility model platforms.
 """
 
 from __future__ import annotations
@@ -42,7 +42,8 @@ class ModelPreset:
     hf_id: str
     family: str
     type: str  # "llm" | "diffusion"
-    variant: str | None = None  # "macOS" | "iOS" for llm; None for diffusion
+    # "macOS" | "iOS" for llm and Sana Sprint; None for the other diffusion models
+    variant: str | None = None
     compression: str = "none"
     compute_precision: str | None = None  # None = use export tool default
     max_context_length: int | None = None  # llm-only; None for diffusion
@@ -694,7 +695,28 @@ DIFFUSION_PRESETS: list[ModelPreset] = [
         "Efficient-Large-Model/Sana_Sprint_0.6B_1024px_diffusers",
         "sana-sprint",
         "diffusion",
+        "macOS",
+        "t8bit-te4bit-asym",
+        "bfloat16",
         None,
+    ),
+    ModelPreset(
+        "sana-sprint-0.6b",
+        "Efficient-Large-Model/Sana_Sprint_0.6B_1024px_diffusers",
+        "sana-sprint",
+        "diffusion",
+        "iOS",
+        "te6bit-tok8-tx8bit-pal",
+        "float16",
+        None,
+        notes="Neural Engine float16 build (--platform iOS)",
+    ),
+    ModelPreset(
+        "sana-sprint-1.6b",
+        "Efficient-Large-Model/Sana_Sprint_1.6B_1024px_diffusers",
+        "sana-sprint",
+        "diffusion",
+        "macOS",
         "t8bit-te4bit-asym",
         "bfloat16",
         None,
@@ -704,10 +726,11 @@ DIFFUSION_PRESETS: list[ModelPreset] = [
         "Efficient-Large-Model/Sana_Sprint_1.6B_1024px_diffusers",
         "sana-sprint",
         "diffusion",
+        "iOS",
+        "te6bit-tok8-tx8bit-pal",
+        "float16",
         None,
-        "t8bit-te4bit-asym",
-        "bfloat16",
-        None,
+        notes="Neural Engine float16 build (--platform iOS)",
     ),
 ]
 
@@ -1071,6 +1094,8 @@ def _preset_to_export_args(preset: ModelPreset) -> list[str]:
     # Skip the flag for the macOS default to match the batch scripts.
     if preset.type == "llm" and preset.variant and preset.variant != "macOS":
         args += ["--platform", preset.variant]
+    if preset.type == "diffusion" and preset.variant == "iOS":
+        args += ["--platform", "iOS"]
     return args
 
 
@@ -1083,12 +1108,12 @@ def _preset_to_output_name(preset: ModelPreset) -> str:
     preset points at a YAML config, the YAML stem (which encodes model identity)
     replaces the `<hf_tail>_<compression>` segment to avoid duplication.
 
-    Diffusion: the HF id's tail (e.g. `FLUX.2-klein-4B`); the export
-    tool writes a directory of components there.
+    Diffusion: the HF id's tail (e.g. `FLUX.2-klein-4B`), plus `-ios` for an iOS preset; the
+    export tool writes a directory of components there.
     """
     tail = preset.hf_id.split("/")[-1]
     if preset.type == "diffusion":
-        return tail
+        return f"{tail}-ios" if preset.variant == "iOS" else tail
     if preset.variant == "macOS":
         variant_suffix = "_dynamic"
     elif preset.variant == "iOS":
@@ -1184,8 +1209,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--platform",
         choices=KNOWN_VARIANTS,
-        help="Platform filter (macOS / iOS). Filters LLM variants and utility model platforms; "
-        "diffusion entries are excluded when --platform is set.",
+        help="Platform filter (macOS / iOS). Filters LLM and Sana Sprint variants and utility "
+        "model platforms; diffusion entries without a platform (FLUX.2, Wan) are excluded "
+        "when --platform is set.",
     )
     parser.add_argument(
         "--family",
@@ -1251,7 +1277,7 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="format",
         const="export-args",
         help="Print the argv to forward to coreai.{type}.export. "
-        "Requires --model-info plus --platform for LLM.",
+        "Requires --model-info plus --platform for LLM and Sana Sprint.",
     )
     fmt.add_argument(
         "--as-output-name",
@@ -1261,7 +1287,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Print the basename the export tool would write for "
         "this preset (LLM: bundle directory name; "
         "diffusion: model directory name). "
-        "Requires --model-info plus --platform for LLM.",
+        "Requires --model-info plus --platform for LLM and Sana Sprint.",
     )
     parser.set_defaults(format="text")
 

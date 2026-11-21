@@ -58,6 +58,13 @@ public struct DiffusionConfig: Codable, Sendable, Equatable {
     /// Token count of the text encoder output fed to the transformer.
     public let textSequenceLength: Int?
 
+    // MARK: Compute units
+
+    /// Component name (`transformer`, `text_encoder`, ...) to the compute units its asset was
+    /// built for, preferred first, e.g. `["neural_engine"]`. Sana Sprint loads each asset on its
+    /// first unit (the GPU if unlisted) and refuses a unit it does not support.
+    public let computeUnits: [String: [String]]?
+
     // MARK: Video (Wan)
 
     /// Text-encoder embedding dimension (Wan `text_dim`).
@@ -91,6 +98,7 @@ public struct DiffusionConfig: Codable, Sendable, Equatable {
         promptPrefix: String? = nil,
         textInputLength: Int? = nil,
         textSequenceLength: Int? = nil,
+        computeUnits: [String: [String]]? = nil,
         textDim: Int? = nil,
         latentChannels: Int? = nil,
         schedulerShift: Float? = nil,
@@ -117,6 +125,7 @@ public struct DiffusionConfig: Codable, Sendable, Equatable {
         self.promptPrefix = promptPrefix
         self.textInputLength = textInputLength
         self.textSequenceLength = textSequenceLength
+        self.computeUnits = computeUnits
         self.textDim = textDim
         self.latentChannels = latentChannels
         self.schedulerShift = schedulerShift
@@ -145,6 +154,7 @@ public struct DiffusionConfig: Codable, Sendable, Equatable {
         case promptPrefix = "prompt_prefix"
         case textInputLength = "text_input_length"
         case textSequenceLength = "text_sequence_length"
+        case computeUnits = "compute_units"
         case textDim = "text_dim"
         case latentChannels = "z_dim"
         case schedulerShift = "default_shift"
@@ -178,6 +188,7 @@ public struct DiffusionConfig: Codable, Sendable, Equatable {
         self.promptPrefix = try c.decodeIfPresent(String.self, forKey: .promptPrefix)
         self.textInputLength = try c.decodeIfPresent(Int.self, forKey: .textInputLength)
         self.textSequenceLength = try c.decodeIfPresent(Int.self, forKey: .textSequenceLength)
+        self.computeUnits = try c.decodeIfPresent([String: [String]].self, forKey: .computeUnits)
         self.textDim = try c.decodeIfPresent(Int.self, forKey: .textDim)
         self.latentChannels = try c.decodeIfPresent(Int.self, forKey: .latentChannels)
         self.schedulerShift = try c.decodeIfPresent(Float.self, forKey: .schedulerShift)
