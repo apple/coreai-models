@@ -1958,7 +1958,8 @@ struct EngineImpl: ~Copyable {
     private mutating func _encodeChunk(tokens: [Int32]) async throws {
         let queryLength = tokens.count
         let currentStep = processedTokenCount
-        let graphName = prefillFunction != nil ? prefillGraphFunctionName : config.function
+        let prefillGraph = chunkRunsOnPrefillGraph(queryLength: queryLength) ? prefillFunction : nil
+        let graphName = prefillGraph != nil ? prefillGraphFunctionName : config.function
 
         let chunkID = InstrumentsProfiler.beginCustomInterval(
             name: "CoreAIPipelinedChunk",
@@ -2009,9 +2010,9 @@ struct EngineImpl: ~Copyable {
         var valState = unsafe InferenceFunction.AsyncMutableValue(
             unsafeBuffer: valBuffer, byteOffset: 0,
             scalarType: valueCacheScalarType, shape: valShape, strides: valStrides)
-        if let prefillFn = prefillFunction {
+        if let prefillGraph {
             try encodeWithStatesNoOutputs(
-                function: prefillFn, inputs: asyncInputs,
+                function: prefillGraph, inputs: asyncInputs,
                 keyState: &keyState, keyCacheName: keyCacheName,
                 valState: &valState, valueCacheName: valueCacheName,
                 additionalStates: additionalStates,
