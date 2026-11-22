@@ -28,6 +28,7 @@ Key differences from other iOS models (Qwen3, Llama):
     attention enables large contexts)
 """
 
+import logging
 from typing import Any, cast
 
 # Registers `torch.ops.coreai.lut_to_dense` and `torch.ops.coreai.constexpr_blockwise_shift_scale`,
@@ -72,7 +73,7 @@ from coreai_models.primitives.ios.quantization import (
     unpack_signed_subbyte,
     unpack_unsigned_subbyte,
 )
-from coreai_models.primitives.ios.rms_norm import RMSNorm
+from coreai_models.primitives.ios.rms_norm import MaxAbsRMSNorm, MaxAbsRMSNormNoScale, RMSNorm
 from coreai_models.primitives.ios.rope import apply_rope
 from coreai_models.primitives.ios.sdpa import SDPA, BlockedSDPA
 
@@ -89,6 +90,8 @@ try:
 except ImportError:  # pragma: no cover - depends on the installed transformers
     QuantizedEmbedding = None  # type: ignore[assignment,misc]
     QuantizedLinear = None  # type: ignore[assignment,misc]
+
+logger = logging.getLogger(__name__)
 
 # Flash chunk width for the global (full-attention) ``BlockedSDPA`` over the flat cache:
 # the largest key-axis chunk whose per-block score/softmax stays within the accelerator's
@@ -148,6 +151,39 @@ class RMSNormNoScale(nn.Module):
         return x * inv_rms
 
 
+def _rms_norm(config, dim: int, eps: float) -> nn.Module:
+    """RMSNorm over the last axis. Native-quantized (QAT) checkpoints use the float16-overflow-safe
+    max-abs form: their activations exceed the ~256 magnitude past which squaring overflows."""
+    if getattr(config, "native_quantized", False):
+        return MaxAbsRMSNorm(dim, eps=eps)
+    return RMSNorm(dim, eps=eps)
+
+
+def _rms_norm_no_scale(config, eps: float) -> nn.Module:
+    """``_rms_norm`` without a learnable scale."""
+    if getattr(config, "native_quantized", False):
+        return MaxAbsRMSNormNoScale(eps=eps)
+    return RMSNormNoScale(eps=eps)
+
+
+def _quantize_activation(x: torch.Tensor, scale: float) -> torch.Tensor:
+    """Static symmetric INT8 quantize-dequantize of an activation, as the QAT checkpoints were
+    trained with (``transformers.integrations.gemma_quant.apply_srq``): ``x`` is rounded to the
+    nearest multiple of ``scale`` within ``[-128, 127]`` steps. A ``scale`` of 0 means the layer
+    is uncalibrated and leaves ``x`` unchanged, adding nothing to the graph.
+
+    Written as CoreAI's native ``quantize``/``dequantize`` pair, which the converter keeps as
+    real INT8 quantization ops; a generic ``round`` would not stay on the static-shape engine.
+    """
+    if not scale:
+        return x
+    # The scale in the activation's dtype, as the checkpoint applies it: rounding is decided at
+    # the boundaries, so the scale's own precision matters.
+    scale_t = torch.tensor(scale, dtype=x.dtype)
+    q = torch.ops.coreai.quantize(x, scale_t, torch.int8)
+    return torch.ops.coreai.dequantize(q, scale_t, input_dtype=torch.int8, output_dtype=x.dtype)
+
+
 class NativeQuantConv1x1(nn.Module):
     """1x1-Conv2d-shaped weight held in CoreAI's native quantized format.
 
@@ -167,10 +203,16 @@ class NativeQuantConv1x1(nn.Module):
             "quantized_data", torch.zeros(out_channels, in_channels, 1, 1, dtype=torch.int8)
         )
         self.register_buffer("scale", torch.ones(out_channels, 1, 1, 1, dtype=torch.float16))
+        # The checkpoint's static INT8 activation scales for this layer's input and output (see
+        # `_quantize_activation`); 0 leaves that side unquantized. Plain floats, so they are
+        # constants in the traced graph.
+        self.input_activation_scale = 0.0
+        self.output_activation_scale = 0.0
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = _quantize_activation(x, self.input_activation_scale)
         weight = dequantize_native(self.quantized_data, self.scale, self.nbits, x.dtype)
-        return nn.functional.conv2d(x, weight)
+        return _quantize_activation(nn.functional.conv2d(x, weight), self.output_activation_scale)
 
 
 class NativeLutQuantConv1x1(nn.Module):
@@ -210,11 +252,15 @@ class NativeLutQuantConv1x1(nn.Module):
             levels = torch.arange(2**nbits, dtype=torch.int8) - bias
             lut = levels.reshape(1, 1, 1, 1, 2**nbits, 1)
         self.register_buffer("lut", lut, persistent=False)
+        # See `NativeQuantConv1x1`.
+        self.input_activation_scale = 0.0
+        self.output_activation_scale = 0.0
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = _quantize_activation(x, self.input_activation_scale)
         dense = torch.ops.coreai.lut_to_dense(self.indices, self.lut, 0)
         weight = dequantize_native_dense(dense, self.scale, x.dtype)
-        return nn.functional.conv2d(x, weight)
+        return _quantize_activation(nn.functional.conv2d(x, weight), self.output_activation_scale)
 
 
 class NativeQuantLinear(nn.Module):
@@ -351,14 +397,17 @@ class GeGLUMLP(nn.Module):
         self.down_proj = _make_proj_conv(config, hidden_dim, dim, nbits=nbits)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        batch_size, query_len, _, dim = x.shape
-        x = x.reshape(batch_size * query_len, dim, 1, 1)
+        # Tokens go in the 1x1 convs' width, (B, D, 1, S), as in `Attention`, not in their batch,
+        # (B*S, D, 1, 1): on the Neural Engine, a QAT checkpoint's activation quantize/dequantize
+        # around these convs makes the batch layout several times slower in prefill. The two
+        # layouts compute the same values, and the standard checkpoints use this layout too.
+        x = x.transpose(-3, -1)
 
         up_tensor = self.up_proj(x)
         gate_tensor = nn.functional.gelu(self.gate_proj(x), approximate="tanh")
         down_tensor = self.down_proj(up_tensor * gate_tensor)
 
-        return down_tensor.reshape(batch_size, query_len, 1, dim)
+        return down_tensor.transpose(-3, -1)
 
 
 class Attention(nn.Module):
@@ -398,10 +447,10 @@ class Attention(nn.Module):
             self.v_proj = _make_proj_conv(config, dim, self.n_kv_heads * self.head_dim, nbits=4)
         self.o_proj = _make_proj_conv(config, self.n_heads * self.head_dim, dim, nbits=4)
 
-        self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = _rms_norm(config, self.head_dim, eps=config.rms_norm_eps)
         if not is_kv_shared:
-            self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.v_norm = RMSNormNoScale(eps=config.rms_norm_eps)
+            self.k_norm = _rms_norm(config, self.head_dim, eps=config.rms_norm_eps)
+        self.v_norm = _rms_norm_no_scale(config, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -497,10 +546,10 @@ class TransformerBlock(nn.Module):
         self.mlp = GeGLUMLP(config, hidden_size, intermediate_size, layer_idx)
 
         eps = config.rms_norm_eps
-        self.input_layernorm = RMSNorm(hidden_size, eps=eps)
-        self.post_attention_layernorm = RMSNorm(hidden_size, eps=eps)
-        self.pre_feedforward_layernorm = RMSNorm(hidden_size, eps=eps)
-        self.post_feedforward_layernorm = RMSNorm(hidden_size, eps=eps)
+        self.input_layernorm = _rms_norm(config, hidden_size, eps=eps)
+        self.post_attention_layernorm = _rms_norm(config, hidden_size, eps=eps)
+        self.pre_feedforward_layernorm = _rms_norm(config, hidden_size, eps=eps)
+        self.post_feedforward_layernorm = _rms_norm(config, hidden_size, eps=eps)
 
         self.hidden_size_per_layer_input = config.hidden_size_per_layer_input
         if self.hidden_size_per_layer_input:
@@ -511,7 +560,7 @@ class TransformerBlock(nn.Module):
             self.per_layer_projection = _make_proj_conv(
                 config, self.hidden_size_per_layer_input, hidden_size, nbits=8
             )
-            self.post_per_layer_input_norm = RMSNorm(hidden_size, eps=eps)
+            self.post_per_layer_input_norm = _rms_norm(config, hidden_size, eps=eps)
 
         self.register_buffer("layer_scalar", torch.ones(1))
 
@@ -614,8 +663,8 @@ class Gemma4Model(nn.Module):
                 hidden_size, ple_dim, kernel_size=1, bias=False
             )
             self.per_layer_model_projection_scale = hidden_size**-0.5
-            self.per_layer_projection_norm = RMSNorm(
-                config.hidden_size_per_layer_input, eps=config.rms_norm_eps
+            self.per_layer_projection_norm = _rms_norm(
+                config, config.hidden_size_per_layer_input, eps=config.rms_norm_eps
             )
             self.per_layer_input_scale = 2.0**-0.5
 
@@ -643,7 +692,7 @@ class Gemma4Model(nn.Module):
                 )
             )
         self.layers = nn.ModuleList(layers)
-        self.norm = RMSNorm(hidden_size, eps=config.rms_norm_eps)
+        self.norm = _rms_norm(config, hidden_size, eps=config.rms_norm_eps)
 
         # RoPE cos/sin are precomputed in the runner and passed in as graph inputs: a 131k
         # position index overflows a 16-bit position input, and a 32-bit one feeding the
@@ -1419,12 +1468,15 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
         disable_embedding_quantization: bool = False,
         use_attention_mask: bool = False,
         backend: BackendName = "huggingface",
+        activation_quant: bool = True,
     ) -> "Gemma4ForCausalLMForiOS":
         """Load from HF multimodal model, extracting the text decoder only.
 
         A standard checkpoint loads through the base loader. A QAT checkpoint loads with
         quantized modules, whose packed weights, per-layer bit widths and PLE table are read
-        off those modules before the HF model is discarded.
+        off those modules before the HF model is discarded. Its static INT8 activation
+        quantization is carried over too unless ``activation_quant`` is False, which leaves
+        the activations unquantized (weights only).
         """
         load_id = resolve_local(
             huggingface_model_id_or_path,
@@ -1511,6 +1563,21 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
                 # The untied `lm_head` sits outside the `model.language_model.` prefix.
                 text_sd[k] = v
 
+        # The checkpoint's static INT8 activation scales, by text-model module name (see
+        # `_quantize_activation`); applied to the matching native modules once they are loaded.
+        activation_scales = (
+            {
+                name[len(hf_prefix) :]: (
+                    float(module.input_activation_scale),
+                    float(module.output_activation_scale),
+                )
+                for name, module in modules_by_name.items()
+                if isinstance(module, QuantizedLinear) and name.startswith(hf_prefix)
+            }
+            if activation_quant
+            else {}
+        )
+
         del hf_model, full_sd, modules_by_name, ple_module
 
         if num_layers is not None:
@@ -1541,6 +1608,8 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
 
         strict = num_layers is None
         model.load_state_dict(text_sd, assign=True, strict=strict)
+        if activation_scales:
+            model._apply_activation_scales(activation_scales)
 
         if mmap_path is not None:
             move_model_to_disk(model, path=mmap_path)
@@ -1662,6 +1731,37 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
         state_dict.pop("model.embed_tokens.weight")
 
         state_dict.pop("lm_head.weight", None)
+
+    def _apply_activation_scales(self, scales: dict[str, tuple[float, float]]) -> None:
+        """Set each native quantized projection's static input activation scale from ``scales``,
+        keyed by text-model module name (``layers.<i>.self_attn.q_proj`` and so on). Layers
+        this model does not build (the shared-KV layers' ``k_proj``/``v_proj``) are skipped.
+
+        Only each projection's input is quantized; the checkpoint's output scales are not
+        applied. An output quantize/dequantize sits between a conv and the op after it (the
+        MLP's GELU, for one), which keeps the Neural Engine compiler from fusing the input
+        quantize into an integer convolution, and the next projection quantizes its own input
+        anyway. ``lm_head`` is not a 1x1-conv projection and keeps a float input."""
+        root = "extend.model."
+        applied = 0
+        for name, module in self.named_modules():
+            if not name.startswith(root) or not isinstance(
+                module, (NativeQuantConv1x1, NativeLutQuantConv1x1)
+            ):
+                continue
+            entry = scales.get(name[len(root) :])
+            if entry is None:
+                raise ValueError(f"No activation scales in the checkpoint for {name}")
+            input_scale, _ = entry
+            if name.endswith(".self_attn.o_proj"):
+                # Its input comes straight from the attention composite, and the static-shape
+                # engine's compiler fails ("internal error in Quant Hoisting logic") when a
+                # quantize follows that composite; the whole function then falls back off the
+                # engine. Left unquantized until the compiler handles it.
+                input_scale = 0.0
+            module.input_activation_scale, module.output_activation_scale = input_scale, 0.0
+            applied += 1
+        logger.info(f"Applied static INT8 activation quantization to {applied} projections.")
 
     def _mutate_native_quantized_state_dict(self, state_dict: dict[str, torch.Tensor]) -> None:
         """``_mutate_state_dict``'s native-quantized counterpart.

@@ -225,7 +225,8 @@ def _resolve_compression(args: argparse.Namespace, native_quantized: bool) -> tu
     A native-quantized (QAT) checkpoint is already quantized in the traced graph, and
     re-clustering its weights would only add noise to the checkpoint's own QAT values, so it
     is never palettized; an explicit ``--compression`` or ``--compression-config`` is refused
-    rather than ignored.
+    rather than ignored. ``--weights-only`` names the bundle apart from the default export,
+    which also carries the checkpoint's activation quantization.
     """
     if native_quantized:
         if getattr(args, "explicit_compression", False):
@@ -233,6 +234,8 @@ def _resolve_compression(args: argparse.Namespace, native_quantized: bool) -> tu
                 f"{args.model} is a native-quantized checkpoint and is exported with its own "
                 "quantization; drop --compression / --compression-config."
             )
+        if getattr(args, "weights_only", False):
+            return None, "native_quantized_weights_only"
         return None, "native_quantized"
     if args.compression_config is not None:
         return _load_compression_config_object(args.compression_config, "iOS"), (
@@ -242,12 +245,20 @@ def _resolve_compression(args: argparse.Namespace, native_quantized: bool) -> tu
 
 
 def _check_native_quantized_options(args: argparse.Namespace, native_quantized: bool) -> None:
-    """Refuse options a native-quantized (QAT) checkpoint cannot be exported with.
+    """Refuse options that do not apply to the checkpoint's kind.
 
     ``--include-vision``: the vision encoder export reads float ``*.linear.weight`` tensors,
     but the QAT checkpoints quantize the vision tower too (INT8 weights with a per-channel
     scale), which it would load as float values without their scale.
+
+    ``--weights-only``: only a native-quantized (QAT) checkpoint has activation quantization
+    to drop.
     """
+    if not native_quantized and getattr(args, "weights_only", False):
+        raise SystemExit(
+            "--weights-only only applies to the native-quantized (QAT) checkpoints, "
+            f"not {args.model}."
+        )
     if native_quantized and getattr(args, "include_vision", False):
         raise SystemExit(
             f"--include-vision is not supported for the native-quantized checkpoint {args.model}: "
@@ -592,11 +603,11 @@ async def _export_ios(args: argparse.Namespace) -> str:
     native_quantized = _native_quantized_checkpoint(hf_model_id)
     _check_native_quantized_options(args, native_quantized)
     palettization_config, compression = _resolve_compression(args, native_quantized)
-    if native_quantized:
+    if native_quantized and args.weights_only:
         logger.warning(
-            f"{hf_model_id} is exported with its quantized weights only: the static activation "
-            "quantization it was trained with is not applied, so its accuracy can fall below "
-            "the default palettized export of the standard checkpoint."
+            f"{hf_model_id} is exported with its quantized weights only (--weights-only): the "
+            "static activation quantization it was trained with is not applied, so its accuracy "
+            "can fall below the default palettized export of the standard checkpoint."
         )
 
     output_name = args.output_name or _generate_output_name(
@@ -638,6 +649,7 @@ async def _export_ios(args: argparse.Namespace) -> str:
             max_context_length=max_ctx,
             target_dtype=target_dtype,
             mmap_path=os.path.join(temp_dir, "weights"),
+            activation_quant=not args.weights_only,
         ).eval()
         hf_config.max_position_embeddings = max_ctx
 
@@ -778,6 +790,12 @@ def build_parser() -> argparse.ArgumentParser:
         "asset smaller.",
     )
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable DEBUG logging")
+    parser.add_argument(
+        "--weights-only",
+        action="store_true",
+        help="For a native-quantized (QAT) checkpoint, drop its static INT8 activation "
+        "quantization and keep only the quantized weights. Default: off.",
+    )
     parser.add_argument(
         "--emit-hidden-states",
         action="store_true",

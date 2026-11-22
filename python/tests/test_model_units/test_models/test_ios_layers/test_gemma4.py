@@ -32,6 +32,7 @@ from coreai_models._constants import EXTEND_FUNCTION_NAME  # noqa: E402
 from coreai_models.models.base import TraceSpec, _is_layer_key_beyond  # noqa: E402
 from coreai_models.models.ios.gemma4_text import (  # noqa: E402
     DEFAULT_KV_BLOCK_SIZE,
+    GeGLUMLP,
     Gemma4Extend,
     Gemma4ForCausalLMForiOS,
     NativeLutQuantConv1x1,
@@ -918,6 +919,7 @@ def test_e2b_qat_native_quantization_dispatch_and_bit_exactness():
     ours_mods = dict(model.named_modules())
     hf_prefix = "model.language_model."
     covered = set()
+    quantized_inputs = 0
     for name, hf_mod in hf_mods.items():
         if not isinstance(hf_mod, QuantizedLinear) or not (
             name.startswith(hf_prefix) or name == "lm_head"
@@ -929,6 +931,17 @@ def test_e2b_qat_native_quantization_dispatch_and_bit_exactness():
             continue
         assert ours.nbits >= hf_mod.num_bits, name
         covered.add(name.rsplit(".", 1)[-1])
+        # `from_hf` carries each conv projection's input activation scale over (o_proj's
+        # stays 0, see `_apply_activation_scales`) and never its output scale.
+        if isinstance(ours, (NativeQuantConv1x1, NativeLutQuantConv1x1)):
+            if name.endswith(".self_attn.o_proj"):
+                assert ours.input_activation_scale == 0.0, name
+            else:
+                expected = float(hf_mod.input_activation_scale)
+                assert expected > 0, name
+                assert ours.input_activation_scale == pytest.approx(expected), name
+                quantized_inputs += 1
+            assert ours.output_activation_scale == 0.0, name
     assert {
         "q_proj",
         "o_proj",
@@ -936,6 +949,114 @@ def test_e2b_qat_native_quantization_dispatch_and_bit_exactness():
         "per_layer_projection",
         "lm_head",
     } <= covered
+    assert quantized_inputs > 0
     assert False in compared, "expected at least one 4-bit MLP layer in this checkpoint"
 
     del hf_model, model
+
+
+def test_native_quant_conv1x1_activation_quant_matches_hf_srq():
+    """With activation scales set, the module quantizes its input and output exactly as the
+    HF QAT layer does (``apply_srq`` around the matmul); a scale of 0 leaves that side alone."""
+    gemma_quant = pytest.importorskip("transformers.integrations.gemma_quant")
+    torch.manual_seed(0)
+    out_c, in_c = 16, 8
+    mod = NativeQuantConv1x1(in_c, out_c, nbits=4)
+    q = torch.randint(-8, 8, (out_c, in_c, 1, 1), dtype=torch.int8)
+    scale = torch.rand(out_c, 1, 1, 1, dtype=torch.float16) * 0.05
+    with torch.no_grad():
+        mod.quantized_data.copy_(q)
+        mod.scale.copy_(scale)
+    x = torch.randn(1, in_c, 1, 6, dtype=torch.float16)
+    weight = q.reshape(out_c, in_c).to(torch.float16) * scale.reshape(out_c, 1)
+
+    def reference(s_in: float, s_out: float) -> torch.Tensor:
+        xs = x.squeeze(2).transpose(1, 2)  # (1, 6, in_c): the HF linear layout
+        xs = gemma_quant.apply_srq(xs, torch.tensor(s_in))
+        out = gemma_quant.apply_srq(torch.nn.functional.linear(xs, weight), torch.tensor(s_out))
+        return out.transpose(1, 2).unsqueeze(2)
+
+    for s_in in (0.0, 0.02):
+        mod.input_activation_scale, mod.output_activation_scale = s_in, 0.0
+        with torch.no_grad():
+            torch.testing.assert_close(mod(x), reference(s_in, 0.0), atol=1e-3, rtol=1e-3)
+    # With the output quantized too, the conv and the linear accumulate in a different fp16
+    # order, so a value on a rounding boundary can land one step either way.
+    mod.input_activation_scale, mod.output_activation_scale = 0.02, 0.01
+    with torch.no_grad():
+        diff = (mod(x) - reference(0.02, 0.01)).abs()
+    assert diff.max() <= 0.01 + 1e-3
+    assert (diff > 1e-3).float().mean() < 0.05
+    # The scales really do change the result.
+    mod.input_activation_scale = mod.output_activation_scale = 0.0
+    plain = mod(x)
+    mod.input_activation_scale, mod.output_activation_scale = 0.05, 0.05
+    assert not torch.allclose(mod(x), plain)
+
+
+def test_geglu_mlp_puts_tokens_in_the_conv_width():
+    """The MLP runs its 1x1 convs with the tokens in their width, (B, D, 1, S), and computes
+    exactly what the per-token batch layout, (B*S, D, 1, 1), computes, activation quantization
+    included."""
+    cfg = _make_config()
+    cfg.native_quantized = True
+    torch.manual_seed(0)
+    mlp = GeGLUMLP(cfg, cfg.hidden_size, cfg.intermediate_size, layer_idx=0).half().eval()
+    with torch.no_grad():
+        for conv in (mlp.gate_proj, mlp.up_proj, mlp.down_proj):
+            conv.quantized_data.copy_(torch.randint(-8, 8, conv.quantized_data.shape))
+            conv.scale.copy_(torch.rand_like(conv.scale) * 0.05)
+            conv.input_activation_scale, conv.output_activation_scale = 0.02, 0.03
+    shapes = []
+    mlp.gate_proj.register_forward_pre_hook(lambda _, args: shapes.append(tuple(args[0].shape)))
+    seq, dim = 7, cfg.hidden_size
+    x = torch.randn(1, seq, 1, dim, dtype=torch.float16)
+
+    with torch.no_grad():
+        out = mlp(x)
+        xb = x.reshape(seq, dim, 1, 1)
+        gate = torch.nn.functional.gelu(mlp.gate_proj(xb), approximate="tanh")
+        reference = mlp.down_proj(mlp.up_proj(xb) * gate).reshape(1, seq, 1, dim)
+
+    assert shapes[0] == (1, dim, 1, seq)
+    assert torch.equal(out, reference)
+
+
+def test_activation_scales_quantize_only_projection_inputs():
+    """The checkpoint's input scales are applied and its output scales are not, so no
+    quantize/dequantize sits between a conv and the op after it; o_proj's input stays
+    unquantized; a projection the checkpoint has no scales for is an error."""
+
+    def tree(names):
+        root = torch.nn.Module()
+        for name in names:
+            parent = root
+            *path, leaf = name.split(".")
+            for part in path:
+                if not hasattr(parent, part):
+                    parent.add_module(part, torch.nn.Module())
+                parent = getattr(parent, part)
+            # The sub-4-bit MLP projections are LUT-decoded; they get their input scale too.
+            conv = (
+                NativeLutQuantConv1x1(4, 4, nbits=2)
+                if name.endswith("down_proj")
+                else NativeQuantConv1x1(4, 4, nbits=4)
+            )
+            parent.add_module(leaf, conv)
+        return root
+
+    names = ["layers.0.mlp.gate_proj", "layers.0.mlp.down_proj", "layers.0.self_attn.o_proj"]
+    root = tree([f"extend.model.{n}" for n in names])
+    scales = {n: (0.02 + i * 0.01, 0.5) for i, n in enumerate(names)}
+    Gemma4ForCausalLMForiOS._apply_activation_scales(root, scales)
+
+    modules = dict(root.named_modules())
+    assert isinstance(modules["extend.model.layers.0.mlp.down_proj"], NativeLutQuantConv1x1)
+    for i, n in enumerate(names):
+        conv = modules[f"extend.model.{n}"]
+        assert conv.output_activation_scale == 0.0, n
+        expected = 0.0 if n.endswith("o_proj") else 0.02 + i * 0.01
+        assert conv.input_activation_scale == pytest.approx(expected), n
+
+    with pytest.raises(ValueError, match="No activation scales"):
+        Gemma4ForCausalLMForiOS._apply_activation_scales(root, {})
