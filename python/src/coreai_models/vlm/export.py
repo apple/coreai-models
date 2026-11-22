@@ -38,12 +38,14 @@ from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from transformers import AutoConfig, AutoTokenizer
 
-from coreai_models._constants import DEFAULT_INCLUDE_DEBUG_INFO
+from coreai_models._constants import DEFAULT_INCLUDE_DEBUG_INFO, METADATA_VERSION
 from coreai_models.export.macos import export_to_coreai
 from coreai_models.export.metadata import build_aimodel_metadata
+from coreai_models.export.presets import get_preset
 from coreai_models.models.macos.muse_glimmer import MuseGlimmerForCausalLMEmbeddings
 from coreai_models.models.macos.muse_glimmer_vision import MuseGlimmerVisionModel
 from coreai_models.models.macos.qwen3_vl import Qwen3VLForCausalLMEmbeddings
+from coreai_models.primitives.ios.rope import rotate_half
 
 # Core AI state names for the persistent KV cache.
 KV_STATE_NAMES = ("k_cache", "v_cache")
@@ -355,6 +357,29 @@ def _vision_metadata(spec: VLMSpec) -> dict:
     }
 
 
+def _write_vision_metadata(
+    bundle_path: Path, spec: VLMSpec, num_frames: int, num_visual_tokens: int
+) -> None:
+    """Record the vision asset in the bundle's metadata.json.
+
+    The ``vision`` block is rewritten whole, so a re-export never keeps the
+    fields of an earlier one (a video export's frame counts, say).
+    """
+    metadata_path = bundle_path / "metadata.json"
+    with open(metadata_path) as f:
+        metadata = json.load(f)
+    metadata["assets"]["vision"] = "vision.aimodel"
+    vision = _vision_metadata(spec)
+    if num_frames > 1:
+        vision["image_token_count"] = num_visual_tokens
+        vision["max_video_frames"] = num_frames
+        vision["tokens_per_frame"] = spec.num_visual_tokens
+        vision["temporal_patch_size"] = spec.temporal_patch_size
+    metadata["vision"] = vision
+    with open(metadata_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+
+
 async def export_text_bundle(
     spec: VLMSpec,
     *,
@@ -500,7 +525,7 @@ async def export_text_bundle(
     # Asset roles match Swift ModelBundle.ComponentKey: `main` (decoder),
     # `embedding` (embed.aimodel), `vision` (added by export_vision_encoder).
     metadata = {
-        "metadata_version": "0.2",
+        "metadata_version": METADATA_VERSION,
         "kind": "vlm",
         "name": output_name,
         "assets": {
@@ -538,10 +563,9 @@ def _f16_attention_forward(
     """Dtype-preserving eager attention for the Qwen VL-family vision towers.
 
     HF's eager path upcasts to fp32 inline twice per layer (RoPE's
-    q/k.float() and softmax(dtype=fp32)); the ANE runs f16 only, so each
-    upcast cuts the compiled graph — 2 cuts x 24 layers left 49 ANE regions
-    whose boundary traffic made the hybrid slower than pure GPU. Keeping the
-    whole layer in the input dtype lets the graph compile to a single region.
+    q/k.float() and softmax(dtype=fp32)); the Neural Engine runs f16 only, so
+    each upcast cuts the compiled graph into another Neural Engine region.
+    Keeping the whole layer in the input dtype lets it compile to one region.
 
     cos/sin arrive pre-tiled to [seq, heads, head_dim] (exact match, zero
     broadcast); the 1/sqrt(head_dim) scale is folded into q right after RoPE
@@ -552,11 +576,6 @@ def _f16_attention_forward(
     q, k, v = qkv.unbind(0)  # [S, H, D] each
 
     cos, sin = position_embeddings  # pre-tiled [S, H, D]
-    half = q.shape[-1] // 2
-
-    def rotate_half(x):
-        return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
-
     q = (q * cos + rotate_half(q) * sin) * self.scaling
     k = k * cos + rotate_half(k) * sin
 
@@ -610,10 +629,7 @@ class StaticVisionEncoder(nn.Module):
         self.patchified_input = patchified_input
 
         if f16_attention:
-            # Bound per attention instance: `nn.Module.__call__` reads `forward`
-            # off the instance, so tracing follows it, while every other module of
-            # the same class in this process keeps HF's implementation, the only
-            # one that accepts the plain [seq, head_dim] rotary layout.
+            # Bound per instance, so other towers of this class keep HF's forward.
             for block in self.blocks:
                 block.attn.forward = MethodType(_f16_attention_forward, block.attn)
 
@@ -665,7 +681,7 @@ class StaticVisionEncoder(nn.Module):
         if linear_patch_embed:
             # Conv3d with kernel_size == stride sees exactly one window per output
             # position, so it is an exact Linear over the flattened [c, t, p, p]
-            # patch vector — the form the ANE compiler can map.
+            # patch vector — the form the Neural Engine compiler can map.
             proj = visual_model.patch_embed.proj
             linear = nn.Linear(self.patch_dim, proj.out_channels, bias=proj.bias is not None)
             with torch.no_grad():
@@ -708,8 +724,8 @@ class StaticVisionEncoder(nn.Module):
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
         # pixel_values: [1, 3, H, W] (NCHW) → patchify → [num_patches, patch_dim];
         # patchified_input: [1, num_patches, patch_dim] fed directly (the rank-9
-        # patchify reshape exceeds the ANE compiler's rank-5 limit, so ANE-friendly
-        # exports move it host-side).
+        # patchify reshape exceeds the Neural Engine compiler's rank-5 limit, so
+        # Neural Engine exports move it host-side).
         if self.patchified_input:
             patches = pixel_values.reshape(self.num_patches, self.patch_dim)
         else:
@@ -733,10 +749,10 @@ class StaticVisionEncoder(nn.Module):
 class BatchedF16VisionEncoder(nn.Module):
     """Conform the encoder output to the runner contract shared with embed/main.
 
-    StaticVisionEncoder emits [num_visual_tokens, text_hidden]; PR #65 expects
+    StaticVisionEncoder emits [num_visual_tokens, text_hidden]; the runner expects
     f16/bf16 [1, image_token_count, hidden] (a leading batch dim, like embed.aimodel).
     With `input_cast` the pixels are cast at the graph entry so the encoder can run
-    in that dtype throughout (fp16 math is required for ANE mapping); without it the
+    in that dtype throughout (fp16 math is required on the Neural Engine); without it the
     vision math stays f32 and only the final result is cast.
     """
 
@@ -836,6 +852,40 @@ def _patch_fast_pos_embed_interpolate(vision_model_cls: type) -> None:
     vision_model_cls.fast_pos_embed_interpolate = patched
 
 
+#: Compression presets the vision encoder takes: a weight-only quantization preset
+#: or a palettization preset from ``export/presets.py``.
+VISION_COMPRESSION_PRESETS = ("none", "4bit", "4bit_weight_palettized_group32")
+
+
+def _compress_vision_encoder(
+    module: nn.Module, pixel_shape: tuple[int, ...], compression: str
+) -> nn.Module:
+    """Apply a compression preset to the export module, before conversion."""
+    if compression == "none":
+        return module
+    if compression not in VISION_COMPRESSION_PRESETS:
+        raise ValueError(
+            f"Unsupported vision compression {compression!r}; "
+            f"choose from {', '.join(VISION_COMPRESSION_PRESETS)}"
+        )
+    from coreai_models.export.compression import palettize_pytorch_model, quantize_pytorch_model
+
+    preset = get_preset(compression)
+    # The graph entry takes f32 pixels and casts them itself.
+    example_inputs = (torch.randn(*pixel_shape, dtype=torch.float32),)
+    logging.info(f"Compressing the vision encoder ({compression})...")
+    if "torch_palettization_config" in preset:
+        return palettize_pytorch_model(module, example_inputs, preset["torch_palettization_config"])
+    return quantize_pytorch_model(
+        module,
+        example_inputs,
+        None,
+        preset["torch_quantization_config"],
+        cache_seq_len=0,
+        state_indices=(),
+    )
+
+
 async def export_vision_encoder(
     spec: VLMSpec,
     bundle_path: Path,
@@ -843,10 +893,17 @@ async def export_vision_encoder(
     num_frames: int = 1,
     include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
     vision_dtype: str = "f32",
-    ane_friendly: bool = False,
+    neural_engine: bool = False,
     vision_compression: str = "none",
 ) -> str:
     """Export the vision encoder as vision.aimodel and patch metadata.json."""
+    if neural_engine and num_frames != 1:
+        # The host-side patchify the runtime pairs with this form duplicates one frame.
+        raise ValueError(
+            f"The Neural Engine form is a single-image encoder, got num_frames={num_frames}"
+        )
+    if neural_engine and vision_dtype != "f16":
+        raise ValueError(f"The Neural Engine form needs vision_dtype='f16', got {vision_dtype!r}")
     if not bundle_path.exists():
         raise FileNotFoundError(f"Bundle not found: {bundle_path}. Export the text decoder first.")
 
@@ -862,10 +919,10 @@ async def export_vision_encoder(
                 "Muse Glimmer vision encoder currently supports single-image only "
                 f"(num_frames=1), got {num_frames}"
             )
-        if ane_friendly or vision_dtype != "f32":
+        if neural_engine or vision_dtype != "f32" or vision_compression != "none":
             raise NotImplementedError(
-                "The ANE-friendly form and the f16 vision graph are built around "
-                "StaticVisionEncoder, which Muse Glimmer does not go through"
+                "The Neural Engine form, the f16 vision graph and vision compression are "
+                "built around StaticVisionEncoder, which Muse Glimmer does not go through"
             )
         logging.info(f"Loading {spec.hf_model_id} vision encoder (MuseGlimmerVisionModel)...")
         vision_model = MuseGlimmerVisionModel.from_pretrained(spec.hf_model_id, dtype=torch.float32)
@@ -894,15 +951,15 @@ async def export_vision_encoder(
             spatial_merge_size=spec.spatial_merge_size,
             temporal_patch_size=spec.temporal_patch_size,
             num_frames=num_frames,
-            patchified_input=ane_friendly,
-            linear_patch_embed=ane_friendly,
-            f16_attention=ane_friendly,
+            patchified_input=neural_engine,
+            linear_patch_embed=neural_engine,
+            f16_attention=neural_engine,
         ).eval()
         del hf_model
 
         grid_t = wrapper.grid_t
         num_visual_tokens = spec.num_visual_tokens * grid_t
-        if ane_friendly:
+        if neural_engine:
             pixel_shape = (1, wrapper.num_patches, wrapper.patch_dim)
         elif num_frames == 1:
             pixel_shape = (1, 3, spec.image_size, spec.image_size)
@@ -950,51 +1007,7 @@ async def export_vision_encoder(
             f"(expected (1, {num_visual_tokens}, {text_hidden}) torch.float16)"
         )
 
-    if vision_compression.endswith("-palettized"):
-        from coreai_models.export.compression import palettize_pytorch_model
-
-        n_bits = int(vision_compression.split("bit")[0])
-        logging.info(f"Palettizing the vision encoder ({n_bits}-bit, group 32)...")
-        export_module = palettize_pytorch_model(
-            export_module,
-            (torch.randn(*pixel_shape, dtype=torch.float32),),
-            {
-                "global_config": {
-                    "op_state_spec": {
-                        "weight": {
-                            "n_bits": n_bits,
-                            "granularity": {
-                                "type": "per_grouped_channel",
-                                "axis": 0,
-                                "group_size": 32,
-                            },
-                        }
-                    }
-                }
-            },
-        )
-        logging.info("Vision palettization complete.")
-    elif vision_compression != "none":
-        import copy
-
-        from coreai_models.export.compression import quantize_pytorch_model
-        from coreai_models.export.presets import MACOS_PRESETS
-
-        logging.info(
-            f"Applying {vision_compression} weight-only quantization to the vision encoder..."
-        )
-        quant_cfg = copy.deepcopy(MACOS_PRESETS["4bit"]["torch_quantization_config"])
-        if vision_compression == "8bit":
-            quant_cfg["global_config"]["op_state_spec"]["weight"]["dtype"] = "int8"
-        export_module = quantize_pytorch_model(
-            export_module,
-            (torch.randn(*pixel_shape, dtype=torch.float32),),
-            None,
-            quant_cfg,
-            cache_seq_len=0,
-            state_indices=(),
-        )
-        logging.info("Vision quantization complete.")
+    export_module = _compress_vision_encoder(export_module, pixel_shape, vision_compression)
 
     reference_inputs = {"pixel_values": torch.randn(*pixel_shape, dtype=torch.float32)}
 
@@ -1023,17 +1036,7 @@ async def export_vision_encoder(
     await asyncio.to_thread(program.save_asset, vision_path, build_meta)
 
     # ---- 7. Patch metadata.json ----
-    with open(bundle_path / "metadata.json") as f:
-        metadata = json.load(f)
-    metadata["assets"]["vision"] = "vision.aimodel"
-    if num_frames > 1:
-        metadata["vision"]["image_token_count"] = num_visual_tokens
-        metadata["vision"]["max_video_frames"] = num_frames
-        metadata["vision"]["tokens_per_frame"] = spec.num_visual_tokens
-        metadata["vision"]["temporal_patch_size"] = spec.temporal_patch_size
-    with open(bundle_path / "metadata.json", "w") as f:
-        json.dump(metadata, f, indent=2)
-
+    _write_vision_metadata(bundle_path, spec, num_frames, num_visual_tokens)
     logging.info("Updated metadata.json with vision asset")
     return "vision.aimodel"
 
@@ -1112,25 +1115,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--vision-dtype",
         choices=["f32", "f16"],
-        default="f32",
+        default=None,
         help="Vision-encoder math dtype: f16 keeps the whole graph in half "
-        "precision (required for ANE mapping); f32 keeps math in float32 (default)",
+        "precision (required on the Neural Engine); f32 keeps math in float32 "
+        "(default: f16 with --vision-neural-engine, f32 otherwise)",
     )
     parser.add_argument(
-        "--vision-ane-friendly",
+        "--vision-neural-engine",
         action="store_true",
-        help="Export the vision encoder in ANE-mappable form: pre-patchified "
-        "[1, num_patches, patch_dim] input (host does patchify), the Conv3d "
-        "patch embed linearized, and dtype-preserving attention (no inline "
-        "fp32 islands, so the graph compiles to a single ANE region)",
+        help="Export the vision encoder in the form the Neural Engine maps: "
+        "pre-patchified [1, num_patches, patch_dim] input (the host does the "
+        "patchify), a linear patch embedding, and attention kept in f16 "
+        "throughout. Single image only; implies --vision-dtype f16",
     )
     parser.add_argument(
         "--vision-compression",
-        choices=["none", "4bit", "8bit", "4bit-palettized", "8bit-palettized"],
+        choices=VISION_COMPRESSION_PRESETS,
         default="none",
-        help="Vision-encoder weight compression: int4/int8 symmetric per-block "
-        "weight-only quantization, or 4/8-bit k-means palettization group 32 "
-        "(the palettized form is the one the ANE path supports; default: none)",
+        help="Vision-encoder compression preset: 4bit (int4 weight-only "
+        "quantization) or 4bit_weight_palettized_group32 (4-bit k-means "
+        "palettization); default: none",
     )
     parser.add_argument(
         "--list-models",
@@ -1155,7 +1159,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--compression",
         default="none",
         help="Compression preset for the text decoder (e.g. '4bit', 'none'). "
-        "The vision encoder and embedding are always exported at full precision.",
+        "The embedding is exported at full precision; the vision encoder takes "
+        "--vision-compression and --vision-dtype.",
     )
     parser.add_argument(
         "--verbose",
@@ -1178,7 +1183,7 @@ def _prepare_vision_only_bundle(spec: VLMSpec, output_dir: Path) -> Path:
     metadata_path = bundle_path / "metadata.json"
     if not metadata_path.exists():
         metadata = {
-            "metadata_version": "0.2",
+            "metadata_version": METADATA_VERSION,
             "kind": "vlm",
             "name": spec.output_name,
             "assets": {},
@@ -1215,8 +1220,8 @@ async def _run(spec: VLMSpec, args: argparse.Namespace) -> Path:
             args.overwrite,
             args.num_frames,
             include_debug_info=args.include_debug_info,
-            vision_dtype=args.vision_dtype,
-            ane_friendly=args.vision_ane_friendly,
+            vision_dtype=args.vision_dtype or ("f16" if args.vision_neural_engine else "f32"),
+            neural_engine=args.vision_neural_engine,
             vision_compression=args.vision_compression,
         )
     return bundle_path
@@ -1253,6 +1258,24 @@ def main() -> None:
             f"Error: '{args.model}' has no text decoder recipe; it supports vision-encoder "
             f"export only. Run with --vision-only."
         )
+
+    vision_options = (
+        args.vision_neural_engine
+        or args.vision_dtype is not None
+        or args.vision_compression != "none"
+    )
+    if args.skip_vision and vision_options:
+        parser.error(
+            "--skip-vision exports no vision encoder; drop --vision-neural-engine, "
+            "--vision-dtype and --vision-compression"
+        )
+    if args.vision_only and (args.compression != "none" or args.num_layers is not None):
+        parser.error("--vision-only exports no text decoder; drop --compression and --num-layers")
+    if args.vision_neural_engine:
+        if args.num_frames != 1:
+            parser.error("--vision-neural-engine supports a single image only (--num-frames 1)")
+        if args.vision_dtype == "f32":
+            parser.error("--vision-neural-engine needs --vision-dtype f16")
 
     bundle_path = asyncio.run(_run(spec, args))
     print(f"\nExport complete: {bundle_path.resolve()}")

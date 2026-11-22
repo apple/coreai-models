@@ -49,7 +49,6 @@ from coreai_models.export.presets import (
 )
 from coreai_models.hub import FULL_PATTERNS, SNAPSHOT_PATTERNS, BackendName, resolve_local
 from coreai_models.model_registry import ModelPreset
-from coreai_models.models.base import TraceSpec
 from coreai_models.models.registry import ModelEntry, get_model_entry
 
 logger = logging.getLogger(__name__)
@@ -410,6 +409,8 @@ def build_model(
     effective_max_ctx = max_context_length or getattr(
         hf_config, "max_position_embeddings", TRACE_KV_CACHE_SEQ_LEN
     )
+    vocab_size = hf_config.vocab_size
+    batch_size = 1
     # Set when composite ops are marked for externalization before quantization.
     externalized_model: torch.nn.Module | None = None
     if torch_quantization_config is not None:
@@ -488,10 +489,33 @@ def build_model(
     if torch_palettization_config is not None:
         assert config.variant == "iOS", "palettization is only supported for iOS variant."
 
-        palettization_inputs = model.build_compression_inputs(
-            hf_config,
-            target_dtype,
-            TraceSpec(max_context_length=effective_max_ctx, cache_seq_len=effective_max_ctx),
+        query_len = 8
+        input_ids = torch.randint(1, vocab_size, (batch_size, query_len), dtype=torch.int32)
+        position_ids = (
+            torch.arange(query_len).to(torch.uint16).unsqueeze(0).expand(batch_size, query_len)
+        )
+        in_step = torch.zeros((1,), dtype=torch.int32)
+        causal_mask = torch.zeros(1, effective_max_ctx, 1, query_len, dtype=torch.float16)
+        if hasattr(hf_config, "head_dim") and isinstance(hf_config.head_dim, int):
+            head_dim = hf_config.head_dim
+        else:
+            head_dim = hf_config.hidden_size // hf_config.num_attention_heads
+        key_cache = torch.zeros(
+            hf_config.num_hidden_layers,
+            1,  # batch_size
+            hf_config.num_key_value_heads * head_dim,
+            1,
+            effective_max_ctx,
+            dtype=torch.float16,
+        )
+        value_cache = key_cache.clone()
+        palettization_inputs = (
+            input_ids,
+            position_ids,
+            in_step,
+            causal_mask,
+            key_cache,
+            value_cache,
         )
         model = palettize_pytorch_model(
             model, palettization_inputs, torch_palettization_config, export_backend=export_backend

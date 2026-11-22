@@ -272,7 +272,7 @@ extension VisionFrontEnd {
     /// rearrangement the host applies to CHW pixels to fill it.
     ///
     /// A rank-4 input is `[1, 3, H, W]` and takes the normalized CHW pixels unchanged. A rank-3
-    /// input is `[1, num_patches, patch_dim]`, the form ANE-mappable exports declare because the
+    /// input is `[1, num_patches, patch_dim]`, the form Neural Engine exports declare because the
     /// in-graph patchify exceeds the Neural Engine's rank limit; the host builds its patch rows
     /// with `VisionPatchify`. Dynamic dimensions resolve to the `[1, 3, H, W]` image shape, and a
     /// fully static input is bound at its declared shape.

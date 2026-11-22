@@ -1250,21 +1250,6 @@ class BaseForCausalLMForiOS(BaseForCausalLM):
             },
         }
 
-    def build_compression_inputs(self, config, target_dtype: torch.dtype, spec: TraceSpec) -> tuple:
-        """Positional arguments for ``forward``, for the pre-export compressors.
-
-        coreai-opt runs the model once to see its modules, and it takes a tuple. The
-        tensors are the contract's own reference inputs re-associated with the composed
-        ``forward`` rather than the transformer entrypoint: the token ids stand in for the
-        embedded input, and the embedding table is not a parameter of ``forward``.
-        """
-        reference = self.build_reference_inputs(config, target_dtype, spec)
-        transformer = dict(reference[EXTEND_FUNCTION_NAME])
-        transformer.pop(TRANSFORMER_INPUT_NAME)
-        transformer.pop(EMBEDDING_TABLE_INPUT_NAME, None)
-        gathered = reference[GATHER_EMBEDDINGS_FUNCTION_NAME]
-        return self.reference_inputs_as_args({"input_ids": gathered["input_ids"], **transformer})
-
     @classmethod
     def export_static_shape_configs(
         cls, config, max_context_length: int

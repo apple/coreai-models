@@ -1009,26 +1009,6 @@ public final class CoreAISequentialEngine: MultimodalInferenceEngine, Idempotent
         try await requireVisionFrontEnd().encodeVideo(video)
     }
 
-    // `encodeImage(cgImage:)` in three stages, so a caller can time image preprocessing, the
-    // host-side rearrangement and the encoder forward apart.
-
-    /// Preprocess an image into the normalized CHW pixels `visionInput(fromCHW:)` consumes.
-    public func preprocessImage(cgImage: CGImage) throws -> [Float] {
-        try requireVisionFrontEnd().preprocessImage(cgImage: cgImage)
-    }
-
-    /// Turn CHW pixels into the buffer the vision encoder takes: the patch rows of a
-    /// pre-patchified (`[1, num_patches, patch_dim]`) export, or the CHW pixels themselves.
-    public func visionInput(fromCHW pixels: [Float]) throws -> [Float] {
-        try requireVisionFrontEnd().visionInput(fromCHW: pixels)
-    }
-
-    /// Run the vision encoder, and the projector when it is separate, on a buffer from
-    /// `visionInput(fromCHW:)`. Returns the image embeddings `encodeImage(cgImage:)` wraps.
-    public func visionForward(pixels: [Float]) async throws -> NDArray {
-        try await requireVisionFrontEnd().visionForward(pixels: pixels)
-    }
-
     /// Generate tokens from a token sequence with embedded image regions, on the engine's
     /// internal session.
     ///

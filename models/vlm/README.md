@@ -28,6 +28,15 @@ Options:
 - `--num-layers N` — truncate the text decoder to N layers (debugging)
 - `--output-dir DIR` — bundle output directory (default: `<repo-root>/exports/`)
 - `--overwrite` — overwrite existing output
+- `--vision-only` — export the vision encoder alone (see below)
+- `--vision-dtype {f32,f16}` — vision-encoder math dtype; f16 is required on
+  the Neural Engine (default: f16 with `--vision-neural-engine`, f32 otherwise)
+- `--vision-neural-engine` — Neural Engine form of a Qwen VL-family encoder:
+  pre-patchified `[1, num_patches, patch_dim]` input built by the host, a
+  linear patch embedding, and attention kept in f16. Single image only
+  (`--num-frames 1`)
+- `--vision-compression {none,4bit,4bit_weight_palettized_group32}` —
+  vision-encoder compression preset from `export/presets.py` (default: none)
 
 ## Bundle layout
 
@@ -54,8 +63,7 @@ patch/merge sizes, normalization stats). `text_decoder_class` names the
 reauthored decoder the text bundle is built from; set it to `None` for a
 checkpoint whose text decoder this exporter does not build — `--vision-only`
 exports its vision encoder, and a text export raises an error naming the model.
-Qwen3.5 is one: its embeddings-input decoder is exported with
-`spike_qwen35/spike.py export`. New decoder architectures are registered in
+New decoder architectures are registered in
 [`models/registry.py`](../../python/src/coreai_models/models/registry.py).
 
 ## Image preprocessing

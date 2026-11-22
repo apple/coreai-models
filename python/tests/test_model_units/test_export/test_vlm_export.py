@@ -6,6 +6,7 @@
 """Tests for the VLM export recipe: vision geometry, model dispatch, attention swap."""
 
 import asyncio
+import copy
 import json
 from dataclasses import replace
 from types import SimpleNamespace
@@ -113,7 +114,7 @@ def _stub_auto_config(hidden_size: int = 8, vocab_size: int = 16):
 
 
 class _OtherDecoder:
-    """A decoder class no registered spec uses, to tell dispatch from a fixed choice."""
+    """A decoder class no registered spec uses."""
 
 
 class TestTextDecoderDispatch:
@@ -216,7 +217,7 @@ class TestVisionOnlyBundle:
 
 
 # ---------------------------------------------------------------------------
-# ANE-friendly attention
+# Neural Engine form
 # ---------------------------------------------------------------------------
 
 _TOWER_GEOMETRY = dict(image_size=32, patch_size=16, spatial_merge_size=1, temporal_patch_size=2)
@@ -246,7 +247,7 @@ def _tiny_vision_tower(config_cls, model_cls, seed: int = 0):
     return model_cls(config).eval()
 
 
-def _ane_encoder(tower) -> StaticVisionEncoder:
+def _neural_engine_encoder(tower) -> StaticVisionEncoder:
     return StaticVisionEncoder(
         tower,
         **_TOWER_GEOMETRY,
@@ -271,7 +272,9 @@ def _count_f16_attention_calls(monkeypatch) -> list:
 
 @pytest.mark.parametrize(("config_cls", "model_cls"), _VISION_TOWERS)
 class TestF16AttentionScope:
-    def test_plain_encoder_is_unaffected_by_an_ane_encoder(self, config_cls, model_cls):
+    """The f16 attention is bound to the Neural Engine encoder's own attention modules."""
+
+    def test_plain_encoder_is_unaffected_by_a_neural_engine_encoder(self, config_cls, model_cls):
         plain = StaticVisionEncoder(
             _tiny_vision_tower(config_cls, model_cls), **_TOWER_GEOMETRY
         ).eval()
@@ -280,7 +283,7 @@ class TestF16AttentionScope:
             before = plain(pixels)
         assert torch.isfinite(before).all()
 
-        _ane_encoder(_tiny_vision_tower(config_cls, model_cls, seed=1))
+        _neural_engine_encoder(_tiny_vision_tower(config_cls, model_cls, seed=1))
 
         with torch.no_grad():
             after = plain(pixels)
@@ -291,16 +294,16 @@ class TestF16AttentionScope:
         tower = _tiny_vision_tower(config_cls, model_cls)
         attention_cls = type(tower.blocks[0].attn)
 
-        _ane_encoder(tower)
+        _neural_engine_encoder(tower)
 
         assert attention_cls.forward is not vlm_export._f16_attention_forward
         for block in tower.blocks:
             assert block.attn.forward.__func__ is vlm_export._f16_attention_forward
 
-    def test_ane_encoder_runs_the_replacement(self, monkeypatch, config_cls, model_cls):
+    def test_neural_engine_encoder_runs_the_replacement(self, monkeypatch, config_cls, model_cls):
         calls = _count_f16_attention_calls(monkeypatch)
         tower = _tiny_vision_tower(config_cls, model_cls)
-        encoder = _ane_encoder(tower)
+        encoder = _neural_engine_encoder(tower)
 
         patches = torch.randn(1, encoder.num_patches, encoder.patch_dim)
         with torch.no_grad():
@@ -312,9 +315,300 @@ class TestF16AttentionScope:
     def test_export_traces_the_replacement(self, monkeypatch, config_cls, model_cls):
         calls = _count_f16_attention_calls(monkeypatch)
         tower = _tiny_vision_tower(config_cls, model_cls)
-        encoder = _ane_encoder(tower)
+        encoder = _neural_engine_encoder(tower)
 
         patches = torch.randn(1, encoder.num_patches, encoder.patch_dim)
         torch.export.export(encoder, (patches,))
 
         assert {id(attention) for attention in calls} == {id(block.attn) for block in tower.blocks}
+
+
+@pytest.mark.parametrize(("config_cls", "model_cls"), _VISION_TOWERS)
+class TestNeuralEngineFormParity:
+    """The Neural Engine form computes the plain encoder's features from host-patchified input.
+
+    Both encoders wrap their own copy of one randomly initialized tower: the attention
+    swap binds to the tower's modules, so they cannot share one.
+    """
+
+    def _pair(self, config_cls, model_cls) -> tuple[StaticVisionEncoder, StaticVisionEncoder]:
+        tower = _tiny_vision_tower(config_cls, model_cls)
+        with torch.no_grad():
+            # The default init leaves attention scores near zero, where a missing scale or a
+            # misrouted rotary half barely moves the output.
+            for param in tower.parameters():
+                param.normal_(0.0, 0.5)
+        plain = StaticVisionEncoder(copy.deepcopy(tower), **_TOWER_GEOMETRY)
+        neural_engine = _neural_engine_encoder(tower)
+        return plain.eval(), neural_engine
+
+    def test_f32_matches_the_plain_encoder(self, config_cls, model_cls):
+        plain, neural_engine = self._pair(config_cls, model_cls)
+        pixels = torch.randn(1, 3, 32, 32)
+        with torch.no_grad():
+            expected = plain(pixels)
+            got = neural_engine(plain._patchify(pixels).unsqueeze(0))
+        torch.testing.assert_close(got, expected, rtol=1e-4, atol=1e-5)
+
+    def test_f16_stays_close_to_the_f32_plain_encoder(self, config_cls, model_cls):
+        plain, neural_engine = self._pair(config_cls, model_cls)
+        pixels = torch.randn(1, 3, 32, 32)
+        with torch.no_grad():
+            expected = plain(pixels)
+            got = neural_engine.half()(plain._patchify(pixels).unsqueeze(0).half())
+        assert got.dtype == torch.float16
+        torch.testing.assert_close(got.float(), expected, rtol=2e-2, atol=2e-2)
+
+
+class TestNeuralEngineFormSingleImage:
+    def test_cli_refuses_multi_frame(self, monkeypatch):
+        monkeypatch.setattr(
+            "sys.argv",
+            ["coreai.vlm.export", "qwen3-vl", "--vision-neural-engine", "--num-frames", "4"],
+        )
+        monkeypatch.setattr(vlm_export, "_run", _refuse_download)
+        with pytest.raises(SystemExit):
+            vlm_export.main()
+
+    def test_export_refuses_multi_frame_before_download(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            vlm_export, "AutoConfig", SimpleNamespace(from_pretrained=_refuse_download)
+        )
+        with pytest.raises(ValueError, match="single-image"):
+            asyncio.run(
+                vlm_export.export_vision_encoder(
+                    SUPPORTED_MODELS["qwen3-vl"],
+                    tmp_path,
+                    overwrite=True,
+                    num_frames=4,
+                    neural_engine=True,
+                    vision_dtype="f16",
+                )
+            )
+
+    def test_export_requires_f16(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            vlm_export, "AutoConfig", SimpleNamespace(from_pretrained=_refuse_download)
+        )
+        with pytest.raises(ValueError, match="f16"):
+            asyncio.run(
+                vlm_export.export_vision_encoder(
+                    SUPPORTED_MODELS["qwen3-vl"],
+                    tmp_path,
+                    overwrite=True,
+                    neural_engine=True,
+                    vision_dtype="f32",
+                )
+            )
+
+    def test_cli_refuses_f32(self, monkeypatch):
+        monkeypatch.setattr(
+            "sys.argv",
+            ["coreai.vlm.export", "qwen3-vl", "--vision-neural-engine", "--vision-dtype", "f32"],
+        )
+        monkeypatch.setattr(vlm_export, "_run", _refuse_download)
+        with pytest.raises(SystemExit):
+            vlm_export.main()
+
+    def test_cli_defaults_to_f16(self, monkeypatch, tmp_path):
+        args = vlm_export.build_parser().parse_args(
+            ["qwen3-vl", "--vision-only", "--vision-neural-engine", "--output-dir", str(tmp_path)]
+        )
+        seen = {}
+
+        async def _record_vision(*_a, **kwargs):
+            seen.update(kwargs)
+            return "vision.aimodel"
+
+        monkeypatch.setattr(vlm_export, "export_vision_encoder", _record_vision)
+        asyncio.run(vlm_export._run(SUPPORTED_MODELS["qwen3-vl"], args))
+        assert seen["vision_dtype"] == "f16"
+        assert seen["neural_engine"] is True
+
+
+# ---------------------------------------------------------------------------
+# Graph entry, compression and metadata
+# ---------------------------------------------------------------------------
+
+
+def _export_module(tower, neural_engine: bool) -> tuple[nn.Module, tuple[int, ...]]:
+    """The module ``export_vision_encoder`` hands the converter, and its pixel shape."""
+    if neural_engine:
+        encoder = _neural_engine_encoder(tower).half()
+        module = vlm_export.BatchedF16VisionEncoder(encoder, input_cast=torch.float16)
+        return module.eval(), (1, encoder.num_patches, encoder.patch_dim)
+    encoder = StaticVisionEncoder(tower, **_TOWER_GEOMETRY).eval()
+    return vlm_export.BatchedF16VisionEncoder(encoder).eval(), (1, 3, 32, 32)
+
+
+def _assert_exports_f32_in_f16_out(module: nn.Module, pixel_shape: tuple[int, ...]) -> None:
+    pixels = torch.randn(*pixel_shape, dtype=torch.float32)
+    program = torch.export.export(module, (pixels,))
+    (pixel_node,) = [n for n in program.graph.nodes if n.op == "placeholder" and "pixel" in n.name]
+    assert pixel_node.meta["val"].dtype == torch.float32
+    with torch.no_grad():
+        out = program.module()(pixels)
+    assert out.dtype == torch.float16
+    assert out.shape == (1, 4, 32)
+    assert torch.isfinite(out).all()
+
+
+@pytest.mark.parametrize("neural_engine", [False, True], ids=["f32", "neural-engine-f16"])
+class TestVisionGraphEntry:
+    def test_exports_with_f32_pixels_and_f16_features(self, neural_engine):
+        module, pixel_shape = _export_module(
+            _tiny_vision_tower(Qwen3VLVisionConfig, Qwen3VLVisionModel), neural_engine
+        )
+        _assert_exports_f32_in_f16_out(module, pixel_shape)
+
+    def test_4bit_quantized_encoder_exports(self, neural_engine):
+        module, pixel_shape = _export_module(
+            _tiny_vision_tower(Qwen3VLVisionConfig, Qwen3VLVisionModel), neural_engine
+        )
+        compressed = vlm_export._compress_vision_encoder(module, pixel_shape, "4bit")
+        assert any(hasattr(m, "parametrizations") for m in compressed.modules()), (
+            "no weight was quantized"
+        )
+        _assert_exports_f32_in_f16_out(compressed, pixel_shape)
+
+
+class TestVisionCompression:
+    def test_none_returns_the_module(self):
+        module = nn.Linear(2, 2)
+        assert vlm_export._compress_vision_encoder(module, (1, 2), "none") is module
+
+    def test_rejects_an_unknown_preset(self):
+        with pytest.raises(ValueError, match="4bit_weight_palettized_group32"):
+            vlm_export._compress_vision_encoder(nn.Linear(2, 2), (1, 2), "8bit")
+
+    def test_cli_offers_the_presets(self):
+        parser = vlm_export.build_parser()
+        for preset in vlm_export.VISION_COMPRESSION_PRESETS:
+            assert parser.parse_args(["qwen3-vl", "--vision-compression", preset])
+        with pytest.raises(SystemExit):
+            parser.parse_args(["qwen3-vl", "--vision-compression", "8bit"])
+
+    def test_palettization_uses_the_preset_on_f32_pixels(self, monkeypatch):
+        from coreai_models.export import compression
+        from coreai_models.export.presets import get_preset
+
+        seen = {}
+
+        def _capture(module, example_inputs, config, *_a, **_k):
+            seen.update(module=module, example_inputs=example_inputs, config=config)
+            return module
+
+        monkeypatch.setattr(compression, "palettize_pytorch_model", _capture)
+        module = nn.Linear(2, 2)
+        out = vlm_export._compress_vision_encoder(
+            module, (1, 4, 2), "4bit_weight_palettized_group32"
+        )
+        assert out is module
+        assert (
+            seen["config"]
+            == get_preset("4bit_weight_palettized_group32")["torch_palettization_config"]
+        )
+        (pixels,) = seen["example_inputs"]
+        assert pixels.shape == (1, 4, 2)
+        assert pixels.dtype == torch.float32
+
+
+class TestVisionMetadata:
+    def _bundle(self, tmp_path, vision: dict):
+        (tmp_path / "metadata.json").write_text(
+            json.dumps({"assets": {"main": "m.aimodel"}, "vision": vision})
+        )
+        return tmp_path
+
+    def test_single_frame_export_drops_video_fields(self, tmp_path):
+        spec = SUPPORTED_MODELS["qwen3-vl"]
+        stale = {
+            **vlm_export._vision_metadata(spec),
+            "image_token_count": 4 * spec.num_visual_tokens,
+            "max_video_frames": 4,
+            "tokens_per_frame": spec.num_visual_tokens,
+            "temporal_patch_size": 2,
+        }
+        bundle = self._bundle(tmp_path, stale)
+
+        vlm_export._write_vision_metadata(bundle, spec, 1, spec.num_visual_tokens)
+
+        metadata = json.loads((bundle / "metadata.json").read_text())
+        assert metadata["vision"] == vlm_export._vision_metadata(spec)
+        assert metadata["assets"] == {"main": "m.aimodel", "vision": "vision.aimodel"}
+
+    def test_multi_frame_export_records_frames(self, tmp_path):
+        spec = SUPPORTED_MODELS["qwen3-vl"]
+        bundle = self._bundle(tmp_path, vlm_export._vision_metadata(spec))
+
+        vlm_export._write_vision_metadata(bundle, spec, 4, 2 * spec.num_visual_tokens)
+
+        vision = json.loads((bundle / "metadata.json").read_text())["vision"]
+        assert vision["image_token_count"] == 2 * spec.num_visual_tokens
+        assert vision["max_video_frames"] == 4
+        assert vision["tokens_per_frame"] == spec.num_visual_tokens
+
+    def test_vision_only_manifest_uses_the_shared_version(self, tmp_path):
+        from coreai_models._constants import METADATA_VERSION
+
+        bundle = vlm_export._prepare_vision_only_bundle(SUPPORTED_MODELS["qwen3.5-0.8b"], tmp_path)
+        metadata = json.loads((bundle / "metadata.json").read_text())
+        assert metadata["metadata_version"] == METADATA_VERSION
+
+
+# ---------------------------------------------------------------------------
+# Patch order shared with the Swift runtime
+# ---------------------------------------------------------------------------
+
+
+class TestPatchOrderSharedWithSwift:
+    """``VisionPatchifyTests.swift`` asserts these same rows for the host-side patchify.
+
+    An 8x8 image whose CHW values are their own flat index, at patch 2, merge 2 and two
+    temporal copies: row ``r`` holds, for each channel, both temporal copies of the 2x2
+    pixels below and right of ``topLeft``.
+    """
+
+    @staticmethod
+    def _patch_row(top_left: int) -> list[int]:
+        row = []
+        for channel in (0, 64, 128):
+            pixels = [top_left + channel + offset for offset in (0, 1, 8, 9)]
+            row += pixels + pixels
+        return row
+
+    def test_rows_match_the_swift_expectations(self):
+        visual = _FakeVisualModel(patch_dim=2 * 3 * 2 * 2)
+        encoder = StaticVisionEncoder(
+            visual, image_size=8, patch_size=2, spatial_merge_size=2, temporal_patch_size=2
+        )
+        pixels = torch.arange(3 * 8 * 8, dtype=torch.float32).reshape(1, 3, 8, 8)
+        patches = encoder._patchify(pixels).to(torch.int64)
+
+        assert patches.shape == (16, 24)
+        for row, top_left in ((0, 0), (2, 16), (5, 6), (15, 54)):
+            assert patches[row].tolist() == self._patch_row(top_left), row
+
+
+class TestCliCombinations:
+    @pytest.mark.parametrize(
+        "extra",
+        [
+            ["--skip-vision", "--vision-neural-engine"],
+            ["--skip-vision", "--vision-dtype", "f16"],
+            ["--skip-vision", "--vision-compression", "4bit"],
+            ["--vision-only", "--compression", "4bit"],
+            ["--vision-only", "--num-layers", "2"],
+        ],
+    )
+    def test_refuses_options_the_run_would_ignore(self, monkeypatch, extra):
+        monkeypatch.setattr("sys.argv", ["coreai.vlm.export", "qwen3-vl", *extra])
+        monkeypatch.setattr(vlm_export, "_run", _refuse_download)
+        with pytest.raises(SystemExit):
+            vlm_export.main()
+
+
+def test_vision_compression_choices_are_existing_presets():
+    from coreai_models.export.presets import ALL_PRESET_NAMES
+
+    assert set(vlm_export.VISION_COMPRESSION_PRESETS) <= set(ALL_PRESET_NAMES)

@@ -370,14 +370,7 @@ def palettize_pytorch_model(
     logger.info(f"Palettization config: {config}")
 
     palettizer = KMeansPalettizer(model, config)
-    # The k-means pool uses multiprocessing's spawn start method: every worker is
-    # a fresh interpreter that re-imports the calling script's __main__ module and
-    # holds its own copy of the model, peaking around 3 GB each. The pool must
-    # therefore be sized to available memory rather than CPU count (6 workers is
-    # about 18 GB), and any script that calls into this path must keep its
-    # top-level work behind an `if __name__ == "__main__":` guard so the workers
-    # do not re-run the export.
-    prepared_model = palettizer.prepare(example_inputs=example_inputs, num_workers=6)
+    prepared_model = palettizer.prepare(example_inputs=example_inputs, num_workers=32)
 
     finalized_model = palettizer.finalize(prepared_model, backend=export_backend)
 

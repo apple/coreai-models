@@ -207,8 +207,7 @@ public struct PreparedModel: Sendable {
     /// - Returns: Prepared asset with compiled library and detected structure
     /// - Throws: Error from `AIModel` if loading or specialization fails
     public static func prepare(
-        at url: URL,
-        computeUnitOverride: ComputeUnitKind? = nil
+        at url: URL
     ) async throws -> PreparedModel {
         CLILogger.log("PreparedModelAsset: Preparing \(url.lastPathComponent)")
 
@@ -216,14 +215,7 @@ public struct PreparedModel: Sendable {
         let probedStructure = probeStructure(at: url)
         CLILogger.log("  - Probed structure: \(probedStructure.description)")
 
-        var options = probedStructure.specializationOptions
-        if let computeUnitOverride {
-            options = SpecializationOptions(preferredComputeUnitKind: computeUnitOverride)
-            CLILogger.log("  - Compute-unit override: \(computeUnitOverride)")
-        }
-        CLILogger.log(
-            "  - SpecializationOptions preferred=\(String(describing: options.preferredComputeUnitKind)) "
-                + "allowed=\(options.allowedComputeUnitKinds) reshapes=\(options.expectFrequentReshapes)")
+        let options = probedStructure.specializationOptions
         let model = try await AIModel(contentsOf: url, options: options)
         CLILogger.log("  - Loaded \(model.functionNames.count) graphs")
 

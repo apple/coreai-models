@@ -7,9 +7,9 @@ import Foundation
 
 /// Host-side patchify for pre-patchified vision encoders.
 ///
-/// ANE-mappable exports declare `pixel_values` as `[1, num_patches, patch_dim]`
+/// Neural Engine exports declare `pixel_values` as `[1, num_patches, patch_dim]`
 /// instead of `[1, 3, H, W]`: the rank-9 rearrangement that turns pixels into
-/// Qwen patches exceeds the ANE compiler's rank-5 limit, so the host produces the
+/// Qwen patches exceeds the Neural Engine compiler's rank-5 limit, so the host produces the
 /// patch buffer the encoder consumes.
 ///
 /// Layout, matching the exporter's `StaticVisionEncoder._patchify`: patches run

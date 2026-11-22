@@ -98,7 +98,8 @@ struct VisionPatchifyTests {
             }
         }
         // Rows are merge-window-major: row 2 is the lower-left patch of the first window, row 5
-        // the upper-right patch of the second, row 15 the last patch of the image.
+        // the upper-right patch of the second, row 15 the last patch of the image. The Python
+        // exporter's `TestPatchOrderSharedWithSwift` asserts the same rows of `_patchify`.
         #expect(row(patches, 0) == patchRow(topLeft: 0))
         #expect(row(patches, 2) == patchRow(topLeft: 16))
         #expect(row(patches, 5) == patchRow(topLeft: 6))
