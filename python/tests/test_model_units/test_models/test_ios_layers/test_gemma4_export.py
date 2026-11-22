@@ -134,6 +134,56 @@ def test_cli_accepts_small_and_default_contexts():
         export_g4._resolve_defaults(_cli_args(*argv))
 
 
+@pytest.mark.parametrize(
+    "argv", [("--compression", "none"), ("--compression-config", "my_palett.yaml")]
+)
+def test_native_checkpoint_refuses_explicit_compression(argv):
+    """A native-quantized checkpoint is never palettized, so an explicit flag is an error."""
+    args = _cli_args(*argv)
+    export_g4._resolve_defaults(args)
+    with pytest.raises(SystemExit, match="native-quantized checkpoint"):
+        export_g4._resolve_compression(args, native_quantized=True)
+
+
+def test_compression_defaults():
+    """No flag: a native checkpoint keeps its quantization, a standard one gets the recipe."""
+    args = _cli_args()
+    export_g4._resolve_defaults(args)
+    assert export_g4._resolve_compression(args, native_quantized=True) == (
+        None,
+        "native_quantized",
+    )
+    recipe, name = export_g4._resolve_compression(args, native_quantized=False)
+    assert recipe is not None
+    assert name == export_g4.DEFAULT_IOS_COMPRESSION_CONFIG.stem
+
+    none_args = _cli_args("--compression", "none")
+    export_g4._resolve_defaults(none_args)
+    assert export_g4._resolve_compression(none_args, native_quantized=False) == (None, "none")
+
+
+def test_native_checkpoint_refuses_include_vision():
+    """The QAT vision tower is quantized, which the vision encoder export cannot read."""
+    args = _cli_args("--include-vision")
+    export_g4._resolve_defaults(args)
+    with pytest.raises(SystemExit, match="--include-vision"):
+        export_g4._check_native_quantized_options(args, native_quantized=True)
+    export_g4._check_native_quantized_options(args, native_quantized=False)
+    export_g4._check_native_quantized_options(_cli_args(), native_quantized=True)
+
+
+def test_supported_models_match_the_registry_and_metadata():
+    """Every supported checkpoint has asset metadata, and every Gemma 4 registry preset and
+    metadata entry names a supported checkpoint."""
+    from coreai_models.export.metadata import _METADATA
+    from coreai_models.model_registry import LLM_PRESETS
+
+    supported = set(export_g4.SUPPORTED_MODELS)
+    assert supported <= set(_METADATA)
+    assert {p.hf_id for p in LLM_PRESETS if p.family == "gemma4"} == supported
+    assert {k for k in _METADATA if k.startswith("google/gemma-4-")} == supported
+
+
 def test_metadata_extras_require_what_the_runner_needs():
     cfg = _make_config()
     cfg.final_logit_softcapping = 30.0
