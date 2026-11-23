@@ -100,6 +100,8 @@ Ahead of time (AOT) compilation of models can optionally be performed with:
 xcrun coreai-build compile model.aimodel --platform iOS
 ```
 
+For a Neural Engine model (the iOS LLM exports), add `--preferred-compute neural-engine`. Without it the compiled model has no Neural Engine region and runs on the GPU; see "Neural Engine model compiles but runs on CPU or GPU" in the model-authoring skill's `references/common_issues.md`.
+
 **Docs**: [Ahead-of-time compilation](https://developer.apple.com/documentation/coreai/compiling-core-ai-models-ahead-of-time)
 
 ______________________________________________________________________
