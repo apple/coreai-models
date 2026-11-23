@@ -7,17 +7,19 @@ supported models are registered in its `SUPPORTED_MODELS` table.
 
 ## Supported models
 
-| Short-name | HuggingFace ID            | Notes                                    |
-|------------|---------------------------|------------------------------------------|
-| `qwen3-vl` | `Qwen/Qwen3-VL-2B-Instruct` | 448×448 vision encoder, f16 text decoder |
+| Short-name        | HuggingFace ID                 | Notes                                     |
+|-------------------|--------------------------------|-------------------------------------------|
+| `qwen3-vl`        | `Qwen/Qwen3-VL-2B-Instruct`    | 448×448 vision encoder, f16 text decoder  |
 | `muse-glimmer-vl` | `meta-models/Muse-Glimmer-30B` | ViT-G/14 vision encoder, f16 text decoder |
+| `qwen3.5-0.8b`    | `Qwen/Qwen3.5-0.8B`            | 448×448 vision encoder; vision-only       |
 
 ## Exporting
 
 ```bash
-uv run coreai.vlm.export --list-models          # list supported VLMs
-uv run coreai.vlm.export qwen3-vl               # full bundle (text + vision)
-uv run coreai.vlm.export qwen3-vl --skip-vision # text decoder + embedding only
+uv run coreai.vlm.export --list-models              # list supported VLMs
+uv run coreai.vlm.export qwen3-vl                   # full bundle (text + vision)
+uv run coreai.vlm.export qwen3-vl --skip-vision     # text decoder + embedding only
+uv run coreai.vlm.export qwen3.5-0.8b --vision-only # vision encoder only
 ```
 
 Options:
@@ -26,6 +28,15 @@ Options:
 - `--num-layers N` — truncate the text decoder to N layers (debugging)
 - `--output-dir DIR` — bundle output directory (default: `<repo-root>/exports/`)
 - `--overwrite` — overwrite existing output
+- `--vision-only` — export the vision encoder alone (see below)
+- `--vision-dtype {f32,f16}` — vision-encoder math dtype; f16 is required on
+  the Neural Engine (default: f16 with `--vision-neural-engine`, f32 otherwise)
+- `--vision-neural-engine` — Neural Engine form of a Qwen VL-family encoder:
+  pre-patchified `[1, num_patches, patch_dim]` input built by the host, a
+  linear patch embedding, and attention kept in f16. Single image only
+  (`--num-frames 1`)
+- `--vision-compression {none,4bit,4bit_weight_palettized_group32}` —
+  vision-encoder compression preset from `export/presets.py` (default: none)
 
 ## Bundle layout
 
@@ -39,13 +50,20 @@ with asset roles consumed by the Swift runner's `ModelBundle`:
 | `vision`    | `vision.aimodel` | Vision encoder (`pixel_values → image_features`)|
 | —           | `tokenizer/`     | Embedded HuggingFace tokenizer                  |
 
+A `--vision-only` export into a new directory holds `vision.aimodel` and a
+`metadata.json` with the `vision` block alone. It has no `main`, `embedding` or
+`tokenizer/`, so the Swift runner cannot load it by itself.
+
 ## Adding a model
 
 Add a `VLMSpec(...)` entry to `SUPPORTED_MODELS` in
 [`vlm/export.py`](../../python/src/coreai_models/vlm/export.py) with the
 HuggingFace ID, output name, image token id, and vision geometry (resolution,
-patch/merge sizes, normalization stats). Models whose text decoder needs a
-new architecture also require a class registered in
+patch/merge sizes, normalization stats). `text_decoder_class` names the
+reauthored decoder the text bundle is built from; set it to `None` for a
+checkpoint whose text decoder this exporter does not build — `--vision-only`
+exports its vision encoder, and a text export raises an error naming the model.
+New decoder architectures are registered in
 [`models/registry.py`](../../python/src/coreai_models/models/registry.py).
 
 ## Image preprocessing

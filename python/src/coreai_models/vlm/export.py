@@ -17,6 +17,7 @@ Exports a vision-language model to Core AI format as a multi-asset bundle
 Usage:
     uv run coreai.vlm.export qwen3-vl [--max-context-length 4096] [--num-layers N]
     uv run coreai.vlm.export muse-glimmer-vl [--max-context-length 4096]
+    uv run coreai.vlm.export qwen3.5-0.8b --vision-only
     uv run coreai.vlm.export --list-models
 """
 
@@ -29,6 +30,7 @@ import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
+from types import MethodType
 
 import torch
 import torch.nn as nn
@@ -36,12 +38,14 @@ from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from transformers import AutoConfig, AutoTokenizer
 
-from coreai_models._constants import DEFAULT_INCLUDE_DEBUG_INFO
+from coreai_models._constants import DEFAULT_INCLUDE_DEBUG_INFO, METADATA_VERSION
 from coreai_models.export.macos import export_to_coreai
 from coreai_models.export.metadata import build_aimodel_metadata
+from coreai_models.export.presets import get_preset
 from coreai_models.models.macos.muse_glimmer import MuseGlimmerForCausalLMEmbeddings
 from coreai_models.models.macos.muse_glimmer_vision import MuseGlimmerVisionModel
 from coreai_models.models.macos.qwen3_vl import Qwen3VLForCausalLMEmbeddings
+from coreai_models.primitives.ios.rope import rotate_half
 
 # Core AI state names for the persistent KV cache.
 KV_STATE_NAMES = ("k_cache", "v_cache")
@@ -52,14 +56,19 @@ class VLMSpec:
     """Per-model export recipe, keyed by registry short-name.
 
     Carries the bits that vary between VL checkpoints: the HF id, the output
-    bundle name, and the vision geometry (resolution, patch/merge sizes, the
-    image placeholder token, and CLIP normalization stats) that drive both the
-    vision-encoder export and the ``vision`` block of ``metadata.json``.
+    bundle name, the reauthored text-decoder class, and the vision geometry
+    (resolution, patch/merge sizes, the image placeholder token, and CLIP
+    normalization stats) that drive both the vision-encoder export and the
+    ``vision`` block of ``metadata.json``.
     """
 
     short_name: str
     hf_model_id: str
     output_name: str
+    #: Reauthored decoder the text bundle is built from, or ``None`` for a
+    #: checkpoint whose decoder has no recipe here — then only the vision
+    #: encoder can be exported.
+    text_decoder_class: type | None
     image_token_id: int
     image_size: int
     patch_size: int
@@ -82,6 +91,7 @@ SUPPORTED_MODELS: dict[str, VLMSpec] = {
         short_name="qwen3-vl",
         hf_model_id="Qwen/Qwen3-VL-2B-Instruct",
         output_name="qwen3_vl_2b",
+        text_decoder_class=Qwen3VLForCausalLMEmbeddings,
         image_token_id=151655,  # <|image_pad|>
         image_size=448,
         patch_size=16,
@@ -97,6 +107,7 @@ SUPPORTED_MODELS: dict[str, VLMSpec] = {
         short_name="muse-glimmer-vl",
         hf_model_id="meta-models/Muse-Glimmer-30B",
         output_name="muse_glimmer_30b_vlm",
+        text_decoder_class=MuseGlimmerForCausalLMEmbeddings,
         image_token_id=200092,
         image_size=448,
         patch_size=14,
@@ -105,6 +116,22 @@ SUPPORTED_MODELS: dict[str, VLMSpec] = {
         image_mean=(0.48145466, 0.4578275, 0.40821073),  # CLIP normalization
         image_std=(0.26862954, 0.26130258, 0.27577711),
         rescale_factor=1.0,
+    ),
+    "qwen3.5-0.8b": VLMSpec(
+        short_name="qwen3.5-0.8b",
+        hf_model_id="Qwen/Qwen3.5-0.8B",
+        output_name="qwen3_5_0p8b",
+        text_decoder_class=None,
+        image_token_id=248056,  # <|image_pad|>
+        image_size=448,
+        patch_size=16,
+        spatial_merge_size=2,
+        temporal_patch_size=2,
+        image_mean=(0.5, 0.5, 0.5),
+        image_std=(0.5, 0.5, 0.5),
+        rescale_factor=1.0,
+        image_strategy="stretch",
+        include_image_info=True,
     ),
 }
 
@@ -312,6 +339,47 @@ async def export_embed_model(
 # ---------------------------------------------------------------------------
 
 
+def _vision_metadata(spec: VLMSpec) -> dict:
+    """The top-level ``vision`` block of metadata.json.
+
+    Consumed by Swift ``VisionConfig``, hence the snake_case keys.
+    """
+    return {
+        "image_size": spec.image_size,
+        "patch_size": spec.patch_size,
+        "image_token_count": spec.num_visual_tokens,
+        "image_token_id": spec.image_token_id,
+        "image_mean": list(spec.image_mean),
+        "image_std": list(spec.image_std),
+        "rescale_factor": spec.rescale_factor,
+        "image_strategy": spec.image_strategy,
+        "include_image_info": spec.include_image_info,
+    }
+
+
+def _write_vision_metadata(
+    bundle_path: Path, spec: VLMSpec, num_frames: int, num_visual_tokens: int
+) -> None:
+    """Record the vision asset in the bundle's metadata.json.
+
+    The ``vision`` block is rewritten whole, so a re-export never keeps the
+    fields of an earlier one (a video export's frame counts, say).
+    """
+    metadata_path = bundle_path / "metadata.json"
+    with open(metadata_path) as f:
+        metadata = json.load(f)
+    metadata["assets"]["vision"] = "vision.aimodel"
+    vision = _vision_metadata(spec)
+    if num_frames > 1:
+        vision["image_token_count"] = num_visual_tokens
+        vision["max_video_frames"] = num_frames
+        vision["tokens_per_frame"] = spec.num_visual_tokens
+        vision["temporal_patch_size"] = spec.temporal_patch_size
+    metadata["vision"] = vision
+    with open(metadata_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+
+
 async def export_text_bundle(
     spec: VLMSpec,
     *,
@@ -327,7 +395,17 @@ async def export_text_bundle(
     Produces ``<name>.aimodel`` (decoder), ``embed.aimodel``, ``tokenizer/``, and
     a ``metadata.json`` whose ``assets`` cover ``main``/``embedding``. The
     ``vision`` asset is added later by :func:`export_vision_encoder`.
+
+    Raises ``ValueError`` for a spec without a text decoder, before anything is
+    downloaded or loaded.
     """
+    decoder_class = spec.text_decoder_class
+    if decoder_class is None:
+        raise ValueError(
+            f"'{spec.short_name}' has no text decoder recipe; it supports vision-encoder "
+            f"export only. Run with --vision-only."
+        )
+
     output_name = spec.output_name
 
     # ---- 1. Download weights + load config ----
@@ -352,12 +430,8 @@ async def export_text_bundle(
 
     # ---- 2. Load model directly from safetensors ----
     logging.info("Loading model from safetensors (direct, skips vision encoder)...")
-    if spec.short_name == "muse-glimmer-vl":
-        model_class = MuseGlimmerForCausalLMEmbeddings
-    else:
-        model_class = Qwen3VLForCausalLMEmbeddings
     model = load_model_from_safetensors(
-        model_class=model_class,
+        model_class=decoder_class,
         hf_config=raw_cfg,
         model_dir=model_dir,
         max_ctx=max_ctx,
@@ -451,7 +525,7 @@ async def export_text_bundle(
     # Asset roles match Swift ModelBundle.ComponentKey: `main` (decoder),
     # `embedding` (embed.aimodel), `vision` (added by export_vision_encoder).
     metadata = {
-        "metadata_version": "0.2",
+        "metadata_version": METADATA_VERSION,
         "kind": "vlm",
         "name": output_name,
         "assets": {
@@ -465,18 +539,7 @@ async def export_text_bundle(
             "embedded_tokenizer": True,
             "function_map": {"main": ["main"]},
         },
-        # Top-level `vision` block consumed by Swift VisionConfig (snake_case keys).
-        "vision": {
-            "image_size": spec.image_size,
-            "patch_size": spec.patch_size,
-            "image_token_count": spec.num_visual_tokens,
-            "image_token_id": spec.image_token_id,
-            "image_mean": list(spec.image_mean),
-            "image_std": list(spec.image_std),
-            "rescale_factor": spec.rescale_factor,
-            "image_strategy": spec.image_strategy,
-            "include_image_info": spec.include_image_info,
-        },
+        "vision": _vision_metadata(spec),
         "source": {
             "hf_model_id": spec.hf_model_id,
             "model_definition": "torch",
@@ -492,6 +555,39 @@ async def export_text_bundle(
 # ---------------------------------------------------------------------------
 # Vision encoder (448x448 fixed input, fully-static shapes)
 # ---------------------------------------------------------------------------
+
+
+def _f16_attention_forward(
+    self, hidden_states, cu_seqlens=None, position_embeddings=None, **kwargs
+):
+    """Dtype-preserving eager attention for the Qwen VL-family vision towers.
+
+    HF's eager path upcasts to fp32 inline twice per layer (RoPE's
+    q/k.float() and softmax(dtype=fp32)); the Neural Engine runs f16 only, so
+    each upcast cuts the compiled graph into another Neural Engine region.
+    Keeping the whole layer in the input dtype lets it compile to one region.
+
+    cos/sin arrive pre-tiled to [seq, heads, head_dim] (exact match, zero
+    broadcast); the 1/sqrt(head_dim) scale is folded into q right after RoPE
+    so the [1, H, S, S] score tensor stays bounded for the f16 softmax.
+    """
+    seq_length = hidden_states.shape[0]
+    qkv = self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3)
+    q, k, v = qkv.unbind(0)  # [S, H, D] each
+
+    cos, sin = position_embeddings  # pre-tiled [S, H, D]
+    q = (q * cos + rotate_half(q) * sin) * self.scaling
+    k = k * cos + rotate_half(k) * sin
+
+    q = q.transpose(0, 1).unsqueeze(0)  # [1, H, S, D]
+    k = k.transpose(0, 1).unsqueeze(0)
+    v = v.transpose(0, 1).unsqueeze(0)
+
+    scores = torch.matmul(q, k.transpose(2, 3))  # [1, H, S, S]
+    attn = torch.softmax(scores, dim=-1)
+    out = torch.matmul(attn, v)  # [1, H, S, D]
+    out = out.transpose(1, 2).reshape(seq_length, -1)  # [S, H*D]
+    return self.proj(out)
 
 
 class StaticVisionEncoder(nn.Module):
@@ -522,11 +618,20 @@ class StaticVisionEncoder(nn.Module):
         spatial_merge_size: int,
         temporal_patch_size: int,
         num_frames: int = 1,
+        patchified_input: bool = False,
+        linear_patch_embed: bool = False,
+        f16_attention: bool = False,
     ) -> None:
         super().__init__()
         self.patch_embed = visual_model.patch_embed
         self.blocks = visual_model.blocks
         self.merger = visual_model.merger
+        self.patchified_input = patchified_input
+
+        if f16_attention:
+            # Bound per instance, so other towers of this class keep HF's forward.
+            for block in self.blocks:
+                block.attn.forward = MethodType(_f16_attention_forward, block.attn)
 
         self.image_size = image_size
         self.patch_size = patch_size
@@ -559,12 +664,31 @@ class StaticVisionEncoder(nn.Module):
             seq_len = rotary_pos_emb.shape[0]
             rotary_flat = rotary_pos_emb.reshape(seq_len, -1)
             emb = torch.cat([rotary_flat, rotary_flat], dim=-1)
-            self.register_buffer("rot_cos", emb.cos())
-            self.register_buffer("rot_sin", emb.sin())
+            rot_cos, rot_sin = emb.cos(), emb.sin()
+            if f16_attention:
+                # Pre-tile to [seq, heads, head_dim] so the f16 attention applies
+                # RoPE with exact-shape elementwise ops (no runtime broadcast).
+                num_heads = visual_model.blocks[0].attn.num_heads
+                rot_cos = rot_cos.reshape(seq_len, 1, -1).expand(-1, num_heads, -1).contiguous()
+                rot_sin = rot_sin.reshape(seq_len, 1, -1).expand(-1, num_heads, -1).contiguous()
+            self.register_buffer("rot_cos", rot_cos)
+            self.register_buffer("rot_sin", rot_sin)
 
             total_patches = self.grid_t * self.grid_h * self.grid_w
             cu = torch.tensor([0, total_patches], dtype=torch.int32)
             self.register_buffer("cu_seqlens", cu)
+
+        if linear_patch_embed:
+            # Conv3d with kernel_size == stride sees exactly one window per output
+            # position, so it is an exact Linear over the flattened [c, t, p, p]
+            # patch vector — the form the Neural Engine compiler can map.
+            proj = visual_model.patch_embed.proj
+            linear = nn.Linear(self.patch_dim, proj.out_channels, bias=proj.bias is not None)
+            with torch.no_grad():
+                linear.weight.copy_(proj.weight.reshape(proj.out_channels, -1))
+                if proj.bias is not None:
+                    linear.bias.copy_(proj.bias)
+            self.patch_embed = linear
 
     def _patchify(self, pixel_values: torch.Tensor) -> torch.Tensor:
         """Turn pixels into Qwen's pre-patchified [num_patches, patch_dim].
@@ -598,8 +722,14 @@ class StaticVisionEncoder(nn.Module):
         return x.reshape(self.num_patches, self.patch_dim)
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        # pixel_values: [1, 3, H, W] (NCHW) → patchify → [num_patches, patch_dim]
-        patches = self._patchify(pixel_values)
+        # pixel_values: [1, 3, H, W] (NCHW) → patchify → [num_patches, patch_dim];
+        # patchified_input: [1, num_patches, patch_dim] fed directly (the rank-9
+        # patchify reshape exceeds the Neural Engine compiler's rank-5 limit, so
+        # Neural Engine exports move it host-side).
+        if self.patchified_input:
+            patches = pixel_values.reshape(self.num_patches, self.patch_dim)
+        else:
+            patches = self._patchify(pixel_values)
         hidden_states = self.patch_embed(patches)  # [num_patches, vision_hidden]
         hidden_states = hidden_states + self.pos_embeds
 
@@ -619,16 +749,21 @@ class StaticVisionEncoder(nn.Module):
 class BatchedF16VisionEncoder(nn.Module):
     """Conform the encoder output to the runner contract shared with embed/main.
 
-    StaticVisionEncoder emits f32 [num_visual_tokens, text_hidden]; PR #65 expects
+    StaticVisionEncoder emits [num_visual_tokens, text_hidden]; the runner expects
     f16/bf16 [1, image_token_count, hidden] (a leading batch dim, like embed.aimodel).
-    The vision math stays in f32; only the final result is batched and cast to f16.
+    With `input_cast` the pixels are cast at the graph entry so the encoder can run
+    in that dtype throughout (fp16 math is required on the Neural Engine); without it the
+    vision math stays f32 and only the final result is cast.
     """
 
-    def __init__(self, encoder: nn.Module) -> None:
+    def __init__(self, encoder: nn.Module, input_cast: torch.dtype | None = None) -> None:
         super().__init__()
         self.encoder = encoder
+        self.input_cast = input_cast
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        if self.input_cast is not None:
+            pixel_values = pixel_values.to(self.input_cast)
         out = self.encoder(pixel_values)
         if isinstance(out, tuple):
             out = out[0]
@@ -717,14 +852,58 @@ def _patch_fast_pos_embed_interpolate(vision_model_cls: type) -> None:
     vision_model_cls.fast_pos_embed_interpolate = patched
 
 
+#: Compression presets the vision encoder takes: a weight-only quantization preset
+#: or a palettization preset from ``export/presets.py``.
+VISION_COMPRESSION_PRESETS = ("none", "4bit", "4bit_weight_palettized_group32")
+
+
+def _compress_vision_encoder(
+    module: nn.Module, pixel_shape: tuple[int, ...], compression: str
+) -> nn.Module:
+    """Apply a compression preset to the export module, before conversion."""
+    if compression == "none":
+        return module
+    if compression not in VISION_COMPRESSION_PRESETS:
+        raise ValueError(
+            f"Unsupported vision compression {compression!r}; "
+            f"choose from {', '.join(VISION_COMPRESSION_PRESETS)}"
+        )
+    from coreai_models.export.compression import palettize_pytorch_model, quantize_pytorch_model
+
+    preset = get_preset(compression)
+    # The graph entry takes f32 pixels and casts them itself.
+    example_inputs = (torch.randn(*pixel_shape, dtype=torch.float32),)
+    logging.info(f"Compressing the vision encoder ({compression})...")
+    if "torch_palettization_config" in preset:
+        return palettize_pytorch_model(module, example_inputs, preset["torch_palettization_config"])
+    return quantize_pytorch_model(
+        module,
+        example_inputs,
+        None,
+        preset["torch_quantization_config"],
+        cache_seq_len=0,
+        state_indices=(),
+    )
+
+
 async def export_vision_encoder(
     spec: VLMSpec,
     bundle_path: Path,
     overwrite: bool,
     num_frames: int = 1,
     include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
+    vision_dtype: str = "f32",
+    neural_engine: bool = False,
+    vision_compression: str = "none",
 ) -> str:
     """Export the vision encoder as vision.aimodel and patch metadata.json."""
+    if neural_engine and num_frames != 1:
+        # The host-side patchify the runtime pairs with this form duplicates one frame.
+        raise ValueError(
+            f"The Neural Engine form is a single-image encoder, got num_frames={num_frames}"
+        )
+    if neural_engine and vision_dtype != "f16":
+        raise ValueError(f"The Neural Engine form needs vision_dtype='f16', got {vision_dtype!r}")
     if not bundle_path.exists():
         raise FileNotFoundError(f"Bundle not found: {bundle_path}. Export the text decoder first.")
 
@@ -740,6 +919,11 @@ async def export_vision_encoder(
                 "Muse Glimmer vision encoder currently supports single-image only "
                 f"(num_frames=1), got {num_frames}"
             )
+        if neural_engine or vision_dtype != "f32" or vision_compression != "none":
+            raise NotImplementedError(
+                "The Neural Engine form, the f16 vision graph and vision compression are "
+                "built around StaticVisionEncoder, which Muse Glimmer does not go through"
+            )
         logging.info(f"Loading {spec.hf_model_id} vision encoder (MuseGlimmerVisionModel)...")
         vision_model = MuseGlimmerVisionModel.from_pretrained(spec.hf_model_id, dtype=torch.float32)
         # MuseGlimmerVisionModel.forward already returns [1, N, text_hidden]
@@ -748,21 +932,17 @@ async def export_vision_encoder(
         num_visual_tokens = spec.num_visual_tokens
         pixel_shape = (1, 3, spec.image_size, spec.image_size)
     else:
-        # Qwen3-VL: load HF model and wrap with StaticVisionEncoder for
-        # Qwen's 3D patchify + rotary position embeddings.
-        from transformers.models.qwen3_vl.modeling_qwen3_vl import (
-            Qwen3VLForConditionalGeneration as HFModel,
-        )
-        from transformers.models.qwen3_vl.modeling_qwen3_vl import (
-            Qwen3VLVisionModel,
-        )
-
-        _patch_fast_pos_embed_interpolate(Qwen3VLVisionModel)
+        # Qwen VL family: load the checkpoint's own vision tower and wrap it with
+        # StaticVisionEncoder for Qwen's 3D patchify + rotary position embeddings.
+        from transformers import AutoModelForImageTextToText
 
         # ---- 2. Load HF model (vision part only) ----
         logging.info(f"Loading {spec.hf_model_id} for vision encoder extraction...")
-        hf_model = HFModel.from_pretrained(spec.hf_model_id, dtype=torch.float32)
+        hf_model = AutoModelForImageTextToText.from_pretrained(
+            spec.hf_model_id, dtype=torch.float32
+        )
         hf_model = hf_model.eval()
+        _patch_fast_pos_embed_interpolate(type(hf_model.model.visual))
 
         wrapper = StaticVisionEncoder(
             hf_model.model.visual,
@@ -771,12 +951,17 @@ async def export_vision_encoder(
             spatial_merge_size=spec.spatial_merge_size,
             temporal_patch_size=spec.temporal_patch_size,
             num_frames=num_frames,
+            patchified_input=neural_engine,
+            linear_patch_embed=neural_engine,
+            f16_attention=neural_engine,
         ).eval()
         del hf_model
 
         grid_t = wrapper.grid_t
         num_visual_tokens = spec.num_visual_tokens * grid_t
-        if num_frames == 1:
+        if neural_engine:
+            pixel_shape = (1, wrapper.num_patches, wrapper.patch_dim)
+        elif num_frames == 1:
             pixel_shape = (1, 3, spec.image_size, spec.image_size)
         else:
             pixel_shape = (1, 3 * num_frames, spec.image_size, spec.image_size)
@@ -807,7 +992,12 @@ async def export_vision_encoder(
 
             wrapper.merger = MergerWrapper(original_merger)
 
-        export_module = BatchedF16VisionEncoder(wrapper).eval()
+        # ---- 5. Export ----
+        if vision_dtype == "f16":
+            wrapper = wrapper.half()
+            export_module = BatchedF16VisionEncoder(wrapper, input_cast=torch.float16).eval()
+        else:
+            export_module = BatchedF16VisionEncoder(wrapper).eval()
 
     # Final-shape sanity check (batched + f16) before export.
     with torch.no_grad():
@@ -816,6 +1006,8 @@ async def export_vision_encoder(
             f"Export module output: {tuple(final_out.shape)} {final_out.dtype} "
             f"(expected (1, {num_visual_tokens}, {text_hidden}) torch.float16)"
         )
+
+    export_module = _compress_vision_encoder(export_module, pixel_shape, vision_compression)
 
     reference_inputs = {"pixel_values": torch.randn(*pixel_shape, dtype=torch.float32)}
 
@@ -844,17 +1036,7 @@ async def export_vision_encoder(
     await asyncio.to_thread(program.save_asset, vision_path, build_meta)
 
     # ---- 7. Patch metadata.json ----
-    with open(bundle_path / "metadata.json") as f:
-        metadata = json.load(f)
-    metadata["assets"]["vision"] = "vision.aimodel"
-    if num_frames > 1:
-        metadata["vision"]["image_token_count"] = num_visual_tokens
-        metadata["vision"]["max_video_frames"] = num_frames
-        metadata["vision"]["tokens_per_frame"] = spec.num_visual_tokens
-        metadata["vision"]["temporal_patch_size"] = spec.temporal_patch_size
-    with open(bundle_path / "metadata.json", "w") as f:
-        json.dump(metadata, f, indent=2)
-
+    _write_vision_metadata(bundle_path, spec, num_frames, num_visual_tokens)
     logging.info("Updated metadata.json with vision asset")
     return "vision.aimodel"
 
@@ -907,10 +1089,20 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Output directory for the bundle (default: <repo-root>/exports/)",
     )
-    parser.add_argument(
+    stages = parser.add_mutually_exclusive_group()
+    stages.add_argument(
         "--skip-vision",
         action="store_true",
         help="Export only the text decoder + embedding (skip the vision encoder)",
+    )
+    stages.add_argument(
+        "--vision-only",
+        action="store_true",
+        help="Export only the vision encoder into <output-dir>/<bundle>/, creating "
+        "that bundle and its manifest when they do not exist yet (the route for a "
+        "checkpoint whose text decoder has no export recipe). A bundle created this "
+        "way holds the vision asset alone: no text decoder, embedding or tokenizer, "
+        "so the Swift runner cannot load it by itself",
     )
     parser.add_argument(
         "--num-frames",
@@ -919,6 +1111,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="Number of video frames for the vision encoder (default: 1 = single image). "
         "Must be divisible by temporal_patch_size (2 for Qwen). "
         "Multi-frame exports bake temporal position embeddings for native video support.",
+    )
+    parser.add_argument(
+        "--vision-dtype",
+        choices=["f32", "f16"],
+        default=None,
+        help="Vision-encoder math dtype: f16 keeps the whole graph in half "
+        "precision (required on the Neural Engine); f32 keeps math in float32 "
+        "(default: f16 with --vision-neural-engine, f32 otherwise)",
+    )
+    parser.add_argument(
+        "--vision-neural-engine",
+        action="store_true",
+        help="Export the vision encoder in the form the Neural Engine maps: "
+        "pre-patchified [1, num_patches, patch_dim] input (the host does the "
+        "patchify), a linear patch embedding, and attention kept in f16 "
+        "throughout. Single image only; implies --vision-dtype f16",
+    )
+    parser.add_argument(
+        "--vision-compression",
+        choices=VISION_COMPRESSION_PRESETS,
+        default="none",
+        help="Vision-encoder compression preset: 4bit (int4 weight-only "
+        "quantization) or 4bit_weight_palettized_group32 (4-bit k-means "
+        "palettization); default: none",
     )
     parser.add_argument(
         "--list-models",
@@ -943,7 +1159,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--compression",
         default="none",
         help="Compression preset for the text decoder (e.g. '4bit', 'none'). "
-        "The vision encoder and embedding are always exported at full precision.",
+        "The embedding is exported at full precision; the vision encoder takes "
+        "--vision-compression and --vision-dtype.",
     )
     parser.add_argument(
         "--verbose",
@@ -954,17 +1171,47 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _prepare_vision_only_bundle(spec: VLMSpec, output_dir: Path) -> Path:
+    """Bundle directory for a vision-only export, with a manifest to patch.
+
+    :func:`export_vision_encoder` writes into an existing bundle and updates its
+    ``metadata.json``; a checkpoint exported without its text decoder never gets
+    one from :func:`export_text_bundle`, so seed it from the spec.
+    """
+    bundle_path = output_dir / spec.output_name
+    bundle_path.mkdir(parents=True, exist_ok=True)
+    metadata_path = bundle_path / "metadata.json"
+    if not metadata_path.exists():
+        metadata = {
+            "metadata_version": METADATA_VERSION,
+            "kind": "vlm",
+            "name": spec.output_name,
+            "assets": {},
+            "vision": _vision_metadata(spec),
+            "source": {
+                "hf_model_id": spec.hf_model_id,
+                "model_definition": "torch",
+            },
+        }
+        with open(metadata_path, "w") as f:
+            json.dump(metadata, f, indent=2)
+    return bundle_path
+
+
 async def _run(spec: VLMSpec, args: argparse.Namespace) -> Path:
     output_dir = Path(args.output_dir) if args.output_dir else _default_output_dir()
-    bundle_path = await export_text_bundle(
-        spec,
-        max_ctx=args.max_context_length,
-        num_layers=args.num_layers,
-        output_dir=output_dir,
-        overwrite=args.overwrite,
-        compression=args.compression,
-        include_debug_info=args.include_debug_info,
-    )
+    if args.vision_only:
+        bundle_path = _prepare_vision_only_bundle(spec, output_dir)
+    else:
+        bundle_path = await export_text_bundle(
+            spec,
+            max_ctx=args.max_context_length,
+            num_layers=args.num_layers,
+            output_dir=output_dir,
+            overwrite=args.overwrite,
+            compression=args.compression,
+            include_debug_info=args.include_debug_info,
+        )
     if not args.skip_vision:
         logging.info("Exporting vision encoder...")
         await export_vision_encoder(
@@ -973,6 +1220,9 @@ async def _run(spec: VLMSpec, args: argparse.Namespace) -> Path:
             args.overwrite,
             args.num_frames,
             include_debug_info=args.include_debug_info,
+            vision_dtype=args.vision_dtype or ("f16" if args.vision_neural_engine else "f32"),
+            neural_engine=args.vision_neural_engine,
+            vision_compression=args.vision_compression,
         )
     return bundle_path
 
@@ -1002,6 +1252,30 @@ def main() -> None:
             f"Error: '{args.model}' is not a supported VLM short-name. "
             f"Available: {', '.join(SUPPORTED_MODELS)}. Run --list-models."
         )
+
+    if spec.text_decoder_class is None and not args.vision_only:
+        raise SystemExit(
+            f"Error: '{args.model}' has no text decoder recipe; it supports vision-encoder "
+            f"export only. Run with --vision-only."
+        )
+
+    vision_options = (
+        args.vision_neural_engine
+        or args.vision_dtype is not None
+        or args.vision_compression != "none"
+    )
+    if args.skip_vision and vision_options:
+        parser.error(
+            "--skip-vision exports no vision encoder; drop --vision-neural-engine, "
+            "--vision-dtype and --vision-compression"
+        )
+    if args.vision_only and (args.compression != "none" or args.num_layers is not None):
+        parser.error("--vision-only exports no text decoder; drop --compression and --num-layers")
+    if args.vision_neural_engine:
+        if args.num_frames != 1:
+            parser.error("--vision-neural-engine supports a single image only (--num-frames 1)")
+        if args.vision_dtype == "f32":
+            parser.error("--vision-neural-engine needs --vision-dtype f16")
 
     bundle_path = asyncio.run(_run(spec, args))
     print(f"\nExport complete: {bundle_path.resolve()}")
