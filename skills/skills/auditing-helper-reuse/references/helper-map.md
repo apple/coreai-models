@@ -7,7 +7,7 @@ Paths are relative to `python/src/coreai_models/`. Checked against apple/coreai-
 
 | Family | Look in |
 | --- | --- |
-| Whole layers from peer models | `models/macos/mistral.py` (`Attention`, `TransformerBlock`), other decoders in `models/macos/` |
+| A decoder layer to start from | `models/macos/mistral.py`, `models/ios/mistral.py`; each family keeps its own `Attention` and `TransformerBlock`, so copy one rather than import it |
 | RoPE, rotation, cos/sin | `primitives/macos/rope.py` (`RoPE`, `YarnRoPE`), `primitives/ios/rope.py`, `models/macos/diffusion_gemma.py` (`apply_rotary_pos_emb`), `models/macos/muse_glimmer_vision.py` (private `_rotate_half`: promote, don't import) |
 | Norms, MLP, embeddings | `models/macos/diffusion_gemma.py` (`DiffusionGemmaRMSNorm`, `DiffusionGemmaDenseMLP`, `ScaledEmbedding`), `primitives/ios/rms_norm.py` |
 | Attention and masks | `primitives/{macos,ios}/sdpa.py`, `primitives/ios/bidirectional_sdpa.py` |
