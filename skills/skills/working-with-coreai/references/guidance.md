@@ -48,7 +48,7 @@ ______________________________________________________________________
 
 - Static shaped inputs, outputs, and intermediate tensors wherever possible
 - Limited or no control flow or branching
-- Int8/Int4 linear quantized with per-channel granularity or 2/4/6/8 bit palettized weights with per-tensor or per-group-channel granularity
+- Int8/Int4 linear quantized with per-channel granularity or 2/4/6/8 bit palettized weights with per-tensor or per-group-channel granularity. Avoid linear per-block quantization (for example the macOS `4bit` preset) for a model that runs on the Neural Engine: it has produced wrong output with no error ([issue #279](https://github.com/apple/coreai-models/issues/279)). The in-tree iOS presets are palettization only.
 
 Models with variable sequence lengths can be transformed and chunked into a collection of multiple static shaped functions. In some cases a fixed max shape is required — for example, picking a maximum context length and using it to set a fixed-size KV cache.
 
@@ -65,5 +65,7 @@ If you override the default and set a preferred compute unit explicitly, align t
 
 | Preferred compute unit | Recommended model representation |
 | ---------------------- | --------------------------------- |
-| Neural Engine | Static shapes, palettized weights, optimized for energy efficiency |
+| Neural Engine | Static shapes, palettized weights (not linear per-block quantization), optimized for energy efficiency |
 | GPU | Linear quantization, no chunked dynamic shapes, optimized to scale with available compute |
+
+Whichever unit you pin, compare the compressed model's output against an fp32 reference on that unit. A per-block quantized `Linear` has been reported to return wrong values on the GPU as well as the Neural Engine on macOS (see [issue #279](https://github.com/apple/coreai-models/issues/279)), and the runtime gives no warning.
