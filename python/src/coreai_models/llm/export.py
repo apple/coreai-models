@@ -460,6 +460,36 @@ def _resolve_export_config(args: argparse.Namespace) -> ExportConfig:
     )
 
 
+def _print_dry_run(config: ExportConfig) -> None:
+    """Print the resolved export config without exporting."""
+    print("Dry run — resolved export config:")
+    print(f"  model:              {config.hf_model_id}")
+    print(f"  platform:           {config.variant}")
+    print(f"  compression:        {config.compression}")
+    if config.quantization_mode is not None:
+        print(f"  quantization_mode:  {config.quantization_mode}")
+    print(f"  compute_precision:  {config.compute_precision}")
+    if config.max_context_length:
+        print(f"  max_context_length: {config.max_context_length}")
+    if config.backend != "huggingface":
+        print(f"  download_backend:   {config.backend}")
+    print(f"  output_dir:         {config.output_dir}")
+    if config.output_name:
+        print(f"  output_name:        {config.output_name}")
+    if config.num_layers:
+        print(f"  num_layers:         {config.num_layers}")
+    print(f"  overwrite:          {config.overwrite}")
+    print(f"  include_debug_info: {config.include_debug_info}")
+    if config.with_drafter:
+        print("  with_drafter:       True")
+    if config.emits_attn_mask:
+        print(f"  attention_mask:     {config.attention_mask_mode.value}")
+    if config.dynamic_max_batch_size is not None:
+        print(f"  dynamic_batch_size: {config.dynamic_max_batch_size}")
+    if config.variant == "iOS":
+        print(f"  disable_embedding_quantization: {config.disable_embedding_quantization}")
+
+
 def main() -> None:
     """Main entry point for the export CLI."""
     parser = build_parser()
@@ -515,28 +545,7 @@ def main() -> None:
     config = _resolve_export_config(args)
 
     if args.dry_run:
-        print("Dry run — resolved export config:")
-        print(f"  model:              {config.hf_model_id}")
-        print(f"  platform:           {config.variant}")
-        print(f"  compression:        {config.compression}")
-        if config.quantization_mode is not None:
-            print(f"  quantization_mode:  {config.quantization_mode}")
-        print(f"  compute_precision:  {config.compute_precision}")
-        if config.max_context_length:
-            print(f"  max_context_length: {config.max_context_length}")
-        if config.backend != "huggingface":
-            print(f"  download_backend:   {config.backend}")
-        print(f"  output_dir:         {config.output_dir}")
-        if config.output_name:
-            print(f"  output_name:        {config.output_name}")
-        if config.num_layers:
-            print(f"  num_layers:         {config.num_layers}")
-        print(f"  overwrite:          {config.overwrite}")
-        print(f"  include_debug_info: {config.include_debug_info}")
-        if config.with_drafter:
-            print("  with_drafter:       True")
-        if config.variant == "iOS":
-            print(f"  disable_embedding_quantization: {config.disable_embedding_quantization}")
+        _print_dry_run(config)
         return
 
     result = export_model(config)
