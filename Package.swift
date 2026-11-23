@@ -51,6 +51,10 @@ let package = Package(
                 "CoreAIObjectDetector"
             ]
         ),
+        .library(
+            name: "CoreAIEmbeddings",
+            targets: ["CoreAIEmbeddings"]
+        ),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.2.0"),
@@ -93,6 +97,19 @@ let package = Package(
             name: "CoreAIObjectDetector",
             dependencies: ["CoreAIShared"],
             path: "swift/Sources/CoreAIObjectDetector",
+            swiftSettings: [
+                .enableUpcomingFeature("MemberImportVisibility")
+            ]
+        ),
+        // Embedding models
+        .target(
+            name: "CoreAIEmbeddings",
+            dependencies: [
+                "CoreAILMCommon",
+                "CoreAIShared",
+                .product(name: "Tokenizers", package: "swift-transformers"),
+            ],
+            path: "swift/Sources/CoreAIEmbeddings",
             swiftSettings: [
                 .enableUpcomingFeature("MemberImportVisibility")
             ]
@@ -410,6 +427,17 @@ let package = Package(
             path: "swift/Tests/GuidedGenerationTests",
             linkerSettings: [
                 .linkedLibrary("c++")
+            ]
+        ),
+        .testTarget(
+            name: "EmbeddingsTests",
+            dependencies: [
+                "CoreAIEmbeddings",
+                "CoreAIShared",
+            ],
+            path: "swift/Tests/EmbeddingsTests",
+            resources: [
+                .copy("Resources/Bundles"),
             ]
         ),
         .testTarget(

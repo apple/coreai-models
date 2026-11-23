@@ -1,0 +1,96 @@
+{
+  "metadata_version": "0.2",
+  "kind": "embedding",
+  "name": "embeddinggemma-2-ios",
+  "assets": {
+    "token_table": "token_table.aimodel",
+    "encoder": "encoder.aimodel",
+    "image_encoder": "image_encoder.aimodel"
+  },
+  "embedding": {
+    "space": {
+      "id": "google/embeddinggemma-2",
+      "revision": "914f7f89142e33e77833254d9c9b90c3cef7303b"
+    },
+    "dimension": 768,
+    "matryoshka_dimensions": [768, 512, 256, 128],
+    "renormalize_after_truncation": true,
+    "logit_scale": null,
+    "components": {
+      "token_table": {
+        "asset": "token_table",
+        "inputs": {"input_ids": "int32[B,L]"},
+        "outputs": {"inputs_embeds": "float16[B,L,512]"},
+        "compute_units": ["gpu"],
+        "functions": [{"function": "main", "batch": 1, "length": {"min": 2, "max": 8192}}]
+      },
+      "encoder": {
+        "asset": "encoder",
+        "inputs": {
+          "inputs_embeds": "float16[B,L,512]",
+          "bias": "float16[B,L,1,L]",
+          "pool_weights": "float16[B,L]"
+        },
+        "outputs": {"embedding": "float16[B,768]"},
+        "compute_units": ["neural_engine"],
+        "functions": [
+          {"function": "embeds_len128_b1", "batch": 1, "length": 128},
+          {"function": "embeds_len512_b1", "batch": 1, "length": 512},
+          {"function": "embeds_len1024_b1", "batch": 1, "length": 1024}
+        ],
+        "bias": {
+          "layout": "[1, key, 1, query]",
+          "masked": -30000.0,
+          "unmasked": 0.0,
+          "sliding_window": "in_graph"
+        },
+        "pool_weights": "attention_mask / attention_mask.sum(-1)"
+      },
+      "image_encoder": {
+        "asset": "image_encoder",
+        "inputs": {"pixel_values": "float16[B,2520,768]", "position_ids": "float16[B,2520,2]"},
+        "outputs": {"soft_tokens": "float16[B,280,512]"},
+        "compute_units": ["neural_engine"],
+        "functions": [{"function": "main", "batch": 1}]
+      }
+    },
+    "towers": [
+      {"modality": "text", "pipeline": ["token_table", "encoder"]},
+      {"modality": "image", "pipeline": ["image_encoder", "token_table", "encoder"]}
+    ],
+    "text": {
+      "embedded_tokenizer": true,
+      "add_bos_token": true,
+      "add_eos_token": true,
+      "bos_token_id": 2,
+      "eos_token_id": 1,
+      "pad_token_id": 0,
+      "padding_side": "right",
+      "truncation": {"max_tokens": 1024, "keep_eos": true},
+      "model_max_tokens": 8192,
+      "prompts": {
+        "query": "task: search result | query: ",
+        "document": "title: none | text: ",
+        "sentence_similarity": "task: sentence similarity | query: ",
+        "classification": "task: classification | query: ",
+        "clustering": "task: clustering | query: ",
+        "question_answering": "task: question answering | query: ",
+        "fact_checking": "task: fact checking | query: ",
+        "code_retrieval": "task: code retrieval | query: "
+      },
+      "default_prompt_name": null,
+      "document_template": "title: {title} | text: {text}"
+    },
+    "image": {
+      "image_strategy": "aspect_ratio_preserving",
+      "image_mean": [0.0, 0.0, 0.0],
+      "image_std": [1.0, 1.0, 1.0],
+      "patch_size": 16,
+      "pooling_kernel_size": 3,
+      "max_soft_tokens": 280,
+      "image_token_id": 258880,
+      "boi_token_id": 255999,
+      "eoi_token_id": 258882
+    }
+  }
+}

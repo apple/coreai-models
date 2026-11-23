@@ -188,26 +188,19 @@ private struct Weights: Sendable {
 
         if antialias && scale > 1.0 {
             // Downsampling with a triangle filter whose support grows with the ratio.
-            // Mirrors `aten/src/ATen/native/UpSample.h::_compute_weights_aa`.
-            let support = scale
-            let inverseScale = 1.0 / scale
-            let taps = Int(support.rounded(.up)) * 2 + 1
+            let taps = Int(scale.rounded(.up)) * 2 + 1
             self.maxTaps = taps
             var starts = [Int](repeating: 0, count: destinationSize)
             var counts = [Int](repeating: 0, count: destinationSize)
             var values = [Float](repeating: 0, count: destinationSize * taps)
-            for index in 0..<destinationSize {
-                let center = scale * (Double(index) + 0.5)
-                let start = max(0, Int(center - support + 0.5))
-                let end = min(sourceSize, Int(center + support + 0.5))
-                let count = max(0, end - start)
-                starts[index] = start
-                counts[index] = min(count, taps)
+            let table = AntialiasTaps.taps(
+                sourceSize: sourceSize, destinationSize: destinationSize, filter: .triangle)
+            for (index, tap) in table.enumerated() {
+                starts[index] = tap.start
+                counts[index] = min(tap.weights.count, taps)
                 var total = 0.0
-                for tap in 0..<counts[index] {
-                    let offset = (Double(tap + start) - center + 0.5) * inverseScale
-                    let weight = max(0.0, 1.0 - abs(offset))
-                    values[index * taps + tap] = Float(weight)
+                for (slot, weight) in tap.weights.prefix(counts[index]).enumerated() {
+                    values[index * taps + slot] = Float(weight)
                     total += weight
                 }
                 if total != 0 {

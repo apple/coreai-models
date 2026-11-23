@@ -3,7 +3,6 @@
 // Use of this source code is governed by a BSD-3-clause license that can
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
-import CoreAIShared
 import Foundation
 import Synchronization
 import os.signpost
@@ -57,16 +56,18 @@ public enum SignpostCategory: String, Sendable {
     case ropeBuild = "RopeBuild"  // runner-side RoPE cos/sin precompute (Gemma4)
     case pleGather = "PLEGather"  // INT8 per-layer-embedding gather
     case logitsCopy = "LogitsCopy"  // full-vocab logits copy out of the graph output
+    case embed = "Embed"  // Embedding runtime: one embed call
+    case embedInference = "EmbedInference"  // Embedding runtime: one program call of a tower
 
     /// Which group this category belongs to for table organization
     var group: CategoryGroup {
         switch self {
         case .modelLoad, .tokenizerLoad, .warmup, .reset, .cleanup:
             return .main
-        case .prompt, .extend, .decode, .tokenization, .speculativeDraft, .speculativeVerify:
+        case .prompt, .extend, .decode, .tokenization, .speculativeDraft, .speculativeVerify, .embed:
             return .decoder
         case .logitsInference, .prepareStep, .cacheManagement, .sample, .sampleEncoding,
-            .gatherEmbeddings, .maskBuild, .ropeBuild, .pleGather, .logitsCopy:
+            .gatherEmbeddings, .maskBuild, .ropeBuild, .pleGather, .logitsCopy, .embedInference:
             return .engine
         }
     }
@@ -94,6 +95,8 @@ public enum SignpostCategory: String, Sendable {
         case .ropeBuild: return "RopeBuild"
         case .pleGather: return "PLEGather"
         case .logitsCopy: return "LogitsCopy"
+        case .embed: return "Embed"
+        case .embedInference: return "EmbedInference"
         }
     }
 }
@@ -642,6 +645,18 @@ public struct InstrumentsProfiler {
             span.end()
             throw error
         }
+    }
+
+    /// Begin profiling one embed call over `inputs` texts and images.
+    public static func beginEmbed(inputs: Int) -> ProfileSpan {
+        ProfileSpan(category: .embed, log: Self.log, metadata: ["inputs": "\(inputs)"])
+    }
+
+    /// Begin profiling one call of `function` of an embedding tower's `component`, over `batch` inputs.
+    public static func beginEmbedInference(component: String, function: String, batch: Int) -> ProfileSpan {
+        ProfileSpan(
+            category: .embedInference, log: Self.log,
+            metadata: ["component": component, "function": function, "batch": "\(batch)"])
     }
 
     /// Begin profiling one drafter call of a speculative round, which proposes `tokens` candidates.

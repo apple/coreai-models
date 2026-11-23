@@ -8,6 +8,7 @@ import TestUtilities
 import Testing
 
 @testable import CoreAILanguageModels
+@testable import CoreAIShared
 
 @Suite("ProfileSpan")
 @MainActor

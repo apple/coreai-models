@@ -21,4 +21,6 @@ public enum BundleKind: String, Codable, Sendable, CaseIterable {
     /// carries a `runtime` block with the memory-bank geometry.
     case videoSegmenter = "video_segmenter"
     case speechRecognizer = "speech_recognizer"
+    /// Embedding models (CLIP, CLAP, EmbeddingGemma 2): one vector per input.
+    case embedding
 }
