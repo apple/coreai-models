@@ -50,6 +50,17 @@ final class TokenCountStore: Sendable {
     func set(_ count: Int) { value.withLock { $0 = count } }
 }
 
+/// The generated token IDs a decoded stream's iterator appends and the stream reads back, for
+/// ``DecodeOutcomeReporting/generatedTokenIds(from:)``. Exists only when the stream was asked to
+/// record them (``DecoderOptions/recordTokenIds``); the iterator holds nil otherwise.
+final class TokenIdStore: Sendable {
+    private let value = Mutex<[Int32]>([])
+    func append(_ id: Int32) { value.withLock { $0.append(id) } }
+    func ids(from start: Int) -> [Int32] {
+        value.withLock { Array($0[Swift.min(Swift.max(start, 0), $0.count)...]) }
+    }
+}
+
 /// Shared, thread-safe slot for a sequence's `StopReason`.
 ///
 /// `InferenceOutputSequence`s are value types, but the reason is written by the

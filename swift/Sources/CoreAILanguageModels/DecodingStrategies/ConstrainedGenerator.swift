@@ -76,15 +76,22 @@ public struct ConstrainedGenerator: DecodingStrategy {
     /// Unlike `ConstrainedDecodingStrategy` which streams per-token, this emits the
     /// entire JSON string as one result after generation completes. The `tokenId` is
     /// set to `invalidTokenId` since this represents aggregated output, not a single token.
+    ///
+    /// Throws `InferenceRuntimeError.unsupportedDecoderOption` for ``DecoderOptions/recordTokenIds``:
+    /// the one result stands for the whole reply, so there are no per-token IDs to record.
     public func decode(
         from input: Input,
         tokenizer: any Tokenizer,
         inferenceEngine: any InferenceEngine,
         samplingConfiguration: SamplingConfiguration,
         options: InferenceOptions,
-        stopSequences: StopSequences
-    ) -> ConstrainedGeneratedSequence {
-        ConstrainedGeneratedSequence(
+        decoderOptions: DecoderOptions
+    ) throws -> ConstrainedGeneratedSequence {
+        if decoderOptions.recordTokenIds {
+            throw InferenceRuntimeError.unsupportedDecoderOption(
+                "ConstrainedGenerator returns the whole reply as one result and cannot record token IDs")
+        }
+        return ConstrainedGeneratedSequence(
             jsonSchema: jsonSchema,
             vocabSize: vocabSize,
             invalidTokenId: Self.invalidTokenId,

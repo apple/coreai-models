@@ -54,8 +54,9 @@ public struct PipelinedConstrainedDecodingStrategy: DecodingStrategy {
         inferenceEngine: any InferenceEngine,
         samplingConfiguration: SamplingConfiguration,
         options: InferenceOptions,
-        stopSequences: StopSequences
+        decoderOptions: DecoderOptions
     ) async throws -> PipelinedConstrainedSequence {
+        let stopSequences = decoderOptions.stopSequences
         guard let constrainedEngine = inferenceEngine as? any ConstrainedGenerationCapable else {
             throw InferenceRuntimeError.invalidArgument(
                 "PipelinedConstrainedDecodingStrategy requires a ConstrainedGenerationCapable engine")
@@ -94,7 +95,8 @@ public struct PipelinedConstrainedDecodingStrategy: DecodingStrategy {
             tokenizer: tokenizer,
             engine: constrainedEngine,
             samplingConfiguration: samplingConfiguration,
-            stopSequences: stopSequences
+            stopSequences: stopSequences,
+            tokenIds: decoderOptions.recordTokenIds ? TokenIdStore() : nil
         )
     }
 }
@@ -118,6 +120,8 @@ public struct PipelinedConstrainedSequence: AsyncSequence, DecodeOutcomeReportin
 
     public var tokensGenerated: Int { tokenCount.count }
 
+    public func generatedTokenIds(from start: Int) -> [Int32]? { tokenIds?.ids(from: start) }
+
     fileprivate let session: ConstrainedSessionHandle
     fileprivate let inputTokens: [Int32]
     fileprivate let maxTokens: Int
@@ -125,6 +129,8 @@ public struct PipelinedConstrainedSequence: AsyncSequence, DecodeOutcomeReportin
     let engine: any ConstrainedGenerationCapable
     let samplingConfiguration: SamplingConfiguration
     let stopSequences: StopSequences
+    /// The generated token IDs, when the caller asked for them.
+    fileprivate let tokenIds: TokenIdStore?
 
     /// Guards against multiple `makeAsyncIterator()` calls sharing the same session box.
     private let consumed = SingleUseFlag()
@@ -141,7 +147,8 @@ public struct PipelinedConstrainedSequence: AsyncSequence, DecodeOutcomeReportin
             samplingConfiguration: samplingConfiguration,
             stopSequences: stopSequences,
             outcome: outcome,
-            tokenCount: tokenCount
+            tokenCount: tokenCount,
+            tokenIds: tokenIds
         )
     }
 }
@@ -169,6 +176,7 @@ extension PipelinedConstrainedSequence {
         private var finished: Bool = false
         private let outcome: StopReasonStore
         private let tokenCount: TokenCountStore
+        private let tokenIds: TokenIdStore?
 
         fileprivate init(
             session: ConstrainedSessionHandle,
@@ -179,10 +187,12 @@ extension PipelinedConstrainedSequence {
             samplingConfiguration: SamplingConfiguration,
             stopSequences: StopSequences,
             outcome: StopReasonStore,
-            tokenCount: TokenCountStore
+            tokenCount: TokenCountStore,
+            tokenIds: TokenIdStore?
         ) {
             self.outcome = outcome
             self.tokenCount = tokenCount
+            self.tokenIds = tokenIds
             self.session = session
             self.inputTokens = inputTokens
             self.maxTokens = maxTokens
@@ -230,6 +240,7 @@ extension PipelinedConstrainedSequence {
                     }
                     self.innerIterator = iterator
                     tokenCount.set(generatedTokens.count + 1)
+                    tokenIds?.append(tokenId)
 
                     // Check stop sequences
                     recentTokens.append(tokenId)

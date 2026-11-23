@@ -51,7 +51,8 @@ struct PrefixCacheEngineTests {
     private func reply(_ prompt: String, engine: any InferenceEngine, tokenizer: any Tokenizer) async throws -> String {
         let stream = try await VanillaDecodingStrategy().decode(
             from: .prompt(prompt), tokenizer: tokenizer, inferenceEngine: engine, samplingConfiguration: .greedy,
-            options: InferenceOptions(maxTokens: 16), stopSequences: StopSequences(sequences: []))
+            options: InferenceOptions(maxTokens: 16),
+            decoderOptions: DecoderOptions(stopSequences: StopSequences(sequences: [])))
         var text = ""
         for try await result in stream { text += result.text }
         return text

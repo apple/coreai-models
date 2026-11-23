@@ -38,7 +38,7 @@ struct LLMServer: AsyncParsableCommand {
             /health and /ready report modalities.vision when the model accepts images.
 
             Endpoints:
-              POST /v1/chat/completions  chat generation: streaming, tools, reasoning_effort, image input
+              POST /v1/chat/completions  chat generation: streaming, tools, reasoning_effort, image input, return_token_ids
               POST /v1/completions       prompt scoring: echo, logprobs
               GET  /v1/models            the served model and its capabilities (completion, vision)
               GET  /ready                readiness, modalities, KV-cache memory estimates and batch occupancy

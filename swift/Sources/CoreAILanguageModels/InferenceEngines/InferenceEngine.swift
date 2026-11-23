@@ -392,6 +392,8 @@ public enum InferenceRuntimeError: Error, LocalizedError {
     case bufferAllocationFailed(String)
     /// The scheduler's wait queue is full. `depth` is the queue limit.
     case queueFull(depth: Int)
+    /// The decoding strategy cannot honor a `DecoderOptions` setting the caller asked for.
+    case unsupportedDecoderOption(String)
     case genericError(String)
 
     /// True for `.queueFull`.
@@ -435,6 +437,8 @@ public enum InferenceRuntimeError: Error, LocalizedError {
             return "GPU buffer allocation failed: \(details)"
         case .queueFull(let depth):
             return "Request queue full (depth: \(depth))"
+        case .unsupportedDecoderOption(let description):
+            return "Unsupported decoder option: \(description)"
         case .genericError(let message):
             return message
         }

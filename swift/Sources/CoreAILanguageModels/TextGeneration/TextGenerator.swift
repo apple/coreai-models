@@ -50,7 +50,7 @@ public class TextGenerator {
             inferenceEngine: inferenceEngine,
             samplingConfiguration: samplingConfiguration,
             options: InferenceOptions(maxTokens: maxTokens),
-            stopSequences: effectiveStopSequences
+            decoderOptions: DecoderOptions(stopSequences: effectiveStopSequences)
         )
 
         for try await generationResult in tokenStream {
@@ -84,7 +84,7 @@ public class TextGenerator {
             inferenceEngine: inferenceEngine,
             samplingConfiguration: samplingConfiguration,
             options: .sampleWithLogits(maxTokens: maxTokens),
-            stopSequences: effectiveStopSequences
+            decoderOptions: DecoderOptions(stopSequences: effectiveStopSequences)
         )
 
         for try await result in resultStream {

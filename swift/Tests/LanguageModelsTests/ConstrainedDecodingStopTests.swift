@@ -12,13 +12,15 @@ import Testing
 @Suite("ConstrainedDecodingStrategy — how a stream ends")
 struct ConstrainedDecodingStopTests {
     private func decode(
-        _ engine: MockEngine, maxTokens: Int
+        _ engine: MockEngine, maxTokens: Int, recordTokenIds: Bool = false
     ) async throws -> ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
         let tokenizer = MockTokenizer()
         return try await ConstrainedDecodingStrategy(jsonSchema: #"{"type": "integer"}"#, vocabSize: 256).decode(
             from: .tokens([1]), tokenizer: tokenizer, inferenceEngine: engine, samplingConfiguration: .greedy,
             options: InferenceOptions(maxTokens: maxTokens),
-            stopSequences: StopSequences(for: tokenizer, additionalEosTokenIds: []))
+            decoderOptions: DecoderOptions(
+                stopSequences: StopSequences(for: tokenizer, additionalEosTokenIds: []),
+                recordTokenIds: recordTokenIds))
     }
 
     private func text(_ stream: ConstrainedDecodingStrategy.ConstrainedDecodedSequence) async throws -> String {
@@ -46,5 +48,35 @@ struct ConstrainedDecodingStopTests {
             return
         }
         #expect(stream.tokensGenerated == 2)
+    }
+
+    @Test("Token IDs are recorded only when asked for, the stop token included")
+    func tokenIds() async throws {
+        let unrecorded = try await decode(MockEngine(tokens: [49, 2], vocabSize: 256), maxTokens: 10)
+        _ = try await text(unrecorded)
+        #expect(unrecorded.generatedTokenIds == nil)
+
+        let recorded = try await decode(
+            MockEngine(tokens: [49, 2], vocabSize: 256), maxTokens: 10, recordTokenIds: true)
+        _ = try await text(recorded)
+        #expect(recorded.generatedTokenIds == [49, 2])
+        #expect(recorded.generatedTokenIds?.count == recorded.tokensGenerated)
+    }
+
+    @Test("ConstrainedGenerator refuses to record token IDs rather than ignore the option")
+    func generatorRefusesTokenIds() async throws {
+        let tokenizer = MockTokenizer()
+        let engine = MockEngine(tokens: [49], vocabSize: 256)
+        let generator = ConstrainedGenerator(
+            engine: engine, tokenizer: tokenizer, vocabSize: 256, jsonSchema: #"{"type": "integer"}"#)
+        #expect {
+            _ = try generator.decode(
+                from: .tokens([1]), tokenizer: tokenizer, inferenceEngine: engine, samplingConfiguration: .greedy,
+                options: InferenceOptions(maxTokens: 3),
+                decoderOptions: DecoderOptions(stopSequences: StopSequences(sequences: []), recordTokenIds: true))
+        } throws: { error in
+            guard case InferenceRuntimeError.unsupportedDecoderOption = error else { return false }
+            return true
+        }
     }
 }

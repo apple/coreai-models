@@ -50,8 +50,9 @@ public struct ConstrainedDecodingStrategy: DecodingStrategy {
         inferenceEngine: any InferenceEngine,
         samplingConfiguration: SamplingConfiguration,
         options: InferenceOptions,
-        stopSequences: StopSequences
+        decoderOptions: DecoderOptions
     ) async throws -> ConstrainedDecodedSequence {
+        let stopSequences = decoderOptions.stopSequences
         CLILogger.log(
             "Starting constrained decoding strategy with schema",
             component: "ConstrainedDecodingStrategy"
@@ -77,7 +78,8 @@ public struct ConstrainedDecodingStrategy: DecodingStrategy {
             prepared: ConstrainedDecodedSequence.Prepared(
                 session: consume session,
                 inputTokens: inputTokens,
-                maxTokens: maxTokens
+                maxTokens: maxTokens,
+                tokenIds: decoderOptions.recordTokenIds ? TokenIdStore() : nil
             ),
             tokenizer: tokenizer,
             inferenceEngine: inferenceEngine,
@@ -257,6 +259,8 @@ extension ConstrainedDecodingStrategy {
         public var stopReason: StopReason? { prepared.outcome.stopReason }
 
         public var tokensGenerated: Int { prepared.tokenCount.count }
+
+        public func generatedTokenIds(from start: Int) -> [Int32]? { prepared.tokenIds?.ids(from: start) }
     }
 }
 
@@ -270,15 +274,19 @@ extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
         let outcome = StopReasonStore()
         /// Tokens sampled, the one that ended the reply included, for ``tokensGenerated``.
         let tokenCount = TokenCountStore()
+        /// Their IDs, when the caller asked for them.
+        let tokenIds: TokenIdStore?
 
         init(
             session: consuming ConstrainedGenerationSession,
             inputTokens: [Int32],
-            maxTokens: Int
+            maxTokens: Int,
+            tokenIds: TokenIdStore?
         ) {
             self.session = consume session
             self.inputTokens = inputTokens
             self.maxTokens = maxTokens
+            self.tokenIds = tokenIds
         }
     }
 }
@@ -304,6 +312,7 @@ extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
         private var finished: Bool = false
         private let outcome: StopReasonStore
         private let tokenCount: TokenCountStore
+        private let tokenIds: TokenIdStore?
 
         fileprivate init(
             prepared: ConstrainedDecodingStrategy.ConstrainedDecodedSequence.Prepared,
@@ -318,6 +327,7 @@ extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
             self.maxTokens = prepared.maxTokens
             self.outcome = prepared.outcome
             self.tokenCount = prepared.tokenCount
+            self.tokenIds = prepared.tokenIds
             self.tokenizer = tokenizer
             self.inferenceEngine = inferenceEngine
             self.samplingConfiguration = samplingConfiguration
@@ -372,6 +382,7 @@ extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
                 if stopSequences.matches(recentTokens: [bestToken]) {
                     // Sampled, and paid for, though not part of the reply.
                     tokenCount.set(generatedTokens.count + 1)
+                    tokenIds?.append(bestToken)
                     finished = true
                     outcome.setIfUnset(.stopSequence(tokenizer.decode(tokens: [Int(bestToken)])))
                     return nil
@@ -380,6 +391,7 @@ extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
                 inputTokens.append(bestToken)
                 generatedTokens.append(bestToken)
                 tokenCount.set(generatedTokens.count)
+                tokenIds?.append(bestToken)
                 tokenStep += 1
 
                 if terminatedAfterAccept {

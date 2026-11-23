@@ -169,7 +169,7 @@ struct PipelinedConstrainedIntegrationTests {
             inferenceEngine: engine,
             samplingConfiguration: .greedy,
             options: InferenceOptions(maxTokens: 5),
-            stopSequences: StopSequences(for: tokenizer, additionalEosTokenIds: [])
+            decoderOptions: DecoderOptions(stopSequences: StopSequences(for: tokenizer, additionalEosTokenIds: []))
         )
 
         var results: [GenerationResult] = []
@@ -197,7 +197,7 @@ struct PipelinedConstrainedIntegrationTests {
         // First call
         let stream1 = try await strategy.decode(
             from: .tokens([1]), tokenizer: tokenizer, inferenceEngine: engine,
-            samplingConfiguration: .greedy, options: opts, stopSequences: stops
+            samplingConfiguration: .greedy, options: opts, decoderOptions: DecoderOptions(stopSequences: stops)
         )
         for try await _ in stream1 {}
         try await Task.sleep(for: .milliseconds(50))
@@ -209,7 +209,7 @@ struct PipelinedConstrainedIntegrationTests {
         // Second call with same schema — should reuse cached session
         let stream2 = try await strategy.decode(
             from: .tokens([1]), tokenizer: tokenizer, inferenceEngine: engine,
-            samplingConfiguration: .greedy, options: opts, stopSequences: stops
+            samplingConfiguration: .greedy, options: opts, decoderOptions: DecoderOptions(stopSequences: stops)
         )
         for try await _ in stream2 {}
         try await Task.sleep(for: .milliseconds(50))
@@ -230,7 +230,7 @@ struct PipelinedConstrainedIntegrationTests {
             jsonSchema: #"{"type": "integer"}"#, vocabSize: 256)
         let stream1 = try await strategyA.decode(
             from: .tokens([1]), tokenizer: tokenizer, inferenceEngine: engine,
-            samplingConfiguration: .greedy, options: opts, stopSequences: stops
+            samplingConfiguration: .greedy, options: opts, decoderOptions: DecoderOptions(stopSequences: stops)
         )
         for try await _ in stream1 {}
         try await Task.sleep(for: .milliseconds(50))
@@ -240,7 +240,7 @@ struct PipelinedConstrainedIntegrationTests {
             jsonSchema: #"{"type": "string"}"#, vocabSize: 256)
         let stream2 = try await strategyB.decode(
             from: .tokens([1]), tokenizer: tokenizer, inferenceEngine: engine,
-            samplingConfiguration: .greedy, options: opts, stopSequences: stops
+            samplingConfiguration: .greedy, options: opts, decoderOptions: DecoderOptions(stopSequences: stops)
         )
         for try await _ in stream2 {}
 
@@ -261,7 +261,7 @@ struct PipelinedConstrainedIntegrationTests {
             inferenceEngine: engine,
             samplingConfiguration: .greedy,
             options: InferenceOptions(maxTokens: 1),
-            stopSequences: StopSequences(for: tokenizer, additionalEosTokenIds: [])
+            decoderOptions: DecoderOptions(stopSequences: StopSequences(for: tokenizer, additionalEosTokenIds: []))
         )
 
         var count = 0
@@ -283,7 +283,7 @@ struct PipelinedConstrainedIntegrationTests {
             inferenceEngine: engine,
             samplingConfiguration: .greedy,
             options: InferenceOptions(maxTokens: 10),
-            stopSequences: StopSequences(for: tokenizer, additionalEosTokenIds: [50])
+            decoderOptions: DecoderOptions(stopSequences: StopSequences(for: tokenizer, additionalEosTokenIds: [50]))
         )
 
         var tokens: [Int32] = []
@@ -293,6 +293,28 @@ struct PipelinedConstrainedIntegrationTests {
 
         // Should stop at or before token 50
         #expect(!tokens.contains(where: { $0 > 50 }))
+    }
+
+    @Test("Token IDs are recorded only when asked for, the stop sequence's tokens included")
+    func tokenIds() async throws {
+        func run(recordTokenIds: Bool) async throws -> PipelinedConstrainedSequence {
+            // "123", stopping on "23": a stop of two tokens, which the strategy matches, not the grammar.
+            let stream = try await PipelinedConstrainedDecodingStrategy(
+                jsonSchema: #"{"type": "integer"}"#, vocabSize: 256
+            ).decode(
+                from: .tokens([1]), tokenizer: tokenizer,
+                inferenceEngine: MockConstrainedEngine(scriptedTokens: [49, 50, 51, 52]),
+                samplingConfiguration: .greedy, options: InferenceOptions(maxTokens: 10),
+                decoderOptions: DecoderOptions(
+                    stopSequences: StopSequences(sequences: [[50, 51]]), recordTokenIds: recordTokenIds))
+            for try await _ in stream {}
+            return stream
+        }
+        #expect(try await run(recordTokenIds: false).generatedTokenIds == nil)
+        let recorded = try await run(recordTokenIds: true)
+        #expect(recorded.stopReason == .stopSequence("23"))
+        #expect(recorded.generatedTokenIds == [49, 50, 51])
+        #expect(recorded.generatedTokenIds?.count == recorded.tokensGenerated)
     }
 
     @Test("Invalid schema throws during decode")
@@ -320,7 +342,7 @@ struct PipelinedConstrainedIntegrationTests {
                 inferenceEngine: wrongEngine,
                 samplingConfiguration: .greedy,
                 options: InferenceOptions(maxTokens: 5),
-                stopSequences: StopSequences(for: tokenizer, additionalEosTokenIds: [])
+                decoderOptions: DecoderOptions(stopSequences: StopSequences(for: tokenizer, additionalEosTokenIds: []))
             )
         }
     }
@@ -337,7 +359,7 @@ struct PipelinedConstrainedIntegrationTests {
             inferenceEngine: engine,
             samplingConfiguration: .greedy,
             options: InferenceOptions(maxTokens: 5),
-            stopSequences: StopSequences(for: tokenizer, additionalEosTokenIds: [])
+            decoderOptions: DecoderOptions(stopSequences: StopSequences(for: tokenizer, additionalEosTokenIds: []))
         )
 
         for try await _ in stream {}
@@ -360,7 +382,7 @@ struct PipelinedConstrainedStopTests {
             .decode(
                 from: .tokens([1]), tokenizer: tokenizer, inferenceEngine: engine, samplingConfiguration: .greedy,
                 options: InferenceOptions(maxTokens: maxTokens),
-                stopSequences: StopSequences(for: tokenizer, additionalEosTokenIds: []))
+                decoderOptions: DecoderOptions(stopSequences: StopSequences(for: tokenizer, additionalEosTokenIds: [])))
     }
 
     private func text(_ stream: PipelinedConstrainedSequence) async throws -> String {

@@ -25,7 +25,7 @@ public struct VanillaDecodingStrategy: DecodingStrategy {
     ///   - inferenceEngine: Engine for model inference
     ///   - samplingConfiguration: Sampling parameters (temperature, topK, etc.)
     ///   - options: Inference options (maxTokens, tokens, logits)
-    ///   - stopSequences: Token sequences that halt generation
+    ///   - decoderOptions: Stop sequences, and whether to record the generated token IDs
     /// - Returns: Stream of `GenerationResult` (text + optional logits)
     public func decode(
         from input: Input,
@@ -33,7 +33,7 @@ public struct VanillaDecodingStrategy: DecodingStrategy {
         inferenceEngine: any InferenceEngine,
         samplingConfiguration: SamplingConfiguration,
         options: InferenceOptions,
-        stopSequences: StopSequences
+        decoderOptions: DecoderOptions
     ) async throws -> VanillaDecodedSequence {
         CLILogger.log("🔄 Starting vanilla decoding generation")
 
@@ -50,7 +50,7 @@ public struct VanillaDecodingStrategy: DecodingStrategy {
             inferenceOptions: options
         )
         return decodedSequence(
-            of: stream, inputTokenCount: inputTokens.count, tokenizer: tokenizer, stopSequences: stopSequences)
+            of: stream, inputTokenCount: inputTokens.count, tokenizer: tokenizer, decoderOptions: decoderOptions)
     }
 
     /// Stream decoded text for a prompt with image placeholders.
@@ -62,7 +62,7 @@ public struct VanillaDecodingStrategy: DecodingStrategy {
     ///   - inferenceEngine: Engine that accepts multimodal input
     ///   - samplingConfiguration: Sampling parameters (temperature, topK, etc.)
     ///   - options: Inference options (maxTokens, tokens, logits)
-    ///   - stopSequences: Token sequences that halt generation
+    ///   - decoderOptions: Stop sequences, and whether to record the generated token IDs
     /// - Returns: Stream of `GenerationResult` (text + optional logits)
     package func decode(
         embeddings: InputEmbeddings,
@@ -71,7 +71,7 @@ public struct VanillaDecodingStrategy: DecodingStrategy {
         inferenceEngine: any MultimodalInferenceEngine,
         samplingConfiguration: SamplingConfiguration,
         options: InferenceOptions,
-        stopSequences: StopSequences
+        decoderOptions: DecoderOptions
     ) async throws -> VanillaDecodedSequence {
         let stream = try await inferenceEngine.generate(
             with: embeddings,
@@ -80,22 +80,23 @@ public struct VanillaDecodingStrategy: DecodingStrategy {
             inferenceOptions: options
         )
         return decodedSequence(
-            of: stream, inputTokenCount: tokens.count, tokenizer: tokenizer, stopSequences: stopSequences)
+            of: stream, inputTokenCount: tokens.count, tokenizer: tokenizer, decoderOptions: decoderOptions)
     }
 
     /// The decoded text of the engine's `stream` for a prompt of `inputTokenCount` tokens.
     private func decodedSequence(
         of stream: any InferenceOutputSequence, inputTokenCount: Int, tokenizer: any Tokenizer,
-        stopSequences: StopSequences
+        decoderOptions: DecoderOptions
     ) -> VanillaDecodedSequence {
         VanillaDecodedSequence(
             prepared: VanillaDecodedSequence.Prepared(
                 initialInputTokenCount: inputTokenCount,
                 engineSequence: stream,
-                upstreamIterator: stream.makeAsyncIterator()
+                upstreamIterator: stream.makeAsyncIterator(),
+                tokenIds: decoderOptions.recordTokenIds ? TokenIdStore() : nil
             ),
             tokenizer: tokenizer,
-            stopSequences: stopSequences
+            stopSequences: decoderOptions.stopSequences
         )
     }
 
@@ -136,15 +137,19 @@ extension VanillaDecodingStrategy {
             let outcome = StopReasonStore()
             /// Tokens the engine produced, for ``VanillaDecodedSequence/tokensGenerated``.
             let tokenCount = TokenCountStore()
+            /// Their IDs, when the caller asked for them.
+            let tokenIds: TokenIdStore?
 
             init(
                 initialInputTokenCount: Int,
                 engineSequence: any InferenceOutputSequence,
-                upstreamIterator: any AsyncIteratorProtocol<InferenceOutput, Error>
+                upstreamIterator: any AsyncIteratorProtocol<InferenceOutput, Error>,
+                tokenIds: TokenIdStore?
             ) {
                 self.initialInputTokenCount = initialInputTokenCount
                 self.engineSequence = engineSequence
                 self.upstreamIterator = upstreamIterator
+                self.tokenIds = tokenIds
             }
         }
 
@@ -163,6 +168,8 @@ extension VanillaDecodingStrategy {
         public var stopReason: StopReason? { prepared.outcome.stopReason }
 
         public var tokensGenerated: Int { prepared.tokenCount.count }
+
+        public func generatedTokenIds(from start: Int) -> [Int32]? { prepared.tokenIds?.ids(from: start) }
     }
 }
 
@@ -181,6 +188,7 @@ extension VanillaDecodingStrategy.VanillaDecodedSequence {
         private let initialInputTokenCount: Int
         private let outcome: StopReasonStore
         private let tokenCount: TokenCountStore
+        private let tokenIds: TokenIdStore?
 
         // Decoding state
         private var generatedTokenCount: Int = 0
@@ -208,6 +216,7 @@ extension VanillaDecodingStrategy.VanillaDecodedSequence {
             self.initialInputTokenCount = prepared.initialInputTokenCount
             self.outcome = prepared.outcome
             self.tokenCount = prepared.tokenCount
+            self.tokenIds = prepared.tokenIds
             self.engineSequence = prepared.engineSequence.take()
             self.upstreamIterator = prepared.upstreamIterator.take()
             self.inferenceSpan = InstrumentsProfiler.beginPrompt(tokens: prepared.initialInputTokenCount)
@@ -243,6 +252,7 @@ extension VanillaDecodingStrategy.VanillaDecodedSequence {
                 let decodingSpan = InstrumentsProfiler.beginDecode(step: step)
                 generatedTokenCount += 1
                 tokenCount.set(generatedTokenCount)
+                tokenIds?.append(output.tokenId)
 
                 // An id with no token adds no text, but still counts and can still end a stop sequence.
                 // BPE and WordPiece tokenizers return nil for an id past their vocabulary. Unigram
