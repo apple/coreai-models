@@ -17,6 +17,28 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
+## SDPA aborts at load when the value width differs from the query width
+
+**Cause**: `coreai_torch.composite_ops.SDPA` with q and k wider than v converts and runs on CPU. On the GPU and the Neural Engine the process aborts at load: `'mps_spi.sdpa' op failed: query and value must have matching inner dimension but have 192 and 128`.
+**Fix**: Zero-pad v to the q width and slice the output back to the v width. The output then matches PyTorch within 0.003 on both units.
+
+```python
+from coreai_torch.composite_ops import SDPA
+from torch import nn
+
+
+class PaddedSDPA(nn.Module):
+    def __init__(self, scale):
+        super().__init__()
+        self.sdpa = SDPA(scale=scale)
+
+    def forward(self, q, k, v):  # q and k wider than v
+        value = nn.functional.pad(v, (0, q.shape[-1] - v.shape[-1]))
+        return self.sdpa(query=q, key=k, value=value)[..., : v.shape[-1]]
+```
+
+______________________________________________________________________
+
 ## Input data type mismatch — "Data type int32 does not match"
 
 **Cause**: Input JSON descriptor uses wrong type specifier.
@@ -189,6 +211,21 @@ ______________________________________________________________________
 
 **Cause**: Asset was created with an older toolchain and uses an incompatible format.
 **Fix**: Re-export and save via `deployable.save_asset()`, then recompile with `coreai-build compile`.
+
+______________________________________________________________________
+
+## `.aimodelc` can be larger than the `.aimodel`
+
+**Cause**: An `.aimodel` stores a shared weight once and keeps per-block int8. An `.aimodelc` compiled with `--preferred-compute gpu` stores the weight once per function. With static shapes it also expands per-block int8 to the float size. A dynamic dimension keeps the int8 size, and per-block int4 stays small.
+**Fix**: Size the download from the compiled `.aimodelc`, not from the `.aimodel`.
+
+```python
+from pathlib import Path
+
+
+def megabytes(aimodelc):  # an .aimodelc is a directory: sum its files
+    return sum(f.stat().st_size for f in Path(aimodelc).rglob("*") if f.is_file()) / 1e6
+```
 
 ______________________________________________________________________
 
