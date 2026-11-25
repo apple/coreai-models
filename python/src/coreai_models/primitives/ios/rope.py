@@ -28,6 +28,16 @@ def rotate_half(x: torch.Tensor, dim: int = -1, ndim: int = 1) -> torch.Tensor:
 def rope_gather_cached_cos_sin(
     position_ids: torch.Tensor, cos_cached: torch.Tensor, sin_cached: torch.Tensor
 ) -> list[torch.Tensor]:
+    """Gather cached cos/sin rows by position; lowers to the ``rope_cached_cos_sin_gather``
+    composite.
+
+    All lookups in a graph must be identical (same operand, same tables), and the operand must
+    be a graph input passed straight through. Lookups that differ (a second position input, or
+    a second table) or a sliced or computed operand crash delegate specialization (#280), so
+    multi-position (M-RoPE) models cannot gather a row per axis in the graph. Such models
+    compute cos/sin on the host (``rope_cos_sin``) and take them as ``rope_cos``/``rope_sin``
+    graph inputs, as the Gemma 4 iOS graphs do.
+    """
     position_ids = position_ids.to(torch.int32)
     rope_cos = cos_cached[position_ids]
     rope_sin = sin_cached[position_ids]
@@ -189,5 +199,6 @@ class RoPECache(torch.nn.Module):
             self.sin_cached = torch.nn.Buffer(torch.sin(emb).to(dtype=dtype), persistent=False)
 
     def gather_cos_sin(self, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Gather the cached cos/sin values using the position_ids"""
+        """Gather the cached cos/sin values using the position_ids, which must be a graph input;
+        see ``rope_gather_cached_cos_sin``."""
         return rope_gather_cached_cos_sin(position_ids, self.cos_cached, self.sin_cached)
