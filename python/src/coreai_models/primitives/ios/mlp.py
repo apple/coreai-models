@@ -32,13 +32,14 @@ class MLP(nn.Module):
         self.down_proj = nn.Conv2d(hidden_dim, dim, kernel_size=1, bias=bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        batch_size, query_len, _, dim = x.shape
-
-        # Conv2d expects NCHW format. Fuse batch and seq_len dimensions.
-        x = x.reshape(batch_size * query_len, dim, 1, 1)
+        # Input: (batch, query_len, 1, dim).  Transpose to NCHW with tokens on
+        # the width axis—the same layout the attention path uses—so the Neural
+        # Engine can process all tokens in one dispatch instead of iterating
+        # over the batch dimension.
+        x = x.transpose(-3, -1)  # (batch, dim, 1, query_len)
 
         up_tensor = self.up_proj(x)
         gate_tensor = nn.functional.silu(self.gate_proj(x))
         down_tensor = self.down_proj(up_tensor * gate_tensor)
 
-        return down_tensor.reshape(batch_size, query_len, 1, dim)
+        return down_tensor.transpose(-3, -1)  # (batch, query_len, 1, dim)
