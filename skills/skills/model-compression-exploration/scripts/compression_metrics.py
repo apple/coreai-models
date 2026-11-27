@@ -16,6 +16,41 @@ from dataclasses import dataclass
 from typing import Optional
 
 import torch
+from torch import nn
+
+# Module types coreai-opt actually compresses. Anything else (norms,
+# activations, custom modules) is never palettized or block-quantized, so
+# an indivisible dim there cannot cause a silently skipped layer.
+_COMPRESSIBLE_TYPES = (
+    nn.Linear,
+    nn.Conv1d,
+    nn.Conv2d,
+    nn.Conv3d,
+    nn.ConvTranspose1d,
+    nn.ConvTranspose2d,
+    nn.ConvTranspose3d,
+    nn.Embedding,
+)
+
+_CONV_TRANSPOSE_TYPES = (
+    nn.ConvTranspose1d,
+    nn.ConvTranspose2d,
+    nn.ConvTranspose3d,
+)
+
+
+def _resolve_axis(module: nn.Module, axis: Optional[int]) -> int:
+    """Return the weight-tensor dim a config's axis selects for module.
+
+    Mirrors coreai-opt's PerGroupedChannelGranularity: an explicit integer
+    axis is a raw weight-tensor dim and is used as-is for every module
+    type. Only axis=None is resolved per op, to its default output-channel
+    dim: 0 for Linear/Conv/Embedding, 1 for ConvTranspose, whose weight is
+    stored as (in_channels, out_channels, *kernel).
+    """
+    if axis is not None:
+        return axis
+    return 1 if isinstance(module, _CONV_TRANSPOSE_TYPES) else 0
 
 
 @dataclass(frozen=True)
@@ -57,22 +92,39 @@ def fp16_baseline_mb(model) -> float:
     return (total * 2) / (1024 * 1024)
 
 
-def check_divisibility(model, axis: int, block_size: int) -> dict[str, tuple[int, int]]:
-    """Return layers whose weight.shape[axis] is not divisible by block_size.
+def check_divisibility(
+    model, axis: Optional[int], block_size: int
+) -> dict[str, tuple[int, int]]:
+    """Return compressible layers whose resolved dim is not divisible.
 
     Per-block quantization and per-grouped-channel palettization silently
     skip these layers. Run this before applying such configs and override
     the offending layers via ``set_module_name``.
+
+    Only module types coreai-opt compresses (Linear, Conv*, ConvTranspose*,
+    Embedding) are checked — a norm's weight can never be silently skipped
+    because it is never compressed. Pass the config's axis unchanged: an
+    integer is a raw weight-tensor dim (so with the palettizer presets'
+    axis=0, group 8, ``ConvTranspose2d(12, 64, 3)`` is reported for 12 and
+    ``ConvTranspose2d(64, 12, 3)`` is not), while None uses each op's
+    default output-channel dim (1 for ConvTranspose, 0 otherwise).
 
     Returns:
         Dict mapping module_name -> (offending_dim, block_size).
     """
     incompatible: dict[str, tuple[int, int]] = {}
     for name, module in model.named_modules():
-        if hasattr(module, "weight") and module.weight is not None:
-            dim = module.weight.shape[axis]
-            if dim % block_size != 0:
-                incompatible[name] = (dim, block_size)
+        if not isinstance(module, _COMPRESSIBLE_TYPES):
+            continue
+        weight = getattr(module, "weight", None)
+        if not isinstance(weight, torch.Tensor):
+            continue
+        resolved = _resolve_axis(module, axis)
+        if resolved >= weight.ndim or resolved < -weight.ndim:
+            continue
+        dim = weight.shape[resolved]
+        if dim % block_size != 0:
+            incompatible[name] = (dim, block_size)
     return incompatible
 
 
