@@ -16,6 +16,12 @@ component, or ``component_configs`` keyed by diffusers component name (e.g.
 ``transformer``, ``text_encoder``); unlisted components stay dense. An optional
 ``component_precision`` overrides the export's compute precision per component.
 
+Neural Engine presets (Sana Sprint with ``--platform iOS``) instead hold
+``component_palettization``: coreai-opt ``kmeans_palettization_config`` dicts keyed by
+component name, applied to the re-authored float32 module before it is cast to float16.
+An optional ``component_quantization`` holds coreai-opt ``quantization_config`` dicts keyed
+the same way, applied before palettization to weights k-means skips (embeddings).
+
 Usage::
 
     from coreai_models.diffusion.presets import get_preset, list_presets
@@ -90,6 +96,72 @@ def _weight_only(weight_spec: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _palette_gs16(n_bits: int) -> dict[str, Any]:
+    """k-means palettization with one lookup table per 16 output channels.
+
+    The Neural Engine runs palettized weights natively; unlike int4 per-block, it keeps the graph
+    on the Neural Engine.
+    """
+    granularity = {"type": "per_grouped_channel", "axis": 0, "group_size": 16}
+    return {
+        "global_config": {
+            "op_state_spec": {"weight": {"n_bits": n_bits, "granularity": granularity}}
+        }
+    }
+
+
+_PALETTE_6BIT_GS16 = _palette_gs16(6)
+_PALETTE_4BIT_GS16 = _palette_gs16(4)
+
+# 8-bit k-means, one lookup table per tensor, for the Neural Engine transformer (SanaTransformer).
+# Its timestep/guidance conditioning (float32), caption projection and I/O projections stay
+# dense: they modulate or feed every block. The depthwise convs are tiny.
+_TRANSFORMER_PALETTE_8BIT = {
+    "global_config": {
+        "op_state_spec": {"weight": {"n_bits": 8, "granularity": {"type": "per_tensor"}}}
+    },
+    "module_name_configs": {
+        r"(time_embedder|guidance_embedder)\..*": None,
+        "time_linear": None,
+        "caption_linear_[12]": None,
+        "patch_embed": None,
+        "proj_out": None,
+        r"blocks\.\d+\.ff\.conv_depth": None,
+    },
+}
+
+# int8 with one scale per vocabulary row, for the Neural Engine text encoder's token table. The
+# lookup runs on the GPU (the Neural Engine takes no int32 ids) and k-means skips embeddings.
+_TOKEN_TABLE_INT8 = {
+    "execution_mode": "eager",
+    "global_config": None,
+    "module_name_configs": {
+        "embed_tokens": {
+            "op_state_spec": {
+                "weight": {**_INT8_PER_CHANNEL, "granularity": {"type": "per_channel", "axis": 0}}
+            },
+            **_WEIGHT_ONLY,
+        }
+    },
+}
+
+# int4 in blocks of 32 along the embedding dim, as the GPU text encoder's table: one scale per
+# 2304-wide row leaves too few of int4's 16 levels for most values.
+_TOKEN_TABLE_INT4 = {
+    **_TOKEN_TABLE_INT8,
+    "module_name_configs": {
+        "embed_tokens": {
+            "op_state_spec": {
+                "weight": {
+                    **_INT4_PER_BLOCK32_ASYM,
+                    "granularity": {**_INT4_PER_BLOCK32_ASYM["granularity"], "axis": 1},
+                }
+            },
+            **_WEIGHT_ONLY,
+        }
+    },
+}
+
 PRESETS: dict[str, dict[str, Any]] = {
     "none": {
         "description": "Full precision (no quantization)",
@@ -118,6 +190,33 @@ PRESETS: dict[str, dict[str, Any]] = {
         # Int scales take the weight dtype, and the Core AI GPU int4 dequant kernel rejects
         # bf16 ones. Sana's Gemma2 peaks at ~6% of the fp16 range, so fp16 is safe there.
         "component_precision": {"text_encoder": "float16"},
+    },
+    # Sana Sprint's text encoder for the Neural Engine; k-means skips the token table, which stays
+    # float16.
+    "te6bit-pal": {
+        "description": "Neural Engine: 6-bit palettized text encoder (k-means, group size 16)",
+        "component_palettization": {"text_encoder": _PALETTE_6BIT_GS16},
+    },
+    # The Sana Sprint --platform iOS default.
+    "te6bit-tok8-tx8bit-pal": {
+        "description": "Neural Engine: 6-bit text encoder (k-means, group size 16) with an int8 "
+        "token table, 8-bit transformer (k-means, per tensor)",
+        "component_quantization": {"text_encoder": _TOKEN_TABLE_INT8},
+        "component_palettization": {
+            "text_encoder": _PALETTE_6BIT_GS16,
+            "transformer": _TRANSFORMER_PALETTE_8BIT,
+        },
+    },
+    # The text encoder at the GPU bundle's bit width: smaller and faster than te6bit-tok8, but it
+    # shifts compositions, so it is opt-in.
+    "te4bit-tok4-tx8bit-pal": {
+        "description": "Neural Engine: 4-bit text encoder (k-means, group size 16) with an int4 "
+        "token table (per block of 32), 8-bit transformer (k-means, per tensor)",
+        "component_quantization": {"text_encoder": _TOKEN_TABLE_INT4},
+        "component_palettization": {
+            "text_encoder": _PALETTE_4BIT_GS16,
+            "transformer": _TRANSFORMER_PALETTE_8BIT,
+        },
     },
 }
 

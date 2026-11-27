@@ -214,6 +214,25 @@ def test_detector_ignores_padded_text_slots(detector, config):
     assert (logits_clean - logits_noisy).abs().max() > 1e-2
 
 
+def test_detect_graph_has_no_trig(detector, config):
+    """One ``sin``/``cos`` anywhere in ``detect`` splits it into Neural Engine -> GPU -> Neural
+    Engine on the M2 Neural Engine, which aborts at runtime. Export ``detect`` the way the lite
+    pipeline does (export, then the Core AI decompositions) and check the whole graph, not just
+    the box encoding."""
+    import coreai_torch
+
+    from .test_sam3_trig import trig_targets
+
+    args = (
+        torch.randn(1, config.vision_config.backbone_config.hidden_size, 1, _GRID * _GRID),
+        torch.randn(1, _C, 1, _SEQ),
+        _mask().float().reshape(1, 1, 1, _SEQ),
+    )
+    exported = torch.export.export(detector, args=args)
+    assert not trig_targets(exported)
+    assert not trig_targets(exported.run_decompositions(coreai_torch.get_decomp_table()))
+
+
 @torch.no_grad()
 def test_detector_masks_padding_in_fp16(detector, config):
     """``detect`` ships fp16: the ``-40000`` bias must stay finite and still zero out padding."""

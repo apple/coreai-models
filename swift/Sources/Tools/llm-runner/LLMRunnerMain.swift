@@ -166,7 +166,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     @Flag(
         name: .customLong("speculative"),
         help:
-            "Self-speculative decoding with the bundle's draft head (the 'drafter' component of metadata.json, added by models/gemma4/export_drafter.py --bundle). The head drafts from the target's hidden states and shared K/V, so --model must be exported with --emit-hidden-states. Greedy only; combines with --prompt-lookup and --json-schema."
+            "Self-speculative decoding with the bundle's draft head (the 'drafter' component of metadata.json, added by models/gemma4/export_drafter.py --bundle). The head drafts from the target's hidden states and shared K/V, so --model must be exported with --emit-hidden-states. Combines with --prompt-lookup and, under greedy decoding, --json-schema."
     )
     var speculative: Bool = false
 
@@ -214,6 +214,13 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     )
     var stopTokens: [String] = []
 
+    @Flag(
+        name: .customLong("ignore-eos"),
+        help:
+            "Disable all stop sequences (incl. EOS / end-of-turn) so generation always runs the full --max-tokens. For benchmarking decode throughput."
+    )
+    var ignoreEos: Bool = false
+
     @Option(help: "Save logits to JSON file (path to output file)")
     var saveLogits: String?
 
@@ -256,6 +263,8 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             "Query length bucket granularity for CoreAI (0 to disable, default: 64)", visibility: .hidden)
     )
     var bucketSize: Int?
+
+    @OptionGroup var prefixCache: PrefixCacheOptions
 
     @Option(
         name: .customLong("chunk-size"),
@@ -368,7 +377,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     @Flag(
         name: .customLong("prompt-lookup"),
         help:
-            "Speculative decoding from the running context: a block whose recent tokens recur earlier proposes what followed. Alone it needs no draft model; with --draft-model, a recurring block is proposed from the context and any other from the draft model. Greedy only."
+            "Speculative decoding from the running context: a block whose recent tokens recur earlier proposes what followed. Alone it needs no draft model; with --draft-model, a recurring block is proposed from the context and any other from the draft model."
     )
     var promptLookup: Bool = false
 
@@ -382,6 +391,12 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     @OptionGroup var memoryOptions: MemoryOptions
 
     func validate() throws {
+        try prefixCache.validate(defaultMB: 0)
+        if promptList != nil, !prefixCache.givenFlags.isEmpty {
+            // --prompt-list batches on the sequential engine, which keeps no prefix cache.
+            throw ValidationError(
+                "\(prefixCache.givenFlags.joined(separator: " and ")) can't be used with --prompt-list")
+        }
         if let n = concurrentRequests {
             if n < 1 { throw ValidationError("--concurrent-requests must be >= 1") }
             if promptList == nil { throw ValidationError("--concurrent-requests applies to --prompt-list") }
@@ -446,6 +461,27 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         if repetitionPenaltyWindow != nil && repetitionPenalty == nil {
             throw ValidationError("--repetition-penalty-window requires --repetition-penalty")
         }
+        if ignoreEos {
+            // --ignore-eos only reaches plain text generation; every other path keeps its stops.
+            let conflicting = [
+                jsonSchema != nil ? "--json-schema" : nil,
+                imagePath != nil ? "--image" : nil,
+                videoPath != nil ? "--video" : nil,
+                promptList != nil ? "--prompt-list" : nil,
+                batchPrototypeRows != nil ? "--batch-prototype" : nil,
+                draftModel != nil ? "--draft-model" : nil,
+                promptLookup ? "--prompt-lookup" : nil,
+                speculative ? "--speculative" : nil,
+                continuation != nil ? "--continuation" : nil,
+                rawContinuation != nil ? "--raw-continuation" : nil,
+                stopTokens.isEmpty ? nil : "--stop-tokens",
+            ].compactMap { $0 }
+            if !conflicting.isEmpty {
+                throw ValidationError(
+                    "--ignore-eos applies to plain text generation only; it cannot be used with "
+                        + conflicting.joined(separator: ", "))
+            }
+        }
         if repetitionPenalty != nil && jsonSchema != nil {
             throw ValidationError(
                 "--repetition-penalty cannot be used with --json-schema"
@@ -475,7 +511,8 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         }
         let speculating = draftModel != nil || promptLookup || speculative
         if seed != nil && !speculating {
-            throw ValidationError("--seed applies to speculative decoding (--draft-model or --prompt-lookup)")
+            throw ValidationError(
+                "--seed applies to speculative decoding (--draft-model, --prompt-lookup or --speculative)")
         }
         if let problem = SpeculativeDecodingOptions.grammarProposalProblem(
             grammarProposalMax, speculating: speculating, hasSchema: jsonSchema != nil)
@@ -493,9 +530,8 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
                 throw ValidationError(problem)
             }
             let greedy = samplingStrategy.lowercased() == "greedy" || temperature == 0
-            if let problem = SpeculativeDecodingOptions.samplingProblem(
-                greedy: greedy, promptLookup: promptLookup, draftHead: speculative)
-                ?? SpeculativeDecodingOptions.grammarSamplingProblem(greedy: greedy, hasSchema: jsonSchema != nil)
+            if let problem = SpeculativeDecodingOptions.grammarSamplingProblem(
+                greedy: greedy, hasSchema: jsonSchema != nil)
                 ?? SpeculativeDecodingOptions.imageProblem(hasImage: imagePath != nil, hasRawTokens: rawTokens != nil)
             {
                 throw ValidationError(problem)
@@ -633,8 +669,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         // decoding stops at those that are one token; see `SpeculativeDecodingOptions.stopTokenIds`.
         let stopSequences = try validateAndEncodeStopTokens(
             stopTokens: stopTokens, tokenizer: tokenizer,
-            additionalEosTokenIds: RunnerPrompting.additionalStopTokenIds(
-                tokenizerDirectory: targetBundle.tokenizerPath, tokenizer: tokenizer))
+            additionalEosTokenIds: RunnerPrompting.additionalStopTokenIds(bundle: targetBundle, tokenizer: tokenizer))
         let stops = SpeculativeDecodingOptions.stopTokenIds(stopSequences)
         if let warning = SpeculativeDecodingOptions.multiTokenStopWarning(
             stops.ignored.map { tokenizer.decode(tokens: $0.map(Int.init)) })
@@ -702,20 +737,21 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         let useGreedy = samplingStrategy.lowercased() == "greedy" || temperature == 0
 
         // The speculative path samples with temperature only (or takes the argmax).
-        let ignoredOptions = [
-            topK != nil ? "--top-k" : nil,
-            topP != nil ? "--top-p" : nil,
-            minP != nil ? "--min-p" : nil,
-            repetitionPenalty != nil ? "--repetition-penalty" : nil,
-            repetitionPenaltyWindow != nil ? "--repetition-penalty-window" : nil,
-            synchronousSampling ? "--synchronous-sampling" : nil,
-            saveLogits != nil ? "--save-logits" : nil,
-            printLogits ? "--print-logits" : nil,
-            bucketSize != nil ? "--bucket-size" : nil,
-            chunkSize != nil ? "--chunk-size" : nil,
-            chunkThreshold != nil ? "--chunk-threshold" : nil,
-            imageStrategy != nil ? "--image-strategy" : nil,
-        ].compactMap { $0 }
+        let ignoredOptions =
+            [
+                topK != nil ? "--top-k" : nil,
+                topP != nil ? "--top-p" : nil,
+                minP != nil ? "--min-p" : nil,
+                repetitionPenalty != nil ? "--repetition-penalty" : nil,
+                repetitionPenaltyWindow != nil ? "--repetition-penalty-window" : nil,
+                synchronousSampling ? "--synchronous-sampling" : nil,
+                saveLogits != nil ? "--save-logits" : nil,
+                printLogits ? "--print-logits" : nil,
+                bucketSize != nil ? "--bucket-size" : nil,
+                chunkSize != nil ? "--chunk-size" : nil,
+                chunkThreshold != nil ? "--chunk-threshold" : nil,
+                imageStrategy != nil ? "--image-strategy" : nil,
+            ].compactMap { $0 } + prefixCache.givenFlags
         if let warning = SpeculativeDecodingOptions.ignoredWarning(ignored: ignoredOptions) {
             print(warning)
         }
@@ -1015,7 +1051,11 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             kvCacheSize: kvCacheInitialCapacity,
             prefillChunkSize: resolvedChunkSize,
             prefillChunkThreshold: resolvedChunkThreshold,
-            tensorData: bundle.tensorData
+            tensorData: bundle.tensorData,
+            prefixCacheBytes: prefixCache.memoryBytes(defaultMB: 0),
+            prefixCacheDiskBytes: prefixCache.diskBytes,
+            prefixCacheDirectory: prefixCache.diskBytes > 0
+                ? EngineOptions.defaultPrefixCacheDirectory(forModelAt: bundle.bundlePath) : nil
         )
 
         measurement?.begin("prepare")
@@ -1036,10 +1076,9 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             "Tokenizer loaded from \(bundle.hasEmbeddedTokenizer ? "embedded bundle" : "HuggingFace")",
             component: "Main")
 
-        // Read additional stop token IDs from tokenizer_config.json (e.g. <end_of_turn> for Gemma)
-        // and, for agentic models, the end-of-turn token.
-        let additionalEosTokenIds = RunnerPrompting.additionalStopTokenIds(
-            tokenizerDirectory: bundle.tokenizerPath, tokenizer: tokenizer)
+        // Additional stop token IDs: from tokenizer_config.json (e.g. <end_of_turn> for Gemma), the
+        // bundle's eos_token_ids, and, for agentic models, the end-of-turn token.
+        let additionalEosTokenIds = RunnerPrompting.additionalStopTokenIds(bundle: bundle, tokenizer: tokenizer)
         if !additionalEosTokenIds.isEmpty {
             CLILogger.log(
                 "Found \(additionalEosTokenIds.count) additional stop token(s): \(additionalEosTokenIds.sorted())",
@@ -1052,6 +1091,9 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
 
         // Validate that the sampling strategy is supported by this engine
         try inferenceEngine.validateSamplingStrategy(samplingConfiguration)
+        if let warning = prefixCache.ignoredWarning(cacheEnabled: inferenceEngine.prefixCacheEnabled) {
+            print(warning)
+        }
 
         // Warmup: trigger kernel compilation before first inference
         if warmup != .off { measurement?.begin("warmup") }
@@ -1277,11 +1319,14 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             let decodingID = InstrumentsProfiler.beginDecoding(strategy: "vanilla")
 
             // Encode stop tokens to sequences
-            let stopSequences = try validateAndEncodeStopTokens(
-                stopTokens: stopTokens,
-                tokenizer: tokenizer,
-                additionalEosTokenIds: additionalEosTokenIds
-            )
+            let stopSequences =
+                ignoreEos
+                ? StopSequences(sequences: [])
+                : try validateAndEncodeStopTokens(
+                    stopTokens: stopTokens,
+                    tokenizer: tokenizer,
+                    additionalEosTokenIds: additionalEosTokenIds
+                )
 
             // Check if logits are requested
             let needsLogits = saveLogits != nil || printLogits
@@ -1316,6 +1361,10 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
 
             // End overall timing now that core inference is complete
             await PerformanceMetrics.shared.endOverallTiming()
+
+            // A reply that ends at a stop sequence leaves the engine's generation task winding down.
+            // Wait for it, so it does not release the model while the process exits (#535).
+            try? await inferenceEngine.cancel()
 
             // Extract only the generated part (remove prompt from output)
             let formattedPrompt = tokenizer.decode(tokens: promptTokens)

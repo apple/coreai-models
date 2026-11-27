@@ -39,6 +39,7 @@ from coreai_models.diffusion.pipeline import (
     _resolve_component_precision,
     _resolve_compression,
     _uses_int4,
+    resolve_palettization,
 )
 from coreai_models.diffusion.presets import _EMBEDDING_SUBCLASSES, _MODULE_TYPE_EXCLUSIONS, PRESETS
 from coreai_models.export.compression import quantize_pytorch_model
@@ -186,9 +187,156 @@ def test_presets_satisfy_the_coreai_opt_schema(label: str, config: dict) -> None
 
 
 def test_every_preset_has_exactly_one_config_shape() -> None:
-    """``config`` and ``component_configs`` are alternatives; the resolver reads only one."""
+    """``config``, ``component_configs`` and ``component_palettization`` are alternatives."""
+    shapes = ("config", "component_configs", "component_palettization")
     for name, preset in PRESETS.items():
-        assert ("config" in preset) != ("component_configs" in preset), name
+        assert sum(shape in preset for shape in shapes) == 1, name
+
+
+def test_neural_engine_quantization_only_accompanies_palettization() -> None:
+    """The GPU export rejects palettization presets, so it never sees this key."""
+    for name, preset in PRESETS.items():
+        if "component_quantization" in preset:
+            assert "component_palettization" in preset, name
+
+
+_PALETTIZATION_PRESETS = [n for n, p in PRESETS.items() if "component_palettization" in p]
+
+
+@pytest.mark.parametrize("name", _PALETTIZATION_PRESETS)
+def test_palettization_presets_satisfy_the_coreai_opt_schema(name: str) -> None:
+    from coreai_opt.palettization import KMeansPalettizerConfig
+
+    for config in PRESETS[name]["component_palettization"].values():
+        KMeansPalettizerConfig.from_dict({"kmeans_palettization_config": copy.deepcopy(config)})
+
+
+@pytest.mark.parametrize("name", [n for n, p in PRESETS.items() if "component_quantization" in p])
+def test_neural_engine_quantization_satisfies_the_coreai_opt_schema(name: str) -> None:
+    for config in PRESETS[name]["component_quantization"].values():
+        QuantizerConfig.from_dict({"quantization_config": copy.deepcopy(config)})
+
+
+def test_palettization_presets_are_neural_engine_only() -> None:
+    """The GPU export would otherwise drop the palettization and export dense."""
+    with pytest.raises(ValueError, match="--platform iOS"):
+        resolve_palettization("te6bit-pal", neural_engine=False)
+    assert set(resolve_palettization("te6bit-pal", neural_engine=True)) == {"text_encoder"}
+
+
+@pytest.mark.parametrize("compression", ["8bit", "t8bit-te4bit-asym"])
+def test_neural_engine_export_rejects_quantization_presets(compression: str) -> None:
+    with pytest.raises(ValueError, match="palettization preset"):
+        resolve_palettization(compression, neural_engine=True)
+
+
+def test_neural_engine_export_accepts_none() -> None:
+    assert resolve_palettization("none", neural_engine=True) == {}
+
+
+def _dry_run(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], *argv: str
+) -> str:
+    from coreai_models.diffusion import export
+
+    monkeypatch.setattr("sys.argv", ["export", *argv, "--dry-run"])
+    export.main()
+    return capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "model", ["sana-sprint-0.6b", "Efficient-Large-Model/Sana_Sprint_0.6B_1024px_diffusers"]
+)
+def test_sana_platform_ios_selects_the_neural_engine_build(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], model: str
+) -> None:
+    out = _dry_run(monkeypatch, capsys, model, "--platform", "iOS")
+    assert "neural_engine:     True" in out
+    assert "te6bit-tok8-tx8bit-pal" in out
+
+
+def test_sana_without_a_platform_is_the_gpu_build(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out = _dry_run(monkeypatch, capsys, "sana-sprint-0.6b")
+    assert "neural_engine:     False" in out
+    assert "t8bit-te4bit-asym" in out
+
+
+def test_sana_platform_combines_with_components(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out = _dry_run(
+        monkeypatch, capsys, "sana-sprint-0.6b", "--platform", "iOS", "--components", "transformer"
+    )
+    assert "neural_engine:     True" in out
+    assert "components:         transformer" in out
+
+
+def test_sana_platform_ios_takes_only_float16(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from coreai_models.diffusion import export
+
+    out = _dry_run(
+        monkeypatch,
+        capsys,
+        "sana-sprint-0.6b",
+        "--platform",
+        "iOS",
+        "--compute-precision",
+        "float16",
+    )
+    assert "neural_engine:     True" in out
+    argv = ["export", "sana-sprint-0.6b", "--platform", "iOS", "--compute-precision", "bfloat16"]
+    monkeypatch.setattr("sys.argv", [*argv, "--dry-run"])
+    with pytest.raises(SystemExit):
+        export.main()
+    assert "--platform iOS build is float16" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "argv,error",
+    [
+        (["--platform", "iOS", "--compression", "8bit"], "palettization preset"),
+        (["--compression", "te6bit-pal"], "use it with Sana Sprint and --platform iOS"),
+        (["--platform", "iOS", "--resolution", "512"], "--resolution does not apply"),
+        (["--platform", "iOS", "--low-memory"], "--low-memory does not apply"),
+    ],
+)
+def test_sana_dry_run_refuses_what_the_export_would(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    argv: list[str],
+    error: str,
+) -> None:
+    from coreai_models.diffusion import export
+
+    monkeypatch.setattr("sys.argv", ["export", "sana-sprint-0.6b", *argv, "--dry-run"])
+    with pytest.raises(SystemExit):
+        export.main()
+    assert error in capsys.readouterr().err
+
+
+def test_flux2_platform_ios_stays_on_the_gpu(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out = _dry_run(monkeypatch, capsys, "flux2-klein-4b", "--platform", "iOS")
+    assert "neural_engine:     False" in out
+    assert "compression:        4bit" in out
+    assert "transformer_512" in out
+
+
+def test_flux2_still_rejects_platform_with_components(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from coreai_models.diffusion import export
+
+    argv = ["export", "flux2-klein-4b", "--platform", "iOS", "--components", "transformer"]
+    monkeypatch.setattr("sys.argv", [*argv, "--dry-run"])
+    with pytest.raises(SystemExit):
+        export.main()
+    assert "Cannot specify both --components and --platform" in capsys.readouterr().err
 
 
 def test_int_scales_take_the_dtype_the_weights_are_quantized_in() -> None:

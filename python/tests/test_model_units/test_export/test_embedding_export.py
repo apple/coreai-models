@@ -33,12 +33,8 @@ from coreai_models.embedding.embedding_gemma2 import (
     ios,
     macos,
 )
-from coreai_models.embedding.embedding_gemma2.common import (
-    FunctionSpec,
-    bucket_plan,
-    encoder_functions,
-    text_functions,
-)
+from coreai_models.embedding.embedding_gemma2.common import encoder_functions, text_functions
+from coreai_models.embedding.export_utils import FunctionSpec, bucket_plan
 from tests.test_model_units.test_export._embedding_host import (
     asset_signatures,
     run_function,

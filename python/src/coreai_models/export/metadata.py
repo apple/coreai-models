@@ -251,6 +251,17 @@ _METADATA: dict[str, AIModelMetadataFields] = {
             "text decoder. Source: https://huggingface.co/google/gemma-4-E4B-it"
         ),
     ),
+    "google/gemma-4-E2B-it-qat-mobile-transformers": AIModelMetadataFields(
+        author="Google DeepMind",
+        license="Apache-2.0",
+        model_description=(
+            "Gemma 4 E2B IT QAT is a ~5B-parameter instruction-tuned on-device model from "
+            "Google's Gemma 4 family using Per-Layer Embeddings, trained with quantization-aware "
+            "training; this export targets the text decoder and keeps the checkpoint's own "
+            "quantized weights. "
+            "Source: https://huggingface.co/google/gemma-4-E2B-it-qat-mobile-transformers"
+        ),
+    ),
     "mistralai/Mistral-7B-Instruct-v0.3": AIModelMetadataFields(
         author="Mistral AI",
         license="Apache-2.0",
@@ -294,6 +305,26 @@ _METADATA: dict[str, AIModelMetadataFields] = {
             "SmolLM2-135M-Instruct is a 135M-parameter instruction-tuned causal "
             "language model from HuggingFace. "
             "Source: https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct"
+        ),
+    ),
+    "HuggingFaceTB/SmolLM3-3B": AIModelMetadataFields(
+        author="HuggingFace",
+        license="Apache-2.0",
+        model_description=(
+            "SmolLM3-3B is a 3B-parameter instruction-tuned causal language model "
+            "from HuggingFace, featuring hybrid NoPE/RoPE attention and "
+            "long-context support. "
+            "Source: https://huggingface.co/HuggingFaceTB/SmolLM3-3B"
+        ),
+    ),
+    "HuggingFaceTB/SmolLM3-3B-Base": AIModelMetadataFields(
+        author="HuggingFace",
+        license="Apache-2.0",
+        model_description=(
+            "SmolLM3-3B-Base is a 3B-parameter base causal language model from "
+            "HuggingFace, featuring hybrid NoPE/RoPE attention and long-context "
+            "support. "
+            "Source: https://huggingface.co/HuggingFaceTB/SmolLM3-3B-Base"
         ),
     ),
     "openai/gpt-oss-20b": AIModelMetadataFields(
@@ -409,6 +440,15 @@ _METADATA: dict[str, AIModelMetadataFields] = {
             "producing 768-d L2-normalized vectors (Matryoshka prefixes 512/256/128) for text "
             "and images in one space. "
             "Source: https://huggingface.co/google/embeddinggemma-2"
+        ),
+    ),
+    "Qwen/Qwen3-Embedding-0.6B": AIModelMetadataFields(
+        author="Qwen Team",
+        license="Apache-2.0",
+        model_description=(
+            "Qwen3-Embedding-0.6B is a multilingual text embedding model from the Qwen3 family "
+            "producing 1024-d L2-normalized vectors (Matryoshka prefixes down to 32) from the "
+            "last token. Source: https://huggingface.co/Qwen/Qwen3-Embedding-0.6B"
         ),
     ),
 }

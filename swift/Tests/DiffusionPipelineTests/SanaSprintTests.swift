@@ -122,8 +122,34 @@ struct SanaSprintTests {
         #expect(descriptor.promptPrefix == "Prefix:\nUser Prompt: ")
         #expect(descriptor.textInputLength == 506)
         #expect(descriptor.textSequenceLength == 300)
+        #expect(descriptor.computeUnits == nil)
         #expect(bundle.transformerFilename == "Transformer.aimodel")
         #expect(bundle.textEncoderFilename == "TextEncoder.aimodel")
         #expect(bundle.vaeDecoderFilename == "VAEDecoder.aimodel")
+    }
+
+    @Test("Decodes per-component compute units of a Neural Engine bundle")
+    func decodesComputeUnits() throws {
+        let json = """
+            {"type": "sana-sprint", "compute_units": {"transformer": ["neural_engine"], "vae_decoder": ["neural_engine"]}}
+            """
+        let config = try JSONDecoder().decode(DiffusionConfig.self, from: Data(json.utf8))
+        #expect(config.computeUnits?[DiffusionComponentKey.transformer] == ["neural_engine"])
+        #expect(config.computeUnits?[DiffusionComponentKey.vaeDecoder] == ["neural_engine"])
+        #expect(config.computeUnits?[DiffusionComponentKey.textEncoder] == nil)
+    }
+
+    @Test("Maps each component's compute units to the unit it loads on")
+    func mapsComputeUnits() throws {
+        let config = DiffusionConfig(
+            type: .sanaSprint,
+            computeUnits: ["transformer": ["neural_engine"], "text_encoder": ["gpu"], "vae_decoder": ["cpu"]])
+        #expect(try config.computeUnit(for: DiffusionComponentKey.transformer) == .neuralEngine)
+        #expect(try config.computeUnit(for: DiffusionComponentKey.textEncoder) == .gpu)
+        #expect(try DiffusionConfig(type: .sanaSprint).computeUnit(for: "transformer") == .gpu)
+        #expect(try config.computeUnit(for: DiffusionComponentKey.vaeEncoder) == .gpu)
+        #expect(throws: PipelineLoadError.self) {
+            try config.computeUnit(for: DiffusionComponentKey.vaeDecoder)
+        }
     }
 }

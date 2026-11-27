@@ -6,8 +6,8 @@ NVIDIA's Sana Sprint few-step text-to-image model for on-device image generation
 
 | Model            | Parameters                    | Resolution | Steps | macOS | iOS |
 | ---------------- | ----------------------------- | ---------- | ----- | ----- | --- |
-| Sana Sprint 0.6B | 0.6B DiT + 2.6B Gemma-2 + VAE | 1024x1024  | 1-4   | Yes   | No  |
-| Sana Sprint 1.6B | 1.6B DiT + 2.6B Gemma-2 + VAE | 1024x1024  | 1-4   | Yes   | No  |
+| Sana Sprint 0.6B | 0.6B DiT + 2.6B Gemma-2 + VAE | 1024x1024  | 1-4   | Yes   | Yes |
+| Sana Sprint 1.6B | 1.6B DiT + 2.6B Gemma-2 + VAE | 1024x1024  | 1-4   | Yes   | Yes |
 
 ## Setup
 
@@ -22,10 +22,13 @@ brew install uv
 ```bash
 uv run coreai.diffusion.export sana-sprint-0.6b
 uv run coreai.diffusion.export sana-sprint-1.6b
+uv run coreai.diffusion.export sana-sprint-0.6b --platform iOS # Neural Engine
+uv run coreai.diffusion.export sana-sprint-1.6b --platform iOS # Neural Engine
 ```
 
 These load `Efficient-Large-Model/Sana_Sprint_{0.6B,1.6B}_1024px_diffusers` with diffusers'
-`SanaSprintPipeline` and export in `bfloat16` with the `t8bit-te4bit-asym` compression preset:
+`SanaSprintPipeline`. By default they export in `bfloat16` with the `t8bit-te4bit-asym` compression
+preset:
 
 - **Transformer:** INT8 per-channel weights. INT4 here visibly degrades fine detail and text rendering.
 - **Text encoder:** INT4 asymmetric per-block weights, exported in `float16`, since the Core AI GPU
@@ -38,18 +41,40 @@ For the full-precision `bfloat16` export, pass `--compression none`:
 uv run coreai.diffusion.export sana-sprint-1.6b --compression none
 ```
 
+`--platform iOS` instead exports a `float16` build re-authored for the Neural Engine to
+`exports/Sana_Sprint_<size>_1024px_diffusers-ios/`, with the `te6bit-tok8-tx8bit-pal` preset:
+
+- **Transformer:** 8-bit palettized block weights, one lookup table per tensor. The input, output and
+  caption projections stay dense, as does the timestep and guidance conditioning, which runs in
+  `float32`.
+- **Text encoder:** 6-bit palettized weights, one lookup table per 16 output channels, and an INT8
+  token table.
+- **VAE decoder:** not compressed.
+
+`--compression te4bit-tok4-tx8bit-pal` makes the text encoder 4-bit, smaller and faster at the
+cost of shifted compositions; `--compression none` exports the whole build dense. The GPU
+presets do not apply to this build.
+
+## Note on AOT Compilation
+
+Ahead-of-time compilation is not supported for this model. Please use on-device specialization from .aimodel directly.
+
 ## Components
 
-| Component      | Asset                 | Size (default)                | Size (`--compression none`)   | Description                                                   |
-| -------------- | --------------------- | ----------------------------- | ----------------------------- | ------------------------------------------------------------- |
-| `transformer`  | `Transformer.aimodel` | 570 MB (0.6B) / 1.5 GB (1.6B) | 1.1 GB (0.6B) / 3.0 GB (1.6B) | Linear-attention DiT (28 / 20 blocks) on a 32x32x32 latent    |
-| `text_encoder` | `TextEncoder.aimodel` | 1.4 GB                        | 4.9 GB                        | Gemma-2-2B; returns the 300 tokens the transformer attends to |
-| `vae_decoder`  | `VAEDecoder.aimodel`  | 304 MB                        | 304 MB                        | DC-AE, 32x32 latent to 1024x1024 image                        |
+| Component      | Asset                 | Size (default)                | Size (`--compression none`)   | Size (`--platform iOS`)       | Description                                                   |
+| -------------- | --------------------- | ----------------------------- | ----------------------------- | ----------------------------- | ------------------------------------------------------------- |
+| `transformer`  | `Transformer.aimodel` | 570 MB (0.6B) / 1.5 GB (1.6B) | 1.1 GB (0.6B) / 3.0 GB (1.6B) | 605 MB (0.6B) / 1.6 GB (1.6B) | Linear-attention DiT (28 / 20 blocks) on a 32x32x32 latent    |
+| `text_encoder` | `TextEncoder.aimodel` | 1.4 GB                        | 4.9 GB                        | 2.0 GB                        | Gemma-2-2B; returns the 300 tokens the transformer attends to |
+| `vae_decoder`  | `VAEDecoder.aimodel`  | 304 MB                        | 304 MB                        | 466 MB                        | DC-AE, 32x32 latent to 1024x1024 image                        |
+
+The Neural Engine VAE decoder is larger because its upsampling convolutions are merged into
+4x4 transposed convolutions and its grouped 1x1 convolutions are stored dense.
 
 Both variants share the text encoder, VAE, tokenizer, and sampler settings; only the transformer differs.
 
 The bundle also has `tokenizer/` and `metadata.json`. The metadata carries the instruction prefix that
-diffusers prepends to every prompt, and the timestep schedule.
+diffusers prepends to every prompt, the timestep schedule, and the compute unit each asset was
+exported for, so the same code below loads a `--platform iOS` bundle onto the Neural Engine.
 
 ## Running
 
@@ -81,7 +106,8 @@ swift run -c release diffusion-runner --model exports/Sana_Sprint_0.6B_1024px_di
     --prompt "a cyberpunk cat with a neon sign that says \"Sana\"" --seed 42
 ```
 
-For 1.6B, pass `--model exports/Sana_Sprint_1.6B_1024px_diffusers`.
+For 1.6B, pass `--model exports/Sana_Sprint_1.6B_1024px_diffusers`. For a `--platform iOS` export,
+add `-ios` to the folder name, e.g. `--model exports/Sana_Sprint_0.6B_1024px_diffusers-ios`.
 
 The defaults (2 steps, guidance 4.5) come from `metadata.json`. `--guidance-scale` feeds the
 transformer's guidance embedding; there is no classifier-free guidance pass. `--seed` matches

@@ -13,7 +13,7 @@ torch.nn.Module wrapper that normalises the HF output, and a factory for
 dummy inputs.
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from typing import Any, cast
 
@@ -196,6 +196,27 @@ class MultiFunctionComponentSpec:
         Weights are shared, so just grab the first one.
         """
         return self.quant_dummy_fn or self.functions[0].dummy_fn
+
+
+def _to_float16(module: torch.nn.Module) -> torch.nn.Module:
+    return module.half()
+
+
+@dataclass(frozen=True)
+class NeuralEngineComponentSpec:
+    """A component re-authored for the Neural Engine, exported as one static function ``main``.
+
+    ``build_fn(hf_pipe)`` returns the module in float32, with constants folded into its weights
+    (the pipeline is loaded in float32). The export quantizes and palettizes it as the compression
+    preset says, then ``cast_fn`` sets its export dtypes.
+    """
+
+    asset_name: str
+    input_names: tuple[str, ...]
+    output_names: tuple[str, ...]
+    build_fn: Callable
+    dummy_fn: Callable
+    cast_fn: Callable[[torch.nn.Module], torch.nn.Module] = _to_float16
 
 
 # ---------------------------------------------------------------------------
@@ -425,9 +446,7 @@ FLUX2_DYNAMIC_COMPONENTS: dict[str, ComponentSpec | MultiFunctionComponentSpec] 
     ),
     "text_encoder": FLUX2_COMPONENTS["text_encoder"],
     "vae_decoder": replace(
-        FLUX2_COMPONENTS["vae_decoder"],
-        wrapper_fn=lambda p: Flux2VAEDecoderWrapper(p.vae, dynamic=True),
-        dynamic_shapes_fn=flux2_vae_decoder_dynamic_shapes,
+        FLUX2_COMPONENTS["vae_decoder"], dynamic_shapes_fn=flux2_vae_decoder_dynamic_shapes
     ),
     "vae_encoder": replace(
         FLUX2_COMPONENTS["vae_encoder"], dynamic_shapes_fn=flux2_vae_encoder_dynamic_shapes
@@ -513,7 +532,8 @@ def get_component_registry(
     pipeline_type: str,
     multifunction: bool = False,
     dynamic: bool = False,
-) -> dict[str, ComponentSpec | MultiFunctionComponentSpec]:
+    neural_engine: bool = False,
+) -> Mapping[str, ComponentSpec | MultiFunctionComponentSpec | NeuralEngineComponentSpec]:
     """Return the component registry for the given pipeline type.
 
     Args:
@@ -524,6 +544,8 @@ def get_component_registry(
             (8 functions in one .aimodel: main, half, and six img2img variants).
         dynamic: If True, use the FLUX.2 dynamic registry: one symbolic "main" per
             asset. Takes precedence over ``multifunction`` if True.
+        neural_engine: If True, use the Sana Sprint components re-authored for the
+            Neural Engine.
     """
     if pipeline_type == "flux2":
         if dynamic:
@@ -534,6 +556,12 @@ def get_component_registry(
     if pipeline_type == "wan":
         return WAN_COMPONENTS
     if pipeline_type == "sana_sprint":
+        if neural_engine:
+            from coreai_models.diffusion.sana_neural_engine import (
+                SANA_SPRINT_NEURAL_ENGINE_COMPONENTS,
+            )
+
+            return SANA_SPRINT_NEURAL_ENGINE_COMPONENTS
         return SANA_SPRINT_COMPONENTS
     raise unknown_pipeline_type_error(pipeline_type)
 

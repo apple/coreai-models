@@ -16,6 +16,15 @@ public struct ChatCompletionRequest: Decodable, Sendable {
     public let topP: Double?
     public let topK: Int?
     public let seed: UInt64?
+    /// Additive penalty scaled by how often a token has already appeared (range [-2, 2]).
+    /// Applied as `logit -= frequencyPenalty * count`.
+    public let frequencyPenalty: Double?
+    /// Additive penalty applied once if a token has appeared at all (range [-2, 2]).
+    /// Applied as `logit -= presencePenalty` for any seen token.
+    public let presencePenalty: Double?
+    /// Per-token logit bias keyed by token-ID string → bias value (range [-100, 100]).
+    /// Applied as `logit += bias` before sampling.
+    public let logitBias: [String: Double]?
     public let stream: Bool?
     public let stop: [String]?
     public let responseFormat: ResponseFormat?
@@ -33,6 +42,9 @@ public struct ChatCompletionRequest: Decodable, Sendable {
         case maxCompletionTokens = "max_completion_tokens"
         case topP = "top_p"
         case topK = "top_k"
+        case frequencyPenalty = "frequency_penalty"
+        case presencePenalty = "presence_penalty"
+        case logitBias = "logit_bias"
         case responseFormat = "response_format"
         case toolChoice = "tool_choice"
         case parallelToolCalls = "parallel_tool_calls"
@@ -49,6 +61,9 @@ public struct ChatCompletionRequest: Decodable, Sendable {
         topP = try container.decodeIfPresent(Double.self, forKey: .topP)
         topK = try container.decodeIfPresent(Int.self, forKey: .topK)
         seed = try container.decodeIfPresent(UInt64.self, forKey: .seed)
+        frequencyPenalty = try container.decodeIfPresent(Double.self, forKey: .frequencyPenalty)
+        presencePenalty = try container.decodeIfPresent(Double.self, forKey: .presencePenalty)
+        logitBias = try container.decodeIfPresent([String: Double].self, forKey: .logitBias)
         stream = try container.decodeIfPresent(Bool.self, forKey: .stream)
         responseFormat = try container.decodeIfPresent(ResponseFormat.self, forKey: .responseFormat)
         tools = try container.decodeIfPresent([ToolDefinition].self, forKey: .tools)
@@ -86,13 +101,37 @@ public struct ResponseFormat: Decodable, Sendable {
     public struct JSONSchemaSpec: Decodable, Sendable {
         public let name: String?
         public let schema: JSONValue
+        /// The schema as the request wrote it, when the decoder had the request's text
+        /// (``JSONSourceText``). It keeps the order of `properties`, which `schema` can't. The
+        /// grammar session makes it strict JSON, whatever leniency `JSONDecoder` allowed. A key
+        /// repeated inside the schema stays as written, and the grammar compiler keeps its last
+        /// value where `schema` keeps the first.
+        let schemaText: String?
+
+        enum CodingKeys: String, CodingKey {
+            case name, schema
+        }
+
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            name = try container.decodeIfPresent(String.self, forKey: .name)
+            schema = try container.decode(JSONValue.self, forKey: .schema)
+            schemaText = (decoder.userInfo[JSONSourceText.userInfoKey] as? Data)
+                .flatMap { JSONSourceText.text(at: decoder.codingPath + [CodingKeys.schema], in: $0) }
+        }
     }
 
+    /// The schema to constrain generation with. A grammar generates an object's properties in the
+    /// order its schema lists them, so this is the request's own text where the decoder had it.
+    /// Otherwise it is `schema` re-encoded with sorted keys: a fixed order, though not the client's.
     public var extractedSchema: String? {
         switch type {
         case "json_schema":
             guard let spec = jsonSchema else { return nil }
-            if let data = try? JSONEncoder().encode(spec.schema),
+            if let text = spec.schemaText { return text }
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            if let data = try? encoder.encode(spec.schema),
                 let str = String(data: data, encoding: .utf8)
             {
                 return str

@@ -17,12 +17,14 @@ from coreai_models.model_registry import (
     _preset_to_export_args,
     _preset_to_output_name,
     _utility_to_export_args,
+    families,
     filter_presets,
     filter_utility_models,
     lookup_preset,
     lookup_utility_model,
     presets_for_type,
     try_lookup_preset,
+    try_lookup_preset_by_hf_id,
 )
 
 
@@ -35,9 +37,46 @@ def test_no_duplicate_short_name_variant_pairs() -> None:
             seen.add(key)
 
 
-def test_diffusion_presets_have_no_variant() -> None:
+def test_only_sana_diffusion_presets_have_a_platform() -> None:
     for p in DIFFUSION_PRESETS:
-        assert p.variant is None, f"{p.short_name} should have variant=None"
+        allowed = ("macOS", "iOS") if p.family == "sana-sprint" else (None,)
+        assert p.variant in allowed, f"{p.short_name}: unexpected {p.variant=}"
+
+
+@pytest.mark.parametrize("size", ["0.6B", "1.6B"])
+def test_sana_presets_are_selected_by_platform(size: str) -> None:
+    """Like an LLM: macOS (GPU) unless iOS (Neural Engine) is asked for."""
+    from coreai_models.diffusion.pipeline import diffusion_output_subdir
+
+    hf_id = f"Efficient-Large-Model/Sana_Sprint_{size}_1024px_diffusers"
+    short = f"sana-sprint-{size.lower()}"
+    for macos in (
+        try_lookup_preset(short, model_type="diffusion"),
+        try_lookup_preset_by_hf_id(hf_id, model_type="diffusion"),
+        lookup_preset(short, model_type="diffusion", variant="macOS"),
+    ):
+        assert macos is not None and macos.variant == "macOS"
+        assert macos.compression == "t8bit-te4bit-asym"
+        assert "--platform" not in _preset_to_export_args(macos)
+        assert _preset_to_output_name(macos) == f"Sana_Sprint_{size}_1024px_diffusers"
+        assert _preset_to_output_name(macos) == diffusion_output_subdir(macos.hf_id)
+    for ios in (
+        lookup_preset(short, model_type="diffusion", variant="iOS"),
+        try_lookup_preset_by_hf_id(hf_id, model_type="diffusion", variant="iOS"),
+    ):
+        assert ios.short_name == short and ios.variant == "iOS"
+        assert ios.compression == "te6bit-tok8-tx8bit-pal"
+        assert _preset_to_export_args(ios)[-2:] == ["--platform", "iOS"]
+        assert _preset_to_output_name(ios) == f"Sana_Sprint_{size}_1024px_diffusers-ios"
+        assert _preset_to_output_name(ios) == diffusion_output_subdir(ios.hf_id, neural_engine=True)
+    with pytest.raises(KeyError, match="Pass --platform"):
+        lookup_preset(short, model_type="diffusion")
+
+
+def test_flux2_has_no_ios_preset() -> None:
+    """FLUX.2's --platform only changes export flags, so its one preset serves every platform."""
+    assert try_lookup_preset("flux2-klein-4b", model_type="diffusion", variant="iOS") is None
+    assert try_lookup_preset("flux2-klein-4b", model_type="diffusion") is not None
 
 
 def test_diffusion_presets_name_a_known_compression_preset() -> None:
@@ -164,6 +203,20 @@ def test_output_name_llm_iOS_prepends_hf_tail_when_yaml_stem_lacks_it() -> None:
     assert _preset_to_output_name(p) == "qwen3_0_6b_generic_4bit_static"
 
 
+def test_gemma4_qat_preset_names_the_bundle_the_export_writes() -> None:
+    """The QAT checkpoint is not palettized; its preset carries the compression name the
+    Gemma 4 export gives its bundle."""
+    from coreai_models.export.pipeline import ExportConfig, _generate_output_name
+
+    p = lookup_preset("gemma4-e2b-it-qat", model_type="llm", variant="iOS")
+    assert p.hf_id == "google/gemma-4-E2B-it-qat-mobile-transformers"
+    assert p.compression_config is None
+    expected = _generate_output_name(
+        ExportConfig(hf_model_id=p.hf_id, variant="iOS", compression="native_quantized")
+    )
+    assert _preset_to_output_name(p) == expected
+
+
 def test_output_name_diffusion_is_hf_tail() -> None:
     p = lookup_preset("flux2-klein-4b", model_type="diffusion")
     assert _preset_to_output_name(p) == "FLUX.2-klein-4B"
@@ -225,8 +278,20 @@ def test_embedding_utility_models_have_an_exporter() -> None:
     rows = [u for u in UTILITY_PRESETS if u.export_script == "coreai.embedding.export"]
     assert {row.short_name for row in rows} == set(EXPORTERS)
     for row in rows:
-        assert EXPORTERS[row.short_name].family.hf_model_id == row.hf_id
-        assert row.platforms == ("iOS", "macOS")
+        family = EXPORTERS[row.short_name].family
+        assert family.hf_model_id == row.hf_id
+        assert set(row.platforms) == set(family.precisions)
+
+
+def test_utility_families_do_not_reuse_llm_or_diffusion_families() -> None:
+    """A family name means one kind of model: ``qwen3`` is the Qwen3 LLMs only."""
+    others: set[str] = set()
+    for model_type in ("llm", "diffusion"):
+        others |= set(families(model_type, include_experimental=True))
+    assert not set(families("utility")) & others
+    assert [u.short_name for u in filter_utility_models(model_type="qwen3-embedding")] == [
+        "qwen3-embedding-0.6b"
+    ]
 
 
 def test_utility_export_args_for_console_scripts_and_recipes() -> None:
@@ -255,6 +320,7 @@ def test_utility_platform_filter_excludes_macos_only() -> None:
     ios_models = filter_utility_models(platform="iOS")
     names = [u.short_name for u in ios_models]
     assert "depth-anything-3-small" not in names
+    assert "qwen3-embedding-0.6b" not in names
     assert "clip-vit-b32" in names
 
 
