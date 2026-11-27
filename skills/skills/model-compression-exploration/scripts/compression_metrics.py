@@ -39,19 +39,18 @@ _CONV_TRANSPOSE_TYPES = (
 )
 
 
-def _resolve_axis(module: nn.Module, axis: int) -> int:
-    """Map a config's channel axis to the tensor dim it lands on for module.
+def _resolve_axis(module: nn.Module, axis: Optional[int]) -> int:
+    """Return the weight-tensor dim a config's axis selects for module.
 
-    A compression config's axis names the logical channel axis: 0 for
-    output channels, 1 for input channels. ConvTranspose stores its weight
-    as (in_channels, out_channels, *kernel), so the two logical axes swap
-    (mirrors coreai_opt/quantization/_axis_defaults.py); everything else
-    stores (out_channels, in_channels, ...) and maps 1:1. Axes outside
-    {0, 1} are passed through unchanged.
+    Mirrors coreai-opt's PerGroupedChannelGranularity: an explicit integer
+    axis is a raw weight-tensor dim and is used as-is for every module
+    type. Only axis=None is resolved per op, to its default output-channel
+    dim: 0 for Linear/Conv/Embedding, 1 for ConvTranspose, whose weight is
+    stored as (in_channels, out_channels, *kernel).
     """
-    if isinstance(module, _CONV_TRANSPOSE_TYPES) and axis in (0, 1):
-        return 1 - axis
-    return axis
+    if axis is not None:
+        return axis
+    return 1 if isinstance(module, _CONV_TRANSPOSE_TYPES) else 0
 
 
 @dataclass(frozen=True)
@@ -93,7 +92,9 @@ def fp16_baseline_mb(model) -> float:
     return (total * 2) / (1024 * 1024)
 
 
-def check_divisibility(model, axis: int, block_size: int) -> dict[str, tuple[int, int]]:
+def check_divisibility(
+    model, axis: Optional[int], block_size: int
+) -> dict[str, tuple[int, int]]:
     """Return compressible layers whose resolved dim is not divisible.
 
     Per-block quantization and per-grouped-channel palettization silently
@@ -102,11 +103,11 @@ def check_divisibility(model, axis: int, block_size: int) -> dict[str, tuple[int
 
     Only module types coreai-opt compresses (Linear, Conv*, ConvTranspose*,
     Embedding) are checked — a norm's weight can never be silently skipped
-    because it is never compressed. axis is the config's channel axis
-    (0 = output channels, 1 = input channels) and is resolved per module
-    type; in particular ConvTranspose's output channels live on tensor
-    dim 1, so ``ConvTranspose2d(64, 12, 3)`` with axis=0, block 8 is
-    reported for 12, not cleared for 64.
+    because it is never compressed. Pass the config's axis unchanged: an
+    integer is a raw weight-tensor dim (so with the palettizer presets'
+    axis=0, group 8, ``ConvTranspose2d(12, 64, 3)`` is reported for 12 and
+    ``ConvTranspose2d(64, 12, 3)`` is not), while None uses each op's
+    default output-channel dim (1 for ConvTranspose, 0 otherwise).
 
     Returns:
         Dict mapping module_name -> (offending_dim, block_size).

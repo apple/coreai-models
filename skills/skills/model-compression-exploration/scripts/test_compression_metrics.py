@@ -47,20 +47,29 @@ class TestCheckDivisibility:
         model = nn.Sequential(nn.LayerNorm(60))
         assert check_divisibility(model, axis=0, block_size=8) == {}
 
-    def test_conv_transpose_output_channels_resolve_to_dim_1(self):
-        # ConvTranspose stores weight as (in, out, *kernel): its output
-        # channels live on tensor dim 1. With axis=0 (output channels) and
-        # group 8, ConvTranspose2d(64, 12, 3) must be reported for 12 —
-        # the palettizer would silently skip it — not cleared for 64.
-        model = nn.Sequential(nn.ConvTranspose2d(64, 12, 3))
-        result = check_divisibility(model, axis=0, block_size=8)
-        assert list(result.values()) == [(12, 8)]
+    def test_conv_transpose_explicit_axis_is_a_raw_tensor_dim(self):
+        # coreai-opt uses an explicit axis as-is, even for ConvTranspose
+        # (weight stored as (in, out, *kernel)). With the palettizer
+        # presets' axis=0 and group 8, ConvTranspose2d(12, 64, 3) is
+        # skipped on dim 0 (12) and ConvTranspose2d(64, 12, 3) is not.
+        skipped = nn.Sequential(nn.ConvTranspose2d(12, 64, 3))
+        assert list(check_divisibility(skipped, axis=0, block_size=8).values()) == [
+            (12, 8)
+        ]
+        cleared = nn.Sequential(nn.ConvTranspose2d(64, 12, 3))
+        assert check_divisibility(cleared, axis=0, block_size=8) == {}
 
-    def test_conv_transpose_input_channels_resolve_to_dim_0(self):
-        # The same layer along the input-channel axis resolves to dim 0
-        # (64), which is divisible by 8.
-        model = nn.Sequential(nn.ConvTranspose2d(64, 12, 3))
-        assert check_divisibility(model, axis=1, block_size=8) == {}
+    def test_axis_none_uses_each_ops_output_channel_dim(self):
+        # axis=None is the only case coreai-opt resolves per op: dim 1
+        # (out_channels) for ConvTranspose, dim 0 for everything else.
+        conv_t = nn.Sequential(nn.ConvTranspose2d(64, 12, 3))
+        assert list(check_divisibility(conv_t, axis=None, block_size=8).values()) == [
+            (12, 8)
+        ]
+        linear = nn.Sequential(nn.Linear(64, 12))
+        assert list(check_divisibility(linear, axis=None, block_size=8).values()) == [
+            (12, 8)
+        ]
 
     def test_embedding_is_checked(self):
         model = nn.Sequential(nn.Embedding(100, 32))
