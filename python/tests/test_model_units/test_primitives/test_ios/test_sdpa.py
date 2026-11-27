@@ -11,7 +11,7 @@ import pytest
 import torch
 from transformers.integrations.sdpa_attention import sdpa_attention_forward
 
-from coreai_models.primitives.ios.sdpa import SDPA
+from coreai_models.primitives.ios.sdpa import SDPA, BlockedSDPA
 from tests._runner_infra.testing_utils import (
     assert_close,
     run_compare_coreai,
@@ -190,4 +190,86 @@ class TestSDPA:
             model=model,
             inputs=inputs,
             atol=5e-3 if precision == torch.float16 else 1e-5,
+        )
+
+
+class TestBlockedSDPA:
+    """The online-softmax merge across key blocks against plain softmax attention."""
+
+    @staticmethod
+    def reference(query, key, value, causal_mask, head_dim):
+        n_heads, n_kv = query.shape[1] // head_dim, key.shape[1] // head_dim
+        q = query.view(n_heads, head_dim, -1).transpose(1, 2).float()  # (H, q, d)
+        k = key.view(n_kv, head_dim, -1).float().repeat_interleave(n_heads // n_kv, 0)
+        v = value.view(n_kv, head_dim, -1).float().repeat_interleave(n_heads // n_kv, 0)
+        mask = causal_mask[0, :, 0, :].T.float()  # (q, ctx)
+        weights = torch.softmax(q @ k * head_dim**-0.5 + mask, dim=-1)
+        out = weights @ v.transpose(1, 2)  # (H, q, d)
+        return out.transpose(1, 2).reshape(1, n_heads * head_dim, 1, -1)
+
+    def _check(
+        self,
+        ctx: int,
+        offset: int,
+        precision: torch.dtype,
+        *,
+        block: int = 32,
+        q_len: int = 8,
+        query_scale: float = 1.0,
+        value_fill: float | None = None,
+        atol: float | None = None,
+    ) -> None:
+        torch.manual_seed(0)
+        head_dim, n_heads, n_kv = 16, 4, 2
+        query = torch.randn(1, n_heads * head_dim, 1, q_len, dtype=precision) * query_scale
+        key = torch.randn(1, n_kv * head_dim, 1, ctx, dtype=precision)
+        if value_fill is None:
+            value = torch.randn(1, n_kv * head_dim, 1, ctx, dtype=precision)
+        else:
+            value = torch.full((1, n_kv * head_dim, 1, ctx), value_fill, dtype=precision)
+        # Query i sees keys [0, offset + i]; later keys (and so whole later blocks) are masked.
+        causal_mask = torch.zeros(1, ctx, 1, q_len, dtype=precision)
+        for i in range(q_len):
+            causal_mask[0, offset + i + 1 :, 0, i] = -40000.0
+
+        got = BlockedSDPA(head_dim=head_dim, block_size=block)(query, key, value, causal_mask)
+        expected = self.reference(query, key, value, causal_mask, head_dim)
+        assert torch.isfinite(got).all()
+        if atol is None:
+            atol = 2e-3 if precision == torch.float16 else 1e-5
+        assert_close(got.float(), expected, atol=atol, rtol=0)
+
+    @pytest.mark.parametrize("n_blocks", [1, 2, 3])
+    @pytest.mark.parametrize("precision", [torch.float32, torch.float16])
+    def test_matches_softmax_attention(self, n_blocks: int, precision: torch.dtype) -> None:
+        # Queries sit at the end of the filled cache, so every block holds live keys.
+        ctx = n_blocks * 32
+        self._check(ctx, ctx - 8, precision)
+
+    @pytest.mark.parametrize("offset", [0, 40])
+    @pytest.mark.parametrize("precision", [torch.float32, torch.float16])
+    def test_partly_filled_ragged_cache(self, offset: int, precision: torch.dtype) -> None:
+        """Decode runs on a partly filled cache whose length need not be a multiple of the
+        block: fully masked blocks and a short last block must not leak into the output."""
+        self._check(2 * 32 + 5, offset, precision)
+
+    @pytest.mark.parametrize("precision", [torch.float32, torch.float16])
+    def test_hoisted_transpose_and_super_chunks(self, monkeypatch, precision) -> None:
+        """Past `_MAX_TRANSPOSE_DIM` keys the merge hoists the transpose and walks super-chunks;
+        shrink the limit so a small context takes that path across two super-chunks."""
+        import coreai_models.primitives.ios.sdpa as sdpa
+
+        monkeypatch.setattr(sdpa, "_MAX_TRANSPOSE_DIM", 2 * 32)
+        self._check(3 * 32, 3 * 32 - 8, precision)
+
+    def test_fp16_merge_does_not_overflow(self) -> None:
+        """With uniform scores the block-scaled denominator grows by sqrt(block) per block, so
+        across many blocks the old (o * prev + pv) / den form passes the fp16 max; the scaled
+        form must stay finite and match."""
+        block, n_blocks, value = 16, 32, 2000.0
+        ctx = block * n_blocks
+        # o ~ value and prev ~ (n_blocks - 1) * sqrt(block) before the last block's merge.
+        assert value * (n_blocks - 1) * block**0.5 > torch.finfo(torch.float16).max
+        self._check(
+            ctx, ctx - 8, torch.float16, block=block, query_scale=0.0, value_fill=value, atol=4.0
         )

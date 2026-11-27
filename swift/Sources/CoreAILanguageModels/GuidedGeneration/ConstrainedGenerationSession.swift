@@ -121,7 +121,10 @@ public struct ConstrainedGenerationSession: ~Copyable {
         maxWhitespaceCount: Int?,
         validated: Bool
     ) throws {
+        // `schema` keeps the caller's text: the pipelined engine's session cache compares it with the
+        // text of the next request. Whoever wrote it, the grammar gets it strict.
         self.schema = jsonSchema
+        let jsonSchema = GrammarSchemaJSON.normalized(jsonSchema)
         self.maxWhitespaceCount = maxWhitespaceCount
         self.tokenizerInfo = tokenizerInfo
         self.compiler = GrammarCompiler(tokenizerInfo: tokenizerInfo)

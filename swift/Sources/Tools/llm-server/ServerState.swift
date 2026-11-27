@@ -248,9 +248,15 @@ final class ServerState: @unchecked Sendable {
     }
 
     /// `access`, unless the process is past the device's memory recommendation: then releases it and
-    /// throws ``MemoryRefusal``.
+    /// throws ``MemoryRefusal``. The engine's prefix cache goes first, since it is only a cache.
     private func admittedForMemory(_ access: RequestAccess) throws -> RequestAccess {
-        guard let reason = memoryGuard?.refusalReason() else { return access }
+        guard var reason = memoryGuard?.refusalReason() else { return access }
+        // A second reading under the line, or a cache that gave memory back, earns a fresh check.
+        let excess = memoryGuard?.excess() ?? 0
+        if excess == 0 || engine.shedPrefixCache(atLeast: excess) > 0 {
+            guard let still = memoryGuard?.refusalReason() else { return access }
+            reason = still
+        }
         access.release()
         throw MemoryRefusal(reason: reason)
     }
@@ -461,16 +467,37 @@ final class ServerState: @unchecked Sendable {
         topP: Double?,
         topK: Int?,
         minP: Double?,
-        seed: UInt64? = nil
+        seed: UInt64? = nil,
+        frequencyPenalty: Double? = nil,
+        presencePenalty: Double? = nil,
+        logitBias: [Int32: Float]? = nil
     ) throws -> SamplingConfiguration {
         let temp = temperature ?? config.defaultTemperature
+        let hasAdditiveProcessing =
+            (frequencyPenalty ?? 0) != 0 || (presencePenalty ?? 0) != 0 || !(logitBias?.isEmpty ?? true)
         if temp == 0 {
-            return .greedy
+            // Greedy: additive penalties and the logit bias still shift the argmax, so build a
+            // full temperature-0 config carrying them rather than dropping to bare `.greedy`.
+            guard hasAdditiveProcessing else { return .greedy }
+            if let error = SamplingConfiguration.parameterError(
+                0, frequencyPenalty: frequencyPenalty, presencePenalty: presencePenalty)
+            {
+                throw ServerError.badRequest(error.message(naming: error.parameter.requestField))
+            }
+            return SamplingConfiguration(
+                temperature: 0,
+                seed: seed,
+                frequencyPenalty: frequencyPenalty,
+                presencePenalty: presencePenalty,
+                logitBias: logitBias
+            )
         }
         let topK = topK ?? config.defaultTopK
         let topP = topP ?? config.defaultTopP
         let minP = minP ?? config.defaultMinP
-        if let error = SamplingConfiguration.parameterError(temp, topK, topP, minP) {
+        if let error = SamplingConfiguration.parameterError(
+            temp, topK, topP, minP, frequencyPenalty: frequencyPenalty, presencePenalty: presencePenalty)
+        {
             throw ServerError.badRequest(error.message(naming: error.parameter.requestField))
         }
         return SamplingConfiguration(
@@ -478,7 +505,10 @@ final class ServerState: @unchecked Sendable {
             topK: topK,
             topP: topP,
             minP: minP,
-            seed: seed
+            seed: seed,
+            frequencyPenalty: frequencyPenalty,
+            presencePenalty: presencePenalty,
+            logitBias: logitBias
         )
     }
 }
@@ -493,6 +523,8 @@ extension SamplingParameterError.Parameter {
         case .minP: "min_p"
         case .repetitionPenalty: "repetition_penalty"
         case .repetitionPenaltyWindow: "repetition_penalty_window"
+        case .frequencyPenalty: "frequency_penalty"
+        case .presencePenalty: "presence_penalty"
         }
     }
 }

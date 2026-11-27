@@ -54,7 +54,7 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.2.0"),
-        .package(url: "https://github.com/huggingface/swift-transformers", from: "1.1.0"),
+        .package(url: "https://github.com/huggingface/swift-transformers", from: "1.4.0"),
         // Also resolved through swift-transformers. Chat templates need 2.5.1: a stable key order in
         // tojson (2.3.5), loop.previtem/nextitem (2.3.6), tojson written like json.dumps (2.5.0) and
         // whitespace control on comment tags (2.5.1).
@@ -175,7 +175,7 @@ let package = Package(
             publicHeadersPath: "include"
         ),
 
-        // Memory measurement shared by the CLI tools (not itself a tool)
+        // Memory measurement and options shared by the CLI tools (not itself a tool)
         .target(
             name: "CoreAIMemoryMeasurement",
             dependencies: [
@@ -208,6 +208,7 @@ let package = Package(
             dependencies: [
                 "CoreAILanguageModels",
                 "CoreAILMCommon",
+                "CoreAIMemoryMeasurement",
                 "CoreAIShared",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
                 .product(name: "Hummingbird", package: "hummingbird"),
@@ -327,7 +328,8 @@ let package = Package(
             ],
             path: "swift/Tests/LanguageModelsTests",
             resources: [
-                .copy("Resources/MinimalTokenizer")
+                .copy("Resources/MinimalTokenizer"),
+                .copy("Resources/QwenSplitTokenizer"),
             ],
             swiftSettings: [
                 .enableExperimentalFeature("Lifetimes")

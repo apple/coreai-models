@@ -47,6 +47,7 @@ from coreai_models.export.presets import (
     DEFAULT_MACOS_COMPRESSION_PRESET,
     get_preset,
 )
+from coreai_models.hub import FULL_PATTERNS, SNAPSHOT_PATTERNS, BackendName, resolve_local
 from coreai_models.model_registry import ModelPreset
 from coreai_models.models.registry import ModelEntry, get_model_entry
 
@@ -98,6 +99,10 @@ class ExportConfig:
     # Experimental, macOS only. Max of the dynamic ``batch`` dim across input_ids/position_ids/
     # attn_mask and the KV cache. Defaults to 8 for batched exports; None for the causal mode.
     dynamic_max_batch_size: int | None = None
+    # Model download backend. The default keeps the exact original HF
+    # download behavior; "modelscope" routes downloads through the
+    # ModelScope hub (see coreai_models.hub).
+    backend: BackendName = "huggingface"
 
     @property
     def emits_attn_mask(self) -> bool:
@@ -228,7 +233,12 @@ class BuiltModel(NamedTuple):
 def resolve_model(config: ExportConfig) -> ResolvedModel:
     """Resolve ``config`` against the registry and the checkpoint's config, reading no weights."""
     # ---- 1. Resolve model class ----
-    hf_config = AutoConfig.from_pretrained(config.hf_model_id)
+    # resolve_local returns the hub id unchanged for the HuggingFace backend
+    # (from_pretrained keeps its own download path — the no-op guarantee) and
+    # a pre-downloaded local path for ModelScope.
+    hf_config = AutoConfig.from_pretrained(
+        resolve_local(config.hf_model_id, config.backend, SNAPSHOT_PATTERNS)
+    )
     model_type = config.model_type_override or getattr(hf_config, "model_type", None)
     if model_type is None:
         raise ValueError(
@@ -244,6 +254,11 @@ def resolve_model(config: ExportConfig) -> ResolvedModel:
 
     if config.variant == "iOS" and entry.ios_class is None:
         raise ValueError(f"Model '{model_type}' does not support iOS variant")
+    if config.variant == "iOS" and entry.ios_export_script is not None:
+        raise ValueError(
+            f"Model '{model_type}' exports to iOS through its own script, not coreai.llm.export: "
+            f"uv run {entry.ios_export_script} --model <hf-id>"
+        )
 
     if config.with_drafter:
         if config.variant != "macOS":
@@ -373,6 +388,7 @@ def build_model(
             num_layers=config.num_layers,
             hf_config_attr=entry.hf_config_attr,
             hf_state_dict_prefix=entry.hf_state_dict_prefix,
+            backend=config.backend,
             **attn_mask_kw,
         )
     else:
@@ -382,6 +398,7 @@ def build_model(
             target_dtype=target_dtype,
             num_layers=config.num_layers,
             disable_embedding_quantization=config.disable_embedding_quantization,
+            backend=config.backend,
             **attn_mask_kw,
         )
     model = model.eval()
@@ -400,11 +417,24 @@ def build_model(
         logger.info(f"Applying pre-export torch quantization (preset={config.compression})")
 
         def get_calibration_data():  # type: ignore[no-untyped-def]
-            tokenizer = AutoTokenizer.from_pretrained(config.hf_model_id)
+            tokenizer = AutoTokenizer.from_pretrained(
+                resolve_local(config.hf_model_id, config.backend, SNAPSHOT_PATTERNS)
+            )
             return get_c4(tokenizer)
 
         # Copy so we don't mutate the shared preset.
         quant_cfg = dict(torch_quantization_config)
+
+        if quant_cfg.pop("untie_word_embeddings", False) and (
+            hasattr(model, "lm_head")
+            and hasattr(model.config, "tie_word_embeddings")
+            and model.config.tie_word_embeddings
+        ):
+            logger.info("Untying lm_head from word embeddings for quantization")
+            model.lm_head.weight = torch.nn.Parameter(
+                model.lm_head.weight.detach().clone(), requires_grad=False
+            )
+            model.config.tie_word_embeddings = False
 
         # The preset or YAML is the source of truth; `--quantization-mode` overrides
         # it only when given.
@@ -521,6 +551,12 @@ def export_model(config_or_model_id: ExportConfig | str) -> str:
 
 async def _async_export_model(config: ExportConfig) -> str:
     """Async implementation of export_model."""
+    # Single comprehensive pre-download for the ModelScope backend —
+    # all subsequent resolve_local / from_hf calls hit the local cache
+    # or receive the pre-downloaded path directly.
+    if config.backend == "modelscope":
+        resolve_local(config.hf_model_id, config.backend, FULL_PATTERNS)
+
     resolved = resolve_model(config)
     entry, hf_config, model_type = resolved.entry, resolved.hf_config, resolved.model_type
     target_dtype, max_context_length = resolved.target_dtype, resolved.max_context_length
@@ -594,6 +630,7 @@ async def _async_export_model(config: ExportConfig) -> str:
                 max_context_length=max_context_length,
                 target_dtype=target_dtype,
                 target_model_id=config.hf_model_id,
+                backend=config.backend,
             )
             drafter_model = drafter_model.eval()
 
@@ -629,6 +666,7 @@ async def _async_export_model(config: ExportConfig) -> str:
             drafter_name=drafter_name,
             speculative_config=entry.drafter_config if drafter_name else None,
             max_batch_size=config.dynamic_max_batch_size or 1,
+            backend=config.backend,
         )
 
     logger.info(f"Export complete: {bundle_path}")

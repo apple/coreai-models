@@ -100,7 +100,7 @@ def test_dynamic_vae_decoder_converts() -> None:
     side = FLUX2_MIN_IMAGE_SIZE // 8
     z = torch.randn(1, 4, side, side).half()
     export_stateless(
-        Flux2VAEDecoderWrapper(_tiny_vae().half(), dynamic=True),
+        Flux2VAEDecoderWrapper(_tiny_vae().half()),
         (z,),
         ("z",),
         ("image",),
@@ -108,24 +108,17 @@ def test_dynamic_vae_decoder_converts() -> None:
     )
 
 
-def test_dynamic_vae_decoder_keeps_stock_upsample() -> None:
-    """The static decoder's ``repeat_interleave`` upsample patch fails ANE region formation
-    under symbolic sizes. That only shows on device and still converts, so check the patch
-    directly: a dynamic decoder must leave ``Upsample2D.forward`` alone."""
+def test_dynamic_vae_decoder_patches_upsample() -> None:
+    """Stock nearest ``F.interpolate`` with a symbolic size crashes MPSGraph on macOS 27.0.x
+    (#479). That only shows on device and still converts, so check the patch directly: the
+    dynamic registry's decoder must replace every ``Upsample2D.forward``."""
     from diffusers.models.upsampling import Upsample2D
 
-    def patched_upsamplers(dynamic: bool) -> list[bool]:
-        # The patch mutates the decoder in place, so each wrapper gets a fresh VAE.
-        wrapper = Flux2VAEDecoderWrapper(_tiny_vae(), dynamic=dynamic)
-        return [
-            "forward" in m.__dict__
-            for m in wrapper.vae.decoder.modules()
-            if isinstance(m, Upsample2D)
-        ]
-
-    static = patched_upsamplers(dynamic=False)
-    assert static and all(static)  # the patch applies, so the check below can see it
-    assert not any(patched_upsamplers(dynamic=True))
+    wrapper = FLUX2_DYNAMIC_COMPONENTS["vae_decoder"].wrapper_fn(SimpleNamespace(vae=_tiny_vae()))
+    patched = [
+        "forward" in m.__dict__ for m in wrapper.vae.decoder.modules() if isinstance(m, Upsample2D)
+    ]
+    assert patched and all(patched)
 
 
 def test_dynamic_registry_takes_precedence_over_multifunction() -> None:

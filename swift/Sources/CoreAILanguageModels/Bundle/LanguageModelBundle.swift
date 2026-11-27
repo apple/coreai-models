@@ -142,6 +142,15 @@ public struct LanguageModelBundle: Sendable {
         }
         return try await AutoTokenizer.from(pretrained: language.tokenizer)
     }
+    /// Token IDs beyond `tokenizer`'s main EOS that end generation: those the tokenizer files
+    /// mark as turn-ending (`LanguageConfig.additionalStopTokenIds(from:tokenizer:)`) and those the
+    /// export declares in `eos_token_ids`.
+    public func additionalStopTokenIds(tokenizer: any Tokenizer) -> Set<Int32> {
+        var ids = tokenizerPath.map { LanguageConfig.additionalStopTokenIds(from: $0, tokenizer: tokenizer) } ?? []
+        ids.formUnion(language.eosTokenIds)
+        if let eos = tokenizer.eosTokenId { ids.remove(Int32(eos)) }
+        return ids
+    }
 }
 
 // MARK: - 0.2 payload shape

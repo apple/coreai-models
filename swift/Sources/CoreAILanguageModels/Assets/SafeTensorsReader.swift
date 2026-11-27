@@ -89,6 +89,23 @@ struct SafeTensorsReader: Sendable {
         else {
             throw ReadError.tooSmall
         }
+        return try parse(headerData, fileSize: fileSize)
+    }
+
+    /// Reads the header of a whole `.safetensors` file already in memory, checked as
+    /// ``header(of:)`` checks one on disk.
+    static func header(in file: Data) throws -> Header {
+        guard file.count >= 8 else { throw ReadError.tooSmall }
+        let start = file.startIndex
+        let length = UInt64(littleEndian: file.withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) })
+        guard let headerLength = Int(exactly: length), headerLength <= file.count - 8 else {
+            throw ReadError.tooSmall
+        }
+        return try parse(file[(start + 8)..<(start + 8 + headerLength)], fileSize: file.count)
+    }
+
+    private static func parse(_ headerData: Data, fileSize: Int) throws -> Header {
+        let headerLength = headerData.count
         guard let json = try JSONSerialization.jsonObject(with: headerData) as? [String: Any] else {
             throw ReadError.badHeader("the header is not a JSON object")
         }

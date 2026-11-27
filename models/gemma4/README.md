@@ -4,10 +4,11 @@ Google's Gemma 4 models for on-device inference via Core AI (iOS).
 
 ## Supported Models
 
-| Model                | Parameters | iOS |
-| -------------------- | ---------- | --- |
-| Gemma 4 E2B Instruct | 5.0B       | Yes (27.2+) |
-| Gemma 4 E4B Instruct | 8.0B       | Yes (27.2+) |
+| Model                                          | Parameters | iOS         |
+| ---------------------------------------------- | ---------- | ----------- |
+| Gemma 4 E2B Instruct                           | 5.0B       | Yes (27.2+) |
+| Gemma 4 E4B Instruct                           | 8.0B       | Yes (27.2+) |
+| Gemma 4 E2B Instruct (QAT mobile transformers) | 5.0B       | Yes (27.2+) |
 
 These are the Gemma 4 checkpoints sized for a phone. They export through the
 standalone [`export.py`](export.py) rather than the generic `coreai.llm.export`
@@ -62,6 +63,9 @@ uv run export.py --model google/gemma-4-E2B-it
 # Other variant
 uv run export.py --model google/gemma-4-E4B-it
 
+# Quantization-aware-trained (QAT) E2B checkpoint, exported with its own quantized weights
+uv run export.py --model google/gemma-4-E2B-it-qat-mobile-transformers
+
 # No palettization. The embedding and PLE tables are still 8-bit quantized.
 uv run export.py --model google/gemma-4-E2B-it --compression none
 
@@ -82,6 +86,12 @@ attention unrolls its block loop, so the graph depends on the context length. A
 flat global KV cache is paired with a fixed-depth sliding-window ring, RoPE
 arrives precomputed as `rope_cos`/`rope_sin` inputs, and the INT8 Per-Layer
 Embeddings table is written as a sidecar next to the asset.
+
+The `--compression`, `--compression-config` and `--include-vision` options are not supported
+for the QAT checkpoint since we load the pre-quantized version. Its
+export keeps the quantized weights but not the activation quantization the
+checkpoint was trained with, so its accuracy can be lower than that of the
+standard checkpoint's default export. It runs like any other export.
 
 ## Note on AOT Compilation
 
@@ -160,12 +170,15 @@ Run the model with its draft head through `llm-runner --speculative`:
 llm-runner --model <bundle> --sampling-strategy greedy --speculative --prompt "..."
 ```
 
-The head and the target live in the same bundle, so `--speculative` takes no separate path. The
-output is token for token what greedy decoding of the target alone produces; the head only changes
-how many tokens one verify pass of the target commits. The runner needs greedy decoding, a target
-exported with `--emit-hidden-states`, and either a bundle with a `drafter` of kind `mtp` or
-`--draft-head-pack`, and it says which is missing. `--speculative` combines with `--prompt-lookup` (a block whose recent
-tokens recur in the context is proposed by lookup, any other by the head) and with `--json-schema`.
+The head and the target live in the same bundle, so `--speculative` takes no separate path. Under
+greedy decoding the output is token for token what greedy decoding of the target alone produces;
+with `--temperature` it follows the target's distribution, since each drafted token is accepted with
+the target's probability for it. The head only changes how many tokens one verify pass of the
+target commits. The runner needs a target exported with `--emit-hidden-states` and either a bundle
+with a `drafter` of kind `mtp` or `--draft-head-pack`, and it says which is missing. The head drafts
+the most likely token, so it is accepted less often as the temperature rises. `--speculative`
+combines with `--prompt-lookup` (a block whose recent tokens recur in the context is proposed by
+lookup, any other by the head) and, under greedy decoding, with `--json-schema`.
 `--num-draft-tokens` sets the drafts per round; by default a round drafts one less than the target's
 verify tile is wide, and `--no-align-proposals` drops that limit. `--drafter-top-k` sets how many
 centroids the head's candidate scan scores.
@@ -176,7 +189,8 @@ and leaves the target's accelerator to the target. The bundle then need not decl
 One difference from the program: the CPU head's full-attention layer attends to the most recent
 1024 positions rather than the whole context, which keeps a draft step's cost and memory flat at
 long context. Up to 1024 positions it drafts what the program drafts, up to rounding; past that its
-drafts can differ, which can lower acceptance but never changes the output.
+drafts can differ, which can lower acceptance but never changes the greedy output or the
+distribution sampled with `--temperature`.
 
 The run summary reports the share of drafts accepted and the tokens committed per target pass, then
 the same timing summary as a plain run.

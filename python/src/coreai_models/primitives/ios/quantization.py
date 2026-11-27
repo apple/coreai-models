@@ -122,6 +122,10 @@ def dequantize_per_tensor_meta(
 # ---------------------------------------------------------------------------
 # CoreAI-native quantized weights (bit-exact passthrough of a pre-quantized
 # checkpoint, e.g. Gemma4's "-qat-mobile-transformers" variants)
+#
+# Experimental: everything from here to the end of the module is used only by the Gemma 4 QAT
+# export, and its API may change. The per-tensor helpers above are the stable part of this
+# module that the other iOS models use.
 # ---------------------------------------------------------------------------
 
 # `torch.ops.coreai.constexpr_blockwise_shift_scale`, registered by the `custom_layers` import
@@ -133,6 +137,10 @@ def dequantize_per_tensor_meta(
 # `coreai_models.models.ios.gemma4_text` for the export-time promotion that makes that packing
 # happen.
 _NBITS_TO_TORCH_DTYPE: dict[int, torch.dtype] = {2: torch.int2, 4: torch.int4, 8: torch.int8}
+
+#: Bit widths of a CoreAI-native quantized tensor: the widths ``dequantize_native`` and
+#: ``unpack_signed_subbyte`` / ``unpack_unsigned_subbyte`` accept.
+NATIVE_NBITS: tuple[int, ...] = tuple(sorted(_NBITS_TO_TORCH_DTYPE))
 
 
 def dequantize_native(

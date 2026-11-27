@@ -237,6 +237,22 @@ public protocol InferenceEngine: Sendable {
     /// Defaults to `false`.
     var hasRecurrentState: Bool { get }
 
+    /// Whether the engine keeps a prefix cache, as ``EngineOptions/prefixCacheBytes`` asks: only the
+    /// pipelined engine does, and only for a model whose state it can copy. Defaults to `false`.
+    var prefixCacheEnabled: Bool { get }
+
+    /// Gives back at least `bytes` of what the prefix cache holds in memory, or all of it when it holds
+    /// less, for a caller short of memory: every pending snapshot copy first, then the least recently
+    /// used nodes. Returns the bytes freed: zero when there is no cache, or the engine is in use.
+    /// Defaults to zero.
+    ///
+    /// A disk tier keeps its copies, and a later prompt reads its own chain back into memory.
+    func shedPrefixCache(atLeast bytes: Int) -> Int
+
+    /// Gives back everything the prefix cache holds in memory: ``shedPrefixCache(atLeast:)`` with no
+    /// limit. Defaults to forwarding there.
+    func shedPrefixCache() -> Int
+
     // MARK: - Configuration
 
     associatedtype ConfigType: Codable, InferenceConfiguration
@@ -301,6 +317,23 @@ extension InferenceEngine {
     public var hasRecurrentState: Bool { false }
 }
 
+/// How far back a state set can rewind its processed state. An engine whose states are
+/// `.startOnly` reports ``InferenceEngine/hasRecurrentState``.
+public enum RollbackCapability: Sendable, Equatable {
+    /// Partial rewind is supported: every state is a cache indexed by position. A rewind can
+    /// still be refused once a sliding-window ring has overwritten the keys it needs.
+    case anyPosition
+    /// Only back to 0 (or to the current position, a no-op): a recurrent or conv state
+    /// summarizes the whole prefix, so rewinding means clearing it and replaying the prompt.
+    case startOnly
+}
+
+extension InferenceEngine {
+    public var prefixCacheEnabled: Bool { false }
+    public func shedPrefixCache(atLeast bytes: Int) -> Int { 0 }
+    public func shedPrefixCache() -> Int { shedPrefixCache(atLeast: .max) }
+}
+
 extension InferenceEngine {
     /// Default: engine is not busy.
     public var isBusy: Bool { false }
@@ -332,7 +365,7 @@ extension InferenceEngine {
     /// Default implementation: accepts all sampling configurations.
     ///
     /// Engines that use CPU fallback samplers can accept all configurations
-    /// since CompositeSampler handles greedy, temperature, topK, and topP.
+    /// since ReferenceSampler handles greedy, temperature, topK, and topP.
     ///
     /// Override this in engines with GPU samplers that have limited support.
     public func validateSamplingStrategy(_ config: SamplingConfiguration) throws {

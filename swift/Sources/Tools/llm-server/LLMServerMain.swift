@@ -6,6 +6,7 @@
 import ArgumentParser
 import CoreAILMCommon
 import CoreAILanguageModels
+import CoreAIMemoryMeasurement
 import CoreAIShared
 import Foundation
 import Hummingbird
@@ -98,6 +99,11 @@ struct LLMServer: AsyncParsableCommand {
     @Option(name: .customLong("kv-cache-initial-capacity"), help: "Initial KV cache capacity in tokens")
     var kvCacheInitialCapacity: Int?
 
+    @OptionGroup var prefixCache: PrefixCacheOptions
+
+    /// Megabytes of prefix cache the server keeps when `--prefix-cache-mb` isn't given.
+    static let defaultPrefixCacheMB = EngineOptions.suggestedPrefixCacheBytes >> 20
+
     @Option(
         name: .customLong("chunk-size"),
         help: ArgumentHelp(
@@ -156,6 +162,7 @@ struct LLMServer: AsyncParsableCommand {
     var verbose: Bool = false
 
     func validate() throws {
+        try prefixCache.validate(defaultMB: Self.defaultPrefixCacheMB)
         guard maxQueueDepth >= 0 else {
             throw ValidationError("--max-queue-depth must be >= 0 (got \(maxQueueDepth))")
         }
@@ -201,7 +208,11 @@ struct LLMServer: AsyncParsableCommand {
             kvCacheSize: kvCacheInitialCapacity,
             prefillChunkSize: resolvedChunkSize,
             prefillChunkThreshold: resolvedChunkThreshold,
-            tensorData: bundle.tensorData
+            tensorData: bundle.tensorData,
+            prefixCacheBytes: prefixCache.memoryBytes(defaultMB: Self.defaultPrefixCacheMB),
+            prefixCacheDiskBytes: prefixCache.diskBytes,
+            prefixCacheDirectory: prefixCache.diskBytes > 0
+                ? EngineOptions.defaultPrefixCacheDirectory(forModelAt: bundle.bundlePath) : nil
         )
 
         let modelURL = try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.main)
@@ -218,25 +229,13 @@ struct LLMServer: AsyncParsableCommand {
         let engineConfig = ModelConfig(bundle: bundle)
         // A vision-language bundle builds an engine that also takes images.
         let engine = try await EngineFactory.createEngine(bundle: bundle, options: engineOptions)
+        if let warning = prefixCache.ignoredWarning(cacheEnabled: engine.prefixCacheEnabled) { print(warning) }
 
         let tokenizer = try await bundle.loadTokenizer()
 
-        var additionalEosTokenIds: Set<Int32>
-        if let tokenizerDir = bundle.tokenizerPath {
-            additionalEosTokenIds = LanguageConfig.additionalStopTokenIds(
-                from: tokenizerDir, tokenizer: tokenizer)
-        } else {
-            additionalEosTokenIds = []
-        }
-
-        // Agentic models use <|eot|> as a turn boundary. It may not appear in
-        // tokenizer_config.json, so add it explicitly (skipping the main EOS).
-        let thinkingFormat = detectThinkingFormat(using: tokenizer)
-        if let eotId = agenticEndOfTurnTokenId(thinkingFormat: thinkingFormat, tokenizer: tokenizer),
-            eotId != tokenizer.eosTokenId.map({ Int32($0) })
-        {
-            additionalEosTokenIds.insert(eotId)
-        }
+        // Additional stop token IDs: from the tokenizer files, the bundle's eos_token_ids, and, for
+        // agentic models, <|eot|>. Shared with llm-runner so both tools stop on the same tokens.
+        let additionalEosTokenIds = RunnerPrompting.additionalStopTokenIds(bundle: bundle, tokenizer: tokenizer)
 
         let samplingConfig = SamplingConfiguration(
             temperature: temperature,

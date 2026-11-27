@@ -150,7 +150,9 @@ struct LLMBenchmark: AsyncParsableCommand {
             kvCacheSize: kvCacheInitialCapacity,
             prefillChunkSize: resolvedChunkSize,
             prefillChunkThreshold: resolvedChunkThreshold,
-            tensorData: bundle.tensorData
+            tensorData: bundle.tensorData,
+            // Every trial prefills the same prompt; a cache would time the restore, not the prefill.
+            prefixCacheBytes: 0
         )
         measurement?.begin("prepare")
         let prepareStart = SuspendingClock.now

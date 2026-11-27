@@ -114,15 +114,7 @@ public struct EngineFactory: Sendable {
         }
 
         // The bundle knows its own sidecars; assets passed explicitly still win.
-        let options = EngineOptions(
-            variant: options.variant,
-            kvCacheStrategy: options.kvCacheStrategy,
-            kvCacheSize: options.kvCacheSize,
-            prefillChunkSize: options.prefillChunkSize,
-            prefillChunkThreshold: options.prefillChunkThreshold,
-            tensorData: bundle.tensorData.merging(options.tensorData) { _, explicit in
-                explicit
-            })
+        let options = options.mergingTensorData(bundle.tensorData)
 
         // Standard single-asset LLM: build the config and delegate to the asset/URL path.
         let engineConfig = ModelConfig(bundle: bundle)
@@ -177,7 +169,7 @@ public struct EngineFactory: Sendable {
         return try await StaticShapeEngine(
             configuration: ModelConfig(bundle: bundle),
             modelURL: languageModelURL,
-            tensorData: bundle.tensorData.merging(options.tensorData) { _, explicit in explicit },
+            tensorData: options.mergingTensorData(bundle.tensorData).tensorData,
             visionModelURL: visionModelURL,
             visionConfig: visionConfig
         )
@@ -377,9 +369,9 @@ public struct EngineFactory: Sendable {
             ),
             serializedModel: [modelURL.lastPathComponent],
             function: config.function,
-            overrides: config.overrides
+            overrides: config.overrides,
+            states: config.states
         )
-        modelConfig.states = config.states
 
         modelConfig.applyChunkingOverrides(
             prefillChunkSize: options.prefillChunkSize,
@@ -422,7 +414,7 @@ public struct EngineOptions: Sendable {
     ///
     /// When `nil`, the factory selects a variant from the model's structure. Set this to
     /// `"coreai-sequential"`, `"coreai-pipelined"`, or `"static-shape"` to bypass auto-detection.
-    public let variant: String?
+    public var variant: String?
 
     /// The strategy that determines how the engine sizes the KV cache.
     ///
@@ -432,7 +424,7 @@ public struct EngineOptions: Sendable {
     /// - Important: Avoid `.fixedSize` unless you need a known upper bound. It pre-allocates the
     ///   cache at the full `maxContextLength`, which can consume several gigabytes on long-context
     ///   models and slows each decoding step because every iteration operates on the full-size KV.
-    public let kvCacheStrategy: KVCacheStrategy
+    public var kvCacheStrategy: KVCacheStrategy
 
     /// The KV cache size in tokens that overrides the strategy's default.
     ///
@@ -442,20 +434,65 @@ public struct EngineOptions: Sendable {
     /// - `.fixedSize`: the total capacity, capped at `maxContextLength`.
     /// - `.growing`: the initial capacity, which grows up to `maxContextLength`.
     /// - `.chunked`: the window size.
-    public let kvCacheSize: Int?
+    public var kvCacheSize: Int?
 
     /// Override for the prefill chunk size (tokens per chunk).
     /// When set, takes precedence over model metadata and engine defaults.
-    public let prefillChunkSize: Int?
+    public var prefillChunkSize: Int?
 
     /// Override for the chunk threshold (minimum prompt tokens to trigger chunking).
     /// When set, takes precedence over model metadata and engine defaults.
-    public let prefillChunkThreshold: Int?
+    public var prefillChunkThreshold: Int?
 
     /// Tensor data the bundle ships alongside the model, for weights too large to bake
     /// into the graph, keyed by the role name under `auxiliary_assets` in `metadata.json` (see
     /// ``TensorDataKey``). A role absent here is data the bundle does not ship.
-    public let tensorData: [String: URL]
+    public var tensorData: [String: URL]
+
+    /// Bytes the engine may keep of earlier prompts' state, so a later prompt that starts the same way
+    /// restores that prefix rather than computing it again; zero turns this off.
+    ///
+    /// The engine keeps the KV of every full chunk of tokens it has processed, keyed by the exact
+    /// tokens before it, and on a model with recurrent state a snapshot of that state at chunk
+    /// boundaries, dropping the least recently used when the budget is spent. A second conversation
+    /// sharing a system prompt, or a turn that edits an earlier one, then starts from the deepest chunk
+    /// it shares. Off by default; ``suggestedPrefixCacheBytes`` suits a server.
+    ///
+    /// Only the pipelined engine keeps one, and only for a model whose state it can copy (not one with
+    /// a sliding-window ring); every other engine ignores this. ``InferenceEngine/prefixCacheEnabled``
+    /// says whether an engine took it. On a model with recurrent state, prefill also holds the snapshots
+    /// it has taken until the reply is out, up to half this again.
+    public var prefixCacheBytes: Int
+
+    /// 1 GiB, what llm-server keeps unless told otherwise.
+    public static let suggestedPrefixCacheBytes = 1 << 30
+
+    /// Bytes of disk the prefix cache may also use, in ``prefixCacheDirectory``; zero, the default,
+    /// keeps it in memory only.
+    ///
+    /// Chunks the cache takes in memory are also written to disk, in the background, as far as this
+    /// budget allows, and a prompt that runs past what memory holds reads the next chunks back from there. So this may be larger
+    /// than ``prefixCacheBytes``, and a restarted engine reuses what an earlier one computed. Needs
+    /// ``prefixCacheBytes`` and ``prefixCacheDirectory`` too: chunks reach the KV cache through memory.
+    /// Without either, creating the engine throws. Setting this back to zero leaves the files in
+    /// ``prefixCacheDirectory`` where they are, for a later engine with a disk budget to use; nothing
+    /// deletes them but that engine's own eviction and the system's clearing of its caches directory.
+    public var prefixCacheDiskBytes: Int
+
+    /// Where the prefix cache keeps its files: a directory for this model alone, such as
+    /// ``defaultPrefixCacheDirectory(forModelAt:)``. Nil keeps the cache in memory only.
+    ///
+    /// One process at a time: an engine that finds the directory in use by another runs without a disk
+    /// tier, and logs it.
+    public var prefixCacheDirectory: URL?
+
+    /// A directory for the prefix cache of the model at `modelURL`, under the user's caches directory.
+    ///
+    /// Named by the model's folder and a digest of its path and its files' sizes and modification
+    /// dates, so a model exported again starts afresh rather than reuse another's state.
+    public static func defaultPrefixCacheDirectory(forModelAt modelURL: URL) -> URL? {
+        PrefixCacheStore.defaultDirectory(forModelAt: modelURL)
+    }
 
     /// Well-known `assets` roles for tensor data.
     public enum TensorDataKey {
@@ -474,13 +511,19 @@ public struct EngineOptions: Sendable {
     ///   - prefillChunkSize: Tokens per prefill chunk, or `nil` to use model/engine default.
     ///   - prefillChunkThreshold: Minimum prompt tokens to trigger chunking, or `nil` for default.
     ///   - tensorData: Tensor data URLs keyed by `auxiliary_assets` role. Defaults to empty.
+    ///   - prefixCacheBytes: Bytes of earlier prompts' state to keep. Defaults to zero, off.
+    ///   - prefixCacheDiskBytes: Bytes of disk the prefix cache may also use. Defaults to zero, off.
+    ///   - prefixCacheDirectory: Where the prefix cache keeps its files. Defaults to nil, none.
     public init(
         variant: String? = nil,
         kvCacheStrategy: KVCacheStrategy = .auto,
         kvCacheSize: Int? = nil,
         prefillChunkSize: Int? = nil,
         prefillChunkThreshold: Int? = nil,
-        tensorData: [String: URL] = [:]
+        tensorData: [String: URL] = [:],
+        prefixCacheBytes: Int = 0,
+        prefixCacheDiskBytes: Int = 0,
+        prefixCacheDirectory: URL? = nil
     ) {
         self.variant = variant
         self.kvCacheStrategy = kvCacheStrategy
@@ -488,6 +531,9 @@ public struct EngineOptions: Sendable {
         self.prefillChunkSize = prefillChunkSize
         self.prefillChunkThreshold = prefillChunkThreshold
         self.tensorData = tensorData
+        self.prefixCacheBytes = prefixCacheBytes
+        self.prefixCacheDiskBytes = prefixCacheDiskBytes
+        self.prefixCacheDirectory = prefixCacheDirectory
     }
 
     /// Returns the KV cache size in tokens that the engine uses for a given context length.
@@ -504,6 +550,14 @@ public struct EngineOptions: Sendable {
             return explicitSize
         }
         return kvCacheStrategy.defaultSize(maxContextLength: maxContextLength)
+    }
+
+    /// These options over a bundle's own tensor data: an entry given here wins over the bundle's,
+    /// and every other option carries over unchanged.
+    public func mergingTensorData(_ base: [String: URL]) -> EngineOptions {
+        var merged = self
+        merged.tensorData = base.merging(tensorData) { _, explicit in explicit }
+        return merged
     }
 }
 

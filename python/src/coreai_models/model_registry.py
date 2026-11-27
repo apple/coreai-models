@@ -14,7 +14,7 @@ CLI:
     uv run coreai.model.registry --model-info clip-vit-b32 --type utility --as-export-args
 
 `--type` selects the preset table (`llm`, `diffusion`, or `utility`).
-`--platform` (`macOS` / `iOS`) filters LLM variants and utility model platforms.
+`--platform` (`macOS` / `iOS`) filters LLM and diffusion variants and utility model platforms.
 """
 
 from __future__ import annotations
@@ -42,7 +42,8 @@ class ModelPreset:
     hf_id: str
     family: str
     type: str  # "llm" | "diffusion"
-    variant: str | None = None  # "macOS" | "iOS" for llm; None for diffusion
+    # "macOS" | "iOS" for llm and Sana Sprint; None for the other diffusion models
+    variant: str | None = None
     compression: str = "none"
     compute_precision: str | None = None  # None = use export tool default
     max_context_length: int | None = None  # llm-only; None for diffusion
@@ -55,6 +56,11 @@ class ModelPreset:
     # config.json reports a type we don't want to register globally (e.g.
     # SmolLM2 reports "llama" but we use the qwen2 export path).
     _model_type_override: str | None = None
+    # ModelScope repo id for the download-backend override map. Defaults to
+    # the HF id — presets whose repo exists under the same org/name on both
+    # hubs leave this as None. Only namespace-differing models need an entry
+    # (currently just gpt-oss-20b).
+    modelscope_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -166,7 +172,15 @@ LLM_PRESETS: list[ModelPreset] = [
         32768,
     ),
     ModelPreset(
-        "gpt-oss-20b", "openai/gpt-oss-20b", "gpt-oss", "llm", "macOS", "none", "bfloat16", 32768
+        "gpt-oss-20b",
+        "openai/gpt-oss-20b",
+        "gpt-oss",
+        "llm",
+        "macOS",
+        "none",
+        "bfloat16",
+        32768,
+        modelscope_id="openai-mirror/gpt-oss-20b",
     ),
     ModelPreset(
         "phi-4-mini-instruct",
@@ -253,6 +267,30 @@ LLM_PRESETS: list[ModelPreset] = [
         "none",
         "float16",
         8192,
+        _model_type_override="qwen2",
+    ),
+    ModelPreset(
+        "smollm3-3b",
+        "HuggingFaceTB/SmolLM3-3B",
+        "smollm3",
+        "llm",
+        "macOS",
+        "4bit",
+        "float16",
+        8192,
+        compression_config="models/smollm3/smollm3_mixed_4bit_8bit.yaml",
+        _model_type_override="qwen2",
+    ),
+    ModelPreset(
+        "smollm3-3b-base",
+        "HuggingFaceTB/SmolLM3-3B-Base",
+        "smollm3",
+        "llm",
+        "macOS",
+        "4bit",
+        "float16",
+        8192,
+        compression_config="models/smollm3/smollm3_mixed_4bit_8bit.yaml",
         _model_type_override="qwen2",
     ),
     ModelPreset(
@@ -510,6 +548,30 @@ LLM_PRESETS: list[ModelPreset] = [
         _model_type_override="qwen2",
     ),
     ModelPreset(
+        "smollm3-3b",
+        "HuggingFaceTB/SmolLM3-3B",
+        "smollm3",
+        "llm",
+        "iOS",
+        "none",
+        "float16",
+        4096,
+        compression_config="models/smollm3/smollm3_3b_6bit.yaml",
+        _model_type_override="qwen2",
+    ),
+    ModelPreset(
+        "smollm3-3b-base",
+        "HuggingFaceTB/SmolLM3-3B-Base",
+        "smollm3",
+        "llm",
+        "iOS",
+        "none",
+        "float16",
+        4096,
+        compression_config="models/smollm3/smollm3_3b_6bit.yaml",
+        _model_type_override="qwen2",
+    ),
+    ModelPreset(
         "olmo2-1b-instruct",
         "allenai/OLMo-2-0425-1B-Instruct",
         "olmo2",
@@ -538,6 +600,22 @@ LLM_PRESETS: list[ModelPreset] = [
         ),
     ),
     ModelPreset(
+        "gemma4-e2b-it-qat",
+        "google/gemma-4-E2B-it-qat-mobile-transformers",
+        "gemma4",
+        "llm",
+        "iOS",
+        "native_quantized",
+        "float16",
+        131072,
+        notes=(
+            "Exported via models/gemma4/export.py (standalone recipe, as gemma4-e2b-it). "
+            "The quantization-aware-trained checkpoint keeps its own quantized weights, so it "
+            "is not palettized: the export refuses --compression, --compression-config and "
+            "--include-vision for it."
+        ),
+    ),
+    ModelPreset(
         "gemma4-e4b-it",
         "google/gemma-4-E4B-it",
         "gemma4",
@@ -552,6 +630,36 @@ LLM_PRESETS: list[ModelPreset] = [
             "coreai.llm.export's single-graph pipeline: a per-context blocked ladder "
             "of statically-shaped programs, externalized Per-Layer Embeddings, and "
             "precomputed dual-RoPE rows). Pass --include-vision for image input."
+        ),
+    ),
+    ModelPreset(
+        "qwen3.5-2b",
+        "Qwen/Qwen3.5-2B",
+        "qwen3.5",
+        "llm",
+        "iOS",
+        "none",
+        "float16",
+        32768,
+        compression_config="models/qwen3_5/qwen3_5_2b_4bit_palettized.yaml",
+        notes=(
+            "Exported via models/qwen3_5/export.py (standalone recipe -- a per-bucket static "
+            "ladder with DeltaNet state, not coreai.llm.export). This preset serves evaluation."
+        ),
+    ),
+    ModelPreset(
+        "qwen3.5-4b",
+        "Qwen/Qwen3.5-4B",
+        "qwen3.5",
+        "llm",
+        "iOS",
+        "none",
+        "float16",
+        32768,
+        compression_config="models/qwen3_5/qwen3_5_4b_4bit_palettized.yaml",
+        notes=(
+            "Exported via models/qwen3_5/export.py (standalone recipe -- a per-bucket static "
+            "ladder with DeltaNet state, not coreai.llm.export). This preset serves evaluation."
         ),
     ),
 ]
@@ -587,7 +695,28 @@ DIFFUSION_PRESETS: list[ModelPreset] = [
         "Efficient-Large-Model/Sana_Sprint_0.6B_1024px_diffusers",
         "sana-sprint",
         "diffusion",
+        "macOS",
+        "t8bit-te4bit-asym",
+        "bfloat16",
         None,
+    ),
+    ModelPreset(
+        "sana-sprint-0.6b",
+        "Efficient-Large-Model/Sana_Sprint_0.6B_1024px_diffusers",
+        "sana-sprint",
+        "diffusion",
+        "iOS",
+        "te6bit-tok8-tx8bit-pal",
+        "float16",
+        None,
+        notes="Neural Engine float16 build (--platform iOS)",
+    ),
+    ModelPreset(
+        "sana-sprint-1.6b",
+        "Efficient-Large-Model/Sana_Sprint_1.6B_1024px_diffusers",
+        "sana-sprint",
+        "diffusion",
+        "macOS",
         "t8bit-te4bit-asym",
         "bfloat16",
         None,
@@ -597,10 +726,11 @@ DIFFUSION_PRESETS: list[ModelPreset] = [
         "Efficient-Large-Model/Sana_Sprint_1.6B_1024px_diffusers",
         "sana-sprint",
         "diffusion",
+        "iOS",
+        "te6bit-tok8-tx8bit-pal",
+        "float16",
         None,
-        "t8bit-te4bit-asym",
-        "bfloat16",
-        None,
+        notes="Neural Engine float16 build (--platform iOS)",
     ),
 ]
 
@@ -630,6 +760,14 @@ UTILITY_PRESETS: list[UtilityModel] = [
         "clap",
         "embedding",
         "coreai.embedding.export",
+    ),
+    UtilityModel(
+        "qwen3-embedding-0.6b",
+        "Qwen/Qwen3-Embedding-0.6B",
+        "qwen3-embedding",
+        "embedding",
+        "coreai.embedding.export",
+        platforms=("macOS",),
     ),
     # --- ASR ---
     UtilityModel(
@@ -956,6 +1094,8 @@ def _preset_to_export_args(preset: ModelPreset) -> list[str]:
     # Skip the flag for the macOS default to match the batch scripts.
     if preset.type == "llm" and preset.variant and preset.variant != "macOS":
         args += ["--platform", preset.variant]
+    if preset.type == "diffusion" and preset.variant == "iOS":
+        args += ["--platform", "iOS"]
     return args
 
 
@@ -968,12 +1108,12 @@ def _preset_to_output_name(preset: ModelPreset) -> str:
     preset points at a YAML config, the YAML stem (which encodes model identity)
     replaces the `<hf_tail>_<compression>` segment to avoid duplication.
 
-    Diffusion: the HF id's tail (e.g. `FLUX.2-klein-4B`); the export
-    tool writes a directory of components there.
+    Diffusion: the HF id's tail (e.g. `FLUX.2-klein-4B`), plus `-ios` for an iOS preset; the
+    export tool writes a directory of components there.
     """
     tail = preset.hf_id.split("/")[-1]
     if preset.type == "diffusion":
-        return tail
+        return f"{tail}-ios" if preset.variant == "iOS" else tail
     if preset.variant == "macOS":
         variant_suffix = "_dynamic"
     elif preset.variant == "iOS":
@@ -1069,8 +1209,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--platform",
         choices=KNOWN_VARIANTS,
-        help="Platform filter (macOS / iOS). Filters LLM variants and utility model platforms; "
-        "diffusion entries are excluded when --platform is set.",
+        help="Platform filter (macOS / iOS). Filters LLM and Sana Sprint variants and utility "
+        "model platforms; diffusion entries without a platform (FLUX.2, Wan) are excluded "
+        "when --platform is set.",
     )
     parser.add_argument(
         "--family",
@@ -1136,7 +1277,7 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="format",
         const="export-args",
         help="Print the argv to forward to coreai.{type}.export. "
-        "Requires --model-info plus --platform for LLM.",
+        "Requires --model-info plus --platform for LLM and Sana Sprint.",
     )
     fmt.add_argument(
         "--as-output-name",
@@ -1146,7 +1287,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Print the basename the export tool would write for "
         "this preset (LLM: bundle directory name; "
         "diffusion: model directory name). "
-        "Requires --model-info plus --platform for LLM.",
+        "Requires --model-info plus --platform for LLM and Sana Sprint.",
     )
     parser.set_defaults(format="text")
 

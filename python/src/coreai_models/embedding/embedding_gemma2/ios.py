@@ -10,7 +10,6 @@ The float16 token table (GPU), the static-length encoder and the image encoder (
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -27,7 +26,6 @@ from coreai_models.embedding.embedding_gemma2.common import (
     TOKEN_TABLE_INPUT_NAMES,
     TOKEN_TABLE_OUTPUT_NAME,
     EmbeddingGemma2Family,
-    FunctionSpec,
     ImageTowerFacts,
     TokenTableExportWrapper,
     encoder_functions,
@@ -35,7 +33,7 @@ from coreai_models.embedding.embedding_gemma2.common import (
     output_dtype,
     token_table_trace,
 )
-from coreai_models.embedding.export_utils import TORCH_DTYPES, save_program
+from coreai_models.embedding.export_utils import TORCH_DTYPES, FunctionSpec, save_program
 
 if TYPE_CHECKING:
     from coreai.authoring import AIProgram
@@ -108,31 +106,6 @@ def encoder_reference_inputs(
     return embeds, bias, pool
 
 
-def convert_ane_functions(
-    functions: Sequence[
-        tuple[str, nn.Module, tuple[torch.Tensor, ...], tuple[str, ...], tuple[str, ...]]
-    ],
-    *,
-    include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
-) -> AIProgram:
-    """Convert ``(name, module, args, input_names, output_names)`` entries into one Neural Engine
-    program with one function per entry.
-
-    Uses ``torch.export.default_decompositions()`` and ``register_custom_torch_lowering``.
-    """
-    from coreai_models.converter import add_function, make_converter
-    from coreai_models.export.mlir_ops import register_custom_torch_lowering
-
-    converter = make_converter(include_debug_info)
-    register_custom_torch_lowering(converter)
-    decompositions = torch.export.default_decompositions()
-    for name, module, args, input_names, output_names in functions:
-        add_function(
-            converter, name, module, args, input_names, output_names, decompositions=decompositions
-        )
-    return converter.to_coreai()
-
-
 def export_ane_encoder_program(
     encoder: nn.Module,
     functions: list[FunctionSpec],
@@ -140,6 +113,8 @@ def export_ane_encoder_program(
     include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
 ) -> AIProgram:
     """Neural Engine ``encoder``: one static batch-1 float16 function per length."""
+    from coreai_models.converter import convert_ane_functions
+
     hidden = int(encoder.config.hidden_size)
     traces = [
         (
@@ -160,6 +135,8 @@ def export_ane_image_encoder_program(
     include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
 ) -> AIProgram:
     """Neural Engine ``image_encoder``: function ``main`` at the static budget."""
+    from coreai_models.converter import convert_ane_functions
+
     args = image_reference_inputs(image, DTYPE, DTYPE)
     return convert_ane_functions(
         [("main", image_encoder, args, IMAGE_INPUT_NAMES, (IMAGE_OUTPUT_NAME,))],

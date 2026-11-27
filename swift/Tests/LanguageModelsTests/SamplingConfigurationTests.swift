@@ -125,7 +125,7 @@ struct SamplingConfigurationTests {
         let config = SamplingConfiguration(temperature: 0)
         var logits: [LogitsScalarType] = [0.1, 0.5, 0.2, 0.9, 0.3]
 
-        let token = config.fallbackSampler(from: &logits)
+        let token = config.cpuSampler(from: &logits)
 
         #expect(token == 3)  // Index of max value 0.9
     }
@@ -135,7 +135,7 @@ struct SamplingConfigurationTests {
         let config = SamplingConfiguration(temperature: 1.0)
         var logits: [LogitsScalarType] = [0.1, 0.5, 0.2, 0.9, 0.3]
 
-        let token = config.fallbackSampler(from: &logits)
+        let token = config.cpuSampler(from: &logits)
 
         #expect(token >= 0 && token < 5)
     }
@@ -149,7 +149,7 @@ struct SamplingConfigurationTests {
         var sampledTokens = Set<Int32>()
         for _ in 0..<100 {
             var logitsCopy = logits
-            let token = config.fallbackSampler(from: &logitsCopy)
+            let token = config.cpuSampler(from: &logitsCopy)
             sampledTokens.insert(token)
         }
 
@@ -168,7 +168,7 @@ struct SamplingConfigurationTests {
         var sampledTokens = Set<Int32>()
         for _ in 0..<50 {
             var logitsCopy = logits
-            let token = config.fallbackSampler(from: &logitsCopy)
+            let token = config.cpuSampler(from: &logitsCopy)
             sampledTokens.insert(token)
         }
 
@@ -189,7 +189,7 @@ struct SamplingConfigurationTests {
         // 1/1,000,000,000,000,000 chance this is going to fail (0.5^50)
         for _ in 0..<50 {
             var logitsCopy = logits
-            let token = config.fallbackSampler(from: &logitsCopy)
+            let token = config.cpuSampler(from: &logitsCopy)
             sampledTokens.insert(token)
         }
 
@@ -238,7 +238,7 @@ struct SamplingConfigurationTests {
         var sampledTokens = Set<Int32>()
         for _ in 0..<100 {
             var logitsCopy = logits
-            let token = config.fallbackSampler(from: &logitsCopy)
+            let token = config.cpuSampler(from: &logitsCopy)
             sampledTokens.insert(token)
         }
 
@@ -271,6 +271,10 @@ struct SamplingParameterValidationTests {
                 SamplingConfiguration.parameterError(1, nil, nil, nil, nil, 0),
                 .repetitionPenaltyWindow, "> 0", "0"
             ),
+            (SamplingConfiguration.parameterError(1, frequencyPenalty: 2.5), .frequencyPenalty, "in [-2, 2]", "2.5"),
+            (SamplingConfiguration.parameterError(1, frequencyPenalty: .nan), .frequencyPenalty, "in [-2, 2]", "nan"),
+            (SamplingConfiguration.parameterError(1, presencePenalty: -2.5), .presencePenalty, "in [-2, 2]", "-2.5"),
+            (SamplingConfiguration.parameterError(1, presencePenalty: .nan), .presencePenalty, "in [-2, 2]", "nan"),
         ]
         for (error, parameter, requirement, value) in cases {
             #expect(error == SamplingParameterError(parameter: parameter, requirement: requirement, value: value))
@@ -284,6 +288,7 @@ struct SamplingParameterValidationTests {
             SamplingConfiguration.parameterError(0.7, 1, 1, 1, 1, 1)
                 == nil)
         #expect(SamplingConfiguration.parameterError(1, nil, .leastNonzeroMagnitude) == nil)
+        #expect(SamplingConfiguration.parameterError(1, frequencyPenalty: -2, presencePenalty: 2) == nil)
     }
 
     @Test("The first out-of-range parameter is reported")

@@ -27,6 +27,7 @@ extension FlowTransformerPipeline {
             self = try await Self.loadSanaSprint(from: url, bundle: bundle, mode: mode)
             return
         }
+        try config.requireGPUComputeUnits()
 
         if config.dynamicShapes == true {
             self = try await Self.loadDynamicFlux2(from: url, bundle: bundle, mode: mode)
@@ -164,7 +165,8 @@ extension FlowTransformerPipeline {
         func component(_ name: String, _ path: String?) throws -> CoreAIDiffusionModelFunction {
             guard let path else { throw PipelineLoadError.missingComponent(name) }
             let assetURL = try resolveExistingPipelineAsset(path, in: url, component: name)
-            return CoreAIDiffusionModelFunction(modelURL: assetURL)
+            return CoreAIDiffusionModelFunction(
+                modelURL: assetURL, computeUnit: try bundle.config.computeUnit(for: name))
         }
 
         return Self(
@@ -263,6 +265,32 @@ extension FlowTransformerPipeline {
         let rawData = data[dataStart...]
         return rawData.withUnsafeBytes { ptr in
             Array(ptr.bindMemory(to: Float32.self))
+        }
+    }
+}
+
+extension DiffusionConfig {
+    /// The compute unit `component`'s asset was exported for: its first `compute_units` entry, or
+    /// the GPU if it has none. Throws on a unit the diffusion runtime does not load.
+    func computeUnit(for component: String) throws -> ComputeUnitKind {
+        switch computeUnits?[component]?.first {
+        case nil, "gpu":
+            return .gpu
+        case "neural_engine":
+            return .neuralEngine
+        case let unit?:
+            throw PipelineLoadError.unsupportedConfiguration(
+                "Unsupported compute unit '\(unit)' for component '\(component)'.")
+        }
+    }
+
+    /// Throws unless every asset is listed for the GPU, for pipelines that only load on the GPU
+    /// (FLUX.2, Wan): an asset exported for another unit must not load on the GPU unnoticed.
+    public func requireGPUComputeUnits() throws {
+        for component in (computeUnits ?? [:]).keys.sorted() where try computeUnit(for: component) != .gpu {
+            throw PipelineLoadError.unsupportedConfiguration(
+                "Component '\(component)' is exported for \(computeUnits?[component] ?? []); "
+                    + "this pipeline loads on the GPU only.")
         }
     }
 }
